@@ -1,0 +1,209 @@
+@import "tailwindcss";
+
+@theme {
+  --color-pane-bg: var(--pane-bg);
+  --color-pane-surface: var(--pane-surface);
+  --color-pane-border: var(--pane-border);
+  --color-pane-text: var(--pane-text);
+  --color-pane-text-secondary: var(--pane-text-secondary);
+  --color-pane-status-added: var(--pane-status-added);
+  --color-pane-status-modified: var(--pane-status-modified);
+  --color-pane-status-deleted: var(--pane-status-deleted);
+  --color-pane-status-renamed: var(--pane-status-renamed);
+  --color-pane-status-untracked: var(--pane-status-untracked);
+  --color-pane-error: var(--pane-error);
+
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-sans: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-panel: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  /* Animations - fast and subtle for lightest IDE */
+  --animate-fadeSlideUp: fadeSlideUp 0.12s ease-out;
+  --animate-pressScale: pressScale 0.08s ease-out;
+
+  @keyframes fadeSlideUp {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes pressScale {
+    0% {
+      transform: scale(1);
+    }
+    50% {
+      transform: scale(0.95);
+    }
+    100% {
+      transform: scale(1);
+    }
+  }
+}
+
+:root {
+  /*
+   * Dark — "Ink"
+   * A desk at night. Warm enough to stay, quiet enough to think.
+   * Slight amber undertone throughout — never blue, never sterile.
+   */
+  --pane-bg: #1C1B1A;
+  --pane-surface: #242320;
+  --pane-border: #33312E;
+  --pane-text: #C8C5BE;
+  --pane-text-secondary: #6D6A63;
+  --pane-font-size: 15px;
+  --pane-font-size-sm: 12px;
+  --pane-font-size-xs: 10px;
+  --pane-panel-font-size: 13px;
+  --pane-panel-font-size-sm: 11px;
+  --pane-panel-font-size-xs: 9px;
+
+  /* Semantic — muted, never alarming */
+  --pane-status-added: #8A9A6C;
+  --pane-status-modified: #B8A56A;
+  --pane-status-deleted: #A67272;
+  --pane-status-renamed: #7E97AA;
+  --pane-status-untracked: #6D6A63;
+  --pane-error: #A67272;
+  --pane-error-bg: rgba(166, 114, 114, 0.08);
+  --pane-error-border: rgba(166, 114, 114, 0.2);
+
+  /* Terminal accent — the machine's voice */
+  --pane-terminal: #8AACCA;
+
+  /* Overlay */
+  --pane-overlay: rgba(20, 19, 18, 0.7);
+
+  /* Editor syntax — dark: quiet instruments, not a neon sign */
+  --pane-editor-bg: #1C1B1A;
+  --pane-editor-gutter: #1C1B1A;
+  --pane-editor-gutter-text: #4A4742;
+  --pane-editor-gutter-border: #33312E;
+  --pane-editor-active-line: #242320;
+  --pane-editor-selection: rgba(140, 130, 110, 0.25);
+  --pane-editor-cursor: #C8C5BE;
+  --pane-editor-search-match: rgba(184, 165, 106, 0.15);
+  --pane-editor-search-match-border: rgba(184, 165, 106, 0.3);
+  --pane-editor-search-match-active: rgba(184, 165, 106, 0.25);
+  --pane-editor-search-match-active-border: rgba(184, 165, 106, 0.5);
+  --pane-syn-keyword: #B39BDB;
+  --pane-syn-string: #93A87E;
+  --pane-syn-number: #C9AE6E;
+  --pane-syn-comment: #5A5752;
+  --pane-syn-function: #8AACCA;
+  --pane-syn-type: #8ABCB0;
+  --pane-syn-operator: #B88C8C;
+  --pane-syn-property: #C8C5BE;
+  --pane-syn-tag: #B88C8C;
+  --pane-syn-attribute: #C9AE6E;
+}
+
+[data-theme="light"] {
+  /*
+   * Light — "Paper"
+   * Warm parchment. Something you'd write on, not stare at.
+   * Cream undertone — never hospital white, never clinical.
+   */
+  --pane-bg: #F4F2EC;
+  --pane-surface: #EAE8E2;
+  --pane-border: #D5D3CC;
+  --pane-text: #2C2B28;
+  --pane-text-secondary: #8A877F;
+
+  /* Semantic — light */
+  --pane-status-added: #5B7040;
+  --pane-status-modified: #8A7530;
+  --pane-status-deleted: #8C4A4A;
+  --pane-status-renamed: #4A708A;
+  --pane-status-untracked: #8A877F;
+  --pane-error: #8C4A4A;
+  --pane-error-bg: rgba(140, 74, 74, 0.06);
+  --pane-error-border: rgba(140, 74, 74, 0.15);
+
+  /* Terminal accent — the machine's voice */
+  --pane-terminal: #3A6A8A;
+
+  /* Overlay */
+  --pane-overlay: rgba(44, 43, 40, 0.5);
+
+  /* Editor syntax — light: subdued, reads well on cream */
+  --pane-editor-bg: #F4F2EC;
+  --pane-editor-gutter: #F4F2EC;
+  --pane-editor-gutter-text: #A5A29A;
+  --pane-editor-gutter-border: #D5D3CC;
+  --pane-editor-active-line: #EAE8E2;
+  --pane-editor-selection: rgba(100, 95, 80, 0.20);
+  --pane-editor-cursor: #2C2B28;
+  --pane-editor-search-match: rgba(138, 111, 32, 0.12);
+  --pane-editor-search-match-border: rgba(138, 111, 32, 0.25);
+  --pane-editor-search-match-active: rgba(138, 111, 32, 0.20);
+  --pane-editor-search-match-active-border: rgba(138, 111, 32, 0.4);
+  --pane-syn-keyword: #7B5EA7;
+  --pane-syn-string: #4A7035;
+  --pane-syn-number: #8A6F20;
+  --pane-syn-comment: #A5A29A;
+  --pane-syn-function: #3A6A8A;
+  --pane-syn-type: #3A7A6A;
+  --pane-syn-operator: #8C4A4A;
+  --pane-syn-property: #2C2B28;
+  --pane-syn-tag: #8C4A4A;
+  --pane-syn-attribute: #8A6F20;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: var(--pane-bg);
+  color: var(--pane-text);
+  font-family: var(--font-sans);
+}
+
+.no-select {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--pane-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--pane-text-secondary);
+}
+
+/* macOS window drag regions */
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+}
+
+[data-tauri-drag-region] button,
+[data-tauri-drag-region] a,
+[data-tauri-drag-region] input,
+[data-tauri-drag-region] textarea,
+[data-tauri-drag-region] select,
+[data-tauri-drag-region] [data-no-drag] {
+  -webkit-app-region: no-drag;
+}
+
+/* Interactive feedback - instant, clear, minimal */
+.btn-press:active {
+  opacity: 0.7;
+}
