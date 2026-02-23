@@ -1,40 +1,70 @@
 {
-  "name": "pane-app",
-  "private": true,
+  "name": "pane",
   "version": "0.1.0",
   "type": "module",
+  "description": "The lightest IDE ever built",
+  "main": "./out/main/index.js",
+  "author": "Aslam Abdul",
+  "license": "MIT",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
-    "tauri": "tauri",
-    "tauri:build": "tauri build"
+    "dev": "node scripts/dev.js",
+    "build": "electron-vite build && node scripts/copy-compiled.js",
+    "preview": "electron-vite preview",
+    "build:mac": "npm run build && electron-builder --mac --arm64",
+    "build:all": "npm run build && electron-builder --mac --arm64 --x64"
+  },
+  "build": {
+    "appId": "com.pane.ide",
+    "productName": "Pane",
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ]
+    },
+    "files": [
+      "out/**/*",
+      "src/main/main.mjs",
+      "src/preload/preload.mjs",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    }
   },
   "dependencies": {
-    "@codemirror/commands": "^6.10.2",
-    "@codemirror/language": "^6.12.1",
-    "@codemirror/language-data": "^6.5.2",
-    "@codemirror/search": "^6.6.0",
-    "@codemirror/state": "^6.5.4",
-    "@codemirror/view": "^6.39.15",
     "@fontsource-variable/bricolage-grotesque": "^5.2.10",
+    "@fontsource/geist-mono": "^5.2.7",
     "@fontsource/ibm-plex-mono": "^5.2.7",
-    "@tauri-apps/api": "^2.10.1",
-    "@tauri-apps/plugin-dialog": "^2.6.0",
-    "@tauri-apps/plugin-os": "^2.2.2",
-    "@tauri-apps/plugin-window-state": "^2.4.1",
+    "ace-builds": "^1.40.8",
+    "chokidar": "^5.0.0",
+    "electron-window-state": "^5.0.3",
     "fuse.js": "^7.1.0",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
+    "ignore": "^7.0.5",
+    "react": "^18.3.1",
+    "react-ace": "^12.0.0",
+    "react-dom": "^18.3.1",
     "zustand": "^5.0.0"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.1.0",
-    "@tauri-apps/cli": "^2.10.0",
-    "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^5.1.4",
-    "tailwindcss": "^4.1.0",
-    "typescript": "^5.9.3",
-    "vite": "^7.3.1"
+    "@tailwindcss/vite": "^4.2.0",
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.24",
+    "electron": "^40.6.0",
+    "electron-builder": "^26.8.1",
+    "electron-vite": "^2.3.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.2.0",
+    "typescript": "^5.7.3",
+    "vite": "^5.4.11"
   }
 }

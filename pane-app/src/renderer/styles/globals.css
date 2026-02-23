@@ -1,0 +1,349 @@
+@import "tailwindcss";
+
+@theme {
+  --color-pane-bg: var(--pane-bg);
+  --color-pane-surface: var(--pane-surface);
+  --color-pane-border: var(--pane-border);
+  --color-pane-text: var(--pane-text);
+  --color-pane-text-secondary: var(--pane-text-secondary);
+  --color-pane-status-added: var(--pane-status-added);
+  --color-pane-status-modified: var(--pane-status-modified);
+  --color-pane-status-deleted: var(--pane-status-deleted);
+  --color-pane-status-renamed: var(--pane-status-renamed);
+  --color-pane-status-untracked: var(--pane-status-untracked);
+  --color-pane-error: var(--pane-error);
+
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-sans: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-panel: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  /* Animations - fast and subtle for lightest IDE */
+  --animate-fadeSlideUp: fadeSlideUp 0.12s ease-out;
+  --animate-pressScale: pressScale 0.08s ease-out;
+
+  @keyframes fadeSlideUp {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes pressScale {
+    0% {
+      transform: scale(1);
+    }
+    50% {
+      transform: scale(0.95);
+    }
+    100% {
+      transform: scale(1);
+    }
+  }
+}
+
+:root {
+  /*
+   * Dark — "Ink"
+   * A desk at night. Warm enough to stay, quiet enough to think.
+   * Slight amber undertone throughout — never blue, never sterile.
+   */
+  --pane-bg: #1C1B1A;
+  --pane-surface: #242320;
+  --pane-border: #33312E;
+  --pane-text: #C8C5BE;
+  --pane-text-secondary: #6D6A63;
+  --pane-font-size: 15px;
+  --pane-font-size-sm: 12px;
+  --pane-font-size-xs: 10px;
+  --pane-panel-font-size: 13px;
+  --pane-panel-font-size-sm: 11px;
+  --pane-panel-font-size-xs: 9px;
+
+  /* Semantic — muted, never alarming */
+  --pane-status-added: #8A9A6C;
+  --pane-status-modified: #B8A56A;
+  --pane-status-deleted: #A67272;
+  --pane-status-renamed: #7E97AA;
+  --pane-status-untracked: #6D6A63;
+  --pane-error: #A67272;
+  --pane-error-bg: rgba(166, 114, 114, 0.08);
+  --pane-error-border: rgba(166, 114, 114, 0.2);
+
+  /* Terminal accent — the machine's voice */
+  --pane-terminal: #8AACCA;
+
+  /* Overlay */
+  --pane-overlay: rgba(20, 19, 18, 0.7);
+
+  /* Editor syntax — dark: quiet instruments, not a neon sign */
+  --pane-editor-bg: #1C1B1A;
+  --pane-editor-gutter: #1C1B1A;
+  --pane-editor-gutter-text: #4A4742;
+  --pane-editor-gutter-border: #33312E;
+  --pane-editor-active-line: #242320;
+  --pane-editor-selection: rgba(140, 130, 110, 0.25);
+  --pane-editor-cursor: #C8C5BE;
+  --pane-editor-search-match: rgba(184, 165, 106, 0.15);
+  --pane-editor-search-match-border: rgba(184, 165, 106, 0.3);
+  --pane-editor-search-match-active: rgba(184, 165, 106, 0.25);
+  --pane-editor-search-match-active-border: rgba(184, 165, 106, 0.5);
+  /* Monochromatic syntax - warm grays with subtle amber accents */
+  --pane-syn-keyword: #A8A59E;
+  --pane-syn-string: #C9AE6E;
+  --pane-syn-number: #B8A56A;
+  --pane-syn-comment: #5A5752;
+  --pane-syn-function: #C8C5BE;
+  --pane-syn-type: #9D9A93;
+  --pane-syn-operator: #8A877F;
+  --pane-syn-property: #C8C5BE;
+  --pane-syn-tag: #A8A59E;
+  --pane-syn-attribute: #B8A56A;
+}
+
+[data-theme="light"] {
+  /*
+   * Light — "Paper"
+   * Warm parchment. Something you'd write on, not stare at.
+   * Cream undertone — never hospital white, never clinical.
+   */
+  --pane-bg: #F4F2EC;
+  --pane-surface: #EAE8E2;
+  --pane-border: #D5D3CC;
+  --pane-text: #2C2B28;
+  --pane-text-secondary: #8A877F;
+
+  /* Semantic — light */
+  --pane-status-added: #5B7040;
+  --pane-status-modified: #8A7530;
+  --pane-status-deleted: #8C4A4A;
+  --pane-status-renamed: #4A708A;
+  --pane-status-untracked: #8A877F;
+  --pane-error: #8C4A4A;
+  --pane-error-bg: rgba(140, 74, 74, 0.06);
+  --pane-error-border: rgba(140, 74, 74, 0.15);
+
+  /* Terminal accent — the machine's voice */
+  --pane-terminal: #3A6A8A;
+
+  /* Overlay */
+  --pane-overlay: rgba(44, 43, 40, 0.5);
+
+  /* Editor syntax — light: subdued, reads well on cream */
+  --pane-editor-bg: #F4F2EC;
+  --pane-editor-gutter: #F4F2EC;
+  --pane-editor-gutter-text: #A5A29A;
+  --pane-editor-gutter-border: #D5D3CC;
+  --pane-editor-active-line: #EAE8E2;
+  --pane-editor-selection: rgba(100, 95, 80, 0.20);
+  --pane-editor-cursor: #2C2B28;
+  --pane-editor-search-match: rgba(138, 111, 32, 0.12);
+  --pane-editor-search-match-border: rgba(138, 111, 32, 0.25);
+  --pane-editor-search-match-active: rgba(138, 111, 32, 0.20);
+  --pane-editor-search-match-active-border: rgba(138, 111, 32, 0.4);
+  /* Monochromatic syntax - deep grays with rich amber accents */
+  --pane-syn-keyword: #5A5752;
+  --pane-syn-string: #8A6F20;
+  --pane-syn-number: #9A7F30;
+  --pane-syn-comment: #A5A29A;
+  --pane-syn-function: #2C2B28;
+  --pane-syn-type: #6A6762;
+  --pane-syn-operator: #8A877F;
+  --pane-syn-property: #2C2B28;
+  --pane-syn-tag: #5A5752;
+  --pane-syn-attribute: #9A7F30;
+}
+
+[data-theme="pure"] {
+  /*
+   * Pure — "Blank Page"
+   * Maximum contrast. White canvas, black ink. Nothing between you and the code.
+   */
+  --pane-bg: #FFFFFF;
+  --pane-surface: #F8F8F8;
+  --pane-border: #E0E0E0;
+  --pane-text: #1A1A1A;
+  --pane-text-secondary: #808080;
+
+  /* Semantic — high contrast */
+  --pane-status-added: #2D7A3A;
+  --pane-status-modified: #7A6520;
+  --pane-status-deleted: #9A3333;
+  --pane-status-renamed: #2A5A7A;
+  --pane-status-untracked: #808080;
+  --pane-error: #9A3333;
+  --pane-error-bg: rgba(154, 51, 51, 0.06);
+  --pane-error-border: rgba(154, 51, 51, 0.15);
+
+  /* Terminal accent */
+  --pane-terminal: #2A5A7A;
+
+  /* Overlay */
+  --pane-overlay: rgba(0, 0, 0, 0.4);
+
+  /* Editor syntax — high contrast monochromatic */
+  --pane-editor-bg: #FFFFFF;
+  --pane-editor-gutter: #FFFFFF;
+  --pane-editor-gutter-text: #B0B0B0;
+  --pane-editor-gutter-border: #E0E0E0;
+  --pane-editor-active-line: #F5F5F5;
+  --pane-editor-selection: rgba(80, 80, 80, 0.15);
+  --pane-editor-cursor: #1A1A1A;
+  --pane-editor-search-match: rgba(180, 150, 30, 0.12);
+  --pane-editor-search-match-border: rgba(180, 150, 30, 0.30);
+  --pane-editor-search-match-active: rgba(180, 150, 30, 0.22);
+  --pane-editor-search-match-active-border: rgba(180, 150, 30, 0.45);
+  /* Monochromatic syntax - deeper grays, stronger amber */
+  --pane-syn-keyword: #4A4A4A;
+  --pane-syn-string: #7A5F10;
+  --pane-syn-number: #8A6F20;
+  --pane-syn-comment: #B0B0B0;
+  --pane-syn-function: #1A1A1A;
+  --pane-syn-type: #5A5A5A;
+  --pane-syn-operator: #808080;
+  --pane-syn-property: #1A1A1A;
+  --pane-syn-tag: #4A4A4A;
+  --pane-syn-attribute: #8A6F20;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: var(--pane-bg);
+  color: var(--pane-text);
+  font-family: var(--font-sans);
+}
+
+.no-select {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* No custom scrollbar styling — let macOS use its fully native overlay scrollbar.
+   Both ::-webkit-scrollbar and scrollbar-width/scrollbar-color can interfere with
+   native scroll momentum and compositor-driven scrolling on macOS. */
+
+/* macOS window drag regions */
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+}
+
+[data-tauri-drag-region] button,
+[data-tauri-drag-region] a,
+[data-tauri-drag-region] input,
+[data-tauri-drag-region] textarea,
+[data-tauri-drag-region] select,
+[data-tauri-drag-region] [data-no-drag] {
+  -webkit-app-region: no-drag;
+}
+
+/* Text selection — matches editor selection color */
+::selection {
+  background-color: var(--pane-editor-selection);
+}
+
+/* Pulse animation — compositor-only. Each pulsing element gets its own layer
+   so opacity changes never trigger main-thread repaints during scroll. */
+.pane-pulse {
+  animation: panePulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  will-change: opacity;
+  contain: strict;
+}
+
+@keyframes panePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* Interactive feedback - instant, clear, minimal */
+.btn-press:active {
+  opacity: 0.7;
+}
+
+/* Ace Editor Pane Theme */
+.ace_editor {
+  font-family: var(--font-mono) !important;
+  background-color: var(--pane-editor-bg) !important;
+  color: var(--pane-text) !important;
+}
+
+
+.ace_gutter {
+  background-color: var(--pane-editor-gutter) !important;
+  color: var(--pane-editor-gutter-text) !important;
+  border-right: 1px solid var(--pane-editor-gutter-border) !important;
+}
+
+.ace_gutter-active-line {
+  background-color: var(--pane-editor-active-line) !important;
+}
+
+.ace_active-line {
+  background-color: var(--pane-editor-active-line) !important;
+}
+
+.ace_cursor {
+  color: var(--pane-editor-cursor) !important;
+}
+
+.ace_selection {
+  background-color: var(--pane-editor-selection) !important;
+}
+
+/* Syntax highlighting - monochromatic with subtle amber accents */
+.ace_keyword {
+  color: var(--pane-syn-keyword) !important;
+}
+
+.ace_string {
+  color: var(--pane-syn-string) !important;
+}
+
+.ace_constant.ace_numeric {
+  color: var(--pane-syn-number) !important;
+}
+
+.ace_comment {
+  color: var(--pane-syn-comment) !important;
+  font-style: italic;
+}
+
+.ace_function {
+  color: var(--pane-syn-function) !important;
+}
+
+.ace_support.ace_type,
+.ace_storage.ace_type {
+  color: var(--pane-syn-type) !important;
+}
+
+.ace_operator {
+  color: var(--pane-syn-operator) !important;
+}
+
+.ace_variable {
+  color: var(--pane-text) !important;
+}
+
+.ace_entity.ace_name.ace_tag {
+  color: var(--pane-syn-keyword) !important;
+}
+
+.ace_entity.ace_other.ace_attribute-name {
+  color: var(--pane-syn-function) !important;
+}
+
+.ace_search {
+  background-color: var(--pane-editor-search-match) !important;
+  border: 1px solid var(--pane-editor-search-match-border) !important;
+}
+
+.ace_search.ace_selected {
+  background-color: var(--pane-editor-search-match-active) !important;
+  border: 1px solid var(--pane-editor-search-match-active-border) !important;
+}
