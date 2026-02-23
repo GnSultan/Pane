@@ -72,6 +72,12 @@ export function useSettingsPersistence() {
         if (settings.editor_font_size) {
           useWorkspaceStore.getState().setEditorFontSize(settings.editor_font_size);
         }
+        if (settings.font_weight) {
+          useWorkspaceStore.getState().setFontWeight(settings.font_weight);
+        }
+        if (settings.keybindings) {
+          useWorkspaceStore.getState().setKeybindingsRaw(settings.keybindings as any);
+        }
         if (settings.theme === "light" || settings.theme === "dark" || settings.theme === "pure" || settings.theme === "system") {
           useWorkspaceStore.getState().setTheme(settings.theme);
         }
@@ -150,7 +156,7 @@ export function useSettingsPersistence() {
       // app reload, HMR, or StrictMode double-mount cleanup.
       if (!settingsLoaded) return;
 
-      const { controlPanelVisible, controlPanelWidth, fontSize, panelFontSize, editorFontSize, theme } = useWorkspaceStore.getState();
+      const { controlPanelVisible, controlPanelWidth, fontSize, panelFontSize, editorFontSize, fontWeight, keybindings, theme } = useWorkspaceStore.getState();
       const { projects, activeProjectId, projectOrder } =
         useProjectsStore.getState();
 
@@ -185,6 +191,8 @@ export function useSettingsPersistence() {
         font_size: fontSize,
         panel_font_size: panelFontSize,
         editor_font_size: editorFontSize,
+        font_weight: fontWeight,
+        keybindings: keybindings ?? null,
         theme,
         panel_width: controlPanelWidth,
       }).catch(console.error);
@@ -204,6 +212,8 @@ export function useSettingsPersistence() {
           state.fontSize !== prev.fontSize ||
           state.panelFontSize !== prev.panelFontSize ||
           state.editorFontSize !== prev.editorFontSize ||
+          state.fontWeight !== prev.fontWeight ||
+          state.keybindings !== prev.keybindings ||
           state.theme !== prev.theme ||
           state.controlPanelWidth !== prev.controlPanelWidth ||
           state.controlPanelVisible !== prev.controlPanelVisible

@@ -70,6 +70,7 @@
   --pane-border: #33312E;
   --pane-text: #C8C5BE;
   --pane-text-secondary: #6D6A63;
+  --pane-font-weight: 400;
   --pane-font-size: 15px;
   --pane-font-size-sm: 12px;
   --pane-font-size-xs: 10px;
@@ -231,6 +232,7 @@ html, body, #root {
   background-color: var(--pane-bg);
   color: var(--pane-text);
   font-family: var(--font-sans);
+  font-weight: var(--pane-font-weight);
 }
 
 .no-select {
@@ -283,6 +285,7 @@ html, body, #root {
 /* Ace Editor Pane Theme */
 .ace_editor {
   font-family: var(--font-mono) !important;
+  font-weight: var(--pane-font-weight) !important;
   background-color: var(--pane-editor-bg) !important;
   color: var(--pane-text) !important;
 }

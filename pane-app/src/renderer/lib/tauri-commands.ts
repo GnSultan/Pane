@@ -114,6 +114,8 @@ export interface UserSettings {
   font_size: number | null;
   panel_font_size: number | null;
   editor_font_size: number | null;
+  font_weight: number | null;
+  keybindings: Record<string, { mod: boolean; shift: boolean; alt: boolean; key: string }> | null;
   theme: string | null;
   panel_width: number | null;
 }

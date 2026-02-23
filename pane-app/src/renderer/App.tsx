@@ -1,5 +1,6 @@
 import { useEffect, useCallback, useState } from "react";
 import { setWindowTitle } from "./lib/tauri-commands";
+import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ControlPanel } from "./components/ControlPanel/ControlPanel";
 import { Workspace } from "./components/Workspace/Workspace";
 import { FuzzyFinder } from "./components/FuzzyFinder/FuzzyFinder";
@@ -80,98 +81,96 @@ function App() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "b") {
-        e.preventDefault();
-        toggleControlPanel();
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "/") {
-        e.preventDefault();
-        const { activeProjectId, toggleMode, projects } = useProjectsStore.getState();
-        if (activeProjectId) {
-          const project = projects.get(activeProjectId);
-          // Don't switch to viewer if no file is open
-          if (project?.mode === "conversation" && !project.activeFilePath) return;
-          toggleMode(activeProjectId);
-          const newMode = project?.mode === "conversation" ? "viewer" : "conversation";
-          if (newMode === "conversation") {
-            window.dispatchEvent(new CustomEvent("pane:focus-input"));
-          } else {
-            window.dispatchEvent(new CustomEvent("pane:focus-editor"));
-          }
-        }
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "p") {
-        e.preventDefault();
-        toggleFuzzyFinder();
-      }
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "f") {
-        e.preventDefault();
-        toggleFileSearch();
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-        e.preventDefault();
-        window.dispatchEvent(new CustomEvent("pane:focus-input"));
-      }
-      // Cmd+N — new file (ensure panel is visible first)
-      if ((e.metaKey || e.ctrlKey) && e.key === "n") {
-        e.preventDefault();
-        const ws = useWorkspaceStore.getState();
-        if (!ws.controlPanelVisible) {
-          ws.toggleControlPanel();
-          // Wait for FileTree to mount before dispatching
-          setTimeout(() => window.dispatchEvent(new CustomEvent("pane:new-file")), 100);
-        } else {
-          window.dispatchEvent(new CustomEvent("pane:new-file"));
-        }
-      }
-      // Cmd+, — settings
-      if ((e.metaKey || e.ctrlKey) && e.key === ",") {
-        e.preventDefault();
-        setSettingsOpen((prev) => !prev);
-      }
-      // Cmd+Shift+T — toggle theme
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "t") {
-        e.preventDefault();
-        useWorkspaceStore.getState().toggleTheme();
-      }
-      // Cmd+=/- — font size (context-aware: editor vs chat)
-      if ((e.metaKey || e.ctrlKey) && e.key === "=") {
-        e.preventDefault();
-        const { activeProjectId, projects } = useProjectsStore.getState();
-        const project = activeProjectId ? projects.get(activeProjectId) : undefined;
-        if (project?.mode === "viewer") {
-          useWorkspaceStore.getState().increaseEditorFontSize();
-        } else {
-          useWorkspaceStore.getState().increaseFontSize();
-        }
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "-") {
-        e.preventDefault();
-        const { activeProjectId, projects } = useProjectsStore.getState();
-        const project = activeProjectId ? projects.get(activeProjectId) : undefined;
-        if (project?.mode === "viewer") {
-          useWorkspaceStore.getState().decreaseEditorFontSize();
-        } else {
-          useWorkspaceStore.getState().decreaseFontSize();
-        }
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "0") {
-        e.preventDefault();
-        const { activeProjectId, projects } = useProjectsStore.getState();
-        const project = activeProjectId ? projects.get(activeProjectId) : undefined;
-        if (project?.mode === "viewer") {
-          useWorkspaceStore.getState().resetEditorFontSize();
-        } else {
-          useWorkspaceStore.getState().resetFontSize();
-        }
-      }
-      // Cmd+1/2/3 — switch projects
+      // Cmd+1-9 — project switching (hardcoded, not rebindable)
       if ((e.metaKey || e.ctrlKey) && e.key >= "1" && e.key <= "9") {
         const index = parseInt(e.key) - 1;
         const { projectOrder, setActiveProject } = useProjectsStore.getState();
         if (index < projectOrder.length) {
           e.preventDefault();
           setActiveProject(projectOrder[index]);
+        }
+        return;
+      }
+
+      const bindings = resolveBindings(useWorkspaceStore.getState().keybindings);
+      const action = matchAction(e, bindings);
+      if (!action) return;
+
+      e.preventDefault();
+
+      switch (action) {
+        case "toggle-panel":
+          toggleControlPanel();
+          break;
+        case "toggle-mode": {
+          const { activeProjectId, toggleMode, projects } = useProjectsStore.getState();
+          if (activeProjectId) {
+            const project = projects.get(activeProjectId);
+            if (project?.mode === "conversation" && !project.activeFilePath) return;
+            toggleMode(activeProjectId);
+            const newMode = project?.mode === "conversation" ? "viewer" : "conversation";
+            if (newMode === "conversation") {
+              window.dispatchEvent(new CustomEvent("pane:focus-input"));
+            } else {
+              window.dispatchEvent(new CustomEvent("pane:focus-editor"));
+            }
+          }
+          break;
+        }
+        case "fuzzy-finder":
+          toggleFuzzyFinder();
+          break;
+        case "file-search":
+          toggleFileSearch();
+          break;
+        case "focus-chat":
+          window.dispatchEvent(new CustomEvent("pane:focus-input"));
+          break;
+        case "new-file": {
+          const ws = useWorkspaceStore.getState();
+          if (!ws.controlPanelVisible) {
+            ws.toggleControlPanel();
+            setTimeout(() => window.dispatchEvent(new CustomEvent("pane:new-file")), 100);
+          } else {
+            window.dispatchEvent(new CustomEvent("pane:new-file"));
+          }
+          break;
+        }
+        case "settings":
+          setSettingsOpen((prev) => !prev);
+          break;
+        case "cycle-theme":
+          useWorkspaceStore.getState().toggleTheme();
+          break;
+        case "font-size-increase": {
+          const { activeProjectId, projects } = useProjectsStore.getState();
+          const project = activeProjectId ? projects.get(activeProjectId) : undefined;
+          if (project?.mode === "viewer") {
+            useWorkspaceStore.getState().increaseEditorFontSize();
+          } else {
+            useWorkspaceStore.getState().increaseFontSize();
+          }
+          break;
+        }
+        case "font-size-decrease": {
+          const { activeProjectId, projects } = useProjectsStore.getState();
+          const project = activeProjectId ? projects.get(activeProjectId) : undefined;
+          if (project?.mode === "viewer") {
+            useWorkspaceStore.getState().decreaseEditorFontSize();
+          } else {
+            useWorkspaceStore.getState().decreaseFontSize();
+          }
+          break;
+        }
+        case "font-size-reset": {
+          const { activeProjectId, projects } = useProjectsStore.getState();
+          const project = activeProjectId ? projects.get(activeProjectId) : undefined;
+          if (project?.mode === "viewer") {
+            useWorkspaceStore.getState().resetEditorFontSize();
+          } else {
+            useWorkspaceStore.getState().resetFontSize();
+          }
+          break;
         }
       }
     };

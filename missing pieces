@@ -1,17 +1,32 @@
-claude plan mode, this is a very important feature of building with claude code, we need it for us too, also, we need that ability to accept or refuse a plan until it is updated, we can do this by integrating two simple buttons in when in plan mode to accept the plan or reject, i guess we can build these to be just after the 3 pulsing dots, this is the same place that todo lives, we can make it a multi-purpose place since there are no todo when in plan mode, when you accept a plan then todo comes back in place as claude creates one
+also, i still think that we're missing on a lot of claude outputs, right now it really feels like i'm commanding and it's working in the background, still doesn't feel like we're working together, how about you check documentation on everything we're not rendering that could improve our interaction?
 
-also, the use of claude multi agent, we need that too
+so, as we explored, we realized that we were missing these 
 
-also, when claude is using a tool, mostly the mcp server, it shows a full mcp server name and then a full mcp server tool itslef, we can simplify that, instead of a full mcp server name which we don't need, we can just rename it to punk record, the tool could read something like search memory, or start session, naturally. i think we can customize it like that
+Alright, I've done a thorough audit. Here's what I found — there are real gaps that explain why it feels like "commanding in the background":
 
-but the other issue i see here, is also that claude outputs a lot of tool uses in json format which doesn't make sense to me, i don't really understand anything, we could make that more useful
+## What we're missing from Claude's output
 
-also, i want to see every progress claude makes, if it goes into a file and edits a line of code, when it's thinking, what it learns or finds out, that should be there for me to feel present in that process, i want to be involved, just a simple window to the file, it is working on, when claude is reading something i want to see that it is reading something, i want that logged in the chat. right now it just feels like claude is doing something in the background but i can't see, sometimes i think it is slow becaue i don't see every step it is making, it could be good if every step it made was logged into the chat so i could also know how fast it is going and which files it is touching, i think i'm describing a behavior very similar to how zed editor handles it. zed editor patterns built for pane, how about a deep understanding of that, i know we can learn a lot since zed is an open source project anyway
+**1. Thinking blocks (biggest gap)**
+When Claude uses extended thinking, it returns `thinking` content blocks before responding. We completely ignore these. In Claude Code CLI's stream-json, these come as `content_block_start` with `type: "thinking"` and stream via `thinking_delta`. This is Claude's internal reasoning — seeing it makes you feel like you're watching it work through the problem, not just waiting for a black-box answer.
 
-also, the terminal shouldn't be shared, it should be per project, switching to another project and accessing the same terminal i was already running doesn't feel focused at all
+**2. Streaming tool inputs**
+When Claude calls a tool, the input JSON streams via `input_json_delta` events. We catch the `content_block_start` for `tool_use` but ignore the deltas — so tool calls appear fully-formed at once instead of progressively revealing what Claude is about to do. For long bash commands or big edits, you'd see them building up.
 
-the todo text could actually include a number like 7/12 to show progress without me having to open it, what do you think
+**3. `server_tool_use` blocks (web search)**
+Claude can use built-in server-side tools like `web_search`. These come as `server_tool_use` blocks (not `tool_use`), and their results come as `web_search_tool_result` blocks. We don't handle either type — they'd be silently dropped.
 
-the editor has numbers showing on every line? that's really nasty, what if it just shows numbers on sentences instead
+**4. Markdown links**
+MarkdownText doesn't render `[text](url)` links. Claude often includes documentation links, file references, etc. All render as literal text with brackets.
 
-the push on git is weird, i'm getting a popup confirming a successful push, but this doesn't really look like pane's way of handling this, we could just use the pulses replacing the word push and on success just the word pushed, that would do instead of what we're seeing right now,
+**5. Blockquotes**  
+No `> quote` rendering. Claude uses these for callouts and quoting code/docs.
+
+**6. Tables**
+No table rendering at all. Claude outputs markdown tables frequently when comparing options.
+
+The thinking blocks and streaming tool inputs are the big ones for making it feel collaborative rather than "fire and forget." Want me to plan this out, or should I start implementing? I'd prioritize:
+
+1. **Thinking blocks** — stream and render Claude's reasoning (collapsible, subtle styling)
+2. **Markdown links + blockquotes** — low-effort, high-value rendering fixes
+3. **Streaming tool inputs** — progressive reveal of what Claude is about to do
+4. **Server tool use** (web search) — handle if/when Claude Code enables it

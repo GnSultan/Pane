@@ -1,8 +1,10 @@
 import { create } from "zustand";
+import type { ActionId, KeyBinding } from "../lib/keybindings";
 
 const DEFAULT_FONT_SIZE = 15;
 const DEFAULT_PANEL_FONT_SIZE = 13;
 const DEFAULT_EDITOR_FONT_SIZE = 14;
+const DEFAULT_FONT_WEIGHT = 400;
 
 type Theme = "dark" | "light" | "pure" | "system";
 
@@ -24,6 +26,8 @@ interface WorkspaceState {
   fontSize: number;
   panelFontSize: number;
   editorFontSize: number;
+  fontWeight: number;
+  keybindings: Partial<Record<ActionId, KeyBinding>> | null;
   theme: Theme;
   toggleControlPanel: () => void;
   setControlPanelWidth: (width: number) => void;
@@ -43,6 +47,14 @@ interface WorkspaceState {
   decreaseEditorFontSize: () => void;
   resetEditorFontSize: () => void;
   setEditorFontSize: (size: number) => void;
+  increaseFontWeight: () => void;
+  decreaseFontWeight: () => void;
+  resetFontWeight: () => void;
+  setFontWeight: (weight: number) => void;
+  setKeybinding: (id: ActionId, binding: KeyBinding) => void;
+  resetKeybinding: (id: ActionId) => void;
+  resetAllKeybindings: () => void;
+  setKeybindingsRaw: (kb: Partial<Record<ActionId, KeyBinding>> | null) => void;
   toggleTheme: () => void;
   setTheme: (theme: Theme) => void;
 }
@@ -57,6 +69,10 @@ function applyPanelFontSize(size: number) {
   document.documentElement.style.setProperty("--pane-panel-font-size", `${size}px`);
   document.documentElement.style.setProperty("--pane-panel-font-size-sm", `${size - 2}px`);
   document.documentElement.style.setProperty("--pane-panel-font-size-xs", `${size - 4}px`);
+}
+
+function applyFontWeight(weight: number) {
+  document.documentElement.style.setProperty("--pane-font-weight", `${weight}`);
 }
 
 function applyTheme(theme: Theme) {
@@ -77,6 +93,8 @@ function createWorkspaceStore() {
   fontSize: DEFAULT_FONT_SIZE,
   panelFontSize: DEFAULT_PANEL_FONT_SIZE,
   editorFontSize: DEFAULT_EDITOR_FONT_SIZE,
+  fontWeight: DEFAULT_FONT_WEIGHT,
+  keybindings: null,
   theme: "system" as Theme,
   toggleControlPanel: () =>
     set((state) => ({
@@ -138,6 +156,40 @@ function createWorkspaceStore() {
     set((state) => ({ editorFontSize: Math.max(1, state.editorFontSize - 1) })),
   resetEditorFontSize: () => set({ editorFontSize: DEFAULT_EDITOR_FONT_SIZE }),
   setEditorFontSize: (size: number) => set({ editorFontSize: Math.max(1, size) }),
+  increaseFontWeight: () =>
+    set((state) => {
+      const next = Math.min(900, state.fontWeight + 100);
+      applyFontWeight(next);
+      return { fontWeight: next };
+    }),
+  decreaseFontWeight: () =>
+    set((state) => {
+      const next = Math.max(100, state.fontWeight - 100);
+      applyFontWeight(next);
+      return { fontWeight: next };
+    }),
+  resetFontWeight: () => {
+    applyFontWeight(DEFAULT_FONT_WEIGHT);
+    return set({ fontWeight: DEFAULT_FONT_WEIGHT });
+  },
+  setFontWeight: (weight: number) => {
+    const w = Math.max(100, Math.min(900, weight));
+    applyFontWeight(w);
+    return set({ fontWeight: w });
+  },
+  setKeybinding: (id, binding) =>
+    set((state) => ({
+      keybindings: { ...(state.keybindings ?? {}), [id]: binding },
+    })),
+  resetKeybinding: (id) =>
+    set((state) => {
+      if (!state.keybindings) return {};
+      const next = { ...state.keybindings };
+      delete next[id];
+      return { keybindings: Object.keys(next).length > 0 ? next : null };
+    }),
+  resetAllKeybindings: () => set({ keybindings: null }),
+  setKeybindingsRaw: (kb) => set({ keybindings: kb }),
   toggleTheme: () =>
     set((state) => {
       const cycle: Record<Theme, Theme> = {

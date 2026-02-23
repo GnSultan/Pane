@@ -447,6 +447,8 @@ const defaultSettings = {
   font_size: null,
   editor_font_size: null,
   panel_font_size: null,
+  font_weight: null,
+  keybindings: null,
   theme: null,
   panel_width: null
 };
