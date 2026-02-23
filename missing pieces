@@ -11,3 +11,7 @@ also, i want to see every progress claude makes, if it goes into a file and edit
 also, the terminal shouldn't be shared, it should be per project, switching to another project and accessing the same terminal i was already running doesn't feel focused at all
 
 the todo text could actually include a number like 7/12 to show progress without me having to open it, what do you think
+
+the editor has numbers showing on every line? that's really nasty, what if it just shows numbers on sentences instead
+
+the push on git is weird, i'm getting a popup confirming a successful push, but this doesn't really look like pane's way of handling this, we could just use the pulses replacing the word push and on success just the word pushed, that would do instead of what we're seeing right now,

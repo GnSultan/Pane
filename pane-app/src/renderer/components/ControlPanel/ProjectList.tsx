@@ -49,7 +49,7 @@ function ProjectRow({
 
       {/* Pulsing notification badge when task completes in background */}
       {hasUnread && (
-        <span className="inline-block w-2 h-2 rounded-full bg-pane-status-added shrink-0 pane-pulse" />
+        <span className="inline-block w-2 h-2 rounded-full bg-pane-status-added shrink-0 animate-pulse" />
       )}
 
       <span

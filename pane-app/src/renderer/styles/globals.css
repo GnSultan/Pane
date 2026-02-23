@@ -20,6 +20,9 @@
   /* Animations - fast and subtle for lightest IDE */
   --animate-fadeSlideUp: fadeSlideUp 0.12s ease-out;
   --animate-pressScale: pressScale 0.08s ease-out;
+  --animate-dotPulse1: dotPulse 1.2s ease-in-out infinite;
+  --animate-dotPulse2: dotPulse 1.2s ease-in-out 0.15s infinite;
+  --animate-dotPulse3: dotPulse 1.2s ease-in-out 0.3s infinite;
 
   @keyframes fadeSlideUp {
     from {
@@ -29,6 +32,17 @@
     to {
       opacity: 1;
       transform: translateY(0);
+    }
+  }
+
+  @keyframes dotPulse {
+    0%, 100% {
+      opacity: 0.3;
+      transform: scale(0.85);
+    }
+    50% {
+      opacity: 0.9;
+      transform: scale(1.15);
     }
   }
 
@@ -224,9 +238,23 @@ html, body, #root {
   user-select: none;
 }
 
-/* No custom scrollbar styling — let macOS use its fully native overlay scrollbar.
-   Both ::-webkit-scrollbar and scrollbar-width/scrollbar-color can interfere with
-   native scroll momentum and compositor-driven scrolling on macOS. */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: none;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--pane-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--pane-text-secondary);
+}
 
 /* macOS window drag regions */
 [data-tauri-drag-region] {
@@ -245,19 +273,6 @@ html, body, #root {
 /* Text selection — matches editor selection color */
 ::selection {
   background-color: var(--pane-editor-selection);
-}
-
-/* Pulse animation — compositor-only. Each pulsing element gets its own layer
-   so opacity changes never trigger main-thread repaints during scroll. */
-.pane-pulse {
-  animation: panePulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-  will-change: opacity;
-  contain: strict;
-}
-
-@keyframes panePulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
 }
 
 /* Interactive feedback - instant, clear, minimal */

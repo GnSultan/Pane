@@ -20,33 +20,41 @@ export function Workspace() {
       {/* Spacer for titlebar */}
       <div className="h-10 shrink-0" />
 
-      {/* Conversation pane — flat: one wrapper level to scroll container */}
-      {projectOrder.map((id) => (
+      {/* Content — one view at a time */}
+      <div className="flex-1 min-h-0 flex flex-col">
+        {/* Conversation pane */}
         <div
-          key={id}
-          className="flex-1 min-h-0 min-w-0"
-          style={{ display: activeMode === "conversation" && id === activeProjectId ? "flex" : "none" }}
+          className="flex-1 min-h-0"
+          style={{ display: activeMode === "conversation" ? "flex" : "none" }}
         >
-          <Conversation projectId={id} />
+          {projectOrder.map((id) => (
+            <div
+              key={id}
+              className="flex-1 min-h-0 min-w-0"
+              style={{ display: id === activeProjectId ? "flex" : "none" }}
+            >
+              <Conversation projectId={id} />
+            </div>
+          ))}
         </div>
-      ))}
 
-      {/* File viewer pane */}
-      <div
-        className="flex-1 min-h-0 flex flex-col"
-        style={{ display: activeMode === "viewer" ? "flex" : "none" }}
-      >
-        <FileViewer />
-      </div>
+        {/* File viewer pane */}
+        <div
+          className="flex-1 min-h-0 flex flex-col"
+          style={{ display: activeMode === "viewer" ? "flex" : "none" }}
+        >
+          <FileViewer />
+        </div>
 
-      {/* Terminal pane */}
-      <div
-        className="flex-1 min-h-0 flex flex-col"
-        style={{ display: activeMode === "terminal" ? "flex" : "none" }}
-      >
-        {activeProjectId && activeRoot && (
-          <Terminal projectId={activeProjectId} workingDir={activeRoot} />
-        )}
+        {/* Terminal pane */}
+        <div
+          className="flex-1 min-h-0 flex flex-col"
+          style={{ display: activeMode === "terminal" ? "flex" : "none" }}
+        >
+          {activeProjectId && activeRoot && (
+            <Terminal projectId={activeProjectId} workingDir={activeRoot} />
+          )}
+        </div>
       </div>
     </div>
   );

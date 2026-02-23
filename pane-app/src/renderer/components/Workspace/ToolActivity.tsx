@@ -6,6 +6,13 @@ interface ToolActivityProps {
   toolResult?: ToolResultBlock;
 }
 
+function shortenPath(fullPath: string): string {
+  const srcIdx = fullPath.lastIndexOf("/src/");
+  if (srcIdx !== -1) return fullPath.slice(srcIdx + 1);
+  const parts = fullPath.split("/");
+  return parts.length > 3 ? parts.slice(-3).join("/") : fullPath;
+}
+
 function summarizeTool(name: string, input: Record<string, unknown>): string {
   switch (name) {
     case "Read":
@@ -48,6 +55,127 @@ function getToolLabel(name: string): string {
   }
 }
 
+function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
+  const filePath = (input.file_path as string) || "";
+  const oldStr = (input.old_string as string) || "";
+  const newStr = (input.new_string as string) || "";
+  return (
+    <div
+      className="font-mono overflow-x-auto max-h-[300px] overflow-y-auto
+                 border border-pane-border/40 bg-pane-bg leading-[1.6]"
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    >
+      <div className="px-2.5 py-1.5 text-pane-text-secondary/40 border-b border-pane-border/30">
+        {shortenPath(filePath)}
+      </div>
+      {oldStr && (
+        <pre
+          className="px-2.5 py-1.5 whitespace-pre-wrap break-words border-b border-pane-border/20"
+          style={{ color: "var(--pane-status-deleted)", opacity: 0.7 }}
+        >
+          {oldStr}
+        </pre>
+      )}
+      {newStr && (
+        <pre
+          className="px-2.5 py-1.5 whitespace-pre-wrap break-words"
+          style={{ color: "var(--pane-status-added)", opacity: 0.8 }}
+        >
+          {newStr}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function ExpandedWriteInput({ input }: { input: Record<string, unknown> }) {
+  const filePath = (input.file_path as string) || "";
+  const content = (input.content as string) || "";
+  const lineCount = content.split("\n").length;
+  return (
+    <div
+      className="font-mono overflow-x-auto max-h-[300px] overflow-y-auto
+                 border border-pane-border/40 bg-pane-bg leading-[1.6]"
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    >
+      <div className="px-2.5 py-1.5 text-pane-text-secondary/40 border-b border-pane-border/30">
+        {shortenPath(filePath)}
+        <span className="ml-2" style={{ color: "var(--pane-status-added)", opacity: 0.6 }}>
+          {lineCount} lines
+        </span>
+      </div>
+      <pre className="px-2.5 py-1.5 text-pane-text-secondary/50 whitespace-pre-wrap break-words">
+        {content.length > 3000
+          ? content.slice(0, 3000) + "\n... (truncated)"
+          : content}
+      </pre>
+    </div>
+  );
+}
+
+function ExpandedTodoInput({ input }: { input: Record<string, unknown> }) {
+  const todos = (input.todos as Array<{ content: string; status: string }>) || [];
+  return (
+    <div
+      className="font-mono overflow-y-auto max-h-[300px]
+                 border border-pane-border/40 bg-pane-bg leading-[1.6]"
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    >
+      {todos.map((todo, i) => (
+        <div
+          key={i}
+          className="flex items-start gap-2 px-2.5 py-1 border-b border-pane-border/15 last:border-b-0"
+        >
+          <span className="shrink-0 mt-0.5">
+            {todo.status === "completed"
+              ? "\u2713"
+              : todo.status === "in_progress"
+                ? "\u25CB"
+                : "\u2022"}
+          </span>
+          <span
+            className={
+              todo.status === "completed"
+                ? "text-pane-text-secondary/40 line-through"
+                : todo.status === "in_progress"
+                  ? "text-pane-text"
+                  : "text-pane-text-secondary/60"
+            }
+          >
+            {todo.content}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ExpandedDefaultInput({ input }: { input: Record<string, unknown> }) {
+  return (
+    <pre
+      className="font-mono text-pane-text-secondary/60
+                 bg-pane-bg p-2.5 overflow-x-auto max-h-[250px]
+                 overflow-y-auto border border-pane-border/40 leading-[1.6]"
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    >
+      {JSON.stringify(input, null, 2)}
+    </pre>
+  );
+}
+
+function renderExpandedInput(name: string, input: Record<string, unknown>) {
+  switch (name) {
+    case "Edit":
+      return <ExpandedEditInput input={input} />;
+    case "Write":
+      return <ExpandedWriteInput input={input} />;
+    case "TodoWrite":
+      return <ExpandedTodoInput input={input} />;
+    default:
+      return <ExpandedDefaultInput input={input} />;
+  }
+}
+
 export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
   const [expanded, setExpanded] = useState(false);
   const summary = summarizeTool(toolUse.name, toolUse.input);
@@ -73,7 +201,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
           className={`w-1 h-1 rounded-full shrink-0 ${
             isFailed ? "bg-pane-error" :
             isComplete ? "" :
-            "pane-pulse"
+            "animate-pulse"
           }`}
           style={
             isFailed ? {} :
@@ -93,12 +221,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
           className="mb-0.5 space-y-1 border-l-2 pl-3"
           style={{ borderLeftColor: `color-mix(in srgb, ${accentColor} 15%, transparent)` }}
         >
-          <pre className="font-mono text-pane-text-secondary/60
-                          bg-pane-bg p-2.5 overflow-x-auto max-h-[250px]
-                          overflow-y-auto border border-pane-border/40 leading-[1.6]"
-               style={{ fontSize: "var(--pane-font-size-sm)" }}>
-            {JSON.stringify(toolUse.input, null, 2)}
-          </pre>
+          {renderExpandedInput(toolUse.name, toolUse.input)}
 
           {toolResult && (
             <pre

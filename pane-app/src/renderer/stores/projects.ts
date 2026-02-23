@@ -77,6 +77,7 @@ interface ProjectsState {
   // Per-project file tree
   toggleDir: (projectId: string, path: string) => void;
   setDirContents: (projectId: string, path: string, entries: FileEntry[]) => void;
+  batchSetDirContents: (projectId: string, tree: Record<string, FileEntry[]>) => void;
   setLoading: (projectId: string, path: string, loading: boolean) => void;
   setSelectedPath: (projectId: string, path: string | null) => void;
 
@@ -217,6 +218,17 @@ function createProjectsStore() {
       updateProject(state, projectId, (p) => {
         const next = new Map(p.dirContents);
         next.set(path, entries);
+        return { dirContents: next };
+      }),
+    ),
+
+  batchSetDirContents: (projectId, tree) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => {
+        const next = new Map(p.dirContents);
+        for (const [dir, entries] of Object.entries(tree)) {
+          next.set(dir, entries);
+        }
         return { dirContents: next };
       }),
     ),

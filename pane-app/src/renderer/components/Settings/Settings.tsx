@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { useWorkspaceStore } from "../../stores/workspace";
 
 function SettingRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -63,19 +64,34 @@ export function Settings({ onClose }: SettingsProps) {
   const theme = useWorkspaceStore((s) => s.theme);
   const fontSize = useWorkspaceStore((s) => s.fontSize);
   const panelFontSize = useWorkspaceStore((s) => s.panelFontSize);
+  const editorFontSize = useWorkspaceStore((s) => s.editorFontSize);
   const setTheme = useWorkspaceStore((s) => s.setTheme);
 
   const themeLabel = theme;
 
+  // Close on Escape
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center"
+      role="presentation"
       onClick={onClose}
     >
       <div className="absolute inset-0 bg-pane-bg/80 backdrop-blur-sm" />
       <div
         className="relative bg-pane-surface border border-pane-border rounded-lg
           w-full max-w-md mx-4 overflow-hidden"
+        role="dialog"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -115,12 +131,21 @@ export function Settings({ onClose }: SettingsProps) {
             </div>
           </SettingRow>
 
-          <SettingRow label="editor font size">
+          <SettingRow label="chat font size">
             <FontSizeControl
               value={fontSize}
               onIncrease={() => useWorkspaceStore.getState().increaseFontSize()}
               onDecrease={() => useWorkspaceStore.getState().decreaseFontSize()}
               onReset={() => useWorkspaceStore.getState().resetFontSize()}
+            />
+          </SettingRow>
+
+          <SettingRow label="editor font size">
+            <FontSizeControl
+              value={editorFontSize}
+              onIncrease={() => useWorkspaceStore.getState().increaseEditorFontSize()}
+              onDecrease={() => useWorkspaceStore.getState().decreaseEditorFontSize()}
+              onReset={() => useWorkspaceStore.getState().resetEditorFontSize()}
             />
           </SettingRow>
 
@@ -137,7 +162,7 @@ export function Settings({ onClose }: SettingsProps) {
         {/* Footer */}
         <div className="px-6 py-3 border-t border-pane-border/50">
           <p className="text-pane-text-secondary/40 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-            {themeLabel} theme &middot; editor {fontSize}px &middot; panel {panelFontSize}px
+            {themeLabel} theme &middot; chat {fontSize}px &middot; editor {editorFontSize}px &middot; panel {panelFontSize}px
           </p>
         </div>
       </div>

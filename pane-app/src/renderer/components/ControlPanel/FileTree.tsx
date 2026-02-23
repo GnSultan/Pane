@@ -1,8 +1,9 @@
 import { useEffect, useCallback, useState, useRef } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { useShallow } from "zustand/react/shallow";
-import { readDirectory, readFile, deleteFile, revealInFinder, writeFile } from "../../lib/tauri-commands";
+import { readDirectory, readDirectoryTree, readFile, deleteFile, revealInFinder, writeFile } from "../../lib/tauri-commands";
 import type { FileEntry } from "../../lib/tauri-commands";
+import { getParentDir } from "../../lib/file-utils";
 import { ContextMenu } from "../shared/ContextMenu";
 import type { ContextMenuItem } from "../shared/ContextMenu";
 
@@ -102,12 +103,39 @@ export function FileTree() {
     setNewFileDir(null);
   }, []);
 
-  // Load root directory when project becomes active
+  // Deep preload root directory (3 levels) when project becomes active
   useEffect(() => {
-    if (root && !hasRootLoaded) {
-      loadDir(root);
-    }
+    if (!root || hasRootLoaded || !activeProjectId) return;
+    readDirectoryTree(root, 3)
+      .then((tree) => {
+        useProjectsStore.getState().batchSetDirContents(activeProjectId, tree);
+      })
+      .catch(() => {
+        // Fallback to single-level load
+        loadDir(root);
+      });
   }, [root, activeProjectId, hasRootLoaded, loadDir]);
+
+  const handleDelete = useCallback(async (filePath: string) => {
+    try {
+      await deleteFile(filePath);
+      const store = useProjectsStore.getState();
+      const p = activeProjectId ? store.projects.get(activeProjectId) : undefined;
+      if (!p || !activeProjectId) return;
+      // Clear active file if it IS the deleted file, or is INSIDE a deleted directory
+      if (p.activeFilePath && (p.activeFilePath === filePath || p.activeFilePath.startsWith(filePath + "/"))) {
+        store.clearFile(activeProjectId);
+      }
+      // Reload the parent directory to reflect the deletion
+      const parentDir = getParentDir(filePath);
+      const entries = await readDirectory(parentDir);
+      store.setDirContents(activeProjectId, parentDir, entries);
+      // Invalidate the file index so fuzzy finder picks up the change
+      store.invalidateFileIndex(activeProjectId);
+    } catch (err) {
+      console.error("Failed to delete:", err);
+    }
+  }, [activeProjectId]);
 
   const handleContextMenu = useCallback(
     (x: number, y: number, path: string, isDir: boolean) => {
@@ -134,17 +162,15 @@ export function FileTree() {
           label: "Reveal in Finder",
           action: () => revealInFinder(menu.path).catch(console.error),
         },
-      );
-      if (!menu.isDir) {
-        items.push({
-          label: "Delete File",
+        {
+          label: "Delete",
           danger: true,
-          action: () => deleteFile(menu.path).catch(console.error),
-        });
-      }
+          action: () => handleDelete(menu.path),
+        },
+      );
       return items;
     },
-    [],
+    [handleDelete],
   );
 
   const entries = rootEntries.length > 0 ? rootEntries : undefined;
@@ -162,7 +188,7 @@ export function FileTree() {
 
   return (
     <div
-      className="flex-1 overflow-y-auto overflow-x-hidden py-2 relative overscroll-contain"
+      className="flex-1 overflow-y-auto overflow-x-hidden py-2 relative"
       onContextMenu={handleRootContextMenu}
     >
       {newFileDir === root && (

@@ -646,11 +646,6 @@ function createWindow() {
     mainWindow = null;
   });
 }
-// GPU acceleration for ProMotion 120Hz
-app.commandLine.appendSwitch('enable-gpu-rasterization');
-app.commandLine.appendSwitch('enable-zero-copy');
-app.commandLine.appendSwitch('ignore-gpu-blocklist');
-
 app.whenReady().then(() => {
   registerIpcHandlers();
   createWindow();

@@ -35,7 +35,7 @@ export function TodoPanel({ projectId }: { projectId: string }) {
               {todo.status === "completed" ? (
                 <div className="w-1.5 h-1.5 rounded-full bg-pane-text-secondary/40" />
               ) : todo.status === "in_progress" ? (
-                <div className="w-1.5 h-1.5 rounded-full bg-pane-accent-secondary pane-pulse" />
+                <div className="w-1.5 h-1.5 rounded-full bg-pane-accent-secondary animate-pulse" />
               ) : (
                 <div className="w-1.5 h-1.5 rounded-full bg-pane-text-secondary/20" />
               )}

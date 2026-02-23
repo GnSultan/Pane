@@ -122,7 +122,7 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
                     <div key={i}>
                       <MarkdownText text={text} />
                       {message.isStreaming && isLastBlock && (
-                        <span className="inline-block w-[2px] h-[14px] bg-pane-text/70 ml-0.5 align-middle pane-pulse" />
+                        <span className="inline-block w-[2px] h-[14px] bg-pane-text/70 ml-0.5 align-middle animate-pulse" />
                       )}
                     </div>
                   );
@@ -137,7 +137,7 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
                 const toolBlock = block as ToolUseBlock;
                 const result = toolResults.get(toolBlock.id);
                 return (
-                  <ToolActivity key={i} toolUse={toolBlock} toolResult={result} />
+                  <ToolActivity key={toolBlock.id} toolUse={toolBlock} toolResult={result} />
                 );
               })}
             </div>

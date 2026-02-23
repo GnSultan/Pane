@@ -78,13 +78,11 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
     <div className="shrink-0 px-4 pt-2">
       {isProcessing && (
         <div className="flex items-center gap-3 px-2 pb-3 animate-fadeSlideUp">
-          <span className="inline-block w-2.5 h-2.5 rounded-full bg-pane-text/60 pane-pulse" />
-          <span
-            className="text-pane-text/70 font-sans font-medium"
-            style={{ fontSize: "var(--pane-font-size)" }}
-          >
-            claude is working
-          </span>
+          <div className="flex items-center gap-1">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse1" />
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse2" />
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse3" />
+          </div>
           {todos.length > 0 && (
             <button
               onClick={() => setTodoPanelOpen((v) => !v)}

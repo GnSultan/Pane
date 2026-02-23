@@ -100,7 +100,7 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
   return (
     <div className="flex flex-col h-full w-full">
       {/* Terminal output area — scrollable, like conversation messages */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 px-10 py-8 overscroll-contain">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 px-10 py-8">
         {lines.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full select-none gap-6">
             <span
@@ -134,7 +134,7 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
 
         {isRunning && (
           <div className="flex items-center gap-2 text-pane-text-secondary/50 font-mono mt-2">
-            <span className="inline-block w-1 h-3 bg-pane-text-secondary/50 pane-pulse" />
+            <span className="inline-block w-1 h-3 bg-pane-text-secondary/50 animate-pulse" />
             <span style={{ fontSize: "var(--pane-font-size-sm)" }}>running...</span>
           </div>
         )}

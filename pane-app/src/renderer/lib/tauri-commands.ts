@@ -15,6 +15,10 @@ export async function readDirectory(path: string): Promise<FileEntry[]> {
   return electronAPI.invoke("read_directory", { path });
 }
 
+export async function readDirectoryTree(path: string, maxDepth: number): Promise<Record<string, FileEntry[]>> {
+  return electronAPI.invoke("read_directory_tree", { path, maxDepth });
+}
+
 export async function readFile(path: string): Promise<string> {
   return electronAPI.invoke("read_file", { path });
 }
