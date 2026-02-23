@@ -119,6 +119,7 @@ interface ProjectsState {
   setHasUnreadCompletion: (projectId: string, hasUnread: boolean) => void;
   restoreConversation: (projectId: string, messages: ConversationMessage[], sessionId: string | null) => void;
   setConversationTodos: (projectId: string, todos: import("../lib/claude-types").Todo[]) => void;
+  setPendingPlanApproval: (projectId: string, pending: boolean) => void;
 }
 
 function updateProject(
@@ -440,6 +441,13 @@ function createProjectsStore() {
       })),
     ),
 
+  setPendingPlanApproval: (projectId, pending) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => ({
+        conversation: { ...p.conversation, pendingPlanApproval: pending },
+      })),
+    ),
+
   restoreConversation: (projectId, messages, sessionId) =>
     set((state) =>
       updateProject(state, projectId, () => ({
@@ -448,6 +456,8 @@ function createProjectsStore() {
           sessionId,
           isProcessing: false,
           error: null,
+          todos: [],
+          pendingPlanApproval: false,
         },
       })),
     ),

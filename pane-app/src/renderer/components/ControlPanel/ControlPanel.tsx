@@ -1,4 +1,4 @@
-import { useState, useCallback, type ReactNode } from "react";
+import { useState, useCallback, useEffect, type ReactNode } from "react";
 import { FileTree } from "./FileTree";
 import { ProjectList } from "./ProjectList";
 import { GitStatus } from "./GitStatus";
@@ -37,7 +37,7 @@ function SettingsIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="8" cy="8" r="2" />
-      <path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.05 3.05l1.06 1.06M11.89 11.89l1.06 1.06M3.05 12.95l1.06-1.06M11.89 4.11l1.06-1.06" />
+      <path d="M6.83 2.17a.5.5 0 0 1 .49-.4h1.36a.5.5 0 0 1 .49.4l.2 1.18a4.5 4.5 0 0 1 1.09.63l1.12-.38a.5.5 0 0 1 .58.2l.68 1.18a.5.5 0 0 1-.1.6l-.92.8a4.5 4.5 0 0 1 0 1.24l.92.8a.5.5 0 0 1 .1.6l-.68 1.18a.5.5 0 0 1-.58.2l-1.12-.38a4.5 4.5 0 0 1-1.09.63l-.2 1.18a.5.5 0 0 1-.49.4H7.32a.5.5 0 0 1-.49-.4l-.2-1.18a4.5 4.5 0 0 1-1.09-.63l-1.12.38a.5.5 0 0 1-.58-.2l-.68-1.18a.5.5 0 0 1 .1-.6l.92-.8a4.5 4.5 0 0 1 0-1.24l-.92-.8a.5.5 0 0 1-.1-.6l.68-1.18a.5.5 0 0 1 .58-.2l1.12.38a4.5 4.5 0 0 1 1.09-.63l.2-1.18z" />
     </svg>
   );
 }
@@ -76,10 +76,10 @@ function ToolbarButton({ icon, active, disabled, onClick }: {
       disabled={disabled}
       className={`w-7 h-7 flex items-center justify-center rounded
         ${disabled
-          ? "text-pane-text-secondary/15 cursor-default"
+          ? "text-pane-text-secondary/25 cursor-default"
           : active
             ? "text-pane-text bg-pane-text/[0.08]"
-            : "text-pane-text-secondary/40 hover:text-pane-text-secondary hover:bg-pane-text/[0.04]"
+            : "text-pane-text-secondary/60 hover:text-pane-text-secondary hover:bg-pane-text/[0.04]"
         }`}
     >
       {icon}
@@ -110,7 +110,12 @@ export function ControlPanel() {
     return s.projects.get(s.activeProjectId)?.root;
   });
 
-  const [gitExpanded, setGitExpanded] = useState(false);
+  const [gitPanelActive, setGitPanelActive] = useState(false);
+
+  // Auto-close git panel when project changes or isn't a git repo
+  useEffect(() => {
+    setGitPanelActive(false);
+  }, [activeProjectId, isGitRepo]);
 
   const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal") => {
     if (!activeProjectId || mode === newMode) return;
@@ -125,7 +130,7 @@ export function ControlPanel() {
   }, [activeProjectId, mode, activeFilePath, setMode]);
 
   const toggleGit = useCallback(() => {
-    setGitExpanded((prev) => !prev);
+    setGitPanelActive((prev) => !prev);
   }, []);
 
   return (
@@ -138,13 +143,11 @@ export function ControlPanel() {
         <ProjectList />
       </div>
 
-      <FileTree />
-
-      {/* Git status — expands above toolbar */}
-      {gitExpanded && isGitRepo && root && activeProjectId && (
-        <div className="border-t border-pane-border">
-          <GitStatus root={root} projectId={activeProjectId} />
-        </div>
+      {/* FileTree and GitStatus are mutually exclusive — git takes over the panel */}
+      {gitPanelActive && isGitRepo && root && activeProjectId ? (
+        <GitStatus root={root} projectId={activeProjectId} />
+      ) : (
+        <FileTree />
       )}
 
       {/* Toolbar */}
@@ -172,7 +175,7 @@ export function ControlPanel() {
         {isGitRepo && (
           <ToolbarButton
             icon={<GitBranchIcon />}
-            active={gitExpanded}
+            active={gitPanelActive}
             onClick={toggleGit}
           />
         )}

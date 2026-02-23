@@ -64,7 +64,6 @@ export function useClaude(projectId: string) {
             const s = useProjectsStore.getState();
             s.setConversationProcessing(projectId, false);
             s.setLastMessageStreamingDone(projectId);
-
             // Show notification badge if this isn't the active project
             if (s.activeProjectId !== projectId) {
               const project = s.projects.get(projectId);
@@ -260,10 +259,13 @@ function handleClaudeMessage(
               ];
               store.updateLastAssistantContent(projectId, newContent);
 
-              // Parse TodoWrite tool calls
+              // Parse special tool calls
               const toolBlock = evt.content_block as ToolUseBlock;
               if (toolBlock.name === "TodoWrite" && toolBlock.input?.todos) {
                 store.setConversationTodos(projectId, toolBlock.input.todos);
+              }
+              if (toolBlock.name === "ExitPlanMode") {
+                store.setPendingPlanApproval(projectId, true);
               }
             }
           }

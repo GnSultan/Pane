@@ -54,11 +54,11 @@ export function FuzzyFinder() {
   }, [files]);
 
   const results = useMemo(() => {
-    if (query.length > 0) {
-      return fuse.search(query, { limit: 50 }).map((r) => r.item);
-    }
-    return files.slice(0, 50);
-  }, [query, fuse, files]);
+    if (query.length === 0) return [];
+    return fuse.search(query, { limit: 50 }).map((r) => r.item);
+  }, [query, fuse]);
+
+  const hasResults = results.length > 0;
 
   // Reset selection when results change
   useEffect(() => {
@@ -106,52 +106,68 @@ export function FuzzyFinder() {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[15%]"
-      style={{ backgroundColor: "var(--pane-overlay)" }}
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[12%]"
       onClick={closeFuzzyFinder}
     >
       <div
-        className="w-[560px] max-h-[400px] bg-pane-surface border border-pane-border overflow-hidden flex flex-col"
+        className={`w-full max-w-[560px] mx-4 bg-pane-surface rounded-lg overflow-hidden flex flex-col animate-fadeSlideUp ${
+          hasResults ? "max-h-[420px]" : ""
+        }`}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
       >
-        <div className="px-3 py-2 border-b border-pane-border">
+        <div className="px-5 py-4 shrink-0">
           <input
             ref={inputRef}
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={isLoading ? "Indexing files..." : "Search files..."}
-            className="w-full bg-transparent text-pane-text text-sm font-mono outline-none placeholder:text-pane-text-secondary"
+            placeholder={isLoading ? "indexing..." : "search"}
+            className="w-full bg-transparent text-pane-text font-mono outline-none placeholder:text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size)" }}
           />
         </div>
 
-        <div ref={listRef} className="flex-1 overflow-y-auto">
-          {results.map((relativePath, i) => (
-            <button
-              key={relativePath}
-              onClick={() => handleSelect(relativePath)}
-              className={`w-full px-3 py-1.5 text-left text-xs font-mono truncate flex items-center gap-2 ${
-                i === selectedIndex
-                  ? "bg-pane-text/[0.07] text-pane-text"
-                  : "text-pane-text hover:bg-pane-text/[0.04]"
-              }`}
+        {hasResults && (
+          <div ref={listRef} className="flex-1 overflow-y-auto">
+            {results.map((relativePath, i) => (
+              <button
+                key={relativePath}
+                onClick={() => handleSelect(relativePath)}
+                className={`w-full px-5 py-2.5 text-left font-mono flex items-center gap-3 ${
+                  i === selectedIndex
+                    ? "bg-pane-text/[0.07]"
+                    : "hover:bg-pane-text/[0.04]"
+                }`}
+              >
+                <span
+                  className="shrink-0 text-pane-text"
+                  style={{ fontSize: "var(--pane-font-size-sm)" }}
+                >
+                  {getFileName(relativePath)}
+                </span>
+                <span
+                  className="text-pane-text-secondary/40 truncate"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  {relativePath.split("/").slice(0, -1).join("/")}
+                  {relativePath.includes("/") && "/"}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {query.length > 0 && results.length === 0 && !isLoading && (
+          <div className="px-5 pb-4">
+            <p
+              className="text-pane-text-secondary/30 font-mono tracking-wider"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
             >
-              <span className="text-pane-text-secondary truncate flex-1">
-                {relativePath.split("/").slice(0, -1).join("/")}
-                {relativePath.includes("/") && "/"}
-              </span>
-              <span className="shrink-0 text-pane-text">
-                {getFileName(relativePath)}
-              </span>
-            </button>
-          ))}
-          {results.length === 0 && !isLoading && (
-            <p className="px-3 py-4 text-pane-text-secondary text-xs font-mono text-center">
-              No files found
+              no matches
             </p>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -90,69 +90,100 @@ export function FileSearch() {
     }
   };
 
+  const hasResults = results.length > 0;
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[15%]"
-      style={{ backgroundColor: "var(--pane-overlay)" }}
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[12%]"
       onClick={closeFileSearch}
     >
       <div
-        className="w-[640px] max-h-[500px] bg-pane-surface border border-pane-border overflow-hidden flex flex-col"
+        className={`w-full max-w-[640px] mx-4 bg-pane-surface rounded-lg overflow-hidden flex flex-col animate-fadeSlideUp ${
+          hasResults ? "max-h-[520px]" : ""
+        }`}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
       >
-        <div className="px-3 py-2 border-b border-pane-border flex items-center gap-2">
-          <span className="text-pane-text-secondary text-xs font-mono shrink-0">
-            grep
-          </span>
-          <input
-            ref={inputRef}
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search in files..."
-            className="w-full bg-transparent text-pane-text text-sm font-mono outline-none placeholder:text-pane-text-secondary"
-          />
-          {isSearching && (
-            <span className="text-pane-text-secondary text-[10px] shrink-0">
-              ...
+        <div className="px-5 py-4 shrink-0">
+          <div className="flex items-center gap-3">
+            <span
+              className="shrink-0 font-mono"
+              style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)" }}
+            >
+              grep
             </span>
-          )}
+            <input
+              ref={inputRef}
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="pattern"
+              className="w-full bg-transparent text-pane-text font-mono outline-none placeholder:text-pane-text-secondary/30"
+              style={{ fontSize: "var(--pane-font-size)" }}
+            />
+            {isSearching && (
+              <span className="flex items-center gap-1 shrink-0">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse1" />
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse2" />
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse3" />
+              </span>
+            )}
+          </div>
         </div>
 
-        <div ref={listRef} className="flex-1 overflow-y-auto">
-          {results.map((result, i) => (
-            <button
-              key={`${result.file_path}:${result.line_number}`}
-              onClick={() => handleSelect(result)}
-              className={`w-full px-3 py-1.5 text-left text-xs font-mono flex flex-col gap-0.5 ${
-                i === selectedIndex
-                  ? "bg-pane-text/[0.07] text-pane-text"
-                  : "text-pane-text hover:bg-pane-text/[0.04]"
-              }`}
+        {hasResults && (
+          <div ref={listRef} className="flex-1 overflow-y-auto">
+            {results.map((result, i) => (
+              <button
+                key={`${result.file_path}:${result.line_number}`}
+                onClick={() => handleSelect(result)}
+                className={`w-full px-5 py-3 text-left font-mono flex flex-col gap-1.5 ${
+                  i === selectedIndex
+                    ? "bg-pane-text/[0.07]"
+                    : "hover:bg-pane-text/[0.04]"
+                }`}
+              >
+                <span className="flex items-baseline gap-2">
+                  <span
+                    className="text-pane-text shrink-0"
+                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                  >
+                    {getFileName(result.file_path)}
+                  </span>
+                  <span
+                    className="shrink-0"
+                    style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)" }}
+                  >
+                    :{result.line_number}
+                  </span>
+                  <span
+                    className="text-pane-text-secondary/30 truncate"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {result.file_path}
+                  </span>
+                </span>
+                <span
+                  className="text-pane-text-secondary/60 truncate"
+                  style={{ fontSize: "var(--pane-font-size-sm)" }}
+                >
+                  {result.line_content.trim()}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {query.length >= 2 && results.length === 0 && !isSearching && (
+          <div className="px-5 pb-4">
+            <p
+              className="text-pane-text-secondary/30 font-mono tracking-wider"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
             >
-              <span className="flex items-center gap-2">
-                <span className="text-pane-text truncate">
-                  {getFileName(result.file_path)}
-                </span>
-                <span className="text-pane-text-secondary shrink-0">
-                  :{result.line_number}
-                </span>
-                <span className="text-pane-text-secondary truncate flex-1 text-[10px]">
-                  {result.file_path}
-                </span>
-              </span>
-              <span className="text-pane-text-secondary truncate">
-                {result.line_content.trim()}
-              </span>
-            </button>
-          ))}
-          {results.length === 0 && query.length >= 2 && !isSearching && (
-            <p className="px-3 py-4 text-pane-text-secondary text-xs font-mono text-center">
-              No matches found
+              no matches
             </p>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

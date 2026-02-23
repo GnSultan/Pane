@@ -3,16 +3,18 @@ import { FileViewer } from "./FileViewer";
 import { Terminal } from "./Terminal";
 import { useProjectsStore } from "../../stores/projects";
 
+function ProjectTerminal({ projectId }: { projectId: string }) {
+  const root = useProjectsStore((s) => s.projects.get(projectId)?.root ?? "");
+  if (!root) return null;
+  return <Terminal projectId={projectId} workingDir={root} />;
+}
+
 export function Workspace() {
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const projectOrder = useProjectsStore((s) => s.projectOrder);
   const activeMode = useProjectsStore((s) => {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
-  });
-  const activeRoot = useProjectsStore((s) => {
-    if (!s.activeProjectId) return null;
-    return s.projects.get(s.activeProjectId)?.root ?? null;
   });
 
   return (
@@ -46,14 +48,20 @@ export function Workspace() {
           <FileViewer />
         </div>
 
-        {/* Terminal pane */}
+        {/* Terminal pane — per-project, like conversation */}
         <div
-          className="flex-1 min-h-0 flex flex-col"
+          className="flex-1 min-h-0"
           style={{ display: activeMode === "terminal" ? "flex" : "none" }}
         >
-          {activeProjectId && activeRoot && (
-            <Terminal projectId={activeProjectId} workingDir={activeRoot} />
-          )}
+          {projectOrder.map((id) => (
+            <div
+              key={id}
+              className="flex-1 min-h-0 min-w-0 flex flex-col"
+              style={{ display: id === activeProjectId ? "flex" : "none" }}
+            >
+              <ProjectTerminal projectId={id} />
+            </div>
+          ))}
         </div>
       </div>
     </div>

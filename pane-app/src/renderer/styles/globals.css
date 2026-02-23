@@ -13,7 +13,7 @@
   --color-pane-status-untracked: var(--pane-status-untracked);
   --color-pane-error: var(--pane-error);
 
-  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-mono: "Geist Mono Variable", ui-monospace, monospace;
   --font-sans: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-panel: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
 

@@ -129,6 +129,7 @@ export interface ConversationState {
   isProcessing: boolean;
   error: string | null;
   todos: Todo[];
+  pendingPlanApproval: boolean;
 }
 
 export function createEmptyConversation(): ConversationState {
@@ -138,5 +139,6 @@ export function createEmptyConversation(): ConversationState {
     isProcessing: false,
     error: null,
     todos: [],
+    pendingPlanApproval: false,
   };
 }

@@ -26,7 +26,7 @@ function CopyButton({ onClick, copied }: { onClick: () => void; copied: boolean 
         w-7 h-7 flex items-center justify-center rounded shrink-0
         ${copied
           ? "text-pane-text-secondary"
-          : "text-pane-text-secondary/30 hover:text-pane-text-secondary hover:bg-pane-text/[0.06]"
+          : "text-pane-text-secondary/50 hover:text-pane-text-secondary hover:bg-pane-text/[0.06]"
         }`}
       title="Copy"
     >
@@ -148,7 +148,7 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
         {!message.isStreaming && (
           <div className="mt-4 flex items-center gap-4 pl-6">
             {(message.costUsd !== undefined || message.durationMs !== undefined) && (
-              <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary/50 tracking-wider">
+              <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary/60 tracking-wider">
                 {message.costUsd !== undefined && (
                   <span>${message.costUsd.toFixed(4)}</span>
                 )}

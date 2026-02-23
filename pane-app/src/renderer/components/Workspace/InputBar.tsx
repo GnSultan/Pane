@@ -27,7 +27,9 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
   const todos = useProjectsStore(
     useShallow((s) => s.projects.get(projectId)?.conversation.todos ?? EMPTY_TODOS)
   );
-
+  const pendingPlanApproval = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.pendingPlanApproval ?? false
+  );
   // Auto-focus when not processing — but only if conversation mode is active
   useEffect(() => {
     if (!isProcessing && textareaRef.current && isConversationVisible()) {
@@ -74,9 +76,19 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
     [value, isProcessing, onSend, onAbort],
   );
 
+  const handleAcceptPlan = useCallback(() => {
+    useProjectsStore.getState().setPendingPlanApproval(projectId, false);
+    onSend("yes, go ahead with this plan");
+  }, [projectId, onSend]);
+
+  const handleRejectPlan = useCallback(() => {
+    useProjectsStore.getState().setPendingPlanApproval(projectId, false);
+    onSend("no, revise the plan");
+  }, [projectId, onSend]);
+
   return (
     <div className="shrink-0 px-4 pt-2">
-      {isProcessing && (
+      {isProcessing && !pendingPlanApproval && (
         <div className="flex items-center gap-3 px-2 pb-3 animate-fadeSlideUp">
           <div className="flex items-center gap-1">
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse1" />
@@ -86,15 +98,49 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
           {todos.length > 0 && (
             <button
               onClick={() => setTodoPanelOpen((v) => !v)}
-              className="text-pane-text-secondary/50 font-mono hover:text-pane-text-secondary btn-press"
+              className="text-pane-text-secondary/70 font-mono hover:text-pane-text-secondary btn-press shrink-0"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
-              todo
+              todo {todos.filter((t) => t.status === "completed").length}/{todos.length}
             </button>
           )}
           <button
             onClick={onAbort}
-            className="text-pane-text-secondary/40 font-mono
+            className="text-pane-text-secondary/50 font-mono
+                       hover:text-pane-text ml-auto btn-press"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            esc
+          </button>
+        </div>
+      )}
+      {pendingPlanApproval && (
+        <div className="flex items-center gap-3 px-2 pb-3 animate-fadeSlideUp">
+          <span
+            className="text-pane-text/70 font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            plan ready
+          </span>
+          <button
+            onClick={handleAcceptPlan}
+            className="px-3 py-1 rounded font-mono text-pane-status-added
+                       hover:bg-pane-status-added/10 btn-press"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            accept
+          </button>
+          <button
+            onClick={handleRejectPlan}
+            className="px-3 py-1 rounded font-mono text-pane-text-secondary/70
+                       hover:text-pane-text-secondary hover:bg-pane-text/[0.06] btn-press"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            reject
+          </button>
+          <button
+            onClick={onAbort}
+            className="text-pane-text-secondary/50 font-mono
                        hover:text-pane-text ml-auto btn-press"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
@@ -105,7 +151,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
       {todoPanelOpen && todos.length > 0 && (
         <TodoPanel projectId={projectId} />
       )}
-      <div className="bg-pane-surface border border-pane-border rounded-lg">
+      <div className="bg-pane-surface rounded-lg">
         <textarea
           ref={textareaRef}
           value={value}

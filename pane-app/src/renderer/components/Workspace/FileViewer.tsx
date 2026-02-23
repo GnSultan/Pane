@@ -162,15 +162,17 @@ export function FileViewer() {
         height="100%"
         fontSize={editorFontSize}
         showPrintMargin={false}
-        showGutter={true}
+        showGutter={false}
         highlightActiveLine={false}
         setOptions={{
           enableBasicAutocompletion: true,
           enableLiveAutocompletion: false,
           enableSnippets: false,
-          showLineNumbers: true,
+          showLineNumbers: false,
           tabSize: 2,
           useWorker: false,
+          wrap: true,
+          scrollPastEnd: 0.5,
         }}
         editorProps={{ $blockScrolling: true }}
       />

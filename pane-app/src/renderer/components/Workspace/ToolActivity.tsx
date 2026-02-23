@@ -13,7 +13,20 @@ function shortenPath(fullPath: string): string {
   return parts.length > 3 ? parts.slice(-3).join("/") : fullPath;
 }
 
+// Parse MCP tool names: "mcp__server-name__tool_name" → { server, tool }
+function parseMcpName(name: string): { server: string; tool: string } | null {
+  if (!name.startsWith("mcp__")) return null;
+  const parts = name.slice(5).split("__");
+  if (parts.length < 2) return null;
+  const server = parts[0].replace(/-/g, " ");
+  const tool = parts.slice(1).join(" ").replace(/_/g, " ");
+  return { server, tool };
+}
+
 function summarizeTool(name: string, input: Record<string, unknown>): string {
+  const mcp = parseMcpName(name);
+  if (mcp) return mcp.tool;
+
   switch (name) {
     case "Read":
       return (input.file_path as string)?.split("/").pop() || "file";
@@ -41,6 +54,9 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
 }
 
 function getToolLabel(name: string): string {
+  const mcp = parseMcpName(name);
+  if (mcp) return mcp.server;
+
   switch (name) {
     case "Read": return "read";
     case "Glob": return "glob";
@@ -65,7 +81,7 @@ function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
                  border border-pane-border/40 bg-pane-bg leading-[1.6]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
-      <div className="px-2.5 py-1.5 text-pane-text-secondary/40 border-b border-pane-border/30">
+      <div className="px-2.5 py-1.5 text-pane-text-secondary/60 border-b border-pane-border/30">
         {shortenPath(filePath)}
       </div>
       {oldStr && (
@@ -98,13 +114,13 @@ function ExpandedWriteInput({ input }: { input: Record<string, unknown> }) {
                  border border-pane-border/40 bg-pane-bg leading-[1.6]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
-      <div className="px-2.5 py-1.5 text-pane-text-secondary/40 border-b border-pane-border/30">
+      <div className="px-2.5 py-1.5 text-pane-text-secondary/60 border-b border-pane-border/30">
         {shortenPath(filePath)}
-        <span className="ml-2" style={{ color: "var(--pane-status-added)", opacity: 0.6 }}>
+        <span className="ml-2" style={{ color: "var(--pane-status-added)", opacity: 0.75 }}>
           {lineCount} lines
         </span>
       </div>
-      <pre className="px-2.5 py-1.5 text-pane-text-secondary/50 whitespace-pre-wrap break-words">
+      <pre className="px-2.5 py-1.5 text-pane-text-secondary/70 whitespace-pre-wrap break-words">
         {content.length > 3000
           ? content.slice(0, 3000) + "\n... (truncated)"
           : content}
@@ -136,7 +152,7 @@ function ExpandedTodoInput({ input }: { input: Record<string, unknown> }) {
           <span
             className={
               todo.status === "completed"
-                ? "text-pane-text-secondary/40 line-through"
+                ? "text-pane-text-secondary/60 line-through"
                 : todo.status === "in_progress"
                   ? "text-pane-text"
                   : "text-pane-text-secondary/60"
@@ -163,7 +179,65 @@ function ExpandedDefaultInput({ input }: { input: Record<string, unknown> }) {
   );
 }
 
+function ExpandedReadInput({ input }: { input: Record<string, unknown> }) {
+  const filePath = (input.file_path as string) || "";
+  return (
+    <div
+      className="font-mono border border-pane-border/40 bg-pane-bg leading-[1.6]"
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    >
+      <div className="px-2.5 py-1.5 text-pane-text-secondary/60">
+        {shortenPath(filePath)}
+      </div>
+    </div>
+  );
+}
+
+function ExpandedBashInput({ input }: { input: Record<string, unknown> }) {
+  const cmd = (input.command as string) || "";
+  return (
+    <div
+      className="font-mono border border-pane-border/40 bg-pane-bg leading-[1.6]"
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    >
+      <pre className="px-2.5 py-1.5 text-pane-text-secondary/60 whitespace-pre-wrap break-words">
+        $ {cmd}
+      </pre>
+    </div>
+  );
+}
+
+function ExpandedMcpInput({ input, toolName }: { input: Record<string, unknown>; toolName: string }) {
+  const mcp = parseMcpName(toolName);
+  const entries = Object.entries(input).filter(
+    ([, v]) => v !== null && v !== undefined && v !== "",
+  );
+  return (
+    <div
+      className="font-mono border border-pane-border/40 bg-pane-bg leading-[1.6]"
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    >
+      {mcp && (
+        <div className="px-2.5 py-1.5 text-pane-text-secondary/60 border-b border-pane-border/30">
+          {mcp.server} / {mcp.tool}
+        </div>
+      )}
+      {entries.map(([key, val]) => (
+        <div key={key} className="flex gap-2 px-2.5 py-0.5 border-b border-pane-border/10 last:border-b-0">
+          <span className="text-pane-text-secondary/60 shrink-0">{key.replace(/_/g, " ")}</span>
+          <span className="text-pane-text-secondary/70 truncate">
+            {typeof val === "string" ? val : JSON.stringify(val)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function renderExpandedInput(name: string, input: Record<string, unknown>) {
+  if (parseMcpName(name)) {
+    return <ExpandedMcpInput input={input} toolName={name} />;
+  }
   switch (name) {
     case "Edit":
       return <ExpandedEditInput input={input} />;
@@ -171,6 +245,10 @@ function renderExpandedInput(name: string, input: Record<string, unknown>) {
       return <ExpandedWriteInput input={input} />;
     case "TodoWrite":
       return <ExpandedTodoInput input={input} />;
+    case "Read":
+      return <ExpandedReadInput input={input} />;
+    case "Bash":
+      return <ExpandedBashInput input={input} />;
     default:
       return <ExpandedDefaultInput input={input} />;
   }
@@ -189,7 +267,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
     <>
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-1.5 text-pane-text-secondary/50 font-mono
+        className="flex items-center gap-1.5 text-pane-text-secondary/70 font-mono
                    hover:text-pane-text-secondary w-full text-left
                    h-5 leading-none border-l-2 pl-3"
         style={{
@@ -205,14 +283,14 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
           }`}
           style={
             isFailed ? {} :
-            isComplete ? { backgroundColor: `color-mix(in srgb, ${accentColor} 25%, transparent)` } :
-            { backgroundColor: `color-mix(in srgb, ${accentColor} 50%, transparent)` }
+            isComplete ? { backgroundColor: `color-mix(in srgb, ${accentColor} 40%, transparent)` } :
+            { backgroundColor: `color-mix(in srgb, ${accentColor} 60%, transparent)` }
           }
         />
-        <span className="shrink-0 opacity-50" style={{ color: accentColor }}>{label}</span>
+        <span className="shrink-0 opacity-70" style={{ color: accentColor }}>{label}</span>
         <span className="truncate">{summary}</span>
         {isFailed && (
-          <span className="text-pane-error/60 shrink-0">err</span>
+          <span className="text-pane-error/80 shrink-0">err</span>
         )}
       </button>
 
@@ -230,7 +308,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
                           ${
                             toolResult.is_error
                               ? "text-pane-error/60 bg-[var(--pane-error-bg)] border-[var(--pane-error-border)]"
-                              : "text-pane-text-secondary/50 bg-pane-bg border-pane-border/40"
+                              : "text-pane-text-secondary/70 bg-pane-bg border-pane-border/40"
                           }`}
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >

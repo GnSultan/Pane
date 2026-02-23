@@ -40,8 +40,8 @@
   },
   "dependencies": {
     "@fontsource-variable/bricolage-grotesque": "^5.2.10",
+    "@fontsource-variable/geist-mono": "^5.2.7",
     "@fontsource/geist-mono": "^5.2.7",
-    "@fontsource/ibm-plex-mono": "^5.2.7",
     "ace-builds": "^1.40.8",
     "chokidar": "^5.0.0",
     "electron-window-state": "^5.0.3",
