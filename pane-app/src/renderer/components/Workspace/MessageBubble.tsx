@@ -78,7 +78,7 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
     const text = getMessageText(message);
 
     return (
-      <div className={`mb-10 group ${animClass}`}>
+      <div className={`mb-10 group flex flex-col items-end ${animClass}`}>
         <div
           className="px-5 py-4 bg-pane-surface rounded-lg"
           style={{ maxWidth: "65ch" }}

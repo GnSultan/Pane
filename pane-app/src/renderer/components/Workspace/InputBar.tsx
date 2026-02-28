@@ -96,11 +96,25 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
     <div className="shrink-0 px-4 pt-2">
       {isProcessing && !pendingPlanApproval && (
         <div className="flex items-center gap-3 px-2 pb-3 animate-fadeSlideUp">
-          <div className="flex items-center gap-1">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse1" />
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse2" />
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse3" />
-          </div>
+          <svg
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            className="text-pane-text-secondary"
+          >
+            {/* The circle pulses - simple, minimal, Pane */}
+            <circle
+              cx="12"
+              cy="12"
+              r="7"
+              fill="none"
+              className="animate-circle-pulse"
+              style={{ strokeWidth: 'var(--circle-stroke-width, 1.5)' }}
+            />
+          </svg>
           {isPlanning && (
             <span
               className="text-pane-text-secondary font-mono"
