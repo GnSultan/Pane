@@ -120,6 +120,10 @@ export function useClaude(projectId: string) {
         s.setConversationProcessing(projectId, false);
         s.setLastMessageStreamingDone(projectId);
         s.setIsPlanning(projectId, false);
+
+        // Play completion sound when processing finishes
+        useWorkspaceStore.getState().playCompletionSound();
+
         // Show notification badge if this isn't the active project
         if (s.activeProjectId !== projectId) {
           const proj = s.projects.get(projectId);
@@ -301,9 +305,6 @@ function handleClaudeMessage(
             store.setConversationTodos(projectId, []);
           }
         }
-
-        // Play completion sound
-        useWorkspaceStore.getState().playCompletionSound();
       } else {
         const assistantMsg: ConversationMessage = {
           id: nextMessageId(),
@@ -547,7 +548,8 @@ function handleClaudeMessage(
                 .reverse()
                 .find((b) => b.type === "tool_use") as ToolUseBlock | undefined;
               if (lastTool?.name === "TodoWrite" && parsed.todos) {
-                store.setConversationTodos(projectId, parsed.todos);
+                // Deep clone to ensure Zustand detects updates even within todo objects
+                store.setConversationTodos(projectId, parsed.todos.map((t: unknown) => ({ ...t })));
               }
             }
           }
