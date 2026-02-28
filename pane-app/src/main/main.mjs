@@ -1,119 +1,94 @@
 import path from "node:path";
-import { ipcMain, BrowserWindow, shell, dialog, app } from "electron";
+import { ipcMain, BrowserWindow, shell, dialog, app, utilityProcess } from "electron";
 import windowStateKeeper from "electron-window-state";
-import { spawn, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import os from "node:os";
-import readline from "node:readline";
 import fs from "node:fs";
 import { promisify } from "node:util";
 import ignore from "ignore";
 import chokidar from "chokidar";
-import __cjs_mod__ from "node:module";
-const __filename = import.meta.filename;
 const __dirname = import.meta.dirname;
-const require2 = __cjs_mod__.createRequire(import.meta.url);
-const activeProcesses = /* @__PURE__ */ new Map();
-function shellEscape(s) {
-  if (s.length === 0) return "''";
-  if (/^[a-zA-Z0-9\-_./:]+$/.test(s)) return s;
-  return `'${s.replace(/'/g, "'\\''")}'`;
-}
-function sendToRenderer$2(channel, data) {
-  const windows = BrowserWindow.getAllWindows();
-  for (const win of windows) {
-    if (!win.isDestroyed()) {
-      win.webContents.send(channel, data);
+// Claude CLI runs in a UtilityProcess to keep the main thread free.
+// Main process is a thin relay — never touches JSON.parse or Claude data.
+let claudeWorker = null;
+const activeProjectIds = new Set();
+function getClaudeWorker() {
+  if (claudeWorker && !claudeWorker.killed) return claudeWorker;
+  const workerPath = path.join(__dirname, "claude-worker.mjs");
+  claudeWorker = utilityProcess.fork(workerPath);
+  // setImmediate-based yielding for the relay — prevents the main process from
+  // blocking on a burst of messages (e.g., context compaction dumps 30+ messages).
+  // Without yielding, each webContents.send() does a synchronous structured clone,
+  // and the main process can't handle input events until the entire burst clears.
+  const relayQueue = [];
+  let relayDraining = false;
+
+  function drainRelayQueue() {
+    if (relayQueue.length === 0) { relayDraining = false; return; }
+    const { channel, event } = relayQueue.shift();
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send(channel, event);
     }
+    if (relayQueue.length > 0) setImmediate(drainRelayQueue);
+    else relayDraining = false;
   }
+
+  claudeWorker.on("message", (message) => {
+    if (message.type === "event") {
+      if (message.event.event === "processEnded") {
+        activeProjectIds.delete(message.projectId);
+      }
+      const channel = `claude-stream:${message.projectId}`;
+
+      // Critical events bypass queue — must reach renderer immediately
+      if (message.event.event === "processEnded" || message.event.event === "error") {
+        // Drain any queued events first so ordering is preserved
+        while (relayQueue.length > 0) {
+          const { channel: ch, event } = relayQueue.shift();
+          for (const win of BrowserWindow.getAllWindows()) {
+            if (!win.isDestroyed()) win.webContents.send(ch, event);
+          }
+        }
+        relayDraining = false;
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) win.webContents.send(channel, message.event);
+        }
+        return;
+      }
+
+      relayQueue.push({ channel, event: message.event });
+      if (!relayDraining) { relayDraining = true; setImmediate(drainRelayQueue); }
+    }
+  });
+  claudeWorker.on("exit", (code) => {
+    console.warn(`[pane] Claude worker exited with code ${code}`);
+    for (const projectId of activeProjectIds) {
+      const channel = `claude-stream:${projectId}`;
+      const windows = BrowserWindow.getAllWindows();
+      for (const win of windows) {
+        if (!win.isDestroyed()) {
+          win.webContents.send(channel, {
+            event: "processEnded",
+            data: { exit_code: null }
+          });
+        }
+      }
+    }
+    activeProjectIds.clear();
+    claudeWorker = null;
+  });
+  return claudeWorker;
 }
 function registerClaudeHandlers() {
   ipcMain.handle("send_to_claude", async (_event, args) => {
     const { projectId, prompt, workingDir, sessionId } = args;
-    const channel = `claude-stream:${projectId}`;
-    const cmdParts = [
-      "claude",
-      "-p",
-      prompt,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--max-turns",
-      "50",
-      "--dangerously-skip-permissions",
-      "--append-system-prompt",
-      `For non-trivial tasks, present a brief plan FIRST and end with: "Ready to proceed — send 'go' to start." Wait for the user to confirm before making changes. For simple tasks (quick fixes, single-file edits, questions), just do them directly.`
-    ];
-    if (sessionId) {
-      cmdParts.push("--resume", sessionId);
-    }
-    const shellCmd = cmdParts.map((arg) => shellEscape(arg)).join(" ");
-    const home = os.homedir();
-    const fullCmd = `eval $(/usr/libexec/path_helper -s 2>/dev/null); [ -f "${home}/.zshrc" ] && source "${home}/.zshrc" 2>/dev/null; ${shellCmd}`;
-    const child = spawn("/bin/zsh", ["-c", fullCmd], {
-      cwd: workingDir,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env }
-    });
-    activeProcesses.set(projectId, child);
-    sendToRenderer$2(channel, {
-      event: "processStarted",
-      data: null
-    });
-    if (child.stdout) {
-      const rl = readline.createInterface({ input: child.stdout });
-      rl.on("line", (line) => {
-        if (line.trim().length === 0) return;
-        sendToRenderer$2(channel, {
-          event: "message",
-          data: { raw_json: line }
-        });
-      });
-    }
-    let stderrOutput = "";
-    if (child.stderr) {
-      child.stderr.on("data", (chunk) => {
-        stderrOutput += chunk.toString();
-      });
-    }
-    return new Promise((resolve) => {
-      child.on("close", (code) => {
-        if (code !== 0 && stderrOutput.trim().length > 0) {
-          sendToRenderer$2(channel, {
-            event: "error",
-            data: { message: stderrOutput.trim() }
-          });
-        }
-        sendToRenderer$2(channel, {
-          event: "processEnded",
-          data: { exit_code: code }
-        });
-        activeProcesses.delete(projectId);
-        resolve();
-      });
-      child.on("error", (err) => {
-        sendToRenderer$2(channel, {
-          event: "error",
-          data: {
-            message: `Failed to spawn claude: ${err.message}. Is claude CLI installed and in PATH?`
-          }
-        });
-        sendToRenderer$2(channel, {
-          event: "processEnded",
-          data: { exit_code: null }
-        });
-        activeProcesses.delete(projectId);
-        resolve();
-      });
-    });
+    const worker = getClaudeWorker();
+    activeProjectIds.add(projectId);
+    worker.postMessage({ type: "spawn", projectId, prompt, workingDir, sessionId });
   });
   ipcMain.handle("abort_claude", async (_event, args) => {
-    const child = activeProcesses.get(args.projectId);
-    if (child?.pid) {
-      try {
-        process.kill(child.pid, "SIGTERM");
-      } catch {
-      }
-      activeProcesses.delete(args.projectId);
+    if (claudeWorker && !claudeWorker.killed) {
+      claudeWorker.postMessage({ type: "abort", projectId: args.projectId });
     }
   });
 }
@@ -468,81 +443,97 @@ function registerSettingsHandlers() {
     await fs.promises.writeFile(filePath, JSON.stringify(args.settings, null, 2), "utf-8");
   });
 }
-const activeSessions = /* @__PURE__ */ new Map();
-function sendToRenderer$1(channel, data) {
-  const windows = BrowserWindow.getAllWindows();
-  for (const win of windows) {
-    if (!win.isDestroyed()) {
-      win.webContents.send(channel, data);
-    }
-  }
-}
-function registerTerminalHandlers() {
-  ipcMain.handle("execute_terminal_command", async (_event, args) => {
-    const { sessionId, command, cwd } = args;
-    const channel = `terminal-output:${sessionId}`;
-    const home = os.homedir();
-    const shell2 = process.env.SHELL || "/bin/zsh";
-    const shellName = shell2.split("/").pop() || "zsh";
-    let initCmd = `eval $(/usr/libexec/path_helper -s 2>/dev/null);`;
-    if (shellName === "zsh" && require2("fs").existsSync(`${home}/.zshrc`)) {
-      initCmd += ` source "${home}/.zshrc" 2>/dev/null;`;
-    } else if (shellName === "bash" && require2("fs").existsSync(`${home}/.bashrc`)) {
-      initCmd += ` source "${home}/.bashrc" 2>/dev/null;`;
-    }
-    const fullCmd = `${initCmd} ${command}`;
-    const child = spawn(shell2, ["-c", fullCmd], {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env }
-    });
-    activeSessions.set(sessionId, child);
-    if (child.stdout) {
-      child.stdout.on("data", (chunk) => {
-        sendToRenderer$1(channel, {
-          type: "stdout",
-          data: chunk.toString()
-        });
-      });
-    }
-    if (child.stderr) {
-      child.stderr.on("data", (chunk) => {
-        sendToRenderer$1(channel, {
-          type: "stderr",
-          data: chunk.toString()
-        });
-      });
-    }
-    return new Promise((resolve) => {
-      child.on("close", (code) => {
-        sendToRenderer$1(channel, {
-          type: "exit",
-          exitCode: code
-        });
-        activeSessions.delete(sessionId);
-        resolve({ exitCode: code });
-      });
-      child.on("error", (err) => {
-        sendToRenderer$1(channel, {
-          type: "error",
-          message: err.message
-        });
-        activeSessions.delete(sessionId);
-        resolve({ exitCode: null });
-      });
-    });
-  });
-  ipcMain.handle("kill_terminal_session", async (_event, args) => {
-    const child = activeSessions.get(args.sessionId);
-    if (child?.pid) {
-      try {
-        process.kill(child.pid, "SIGTERM");
-      } catch {
+// PTY runs in a UtilityProcess to isolate node-pty crashes from the main process.
+// Same pattern as the Claude worker — main process is a zero-cost relay.
+let ptyWorker = null;
+const activePtyIds = new Set();
+function getPtyWorker() {
+  if (ptyWorker && !ptyWorker.killed) return ptyWorker;
+  const workerPath = path.join(__dirname, "pty-worker.mjs");
+  ptyWorker = utilityProcess.fork(workerPath);
+  ptyWorker.on("message", (message) => {
+    if (message.type === "data") {
+      const channel = `pty-data:${message.ptyId}`;
+      const windows = BrowserWindow.getAllWindows();
+      for (const win of windows) {
+        if (!win.isDestroyed()) {
+          win.webContents.send(channel, message.data);
+        }
       }
-      activeSessions.delete(args.sessionId);
+    } else if (message.type === "exit") {
+      activePtyIds.delete(message.ptyId);
+      const channel = `pty-exit:${message.ptyId}`;
+      const windows = BrowserWindow.getAllWindows();
+      for (const win of windows) {
+        if (!win.isDestroyed()) {
+          win.webContents.send(channel, { exitCode: message.exitCode });
+        }
+      }
+    }
+  });
+  // Crash recovery: if node-pty kills the worker, send synthetic exit to all active PTYs
+  ptyWorker.on("exit", (code) => {
+    console.warn(`[pane] PTY worker exited with code ${code}`);
+    for (const ptyId of activePtyIds) {
+      const channel = `pty-exit:${ptyId}`;
+      const windows = BrowserWindow.getAllWindows();
+      for (const win of windows) {
+        if (!win.isDestroyed()) {
+          win.webContents.send(channel, { exitCode: null });
+        }
+      }
+    }
+    activePtyIds.clear();
+    ptyWorker = null;
+  });
+  return ptyWorker;
+}
+function registerPtyHandlers() {
+  ipcMain.handle("pty_create", async (_event, args) => {
+    const worker = getPtyWorker();
+    activePtyIds.add(args.ptyId);
+    worker.postMessage({ type: "create", ptyId: args.ptyId, projectId: args.projectId, cwd: args.cwd });
+  });
+  ipcMain.handle("pty_write", async (_event, args) => {
+    if (ptyWorker && !ptyWorker.killed) {
+      ptyWorker.postMessage({ type: "write", ptyId: args.ptyId, data: args.data });
+    }
+  });
+  ipcMain.handle("pty_destroy", async (_event, args) => {
+    if (ptyWorker && !ptyWorker.killed) {
+      ptyWorker.postMessage({ type: "destroy", ptyId: args.ptyId });
+    }
+    activePtyIds.delete(args.ptyId);
+  });
+  ipcMain.handle("pty_destroy_project", async (_event, args) => {
+    if (ptyWorker && !ptyWorker.killed) {
+      ptyWorker.postMessage({ type: "destroy_project", projectId: args.projectId });
     }
   });
 }
+// Both Claude and PTY run in UtilityProcesses — clean shutdown via postMessage.
+// node-pty's SIGABRT bug (vscode#243952) can't crash the main process anymore
+// because node-pty lives in the PTY worker, not here.
+app.on("before-quit", () => {
+  if (claudeWorker && !claudeWorker.killed) {
+    claudeWorker.postMessage({ type: "shutdown" });
+    claudeWorker.kill();
+    claudeWorker = null;
+  }
+  if (ptyWorker && !ptyWorker.killed) {
+    // Send shutdown and let the worker exit gracefully — it needs time to
+    // dispose native ThreadSafeFunction handles before environment teardown.
+    // Force-kill only as a fallback if graceful shutdown doesn't complete.
+    ptyWorker.postMessage({ type: "shutdown" });
+    const workerRef = ptyWorker;
+    ptyWorker = null;
+    setTimeout(() => {
+      if (!workerRef.killed) {
+        workerRef.kill();
+      }
+    }, 500);
+  }
+});
 const watchers = /* @__PURE__ */ new Map();
 function sendToRenderer(channel, data) {
   const windows = BrowserWindow.getAllWindows();
@@ -559,30 +550,39 @@ function registerWatcherHandlers() {
     let debounceTimer = null;
     const flush = () => {
       if (pendingPaths.size > 0) {
-        sendToRenderer("pane://file-changed", {
-          paths: Array.from(pendingPaths)
-        });
+        sendToRenderer("pane://file-changed", Array.from(pendingPaths));
         pendingPaths = /* @__PURE__ */ new Set();
       }
       debounceTimer = null;
     };
     const watcher = chokidar.watch(args.path, {
       ignoreInitial: true,
-      ignored: /(^|[/\\])\../,
-      // Ignore dotfiles
+      ignored: [
+        /(^|[/\\])\../,            // dotfiles (.git, .DS_Store, etc.)
+        /node_modules/,
+        /\.next\//,
+        /dist\//,
+        /build\//,
+        /out\//,
+        /target\//,
+        /\.turbo\//,
+        /coverage\//
+      ],
       persistent: true,
-      usePolling: true,  // Use polling to avoid EMFILE
-      interval: 1000,
-      depth: 5,
+      usePolling: false,
+      depth: 3,
       awaitWriteFinish: {
-        stabilityThreshold: 200,
-        pollInterval: 50
+        stabilityThreshold: 300,
+        pollInterval: 100
       }
+    });
+    watcher.on("error", (err) => {
+      console.error("Chokidar watcher error:", err.message);
     });
     watcher.on("all", (_eventType, filePath) => {
       pendingPaths.add(filePath);
       if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(flush, 300);
+      debounceTimer = setTimeout(flush, 800);
     });
     watchers.set(args.path, watcher);
   });
@@ -599,7 +599,7 @@ function registerIpcHandlers() {
   registerSettingsHandlers();
   registerClaudeHandlers();
   registerWatcherHandlers();
-  registerTerminalHandlers();
+  registerPtyHandlers();
 }
 let mainWindow = null;
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
@@ -651,6 +651,8 @@ function createWindow() {
 app.whenReady().then(() => {
   registerIpcHandlers();
   createWindow();
+  getClaudeWorker(); // Pre-fork to hide first-use latency
+  getPtyWorker();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();

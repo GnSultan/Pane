@@ -172,7 +172,7 @@ export function FileViewer() {
           tabSize: 2,
           useWorker: false,
           wrap: true,
-          scrollPastEnd: 0.5,
+          scrollPastEnd: 0.5 as unknown as boolean,
         }}
         editorProps={{ $blockScrolling: true }}
       />

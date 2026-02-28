@@ -30,6 +30,10 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
   const pendingPlanApproval = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.pendingPlanApproval ?? false
   );
+  const isPlanning = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.isPlanning ?? false
+  );
+  const [planRejected, setPlanRejected] = useState(false);
   // Auto-focus when not processing — but only if conversation mode is active
   useEffect(() => {
     if (!isProcessing && textareaRef.current && isConversationVisible()) {
@@ -66,6 +70,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
         if (trimmed) {
           onSend(trimmed);
           setValue("");
+          setPlanRejected(false);
         }
       }
       if (e.key === "Escape" && isProcessing) {
@@ -78,13 +83,14 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
 
   const handleAcceptPlan = useCallback(() => {
     useProjectsStore.getState().setPendingPlanApproval(projectId, false);
-    onSend("yes, go ahead with this plan");
+    onSend("go");
   }, [projectId, onSend]);
 
   const handleRejectPlan = useCallback(() => {
     useProjectsStore.getState().setPendingPlanApproval(projectId, false);
-    onSend("no, revise the plan");
-  }, [projectId, onSend]);
+    setPlanRejected(true);
+    setTimeout(() => textareaRef.current?.focus(), 0);
+  }, [projectId]);
 
   return (
     <div className="shrink-0 px-4 pt-2">
@@ -95,18 +101,28 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse2" />
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-text/50 animate-dotPulse3" />
           </div>
+          {isPlanning && (
+            <span
+              className="text-pane-text-secondary font-mono"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              planning
+            </span>
+          )}
           {todos.length > 0 && (
             <button
               onClick={() => setTodoPanelOpen((v) => !v)}
-              className="text-pane-text-secondary/70 font-mono hover:text-pane-text-secondary btn-press shrink-0"
+              className="text-pane-text-secondary font-mono hover:text-pane-text btn-press shrink-0"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
-              todo {todos.filter((t) => t.status === "completed").length}/{todos.length}
+              {todos.every((t) => t.status === "completed")
+                ? "done"
+                : `todo ${todos.filter((t) => t.status === "completed").length}/${todos.length}`}
             </button>
           )}
           <button
             onClick={onAbort}
-            className="text-pane-text-secondary/50 font-mono
+            className="text-pane-text-secondary font-mono
                        hover:text-pane-text ml-auto btn-press"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
@@ -115,55 +131,59 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
         </div>
       )}
       {pendingPlanApproval && (
-        <div className="flex items-center gap-3 px-2 pb-3 animate-fadeSlideUp">
-          <span
-            className="text-pane-text/70 font-mono"
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
-          >
-            plan ready
-          </span>
-          <button
-            onClick={handleAcceptPlan}
-            className="px-3 py-1 rounded font-mono text-pane-status-added
-                       hover:bg-pane-status-added/10 btn-press"
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
-          >
-            accept
-          </button>
-          <button
-            onClick={handleRejectPlan}
-            className="px-3 py-1 rounded font-mono text-pane-text-secondary/70
-                       hover:text-pane-text-secondary hover:bg-pane-text/[0.06] btn-press"
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
-          >
-            reject
-          </button>
-          <button
-            onClick={onAbort}
-            className="text-pane-text-secondary/50 font-mono
-                       hover:text-pane-text ml-auto btn-press"
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
-          >
-            esc
-          </button>
+        <div className="px-2 pb-3 animate-fadeSlideUp">
+          <div className="flex items-center gap-3">
+            <span
+              className="text-pane-text font-mono"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              plan above — proceed?
+            </span>
+            <button
+              onClick={handleAcceptPlan}
+              className="px-3 py-1 rounded font-mono text-pane-status-added
+                         hover:bg-pane-status-added/10 btn-press"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              go
+            </button>
+            <button
+              onClick={handleRejectPlan}
+              className="px-3 py-1 rounded font-mono text-pane-text-secondary
+                         hover:text-pane-text hover:bg-pane-text/[0.06] btn-press"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              revise
+            </button>
+            <button
+              onClick={onAbort}
+              className="text-pane-text-secondary font-mono
+                         hover:text-pane-text ml-auto btn-press"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              esc
+            </button>
+          </div>
         </div>
       )}
       {todoPanelOpen && todos.length > 0 && (
         <TodoPanel projectId={projectId} />
       )}
-      <div className="bg-pane-surface rounded-lg">
-        <textarea
-          ref={textareaRef}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder={isProcessing ? "" : "write to claude..."}
-          className="w-full bg-transparent text-pane-text font-mono
-                     resize-none outline-none placeholder:text-pane-text-secondary/30
-                     leading-[1.75] px-5 py-4 min-h-[160px] max-h-[40vh] overflow-y-auto"
-          style={{ fontSize: "var(--pane-font-size)" }}
-        />
-      </div>
+      {!pendingPlanApproval && (
+        <div className="bg-pane-surface rounded-lg">
+          <textarea
+            ref={textareaRef}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={isProcessing ? "" : planRejected ? "what should change..." : "write to claude..."}
+            className="w-full bg-transparent text-pane-text font-mono
+                       resize-none outline-none placeholder:text-pane-text-secondary
+                       leading-[1.75] px-5 py-4 min-h-[160px] max-h-[40vh] overflow-y-auto"
+            style={{ fontSize: "var(--pane-font-size)" }}
+          />
+        </div>
+      )}
     </div>
   );
 }

@@ -3,7 +3,7 @@ import { useProjectsStore } from "../../stores/projects";
 import { useClaude } from "../../hooks/useClaude";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
-import type { ConversationMessage, ToolResultBlock } from "../../lib/claude-types";
+import type { ConversationMessage, ToolResultBlock, ToolUseBlock } from "../../lib/claude-types";
 
 const EMPTY_MESSAGES: ConversationMessage[] = [];
 
@@ -19,6 +19,21 @@ const MemoizedMessage = memo(function MemoizedMessage({
   toolResults: Map<string, ToolResultBlock>;
 }) {
   return <MessageBubble message={message} toolResults={toolResults} />;
+}, (prev, next) => {
+  // Message reference changed — must re-render
+  if (prev.message !== next.message) return false;
+  // Same Map reference — nothing changed
+  if (prev.toolResults === next.toolResults) return true;
+  // Non-assistant messages don't use toolResults
+  if (prev.message.type !== "assistant") return true;
+  // Only re-render if a tool result for THIS message's tool_use blocks changed
+  for (const block of prev.message.content) {
+    if (block.type === "tool_use") {
+      const id = (block as ToolUseBlock).id;
+      if (prev.toolResults.get(id) !== next.toolResults.get(id)) return false;
+    }
+  }
+  return true;
 });
 
 export function Conversation({ projectId }: ConversationProps) {
@@ -32,7 +47,11 @@ export function Conversation({ projectId }: ConversationProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
 
-  const messageCount = messages.length;
+  // Count only system messages (tool results) — text streaming doesn't change this
+  const systemMessageCount = useMemo(
+    () => messages.filter((m) => m.type === "system").length,
+    [messages],
+  );
   const toolResultMap = useMemo(() => {
     const map = new Map<string, ToolResultBlock>();
     for (const msg of messages) {
@@ -48,10 +67,9 @@ export function Conversation({ projectId }: ConversationProps) {
       }
     }
     return map;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messageCount]);
+  }, [systemMessageCount]);
 
-  // Track scroll position
+  // Track scroll position — passive so it never blocks compositor scrolling
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -59,14 +77,20 @@ export function Conversation({ projectId }: ConversationProps) {
       isAtBottomRef.current =
         el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     };
-    el.addEventListener("scroll", handleScroll);
+    el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
   }, []);
 
-  // Auto-scroll when messages change
+  // Auto-scroll when messages change — defer to rAF to batch with paint
+  const scrollRafRef = useRef(0);
   useEffect(() => {
     if (isAtBottomRef.current && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = requestAnimationFrame(() => {
+        if (scrollRef.current) {
+          scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        }
+      });
     }
   }, [messages]);
 
@@ -89,7 +113,7 @@ export function Conversation({ projectId }: ConversationProps) {
 
   return (
     <div className="flex flex-col h-full w-full">
-      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 px-10 py-8">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 px-10 py-8" style={{ willChange: "transform" }}>
         {messages.length === 0 && (
           <div className="flex items-center justify-center h-full select-none">
             <span

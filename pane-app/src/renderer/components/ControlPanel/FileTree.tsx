@@ -103,15 +103,27 @@ export function FileTree() {
     setNewFileDir(null);
   }, []);
 
-  // Deep preload root directory (3 levels) when project becomes active
+  // Load root directory when project becomes active
+  // Phase 1: Load root level immediately for fast first paint
+  // Phase 2: Deep preload remaining levels when idle
   useEffect(() => {
     if (!root || hasRootLoaded || !activeProjectId) return;
-    readDirectoryTree(root, 3)
-      .then((tree) => {
-        useProjectsStore.getState().batchSetDirContents(activeProjectId, tree);
+    const id = activeProjectId;
+
+    // Load root level immediately — gives user something to see right away
+    readDirectory(root)
+      .then((entries) => {
+        useProjectsStore.getState().setDirContents(id, root, entries);
+        // Then deep-preload expanded subdirs when idle
+        requestIdleCallback(() => {
+          readDirectoryTree(root, 3)
+            .then((tree) => {
+              useProjectsStore.getState().batchSetDirContents(id, tree);
+            })
+            .catch(() => {});
+        });
       })
       .catch(() => {
-        // Fallback to single-level load
         loadDir(root);
       });
   }, [root, activeProjectId, hasRootLoaded, loadDir]);
@@ -189,6 +201,7 @@ export function FileTree() {
   return (
     <div
       className="flex-1 overflow-y-auto overflow-x-hidden py-2 relative"
+      style={{ willChange: "transform" }}
       onContextMenu={handleRootContextMenu}
     >
       {newFileDir === root && (
@@ -322,15 +335,10 @@ function FileTreeNode({
     if (!s.activeProjectId) return undefined;
     return s.projects.get(s.activeProjectId)?.git.fileStatuses.get(entry.path);
   });
-  // Compute dirHasChanges inside selector to return a boolean (primitive)
+  // O(1) lookup via pre-computed dirtyDirs set instead of iterating all statuses
   const dirHasChanges = useProjectsStore((s) => {
     if (!entry.is_dir || !s.activeProjectId) return false;
-    const statuses = s.projects.get(s.activeProjectId)?.git.fileStatuses;
-    if (!statuses) return false;
-    for (const p of statuses.keys()) {
-      if (p.startsWith(entry.path + "/")) return true;
-    }
-    return false;
+    return s.projects.get(s.activeProjectId)?.git.dirtyDirs.has(entry.path) ?? false;
   });
 
   // Check if this directory has been loaded (even if empty)
@@ -338,8 +346,6 @@ function FileTreeNode({
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.dirContents.has(entry.path) ?? false;
   });
-
-  const hasChildren = children.length > 0;
 
   // Auto-load contents for dirs restored as expanded (e.g. after settings restore)
   // Use isDirLoaded instead of hasChildren — empty dirs have no children but ARE loaded

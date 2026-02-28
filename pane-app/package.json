@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.1.0",
+  "version": "0.2.8",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -8,10 +8,15 @@
   "license": "MIT",
   "scripts": {
     "dev": "node scripts/dev.js",
-    "build": "electron-vite build && node scripts/copy-compiled.js",
+    "build": "npm version patch --no-git-tag-version && electron-vite build && node scripts/copy-compiled.js",
     "preview": "electron-vite preview",
     "build:mac": "npm run build && electron-builder --mac --arm64",
-    "build:all": "npm run build && electron-builder --mac --arm64 --x64"
+    "build:all": "npm run build && electron-builder --mac --arm64 --x64",
+    "version:patch": "npm version patch --no-git-tag-version",
+    "version:minor": "npm version minor --no-git-tag-version",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/renderer/",
+    "postinstall": "electron-rebuild -f -w node-pty"
   },
   "build": {
     "appId": "com.pane.ide",
@@ -31,8 +36,13 @@
     "files": [
       "out/**/*",
       "src/main/main.mjs",
+      "src/main/claude-worker.mjs",
+      "src/main/pty-worker.mjs",
       "src/preload/preload.mjs",
       "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/node-pty/**"
     ],
     "directories": {
       "output": "dist"
@@ -40,6 +50,7 @@
   },
   "dependencies": {
     "@fontsource-variable/bricolage-grotesque": "^5.2.10",
+    "@fontsource-variable/dm-sans": "^5.2.8",
     "@fontsource-variable/geist-mono": "^5.2.7",
     "@fontsource/geist-mono": "^5.2.7",
     "ace-builds": "^1.40.8",
@@ -47,12 +58,16 @@
     "electron-window-state": "^5.0.3",
     "fuse.js": "^7.1.0",
     "ignore": "^7.0.5",
+    "node-pty": "^1.1.0",
     "react": "^18.3.1",
     "react-ace": "^12.0.0",
     "react-dom": "^18.3.1",
+    "strip-ansi": "^7.1.2",
     "zustand": "^5.0.0"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.0.3",
+    "@eslint/js": "^10.0.1",
     "@tailwindcss/vite": "^4.2.0",
     "@types/node": "^22.10.5",
     "@types/react": "^18.3.12",
@@ -62,9 +77,11 @@
     "electron": "^40.6.0",
     "electron-builder": "^26.8.1",
     "electron-vite": "^2.3.0",
+    "eslint": "^10.0.2",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.2.0",
     "typescript": "^5.7.3",
+    "typescript-eslint": "^8.56.1",
     "vite": "^5.4.11"
   }
 }

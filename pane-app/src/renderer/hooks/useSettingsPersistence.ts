@@ -19,6 +19,12 @@ import { useProjectsStore } from "../stores/projects";
 let settingsLoaded = false;
 let paneDir = "";
 
+// App readiness gate — other hooks (git, watcher) wait for this before starting
+let resolveAppReady: () => void;
+export const appReadyPromise = new Promise<void>((resolve) => {
+  resolveAppReady = resolve;
+});
+
 // --- Conversation persistence helpers ---
 
 interface PersistedConversation {
@@ -90,16 +96,30 @@ export function useSettingsPersistence() {
 
         if (settings.project_roots.length > 0) {
           // Restore saved projects (in saved order)
+          // Phase 1: Add all projects in one pass (each addProject creates a Map copy)
           let activeId: string | null = null;
+          const projectIds: string[] = [];
           for (const root of settings.project_roots) {
             const id = addProject(root);
+            projectIds.push(id);
             if (root === settings.active_project_root) {
               activeId = id;
             }
+          }
+          if (activeId) {
+            setActiveProject(activeId);
+          }
 
-            // Restore per-project state
+          // Phase 2: Defer per-project state restoration to idle time
+          // This prevents expanded dirs, file reads, and conversation loads
+          // from blocking the initial render
+          const restoreProjectState = (idx: number) => {
+            if (idx >= projectIds.length) return;
+            const id = projectIds[idx]!;
+            const root = settings.project_roots[idx]!;
             const state: ProjectSessionState | undefined =
               settings.project_states?.[root];
+
             if (state) {
               // Restore expanded dirs
               for (const dir of state.expanded_dirs) {
@@ -112,28 +132,27 @@ export function useSettingsPersistence() {
                   .then((content) => {
                     const store = useProjectsStore.getState();
                     store.openFile(id, filePath, content);
-                    // Stay in conversation mode on restore — user can toggle to see file
                     store.setMode(id, "conversation");
                   })
-                  .catch(() => {
-                    /* file may have been deleted */
-                  });
+                  .catch(() => {});
               }
             }
-          }
-          if (activeId) {
-            setActiveProject(activeId);
-          }
 
-          // Restore conversation history for all projects
-          const store = useProjectsStore.getState();
-          for (const [id] of store.projects) {
+            // Load conversation history
             loadConversation(id).then((saved) => {
               if (saved && saved.messages.length > 0) {
                 useProjectsStore.getState().restoreConversation(id, saved.messages, saved.sessionId);
               }
             }).catch(() => {});
-          }
+
+            // Stagger next project restoration to next idle period
+            if (idx + 1 < projectIds.length) {
+              requestIdleCallback(() => restoreProjectState(idx + 1));
+            }
+          };
+
+          // Start restoring project states after first paint
+          requestIdleCallback(() => restoreProjectState(0));
         } else {
           // First launch — auto-detect from CWD
           const cwd = await getCwd();
@@ -144,8 +163,14 @@ export function useSettingsPersistence() {
         // Mark settings as loaded — saves are now safe
         settingsLoaded = true;
         loadedRef.current = true;
+        // Signal other hooks that the app is ready
+        resolveAppReady();
       })
-      .catch(console.error);
+      .catch((err) => {
+        console.error(err);
+        // Still resolve so hooks don't hang forever
+        resolveAppReady();
+      });
   }, []);
 
   // Save on changes
@@ -224,65 +249,68 @@ export function useSettingsPersistence() {
     );
 
     // Save when structural project state changes (not conversation streaming)
+    // Track a fingerprint of the structural fields to avoid iterating all projects
+    let lastStructuralKey = "";
+    const computeStructuralKey = (state: ReturnType<typeof useProjectsStore.getState>) => {
+      const parts: string[] = [state.activeProjectId ?? "", state.projectOrder.join(",")];
+      for (const id of state.projectOrder) {
+        const p = state.projects.get(id);
+        if (!p) continue;
+        parts.push(`${id}:${p.expandedDirs.size}:${p.activeFilePath ?? ""}:${p.mode}`);
+      }
+      return parts.join("|");
+    };
+    lastStructuralKey = computeStructuralKey(useProjectsStore.getState());
+
     const unsubProjects = useProjectsStore.subscribe(
-      (state, prev) => {
-        if (state.activeProjectId !== prev.activeProjectId ||
-            state.projectOrder !== prev.projectOrder) {
+      (state) => {
+        const key = computeStructuralKey(state);
+        if (key !== lastStructuralKey) {
+          lastStructuralKey = key;
           debouncedSave();
-          return;
-        }
-        if (state.projects !== prev.projects) {
-          // Only save on structural changes, NOT conversation/streaming updates
-          if (state.projects.size !== prev.projects.size) {
-            debouncedSave();
-            return;
-          }
-          for (const [id, project] of state.projects) {
-            const prevProject = prev.projects.get(id);
-            if (!prevProject) { debouncedSave(); return; }
-            if (
-              project.expandedDirs !== prevProject.expandedDirs ||
-              project.activeFilePath !== prevProject.activeFilePath ||
-              project.mode !== prevProject.mode
-            ) {
-              debouncedSave();
-              return;
-            }
-          }
         }
       },
     );
 
     // Save conversation history when messages change
+    // Track per-project fingerprint to avoid iterating all projects on every mutation
     let convDebounce: ReturnType<typeof setTimeout> | null = null;
+    const lastConvKeys = new Map<string, string>();
+    const convKey = (p: ReturnType<typeof useProjectsStore.getState>["projects"] extends Map<string, infer V> ? V : never) =>
+      `${p.conversation.messages.length}:${p.conversation.sessionId ?? ""}:${p.conversation.isProcessing}`;
+
+    // Initialize keys
+    for (const [id, p] of useProjectsStore.getState().projects) {
+      lastConvKeys.set(id, convKey(p));
+    }
+
     const unsubConversation = useProjectsStore.subscribe(
-      (state, prev) => {
+      (state) => {
         if (!settingsLoaded) return;
-        for (const [id, project] of state.projects) {
-          const prevProject = prev.projects.get(id);
-          if (!prevProject) continue;
-          const conv = project.conversation;
-          const prevConv = prevProject.conversation;
-          // Only save when messages actually change (not during streaming text appends)
-          if (conv.messages.length !== prevConv.messages.length ||
-              conv.sessionId !== prevConv.sessionId ||
-              (!conv.isProcessing && prevConv.isProcessing)) {
-            if (convDebounce) clearTimeout(convDebounce);
-            convDebounce = setTimeout(() => {
-              // Save all projects that have messages
-              const current = useProjectsStore.getState();
-              for (const [pid, p] of current.projects) {
-                if (p.conversation.messages.length > 0 && !p.conversation.isProcessing) {
-                  saveConversation(pid, {
-                    sessionId: p.conversation.sessionId,
-                    messages: p.conversation.messages,
-                  }).catch(console.error);
-                }
-              }
-            }, 1000);
-            break;
+        let changed = false;
+        for (const id of state.projectOrder) {
+          const project = state.projects.get(id);
+          if (!project) continue;
+          const key = convKey(project);
+          if (key !== lastConvKeys.get(id)) {
+            lastConvKeys.set(id, key);
+            changed = true;
           }
         }
+        if (!changed) return;
+
+        if (convDebounce) clearTimeout(convDebounce);
+        convDebounce = setTimeout(() => {
+          const current = useProjectsStore.getState();
+          for (const [pid, p] of current.projects) {
+            if (p.conversation.messages.length > 0 && !p.conversation.isProcessing) {
+              saveConversation(pid, {
+                sessionId: p.conversation.sessionId,
+                messages: p.conversation.messages,
+              }).catch(console.error);
+            }
+          }
+        }, 1000);
       },
     );
 

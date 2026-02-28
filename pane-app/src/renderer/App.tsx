@@ -1,5 +1,5 @@
 import { useEffect, useCallback, useState } from "react";
-import { setWindowTitle } from "./lib/tauri-commands";
+import { setWindowTitle, destroyPty } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ControlPanel } from "./components/ControlPanel/ControlPanel";
 import { Workspace } from "./components/Workspace/Workspace";
@@ -87,7 +87,7 @@ function App() {
         const { projectOrder, setActiveProject } = useProjectsStore.getState();
         if (index < projectOrder.length) {
           e.preventDefault();
-          setActiveProject(projectOrder[index]);
+          setActiveProject(projectOrder[index]!);
         }
         return;
       }
@@ -169,6 +169,46 @@ function App() {
             useWorkspaceStore.getState().resetEditorFontSize();
           } else {
             useWorkspaceStore.getState().resetFontSize();
+          }
+          break;
+        }
+        case "terminal-new-tab": {
+          const store = useProjectsStore.getState();
+          const proj = store.activeProjectId ? store.projects.get(store.activeProjectId) : undefined;
+          if (proj?.mode === "terminal") {
+            const tabId = `pty-${proj.id}-${Date.now()}`;
+            const title = proj.terminalTabs.length === 0 ? "zsh" : `zsh (${proj.terminalTabs.length + 1})`;
+            // PTY is created by TerminalTabContent on mount — just add to store
+            store.addTerminalTab(proj.id, { id: tabId, title, isAlive: true });
+          }
+          break;
+        }
+        case "terminal-close-tab": {
+          const store = useProjectsStore.getState();
+          const proj = store.activeProjectId ? store.projects.get(store.activeProjectId) : undefined;
+          if (proj?.mode === "terminal" && proj.activeTerminalTabId) {
+            destroyPty(proj.activeTerminalTabId).catch(() => {});
+            store.removeTerminalTab(proj.id, proj.activeTerminalTabId);
+          }
+          break;
+        }
+        case "terminal-next-tab": {
+          const store = useProjectsStore.getState();
+          const proj = store.activeProjectId ? store.projects.get(store.activeProjectId) : undefined;
+          if (proj?.mode === "terminal" && proj.terminalTabs.length > 1 && proj.activeTerminalTabId) {
+            const idx = proj.terminalTabs.findIndex((t) => t.id === proj.activeTerminalTabId);
+            const nextIdx = (idx + 1) % proj.terminalTabs.length;
+            store.setActiveTerminalTab(proj.id, proj.terminalTabs[nextIdx]!.id);
+          }
+          break;
+        }
+        case "terminal-prev-tab": {
+          const store = useProjectsStore.getState();
+          const proj = store.activeProjectId ? store.projects.get(store.activeProjectId) : undefined;
+          if (proj?.mode === "terminal" && proj.terminalTabs.length > 1 && proj.activeTerminalTabId) {
+            const idx = proj.terminalTabs.findIndex((t) => t.id === proj.activeTerminalTabId);
+            const prevIdx = (idx - 1 + proj.terminalTabs.length) % proj.terminalTabs.length;
+            store.setActiveTerminalTab(proj.id, proj.terminalTabs[prevIdx]!.id);
           }
           break;
         }

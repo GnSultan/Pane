@@ -3,9 +3,13 @@ import type {
   ConversationMessage,
   ToolUseBlock,
   ToolResultBlock,
+  ThinkingBlock,
+  ServerToolUseBlock,
+  WebSearchToolResultBlock,
 } from "../../lib/claude-types";
-import { ToolActivity } from "./ToolActivity";
+import { ToolActivity, ServerToolActivity } from "./ToolActivity";
 import { MarkdownText } from "./MarkdownText";
+import { ThinkingBlockDisplay } from "./ThinkingBlock";
 
 // No CSS containment — content-visibility: auto causes visible pop-in stutter
 // when messages scroll into view, which is worse than the layout cost it saves.
@@ -16,6 +20,11 @@ function getMessageText(message: ConversationMessage): string {
     .filter((b) => b.type === "text")
     .map((b) => (b as { type: "text"; text: string }).text)
     .join("\n");
+}
+
+function formatTokenCount(count: number): string {
+  if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+  return String(count);
 }
 
 function CopyButton({ onClick, copied }: { onClick: () => void; copied: boolean }) {
@@ -70,12 +79,17 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
 
     return (
       <div className={`mb-10 group ${animClass}`}>
-        <p
-          className="text-pane-text font-mono leading-[1.75] whitespace-pre-wrap"
-          style={{ fontSize: "var(--pane-font-size)", maxWidth: "65ch" }}
+        <div
+          className="px-5 py-4 bg-pane-surface rounded-lg"
+          style={{ maxWidth: "65ch" }}
         >
-          {text}
-        </p>
+          <p
+            className="text-pane-text font-mono leading-[1.75] whitespace-pre-wrap"
+            style={{ fontSize: "var(--pane-font-size)" }}
+          >
+            {text}
+          </p>
+        </div>
         <div className="flex justify-end mt-1">
           <CopyButton onClick={handleCopy} copied={copied} />
         </div>
@@ -89,16 +103,27 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
   }
 
   if (message.type === "assistant") {
-    // Group consecutive blocks by type: text blocks get the conversation border,
-    // tool_use blocks break out with their own terminal accent
     // Filter out TodoWrite tool calls — they render in TodoPanel only
     const filteredContent = message.content.filter(
       (b) => b.type !== "tool_use" || (b as ToolUseBlock).name !== "TodoWrite"
     );
 
-    const groups: { type: "text" | "tools"; blocks: typeof message.content }[] = [];
+    // Group consecutive blocks by type: text, tools, or thinking
+    type GroupType = "text" | "tools" | "thinking";
+    const groups: { type: GroupType; blocks: typeof message.content }[] = [];
     for (const block of filteredContent) {
-      const groupType = block.type === "tool_use" ? "tools" : "text";
+      let groupType: GroupType;
+      if (block.type === "thinking") {
+        groupType = "thinking";
+      } else if (
+        block.type === "tool_use" ||
+        block.type === "server_tool_use" ||
+        block.type === "web_search_tool_result"
+      ) {
+        groupType = "tools";
+      } else {
+        groupType = "text";
+      }
       const last = groups[groups.length - 1];
       if (last && last.type === groupType) {
         last.blocks.push(block);
@@ -109,18 +134,39 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
 
     const hasText = message.content.some((b) => b.type === "text");
 
+    // Collect all tool_use block IDs to determine which are "last 3"
+    const allToolUseIds: string[] = [];
+    for (const block of filteredContent) {
+      if (block.type === "tool_use") allToolUseIds.push((block as ToolUseBlock).id);
+    }
+    const recentToolIds = new Set(allToolUseIds.slice(-3));
+
     return (
       <div className={`group ${animClass} ${hasText ? "mb-10" : "mb-1"}`}>
         {groups.map((group, gi) => {
+          if (group.type === "thinking") {
+            return (
+              <div key={gi}>
+                {group.blocks.map((block, i) => (
+                  <ThinkingBlockDisplay
+                    key={i}
+                    block={block as ThinkingBlock}
+                    isStreaming={message.isStreaming}
+                  />
+                ))}
+              </div>
+            );
+          }
+
           if (group.type === "text") {
             return (
-              <div key={gi} className="font-sans font-light">
+              <div key={gi} className="font-sans" style={{ fontWeight: "var(--pane-font-weight)" }}>
                 {group.blocks.map((block, i) => {
                   const text = (block as { type: "text"; text: string }).text;
                   const isLastBlock = gi === groups.length - 1 && i === group.blocks.length - 1;
                   return (
                     <div key={i}>
-                      <MarkdownText text={text} />
+                      <MarkdownText text={text} isStreaming={message.isStreaming} />
                       {message.isStreaming && isLastBlock && (
                         <span className="inline-block w-[2px] h-[14px] bg-pane-text/70 ml-0.5 align-middle animate-pulse" />
                       )}
@@ -131,29 +177,63 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
             );
           }
 
+          // tools group
           return (
             <div key={gi} className="my-0.5">
-              {group.blocks.map((block, i) => {
-                const toolBlock = block as ToolUseBlock;
-                const result = toolResults.get(toolBlock.id);
-                return (
-                  <ToolActivity key={toolBlock.id} toolUse={toolBlock} toolResult={result} />
-                );
+              {group.blocks.map((block) => {
+                if (block.type === "tool_use") {
+                  const toolBlock = block as ToolUseBlock;
+                  const result = toolResults.get(toolBlock.id);
+                  return (
+                    <ToolActivity
+                      key={toolBlock.id}
+                      toolUse={toolBlock}
+                      toolResult={result}
+                      forceExpanded={recentToolIds.has(toolBlock.id)}
+                    />
+                  );
+                }
+                if (block.type === "server_tool_use") {
+                  const serverBlock = block as ServerToolUseBlock;
+                  // Find matching web_search_tool_result in the same message
+                  const searchResult = message.content.find(
+                    (b) =>
+                      b.type === "web_search_tool_result" &&
+                      (b as WebSearchToolResultBlock).tool_use_id === serverBlock.id,
+                  ) as WebSearchToolResultBlock | undefined;
+                  return (
+                    <ServerToolActivity
+                      key={serverBlock.id}
+                      block={serverBlock}
+                      searchResult={searchResult}
+                    />
+                  );
+                }
+                // web_search_tool_result rendered by its parent server_tool_use
+                return null;
               })}
             </div>
           );
         })}
 
-        {/* Footer: cost/duration + copy */}
+        {/* Footer: cost/duration/tokens + copy */}
         {!message.isStreaming && (
           <div className="mt-4 flex items-center gap-4 pl-6">
             {(message.costUsd !== undefined || message.durationMs !== undefined) && (
-              <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary/60 tracking-wider">
+              <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary tracking-wider">
                 {message.costUsd !== undefined && (
                   <span>${message.costUsd.toFixed(4)}</span>
                 )}
                 {message.durationMs !== undefined && (
                   <span>{(message.durationMs / 1000).toFixed(1)}s</span>
+                )}
+                {message.inputTokens !== undefined && message.outputTokens !== undefined && (
+                  <span>
+                    {formatTokenCount(message.inputTokens)} in / {formatTokenCount(message.outputTokens)} out
+                  </span>
+                )}
+                {message.numTurns !== undefined && message.numTurns > 1 && (
+                  <span>{message.numTurns} turns</span>
                 )}
               </div>
             )}

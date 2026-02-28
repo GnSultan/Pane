@@ -20,6 +20,14 @@ function copyCompiled() {
     `${projectRoot}/src/preload/preload.mjs`,
     `${projectRoot}/out/preload/preload.mjs`
   );
+  copyFileSync(
+    `${projectRoot}/src/main/claude-worker.mjs`,
+    `${projectRoot}/out/main/claude-worker.mjs`
+  );
+  copyFileSync(
+    `${projectRoot}/src/main/pty-worker.mjs`,
+    `${projectRoot}/out/main/pty-worker.mjs`
+  );
   console.log('✓ Compiled scripts copied');
 }
 
@@ -60,6 +68,32 @@ watch(`${projectRoot}/src/main/main.mjs`, () => {
 
 watch(`${projectRoot}/src/preload/preload.mjs`, () => {
   console.log('🔄 preload.mjs changed, will re-copy after next build...');
+});
+
+watch(`${projectRoot}/src/main/claude-worker.mjs`, () => {
+  console.log('🔄 claude-worker.mjs changed, copying...');
+  try {
+    copyFileSync(
+      `${projectRoot}/src/main/claude-worker.mjs`,
+      `${projectRoot}/out/main/claude-worker.mjs`
+    );
+    console.log('✓ claude-worker.mjs copied');
+  } catch (err) {
+    console.error('Copy failed:', err.message);
+  }
+});
+
+watch(`${projectRoot}/src/main/pty-worker.mjs`, () => {
+  console.log('🔄 pty-worker.mjs changed, copying...');
+  try {
+    copyFileSync(
+      `${projectRoot}/src/main/pty-worker.mjs`,
+      `${projectRoot}/out/main/pty-worker.mjs`
+    );
+    console.log('✓ pty-worker.mjs copied');
+  } catch (err) {
+    console.error('Copy failed:', err.message);
+  }
 });
 
 vite.on('exit', (code) => {

@@ -20,4 +20,12 @@ copyFileSync(
   `${projectRoot}/src/preload/preload.mjs`,
   `${projectRoot}/out/preload/preload.mjs`
 );
+copyFileSync(
+  `${projectRoot}/src/main/claude-worker.mjs`,
+  `${projectRoot}/out/main/claude-worker.mjs`
+);
+copyFileSync(
+  `${projectRoot}/src/main/pty-worker.mjs`,
+  `${projectRoot}/out/main/pty-worker.mjs`
+);
 console.log('✓ Compiled scripts copied successfully');

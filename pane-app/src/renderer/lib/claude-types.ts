@@ -19,7 +19,45 @@ export interface ToolResultBlock {
   is_error?: boolean;
 }
 
-export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock;
+export interface ThinkingBlock {
+  type: "thinking";
+  thinking: string;
+  signature?: string;
+}
+
+export interface ServerToolUseBlock {
+  type: "server_tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+export interface WebSearchResult {
+  type: "web_search_result";
+  url: string;
+  title: string;
+  encrypted_content: string;
+  page_age?: string | null;
+}
+
+export interface WebSearchToolResultError {
+  type: "web_search_tool_result_error";
+  error_code: string;
+}
+
+export interface WebSearchToolResultBlock {
+  type: "web_search_tool_result";
+  tool_use_id: string;
+  content: WebSearchResult[] | WebSearchToolResultError;
+}
+
+export type ContentBlock =
+  | TextBlock
+  | ToolUseBlock
+  | ToolResultBlock
+  | ThinkingBlock
+  | ServerToolUseBlock
+  | WebSearchToolResultBlock;
 
 // Top-level message types from stream-json
 
@@ -55,6 +93,10 @@ export interface ResultMessage {
   duration_api_ms?: number;
   is_error?: boolean;
   num_turns?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+  };
 }
 
 export interface StreamEvent {
@@ -65,6 +107,9 @@ export interface StreamEvent {
     delta?: {
       type: string;
       text?: string;
+      thinking?: string;
+      signature?: string;
+      partial_json?: string;
     };
     content_block?: ContentBlock;
   };
@@ -77,11 +122,11 @@ export type ClaudeStreamMessage =
   | ResultMessage
   | StreamEvent;
 
-// Frontend event envelope from Rust backend (Tauri Channel)
+// Frontend event envelope from Electron IPC
 
 export interface ClaudeEventMessage {
   event: "message";
-  data: { raw_json: string };
+  data: { parsed?: ClaudeStreamMessage; raw_json?: string };
 }
 
 export interface ClaudeEventProcessStarted {
@@ -115,6 +160,9 @@ export interface ConversationMessage {
   isStreaming: boolean;
   costUsd?: number;
   durationMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  numTurns?: number;
 }
 
 export interface Todo {
@@ -127,6 +175,7 @@ export interface ConversationState {
   messages: ConversationMessage[];
   sessionId: string | null;
   isProcessing: boolean;
+  isPlanning: boolean;
   error: string | null;
   todos: Todo[];
   pendingPlanApproval: boolean;
@@ -137,6 +186,7 @@ export function createEmptyConversation(): ConversationState {
     messages: [],
     sessionId: null,
     isProcessing: false,
+    isPlanning: false,
     error: null,
     todos: [],
     pendingPlanApproval: false,

@@ -6,7 +6,6 @@ const electronAPI = (window as any).electronAPI;
 
 interface GitStatusProps {
   root: string;
-  projectId: string;
 }
 
 function CommitRow({ commit: c }: { commit: GitCommit }) {
@@ -44,7 +43,7 @@ function CommitRow({ commit: c }: { commit: GitCommit }) {
   );
 }
 
-export function GitStatus({ root, projectId }: GitStatusProps) {
+export function GitStatus({ root }: GitStatusProps) {
   const [commits, setCommits] = useState<GitCommit[]>([]);
   const [status, setStatus] = useState<GitStatusInfo | null>(null);
   const [loading, setLoading] = useState(true);
@@ -203,7 +202,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
       </div>
 
       {/* Scrollable body: changes + history */}
-      <div className="flex-1 overflow-y-auto min-h-0">
+      <div className="flex-1 overflow-y-auto min-h-0" style={{ willChange: "transform" }}>
         {/* Changes section */}
         <div className="py-1">
           <div className="px-3 py-1">

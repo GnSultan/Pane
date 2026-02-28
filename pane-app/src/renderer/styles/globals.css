@@ -14,8 +14,8 @@
   --color-pane-error: var(--pane-error);
 
   --font-mono: "Geist Mono Variable", ui-monospace, monospace;
-  --font-sans: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-panel: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-panel: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
 
   /* Animations - fast and subtle for lightest IDE */
   --animate-fadeSlideUp: fadeSlideUp 0.12s ease-out;
@@ -67,9 +67,9 @@
    */
   --pane-bg: #1C1B1A;
   --pane-surface: #242320;
-  --pane-border: #33312E;
-  --pane-text: #C8C5BE;
-  --pane-text-secondary: #6D6A63;
+  --pane-border: #4A4742;
+  --pane-text: #E8E5DE;
+  --pane-text-secondary: #A8A59E;
   --pane-font-weight: 400;
   --pane-font-size: 15px;
   --pane-font-size-sm: 12px;
@@ -127,9 +127,9 @@
    */
   --pane-bg: #F4F2EC;
   --pane-surface: #EAE8E2;
-  --pane-border: #D5D3CC;
-  --pane-text: #2C2B28;
-  --pane-text-secondary: #8A877F;
+  --pane-border: #B8B6AF;
+  --pane-text: #1A1918;
+  --pane-text-secondary: #5A5752;
 
   /* Semantic — light */
   --pane-status-added: #5B7040;
@@ -178,10 +178,10 @@
    * Maximum contrast. White canvas, black ink. Nothing between you and the code.
    */
   --pane-bg: #FFFFFF;
-  --pane-surface: #F8F8F8;
-  --pane-border: #E0E0E0;
-  --pane-text: #1A1A1A;
-  --pane-text-secondary: #808080;
+  --pane-surface: #F0F0F0;
+  --pane-border: #C0C0C0;
+  --pane-text: #0A0A0A;
+  --pane-text-secondary: #4A4A4A;
 
   /* Semantic — high contrast */
   --pane-status-added: #2D7A3A;
@@ -194,7 +194,7 @@
   --pane-error-border: rgba(154, 51, 51, 0.15);
 
   /* Terminal accent */
-  --pane-terminal: #2A5A7A;
+  --pane-terminal: #1A4A6A;
 
   /* Overlay */
   --pane-overlay: rgba(0, 0, 0, 0.4);

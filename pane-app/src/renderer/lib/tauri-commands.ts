@@ -140,11 +140,37 @@ export async function sendToClaude(
   // Self-cleaning listener — stays active until processEnded or error
   let cleanup: (() => void) | null = null;
 
-  cleanup = electronAPI.on(`claude-stream:${projectId}`, (event: ClaudeStreamEvent) => {
+  // MessageChannel-based event yielding — same technique React's scheduler uses.
+  // Instead of processing all IPC events synchronously (starving clicks/inputs),
+  // we queue events and drain one-per-task via MessageChannel.postMessage
+  // which yields to the browser between each event (zero-delay, no setTimeout 4ms minimum).
+  const queue: ClaudeStreamEvent[] = [];
+  let draining = false;
+  const { port1, port2 } = new MessageChannel();
+
+  port2.onmessage = () => {
+    if (queue.length === 0) { draining = false; return; }
+    const event = queue.shift()!;
     onEvent(event);
+    if (queue.length > 0) port1.postMessage(null);
+    else draining = false;
+  };
+
+  cleanup = electronAPI.on(`claude-stream:${projectId}`, (event: ClaudeStreamEvent) => {
+    // Critical events bypass queue — must process immediately.
+    // Drain queued events FIRST so ordering is preserved (they happened before
+    // this terminal event). Then process the terminal event itself.
     if (event.event === "processEnded" || event.event === "error") {
+      while (queue.length > 0) onEvent(queue.shift()!);
+      onEvent(event);
+      draining = false;
+      port1.close();
+      port2.close();
       setTimeout(() => cleanup?.(), 0);
+      return;
     }
+    queue.push(event);
+    if (!draining) { draining = true; port1.postMessage(null); }
   });
 
   try {
@@ -155,6 +181,8 @@ export async function sendToClaude(
       sessionId,
     });
   } catch (err) {
+    port1.close();
+    port2.close();
     cleanup?.();
     throw err;
   }
@@ -168,34 +196,28 @@ export async function setWindowTitle(title: string): Promise<void> {
   return electronAPI.invoke("set_window_title", { title });
 }
 
-// Terminal management
+// PTY terminal management
 
-export interface TerminalOutput {
-  type: "stdout" | "stderr" | "exit" | "error";
-  data?: string;
-  exitCode?: number | null;
-  message?: string;
+export async function createPty(ptyId: string, projectId: string, cwd: string): Promise<void> {
+  return electronAPI.invoke("pty_create", { ptyId, projectId, cwd });
 }
 
-export async function executeTerminalCommand(
-  sessionId: string,
-  command: string,
-  cwd: string,
-  onOutput: (output: TerminalOutput) => void,
-): Promise<{ exitCode: number | null }> {
-  const listener = electronAPI.on(`terminal-output:${sessionId}`, onOutput);
-
-  try {
-    return await electronAPI.invoke("execute_terminal_command", {
-      sessionId,
-      command,
-      cwd,
-    });
-  } finally {
-    listener();
-  }
+export async function writePty(ptyId: string, data: string): Promise<void> {
+  return electronAPI.invoke("pty_write", { ptyId, data });
 }
 
-export async function killTerminalSession(sessionId: string): Promise<void> {
-  return electronAPI.invoke("kill_terminal_session", { sessionId });
+export async function destroyPty(ptyId: string): Promise<void> {
+  return electronAPI.invoke("pty_destroy", { ptyId });
+}
+
+export async function destroyAllPtysForProject(projectId: string): Promise<void> {
+  return electronAPI.invoke("pty_destroy_project", { projectId });
+}
+
+export function onPtyData(ptyId: string, cb: (data: string) => void): () => void {
+  return electronAPI.on(`pty-data:${ptyId}`, cb);
+}
+
+export function onPtyExit(ptyId: string, cb: (info: { exitCode: number }) => void): () => void {
+  return electronAPI.on(`pty-exit:${ptyId}`, cb);
 }

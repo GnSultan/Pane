@@ -145,7 +145,7 @@ export function ControlPanel() {
 
       {/* FileTree and GitStatus are mutually exclusive — git takes over the panel */}
       {gitPanelActive && isGitRepo && root && activeProjectId ? (
-        <GitStatus root={root} projectId={activeProjectId} />
+        <GitStatus root={root} />
       ) : (
         <FileTree />
       )}

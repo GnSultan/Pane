@@ -318,8 +318,6 @@ export function Settings({ onClose }: SettingsProps) {
   const fontWeight = useWorkspaceStore((s) => s.fontWeight);
   const setTheme = useWorkspaceStore((s) => s.setTheme);
 
-  const themeLabel = theme;
-
   // Close on Escape (only if not recording a keybinding — capture handler takes priority)
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {

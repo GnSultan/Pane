@@ -2,12 +2,9 @@ import { useEffect, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
 import { readFile, readDirectory, watchDirectory, unwatchDirectory } from "../lib/tauri-commands";
 import { getParentDir } from "../lib/file-utils";
+import { appReadyPromise } from "./useSettingsPersistence";
 
 const electronAPI = (window as any).electronAPI;
-
-interface FileChangePayload {
-  paths: string[];
-}
 
 // Track files we recently wrote so the watcher doesn't clobber the editor
 const recentWrites = new Map<string, number>();
@@ -29,37 +26,52 @@ export function useFileWatcher() {
   const projectOrder = useProjectsStore((s) => s.projectOrder);
   const watchedRootsRef = useRef<Set<string>>(new Set());
 
-  // Watch all project roots
+  // Watch all project roots — wait for app to settle first
   useEffect(() => {
-    const { projects } = useProjectsStore.getState();
-    const currentRoots = new Set<string>();
-    for (const id of projectOrder) {
-      const project = projects.get(id);
-      if (project) currentRoots.add(project.root);
-    }
+    let cancelled = false;
 
-    // Start watching new roots
-    for (const root of currentRoots) {
-      if (!watchedRootsRef.current.has(root)) {
-        watchDirectory(root).catch(console.error);
+    appReadyPromise.then(() => {
+      if (cancelled) return;
+
+      const { projects } = useProjectsStore.getState();
+      const currentRoots = new Set<string>();
+      for (const id of projectOrder) {
+        const project = projects.get(id);
+        if (project) currentRoots.add(project.root);
       }
-    }
 
-    // Unwatch removed roots
-    for (const root of watchedRootsRef.current) {
-      if (!currentRoots.has(root)) {
-        unwatchDirectory(root).catch(console.error);
+      // Start watching new roots
+      for (const root of currentRoots) {
+        if (!watchedRootsRef.current.has(root)) {
+          watchDirectory(root).catch(console.error);
+        }
       }
-    }
 
-    watchedRootsRef.current = currentRoots;
+      // Unwatch removed roots
+      for (const root of watchedRootsRef.current) {
+        if (!currentRoots.has(root)) {
+          unwatchDirectory(root).catch(console.error);
+        }
+      }
+
+      watchedRootsRef.current = currentRoots;
+    });
+
+    return () => { cancelled = true; };
   }, [projectOrder]);
 
   // Listen for file change events and route to correct project
   useEffect(() => {
+    // Debounce file index invalidation — fuzzy finder doesn't need instant updates
+    const indexDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
     const unlisten = electronAPI.on(
       "pane://file-changed",
-      (paths: string[]) => {
+      (raw: string[] | { paths: string[] }) => {
+        // Backend sends string[] directly; handle legacy { paths } wrapper defensively
+        const paths = Array.isArray(raw) ? raw : raw?.paths;
+        if (!paths || !Array.isArray(paths)) return;
+
         const state = useProjectsStore.getState();
 
         // For each project, check if any changed paths belong to it
@@ -97,14 +109,23 @@ export function useFileWatcher() {
               .catch(console.error);
           }
 
-          // Invalidate file index for fuzzy finder
-          useProjectsStore.getState().invalidateFileIndex(projectId);
+          // Debounce file index invalidation — coalesce rapid file changes
+          const existing = indexDebounceTimers.get(projectId);
+          if (existing) clearTimeout(existing);
+          indexDebounceTimers.set(
+            projectId,
+            setTimeout(() => {
+              useProjectsStore.getState().invalidateFileIndex(projectId);
+              indexDebounceTimers.delete(projectId);
+            }, 500),
+          );
         }
       },
     );
 
     return () => {
       unlisten();
+      for (const timer of indexDebounceTimers.values()) clearTimeout(timer);
     };
   }, []);
 }

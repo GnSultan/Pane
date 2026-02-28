@@ -1,11 +1,12 @@
 import { create } from "zustand";
 import type { FileEntry } from "../lib/tauri-commands";
-import type { ConversationState, ConversationMessage, ContentBlock } from "../lib/claude-types";
+import type { ConversationState, ConversationMessage, ContentBlock, ToolUseBlock } from "../lib/claude-types";
 import { createEmptyConversation } from "../lib/claude-types";
 
 export interface ProjectGit {
   branch: string | null;
   fileStatuses: Map<string, string>;
+  dirtyDirs: Set<string>; // pre-computed: all ancestor dirs of changed files
   isGitRepo: boolean;
 }
 
@@ -13,6 +14,12 @@ export interface ProjectFileIndex {
   files: string[];
   lastIndexed: number;
   isLoading: boolean;
+}
+
+export interface TerminalTab {
+  id: string;       // doubles as ptyId
+  title: string;    // "zsh", "zsh (2)", etc.
+  isAlive: boolean; // false after PTY exit
 }
 
 export interface Project {
@@ -30,6 +37,8 @@ export interface Project {
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
   hasUnreadCompletion: boolean; // true when background task completes, cleared when project becomes active
+  terminalTabs: TerminalTab[];
+  activeTerminalTabId: string | null;
 }
 
 function createProject(root: string): Project {
@@ -47,9 +56,11 @@ function createProject(root: string): Project {
     activeFileContent: null,
     mode: "conversation",
     conversation: createEmptyConversation(),
-    git: { branch: null, fileStatuses: new Map(), isGitRepo: false },
+    git: { branch: null, fileStatuses: new Map(), dirtyDirs: new Set(), isGitRepo: false },
     fileIndex: { files: [], lastIndexed: 0, isLoading: false },
     hasUnreadCompletion: false,
+    terminalTabs: [],
+    activeTerminalTabId: null,
   };
 }
 
@@ -110,16 +121,26 @@ interface ProjectsState {
   addConversationMessage: (projectId: string, message: ConversationMessage) => void;
   updateLastAssistantContent: (projectId: string, content: ContentBlock[]) => void;
   appendToLastAssistantText: (projectId: string, text: string) => void;
+  appendToLastAssistantThinking: (projectId: string, thinking: string) => void;
+  setLastThinkingSignature: (projectId: string, signature: string) => void;
   setConversationSessionId: (projectId: string, sessionId: string) => void;
   setConversationProcessing: (projectId: string, isProcessing: boolean) => void;
   setConversationError: (projectId: string, error: string | null) => void;
   setLastMessageStreamingDone: (projectId: string) => void;
-  setLastAssistantMeta: (projectId: string, costUsd: number, durationMs: number) => void;
+  setLastAssistantMeta: (projectId: string, costUsd: number, durationMs: number, inputTokens?: number, outputTokens?: number, numTurns?: number) => void;
   clearConversation: (projectId: string) => void;
   setHasUnreadCompletion: (projectId: string, hasUnread: boolean) => void;
   restoreConversation: (projectId: string, messages: ConversationMessage[], sessionId: string | null) => void;
   setConversationTodos: (projectId: string, todos: import("../lib/claude-types").Todo[]) => void;
   setPendingPlanApproval: (projectId: string, pending: boolean) => void;
+  setIsPlanning: (projectId: string, isPlanning: boolean) => void;
+  updateLastToolUseInput: (projectId: string, input: Record<string, unknown>) => void;
+
+  // Terminal tabs
+  addTerminalTab: (projectId: string, tab: TerminalTab) => void;
+  removeTerminalTab: (projectId: string, tabId: string) => void;
+  setActiveTerminalTab: (projectId: string, tabId: string) => void;
+  markTerminalTabDead: (projectId: string, tabId: string) => void;
 }
 
 function updateProject(
@@ -293,7 +314,7 @@ function createProjectsStore() {
   reorderProjects: (fromIndex, toIndex) =>
     set((state) => {
       const next = [...state.projectOrder];
-      const [moved] = next.splice(fromIndex, 1);
+      const [moved] = next.splice(fromIndex, 1) as [string];
       next.splice(toIndex, 0, moved);
       return { projectOrder: next };
     }),
@@ -301,9 +322,21 @@ function createProjectsStore() {
   // Git
   setGitStatus: (projectId, branch, fileStatuses, isGitRepo) =>
     set((state) =>
-      updateProject(state, projectId, () => ({
-        git: { branch, fileStatuses, isGitRepo },
-      })),
+      updateProject(state, projectId, () => {
+        // Pre-compute set of all ancestor directories that contain changes
+        const dirtyDirs = new Set<string>();
+        for (const filePath of fileStatuses.keys()) {
+          let dir = filePath;
+          while (true) {
+            const slash = dir.lastIndexOf("/");
+            if (slash <= 0) break;
+            dir = dir.slice(0, slash);
+            if (dirtyDirs.has(dir)) break; // ancestors already added
+            dirtyDirs.add(dir);
+          }
+        }
+        return { git: { branch, fileStatuses, dirtyDirs, isGitRepo } };
+      }),
     ),
 
   // File index
@@ -373,6 +406,48 @@ function createProjectsStore() {
       }),
     ),
 
+  appendToLastAssistantThinking: (projectId, thinking) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => {
+        const msgs = [...p.conversation.messages];
+        const last = msgs[msgs.length - 1];
+        if (last && last.type === "assistant") {
+          const blocks = [...last.content];
+          const lastBlock = blocks[blocks.length - 1];
+          if (lastBlock && lastBlock.type === "thinking") {
+            blocks[blocks.length - 1] = {
+              ...lastBlock,
+              thinking: (lastBlock as { type: "thinking"; thinking: string }).thinking + thinking,
+            };
+          } else {
+            blocks.push({ type: "thinking", thinking });
+          }
+          msgs[msgs.length - 1] = { ...last, content: blocks };
+        }
+        return { conversation: { ...p.conversation, messages: msgs } };
+      }),
+    ),
+
+  setLastThinkingSignature: (projectId, signature) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => {
+        const msgs = [...p.conversation.messages];
+        const last = msgs[msgs.length - 1];
+        if (last && last.type === "assistant") {
+          const blocks = [...last.content];
+          for (let i = blocks.length - 1; i >= 0; i--) {
+            const block = blocks[i]!;
+            if (block.type === "thinking") {
+              blocks[i] = { ...block, signature };
+              break;
+            }
+          }
+          msgs[msgs.length - 1] = { ...last, content: blocks };
+        }
+        return { conversation: { ...p.conversation, messages: msgs } };
+      }),
+    ),
+
   setConversationSessionId: (projectId, sessionId) =>
     set((state) =>
       updateProject(state, projectId, (p) => ({
@@ -406,13 +481,13 @@ function createProjectsStore() {
       }),
     ),
 
-  setLastAssistantMeta: (projectId, costUsd, durationMs) =>
+  setLastAssistantMeta: (projectId, costUsd, durationMs, inputTokens, outputTokens, numTurns) =>
     set((state) =>
       updateProject(state, projectId, (p) => {
         const msgs = [...p.conversation.messages];
         for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].type === "assistant") {
-            msgs[i] = { ...msgs[i], costUsd, durationMs };
+          if (msgs[i]!.type === "assistant") {
+            msgs[i] = { ...msgs[i]!, costUsd, durationMs, inputTokens, outputTokens, numTurns };
             break;
           }
         }
@@ -448,6 +523,32 @@ function createProjectsStore() {
       })),
     ),
 
+  setIsPlanning: (projectId, isPlanning) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => ({
+        conversation: { ...p.conversation, isPlanning },
+      })),
+    ),
+
+  updateLastToolUseInput: (projectId, input) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => {
+        const msgs = [...p.conversation.messages];
+        const last = msgs[msgs.length - 1];
+        if (last && last.type === "assistant") {
+          const blocks = [...last.content];
+          for (let i = blocks.length - 1; i >= 0; i--) {
+            if (blocks[i]!.type === "tool_use") {
+              blocks[i] = { ...blocks[i]!, input } as ToolUseBlock;
+              break;
+            }
+          }
+          msgs[msgs.length - 1] = { ...last, content: blocks };
+        }
+        return { conversation: { ...p.conversation, messages: msgs } };
+      }),
+    ),
+
   restoreConversation: (projectId, messages, sessionId) =>
     set((state) =>
       updateProject(state, projectId, () => ({
@@ -455,10 +556,48 @@ function createProjectsStore() {
           messages,
           sessionId,
           isProcessing: false,
+          isPlanning: false,
           error: null,
           todos: [],
           pendingPlanApproval: false,
         },
+      })),
+    ),
+
+  // Terminal tabs
+  addTerminalTab: (projectId, tab) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => ({
+        terminalTabs: [...p.terminalTabs, tab],
+        activeTerminalTabId: tab.id,
+      })),
+    ),
+
+  removeTerminalTab: (projectId, tabId) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => {
+        const tabs = p.terminalTabs.filter((t) => t.id !== tabId);
+        let activeId = p.activeTerminalTabId;
+        if (activeId === tabId) {
+          activeId = tabs.length > 0 ? tabs[tabs.length - 1]!.id : null;
+        }
+        return { terminalTabs: tabs, activeTerminalTabId: activeId };
+      }),
+    ),
+
+  setActiveTerminalTab: (projectId, tabId) =>
+    set((state) =>
+      updateProject(state, projectId, () => ({
+        activeTerminalTabId: tabId,
+      })),
+    ),
+
+  markTerminalTabDead: (projectId, tabId) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => ({
+        terminalTabs: p.terminalTabs.map((t) =>
+          t.id === tabId ? { ...t, isAlive: false } : t,
+        ),
       })),
     ),
 }));

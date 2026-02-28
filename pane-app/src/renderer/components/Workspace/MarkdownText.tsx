@@ -1,8 +1,10 @@
+import { memo, useMemo } from "react";
 import type React from "react";
 
 /**
  * Lightweight markdown renderer — zero dependencies.
- * Handles code fences, inline code, bold, italic, headings, lists, and horizontal rules.
+ * Handles code fences, inline code, bold, italic, links, headings,
+ * blockquotes, tables, lists, and horizontal rules.
  * Anything unrecognized renders as literal text.
  *
  * All sizes scale with --pane-font-size CSS variable (Cmd+/- adjustable).
@@ -10,12 +12,32 @@ import type React from "react";
 
 interface MarkdownTextProps {
   text: string;
+  isStreaming?: boolean;
 }
 
-export function MarkdownText({ text }: MarkdownTextProps) {
-  const blocks = parseBlocks(text);
+export const MarkdownText = memo(function MarkdownText({ text, isStreaming }: MarkdownTextProps) {
+  // During streaming, skip markdown parsing entirely — parseBlocks runs O(n)
+  // regex passes over the full accumulated text on every frame. For long messages
+  // (summaries, plans), this exceeds 16ms and freezes the app.
+  // Raw text renders in O(1). Full markdown parses once when streaming ends.
+  const blocks = useMemo(
+    () => isStreaming ? null : parseBlocks(text),
+    [text, isStreaming],
+  );
+
+  if (isStreaming || !blocks) {
+    return (
+      <p
+        className="text-pane-text leading-[1.75] whitespace-pre-wrap mb-5"
+        style={{ fontSize: "var(--pane-font-size)", maxWidth: "65ch" }}
+      >
+        {text}
+      </p>
+    );
+  }
+
   return <>{blocks.map((block, i) => renderBlock(block, i))}</>;
-}
+});
 
 // --- Block-level parsing ---
 
@@ -24,6 +46,8 @@ type Block =
   | { type: "heading"; level: number; content: string }
   | { type: "hr" }
   | { type: "list"; ordered: boolean; items: string[] }
+  | { type: "blockquote"; content: string }
+  | { type: "table"; headers: string[]; rows: string[][] }
   | { type: "paragraph"; content: string };
 
 function parseBlocks(text: string): Block[] {
@@ -32,16 +56,16 @@ function parseBlocks(text: string): Block[] {
   let i = 0;
 
   while (i < lines.length) {
-    const line = lines[i];
+    const line = lines[i]!;
 
     // Code fence
     const fenceMatch = line.match(/^```(\w*)/);
     if (fenceMatch) {
-      const lang = fenceMatch[1] || "";
+      const lang = fenceMatch[1] ?? "";
       const codeLines: string[] = [];
       i++;
-      while (i < lines.length && !lines[i].startsWith("```")) {
-        codeLines.push(lines[i]);
+      while (i < lines.length && !lines[i]!.startsWith("```")) {
+        codeLines.push(lines[i]!);
         i++;
       }
       if (i < lines.length) i++; // skip closing ```
@@ -61,22 +85,51 @@ function parseBlocks(text: string): Block[] {
     if (headingMatch) {
       blocks.push({
         type: "heading",
-        level: headingMatch[1].length,
-        content: headingMatch[2],
+        level: headingMatch[1]!.length,
+        content: headingMatch[2]!,
       });
       i++;
+      continue;
+    }
+
+    // Table — line starts with | and next line is separator (|---|---|)
+    if (
+      line.startsWith("|") &&
+      i + 1 < lines.length &&
+      /^\|[-:\s|]+\|$/.test(lines[i + 1]!)
+    ) {
+      const headerCells = line.split("|").slice(1, -1).map((c) => c.trim());
+      i += 2; // skip header + separator
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i]!.startsWith("|")) {
+        const cells = lines[i]!.split("|").slice(1, -1).map((c) => c.trim());
+        rows.push(cells);
+        i++;
+      }
+      blocks.push({ type: "table", headers: headerCells, rows });
+      continue;
+    }
+
+    // Blockquote
+    if (line.startsWith("> ") || line === ">") {
+      const quoteLines: string[] = [];
+      while (i < lines.length && (lines[i]!.startsWith("> ") || lines[i]! === ">")) {
+        quoteLines.push(lines[i]!.replace(/^>\s?/, ""));
+        i++;
+      }
+      blocks.push({ type: "blockquote", content: quoteLines.join("\n") });
       continue;
     }
 
     // List (unordered or ordered)
     const listMatch = line.match(/^(\s*)([-*]|\d+\.)\s/);
     if (listMatch) {
-      const ordered = /^\d+\./.test(listMatch[2]);
+      const ordered = /^\d+\./.test(listMatch[2]!);
       const items: string[] = [];
       while (i < lines.length) {
-        const lm = lines[i].match(/^(\s*)([-*]|\d+\.)\s+(.*)/);
+        const lm = lines[i]!.match(/^(\s*)([-*]|\d+\.)\s+(.*)/);
         if (!lm) break;
-        items.push(lm[3]);
+        items.push(lm[3]!);
         i++;
       }
       blocks.push({ type: "list", ordered, items });
@@ -92,13 +145,15 @@ function parseBlocks(text: string): Block[] {
     // Paragraph — collect consecutive non-empty, non-special lines
     const paraLines: string[] = [];
     while (i < lines.length) {
-      const l = lines[i];
+      const l = lines[i]!;
       if (
         l.trim() === "" ||
         l.startsWith("```") ||
         /^#{1,4}\s/.test(l) ||
         /^(-{3,}|\*{3,}|_{3,})\s*$/.test(l) ||
-        /^\s*([-*]|\d+\.)\s/.test(l)
+        /^\s*([-*]|\d+\.)\s/.test(l) ||
+        /^>\s?/.test(l) ||
+        l.startsWith("|")
       ) {
         break;
       }
@@ -155,7 +210,7 @@ function renderBlock(block: Block, key: number) {
           className: "font-medium mt-5 mb-2 uppercase tracking-[0.05em]",
         },
       };
-      const s = styles[block.level] || styles[3];
+      const s = styles[block.level] ?? styles[3]!;
       return (
         <div
           key={key}
@@ -173,6 +228,60 @@ function renderBlock(block: Block, key: number) {
           key={key}
           className="border-none border-t border-pane-border/30 my-8"
         />
+      );
+
+    case "blockquote":
+      return (
+        <div
+          key={key}
+          className="my-4 pl-4 border-l-2 border-pane-text-secondary/20"
+        >
+          <p
+            className="text-pane-text-secondary leading-[1.75] italic"
+            style={{ fontSize: "var(--pane-font-size)" }}
+          >
+            {renderInline(block.content)}
+          </p>
+        </div>
+      );
+
+    case "table":
+      return (
+        <div key={key} className="my-6 overflow-x-auto">
+          <table
+            className="w-full font-mono border-collapse"
+            style={{ fontSize: "calc(var(--pane-font-size) - 1px)" }}
+          >
+            <thead>
+              <tr>
+                {block.headers.map((h, j) => (
+                  <th
+                    key={j}
+                    className="text-left text-pane-text-secondary/70 font-medium
+                               px-3 py-1.5 border-b border-pane-border/40"
+                  >
+                    {renderInline(h)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {block.rows.map((row, ri) => (
+                <tr key={ri}>
+                  {row.map((cell, ci) => (
+                    <td
+                      key={ci}
+                      className="text-pane-text/80 px-3 py-1.5
+                                 border-b border-pane-border/20"
+                    >
+                      {renderInline(cell)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       );
 
     case "list": {
@@ -210,6 +319,7 @@ function renderBlock(block: Block, key: number) {
 
 // --- Emoji stripping ---
 
+// eslint-disable-next-line no-misleading-character-class -- intentional Unicode range for emoji stripping
 const emojiPattern = /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]+/gu;
 
 function stripEmojis(text: string): string {
@@ -221,8 +331,8 @@ function stripEmojis(text: string): string {
 function renderInline(text: string): (string | React.JSX.Element)[] {
   const cleaned = stripEmojis(text);
   const parts: (string | React.JSX.Element)[] = [];
-  // Match: `code`, **bold**, *italic*
-  const regex = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+  // Match: [link](url), `code`, **bold**, *italic*
+  const regex = /(\[[^\]]+\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -235,7 +345,24 @@ function renderInline(text: string): (string | React.JSX.Element)[] {
     const token = match[0];
     const key = `inline-${match.index}`;
 
-    if (token.startsWith("`")) {
+    if (token.startsWith("[")) {
+      const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      if (linkMatch) {
+        parts.push(
+          <a
+            key={key}
+            href={linkMatch[2]}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-pane-terminal hover:text-pane-terminal/80
+                       underline underline-offset-2
+                       decoration-pane-terminal/30 hover:decoration-pane-terminal/60"
+          >
+            {linkMatch[1]}
+          </a>,
+        );
+      }
+    } else if (token.startsWith("`")) {
       parts.push(
         <code
           key={key}
