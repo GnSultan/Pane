@@ -145,7 +145,12 @@ function App() {
         case "font-size-increase": {
           const { activeProjectId, projects } = useProjectsStore.getState();
           const project = activeProjectId ? projects.get(activeProjectId) : undefined;
-          if (project?.mode === "viewer") {
+          const target = e.target as HTMLElement;
+          const isInPanel = target.closest('[data-panel="control"]');
+
+          if (isInPanel) {
+            useWorkspaceStore.getState().increasePanelFontSize();
+          } else if (project?.mode === "viewer") {
             useWorkspaceStore.getState().increaseEditorFontSize();
           } else {
             useWorkspaceStore.getState().increaseFontSize();
@@ -155,7 +160,12 @@ function App() {
         case "font-size-decrease": {
           const { activeProjectId, projects } = useProjectsStore.getState();
           const project = activeProjectId ? projects.get(activeProjectId) : undefined;
-          if (project?.mode === "viewer") {
+          const target = e.target as HTMLElement;
+          const isInPanel = target.closest('[data-panel="control"]');
+
+          if (isInPanel) {
+            useWorkspaceStore.getState().decreasePanelFontSize();
+          } else if (project?.mode === "viewer") {
             useWorkspaceStore.getState().decreaseEditorFontSize();
           } else {
             useWorkspaceStore.getState().decreaseFontSize();
@@ -165,7 +175,12 @@ function App() {
         case "font-size-reset": {
           const { activeProjectId, projects } = useProjectsStore.getState();
           const project = activeProjectId ? projects.get(activeProjectId) : undefined;
-          if (project?.mode === "viewer") {
+          const target = e.target as HTMLElement;
+          const isInPanel = target.closest('[data-panel="control"]');
+
+          if (isInPanel) {
+            useWorkspaceStore.getState().resetPanelFontSize();
+          } else if (project?.mode === "viewer") {
             useWorkspaceStore.getState().resetEditorFontSize();
           } else {
             useWorkspaceStore.getState().resetFontSize();

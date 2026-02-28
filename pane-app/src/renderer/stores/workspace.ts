@@ -29,6 +29,7 @@ interface WorkspaceState {
   fontWeight: number;
   keybindings: Partial<Record<ActionId, KeyBinding>> | null;
   theme: Theme;
+  completionSound: string; // "none" | system sound name | custom file path
   toggleControlPanel: () => void;
   setControlPanelWidth: (width: number) => void;
   toggleFuzzyFinder: () => void;
@@ -57,6 +58,8 @@ interface WorkspaceState {
   setKeybindingsRaw: (kb: Partial<Record<ActionId, KeyBinding>> | null) => void;
   toggleTheme: () => void;
   setTheme: (theme: Theme) => void;
+  setCompletionSound: (sound: string) => void;
+  playCompletionSound: () => void;
 }
 
 function applyFontSize(size: number) {
@@ -96,6 +99,7 @@ function createWorkspaceStore() {
   fontWeight: DEFAULT_FONT_WEIGHT,
   keybindings: null,
   theme: "system" as Theme,
+  completionSound: "none",
   toggleControlPanel: () =>
     set((state) => ({
       controlPanelVisible: !state.controlPanelVisible,
@@ -205,6 +209,12 @@ function createWorkspaceStore() {
   setTheme: (theme: Theme) => {
     applyTheme(theme);
     return set({ theme });
+  },
+  setCompletionSound: (sound: string) => set({ completionSound: sound }),
+  playCompletionSound: () => {
+    const { completionSound } = useWorkspaceStore.getState();
+    if (completionSound === "none") return;
+    window.electronAPI.invoke("play_sound", { sound: completionSound });
   },
 }));
 }

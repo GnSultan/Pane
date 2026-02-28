@@ -317,6 +317,9 @@ export function Settings({ onClose }: SettingsProps) {
   const editorFontSize = useWorkspaceStore((s) => s.editorFontSize);
   const fontWeight = useWorkspaceStore((s) => s.fontWeight);
   const setTheme = useWorkspaceStore((s) => s.setTheme);
+  const completionSound = useWorkspaceStore((s) => s.completionSound);
+  const setCompletionSound = useWorkspaceStore((s) => s.setCompletionSound);
+  const playCompletionSound = useWorkspaceStore((s) => s.playCompletionSound);
 
   // Close on Escape (only if not recording a keybinding — capture handler takes priority)
   useEffect(() => {
@@ -415,6 +418,42 @@ export function Settings({ onClose }: SettingsProps) {
               onReset={() => useWorkspaceStore.getState().resetFontWeight()}
               unit=""
             />
+          </SettingRow>
+
+          <SettingRow label="completion sound">
+            <div className="flex gap-1">
+              <select
+                value={completionSound}
+                onChange={(e) => setCompletionSound(e.target.value)}
+                className="px-3 py-1 rounded font-mono bg-pane-surface text-pane-text border border-pane-border/50 hover:border-pane-border outline-none"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+              >
+                <option value="none">none</option>
+                <option value="Basso">basso</option>
+                <option value="Blow">blow</option>
+                <option value="Bottle">bottle</option>
+                <option value="Frog">frog</option>
+                <option value="Funk">funk</option>
+                <option value="Glass">glass</option>
+                <option value="Hero">hero</option>
+                <option value="Morse">morse</option>
+                <option value="Ping">ping</option>
+                <option value="Pop">pop</option>
+                <option value="Purr">purr</option>
+                <option value="Sosumi">sosumi</option>
+                <option value="Submarine">submarine</option>
+                <option value="Tink">tink</option>
+              </select>
+              <button
+                onClick={playCompletionSound}
+                disabled={completionSound === "none"}
+                className="px-3 py-1 rounded font-mono text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04] disabled:opacity-30 disabled:cursor-default"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+                title="Test sound"
+              >
+                ▶
+              </button>
+            </div>
           </SettingRow>
         </div>
 

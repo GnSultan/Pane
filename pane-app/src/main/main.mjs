@@ -397,6 +397,16 @@ function registerCommandHandlers() {
   ipcMain.handle("reveal_in_finder", (_event, args) => {
     shell.showItemInFolder(args.path);
   });
+  ipcMain.handle("play_sound", async (_event, args) => {
+    const { sound } = args;
+    if (sound === "none") return;
+    const soundPath = `/System/Library/Sounds/${sound}.aiff`;
+    try {
+      await execFileAsync("afplay", [soundPath]);
+    } catch (error) {
+      console.error("Sound playback failed:", error);
+    }
+  });
   ipcMain.handle("set_window_title", (_event, args) => {
     const win = BrowserWindow.getFocusedWindow();
     if (win) win.setTitle(args.title);

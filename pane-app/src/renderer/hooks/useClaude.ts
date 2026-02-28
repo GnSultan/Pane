@@ -1,5 +1,6 @@
 import { useCallback, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
+import { useWorkspaceStore } from "../stores/workspace";
 import { sendToClaude, abortClaude } from "../lib/tauri-commands";
 import type {
   ClaudeStreamEvent,
@@ -292,6 +293,17 @@ function handleClaudeMessage(
           store.updateLastAssistantContent(projectId, finalContent);
         }
         store.setLastMessageStreamingDone(projectId);
+
+        // Auto-clear todos if all completed
+        if (project) {
+          const todos = project.conversation.todos;
+          if (todos.length > 0 && todos.every((t) => t.status === "completed")) {
+            store.setConversationTodos(projectId, []);
+          }
+        }
+
+        // Play completion sound
+        useWorkspaceStore.getState().playCompletionSound();
       } else {
         const assistantMsg: ConversationMessage = {
           id: nextMessageId(),

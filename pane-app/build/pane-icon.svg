@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <style>
+      .bg {
+        fill: rgba(28, 27, 26, 0.85);
+      }
+      .circle-gradient {
+        fill: url(#circleGradient);
+      }
+    </style>
+    <linearGradient id="circleGradient" x1="312" y1="512" x2="712" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9D9A93"/>
+      <stop offset=".2" stop-color="#8A877F"/>
+      <stop offset=".4" stop-color="#6A6762"/>
+      <stop offset=".6" stop-color="#4A4742"/>
+      <stop offset=".8" stop-color="#33312E"/>
+      <stop offset="1" stop-color="#242320"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background with transparency for vibrancy -->
+  <rect class="bg" width="1024" height="1024" rx="226.27" ry="226.27"/>
+
+  <!-- Circle gradient - adjusted to be visible on both light and dark -->
+  <path class="circle-gradient" d="M512,312c-110.46,0-200,89.54-200,200s89.54,200,200,200,200-89.54,200-200-89.54-200-200-200ZM615.11,615.11c-27.64,27.63-64.39,42.86-103.11,42.86s-75.47-15.23-103.11-42.86c-27.63-27.64-42.86-64.39-42.86-103.11s15.23-75.47,42.86-103.11c27.64-27.63,64.39-42.86,103.11-42.86s75.47,15.23,103.11,42.86c27.63,27.64,42.86,64.39,42.86,103.11s-15.23,75.47-42.86,103.11Z"/>
+</svg>

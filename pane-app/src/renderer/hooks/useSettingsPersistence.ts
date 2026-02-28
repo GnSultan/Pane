@@ -90,6 +90,9 @@ export function useSettingsPersistence() {
         if (settings.panel_width) {
           useWorkspaceStore.getState().setControlPanelWidth(settings.panel_width);
         }
+        if (settings.completion_sound) {
+          useWorkspaceStore.getState().setCompletionSound(settings.completion_sound);
+        }
 
         const { addProject, setActiveProject, toggleDir } =
           useProjectsStore.getState();
@@ -181,7 +184,7 @@ export function useSettingsPersistence() {
       // app reload, HMR, or StrictMode double-mount cleanup.
       if (!settingsLoaded) return;
 
-      const { controlPanelVisible, controlPanelWidth, fontSize, panelFontSize, editorFontSize, fontWeight, keybindings, theme } = useWorkspaceStore.getState();
+      const { controlPanelVisible, controlPanelWidth, fontSize, panelFontSize, editorFontSize, fontWeight, keybindings, theme, completionSound } = useWorkspaceStore.getState();
       const { projects, activeProjectId, projectOrder } =
         useProjectsStore.getState();
 
@@ -220,6 +223,7 @@ export function useSettingsPersistence() {
         keybindings: keybindings ?? null,
         theme,
         panel_width: controlPanelWidth,
+        completion_sound: completionSound,
       }).catch(console.error);
     };
 
@@ -241,7 +245,8 @@ export function useSettingsPersistence() {
           state.keybindings !== prev.keybindings ||
           state.theme !== prev.theme ||
           state.controlPanelWidth !== prev.controlPanelWidth ||
-          state.controlPanelVisible !== prev.controlPanelVisible
+          state.controlPanelVisible !== prev.controlPanelVisible ||
+          state.completionSound !== prev.completionSound
         ) {
           debouncedSave();
         }

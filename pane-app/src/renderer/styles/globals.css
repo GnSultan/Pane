@@ -20,6 +20,8 @@
   /* Animations - fast and subtle for lightest IDE */
   --animate-fadeSlideUp: fadeSlideUp 0.12s ease-out;
   --animate-pressScale: pressScale 0.08s ease-out;
+  --animate-fadeIn: fadeIn 1.5s ease-out;
+  --animate-fadeOut: fadeOut 1.5s ease-out forwards;
   --animate-circle-pulse: circle-pulse 2.5s ease-in-out infinite;
   --animate-dot-1: orbit-1 3s ease-in-out infinite;
   --animate-dot-2: orbit-2 3.2s ease-in-out 0.1s infinite;
@@ -40,6 +42,24 @@
     to {
       opacity: 1;
       transform: translateY(0);
+    }
+  }
+
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes fadeOut {
+    0% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
     }
   }
 
@@ -399,4 +419,45 @@ html, body, #root {
 .ace_search.ace_selected {
   background-color: var(--pane-editor-search-match-active) !important;
   border: 1px solid var(--pane-editor-search-match-active-border) !important;
+}
+
+/* Markdown syntax - monochromatic, no bright blues */
+.ace_markup.ace_heading {
+  color: var(--pane-syn-keyword) !important;
+  font-weight: 600 !important;
+}
+
+.ace_markup.ace_list {
+  color: var(--pane-syn-operator) !important;
+}
+
+.ace_link,
+.ace_url {
+  color: var(--pane-syn-string) !important;
+  text-decoration: none !important;
+}
+
+.ace_markup.ace_underline {
+  text-decoration: none !important;
+  color: var(--pane-syn-string) !important;
+}
+
+.ace_strong {
+  font-weight: 600 !important;
+  color: var(--pane-text) !important;
+}
+
+.ace_emphasis {
+  font-style: italic !important;
+  color: var(--pane-text) !important;
+}
+
+.ace_blockquote {
+  color: var(--pane-syn-comment) !important;
+  font-style: italic !important;
+}
+
+.ace_code {
+  color: var(--pane-syn-number) !important;
+  background-color: transparent !important;
 }

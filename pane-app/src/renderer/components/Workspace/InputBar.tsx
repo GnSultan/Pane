@@ -23,6 +23,7 @@ function isConversationVisible(): boolean {
 export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarProps) {
   const [value, setValue] = useState("");
   const [todoPanelOpen, setTodoPanelOpen] = useState(false);
+  const [isFadingOut, setIsFadingOut] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const todos = useProjectsStore(
     useShallow((s) => s.projects.get(projectId)?.conversation.todos ?? EMPTY_TODOS)
@@ -34,6 +35,19 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
     (s) => s.projects.get(projectId)?.conversation.isPlanning ?? false
   );
   const [planRejected, setPlanRejected] = useState(false);
+
+  // Handle graceful fadeout of processing indicator
+  useEffect(() => {
+    if (!isProcessing && !isFadingOut) {
+      // Start fadeout
+      setIsFadingOut(true);
+      // Clear fadeout state after animation completes
+      const timer = setTimeout(() => setIsFadingOut(false), 1500);
+      return () => clearTimeout(timer);
+    } else if (isProcessing) {
+      setIsFadingOut(false);
+    }
+  }, [isProcessing, isFadingOut]);
   // Auto-focus when not processing — but only if conversation mode is active
   useEffect(() => {
     if (!isProcessing && textareaRef.current && isConversationVisible()) {
@@ -94,8 +108,8 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
 
   return (
     <div className="shrink-0 px-4 pt-2">
-      {isProcessing && !pendingPlanApproval && (
-        <div className="flex items-center gap-3 px-2 pb-3 animate-fadeSlideUp">
+      {(isProcessing || isFadingOut) && !pendingPlanApproval && (
+        <div className={`flex items-center gap-3 px-2 pb-3 ${isFadingOut ? 'animate-fadeOut' : 'animate-fadeIn'}`}>
           <svg
             width="24"
             height="24"

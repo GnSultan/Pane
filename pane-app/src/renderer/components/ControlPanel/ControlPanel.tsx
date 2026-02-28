@@ -5,12 +5,13 @@ import { GitStatus } from "./GitStatus";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 
-// --- Inline SVG icons (16x16, stroke-based, currentColor) ---
+// --- Inline SVG icons (16x16, outlined, unified) ---
+// Pane design language: consistent 1.5px stroke, simple geometry, harmonious system
 
-function SparkleIcon() {
+function ConversationIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-      <path d="M8 1C8.5 4.5 11.5 7.5 15 8C11.5 8.5 8.5 11.5 8 15C7.5 11.5 4.5 8.5 1 8C4.5 7.5 7.5 4.5 8 1Z" />
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="8" r="5" />
     </svg>
   );
 }
@@ -18,8 +19,8 @@ function SparkleIcon() {
 function FileIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M9 1.5H4.5A1 1 0 003.5 2.5v11a1 1 0 001 1h7a1 1 0 001-1V5L9 1.5z" />
-      <polyline points="9 1.5 9 5 12.5 5" />
+      <rect x="4" y="2.5" width="8" height="11" rx="0.5" />
+      <path d="M6.5 6h3M6.5 9h3" />
     </svg>
   );
 }
@@ -28,7 +29,7 @@ function SearchIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="7" cy="7" r="4" />
-      <line x1="10" y1="10" x2="14" y2="14" />
+      <path d="M10 10l3.5 3.5" />
     </svg>
   );
 }
@@ -36,19 +37,19 @@ function SearchIcon() {
 function SettingsIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="8" cy="8" r="2" />
-      <path d="M6.83 2.17a.5.5 0 0 1 .49-.4h1.36a.5.5 0 0 1 .49.4l.2 1.18a4.5 4.5 0 0 1 1.09.63l1.12-.38a.5.5 0 0 1 .58.2l.68 1.18a.5.5 0 0 1-.1.6l-.92.8a4.5 4.5 0 0 1 0 1.24l.92.8a.5.5 0 0 1 .1.6l-.68 1.18a.5.5 0 0 1-.58.2l-1.12-.38a4.5 4.5 0 0 1-1.09.63l-.2 1.18a.5.5 0 0 1-.49.4H7.32a.5.5 0 0 1-.49-.4l-.2-1.18a4.5 4.5 0 0 1-1.09-.63l-1.12.38a.5.5 0 0 1-.58-.2l-.68-1.18a.5.5 0 0 1 .1-.6l.92-.8a4.5 4.5 0 0 1 0-1.24l-.92-.8a.5.5 0 0 1-.1-.6l.68-1.18a.5.5 0 0 1 .58-.2l1.12.38a4.5 4.5 0 0 1 1.09-.63l.2-1.18z" />
+      <circle cx="8" cy="8" r="2.5" />
+      <path d="M8 2v2M8 12v2M14 8h-2M4 8H2" />
     </svg>
   );
 }
 
-function GitBranchIcon() {
+function GitIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="5" cy="4" r="1.5" />
-      <circle cx="5" cy="12" r="1.5" />
-      <circle cx="11" cy="6" r="1.5" />
-      <path d="M5 5.5v5M9.5 6c-1.5 0-4.5 1-4.5 4" />
+      <circle cx="4" cy="4" r="1.5" />
+      <circle cx="4" cy="12" r="1.5" />
+      <circle cx="12" cy="8" r="1.5" />
+      <path d="M4 5.5v5M5.5 8H12" />
     </svg>
   );
 }
@@ -56,8 +57,8 @@ function GitBranchIcon() {
 function TerminalIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M2 3.5h12v9H2z" />
-      <path d="M4.5 6.5l2 1.5-2 1.5M8 9.5h3" />
+      <path d="M3 5.5l3 2.5-3 2.5" />
+      <path d="M8 10.5h5" />
     </svg>
   );
 }
@@ -76,10 +77,10 @@ function ToolbarButton({ icon, active, disabled, onClick }: {
       disabled={disabled}
       className={`w-7 h-7 flex items-center justify-center rounded
         ${disabled
-          ? "text-pane-text-secondary/25 cursor-default"
+          ? "text-pane-text-secondary opacity-30 cursor-default"
           : active
             ? "text-pane-text bg-pane-text/[0.08]"
-            : "text-pane-text-secondary/60 hover:text-pane-text-secondary hover:bg-pane-text/[0.04]"
+            : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04]"
         }`}
     >
       {icon}
@@ -134,7 +135,11 @@ export function ControlPanel() {
   }, []);
 
   return (
-    <div className="no-select flex flex-col h-full bg-pane-surface rounded-lg font-panel">
+    <div
+      className="no-select flex flex-col h-full bg-pane-surface rounded-lg font-panel outline-none"
+      data-panel="control"
+      tabIndex={0}
+    >
       {/* Spacer for macOS traffic lights — enough room so they sit inside the panel */}
       <div className="h-12 shrink-0" />
 
@@ -153,7 +158,7 @@ export function ControlPanel() {
       {/* Toolbar */}
       <div className="h-9 flex items-center gap-1 px-2 border-t border-pane-border shrink-0">
         <ToolbarButton
-          icon={<SparkleIcon />}
+          icon={<ConversationIcon />}
           active={mode === "conversation"}
           onClick={() => handleSetMode("conversation")}
         />
@@ -164,21 +169,21 @@ export function ControlPanel() {
           onClick={() => handleSetMode("viewer")}
         />
         <ToolbarButton
-          icon={<TerminalIcon />}
-          active={mode === "terminal"}
-          onClick={() => handleSetMode("terminal")}
-        />
-        <ToolbarButton
           icon={<SearchIcon />}
           onClick={() => useWorkspaceStore.getState().toggleFuzzyFinder()}
         />
         {isGitRepo && (
           <ToolbarButton
-            icon={<GitBranchIcon />}
+            icon={<GitIcon />}
             active={gitPanelActive}
             onClick={toggleGit}
           />
         )}
+        <ToolbarButton
+          icon={<TerminalIcon />}
+          active={mode === "terminal"}
+          onClick={() => handleSetMode("terminal")}
+        />
         <div className="ml-auto">
           <ToolbarButton
             icon={<SettingsIcon />}
