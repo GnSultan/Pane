@@ -208,15 +208,30 @@ function ExpandedReadInput({ input }: { input: Record<string, unknown> }) {
 
 function ExpandedBashInput({ input }: { input: Record<string, unknown> }) {
   const cmd = (input.command as string) || "";
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(cmd).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    }).catch(() => {});
+  };
+
   return (
-    <div
-      className="font-mono border border-pane-border bg-pane-bg leading-[1.6]"
+    <button
+      onClick={handleCopy}
+      className="w-full text-left font-mono border border-pane-border bg-pane-bg leading-[1.6]
+                 hover:bg-pane-text/[0.02] transition-colors group"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
+      title="click to copy"
     >
-      <pre className="px-2.5 py-1.5 text-pane-text-secondary whitespace-pre-wrap break-words">
-        $ {cmd}
+      <pre className="px-2.5 py-1.5 text-pane-text-secondary whitespace-pre-wrap break-words flex items-start justify-between gap-2">
+        <span>$ {cmd}</span>
+        <span className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-pane-text-secondary/50">
+          {copied ? "✓" : "copy"}
+        </span>
       </pre>
-    </div>
+    </button>
   );
 }
 
@@ -286,8 +301,8 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
   // 4. Read/Bash/Grep/Glob/Search → always collapsed (quiet unless clicked)
   // 5. Everything else → collapsed by default
 
-  const alwaysExpanded = ["Edit", "Write"];
-  const alwaysCollapsed = ["Read", "Bash", "Grep", "Glob", "WebSearch", "Task"];
+  const alwaysExpanded = ["Edit", "Write", "Bash"];
+  const alwaysCollapsed = ["Read", "Grep", "Glob", "WebSearch", "Task"];
 
   const expanded = userToggle !== null
     ? userToggle

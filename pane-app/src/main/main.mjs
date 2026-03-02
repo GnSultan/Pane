@@ -129,12 +129,25 @@ function registerClaudeHandlers() {
   });
   ipcMain.handle("update_claude", async () => {
     try {
-      const { stdout, stderr } = await execFileAsync("npm", ["install", "-g", "--force", "@anthropic-ai/claude-code@latest"], { timeout: 120000, env: getEnvWithPath() });
-      const output = stdout + stderr;
-      const success = !output.toLowerCase().includes("npm error");
-      return { success, output, error: null };
+      const env = getEnvWithPath();
+
+      // Find where claude is globally installed
+      const { stdout: prefixOut } = await execFileAsync("npm", ["root", "-g"], { env, timeout: 10000 });
+      const globalRoot = prefixOut.trim(); // e.g. /Users/x/.nvm/.../lib/node_modules
+      const pkgDir = path.join(globalRoot, "@anthropic-ai", "claude-code");
+
+      // Remove existing install directory — npm ENOTEMPTY prevents in-place upgrade
+      await fs.promises.rm(pkgDir, { recursive: true, force: true });
+
+      // Fresh install
+      const { stdout, stderr } = await execFileAsync(
+        "npm", ["install", "-g", "@anthropic-ai/claude-code@latest"],
+        { timeout: 120000, env }
+      );
+      return { success: true, output: stdout + stderr, error: null };
     } catch (error) {
-      return { success: false, output: error.stdout || "", error: error.message };
+      const output = (error.stdout || "") + (error.stderr || "");
+      return { success: false, output, error: error.message };
     }
   });
 }

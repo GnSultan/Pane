@@ -48,7 +48,10 @@ export function Conversation({ projectId }: ConversationProps) {
   const { sendMessage, abortMessage } = useClaude(projectId);
   useClaudeWarmup(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const isAtBottomRef = useRef(true);
+  // true = follow new messages; false = user scrolled up, leave them alone
+  const followRef = useRef(true);
+  // distinguish programmatic scrolls from user-initiated ones
+  const programmaticScrollRef = useRef(false);
 
   // Count only system messages (tool results) — text streaming doesn't change this
   const systemMessageCount = useMemo(
@@ -72,49 +75,52 @@ export function Conversation({ projectId }: ConversationProps) {
     return map;
   }, [systemMessageCount]);
 
-  // Track scroll position — passive so it never blocks compositor scrolling
-  // Larger threshold (100px) makes it easier to "break free" from auto-scroll during streaming
+  // Track scroll — if user scrolled up, stop following; if they scroll back to bottom, resume
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const handleScroll = () => {
+      if (programmaticScrollRef.current) return;
       const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-      isAtBottomRef.current = distanceFromBottom < 100;
+      followRef.current = distanceFromBottom < 80;
     };
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
   }, []);
 
-  // Auto-scroll when messages change — only if user hasn't scrolled up
-  // Respects user control: scrolling up by 100px+ disables auto-scroll
+  // Auto-scroll when messages change — only if following
   const scrollRafRef = useRef(0);
   useEffect(() => {
-    if (isAtBottomRef.current && scrollRef.current) {
-      cancelAnimationFrame(scrollRafRef.current);
-      scrollRafRef.current = requestAnimationFrame(() => {
-        if (scrollRef.current) {
-          scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-        }
-      });
-    }
+    if (!followRef.current || !scrollRef.current) return;
+    cancelAnimationFrame(scrollRafRef.current);
+    scrollRafRef.current = requestAnimationFrame(() => {
+      if (!scrollRef.current) return;
+      programmaticScrollRef.current = true;
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+    });
   }, [messages]);
 
-  // Scroll to bottom when this conversation becomes active
+  // Scroll to bottom when this conversation becomes active or on initial mount
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const isActive = activeProjectId === projectId;
 
   useEffect(() => {
-    if (isActive && scrollRef.current) {
-      const scroll = () => {
-        if (scrollRef.current) {
-          scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-          isAtBottomRef.current = true;
-        }
-      };
-      scroll();
-      requestAnimationFrame(scroll);
-    }
-  }, [isActive]);
+    if (!isActive || !isReady) return;
+    const scrollToBottom = () => {
+      if (scrollRef.current) {
+        programmaticScrollRef.current = true;
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        followRef.current = true;
+        requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+      }
+    };
+    // Double rAF: first ensures layout, second ensures paint + message DOM is ready
+    requestAnimationFrame(() => {
+      scrollToBottom();
+      requestAnimationFrame(scrollToBottom);
+    });
+  }, [isActive, isReady, projectId]);
 
   // Show loading state when Claude is initializing
   if (!isReady) {

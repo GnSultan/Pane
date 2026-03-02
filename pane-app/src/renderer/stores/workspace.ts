@@ -32,7 +32,7 @@ interface WorkspaceState {
   completionSound: string; // "none" | system sound name | custom file path
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
   claudeUpdateAvailable: boolean;
-  claudeUpdateState: 'available' | 'updating' | 'updated' | null;
+  claudeUpdateState: 'available' | 'updating' | 'updated' | 'restart' | null;
   claudeCurrentVersion: string | null;
   claudeNewVersion: string | null;
   checkForClaudeUpdate: () => Promise<void>;
@@ -138,9 +138,9 @@ function createWorkspaceStore() {
     const result = await updateClaude();
     if (result.success) {
       set({ claudeUpdateState: 'updated', claudeUpdateAvailable: false });
-      setTimeout(() => set({ claudeUpdateState: null }), 3000);
+      setTimeout(() => set({ claudeUpdateState: 'restart' }), 1500);
     } else {
-      // reset back to available so user can retry
+      // keep showing available so user can retry, but don't silently swallow the error
       set({ claudeUpdateState: 'available' });
     }
   },

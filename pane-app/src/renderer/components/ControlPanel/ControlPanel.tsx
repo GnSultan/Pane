@@ -75,7 +75,7 @@ function ToolbarButton({ icon, active, disabled, onClick }: {
     <button
       onClick={onClick}
       disabled={disabled}
-      className={`w-7 h-7 flex items-center justify-center rounded
+      className={`w-7 h-7 flex items-center justify-center rounded-xl
         ${disabled
           ? "text-pane-text-secondary opacity-30 cursor-default"
           : active
@@ -136,7 +136,7 @@ export function ControlPanel() {
 
   return (
     <div
-      className="no-select flex flex-col h-full bg-pane-bg rounded-lg font-panel outline-none ring-1 ring-pane-border/40"
+      className="no-select flex flex-col h-full bg-pane-bg rounded-3xl font-panel outline-none ring-1 ring-pane-border/40"
       data-panel="control"
       tabIndex={0}
     >

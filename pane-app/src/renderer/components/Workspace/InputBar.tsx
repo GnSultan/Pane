@@ -289,7 +289,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
 
       {/* The unified card — textarea body + toolbar strip */}
       {!pendingPlanApproval && (
-        <div className="bg-pane-bg rounded-2xl ring-1 ring-pane-border/40">
+        <div className="bg-pane-bg rounded-3xl ring-1 ring-pane-border/40 overflow-hidden">
           {/* Writing area */}
           <textarea
             ref={textareaRef}
@@ -299,13 +299,13 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
             placeholder={isProcessing ? "" : planRejected ? "what should change..." : "write to claude..."}
             className="w-full bg-transparent text-pane-text font-mono
                        resize-none outline-none placeholder:text-pane-text-secondary
-                       leading-[1.75] px-5 pt-4 pb-3 min-h-[96px] max-h-[40vh] overflow-y-auto rounded-t-2xl"
+                       leading-[1.75] px-5 pt-4 pb-3 min-h-[96px] max-h-[40vh] overflow-y-auto"
             style={{ fontSize: "var(--pane-font-size)" }}
           />
 
           {/* Toolbar strip */}
           <div
-            className="h-9 flex items-center px-2 border-t border-pane-border shrink-0 bg-transparent rounded-b-2xl font-mono text-pane-text-secondary"
+            className="h-9 flex items-center px-2 border-t border-pane-border shrink-0 bg-transparent font-mono text-pane-text-secondary"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
             <div className="flex-1" />
@@ -323,6 +323,15 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
             )}
             {claudeUpdateState === 'updated' && (
               <span className="mr-5">updated</span>
+            )}
+            {claudeUpdateState === 'restart' && (
+              <button
+                onClick={() => window.location.reload()}
+                className="flex items-center gap-1.5 hover:text-pane-text btn-press transition-colors mr-5"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
+                restart
+              </button>
             )}
             <ModelPicker value={selectedModel} onChange={setSelectedModel} />
           </div>
