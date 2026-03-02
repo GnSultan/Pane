@@ -12,7 +12,6 @@ interface InputBarProps {
   onSend: (message: string) => void;
   onAbort: () => void;
   isProcessing: boolean;
-  onUpdateClick: () => void;
 }
 
 function isConversationVisible(): boolean {
@@ -55,9 +54,7 @@ function ModelPicker({
     <div ref={containerRef} className="relative">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1 font-mono text-pane-text-secondary
-                   hover:text-pane-text transition-colors btn-press select-none"
-        style={{ fontSize: "var(--pane-font-size-sm)" }}
+        className="flex items-center gap-1 hover:text-pane-text transition-colors btn-press select-none"
       >
         {current?.label.toLowerCase()}
         <svg
@@ -105,7 +102,7 @@ function ModelPicker({
   );
 }
 
-export function InputBar({ projectId, onSend, onAbort, isProcessing, onUpdateClick }: InputBarProps) {
+export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarProps) {
   const [value, setValue] = useState("");
   const [todoPanelOpen, setTodoPanelOpen] = useState(false);
   const [isFadingOut, setIsFadingOut] = useState(false);
@@ -122,7 +119,8 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing, onUpdateCli
   );
   const selectedModel = useWorkspaceStore((s) => s.selectedModel);
   const setSelectedModel = useWorkspaceStore((s) => s.setSelectedModel);
-  const claudeUpdateAvailable = useWorkspaceStore((s) => s.claudeUpdateAvailable);
+  const claudeUpdateState = useWorkspaceStore((s) => s.claudeUpdateState);
+  const triggerClaudeUpdate = useWorkspaceStore((s) => s.triggerClaudeUpdate);
 
   const [planRejected, setPlanRejected] = useState(false);
 
@@ -301,29 +299,31 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing, onUpdateCli
             placeholder={isProcessing ? "" : planRejected ? "what should change..." : "write to claude..."}
             className="w-full bg-transparent text-pane-text font-mono
                        resize-none outline-none placeholder:text-pane-text-secondary
-                       leading-[1.75] px-5 pt-4 pb-3 min-h-[96px] max-h-[40vh] overflow-y-auto"
+                       leading-[1.75] px-5 pt-4 pb-3 min-h-[96px] max-h-[40vh] overflow-y-auto rounded-t-2xl"
             style={{ fontSize: "var(--pane-font-size)" }}
           />
 
-          {/* Toolbar strip — separated by border like panel toolbar */}
-          <div className="h-9 flex items-center px-2 border-t border-pane-border shrink-0 bg-transparent">
-            {/* Left: update alert when available */}
-            {claudeUpdateAvailable && (
+          {/* Toolbar strip */}
+          <div
+            className="h-9 flex items-center px-2 border-t border-pane-border shrink-0 bg-transparent rounded-b-2xl font-mono text-pane-text-secondary"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            <div className="flex-1" />
+            {claudeUpdateState === 'available' && (
               <button
-                onClick={onUpdateClick}
-                className="flex items-center gap-1.5 font-mono text-pane-text-secondary
-                           hover:text-pane-text btn-press transition-colors"
-                style={{ fontSize: "var(--pane-font-size-sm)" }}
+                onClick={() => triggerClaudeUpdate()}
+                className="flex items-center gap-1.5 hover:text-pane-text btn-press transition-colors mr-5"
               >
                 <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0" />
                 update available
               </button>
             )}
-
-            {/* Spacer */}
-            <div className="flex-1" />
-
-            {/* Right: model picker */}
+            {claudeUpdateState === 'updating' && (
+              <span className="mr-5">updating...</span>
+            )}
+            {claudeUpdateState === 'updated' && (
+              <span className="mr-5">updated</span>
+            )}
             <ModelPicker value={selectedModel} onChange={setSelectedModel} />
           </div>
         </div>

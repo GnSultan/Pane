@@ -107,37 +107,31 @@ function registerClaudeHandlers() {
     }
   });
   ipcMain.handle("check_claude_update", async () => {
-    console.log("[Pane Main] Checking for Claude update...");
     try {
-      const { stdout, stderr } = await execFileAsync("claude", ["update"], { timeout: 30000 });
-      const output = stdout + stderr;
-      console.log("[Pane Main] Claude update output:", output);
-      const currentMatch = output.match(/Current version:\s*([\d.]+)/);
-      const newMatch = output.match(/New version available:\s*([\d.]+)/);
-      console.log("[Pane Main] Current match:", currentMatch?.[1], "New match:", newMatch?.[1]);
-      if (newMatch && currentMatch) {
-        const result = {
-          updateAvailable: true,
-          currentVersion: currentMatch[1],
-          newVersion: newMatch[1],
-          error: null
-        };
-        console.log("[Pane Main] Update available, returning:", result);
-        return result;
+      // Get current version from claude --version
+      const { stdout: versionOut } = await execFileAsync("claude", ["--version"]);
+      const currentMatch = versionOut.trim().match(/^([\d.]+)/);
+      const current = currentMatch?.[1] ?? null;
+
+      // Get latest version from npm registry (no install, just metadata)
+      const { stdout: npmOut } = await execFileAsync("npm", ["show", "@anthropic-ai/claude-code", "version"], { timeout: 15000, env: getEnvWithPath() });
+      const latest = npmOut.trim() || null;
+
+      if (!current || !latest) {
+        return { updateAvailable: false, currentVersion: current, newVersion: null, error: null };
       }
-      const result = { updateAvailable: false, currentVersion: currentMatch?.[1] || null, newVersion: null, error: null };
-      console.log("[Pane Main] No update, returning:", result);
-      return result;
+
+      const updateAvailable = latest !== current;
+      return { updateAvailable, currentVersion: current, newVersion: updateAvailable ? latest : null, error: null };
     } catch (error) {
-      console.error("[Pane Main] Error checking update:", error);
       return { updateAvailable: false, currentVersion: null, newVersion: null, error: error.message };
     }
   });
   ipcMain.handle("update_claude", async () => {
     try {
-      const { stdout, stderr } = await execFileAsync("claude", ["update"], { timeout: 120000 });
+      const { stdout, stderr } = await execFileAsync("npm", ["install", "-g", "--force", "@anthropic-ai/claude-code@latest"], { timeout: 120000, env: getEnvWithPath() });
       const output = stdout + stderr;
-      const success = !output.includes("Error:") && !output.includes("Failed");
+      const success = !output.toLowerCase().includes("npm error");
       return { success, output, error: null };
     } catch (error) {
       return { success: false, output: error.stdout || "", error: error.message };
@@ -145,6 +139,30 @@ function registerClaudeHandlers() {
   });
 }
 const execFileAsync = promisify(execFile);
+
+// Build a PATH that includes common tool locations Electron strips out
+function getEnvWithPath() {
+  const home = os.homedir();
+  // Add all nvm node version bin dirs
+  const nvmVersionsDir = path.join(home, ".nvm", "versions", "node");
+  const nvmBins = [];
+  try {
+    const versions = fs.readdirSync(nvmVersionsDir);
+    for (const v of versions) {
+      nvmBins.push(path.join(nvmVersionsDir, v, "bin"));
+    }
+  } catch {}
+  const extra = [
+    ...nvmBins,
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/usr/bin",
+    "/bin",
+  ];
+  const existing = process.env.PATH || "";
+  const combined = [...extra, ...existing.split(":")].filter(Boolean).join(":");
+  return { ...process.env, PATH: combined };
+}
 function registerCommandHandlers() {
   ipcMain.handle("read_directory", async (_event, args) => {
     const dirEntries = await fs.promises.readdir(args.path, {

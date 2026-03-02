@@ -32,9 +32,11 @@ interface WorkspaceState {
   completionSound: string; // "none" | system sound name | custom file path
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
   claudeUpdateAvailable: boolean;
+  claudeUpdateState: 'available' | 'updating' | 'updated' | null;
   claudeCurrentVersion: string | null;
   claudeNewVersion: string | null;
   checkForClaudeUpdate: () => Promise<void>;
+  triggerClaudeUpdate: () => Promise<void>;
   toggleControlPanel: () => void;
   setControlPanelWidth: (width: number) => void;
   toggleFuzzyFinder: () => void;
@@ -108,27 +110,38 @@ function createWorkspaceStore() {
   completionSound: "none",
   selectedModel: "opus",
   claudeUpdateAvailable: false,
+  claudeUpdateState: null,
   claudeCurrentVersion: null,
   claudeNewVersion: null,
   checkForClaudeUpdate: async () => {
-    console.log("[Pane] Checking for Claude updates...");
     const { checkClaudeUpdate } = await import("../lib/tauri-commands");
     const result = await checkClaudeUpdate();
-    console.log("[Pane] Update check result:", result);
     if (!result.error && result.updateAvailable) {
-      console.log("[Pane] Update available! Setting state...");
       set({
         claudeUpdateAvailable: true,
+        claudeUpdateState: 'available',
         claudeCurrentVersion: result.currentVersion,
         claudeNewVersion: result.newVersion,
       });
     } else {
-      console.log("[Pane] No update available or error:", result.error);
       set({
         claudeUpdateAvailable: false,
+        claudeUpdateState: null,
         claudeCurrentVersion: result.currentVersion,
         claudeNewVersion: null,
       });
+    }
+  },
+  triggerClaudeUpdate: async () => {
+    set({ claudeUpdateState: 'updating' });
+    const { updateClaude } = await import("../lib/tauri-commands");
+    const result = await updateClaude();
+    if (result.success) {
+      set({ claudeUpdateState: 'updated', claudeUpdateAvailable: false });
+      setTimeout(() => set({ claudeUpdateState: null }), 3000);
+    } else {
+      // reset back to available so user can retry
+      set({ claudeUpdateState: 'available' });
     }
   },
   toggleControlPanel: () =>

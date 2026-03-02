@@ -164,10 +164,10 @@ export function FileViewer() {
         showPrintMargin={false}
         showGutter={false}
         highlightActiveLine={false}
+        enableBasicAutocompletion={true}
+        enableLiveAutocompletion={false}
+        enableSnippets={false}
         setOptions={{
-          enableBasicAutocompletion: true,
-          enableLiveAutocompletion: false,
-          enableSnippets: false,
           showLineNumbers: false,
           tabSize: 2,
           useWorker: false,
