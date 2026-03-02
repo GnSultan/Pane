@@ -30,6 +30,11 @@ interface WorkspaceState {
   keybindings: Partial<Record<ActionId, KeyBinding>> | null;
   theme: Theme;
   completionSound: string; // "none" | system sound name | custom file path
+  selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
+  claudeUpdateAvailable: boolean;
+  claudeCurrentVersion: string | null;
+  claudeNewVersion: string | null;
+  checkForClaudeUpdate: () => Promise<void>;
   toggleControlPanel: () => void;
   setControlPanelWidth: (width: number) => void;
   toggleFuzzyFinder: () => void;
@@ -60,6 +65,7 @@ interface WorkspaceState {
   setTheme: (theme: Theme) => void;
   setCompletionSound: (sound: string) => void;
   playCompletionSound: () => void;
+  setSelectedModel: (model: string) => void;
 }
 
 function applyFontSize(size: number) {
@@ -100,6 +106,31 @@ function createWorkspaceStore() {
   keybindings: null,
   theme: "system" as Theme,
   completionSound: "none",
+  selectedModel: "opus",
+  claudeUpdateAvailable: false,
+  claudeCurrentVersion: null,
+  claudeNewVersion: null,
+  checkForClaudeUpdate: async () => {
+    console.log("[Pane] Checking for Claude updates...");
+    const { checkClaudeUpdate } = await import("../lib/tauri-commands");
+    const result = await checkClaudeUpdate();
+    console.log("[Pane] Update check result:", result);
+    if (!result.error && result.updateAvailable) {
+      console.log("[Pane] Update available! Setting state...");
+      set({
+        claudeUpdateAvailable: true,
+        claudeCurrentVersion: result.currentVersion,
+        claudeNewVersion: result.newVersion,
+      });
+    } else {
+      console.log("[Pane] No update available or error:", result.error);
+      set({
+        claudeUpdateAvailable: false,
+        claudeCurrentVersion: result.currentVersion,
+        claudeNewVersion: null,
+      });
+    }
+  },
   toggleControlPanel: () =>
     set((state) => ({
       controlPanelVisible: !state.controlPanelVisible,
@@ -216,6 +247,7 @@ function createWorkspaceStore() {
     if (completionSound === "none") return;
     (window as any).electronAPI.invoke("play_sound", { sound: completionSound });
   },
+  setSelectedModel: (model: string) => set({ selectedModel: model }),
 }));
 }
 

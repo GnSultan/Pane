@@ -119,6 +119,7 @@ export interface UserSettings {
   theme: string | null;
   panel_width: number | null;
   completion_sound: string | null;
+  selected_model: string | null;
 }
 
 export async function loadSettings(): Promise<UserSettings> {
@@ -136,6 +137,7 @@ export async function sendToClaude(
   prompt: string,
   workingDir: string,
   sessionId: string | null,
+  model: string | null,
   onEvent: (event: ClaudeStreamEvent) => void,
 ): Promise<void> {
   // Self-cleaning listener — stays active until processEnded or error
@@ -180,6 +182,7 @@ export async function sendToClaude(
       prompt,
       workingDir,
       sessionId,
+      model,
     });
   } catch (err) {
     port1.close();
@@ -229,4 +232,34 @@ export function onPtyExit(ptyId: string, cb: (info: { exitCode: number }) => voi
 
 export async function getClaudePlanInfo(): Promise<string | null> {
   return electronAPI.invoke("get_claude_plan_info");
+}
+
+export interface ClaudeVersionInfo {
+  current: string | null;
+  error: string | null;
+}
+
+export interface ClaudeUpdateInfo {
+  updateAvailable: boolean;
+  currentVersion: string | null;
+  newVersion: string | null;
+  error: string | null;
+}
+
+export interface ClaudeUpdateResult {
+  success: boolean;
+  output: string;
+  error: string | null;
+}
+
+export async function checkClaudeVersion(): Promise<ClaudeVersionInfo> {
+  return electronAPI.invoke("check_claude_version");
+}
+
+export async function checkClaudeUpdate(): Promise<ClaudeUpdateInfo> {
+  return electronAPI.invoke("check_claude_update");
+}
+
+export async function updateClaude(): Promise<ClaudeUpdateResult> {
+  return electronAPI.invoke("update_claude");
 }

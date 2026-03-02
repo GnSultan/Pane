@@ -196,11 +196,13 @@ export function useClaude(projectId: string) {
       };
 
       try {
+        const selectedModel = useWorkspaceStore.getState().selectedModel;
         await sendToClaude(
           projectId,
           prompt,
           project.root,
           sessionId,
+          selectedModel,
           handleEvent,
         );
       } catch (err) {

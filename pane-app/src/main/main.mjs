@@ -81,10 +81,10 @@ function getClaudeWorker() {
 }
 function registerClaudeHandlers() {
   ipcMain.handle("send_to_claude", async (_event, args) => {
-    const { projectId, prompt, workingDir, sessionId } = args;
+    const { projectId, prompt, workingDir, sessionId, model } = args;
     const worker = getClaudeWorker();
     activeProjectIds.add(projectId);
-    worker.postMessage({ type: "spawn", projectId, prompt, workingDir, sessionId });
+    worker.postMessage({ type: "spawn", projectId, prompt, workingDir, sessionId, model });
   });
   ipcMain.handle("abort_claude", async (_event, args) => {
     if (claudeWorker && !claudeWorker.killed) {
@@ -94,6 +94,53 @@ function registerClaudeHandlers() {
   ipcMain.handle("terminate_claude_session", async (_event, args) => {
     if (claudeWorker && !claudeWorker.killed) {
       claudeWorker.postMessage({ type: "terminate", projectId: args.projectId });
+    }
+  });
+  ipcMain.handle("check_claude_version", async () => {
+    try {
+      const { stdout } = await execFileAsync("claude", ["--version"]);
+      const versionMatch = stdout.trim().match(/^([\d.]+)/);
+      if (!versionMatch) return { current: null, error: "Could not parse version" };
+      return { current: versionMatch[1], error: null };
+    } catch (error) {
+      return { current: null, error: error.message };
+    }
+  });
+  ipcMain.handle("check_claude_update", async () => {
+    console.log("[Pane Main] Checking for Claude update...");
+    try {
+      const { stdout, stderr } = await execFileAsync("claude", ["update"], { timeout: 30000 });
+      const output = stdout + stderr;
+      console.log("[Pane Main] Claude update output:", output);
+      const currentMatch = output.match(/Current version:\s*([\d.]+)/);
+      const newMatch = output.match(/New version available:\s*([\d.]+)/);
+      console.log("[Pane Main] Current match:", currentMatch?.[1], "New match:", newMatch?.[1]);
+      if (newMatch && currentMatch) {
+        const result = {
+          updateAvailable: true,
+          currentVersion: currentMatch[1],
+          newVersion: newMatch[1],
+          error: null
+        };
+        console.log("[Pane Main] Update available, returning:", result);
+        return result;
+      }
+      const result = { updateAvailable: false, currentVersion: currentMatch?.[1] || null, newVersion: null, error: null };
+      console.log("[Pane Main] No update, returning:", result);
+      return result;
+    } catch (error) {
+      console.error("[Pane Main] Error checking update:", error);
+      return { updateAvailable: false, currentVersion: null, newVersion: null, error: error.message };
+    }
+  });
+  ipcMain.handle("update_claude", async () => {
+    try {
+      const { stdout, stderr } = await execFileAsync("claude", ["update"], { timeout: 120000 });
+      const output = stdout + stderr;
+      const success = !output.includes("Error:") && !output.includes("Failed");
+      return { success, output, error: null };
+    } catch (error) {
+      return { success: false, output: error.stdout || "", error: error.message };
     }
   });
 }

@@ -65,6 +65,11 @@ function App() {
   useGitStatus();
   useSettingsPersistence();
 
+  // Check for Claude updates on app launch
+  useEffect(() => {
+    useWorkspaceStore.getState().checkForClaudeUpdate();
+  }, []);
+
   // Listen for settings open event (from toolbar button)
   useEffect(() => {
     const handler = () => setSettingsOpen(true);

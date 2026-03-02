@@ -93,6 +93,9 @@ export function useSettingsPersistence() {
         if (settings.completion_sound) {
           useWorkspaceStore.getState().setCompletionSound(settings.completion_sound);
         }
+        if (settings.selected_model) {
+          useWorkspaceStore.getState().setSelectedModel(settings.selected_model);
+        }
 
         const { addProject, setActiveProject, toggleDir } =
           useProjectsStore.getState();
@@ -184,7 +187,7 @@ export function useSettingsPersistence() {
       // app reload, HMR, or StrictMode double-mount cleanup.
       if (!settingsLoaded) return;
 
-      const { controlPanelVisible, controlPanelWidth, fontSize, panelFontSize, editorFontSize, fontWeight, keybindings, theme, completionSound } = useWorkspaceStore.getState();
+      const { controlPanelVisible, controlPanelWidth, fontSize, panelFontSize, editorFontSize, fontWeight, keybindings, theme, completionSound, selectedModel } = useWorkspaceStore.getState();
       const { projects, activeProjectId, projectOrder } =
         useProjectsStore.getState();
 
@@ -224,6 +227,7 @@ export function useSettingsPersistence() {
         theme,
         panel_width: controlPanelWidth,
         completion_sound: completionSound,
+        selected_model: selectedModel,
       }).catch(console.error);
     };
 
@@ -246,7 +250,8 @@ export function useSettingsPersistence() {
           state.theme !== prev.theme ||
           state.controlPanelWidth !== prev.controlPanelWidth ||
           state.controlPanelVisible !== prev.controlPanelVisible ||
-          state.completionSound !== prev.completionSound
+          state.completionSound !== prev.completionSound ||
+          state.selectedModel !== prev.selectedModel
         ) {
           debouncedSave();
         }

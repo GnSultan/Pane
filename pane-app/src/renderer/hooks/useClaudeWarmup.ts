@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
+import { useWorkspaceStore } from "../stores/workspace";
 import { sendToClaude } from "../lib/tauri-commands";
 import type { ClaudeStreamEvent, ClaudeStreamMessage } from "../lib/claude-types";
 
@@ -79,11 +80,13 @@ export function useClaudeWarmup(projectId: string) {
 
       try {
         // Send a minimal warmup message
+        const selectedModel = useWorkspaceStore.getState().selectedModel;
         await sendToClaude(
           projectId,
           "ready",
           project.root,
           null,
+          selectedModel,
           handleEvent,
         );
       } catch (err) {

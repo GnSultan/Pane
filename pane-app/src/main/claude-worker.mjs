@@ -18,7 +18,7 @@ function sendToMain(message) {
   process.parentPort.postMessage(message);
 }
 
-function handleSpawn({ projectId, prompt, workingDir, sessionId }) {
+function handleSpawn({ projectId, prompt, workingDir, sessionId, model }) {
   const cmdParts = [
     "claude",
     "-p",
@@ -33,6 +33,9 @@ function handleSpawn({ projectId, prompt, workingDir, sessionId }) {
     "--append-system-prompt",
     `For non-trivial tasks, present a brief plan FIRST and end with: "Ready to proceed — send 'go' to start." Wait for the user to confirm before making changes. For simple tasks (quick fixes, single-file edits, questions), just do them directly.`
   ];
+  if (model) {
+    cmdParts.push("--model", model);
+  }
   if (sessionId) {
     cmdParts.push("--resume", sessionId);
   }
@@ -44,7 +47,11 @@ function handleSpawn({ projectId, prompt, workingDir, sessionId }) {
   const child = spawn("/bin/zsh", ["-c", fullCmd], {
     cwd: workingDir,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env }
+    env: {
+      ...process.env,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-4-6",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4-6",
+    }
   });
 
   activeProcesses.set(projectId, child);
