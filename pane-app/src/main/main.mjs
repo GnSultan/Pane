@@ -732,7 +732,7 @@ function createWindow() {
   });
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
-    // DevTools available with Cmd+Alt+I in development
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
     mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   }

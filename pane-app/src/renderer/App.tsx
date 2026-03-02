@@ -252,7 +252,7 @@ function App() {
             <ResizeHandle />
           </>
         )}
-        <div className="flex-1 min-w-0 pr-2">
+        <div className="flex-1 min-w-0 pr-2 h-full">
           <Workspace />
         </div>
       </div>

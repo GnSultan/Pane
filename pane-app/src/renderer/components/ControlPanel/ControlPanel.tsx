@@ -136,7 +136,7 @@ export function ControlPanel() {
 
   return (
     <div
-      className="no-select flex flex-col h-full bg-pane-surface rounded-lg font-panel outline-none"
+      className="no-select flex flex-col h-full bg-pane-surface rounded-lg font-panel outline-none ring-1 ring-pane-border/40"
       data-panel="control"
       tabIndex={0}
     >

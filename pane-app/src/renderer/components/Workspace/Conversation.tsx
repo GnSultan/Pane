@@ -10,6 +10,7 @@ const EMPTY_MESSAGES: ConversationMessage[] = [];
 
 interface ConversationProps {
   projectId: string;
+  onUpdateClick: () => void;
 }
 
 const MemoizedMessage = memo(function MemoizedMessage({
@@ -37,7 +38,7 @@ const MemoizedMessage = memo(function MemoizedMessage({
   return true;
 });
 
-export function Conversation({ projectId }: ConversationProps) {
+export function Conversation({ projectId, onUpdateClick }: ConversationProps) {
   const messages = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.messages ?? EMPTY_MESSAGES
   );
@@ -145,8 +146,8 @@ export function Conversation({ projectId }: ConversationProps) {
   }
 
   return (
-    <div className="flex flex-col h-full w-full animate-in fade-in duration-500">
-      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 px-10 py-8" style={{ willChange: "transform" }}>
+    <div className="relative h-full w-full animate-in fade-in duration-500">
+      <div ref={scrollRef} className="absolute inset-0 overflow-y-auto px-10 pt-8 pb-48" style={{ willChange: "transform" }}>
         {messages.length === 0 && (
           <div className="flex items-center justify-center h-full select-none">
             <span
@@ -175,12 +176,15 @@ export function Conversation({ projectId }: ConversationProps) {
         )}
       </div>
 
-      <InputBar
-        projectId={projectId}
-        onSend={sendMessage}
-        onAbort={abortMessage}
-        isProcessing={isProcessing}
-      />
+      <div className="absolute bottom-0 left-0 right-0">
+        <InputBar
+          projectId={projectId}
+          onSend={sendMessage}
+          onAbort={abortMessage}
+          isProcessing={isProcessing}
+          onUpdateClick={onUpdateClick}
+        />
+      </div>
     </div>
   );
 }

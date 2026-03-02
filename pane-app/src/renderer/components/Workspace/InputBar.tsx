@@ -12,6 +12,7 @@ interface InputBarProps {
   onSend: (message: string) => void;
   onAbort: () => void;
   isProcessing: boolean;
+  onUpdateClick: () => void;
 }
 
 function isConversationVisible(): boolean {
@@ -37,7 +38,6 @@ function ModelPicker({
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Close on outside click
   useEffect(() => {
     if (!open) return;
     const handler = (e: MouseEvent) => {
@@ -53,7 +53,6 @@ function ModelPicker({
 
   return (
     <div ref={containerRef} className="relative">
-      {/* Trigger */}
       <button
         onClick={() => setOpen((v) => !v)}
         className="flex items-center gap-1 font-mono text-pane-text-secondary
@@ -72,7 +71,6 @@ function ModelPicker({
         </svg>
       </button>
 
-      {/* Popover */}
       {open && (
         <div
           className="absolute bottom-full right-0 mb-2 py-1
@@ -107,11 +105,12 @@ function ModelPicker({
   );
 }
 
-export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarProps) {
+export function InputBar({ projectId, onSend, onAbort, isProcessing, onUpdateClick }: InputBarProps) {
   const [value, setValue] = useState("");
   const [todoPanelOpen, setTodoPanelOpen] = useState(false);
   const [isFadingOut, setIsFadingOut] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
   const todos = useProjectsStore(
     useShallow((s) => s.projects.get(projectId)?.conversation.todos ?? EMPTY_TODOS)
   );
@@ -121,30 +120,31 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
   const isPlanning = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.isPlanning ?? false
   );
-  const [planRejected, setPlanRejected] = useState(false);
   const selectedModel = useWorkspaceStore((s) => s.selectedModel);
   const setSelectedModel = useWorkspaceStore((s) => s.setSelectedModel);
+  const claudeUpdateAvailable = useWorkspaceStore((s) => s.claudeUpdateAvailable);
+
+  const [planRejected, setPlanRejected] = useState(false);
 
   // Handle graceful fadeout of processing indicator
   useEffect(() => {
     if (!isProcessing && !isFadingOut) {
-      // Start fadeout
       setIsFadingOut(true);
-      // Clear fadeout state after animation completes
       const timer = setTimeout(() => setIsFadingOut(false), 1500);
       return () => clearTimeout(timer);
     } else if (isProcessing) {
       setIsFadingOut(false);
     }
   }, [isProcessing, isFadingOut]);
-  // Auto-focus when not processing — but only if conversation mode is active
+
+  // Auto-focus when not processing
   useEffect(() => {
     if (!isProcessing && textareaRef.current && isConversationVisible()) {
       textareaRef.current.focus();
     }
   }, [isProcessing]);
 
-  // Listen for Cmd+K focus event
+  // Cmd+K focus
   useEffect(() => {
     const handler = () => {
       if (textareaRef.current && isConversationVisible()) {
@@ -155,7 +155,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
     return () => window.removeEventListener("pane:focus-input", handler);
   }, []);
 
-  // Auto-resize textarea to fit content
+  // Auto-resize textarea
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -196,19 +196,20 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
   }, [projectId]);
 
   return (
-    <div className="shrink-0 px-4 pt-2">
+    <div className="shrink-0 px-4 bg-transparent">
+
+      {/* Processing indicator — only exists when active, no reserved space */}
       {(isProcessing || isFadingOut) && !pendingPlanApproval && (
-        <div className={`flex items-center gap-3 px-2 pb-3 ${isFadingOut ? 'animate-fadeOut' : 'animate-fadeIn'}`}>
+        <div className={`flex items-center gap-3 px-1 pb-3 ${isFadingOut ? 'animate-fadeOut' : 'animate-fadeIn'}`}>
           <svg
-            width="24"
-            height="24"
+            width="20"
+            height="20"
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
             strokeWidth="1.5"
-            className="text-pane-text-secondary"
+            className="text-pane-text-secondary shrink-0"
           >
-            {/* The circle pulses - simple, minimal, Pane */}
             <circle
               cx="12"
               cy="12"
@@ -239,16 +240,17 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
           )}
           <button
             onClick={onAbort}
-            className="text-pane-text-secondary font-mono
-                       hover:text-pane-text ml-auto btn-press"
+            className="text-pane-text-secondary font-mono hover:text-pane-text ml-auto btn-press"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
             esc
           </button>
         </div>
       )}
+
+      {/* Plan approval */}
       {pendingPlanApproval && (
-        <div className="px-2 pb-3 animate-fadeSlideUp">
+        <div className="px-1 pb-3 animate-fadeSlideUp">
           <div className="flex items-center gap-3">
             <span
               className="text-pane-text font-mono"
@@ -274,8 +276,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
             </button>
             <button
               onClick={onAbort}
-              className="text-pane-text-secondary font-mono
-                         hover:text-pane-text ml-auto btn-press"
+              className="text-pane-text-secondary font-mono hover:text-pane-text ml-auto btn-press"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
               esc
@@ -283,11 +284,15 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
           </div>
         </div>
       )}
+
       {todoPanelOpen && todos.length > 0 && (
         <TodoPanel projectId={projectId} />
       )}
+
+      {/* The unified card — textarea body + toolbar strip */}
       {!pendingPlanApproval && (
-        <div className="bg-pane-surface rounded-xl border border-pane-border/20 relative">
+        <div className="bg-pane-bg rounded-2xl ring-1 ring-pane-border/40">
+          {/* Writing area */}
           <textarea
             ref={textareaRef}
             value={value}
@@ -296,10 +301,29 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
             placeholder={isProcessing ? "" : planRejected ? "what should change..." : "write to claude..."}
             className="w-full bg-transparent text-pane-text font-mono
                        resize-none outline-none placeholder:text-pane-text-secondary
-                       leading-[1.75] px-5 py-4 pb-12 min-h-[160px] max-h-[40vh] overflow-y-auto"
+                       leading-[1.75] px-5 pt-4 pb-3 min-h-[96px] max-h-[40vh] overflow-y-auto"
             style={{ fontSize: "var(--pane-font-size)" }}
           />
-          <div className="absolute bottom-3 right-4 flex items-center gap-2">
+
+          {/* Toolbar strip — separated by border like panel toolbar */}
+          <div className="h-9 flex items-center px-2 border-t border-pane-border shrink-0 bg-transparent">
+            {/* Left: update alert when available */}
+            {claudeUpdateAvailable && (
+              <button
+                onClick={onUpdateClick}
+                className="flex items-center gap-1.5 font-mono text-pane-text-secondary
+                           hover:text-pane-text btn-press transition-colors"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0" />
+                update available
+              </button>
+            )}
+
+            {/* Spacer */}
+            <div className="flex-1" />
+
+            {/* Right: model picker */}
             <ModelPicker value={selectedModel} onChange={setSelectedModel} />
           </div>
         </div>
