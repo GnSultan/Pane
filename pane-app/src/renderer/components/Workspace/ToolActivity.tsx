@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import type {
   ToolUseBlock,
   ToolResultBlock,
@@ -11,8 +11,6 @@ import type {
 interface ToolActivityProps {
   toolUse: ToolUseBlock;
   toolResult?: ToolResultBlock;
-  /** When true, keep expanded even after completion (parent controls collapse). */
-  forceExpanded?: boolean;
 }
 
 function shortenPath(fullPath: string): string {
@@ -38,7 +36,7 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
 
   switch (name) {
     case "Read":
-      return (input.file_path as string)?.split("/").pop() || "file";
+      return shortenPath((input.file_path as string) || "file");
     case "Edit":
       return (input.file_path as string)?.split("/").pop() || "file";
     case "Write":
@@ -269,21 +267,38 @@ function renderExpandedInput(name: string, input: Record<string, unknown>) {
   }
 }
 
-export function ToolActivity({ toolUse, toolResult, forceExpanded }: ToolActivityProps) {
+export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
-  const summary = summarizeTool(toolUse.name, toolUse.input);
+  // Capture summary on first render only — prevents shape-shifting when toolUse object updates
+  // Even if the toolUse reference changes, the summary stays frozen to what was first displayed
+  const summary = useMemo(
+    () => summarizeTool(toolUse.name, toolUse.input),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [] // Empty deps = compute once, never recompute
+  );
   const isComplete = !!toolResult;
+  const isFailed = toolResult?.is_error ?? false;
 
-  // Expand logic:
+  // Stable expansion rules - NO SHAPE-SHIFTING:
   // 1. User manually toggled → respect that always
-  // 2. forceExpanded from parent → keep open (last 3 tools)
-  // 3. Not complete yet → show expanded (in-progress)
-  // 4. Complete and not forced → collapse
+  // 2. Errors → always expanded (need immediate attention)
+  // 3. Edit/Write → always expanded (must see changes)
+  // 4. Read/Bash/Grep/Glob/Search → always collapsed (quiet unless clicked)
+  // 5. Everything else → collapsed by default
+
+  const alwaysExpanded = ["Edit", "Write"];
+  const alwaysCollapsed = ["Read", "Bash", "Grep", "Glob", "WebSearch", "Task"];
+
   const expanded = userToggle !== null
     ? userToggle
-    : forceExpanded || !isComplete;
+    : isFailed
+      ? true  // Errors always visible
+      : alwaysExpanded.includes(toolUse.name)
+        ? true  // Edit/Write always visible
+        : alwaysCollapsed.includes(toolUse.name)
+          ? false  // Read/Bash/Search always quiet
+          : false;  // Everything else defaults to collapsed
 
-  const isFailed = toolResult?.is_error ?? false;
   const label = getToolLabel(toolUse.name);
 
   const accentColor = isFailed ? "var(--pane-error)" : "var(--pane-terminal)";
@@ -326,7 +341,9 @@ export function ToolActivity({ toolUse, toolResult, forceExpanded }: ToolActivit
         >
           {renderExpandedInput(toolUse.name, toolUse.input)}
 
-          {toolResult && (
+          {/* Hide tool result for Edit/Write - the input already shows what changed.
+              Only show results for errors or tools where the output matters (Read, Bash, etc.) */}
+          {toolResult && !["Edit", "Write"].includes(toolUse.name) && (
             <pre
               className={`font-mono p-2.5 overflow-x-auto
                           max-h-[250px] overflow-y-auto border leading-[1.6]
@@ -341,6 +358,18 @@ export function ToolActivity({ toolUse, toolResult, forceExpanded }: ToolActivit
                 ? toolResult.content.length > 5000
                   ? toolResult.content.slice(0, 5000) + "\n... (truncated)"
                   : toolResult.content
+                : JSON.stringify(toolResult.content, null, 2)}
+            </pre>
+          )}
+          {/* Always show errors, even for Edit/Write */}
+          {toolResult?.is_error && ["Edit", "Write"].includes(toolUse.name) && (
+            <pre
+              className="font-mono p-2.5 overflow-x-auto max-h-[250px] overflow-y-auto border leading-[1.6]
+                         text-pane-error bg-[var(--pane-error-bg)] border-[var(--pane-error-border)]"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              {typeof toolResult.content === "string"
+                ? toolResult.content
                 : JSON.stringify(toolResult.content, null, 2)}
             </pre>
           )}
@@ -360,7 +389,12 @@ interface ServerToolActivityProps {
 export function ServerToolActivity({ block, searchResult }: ServerToolActivityProps) {
   const [expanded, setExpanded] = useState(false);
 
-  const query = (block.input?.query as string) || block.name;
+  // Capture query on first render only — prevents shape-shifting
+  const query = useMemo(
+    () => (block.input?.query as string) || block.name,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [] // Empty deps = compute once, never recompute
+  );
   const isComplete = !!searchResult;
   const isError =
     searchResult?.content &&

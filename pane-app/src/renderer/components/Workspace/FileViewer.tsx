@@ -138,7 +138,7 @@ export function FileViewer() {
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="h-10 flex items-center px-6 border-b border-pane-border/60 shrink-0">
+      <div className="h-5 flex items-center px-4 border-b border-pane-border/60 shrink-0">
         <span className="text-pane-text-secondary text-xs font-mono truncate flex-1 tracking-wide">
           {getFileName(activeFilePath)}
         </span>

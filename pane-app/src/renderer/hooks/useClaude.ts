@@ -35,12 +35,25 @@ let thinkingFlushRaf = 0;
 let pendingToolInput: Record<string, unknown> | null = null;
 let toolInputFlushRaf = 0;
 
+// rAF throttle for TodoWrite updates — ensures todos update smoothly during streaming
+// instead of batching all updates until the end.
+let pendingTodos: import("../lib/claude-types").Todo[] | null = null;
+let todosFlushRaf = 0;
+
 function flushToolInput(projectId: string) {
   if (pendingToolInput) {
     useProjectsStore.getState().updateLastToolUseInput(projectId, pendingToolInput);
     pendingToolInput = null;
   }
   toolInputFlushRaf = 0;
+}
+
+function flushTodos(projectId: string) {
+  if (pendingTodos) {
+    useProjectsStore.getState().setConversationTodos(projectId, pendingTodos);
+    pendingTodos = null;
+  }
+  todosFlushRaf = 0;
 }
 
 function flushTextDelta(projectId: string) {
@@ -247,6 +260,10 @@ function handleClaudeMessage(
       cancelAnimationFrame(toolInputFlushRaf);
       flushToolInput(projectId);
     }
+    if (pendingTodos) {
+      cancelAnimationFrame(todosFlushRaf);
+      flushTodos(projectId);
+    }
   }
 
   // Large messages (>100KB) are skipped in the worker to avoid structured clone freeze.
@@ -259,6 +276,11 @@ function handleClaudeMessage(
     case "system": {
       if (msg.subtype === "init" && msg.session_id) {
         store.setConversationSessionId(projectId, msg.session_id);
+        if (msg.model) {
+          store.setConversationModel(projectId, msg.model);
+        }
+        // Mark conversation as ready once we have the model
+        store.setConversationReady(projectId, true);
       }
       return assistantMessageExists;
     }
@@ -396,6 +418,10 @@ function handleClaudeMessage(
         if (pendingToolInput) {
           cancelAnimationFrame(toolInputFlushRaf);
           flushToolInput(projectId);
+        }
+        if (pendingTodos) {
+          cancelAnimationFrame(todosFlushRaf);
+          flushTodos(projectId);
         }
       }
 
@@ -548,8 +574,12 @@ function handleClaudeMessage(
                 .reverse()
                 .find((b) => b.type === "tool_use") as ToolUseBlock | undefined;
               if (lastTool?.name === "TodoWrite" && parsed.todos) {
+                // Throttle todo updates via rAF to prevent React 18 batching all updates
                 // Deep clone to ensure Zustand detects updates even within todo objects
-                store.setConversationTodos(projectId, parsed.todos.map((t: unknown) => ({ ...t })));
+                pendingTodos = (parsed.todos as import("../lib/claude-types").Todo[]).map(t => ({ ...t }));
+                if (!todosFlushRaf) {
+                  todosFlushRaf = requestAnimationFrame(() => flushTodos(projectId));
+                }
               }
             }
           }

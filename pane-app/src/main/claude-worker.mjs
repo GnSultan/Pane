@@ -192,6 +192,23 @@ function handleAbort({ projectId }) {
   }
 }
 
+function handleTerminate({ projectId }) {
+  // Graceful session termination (preserves sessionId, just kills the process)
+  const child = activeProcesses.get(projectId);
+  if (child?.pid) {
+    try {
+      process.kill(child.pid, "SIGTERM");
+      console.log(`[claude-worker] Terminated idle session for project ${projectId}`);
+    } catch (err) {
+      console.error(`[claude-worker] Failed to terminate ${projectId}:`, err);
+    }
+    setTimeout(() => {
+      try { process.kill(child.pid, "SIGKILL"); } catch {}
+    }, 2000);
+    activeProcesses.delete(projectId);
+  }
+}
+
 function handleShutdown() {
   for (const [, child] of activeProcesses) {
     try { process.kill(child.pid, "SIGKILL"); } catch {}
@@ -202,8 +219,9 @@ function handleShutdown() {
 
 process.parentPort.on("message", ({ data }) => {
   switch (data.type) {
-    case "spawn":    handleSpawn(data);    break;
-    case "abort":    handleAbort(data);    break;
-    case "shutdown": handleShutdown();     break;
+    case "spawn":     handleSpawn(data);     break;
+    case "abort":     handleAbort(data);     break;
+    case "terminate": handleTerminate(data); break;
+    case "shutdown":  handleShutdown();      break;
   }
 });

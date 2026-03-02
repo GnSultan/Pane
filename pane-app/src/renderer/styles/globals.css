@@ -112,6 +112,15 @@
       --circle-stroke-width: 2;
     }
   }
+
+  @keyframes breathe {
+    0%, 100% {
+      opacity: 0.96;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
 }
 
 :root {
@@ -123,7 +132,7 @@
   --pane-bg: #1C1B1A;
   --pane-surface: #242320;
   --pane-border: #4A4742;
-  --pane-text: #E8E5DE;
+  --pane-text: #D8D5CE;
   --pane-text-secondary: #A8A59E;
   --pane-font-weight: 400;
   --pane-font-size: 15px;

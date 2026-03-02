@@ -10,6 +10,36 @@ import type React from "react";
  * All sizes scale with --pane-font-size CSS variable (Cmd+/- adjustable).
  */
 
+// --- Emoji stripping ---
+
+// eslint-disable-next-line no-misleading-character-class -- intentional Unicode range for emoji stripping
+const emojiPattern = /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]+/gu;
+
+function stripEmojis(text: string): string {
+  return text.replace(emojiPattern, "").replace(/  +/g, " ").trim();
+}
+
+// --- Markdown marker stripping for streaming ---
+
+function stripMarkdownMarkers(text: string): string {
+  return text
+    // Remove heading markers: ### Heading → Heading
+    .replace(/^#{1,6}\s+/gm, "")
+    // Remove list markers: - item or * item → item
+    .replace(/^[\s]*[-*]\s+/gm, "")
+    // Remove numbered list markers: 1. item → item
+    .replace(/^[\s]*\d+\.\s+/gm, "")
+    // Remove blockquote markers: > quote → quote
+    .replace(/^>\s?/gm, "")
+    // Remove horizontal rules: ---, ***, ___
+    .replace(/^[-*_]{3,}\s*$/gm, "")
+    // Remove code fence markers: ``` → (just remove the backticks, keep the code)
+    .replace(/^```\w*$/gm, "")
+    // Clean up extra whitespace
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 interface MarkdownTextProps {
   text: string;
   isStreaming?: boolean;
@@ -20,18 +50,36 @@ export const MarkdownText = memo(function MarkdownText({ text, isStreaming }: Ma
   // regex passes over the full accumulated text on every frame. For long messages
   // (summaries, plans), this exceeds 16ms and freezes the app.
   // Raw text renders in O(1). Full markdown parses once when streaming ends.
+
+  // Memoize cleaning during streaming — strip emojis AND markdown markers
+  // This prevents visible transformation when streaming ends (### → styled heading, etc.)
+  const displayText = useMemo(
+    () => {
+      if (isStreaming) {
+        const noEmojis = stripEmojis(text);
+        const noMarkdown = stripMarkdownMarkers(noEmojis);
+        return noMarkdown;
+      }
+      return text;
+    },
+    [text, isStreaming]
+  );
+
   const blocks = useMemo(
-    () => isStreaming ? null : parseBlocks(text),
-    [text, isStreaming],
+    () => isStreaming ? null : parseBlocks(displayText),
+    [displayText, isStreaming],
   );
 
   if (isStreaming || !blocks) {
     return (
       <p
         className="text-pane-text leading-[1.75] whitespace-pre-wrap mb-5"
-        style={{ fontSize: "var(--pane-font-size)", maxWidth: "65ch" }}
+        style={{
+          fontSize: "var(--pane-font-size)",
+          maxWidth: "65ch",
+        }}
       >
-        {text}
+        {displayText}
       </p>
     );
   }
@@ -315,15 +363,6 @@ function renderBlock(block: Block, key: number) {
         </p>
       );
   }
-}
-
-// --- Emoji stripping ---
-
-// eslint-disable-next-line no-misleading-character-class -- intentional Unicode range for emoji stripping
-const emojiPattern = /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]+/gu;
-
-function stripEmojis(text: string): string {
-  return text.replace(emojiPattern, "").replace(/  +/g, " ").trim();
 }
 
 // --- Inline parsing ---

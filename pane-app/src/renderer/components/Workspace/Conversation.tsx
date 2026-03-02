@@ -1,6 +1,7 @@
 import { useRef, useEffect, useMemo, memo } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { useClaude } from "../../hooks/useClaude";
+import { useClaudeWarmup } from "../../hooks/useClaudeWarmup";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
 import type { ConversationMessage, ToolResultBlock, ToolUseBlock } from "../../lib/claude-types";
@@ -41,9 +42,11 @@ export function Conversation({ projectId }: ConversationProps) {
     (s) => s.projects.get(projectId)?.conversation.messages ?? EMPTY_MESSAGES
   );
   const isProcessing = useProjectsStore((s) => s.projects.get(projectId)?.conversation.isProcessing ?? false);
+  const isReady = useProjectsStore((s) => s.projects.get(projectId)?.conversation.isReady ?? false);
   const error = useProjectsStore((s) => s.projects.get(projectId)?.conversation.error ?? null);
 
   const { sendMessage, abortMessage } = useClaude(projectId);
+  useClaudeWarmup(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
 
@@ -70,18 +73,20 @@ export function Conversation({ projectId }: ConversationProps) {
   }, [systemMessageCount]);
 
   // Track scroll position — passive so it never blocks compositor scrolling
+  // Larger threshold (100px) makes it easier to "break free" from auto-scroll during streaming
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const handleScroll = () => {
-      isAtBottomRef.current =
-        el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      isAtBottomRef.current = distanceFromBottom < 100;
     };
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
   }, []);
 
-  // Auto-scroll when messages change — defer to rAF to batch with paint
+  // Auto-scroll when messages change — only if user hasn't scrolled up
+  // Respects user control: scrolling up by 100px+ disables auto-scroll
   const scrollRafRef = useRef(0);
   useEffect(() => {
     if (isAtBottomRef.current && scrollRef.current) {
@@ -111,8 +116,36 @@ export function Conversation({ projectId }: ConversationProps) {
     }
   }, [isActive]);
 
+  // Show loading state when Claude is initializing
+  if (!isReady) {
+    return (
+      <div className="flex flex-col h-full w-full">
+        <div className="flex-1 flex items-center justify-center">
+          <svg
+            width="120"
+            height="120"
+            viewBox="0 0 120 120"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            className="text-pane-text-secondary"
+          >
+            <circle
+              cx="60"
+              cy="60"
+              r="40"
+              fill="none"
+              className="animate-circle-pulse"
+              style={{ strokeWidth: 'var(--circle-stroke-width, 2)' }}
+            />
+          </svg>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col h-full w-full">
+    <div className="flex flex-col h-full w-full animate-in fade-in duration-500">
       <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 px-10 py-8" style={{ willChange: "transform" }}>
         {messages.length === 0 && (
           <div className="flex items-center justify-center h-full select-none">

@@ -65,6 +65,20 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
   useEffect(() => { isNewRef.current = false; }, []);
   const animClass = isNewRef.current ? "animate-fadeSlideUp" : "";
 
+  // Graceful completion: track when streaming just ended to add settle animation
+  const wasStreamingRef = useRef(message.isStreaming);
+  const [justCompleted, setJustCompleted] = useState(false);
+
+  useEffect(() => {
+    if (wasStreamingRef.current && !message.isStreaming) {
+      // Streaming just ended — trigger settle state
+      setJustCompleted(true);
+      const timer = setTimeout(() => setJustCompleted(false), 600);
+      return () => clearTimeout(timer);
+    }
+    wasStreamingRef.current = message.isStreaming;
+  }, [message.isStreaming]);
+
   const handleCopy = useCallback(() => {
     const text = getMessageText(message);
     if (!text) return;
@@ -108,8 +122,8 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
       (b) => b.type !== "tool_use" || (b as ToolUseBlock).name !== "TodoWrite"
     );
 
-    // Group consecutive blocks by type: text, tools, or thinking
-    type GroupType = "text" | "tools" | "thinking";
+    // Group consecutive text/thinking blocks, but tools always get their own group
+    type GroupType = "text" | "tool" | "thinking";
     const groups: { type: GroupType; blocks: typeof message.content }[] = [];
     for (const block of filteredContent) {
       let groupType: GroupType;
@@ -120,12 +134,14 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
         block.type === "server_tool_use" ||
         block.type === "web_search_tool_result"
       ) {
-        groupType = "tools";
+        groupType = "tool";
       } else {
         groupType = "text";
       }
       const last = groups[groups.length - 1];
-      if (last && last.type === groupType) {
+      // Only group consecutive text or thinking blocks together
+      // Tools always get their own group (one tool per line)
+      if (last && last.type === groupType && groupType !== "tool") {
         last.blocks.push(block);
       } else {
         groups.push({ type: groupType, blocks: [block] });
@@ -133,13 +149,6 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
     }
 
     const hasText = message.content.some((b) => b.type === "text");
-
-    // Collect all tool_use block IDs to determine which are "last 3"
-    const allToolUseIds: string[] = [];
-    for (const block of filteredContent) {
-      if (block.type === "tool_use") allToolUseIds.push((block as ToolUseBlock).id);
-    }
-    const recentToolIds = new Set(allToolUseIds.slice(-3));
 
     return (
       <div className={`group ${animClass} ${hasText ? "mb-10" : "mb-1"}`}>
@@ -163,13 +172,9 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
               <div key={gi} className="font-sans" style={{ fontWeight: "var(--pane-font-weight)" }}>
                 {group.blocks.map((block, i) => {
                   const text = (block as { type: "text"; text: string }).text;
-                  const isLastBlock = gi === groups.length - 1 && i === group.blocks.length - 1;
                   return (
                     <div key={i}>
                       <MarkdownText text={text} isStreaming={message.isStreaming} />
-                      {message.isStreaming && isLastBlock && (
-                        <span className="inline-block w-[2px] h-[14px] bg-pane-text/70 ml-0.5 align-middle animate-pulse" />
-                      )}
                     </div>
                   );
                 })}
@@ -177,48 +182,48 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
             );
           }
 
-          // tools group
-          return (
-            <div key={gi} className="my-0.5">
-              {group.blocks.map((block) => {
-                if (block.type === "tool_use") {
-                  const toolBlock = block as ToolUseBlock;
-                  const result = toolResults.get(toolBlock.id);
-                  return (
-                    <ToolActivity
-                      key={toolBlock.id}
-                      toolUse={toolBlock}
-                      toolResult={result}
-                      forceExpanded={recentToolIds.has(toolBlock.id)}
-                    />
-                  );
-                }
-                if (block.type === "server_tool_use") {
-                  const serverBlock = block as ServerToolUseBlock;
-                  // Find matching web_search_tool_result in the same message
-                  const searchResult = message.content.find(
-                    (b) =>
-                      b.type === "web_search_tool_result" &&
-                      (b as WebSearchToolResultBlock).tool_use_id === serverBlock.id,
-                  ) as WebSearchToolResultBlock | undefined;
-                  return (
-                    <ServerToolActivity
-                      key={serverBlock.id}
-                      block={serverBlock}
-                      searchResult={searchResult}
-                    />
-                  );
-                }
-                // web_search_tool_result rendered by its parent server_tool_use
-                return null;
-              })}
-            </div>
-          );
+          // tool group (each tool has its own group, one per line)
+          const block = group.blocks[0]!;
+          if (block.type === "tool_use") {
+            const toolBlock = block as ToolUseBlock;
+            const result = toolResults.get(toolBlock.id);
+            return (
+              <div key={toolBlock.id} className="my-0.5">
+                <ToolActivity
+                  toolUse={toolBlock}
+                  toolResult={result}
+                />
+              </div>
+            );
+          }
+          if (block.type === "server_tool_use") {
+            const serverBlock = block as ServerToolUseBlock;
+            // Find matching web_search_tool_result in the same message
+            const searchResult = message.content.find(
+              (b) =>
+                b.type === "web_search_tool_result" &&
+                (b as WebSearchToolResultBlock).tool_use_id === serverBlock.id,
+            ) as WebSearchToolResultBlock | undefined;
+            return (
+              <div key={serverBlock.id} className="my-0.5">
+                <ServerToolActivity
+                  block={serverBlock}
+                  searchResult={searchResult}
+                />
+              </div>
+            );
+          }
+          // web_search_tool_result rendered by its parent server_tool_use
+          return null;
         })}
 
         {/* Footer: cost/duration/tokens + copy */}
         {!message.isStreaming && (
-          <div className="mt-4 flex items-center gap-4 pl-6">
+          <div
+            className={`mt-4 flex items-center gap-4 pl-6 transition-opacity duration-500 ${
+              justCompleted ? "opacity-0" : "opacity-100"
+            }`}
+          >
             {(message.costUsd !== undefined || message.durationMs !== undefined) && (
               <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary tracking-wider">
                 {message.costUsd !== undefined && (

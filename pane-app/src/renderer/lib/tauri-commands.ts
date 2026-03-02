@@ -118,6 +118,7 @@ export interface UserSettings {
   keybindings: Record<string, { mod: boolean; shift: boolean; alt: boolean; key: string }> | null;
   theme: string | null;
   panel_width: number | null;
+  completion_sound: string | null;
 }
 
 export async function loadSettings(): Promise<UserSettings> {
@@ -192,6 +193,10 @@ export async function abortClaude(projectId: string): Promise<void> {
   return electronAPI.invoke("abort_claude", { projectId });
 }
 
+export async function terminateClaudeSession(projectId: string): Promise<void> {
+  return electronAPI.invoke("terminate_claude_session", { projectId });
+}
+
 export async function setWindowTitle(title: string): Promise<void> {
   return electronAPI.invoke("set_window_title", { title });
 }
@@ -220,4 +225,8 @@ export function onPtyData(ptyId: string, cb: (data: string) => void): () => void
 
 export function onPtyExit(ptyId: string, cb: (info: { exitCode: number }) => void): () => void {
   return electronAPI.on(`pty-exit:${ptyId}`, cb);
+}
+
+export async function getClaudePlanInfo(): Promise<string | null> {
+  return electronAPI.invoke("get_claude_plan_info");
 }

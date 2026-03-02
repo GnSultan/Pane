@@ -319,7 +319,11 @@ export function useSettingsPersistence() {
       },
     );
 
-    window.addEventListener("beforeunload", save);
+    const handleBeforeUnload = () => {
+      save();
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
     const interval = setInterval(save, 30000);
 
     return () => {
@@ -327,7 +331,7 @@ export function useSettingsPersistence() {
       unsubProjects();
       unsubConversation();
       if (convDebounce) clearTimeout(convDebounce);
-      window.removeEventListener("beforeunload", save);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
       clearInterval(interval);
       if (debounceTimer) clearTimeout(debounceTimer);
       // Only save on cleanup if this instance successfully loaded settings

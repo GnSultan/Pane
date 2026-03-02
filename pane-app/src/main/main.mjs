@@ -91,6 +91,11 @@ function registerClaudeHandlers() {
       claudeWorker.postMessage({ type: "abort", projectId: args.projectId });
     }
   });
+  ipcMain.handle("terminate_claude_session", async (_event, args) => {
+    if (claudeWorker && !claudeWorker.killed) {
+      claudeWorker.postMessage({ type: "terminate", projectId: args.projectId });
+    }
+  });
 }
 const execFileAsync = promisify(execFile);
 function registerCommandHandlers() {
@@ -420,6 +425,35 @@ function registerCommandHandlers() {
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
   });
+  ipcMain.handle("get_claude_plan_info", async () => {
+    try {
+      const claudeConfigPath = path.join(os.homedir(), ".claude.json");
+      const configData = await fs.promises.readFile(claudeConfigPath, "utf-8");
+      const config = JSON.parse(configData);
+
+      // Infer plan from available fields
+      let plan = null;
+      const hasSubscription = config.oauthAccount?.billingType === "stripe_subscription";
+      const hasExtraUsage = config.oauthAccount?.hasExtraUsageEnabled === true;
+
+      if (hasSubscription && hasExtraUsage) {
+        // Has paid subscription with extra usage enabled = Max plan
+        plan = "Max";
+      } else if (hasSubscription) {
+        // Has subscription but no extra usage = Pro plan
+        plan = "Pro";
+      } else {
+        // No subscription = Free plan
+        plan = "Free";
+      }
+
+      return plan;
+    } catch (error) {
+      // If config doesn't exist or can't be read, return null
+      console.warn("Could not read Claude config:", error.message);
+      return null;
+    }
+  });
 }
 function settingsPath() {
   return path.join(os.homedir(), ".pane", "settings.json");
@@ -651,6 +685,7 @@ function createWindow() {
   });
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
+    // DevTools available with Cmd+Alt+I in development
   } else {
     mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   }

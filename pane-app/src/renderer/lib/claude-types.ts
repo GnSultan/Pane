@@ -73,7 +73,15 @@ export interface AssistantMessage {
   type: "assistant";
   message: {
     content: ContentBlock[];
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_creation_input_tokens?: number;
+      cache_read_input_tokens?: number;
+      service_tier?: string;
+    };
   };
+  model?: string;
 }
 
 export interface UserMessage {
@@ -88,6 +96,7 @@ export interface ResultMessage {
   subtype: string;
   session_id: string;
   result?: string;
+  error?: string;
   total_cost_usd?: number;
   duration_ms?: number;
   duration_api_ms?: number;
@@ -174,21 +183,32 @@ export interface Todo {
 export interface ConversationState {
   messages: ConversationMessage[];
   sessionId: string | null;
+  model: string | null;
+  serviceTier: string | null;
   isProcessing: boolean;
   isPlanning: boolean;
+  isReady: boolean;
   error: string | null;
   todos: Todo[];
   pendingPlanApproval: boolean;
+  // Session lifecycle
+  isProcessActive: boolean;  // Is the Claude CLI child process currently running?
+  lastActivity: number;       // Timestamp of last user interaction with this project
 }
 
 export function createEmptyConversation(): ConversationState {
   return {
     messages: [],
     sessionId: null,
+    model: null,
+    serviceTier: null,
     isProcessing: false,
     isPlanning: false,
+    isReady: false,  // Will be set to true by warmup after initial message completes
     error: null,
     todos: [],
     pendingPlanApproval: false,
+    isProcessActive: false,
+    lastActivity: Date.now(),
   };
 }

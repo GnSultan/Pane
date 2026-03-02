@@ -124,6 +124,8 @@ interface ProjectsState {
   appendToLastAssistantThinking: (projectId: string, thinking: string) => void;
   setLastThinkingSignature: (projectId: string, signature: string) => void;
   setConversationSessionId: (projectId: string, sessionId: string) => void;
+  setConversationModel: (projectId: string, model: string) => void;
+  setConversationReady: (projectId: string, isReady: boolean) => void;
   setConversationProcessing: (projectId: string, isProcessing: boolean) => void;
   setConversationError: (projectId: string, error: string | null) => void;
   setLastMessageStreamingDone: (projectId: string) => void;
@@ -455,6 +457,20 @@ function createProjectsStore() {
       })),
     ),
 
+  setConversationModel: (projectId, model) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => ({
+        conversation: { ...p.conversation, model },
+      })),
+    ),
+
+  setConversationReady: (projectId, isReady) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => ({
+        conversation: { ...p.conversation, isReady },
+      })),
+    ),
+
   setConversationProcessing: (projectId, isProcessing) =>
     set((state) =>
       updateProject(state, projectId, (p) => ({
@@ -555,11 +571,16 @@ function createProjectsStore() {
         conversation: {
           messages,
           sessionId,
+          model: null,
+          serviceTier: null,
           isProcessing: false,
           isPlanning: false,
+          isReady: false,
           error: null,
           todos: [],
           pendingPlanApproval: false,
+          isProcessActive: false,
+          lastActivity: Date.now(),
         },
       })),
     ),

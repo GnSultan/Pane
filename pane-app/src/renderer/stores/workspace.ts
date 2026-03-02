@@ -214,7 +214,7 @@ function createWorkspaceStore() {
   playCompletionSound: () => {
     const { completionSound } = useWorkspaceStore.getState();
     if (completionSound === "none") return;
-    window.electronAPI.invoke("play_sound", { sound: completionSound });
+    (window as any).electronAPI.invoke("play_sound", { sound: completionSound });
   },
 }));
 }
