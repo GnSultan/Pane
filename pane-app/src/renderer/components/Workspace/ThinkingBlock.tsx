@@ -12,9 +12,6 @@ export function ThinkingBlockDisplay({ block, isStreaming }: ThinkingBlockProps)
 
   if (!thinkingText.trim() && !isStreaming) return null;
 
-  const firstLine = thinkingText.split("\n").find((l) => l.trim().length > 0) || "";
-  const preview = firstLine.length > 80 ? firstLine.slice(0, 80) + "..." : firstLine;
-
   return (
     <div className="my-1">
       <button
@@ -32,9 +29,8 @@ export function ThinkingBlockDisplay({ block, isStreaming }: ThinkingBlockProps)
               : "color-mix(in srgb, var(--pane-text-secondary) 25%, transparent)",
           }}
         />
-        <span className="shrink-0 opacity-50">thinking</span>
-        {!expanded && <span className="truncate opacity-40">{preview}</span>}
-        {isStreaming && !expanded && (
+        <span className="opacity-50">thinking</span>
+        {isStreaming && (
           <span className="inline-block w-[2px] h-[10px] bg-pane-text-secondary/40 ml-0.5 animate-pulse" />
         )}
       </button>

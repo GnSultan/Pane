@@ -1,9 +1,8 @@
-import { useRef, useCallback, useEffect, useState } from "react";
+import { useRef, useCallback, useEffect } from "react";
 import AceEditor from "react-ace";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { writeFile } from "../../lib/tauri-commands";
-import { getFileName } from "../../lib/file-utils";
 import { markFileWritten } from "../../hooks/useFileWatcher";
 
 // Import ace modes and themes
@@ -55,29 +54,19 @@ export function FileViewer() {
 
   const editorRef = useRef<AceEditor>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [saveState, setSaveState] = useState<"clean" | "dirty" | "saving">("clean");
 
   const handleChange = useCallback(
     (content: string) => {
       if (!activeFilePath || !activeProjectId) return;
-
-      setSaveState("dirty");
-
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-      }
-
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
       saveTimerRef.current = setTimeout(async () => {
         if (!activeFilePath || !activeProjectId) return;
-        setSaveState("saving");
         try {
           markFileWritten(activeFilePath);
           await writeFile(activeFilePath, content);
           useProjectsStore.getState().updateFileContent(activeProjectId, content);
-          setSaveState("clean");
         } catch (err) {
           console.error("Auto-save failed:", err);
-          setSaveState("dirty");
         }
       }, 800);
     },
@@ -95,7 +84,6 @@ export function FileViewer() {
         editor.moveCursorToPosition(cursorPos);
       }
     }
-    setSaveState("clean");
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
     }
@@ -125,6 +113,25 @@ export function FileViewer() {
     return () => window.removeEventListener("pane:focus-editor", handler);
   }, []);
 
+  // Set top scroll margin to ~45% of editor height so the first line sits
+  // near the middle of the screen on an empty file (typewriter feel).
+  // Updates on resize so it works at any window size.
+  useEffect(() => {
+    if (!editorRef.current) return;
+    const editor = editorRef.current.editor;
+
+    const updateMargin = () => {
+      const height = editor.renderer.scroller.clientHeight;
+      editor.renderer.setScrollMargin(Math.floor(height * 0.45), 0, 0, 0);
+    };
+
+    updateMargin();
+
+    const ro = new ResizeObserver(updateMargin);
+    ro.observe(editor.renderer.scroller);
+    return () => ro.disconnect();
+  }, [activeFilePath]);
+
   if (!activeFilePath || activeFileContent === null) {
     return (
       <div className="flex-1 flex items-center justify-center">
@@ -138,20 +145,7 @@ export function FileViewer() {
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="h-5 flex items-center px-4 border-b border-pane-border/60 shrink-0">
-        <span className="text-pane-text-secondary text-xs font-mono truncate flex-1 tracking-wide">
-          {getFileName(activeFilePath)}
-        </span>
-        <span className="text-[10px] font-mono ml-3">
-          {saveState === "dirty" && (
-            <span className="text-pane-status-modified">●</span>
-          )}
-          {saveState === "saving" && (
-            <span className="text-pane-text-secondary">saving...</span>
-          )}
-        </span>
-      </div>
-
+      <div className="flex-1 min-h-0 w-full max-w-[780px] mx-auto">
       <AceEditor
         ref={editorRef}
         mode={getModeForFile(activeFilePath)}
@@ -172,10 +166,12 @@ export function FileViewer() {
           tabSize: 2,
           useWorker: false,
           wrap: true,
-          scrollPastEnd: 0.5 as unknown as boolean,
+          indentedSoftWrap: false,
+          scrollPastEnd: 0.8 as unknown as boolean,
         }}
         editorProps={{ $blockScrolling: true }}
       />
+      </div>
     </div>
   );
 }

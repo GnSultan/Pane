@@ -23,6 +23,7 @@ function isConversationVisible(): boolean {
 
 const AVAILABLE_MODELS = [
   { value: "opus", label: "Opus" },
+  { value: "opusplan", label: "Opus Plan" },
   { value: "sonnet", label: "Sonnet" },
   { value: "haiku", label: "Haiku" },
 ];
@@ -35,68 +36,35 @@ function ModelPicker({
   onChange: (v: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [open]);
-
   const current = AVAILABLE_MODELS.find((m) => m.value === value);
 
   return (
-    <div ref={containerRef} className="relative">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1 hover:text-pane-text transition-colors btn-press select-none"
-      >
-        {current?.label.toLowerCase()}
-        <svg
-          width="8"
-          height="8"
-          viewBox="0 0 8 8"
-          fill="none"
-          className={`transition-transform duration-150 ${open ? "rotate-180" : ""}`}
+    <div className="flex items-center gap-3">
+      {open ? (
+        AVAILABLE_MODELS.map((model) => (
+          <button
+            key={model.value}
+            onClick={() => { onChange(model.value); setOpen(false); }}
+            className={`flex items-center gap-1.5 btn-press select-none transition-colors ${
+              model.value === value
+                ? "text-pane-text"
+                : "text-pane-text-secondary hover:text-pane-text"
+            }`}
+          >
+            <span className={`w-1 h-1 rounded-full shrink-0 transition-opacity ${
+              model.value === value ? "bg-pane-text opacity-100" : "opacity-0"
+            }`} />
+            {model.label.toLowerCase()}
+          </button>
+        ))
+      ) : (
+        <button
+          onClick={() => setOpen(true)}
+          className="flex items-center gap-1.5 text-pane-text btn-press select-none"
         >
-          <path d="M1 2.5L4 5.5L7 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
-        </svg>
-      </button>
-
-      {open && (
-        <div
-          className="absolute bottom-full right-0 mb-2 py-1
-                     bg-pane-surface border border-pane-border/40
-                     rounded-lg shadow-lg z-50 min-w-[80px]"
-          style={{ backdropFilter: "blur(8px)" }}
-        >
-          {AVAILABLE_MODELS.map((model) => (
-            <button
-              key={model.value}
-              onClick={() => { onChange(model.value); setOpen(false); }}
-              className={`w-full text-left px-3 py-1.5 font-mono transition-colors
-                          ${model.value === value
-                            ? "text-pane-text"
-                            : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-border/20"
-                          }`}
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              <span className="flex items-center gap-2">
-                <span
-                  className={`w-1 h-1 rounded-full shrink-0 transition-opacity ${
-                    model.value === value ? "bg-pane-text opacity-100" : "opacity-0"
-                  }`}
-                />
-                {model.label.toLowerCase()}
-              </span>
-            </button>
-          ))}
-        </div>
+          <span className="w-1 h-1 rounded-full bg-pane-text shrink-0" />
+          {current?.label.toLowerCase()}
+        </button>
       )}
     </div>
   );
@@ -284,7 +252,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
       )}
 
       {todoPanelOpen && todos.length > 0 && (
-        <TodoPanel projectId={projectId} />
+        <TodoPanel projectId={projectId} onCollapse={() => setTodoPanelOpen(false)} />
       )}
 
       {/* The unified card — textarea body + toolbar strip */}
@@ -305,7 +273,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
 
           {/* Toolbar strip */}
           <div
-            className="h-9 flex items-center px-2 border-t border-pane-border shrink-0 bg-transparent font-mono text-pane-text-secondary"
+            className="h-9 flex items-center px-5 border-t border-pane-border shrink-0 bg-transparent font-mono text-pane-text-secondary"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
             <div className="flex-1" />

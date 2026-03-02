@@ -39,7 +39,7 @@ export function Workspace() {
   }, []);
 
   const modelDisplay = formatModelName(model);
-  const showHeader = !!(modelDisplay || plan);
+  const showHeader = !!(modelDisplay || plan) && activeMode !== "viewer";
 
   return (
     <div className="h-full relative">

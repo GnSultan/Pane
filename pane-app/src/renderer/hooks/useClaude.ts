@@ -524,32 +524,44 @@ function handleClaudeMessage(
         evt.content_block?.type === "tool_use"
       ) {
         pendingToolJson = "";
-        if (assistantMessageExists) {
+        const toolBlock = evt.content_block as ToolUseBlock;
+
+        if (!assistantMessageExists) {
+          // Claude started this turn directly with a tool call (no text/thinking first).
+          // Create a placeholder so TodoWrite detection and tool rendering work correctly.
+          const placeholder: ConversationMessage = {
+            id: nextMessageId(),
+            type: "assistant",
+            content: [toolBlock],
+            timestamp: Date.now(),
+            isStreaming: true,
+          };
+          store.addConversationMessage(projectId, placeholder);
+        } else {
           const project = store.projects.get(projectId);
           if (project) {
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              const newContent = [
+              store.updateLastAssistantContent(projectId, [
                 ...last.content,
-                evt.content_block as ToolUseBlock,
-              ];
-              store.updateLastAssistantContent(projectId, newContent);
-
-              const toolBlock = evt.content_block as ToolUseBlock;
-              if (toolBlock.name === "EnterPlanMode") {
-                store.setIsPlanning(projectId, true);
-              }
-              if (toolBlock.name === "ExitPlanMode") {
-                store.setPendingPlanApproval(projectId, true);
-                store.setIsPlanning(projectId, false);
-              }
-              // With --dangerously-skip-permissions, plan tools won't fire.
-              // Plan detection via text pattern happens in the "result" handler.
+                toolBlock,
+              ]);
             }
           }
         }
-        return assistantMessageExists;
+
+        if (toolBlock.name === "EnterPlanMode") {
+          store.setIsPlanning(projectId, true);
+        }
+        if (toolBlock.name === "ExitPlanMode") {
+          store.setPendingPlanApproval(projectId, true);
+          store.setIsPlanning(projectId, false);
+        }
+        // With --dangerously-skip-permissions, plan tools won't fire.
+        // Plan detection via text pattern happens in the "result" handler.
+
+        return true;
       }
 
       // Streaming tool input (input_json_delta)

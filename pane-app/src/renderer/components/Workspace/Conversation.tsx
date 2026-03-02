@@ -75,17 +75,25 @@ export function Conversation({ projectId }: ConversationProps) {
     return map;
   }, [systemMessageCount]);
 
-  // Track scroll — if user scrolled up, stop following; if they scroll back to bottom, resume
+  // Track scroll — wheel up = user wants control, instantly disengage
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
+    const handleWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) followRef.current = false;
+    };
+    // Re-engage only when user scrolls back to very bottom
     const handleScroll = () => {
       if (programmaticScrollRef.current) return;
       const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-      followRef.current = distanceFromBottom < 80;
+      if (distanceFromBottom < 20) followRef.current = true;
     };
+    el.addEventListener("wheel", handleWheel, { passive: true });
     el.addEventListener("scroll", handleScroll, { passive: true });
-    return () => el.removeEventListener("scroll", handleScroll);
+    return () => {
+      el.removeEventListener("wheel", handleWheel);
+      el.removeEventListener("scroll", handleScroll);
+    };
   }, []);
 
   // Auto-scroll when messages change — only if following

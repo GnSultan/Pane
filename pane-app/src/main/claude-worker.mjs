@@ -34,7 +34,9 @@ function handleSpawn({ projectId, prompt, workingDir, sessionId, model }) {
     `For non-trivial tasks, present a brief plan FIRST and end with: "Ready to proceed — send 'go' to start." Wait for the user to confirm before making changes. For simple tasks (quick fixes, single-file edits, questions), just do them directly.`
   ];
   if (model) {
-    cmdParts.push("--model", model);
+    // "opusplan" is a UI alias — pass the actual model name to the CLI
+    const cliModel = model === "opusplan" ? "opus" : model;
+    cmdParts.push("--model", cliModel);
   }
   if (sessionId) {
     cmdParts.push("--resume", sessionId);
