@@ -7,6 +7,7 @@ import {
   readFile,
   writeFile,
   getHomeDir,
+  listCheckpoints,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/claude-types";
@@ -148,6 +149,13 @@ export function useSettingsPersistence() {
             loadConversation(id).then((saved) => {
               if (saved && saved.messages.length > 0) {
                 useProjectsStore.getState().restoreConversation(id, saved.messages, saved.sessionId);
+              }
+            }).catch(() => {});
+
+            // Load checkpoint metadata
+            listCheckpoints(id).then((metas) => {
+              if (metas.length > 0) {
+                useProjectsStore.getState().setCheckpoints(id, metas);
               }
             }).catch(() => {});
 

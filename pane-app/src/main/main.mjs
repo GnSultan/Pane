@@ -719,12 +719,229 @@ function registerWatcherHandlers() {
     }
   });
 }
+function registerCheckpointHandlers() {
+  const CHECKPOINT_MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
+  const CHECKPOINT_MAX_FILES = 200;
+  const CHECKPOINT_KEEP = 50;
+
+  function checkpointDir(projectId) {
+    return path.join(os.homedir(), ".pane", "checkpoints", projectId);
+  }
+
+  ipcMain.handle("create_checkpoint", async (_event, args) => {
+    const { projectId, workingDir, messageId } = args;
+    const cpId = `cp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Must be a git repo
+    let headCommit = null;
+    try {
+      const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workingDir });
+      headCommit = stdout.trim();
+    } catch {
+      return { id: null, fileCount: 0 };
+    }
+
+    // Get dirty + untracked files
+    let porcelain = "";
+    try {
+      const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-unormal"], { cwd: workingDir });
+      porcelain = stdout;
+    } catch {
+      return { id: null, fileCount: 0 };
+    }
+
+    const entries = [];
+    for (const line of porcelain.split("\n")) {
+      if (line.length < 4) continue;
+      const statusCode = line.slice(0, 2).trim();
+      let filePath = line.slice(3);
+      const arrowPos = filePath.indexOf(" -> ");
+      if (arrowPos !== -1) filePath = filePath.slice(arrowPos + 4);
+      entries.push({ relativePath: filePath, gitStatus: statusCode });
+    }
+
+    // Read file contents (skip binary, large files)
+    const files = [];
+    for (const { relativePath, gitStatus } of entries.slice(0, CHECKPOINT_MAX_FILES)) {
+      const fullPath = path.join(workingDir, relativePath);
+      try {
+        const stat = await fs.promises.stat(fullPath);
+        if (stat.size > CHECKPOINT_MAX_FILE_SIZE) continue;
+        const buffer = await fs.promises.readFile(fullPath);
+        // Binary check: null byte in first 512 bytes
+        const checkLen = Math.min(buffer.length, 512);
+        let isBinary = false;
+        for (let i = 0; i < checkLen; i++) {
+          if (buffer[i] === 0) { isBinary = true; break; }
+        }
+        if (isBinary) continue;
+        files.push({ relativePath, content: buffer.toString("utf-8"), gitStatus });
+      } catch {
+        files.push({ relativePath, content: null, gitStatus });
+      }
+    }
+
+    const checkpoint = { id: cpId, timestamp: Date.now(), projectId, headCommit, files, messageId };
+    const dir = checkpointDir(projectId);
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(path.join(dir, `${cpId}.json`), JSON.stringify(checkpoint), "utf-8");
+
+    // Prune old checkpoints
+    try {
+      const all = (await fs.promises.readdir(dir)).filter(f => f.startsWith("cp-") && f.endsWith(".json")).sort();
+      if (all.length > CHECKPOINT_KEEP) {
+        const remove = all.slice(0, all.length - CHECKPOINT_KEEP);
+        await Promise.all(remove.map(f => fs.promises.unlink(path.join(dir, f)).catch(() => {})));
+      }
+    } catch {}
+
+    // Update manifest for external tools (punk-records reads this)
+    try {
+      const remaining = (await fs.promises.readdir(dir)).filter(f => f.startsWith("cp-") && f.endsWith(".json")).sort();
+      const manifest = [];
+      for (const f of remaining) {
+        try {
+          const raw = await fs.promises.readFile(path.join(dir, f), "utf-8");
+          const cp = JSON.parse(raw);
+          manifest.push({ id: cp.id, timestamp: cp.timestamp, messageId: cp.messageId, fileCount: cp.files.length, headCommit: cp.headCommit, workingDir });
+        } catch {}
+      }
+      await fs.promises.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ projectId, projectRoot: workingDir, checkpoints: manifest }), "utf-8");
+    } catch {}
+
+    return { id: cpId, fileCount: files.length, timestamp: checkpoint.timestamp };
+  });
+
+  ipcMain.handle("restore_checkpoint", async (_event, args) => {
+    const { projectId, checkpointId, workingDir } = args;
+    let checkpoint;
+    try {
+      const raw = await fs.promises.readFile(path.join(checkpointDir(projectId), `${checkpointId}.json`), "utf-8");
+      checkpoint = JSON.parse(raw);
+    } catch {
+      return { success: false, error: "Checkpoint not found", restoredFiles: [] };
+    }
+
+    const restored = [];
+
+    // Restore files from checkpoint
+    for (const file of checkpoint.files) {
+      const fullPath = path.join(workingDir, file.relativePath);
+      try {
+        if (file.content === null) {
+          try { await fs.promises.unlink(fullPath); restored.push({ path: file.relativePath, action: "deleted" }); } catch {}
+        } else {
+          await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+          await fs.promises.writeFile(fullPath, file.content, "utf-8");
+          restored.push({ path: file.relativePath, action: "restored" });
+        }
+      } catch {}
+    }
+
+    // Restore clean tracked files Claude modified (not in checkpoint) from git HEAD
+    if (checkpoint.headCommit) {
+      try {
+        const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-unormal"], { cwd: workingDir });
+        const cpPaths = new Set(checkpoint.files.map(f => f.relativePath));
+        for (const line of stdout.split("\n")) {
+          if (line.length < 4) continue;
+          const sc = line.slice(0, 2).trim();
+          let fp = line.slice(3);
+          const ap = fp.indexOf(" -> ");
+          if (ap !== -1) fp = fp.slice(ap + 4);
+          if (cpPaths.has(fp)) continue;
+          if (sc === "??") {
+            restored.push({ path: fp, action: "orphaned_new" });
+          } else {
+            try {
+              await execFileAsync("git", ["checkout", checkpoint.headCommit, "--", fp], { cwd: workingDir });
+              restored.push({ path: fp, action: "git_restored" });
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+
+    return { success: true, restoredFiles: restored };
+  });
+
+  ipcMain.handle("list_checkpoints", async (_event, args) => {
+    const { projectId } = args;
+    try {
+      const entries = await fs.promises.readdir(checkpointDir(projectId));
+      const metas = [];
+      for (const entry of entries) {
+        if (!entry.startsWith("cp-") || !entry.endsWith(".json")) continue;
+        try {
+          const raw = await fs.promises.readFile(path.join(checkpointDir(projectId), entry), "utf-8");
+          const cp = JSON.parse(raw);
+          metas.push({ id: cp.id, timestamp: cp.timestamp, messageId: cp.messageId, fileCount: cp.files.length });
+        } catch {}
+      }
+      metas.sort((a, b) => a.timestamp - b.timestamp);
+      return metas;
+    } catch {
+      return [];
+    }
+  });
+
+  ipcMain.handle("get_checkpoint_diff", async (_event, args) => {
+    const { projectId, checkpointId, workingDir } = args;
+    let checkpoint;
+    try {
+      const raw = await fs.promises.readFile(path.join(checkpointDir(projectId), `${checkpointId}.json`), "utf-8");
+      checkpoint = JSON.parse(raw);
+    } catch {
+      return { files: [] };
+    }
+    const diffs = [];
+    for (const file of checkpoint.files) {
+      let currentContent = null;
+      try {
+        currentContent = await fs.promises.readFile(path.join(workingDir, file.relativePath), "utf-8");
+      } catch {}
+      if (currentContent !== file.content) {
+        diffs.push({
+          relativePath: file.relativePath,
+          status: currentContent === null ? "deleted" : file.content === null ? "created" : "modified",
+        });
+      }
+    }
+    // Also check for new untracked files not in checkpoint
+    if (checkpoint.headCommit) {
+      try {
+        const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-unormal"], { cwd: workingDir });
+        const cpPaths = new Set(checkpoint.files.map(f => f.relativePath));
+        for (const line of stdout.split("\n")) {
+          if (line.length < 4) continue;
+          const sc = line.slice(0, 2).trim();
+          let fp = line.slice(3);
+          const ap = fp.indexOf(" -> ");
+          if (ap !== -1) fp = fp.slice(ap + 4);
+          if (!cpPaths.has(fp) && sc !== "??") {
+            diffs.push({ relativePath: fp, status: "modified" });
+          } else if (!cpPaths.has(fp) && sc === "??") {
+            diffs.push({ relativePath: fp, status: "created" });
+          }
+        }
+      } catch {}
+    }
+    return { files: diffs };
+  });
+
+  ipcMain.handle("delete_project_checkpoints", async (_event, args) => {
+    try {
+      await fs.promises.rm(checkpointDir(args.projectId), { recursive: true, force: true });
+    } catch {}
+  });
+}
 function registerIpcHandlers() {
   registerCommandHandlers();
   registerSettingsHandlers();
   registerClaudeHandlers();
   registerWatcherHandlers();
   registerPtyHandlers();
+  registerCheckpointHandlers();
 }
 let mainWindow = null;
 const isDev = !!process.env.ELECTRON_RENDERER_URL;

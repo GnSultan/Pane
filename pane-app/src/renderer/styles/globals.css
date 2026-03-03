@@ -377,6 +377,11 @@ html, body, #root {
   background-color: var(--pane-editor-selection) !important;
 }
 
+.ace_selected-word {
+  background-color: var(--pane-editor-selection) !important;
+  border: none !important;
+}
+
 /* Syntax highlighting - monochromatic with subtle amber accents */
 .ace_keyword {
   color: var(--pane-syn-keyword) !important;

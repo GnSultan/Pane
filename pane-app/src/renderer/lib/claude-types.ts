@@ -172,6 +172,16 @@ export interface ConversationMessage {
   inputTokens?: number;
   outputTokens?: number;
   numTurns?: number;
+  checkpointId?: string;
+}
+
+// File checkpoint types
+
+export interface CheckpointMeta {
+  id: string;
+  timestamp: number;
+  messageId: string;
+  fileCount: number;
 }
 
 export interface Todo {

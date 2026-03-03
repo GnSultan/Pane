@@ -263,3 +263,61 @@ export async function checkClaudeUpdate(): Promise<ClaudeUpdateInfo> {
 export async function updateClaude(): Promise<ClaudeUpdateResult> {
   return electronAPI.invoke("update_claude");
 }
+
+// --- File Checkpoints ---
+
+export interface CheckpointResult {
+  id: string | null;
+  fileCount: number;
+  timestamp?: number;
+}
+
+export interface RestoredFile {
+  path: string;
+  action: "restored" | "deleted" | "git_restored" | "orphaned_new";
+}
+
+export interface RestoreResult {
+  success: boolean;
+  restoredFiles: RestoredFile[];
+  error?: string;
+}
+
+export interface CheckpointDiffFile {
+  relativePath: string;
+  status: "modified" | "created" | "deleted";
+}
+
+export async function createCheckpoint(
+  projectId: string,
+  workingDir: string,
+  messageId: string,
+): Promise<CheckpointResult> {
+  return electronAPI.invoke("create_checkpoint", { projectId, workingDir, messageId });
+}
+
+export async function restoreCheckpoint(
+  projectId: string,
+  checkpointId: string,
+  workingDir: string,
+): Promise<RestoreResult> {
+  return electronAPI.invoke("restore_checkpoint", { projectId, checkpointId, workingDir });
+}
+
+export async function listCheckpoints(
+  projectId: string,
+): Promise<import("./claude-types").CheckpointMeta[]> {
+  return electronAPI.invoke("list_checkpoints", { projectId });
+}
+
+export async function getCheckpointDiff(
+  projectId: string,
+  checkpointId: string,
+  workingDir: string,
+): Promise<{ files: CheckpointDiffFile[] }> {
+  return electronAPI.invoke("get_checkpoint_diff", { projectId, checkpointId, workingDir });
+}
+
+export async function deleteProjectCheckpoints(projectId: string): Promise<void> {
+  return electronAPI.invoke("delete_project_checkpoints", { projectId });
+}

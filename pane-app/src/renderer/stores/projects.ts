@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import type { FileEntry } from "../lib/tauri-commands";
-import type { ConversationState, ConversationMessage, ContentBlock, ToolUseBlock } from "../lib/claude-types";
+import type { ConversationState, ConversationMessage, ContentBlock, ToolUseBlock, CheckpointMeta } from "../lib/claude-types";
 import { createEmptyConversation } from "../lib/claude-types";
 
 export interface ProjectGit {
@@ -39,6 +39,7 @@ export interface Project {
   hasUnreadCompletion: boolean; // true when background task completes, cleared when project becomes active
   terminalTabs: TerminalTab[];
   activeTerminalTabId: string | null;
+  checkpoints: CheckpointMeta[];
 }
 
 function createProject(root: string): Project {
@@ -61,6 +62,7 @@ function createProject(root: string): Project {
     hasUnreadCompletion: false,
     terminalTabs: [],
     activeTerminalTabId: null,
+    checkpoints: [],
   };
 }
 
@@ -143,6 +145,11 @@ interface ProjectsState {
   removeTerminalTab: (projectId: string, tabId: string) => void;
   setActiveTerminalTab: (projectId: string, tabId: string) => void;
   markTerminalTabDead: (projectId: string, tabId: string) => void;
+
+  // Checkpoints
+  addCheckpoint: (projectId: string, meta: CheckpointMeta) => void;
+  setCheckpoints: (projectId: string, checkpoints: CheckpointMeta[]) => void;
+  clearCheckpoints: (projectId: string) => void;
 }
 
 function updateProject(
@@ -620,6 +627,24 @@ function createProjectsStore() {
           t.id === tabId ? { ...t, isAlive: false } : t,
         ),
       })),
+    ),
+
+  // Checkpoints
+  addCheckpoint: (projectId, meta) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => ({
+        checkpoints: [...p.checkpoints, meta],
+      })),
+    ),
+
+  setCheckpoints: (projectId, checkpoints) =>
+    set((state) =>
+      updateProject(state, projectId, () => ({ checkpoints })),
+    ),
+
+  clearCheckpoints: (projectId) =>
+    set((state) =>
+      updateProject(state, projectId, () => ({ checkpoints: [] })),
     ),
 }));
 }

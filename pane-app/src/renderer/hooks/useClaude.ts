@@ -1,7 +1,7 @@
 import { useCallback, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
-import { sendToClaude, abortClaude } from "../lib/tauri-commands";
+import { sendToClaude, abortClaude, createCheckpoint, deleteProjectCheckpoints } from "../lib/tauri-commands";
 import type {
   ClaudeStreamEvent,
   ClaudeStreamMessage,
@@ -108,14 +108,35 @@ export function useClaude(projectId: string) {
       if (!project) return;
       if (project.conversation.isProcessing) return;
 
-      // Add user message
+      // Build user message (ID generated early for checkpoint linking)
+      const messageId = nextMessageId();
       const userMessage: ConversationMessage = {
-        id: nextMessageId(),
+        id: messageId,
         type: "user",
         content: [{ type: "text", text: prompt }],
         timestamp: Date.now(),
         isStreaming: false,
       };
+
+      // Snapshot files before Claude touches anything (3s timeout — never block the user)
+      try {
+        const cpResult = await Promise.race([
+          createCheckpoint(projectId, project.root, messageId),
+          new Promise<{ id: null; fileCount: 0 }>((resolve) =>
+            setTimeout(() => resolve({ id: null, fileCount: 0 }), 3000),
+          ),
+        ]);
+        if (cpResult.id) {
+          userMessage.checkpointId = cpResult.id;
+          store.addCheckpoint(projectId, {
+            id: cpResult.id,
+            timestamp: cpResult.timestamp ?? Date.now(),
+            messageId,
+            fileCount: cpResult.fileCount,
+          });
+        }
+      } catch {}
+
       store.addConversationMessage(projectId, userMessage);
       store.setConversationProcessing(projectId, true);
       store.setConversationError(projectId, null);
@@ -231,6 +252,8 @@ export function useClaude(projectId: string) {
 
   const clearConversation = useCallback(() => {
     useProjectsStore.getState().clearConversation(projectId);
+    useProjectsStore.getState().clearCheckpoints(projectId);
+    deleteProjectCheckpoints(projectId).catch(() => {});
   }, [projectId]);
 
   return { sendMessage, abortMessage, clearConversation };

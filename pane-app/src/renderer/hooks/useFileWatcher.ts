@@ -22,6 +22,12 @@ function wasRecentlyWritten(path: string): boolean {
   return false;
 }
 
+// Suppress file watcher events during checkpoint restore to avoid thrashing
+let restoreInProgress = false;
+export function setRestoreInProgress(value: boolean) {
+  restoreInProgress = value;
+}
+
 export function useFileWatcher() {
   const projectOrder = useProjectsStore((s) => s.projectOrder);
   const watchedRootsRef = useRef<Set<string>>(new Set());
@@ -68,6 +74,7 @@ export function useFileWatcher() {
     const unlisten = electronAPI.on(
       "pane://file-changed",
       (raw: string[] | { paths: string[] }) => {
+        if (restoreInProgress) return;
         // Backend sends string[] directly; handle legacy { paths } wrapper defensively
         const paths = Array.isArray(raw) ? raw : raw?.paths;
         if (!paths || !Array.isArray(paths)) return;

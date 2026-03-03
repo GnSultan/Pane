@@ -214,7 +214,9 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
             >
               {todos.every((t) => t.status === "completed")
                 ? "done"
-                : `todo ${todos.filter((t) => t.status === "completed").length}/${todos.length}`}
+                : todoPanelOpen
+                  ? `${todos.filter((t) => t.status === "completed").length}/${todos.length}`
+                  : `todo ${todos.filter((t) => t.status === "completed").length}/${todos.length}`}
             </button>
           )}
           <button

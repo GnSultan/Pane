@@ -7,6 +7,10 @@ import type {
   ServerToolUseBlock,
   WebSearchToolResultBlock,
 } from "../../lib/claude-types";
+import { restoreCheckpoint, getCheckpointDiff } from "../../lib/tauri-commands";
+import type { CheckpointDiffFile } from "../../lib/tauri-commands";
+import { useProjectsStore } from "../../stores/projects";
+import { setRestoreInProgress } from "../../hooks/useFileWatcher";
 import { ToolActivity, ServerToolActivity } from "./ToolActivity";
 import { MarkdownText } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
@@ -53,12 +57,120 @@ function CopyButton({ onClick, copied }: { onClick: () => void; copied: boolean 
   );
 }
 
+function CheckpointIndicator({
+  checkpointId,
+  projectId,
+}: {
+  checkpointId: string;
+  projectId: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [diff, setDiff] = useState<CheckpointDiffFile[] | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  const [restored, setRestored] = useState(false);
+  const isProcessing = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.isProcessing ?? false,
+  );
+
+  const handleExpand = async () => {
+    if (restored) return;
+    if (!expanded) {
+      setExpanded(true);
+      const project = useProjectsStore.getState().projects.get(projectId);
+      if (project) {
+        try {
+          const d = await getCheckpointDiff(projectId, checkpointId, project.root);
+          setDiff(d.files);
+        } catch {
+          setDiff([]);
+        }
+      }
+    } else {
+      setExpanded(false);
+    }
+  };
+
+  const handleRestore = async () => {
+    if (restoring || isProcessing) return;
+    const project = useProjectsStore.getState().projects.get(projectId);
+    if (!project) return;
+
+    setRestoring(true);
+    setRestoreInProgress(true);
+    try {
+      await restoreCheckpoint(projectId, checkpointId, project.root);
+      setRestored(true);
+    } finally {
+      setRestoring(false);
+      setTimeout(() => setRestoreInProgress(false), 1000);
+    }
+  };
+
+  if (restored) {
+    return (
+      <div className="flex items-center gap-1.5 mt-1.5 mr-1">
+        <span
+          className="text-pane-text-secondary/50 font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          files restored
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-1.5 mt-1.5 mr-1">
+      <button
+        onClick={handleExpand}
+        className="flex items-center gap-1 text-pane-text-secondary/40
+                   hover:text-pane-text-secondary font-mono btn-press"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        <span className="w-1 h-1 rounded-full" style={{ background: "var(--pane-terminal)" }} />
+        checkpoint
+      </button>
+      {expanded && diff !== null && (
+        <>
+          {diff.length > 0 ? (
+            <>
+              <span
+                className="text-pane-text-secondary/40 font-mono"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                {diff.length} file{diff.length !== 1 ? "s" : ""} changed
+              </span>
+              <button
+                onClick={handleRestore}
+                disabled={restoring || isProcessing}
+                className="text-pane-status-modified hover:text-pane-text font-mono btn-press
+                           disabled:opacity-30 disabled:pointer-events-none"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                {restoring ? "restoring..." : "restore"}
+              </button>
+            </>
+          ) : (
+            <span
+              className="text-pane-text-secondary/40 font-mono"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              no changes
+            </span>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 interface MessageBubbleProps {
   message: ConversationMessage;
   toolResults: Map<string, ToolResultBlock>;
+  projectId: string;
 }
 
-export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
+export function MessageBubble({ message, toolResults, projectId }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   // Only animate on first mount — not when scrolling through old messages
   const isNewRef = useRef(true);
@@ -104,7 +216,10 @@ export function MessageBubble({ message, toolResults }: MessageBubbleProps) {
             {text}
           </p>
         </div>
-        <div className="flex justify-end mt-1">
+        <div className="flex items-center justify-end gap-2 mt-1">
+          {message.checkpointId && (
+            <CheckpointIndicator checkpointId={message.checkpointId} projectId={projectId} />
+          )}
           <CopyButton onClick={handleCopy} copied={copied} />
         </div>
       </div>
