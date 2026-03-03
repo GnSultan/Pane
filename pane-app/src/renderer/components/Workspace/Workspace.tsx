@@ -3,7 +3,6 @@ import { Conversation } from "./Conversation";
 import { FileViewer } from "./FileViewer";
 import { Terminal } from "./Terminal";
 import { useProjectsStore } from "../../stores/projects";
-import { useWorkspaceStore } from "../../stores/workspace";
 import { getClaudePlanInfo } from "../../lib/tauri-commands";
 
 function ProjectTerminal({ projectId }: { projectId: string }) {

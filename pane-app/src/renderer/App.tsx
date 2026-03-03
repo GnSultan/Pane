@@ -108,16 +108,18 @@ function App() {
           toggleControlPanel();
           break;
         case "toggle-mode": {
-          const { activeProjectId, toggleMode, projects } = useProjectsStore.getState();
+          const { activeProjectId, setMode, projects } = useProjectsStore.getState();
           if (activeProjectId) {
             const project = projects.get(activeProjectId);
-            if (project?.mode === "conversation" && !project.activeFilePath) return;
-            toggleMode(activeProjectId);
-            const newMode = project?.mode === "conversation" ? "viewer" : "conversation";
-            if (newMode === "conversation") {
-              window.dispatchEvent(new CustomEvent("pane:focus-input"));
-            } else {
+            if (!project) return;
+            // Only toggle between conversation and viewer — requires an open file
+            if (project.mode === "conversation") {
+              if (!project.activeFilePath) return;
+              setMode(activeProjectId, "viewer");
               window.dispatchEvent(new CustomEvent("pane:focus-editor"));
+            } else {
+              setMode(activeProjectId, "conversation");
+              window.dispatchEvent(new CustomEvent("pane:focus-input"));
             }
           }
           break;

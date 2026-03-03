@@ -51,7 +51,7 @@ export function TodoPanel({ projectId, onCollapse }: TodoPanelProps) {
       {/* Collapse handle at the bottom */}
       <button
         onClick={onCollapse}
-        className="w-full flex items-center justify-center py-2.5
+        className="w-full flex items-center justify-start py-2.5 px-1
                    text-pane-text-secondary/25 hover:text-pane-text-secondary/50
                    transition-colors btn-press"
       >

@@ -297,6 +297,13 @@ html, body, #root {
   color: var(--pane-text);
   font-family: var(--font-sans);
   font-weight: var(--pane-font-weight);
+
+}
+
+* {
+  /* Squircle corner smoothing — converts border-radius to Apple's continuous curvature.
+     Only active in Electron on macOS (60% smoothing). No-op everywhere else. */
+  -electron-corner-smoothing: system-ui;
 }
 
 .no-select {
@@ -375,11 +382,6 @@ html, body, #root {
 
 .ace_selection {
   background-color: var(--pane-editor-selection) !important;
-}
-
-.ace_selected-word {
-  background-color: var(--pane-editor-selection) !important;
-  border: none !important;
 }
 
 /* Syntax highlighting - monochromatic with subtle amber accents */

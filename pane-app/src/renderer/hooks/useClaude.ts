@@ -98,8 +98,64 @@ function fixPartialJson(s: string): string {
   return result;
 }
 
+/**
+ * Build a condensed briefing from the last N messages and active todos.
+ * Used to seed a fresh session when context window is hit.
+ */
+function buildContinuationBrief(projectId: string): string {
+  const project = useProjectsStore.getState().projects.get(projectId);
+  if (!project) return "Continue from where you left off.";
+
+  const { messages, todos } = project.conversation;
+
+  // Last ~6 user+assistant pairs
+  const convoMsgs = messages.filter((m) => m.type === "user" || m.type === "assistant");
+  const recent = convoMsgs.slice(-12);
+
+  const parts: string[] = [
+    "The previous session hit the context window limit. Continuing automatically.",
+    "",
+    "## Recent conversation",
+    "",
+  ];
+
+  for (const msg of recent) {
+    if (msg.type === "user") {
+      const text = msg.content
+        .filter((b): b is { type: "text"; text: string } => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      if (text) parts.push(`**User:** ${text}`);
+    } else if (msg.type === "assistant") {
+      const text = msg.content
+        .filter((b): b is { type: "text"; text: string } => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      if (text) {
+        const truncated = text.length > 600 ? text.slice(0, 600) + "…" : text;
+        parts.push(`**You (Claude):** ${truncated}`);
+      }
+    }
+  }
+
+  const activeTodos = todos.filter((t) => t.status === "in_progress" || t.status === "pending");
+  if (activeTodos.length > 0) {
+    parts.push("", "## Pending tasks");
+    for (const todo of activeTodos) {
+      const marker = todo.status === "in_progress" ? "→" : "·";
+      parts.push(`${marker} ${todo.content}`);
+    }
+  }
+
+  parts.push("", "Pick up exactly where you left off and continue the work.");
+  return parts.join("\n");
+}
+
 export function useClaude(projectId: string) {
   const abortingRef = useRef(false);
+  const continuationRef = useRef<string | null>(null);
 
   const sendMessage = useCallback(
     async (prompt: string) => {
@@ -155,6 +211,9 @@ export function useClaude(projectId: string) {
         s.setLastMessageStreamingDone(projectId);
         s.setIsPlanning(projectId, false);
 
+        // Skip sound and notification if we're auto-continuing after context limit
+        if (continuationRef.current) return;
+
         // Play completion sound when processing finishes
         useWorkspaceStore.getState().playCompletionSound();
 
@@ -207,10 +266,19 @@ export function useClaude(projectId: string) {
           }
 
           case "error": {
-            const s = useProjectsStore.getState();
-            s.setConversationError(projectId, event.data.message);
-            s.setConversationProcessing(projectId, false);
-            s.setIsPlanning(projectId, false);
+            const isContextLimit = /context window|context length|maximum context/i.test(
+              event.data.message,
+            );
+            if (isContextLimit) {
+              // Build brief now while conversation state is still intact.
+              // Don't surface an error — auto-continuation takes over after processEnded.
+              continuationRef.current = buildContinuationBrief(projectId);
+            } else {
+              const s = useProjectsStore.getState();
+              s.setConversationError(projectId, event.data.message);
+              s.setConversationProcessing(projectId, false);
+              s.setIsPlanning(projectId, false);
+            }
             break;
           }
         }
@@ -231,6 +299,17 @@ export function useClaude(projectId: string) {
         const errMsg = err instanceof Error ? err.message : String(err);
         store.setConversationError(projectId, errMsg);
         store.setConversationProcessing(projectId, false);
+      }
+
+      // Auto-continuation after context window limit:
+      // Build brief was stored in continuationRef by the error handler.
+      // Clear the session and fire a fresh one with the condensed handoff.
+      if (continuationRef.current) {
+        const brief = continuationRef.current;
+        continuationRef.current = null;
+        useProjectsStore.getState().clearConversation(projectId);
+        // Let state settle before starting the new session
+        setTimeout(() => sendMessage(brief), 50);
       }
     },
     [projectId],
@@ -413,13 +492,19 @@ function handleClaudeMessage(
           }
         }
       } else if (msg.subtype !== "success") {
+        // "interrupted" is expected — user abort or warmup silent abort. Not an error.
+        if (msg.subtype === "interrupted") return assistantMessageExists;
+
+        console.warn("[pane] Claude non-success result:", msg.subtype, msg);
+
         // Don't overwrite a more specific error already set by the error event
         // (stderr output arrives as an error event before the result message)
         const existing = store.projects.get(projectId)?.conversation.error;
         if (!existing) {
+          const detail = msg.error?.trim() || msg.result?.trim();
           store.setConversationError(
             projectId,
-            msg.result || msg.error || "Claude returned an error",
+            detail || `Claude exited unexpectedly (${msg.subtype ?? "unknown"})`,
           );
         }
       }

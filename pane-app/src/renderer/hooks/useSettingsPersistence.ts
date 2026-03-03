@@ -30,7 +30,17 @@ export const appReadyPromise = new Promise<void>((resolve) => {
 
 interface PersistedConversation {
   sessionId: string | null;
+  model?: string | null;
   messages: ConversationMessage[];
+}
+
+// Mirror of createProject's ID logic — lets us pre-compute the ID from a root
+// path before calling addProject, so we can load conversation state first.
+// NOTE: if two projects collide on the base name, ensureUniqueId appends "-2",
+// which we can't predict here. Accepted edge case — rare in practice.
+function precomputeProjectId(root: string): string {
+  const name = root.split("/").filter(Boolean).pop() || root;
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "-");
 }
 
 function conversationPath(projectId: string): string {
@@ -41,6 +51,7 @@ async function saveConversation(projectId: string, conversation: PersistedConver
   if (!paneDir) return;
   const data: PersistedConversation = {
     sessionId: conversation.sessionId,
+    model: conversation.model,
     messages: conversation.messages,
   };
   await writeFile(conversationPath(projectId), JSON.stringify(data));
@@ -61,10 +72,6 @@ export function useSettingsPersistence() {
 
   // Load on mount
   useEffect(() => {
-    getHomeDir()
-      .then((home) => { paneDir = `${home}/.pane`; })
-      .catch(() => {});
-
     loadSettings()
       .then(async (settings) => {
         if (!settings.control_panel_visible) {
@@ -102,24 +109,50 @@ export function useSettingsPersistence() {
           useProjectsStore.getState();
 
         if (settings.project_roots.length > 0) {
-          // Restore saved projects (in saved order)
-          // Phase 1: Add all projects in one pass (each addProject creates a Map copy)
+          // Phase 1: Pre-load all conversation files in parallel BEFORE adding projects.
+          // This is critical — addProject triggers Zustand updates → React renders →
+          // useClaudeWarmup fires. If conversations aren't loaded by then, warmup sees
+          // sessionId=null and starts a fresh Claude session, destroying continuity.
+          paneDir = `${await getHomeDir()}/.pane`;
+          const preloaded = await Promise.all(
+            settings.project_roots.map(async (root) => {
+              const tentativeId = precomputeProjectId(root);
+              const saved = await loadConversation(tentativeId).catch(() => null);
+              return { root, saved };
+            }),
+          );
+
+          // Phase 2: Add projects + immediately restore conversation state synchronously.
+          // React 18 batches all these Zustand updates into a single render, so warmup
+          // will see the restored sessionId/isReady on its first check.
           let activeId: string | null = null;
           const projectIds: string[] = [];
-          for (const root of settings.project_roots) {
+          for (const { root, saved } of preloaded) {
             const id = addProject(root);
             projectIds.push(id);
-            if (root === settings.active_project_root) {
-              activeId = id;
+            if (root === settings.active_project_root) activeId = id;
+
+            if (saved && saved.messages.length > 0) {
+              const s = useProjectsStore.getState();
+              s.restoreConversation(id, saved.messages, saved.sessionId);
+              if (saved.model) {
+                s.setConversationModel(id, saved.model);
+                // Model known — warmup skips, no loading indicator needed
+                s.setConversationReady(id, true);
+              }
+              // No model → isReady stays false → warmup runs, shows pulsing circle,
+              // fetches model from Claude init, then marks ready
+              // Checkpoints can load in background — not needed before first render
+              listCheckpoints(id).then((metas) => {
+                if (metas.length > 0) useProjectsStore.getState().setCheckpoints(id, metas);
+              }).catch(() => {});
             }
           }
           if (activeId) {
             setActiveProject(activeId);
           }
 
-          // Phase 2: Defer per-project state restoration to idle time
-          // This prevents expanded dirs, file reads, and conversation loads
-          // from blocking the initial render
+          // Phase 3: Defer non-critical state (expanded dirs, active file) to idle time
           const restoreProjectState = (idx: number) => {
             if (idx >= projectIds.length) return;
             const id = projectIds[idx]!;
@@ -145,27 +178,13 @@ export function useSettingsPersistence() {
               }
             }
 
-            // Load conversation history
-            loadConversation(id).then((saved) => {
-              if (saved && saved.messages.length > 0) {
-                useProjectsStore.getState().restoreConversation(id, saved.messages, saved.sessionId);
-              }
-            }).catch(() => {});
-
-            // Load checkpoint metadata
-            listCheckpoints(id).then((metas) => {
-              if (metas.length > 0) {
-                useProjectsStore.getState().setCheckpoints(id, metas);
-              }
-            }).catch(() => {});
-
             // Stagger next project restoration to next idle period
             if (idx + 1 < projectIds.length) {
               requestIdleCallback(() => restoreProjectState(idx + 1));
             }
           };
 
-          // Start restoring project states after first paint
+          // Start restoring non-critical state after first paint
           requestIdleCallback(() => restoreProjectState(0));
         } else {
           // First launch — auto-detect from CWD
@@ -295,7 +314,7 @@ export function useSettingsPersistence() {
     let convDebounce: ReturnType<typeof setTimeout> | null = null;
     const lastConvKeys = new Map<string, string>();
     const convKey = (p: ReturnType<typeof useProjectsStore.getState>["projects"] extends Map<string, infer V> ? V : never) =>
-      `${p.conversation.messages.length}:${p.conversation.sessionId ?? ""}:${p.conversation.isProcessing}`;
+      `${p.conversation.messages.length}:${p.conversation.sessionId ?? ""}:${p.conversation.model ?? ""}:${p.conversation.isProcessing}`;
 
     // Initialize keys
     for (const [id, p] of useProjectsStore.getState().projects) {
@@ -324,6 +343,7 @@ export function useSettingsPersistence() {
             if (p.conversation.messages.length > 0 && !p.conversation.isProcessing) {
               saveConversation(pid, {
                 sessionId: p.conversation.sessionId,
+                model: p.conversation.model,
                 messages: p.conversation.messages,
               }).catch(console.error);
             }

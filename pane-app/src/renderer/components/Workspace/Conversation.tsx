@@ -47,7 +47,7 @@ export function Conversation({ projectId }: ConversationProps) {
   const isReady = useProjectsStore((s) => s.projects.get(projectId)?.conversation.isReady ?? false);
   const error = useProjectsStore((s) => s.projects.get(projectId)?.conversation.error ?? null);
 
-  const { sendMessage, abortMessage, clearConversation } = useClaude(projectId);
+  const { sendMessage, abortMessage } = useClaude(projectId);
   useClaudeWarmup(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
@@ -203,22 +203,9 @@ export function Conversation({ projectId }: ConversationProps) {
 
         {error && (
           <div className="mt-4">
-            {/context window/i.test(error) ? (
-              <div className="font-mono flex items-baseline gap-4 px-4 py-3 leading-[1.7]"
-                style={{ fontSize: "var(--pane-font-size-sm)" }}>
-                <span className="text-pane-text-secondary/60">context limit reached</span>
-                <button
-                  onClick={clearConversation}
-                  className="text-pane-text-secondary hover:text-pane-text btn-press"
-                >
-                  new session
-                </button>
-              </div>
-            ) : (
-              <p className="text-pane-error text-xs font-mono bg-[var(--pane-error-bg)] border border-[var(--pane-error-border)] px-4 py-3 leading-[1.7]">
-                {error}
-              </p>
-            )}
+            <p className="text-pane-error text-xs font-mono bg-[var(--pane-error-bg)] border border-[var(--pane-error-border)] px-4 py-3 leading-[1.7]">
+              {error}
+            </p>
           </div>
         )}
       </div>

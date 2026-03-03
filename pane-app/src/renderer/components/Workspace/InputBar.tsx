@@ -216,7 +216,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
                 ? "done"
                 : todoPanelOpen
                   ? `${todos.filter((t) => t.status === "completed").length}/${todos.length}`
-                  : `todo ${todos.filter((t) => t.status === "completed").length}/${todos.length}`}
+                  : `task ${todos.filter((t) => t.status === "completed").length}/${todos.length}`}
             </button>
           )}
           <button
@@ -245,7 +245,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
                          hover:bg-pane-status-added/10 btn-press"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
-              go
+              good to go
             </button>
             <button
               onClick={handleRejectPlan}
