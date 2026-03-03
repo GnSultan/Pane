@@ -341,8 +341,8 @@ export function Settings({ onClose }: SettingsProps) {
     >
       <div className="absolute inset-0 bg-pane-bg/80 backdrop-blur-sm" />
       <div
-        className="relative bg-pane-surface border border-pane-border rounded-lg
-          w-full max-w-md mx-4 max-h-[85vh] overflow-y-auto"
+        className="relative bg-pane-bg rounded-3xl ring-1 ring-pane-border/40
+          w-full max-w-md mx-4 max-h-[85vh] overflow-hidden overflow-y-auto"
         role="dialog"
         onClick={(e) => e.stopPropagation()}
       >

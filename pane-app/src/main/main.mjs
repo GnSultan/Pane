@@ -8,6 +8,8 @@ import { promisify } from "node:util";
 import ignore from "ignore";
 import chokidar from "chokidar";
 const __dirname = import.meta.dirname;
+const isMac = process.platform === "darwin";
+let forceQuit = false;
 // Claude CLI runs in a UtilityProcess to keep the main thread free.
 // Main process is a thin relay — never touches JSON.parse or Claude data.
 let claudeWorker = null;
@@ -637,6 +639,7 @@ function registerPtyHandlers() {
 // node-pty's SIGABRT bug (vscode#243952) can't crash the main process anymore
 // because node-pty lives in the PTY worker, not here.
 app.on("before-quit", () => {
+  forceQuit = true;
   if (claudeWorker && !claudeWorker.killed) {
     claudeWorker.postMessage({ type: "shutdown" });
     claudeWorker.kill();
@@ -767,6 +770,12 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   }
+  mainWindow.on("close", (e) => {
+    if (isMac && !forceQuit) {
+      e.preventDefault();
+      mainWindow?.hide();
+    }
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
@@ -777,13 +786,15 @@ app.whenReady().then(() => {
   getClaudeWorker(); // Pre-fork to hide first-use latency
   getPtyWorker();
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
+    if (mainWindow) {
+      mainWindow.show();
+    } else {
       createWindow();
     }
   });
 });
 app.on("window-all-closed", () => {
-  app.quit();
+  if (!isMac) app.quit();
 });
 function getMainWindow() {
   return mainWindow;

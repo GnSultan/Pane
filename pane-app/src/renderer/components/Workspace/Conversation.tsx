@@ -1,4 +1,4 @@
-import { useRef, useEffect, useMemo, memo } from "react";
+import { useRef, useEffect, useCallback, useMemo, memo } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { useClaude } from "../../hooks/useClaude";
 import { useClaudeWarmup } from "../../hooks/useClaudeWarmup";
@@ -48,10 +48,7 @@ export function Conversation({ projectId }: ConversationProps) {
   const { sendMessage, abortMessage } = useClaude(projectId);
   useClaudeWarmup(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
-  // true = follow new messages; false = user scrolled up, leave them alone
   const followRef = useRef(true);
-  // distinguish programmatic scrolls from user-initiated ones
-  const programmaticScrollRef = useRef(false);
 
   // Count only system messages (tool results) — text streaming doesn't change this
   const systemMessageCount = useMemo(
@@ -75,39 +72,63 @@ export function Conversation({ projectId }: ConversationProps) {
     return map;
   }, [systemMessageCount]);
 
-  // Track scroll — wheel up = user wants control, instantly disengage
+  // Wheel listener: synchronously disengage follow on upward scroll.
+  // Wheel events fire in the same event-loop turn, BEFORE the next rAF,
+  // so followRef is false by the time the auto-scroll tick checks it.
+  // Deps include isReady because the scroll container doesn't exist during loading.
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
+    const container = scrollRef.current;
+    if (!container) return;
     const handleWheel = (e: WheelEvent) => {
       if (e.deltaY < 0) followRef.current = false;
     };
-    // Re-engage only when user scrolls back to very bottom
+    container.addEventListener("wheel", handleWheel, { passive: true });
+    return () => container.removeEventListener("wheel", handleWheel);
+  }, [isReady]);
+
+  // Scroll listener: re-engage follow when user scrolls back to the bottom.
+  // The !followRef guard ensures this only runs when disengaged — it never
+  // interferes with the rAF loop's programmatic scrolling (which has followRef=true).
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
     const handleScroll = () => {
-      if (programmaticScrollRef.current) return;
-      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-      if (distanceFromBottom < 20) followRef.current = true;
+      if (!followRef.current) {
+        const { scrollTop, scrollHeight, clientHeight } = container;
+        const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+        if (distanceFromBottom < 10) followRef.current = true;
+      }
     };
-    el.addEventListener("wheel", handleWheel, { passive: true });
-    el.addEventListener("scroll", handleScroll, { passive: true });
-    return () => {
-      el.removeEventListener("wheel", handleWheel);
-      el.removeEventListener("scroll", handleScroll);
+    container.addEventListener("scroll", handleScroll, { passive: true });
+    return () => container.removeEventListener("scroll", handleScroll);
+  }, [isReady]);
+
+  // rAF loop: while processing + following, continuously pin to bottom.
+  // isProcessing already changes AFTER isReady, so scrollRef.current is available.
+  const rafRef = useRef(0);
+  useEffect(() => {
+    if (!isProcessing) return;
+    const tick = () => {
+      if (followRef.current && scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      }
+      rafRef.current = requestAnimationFrame(tick);
     };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [isProcessing]);
+
+  // Scroll to bottom on send — re-engages follow
+  const scrollToBottom = useCallback(() => {
+    followRef.current = true;
+    requestAnimationFrame(() => {
+      if (scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      }
+    });
   }, []);
 
-  // Auto-scroll when messages change — only if following
-  const scrollRafRef = useRef(0);
-  useEffect(() => {
-    if (!followRef.current || !scrollRef.current) return;
-    cancelAnimationFrame(scrollRafRef.current);
-    scrollRafRef.current = requestAnimationFrame(() => {
-      if (!scrollRef.current) return;
-      programmaticScrollRef.current = true;
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-      requestAnimationFrame(() => { programmaticScrollRef.current = false; });
-    });
-  }, [messages]);
+  const handleSend = useCallback((msg: string) => { sendMessage(msg); scrollToBottom(); }, [sendMessage, scrollToBottom]);
 
   // Scroll to bottom when this conversation becomes active or on initial mount
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
@@ -115,18 +136,15 @@ export function Conversation({ projectId }: ConversationProps) {
 
   useEffect(() => {
     if (!isActive || !isReady) return;
-    const scrollToBottom = () => {
-      if (scrollRef.current) {
-        programmaticScrollRef.current = true;
-        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-        followRef.current = true;
-        requestAnimationFrame(() => { programmaticScrollRef.current = false; });
-      }
-    };
-    // Double rAF: first ensures layout, second ensures paint + message DOM is ready
     requestAnimationFrame(() => {
-      scrollToBottom();
-      requestAnimationFrame(scrollToBottom);
+      if (scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        requestAnimationFrame(() => {
+          if (scrollRef.current) {
+            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+          }
+        });
+      }
     });
   }, [isActive, isReady, projectId]);
 
@@ -160,7 +178,7 @@ export function Conversation({ projectId }: ConversationProps) {
 
   return (
     <div className="relative h-full w-full animate-in fade-in duration-500">
-      <div ref={scrollRef} className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pt-8 pb-48" style={{ willChange: "transform" }}>
+      <div ref={scrollRef} className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pt-8 pb-48">
         {messages.length === 0 && (
           <div className="flex items-center justify-center h-full select-none">
             <span
@@ -192,7 +210,7 @@ export function Conversation({ projectId }: ConversationProps) {
       <div className="absolute bottom-0 left-0 right-0">
         <InputBar
           projectId={projectId}
-          onSend={sendMessage}
+          onSend={handleSend}
           onAbort={abortMessage}
           isProcessing={isProcessing}
         />

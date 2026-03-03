@@ -1,0 +1,9 @@
+1. the settings menu, and the notification badge should be redesigned to follow the
+textarea design pattern, same language, same dna,
+this includes the edges, the background and the
+rounded size
+
+2. the model picker needs to go to a collapsed state when i click outside of the area and don't choose anything, it currently stays open
+
+
+3. when the todo list is expanded, let's remove the word todo, only the tasks should visible, when collapsed we go back to the todo, how does that sound
