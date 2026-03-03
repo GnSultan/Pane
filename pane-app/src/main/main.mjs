@@ -595,9 +595,11 @@ function getPtyWorker() {
       }
     }
   });
-  // Crash recovery: if node-pty kills the worker, send synthetic exit to all active PTYs
+  // Crash recovery: if node-pty kills the worker, send synthetic exit to all active PTYs.
+  // Ignore exits during app shutdown (ptyWorker already nulled by before-quit handler).
   ptyWorker.on("exit", (code) => {
-    console.warn(`[pane] PTY worker exited with code ${code}`);
+    if (forceQuit) return;
+    console.warn(`[pane] PTY worker exited unexpectedly with code ${code}`);
     for (const ptyId of activePtyIds) {
       const channel = `pty-exit:${ptyId}`;
       const windows = BrowserWindow.getAllWindows();

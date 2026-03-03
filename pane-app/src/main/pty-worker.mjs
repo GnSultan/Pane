@@ -16,31 +16,41 @@ function sendToMain(message) {
 }
 
 function handleCreate({ ptyId, projectId, cwd }) {
-  const userShell = process.env.SHELL || "/bin/zsh";
-  const pty = nodePty.spawn(userShell, [], {
-    name: "xterm-256color",
-    cols: 120,
-    rows: 30,
-    cwd,
-    env: { ...process.env }
-  });
+  try {
+    const userShell = process.env.SHELL || "/bin/zsh";
+    const pty = nodePty.spawn(userShell, [], {
+      name: "xterm-256color",
+      cols: 120,
+      rows: 30,
+      cwd,
+      env: { ...process.env }
+    });
 
-  const dataDisposable = pty.onData((data) => {
-    sendToMain({ type: "data", ptyId, data });
-  });
+    const dataDisposable = pty.onData((data) => {
+      sendToMain({ type: "data", ptyId, data });
+    });
 
-  const exitDisposable = pty.onExit(({ exitCode }) => {
-    sendToMain({ type: "exit", ptyId, exitCode });
-    activePtys.delete(ptyId);
-  });
+    const exitDisposable = pty.onExit(({ exitCode }) => {
+      sendToMain({ type: "exit", ptyId, exitCode });
+      activePtys.delete(ptyId);
+    });
 
-  activePtys.set(ptyId, { pty, projectId, dataDisposable, exitDisposable });
+    activePtys.set(ptyId, { pty, projectId, dataDisposable, exitDisposable });
+  } catch (err) {
+    // Spawn failed (bad cwd, shell not found, etc.) — notify renderer so the
+    // tab shows as dead rather than hanging. Worker stays alive.
+    console.error("[pty-worker] spawn failed:", err.message);
+    sendToMain({ type: "exit", ptyId, exitCode: 1 });
+  }
 }
 
 function handleWrite({ ptyId, data }) {
   const entry = activePtys.get(ptyId);
-  if (entry) {
+  if (!entry) return;
+  try {
     entry.pty.write(data);
+  } catch {
+    // PTY died between the write and cleanup — ignore silently.
   }
 }
 
@@ -80,11 +90,15 @@ function handleShutdown() {
 }
 
 process.parentPort.on("message", ({ data }) => {
-  switch (data.type) {
-    case "create":          handleCreate(data);         break;
-    case "write":           handleWrite(data);          break;
-    case "destroy":         handleDestroy(data);        break;
-    case "destroy_project": handleDestroyProject(data); break;
-    case "shutdown":        handleShutdown();           break;
+  try {
+    switch (data.type) {
+      case "create":          handleCreate(data);         break;
+      case "write":           handleWrite(data);          break;
+      case "destroy":         handleDestroy(data);        break;
+      case "destroy_project": handleDestroyProject(data); break;
+      case "shutdown":        handleShutdown();           break;
+    }
+  } catch (err) {
+    console.error("[pty-worker] unhandled error in message handler:", err.message);
   }
 });

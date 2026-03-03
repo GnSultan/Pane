@@ -12,6 +12,8 @@ interface ConversationProps {
   projectId: string;
 }
 
+const MSG_CV_STYLE: React.CSSProperties = { contentVisibility: "auto", containIntrinsicSize: "auto 80px" };
+
 const MemoizedMessage = memo(function MemoizedMessage({
   message,
   toolResults,
@@ -21,7 +23,11 @@ const MemoizedMessage = memo(function MemoizedMessage({
   toolResults: Map<string, ToolResultBlock>;
   projectId: string;
 }) {
-  return <MessageBubble message={message} toolResults={toolResults} projectId={projectId} />;
+  return (
+    <div style={MSG_CV_STYLE}>
+      <MessageBubble message={message} toolResults={toolResults} projectId={projectId} />
+    </div>
+  );
 }, (prev, next) => {
   // Message reference changed — must re-render
   if (prev.message !== next.message) return false;
@@ -39,7 +45,7 @@ const MemoizedMessage = memo(function MemoizedMessage({
   return true;
 });
 
-export function Conversation({ projectId }: ConversationProps) {
+export const Conversation = memo(function Conversation({ projectId }: ConversationProps) {
   const messages = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.messages ?? EMPTY_MESSAGES
   );
@@ -132,23 +138,22 @@ export function Conversation({ projectId }: ConversationProps) {
 
   const handleSend = useCallback((msg: string) => { sendMessage(msg); scrollToBottom(); }, [sendMessage, scrollToBottom]);
 
-  // Scroll to bottom when this conversation becomes active or on initial mount
-  const activeProjectId = useProjectsStore((s) => s.activeProjectId);
-  const isActive = activeProjectId === projectId;
-
+  // Scroll to bottom when this conversation becomes active (fired by ConversationLayer
+  // via DOM event — no Zustand subscription, no re-render on project switch).
   useEffect(() => {
-    if (!isActive || !isReady) return;
-    requestAnimationFrame(() => {
-      if (scrollRef.current) {
-        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    const handler = (e: Event) => {
+      const { projectId: activatedId } = (e as CustomEvent).detail;
+      if (activatedId === projectId && isReady && scrollRef.current) {
         requestAnimationFrame(() => {
           if (scrollRef.current) {
             scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
           }
         });
       }
-    });
-  }, [isActive, isReady, projectId]);
+    };
+    window.addEventListener("pane:conversation-activated", handler);
+    return () => window.removeEventListener("pane:conversation-activated", handler);
+  }, [projectId, isReady]);
 
   // Show loading state when Claude is initializing
   if (!isReady) {
@@ -179,8 +184,8 @@ export function Conversation({ projectId }: ConversationProps) {
   }
 
   return (
-    <div className="relative h-full w-full animate-in fade-in duration-500">
-      <div ref={scrollRef} className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pt-8 pb-48">
+    <div className="relative h-full w-full">
+      <div ref={scrollRef} className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pt-8 pb-48" style={{ contain: "strict" }}>
         {messages.length === 0 && (
           <div className="flex items-center justify-center h-full select-none">
             <span
@@ -220,4 +225,4 @@ export function Conversation({ projectId }: ConversationProps) {
       </div>
     </div>
   );
-}
+});

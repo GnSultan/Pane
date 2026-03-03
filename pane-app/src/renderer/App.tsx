@@ -236,8 +236,9 @@ function App() {
         }
       }
     };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    // Capture phase so shortcuts fire before Ace editor eats them (e.g. Cmd+/)
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [toggleControlPanel, toggleFuzzyFinder, toggleFileSearch]);
 
   return (
