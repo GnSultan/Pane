@@ -343,6 +343,11 @@ html, body, #root {
   -webkit-app-region: no-drag;
 }
 
+/* Underscore cursor on all editable text */
+textarea, input[type="text"], input:not([type]) {
+  caret-shape: underscore;
+}
+
 /* Text selection — matches editor selection color */
 ::selection {
   background-color: var(--pane-editor-selection);
@@ -378,6 +383,8 @@ html, body, #root {
 
 .ace_cursor {
   color: var(--pane-editor-cursor) !important;
+  border-left: 0 !important;
+  border-bottom: 2px solid var(--pane-editor-cursor) !important;
 }
 
 .ace_selection {

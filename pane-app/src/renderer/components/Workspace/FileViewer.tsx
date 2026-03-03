@@ -168,6 +168,7 @@ export function FileViewer() {
           wrap: true,
           indentedSoftWrap: false,
           scrollPastEnd: 0.8 as unknown as boolean,
+          highlightSelectedWord: false,
         }}
         editorProps={{ $blockScrolling: true }}
       />
