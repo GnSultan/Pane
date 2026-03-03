@@ -59,17 +59,14 @@ export function Workspace() {
           className="flex-1 min-h-0"
           style={{ display: activeMode === "conversation" ? "flex" : "none" }}
         >
-          {projectOrder.map((id) => (
-            <div
-              key={id}
-              className="flex-1 min-h-0 min-w-0"
-              style={{ display: id === activeProjectId ? "flex" : "none" }}
-            >
-              <Conversation
-                projectId={id}
-              />
+          {/* Only mount the active conversation — state lives in Zustand so nothing
+              is lost. All-conversations-in-DOM was causing a heavy reflow on every
+              project switch. key= ensures clean remount per project. */}
+          {activeProjectId && (
+            <div key={activeProjectId} className="flex-1 min-h-0 min-w-0 flex">
+              <Conversation projectId={activeProjectId} />
             </div>
-          ))}
+          )}
         </div>
 
         <div
