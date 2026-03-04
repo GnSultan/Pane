@@ -1,10 +1,10 @@
-import { useRef, useEffect, useCallback, useMemo, memo } from "react";
+import { useRef, useEffect, useCallback, useMemo, memo, useState } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { useClaude } from "../../hooks/useClaude";
 import { useClaudeWarmup } from "../../hooks/useClaudeWarmup";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
-import type { ConversationMessage, ToolResultBlock, ToolUseBlock } from "../../lib/claude-types";
+import type { ConversationMessage, ToolResultBlock, ToolUseBlock, ContextPressure } from "../../lib/claude-types";
 
 const EMPTY_MESSAGES: ConversationMessage[] = [];
 
@@ -52,11 +52,27 @@ export const Conversation = memo(function Conversation({ projectId }: Conversati
   const isProcessing = useProjectsStore((s) => s.projects.get(projectId)?.conversation.isProcessing ?? false);
   const isReady = useProjectsStore((s) => s.projects.get(projectId)?.conversation.isReady ?? false);
   const error = useProjectsStore((s) => s.projects.get(projectId)?.conversation.error ?? null);
+  const contextPressure = useProjectsStore((s) => s.projects.get(projectId)?.conversation.contextPressure ?? "none") as ContextPressure;
+  const contextTokens = useProjectsStore((s) => s.projects.get(projectId)?.conversation.contextTokens ?? 0);
 
   const { sendMessage, abortMessage } = useClaude(projectId);
   useClaudeWarmup(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
+
+  // Context refresh toast — shows briefly when proactive continuation fires
+  const [showRefreshToast, setShowRefreshToast] = useState(false);
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { projectId: refreshedId } = (e as CustomEvent).detail;
+      if (refreshedId === projectId) {
+        setShowRefreshToast(true);
+        setTimeout(() => setShowRefreshToast(false), 3000);
+      }
+    };
+    window.addEventListener("pane:context-refreshed", handler);
+    return () => window.removeEventListener("pane:context-refreshed", handler);
+  }, [projectId]);
 
   // Count only system messages (tool results) — text streaming doesn't change this
   const systemMessageCount = useMemo(
@@ -183,9 +199,29 @@ export const Conversation = memo(function Conversation({ projectId }: Conversati
     );
   }
 
+  const contextPercent = contextTokens > 0 ? Math.min(Math.round((contextTokens / 200000) * 100), 99) : 0;
+
   return (
     <div className="relative h-full w-full">
-      <div ref={scrollRef} className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pt-8 pb-48" style={{ contain: "strict" }}>
+      {contextPressure !== "none" && (
+        <div className="absolute top-0 left-0 right-0 z-10 px-10 pt-2">
+          <div className="flex items-center gap-2 font-mono" style={{ fontSize: "10px" }}>
+            <span className={contextPressure === "high" ? "text-pane-error" : "text-[var(--pane-terminal)]"}>
+              context {contextPercent}%
+            </span>
+            <div className="flex-1 h-[2px] bg-pane-surface rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ${
+                  contextPressure === "high" ? "bg-pane-error" : "bg-[var(--pane-terminal)]"
+                }`}
+                style={{ width: `${contextPercent}%` }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div ref={scrollRef} className={`absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pb-48 ${contextPressure !== "none" ? "pt-12" : "pt-8"}`} style={{ contain: "strict" }}>
         {messages.length === 0 && (
           <div className="flex items-center justify-center h-full select-none">
             <span
@@ -214,6 +250,16 @@ export const Conversation = memo(function Conversation({ projectId }: Conversati
           </div>
         )}
       </div>
+
+      {showRefreshToast && (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
+          <div
+            className="font-mono text-[10px] text-[var(--pane-terminal)] bg-pane-surface px-3 py-1.5 rounded-sm animate-fade-in"
+          >
+            context refreshed — conversation continues with full memory
+          </div>
+        </div>
+      )}
 
       <div className="absolute bottom-0 left-0 right-0">
         <InputBar

@@ -52,7 +52,7 @@ export function TaskNotification() {
         <div
           key={notification.id}
           onClick={() => handleClick(notification)}
-          className="bg-pane-bg rounded-3xl ring-1 ring-pane-border/40 px-4 py-3
+          className="bg-pane-bg rounded-2xl ring-1 ring-pane-border/40 px-4 py-3
                      animate-fadeSlideUp pointer-events-auto cursor-pointer
                      hover:bg-pane-text/[0.04] btn-press
                      flex items-center gap-3 min-w-[280px]"

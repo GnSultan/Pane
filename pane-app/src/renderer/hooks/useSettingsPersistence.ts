@@ -8,6 +8,10 @@ import {
   writeFile,
   getHomeDir,
   listCheckpoints,
+  writeEditorState,
+  writeProjectState,
+  brainGetProfile,
+  brainGetAvatar,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/claude-types";
@@ -165,6 +169,16 @@ export function useSettingsPersistence() {
               for (const dir of state.expanded_dirs) {
                 toggleDir(id, dir);
               }
+              // Restore recent files
+              if (state.recent_files?.length) {
+                useProjectsStore.setState((s) => {
+                  const proj = s.projects.get(id);
+                  if (!proj) return s;
+                  const next = new Map(s.projects);
+                  next.set(id, { ...proj, recentFiles: state.recent_files! });
+                  return { projects: next };
+                });
+              }
               // Restore active file (read content async)
               if (state.active_file_path) {
                 const filePath = state.active_file_path;
@@ -198,6 +212,22 @@ export function useSettingsPersistence() {
         loadedRef.current = true;
         // Signal other hooks that the app is ready
         resolveAppReady();
+
+        // Load profile identity + avatar (non-blocking, after app is ready)
+        brainGetProfile().then(({ profile }) => {
+          if (profile?.identity) {
+            const ws = useWorkspaceStore.getState();
+            if (profile.identity.name) ws.setProfileName(profile.identity.name);
+            if (profile.identity.bio) ws.setProfileBio(profile.identity.bio);
+            if (profile.identity.role) ws.setProfileRole(profile.identity.role);
+          }
+        }).catch(() => {});
+
+        brainGetAvatar().then(({ base64, mime }) => {
+          if (base64 && mime) {
+            useWorkspaceStore.getState().setProfileAvatarDataUrl(`data:${mime};base64,${base64}`);
+          }
+        }).catch(() => {});
       })
       .catch((err) => {
         console.error(err);
@@ -238,6 +268,7 @@ export function useSettingsPersistence() {
         project_states[p.root] = {
           expanded_dirs: Array.from(p.expandedDirs),
           active_file_path: p.activeFilePath,
+          recent_files: p.recentFiles,
         };
       }
 
@@ -356,6 +387,54 @@ export function useSettingsPersistence() {
       save();
     };
 
+    // --- Intelligence Layer: sync state to ~/.pane/state/ for MCP server ---
+    let editorSyncTimer: ReturnType<typeof setTimeout> | null = null;
+    const unsubEditorSync = useProjectsStore.subscribe(
+      (state, prev) => {
+        const activeId = state.activeProjectId;
+        if (!activeId || !settingsLoaded) return;
+        const project = state.projects.get(activeId);
+        const prevProject = prev.projects.get(activeId);
+        // Sync when active file changes or active project changes
+        if (
+          project?.activeFilePath !== prevProject?.activeFilePath ||
+          state.activeProjectId !== prev.activeProjectId
+        ) {
+          if (editorSyncTimer) clearTimeout(editorSyncTimer);
+          editorSyncTimer = setTimeout(() => {
+            if (!project) return;
+            writeEditorState(activeId, {
+              activeFile: project.activeFilePath,
+              content: project.activeFileContent,
+              recentFiles: project.recentFiles,
+            }).catch(() => {});
+          }, 300);
+        }
+      },
+    );
+
+    // Sync project state on git branch change
+    let projectSyncTimer: ReturnType<typeof setTimeout> | null = null;
+    const unsubProjectSync = useProjectsStore.subscribe(
+      (state, prev) => {
+        if (!settingsLoaded) return;
+        for (const [id, project] of state.projects) {
+          const prevProject = prev.projects.get(id);
+          if (project.git.branch !== prevProject?.git.branch || !prevProject) {
+            if (projectSyncTimer) clearTimeout(projectSyncTimer);
+            projectSyncTimer = setTimeout(() => {
+              writeProjectState(id, {
+                name: project.name,
+                root: project.root,
+                gitBranch: project.git.branch,
+                topLevelFiles: project.dirContents.get(project.root)?.map(e => e.name) ?? [],
+              }).catch(() => {});
+            }, 500);
+          }
+        }
+      },
+    );
+
     window.addEventListener("beforeunload", handleBeforeUnload);
     const interval = setInterval(save, 30000);
 
@@ -363,6 +442,10 @@ export function useSettingsPersistence() {
       unsubWorkspace();
       unsubProjects();
       unsubConversation();
+      unsubEditorSync();
+      unsubProjectSync();
+      if (editorSyncTimer) clearTimeout(editorSyncTimer);
+      if (projectSyncTimer) clearTimeout(projectSyncTimer);
       if (convDebounce) clearTimeout(convDebounce);
       window.removeEventListener("beforeunload", handleBeforeUnload);
       clearInterval(interval);

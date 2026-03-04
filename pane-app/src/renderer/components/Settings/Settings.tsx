@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useWorkspaceStore } from "../../stores/workspace";
+import { brainUpdateIdentity, brainSaveAvatar, brainGetProfile, brainUpdateRules, brainUpdatePhilosophy } from "../../lib/tauri-commands";
 import {
   ACTION_DEFINITIONS,
   DEFAULT_BINDINGS,
@@ -209,7 +210,7 @@ function KeybindingsSection() {
   }, [recordingAction]);
 
   return (
-    <div className="px-6 py-3 border-t border-pane-border/50">
+    <div className="py-3">
       <button
         className="flex items-center justify-between w-full group"
         onClick={() => setExpanded((v) => !v)}
@@ -304,6 +305,258 @@ function KeybindingsSection() {
   );
 }
 
+// --- Profile Section ---
+
+function ProfileSection() {
+  const profileName = useWorkspaceStore((s) => s.profileName);
+  const profileBio = useWorkspaceStore((s) => s.profileBio);
+  const profileRole = useWorkspaceStore((s) => s.profileRole);
+  const avatarDataUrl = useWorkspaceStore((s) => s.profileAvatarDataUrl);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Debounced save to brain engine
+  const saveIdentity = useCallback((field: string, value: string) => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      brainUpdateIdentity({ [field]: value }).catch(() => {});
+    }, 500);
+  }, []);
+
+  const handleNameChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    useWorkspaceStore.getState().setProfileName(val);
+    saveIdentity("name", val);
+  }, [saveIdentity]);
+
+  const handleRoleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    useWorkspaceStore.getState().setProfileRole(val);
+    saveIdentity("role", val);
+  }, [saveIdentity]);
+
+  const handleBioChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    useWorkspaceStore.getState().setProfileBio(val);
+    saveIdentity("bio", val);
+  }, [saveIdentity]);
+
+  const handleAvatarClick = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleAvatarChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Read as base64
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const dataUrl = reader.result as string;
+      // Display immediately
+      useWorkspaceStore.getState().setProfileAvatarDataUrl(dataUrl);
+
+      // Save to brain engine
+      const base64Data = dataUrl.split(",")[1]!;
+      await brainSaveAvatar(base64Data, file.type).catch(() => {});
+    };
+    reader.readAsDataURL(file);
+
+    // Reset input so same file can be re-selected
+    e.target.value = "";
+  }, []);
+
+  // Initials for fallback avatar
+  const initials = profileName
+    ? profileName.split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2)
+    : "";
+
+  return (
+    <div className="flex flex-col items-center py-6 gap-4">
+      {/* Avatar */}
+      <button
+        onClick={handleAvatarClick}
+        className="relative w-20 h-20 rounded-full overflow-hidden bg-pane-surface hover:ring-2 hover:ring-pane-text/20 transition-all group"
+        title="Change photo"
+      >
+        {avatarDataUrl ? (
+          <img src={avatarDataUrl} alt="" className="w-full h-full object-cover" />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center">
+            {initials ? (
+              <span className="font-mono text-pane-text text-lg font-medium">{initials}</span>
+            ) : (
+              <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="text-pane-text-secondary/40">
+                <circle cx="16" cy="12" r="5" />
+                <path d="M6 28c0-5.523 4.477-10 10-10s10 4.477 10 10" />
+              </svg>
+            )}
+          </div>
+        )}
+        {/* Hover overlay */}
+        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="white" strokeWidth="1.5" strokeLinecap="round">
+            <circle cx="10" cy="10" r="3" />
+            <path d="M3 8V6a2 2 0 012-2h2M15 4h2a2 2 0 012 2v2M17 14v2a2 2 0 01-2 2h-2M5 16H3a2 2 0 01-2-2v-2" />
+          </svg>
+        </div>
+      </button>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        className="hidden"
+        onChange={handleAvatarChange}
+      />
+
+      {/* Name */}
+      <input
+        type="text"
+        value={profileName}
+        onChange={handleNameChange}
+        placeholder="your name"
+        className="w-full max-w-xs text-center font-mono text-pane-text bg-transparent outline-none text-lg font-medium placeholder:text-pane-text-secondary/30"
+      />
+
+      {/* Role */}
+      <input
+        type="text"
+        value={profileRole}
+        onChange={handleRoleChange}
+        placeholder="role"
+        className="w-full max-w-xs text-center font-mono text-pane-text-secondary bg-transparent outline-none placeholder:text-pane-text-secondary/30"
+        style={{ fontSize: "var(--pane-font-size-sm)" }}
+      />
+
+      {/* Bio */}
+      <textarea
+        value={profileBio}
+        onChange={handleBioChange}
+        placeholder="about you"
+        rows={2}
+        className="w-full max-w-xs text-center font-mono text-pane-text-secondary bg-transparent outline-none resize-none placeholder:text-pane-text-secondary/30"
+        style={{ fontSize: "var(--pane-font-size-sm)" }}
+      />
+    </div>
+  );
+}
+
+// --- Philosophy & Rules Section ---
+
+function PhilosophySection() {
+  const [philosophy, setPhilosophy] = useState("");
+  const [rules, setRules] = useState("");
+  const [expanded, setExpanded] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Load from brain on mount
+  useEffect(() => {
+    brainGetProfile().then(({ profile }) => {
+      if (profile) {
+        setPhilosophy(profile.philosophy || "");
+        setRules(profile.rules || "");
+      }
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, []);
+
+  const handlePhilosophyChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setPhilosophy(val);
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      brainUpdatePhilosophy(val).catch(() => {});
+    }, 800);
+  }, []);
+
+  const handleRulesChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setRules(val);
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      brainUpdateRules(val).catch(() => {});
+    }, 800);
+  }, []);
+
+  if (!loaded) return null;
+
+  return (
+    <div className="py-3">
+      <button
+        className="flex items-center justify-between w-full group"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span
+          className="text-pane-text-secondary/40 font-mono uppercase tracking-wider"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          philosophy & rules
+        </span>
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 12 12"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={`text-pane-text-secondary/30 group-hover:text-pane-text-secondary/60 transition-transform ${
+            expanded ? "rotate-180" : ""
+          }`}
+        >
+          <path d="M3 4.5L6 7.5L9 4.5" />
+        </svg>
+      </button>
+
+      {expanded && (
+        <div className="mt-3 space-y-4">
+          <div>
+            <label
+              className="block text-pane-text-secondary/40 font-mono uppercase tracking-wider mb-1"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              design philosophy
+            </label>
+            <textarea
+              value={philosophy}
+              onChange={handlePhilosophyChange}
+              placeholder="your design principles..."
+              rows={3}
+              className="w-full font-mono text-pane-text bg-pane-surface rounded-lg p-3 outline-none resize-none placeholder:text-pane-text-secondary/30"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            />
+          </div>
+          <div>
+            <label
+              className="block text-pane-text-secondary/40 font-mono uppercase tracking-wider mb-1"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              rules
+            </label>
+            <textarea
+              value={rules}
+              onChange={handleRulesChange}
+              placeholder="always use bun&#10;never auto-commit&#10;prefer functional over class"
+              rows={3}
+              className="w-full font-mono text-pane-text bg-pane-surface rounded-lg p-3 outline-none resize-none placeholder:text-pane-text-secondary/30"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            />
+            <span
+              className="text-pane-text-secondary/30 font-mono mt-1 block"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              one rule per line, these override observed preferences
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // --- Main Settings component ---
 
 interface SettingsProps {
@@ -341,7 +594,7 @@ export function Settings({ onClose }: SettingsProps) {
     >
       <div className="absolute inset-0 bg-pane-bg/80 backdrop-blur-sm" />
       <div
-        className="relative bg-pane-bg rounded-3xl ring-1 ring-pane-border/40
+        className="relative bg-pane-bg rounded-2xl ring-1 ring-pane-border/40
           w-full max-w-md mx-4 max-h-[85vh] overflow-hidden overflow-y-auto"
         role="dialog"
         onClick={(e) => e.stopPropagation()}
@@ -349,7 +602,7 @@ export function Settings({ onClose }: SettingsProps) {
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-pane-border">
           <span className="font-mono text-pane-text font-medium" style={{ fontSize: "var(--pane-font-size)" }}>
-            settings
+            profile
           </span>
           <button
             onClick={onClose}
@@ -362,7 +615,23 @@ export function Settings({ onClose }: SettingsProps) {
           </button>
         </div>
 
-        {/* Settings content */}
+        {/* Profile identity */}
+        <div className="px-6">
+          <ProfileSection />
+        </div>
+
+        {/* Divider */}
+        <div className="border-t border-pane-border/50" />
+
+        {/* Philosophy & Rules (collapsible) */}
+        <div className="px-6">
+          <PhilosophySection />
+        </div>
+
+        {/* Divider */}
+        <div className="border-t border-pane-border/50" />
+
+        {/* Visual Settings */}
         <div className="px-6 py-2">
           <SettingRow label="theme">
             <div className="flex gap-1">
@@ -458,7 +727,9 @@ export function Settings({ onClose }: SettingsProps) {
         </div>
 
         {/* Keyboard shortcuts — interactive rebinding */}
-        <KeybindingsSection />
+        <div className="px-6 border-t border-pane-border/50">
+          <KeybindingsSection />
+        </div>
       </div>
     </div>
   );

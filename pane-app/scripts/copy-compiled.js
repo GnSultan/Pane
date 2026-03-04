@@ -28,4 +28,8 @@ copyFileSync(
   `${projectRoot}/src/main/pty-worker.mjs`,
   `${projectRoot}/out/main/pty-worker.mjs`
 );
+copyFileSync(
+  `${projectRoot}/src/main/brain-engine.mjs`,
+  `${projectRoot}/out/main/brain-engine.mjs`
+);
 console.log('✓ Compiled scripts copied successfully');

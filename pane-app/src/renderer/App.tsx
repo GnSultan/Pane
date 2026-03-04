@@ -1,11 +1,10 @@
-import { useEffect, useCallback, useState } from "react";
+import { useEffect, useCallback } from "react";
 import { setWindowTitle, destroyPty } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ControlPanel } from "./components/ControlPanel/ControlPanel";
 import { Workspace } from "./components/Workspace/Workspace";
 import { FuzzyFinder } from "./components/FuzzyFinder/FuzzyFinder";
 import { FileSearch } from "./components/FileSearch/FileSearch";
-import { Settings } from "./components/Settings/Settings";
 import { TaskNotification } from "./components/shared/TaskNotification";
 import { useWorkspaceStore } from "./stores/workspace";
 import { useProjectsStore } from "./stores/projects";
@@ -57,8 +56,6 @@ function App() {
   const toggleFileSearch = useWorkspaceStore((s) => s.toggleFileSearch);
   const fileSearchOpen = useWorkspaceStore((s) => s.fileSearchOpen);
 
-  const [settingsOpen, setSettingsOpen] = useState(false);
-
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
 
   useFileWatcher();
@@ -68,13 +65,6 @@ function App() {
   // Check for Claude updates on app launch
   useEffect(() => {
     useWorkspaceStore.getState().checkForClaudeUpdate();
-  }, []);
-
-  // Listen for settings open event (from toolbar button)
-  useEffect(() => {
-    const handler = () => setSettingsOpen(true);
-    window.addEventListener("pane:open-settings", handler);
-    return () => window.removeEventListener("pane:open-settings", handler);
   }, []);
 
   // Update window title when active project changes
@@ -144,7 +134,7 @@ function App() {
           break;
         }
         case "settings":
-          setSettingsOpen((prev) => !prev);
+          useWorkspaceStore.getState().toggleProfile();
           break;
         case "cycle-theme":
           useWorkspaceStore.getState().toggleTheme();
@@ -262,7 +252,6 @@ function App() {
 
       {fuzzyFinderOpen && <FuzzyFinder />}
       {fileSearchOpen && <FileSearch />}
-      {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} />}
       <TaskNotification />
     </div>
   );

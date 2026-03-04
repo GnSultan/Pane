@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { createPty, writePty, destroyPty, destroyAllPtysForProject, onPtyData, onPtyExit, getHomeDir } from "../../lib/tauri-commands";
+import { createPty, writePty, destroyPty, destroyAllPtysForProject, onPtyData, onPtyExit, getHomeDir, writeTerminalState } from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";
 import type { TerminalTab } from "../../stores/projects";
 import stripAnsi from "strip-ansi";
@@ -42,6 +42,8 @@ interface TabState {
   isRunning: boolean;
   initialized: boolean; // suppress initial shell prompt
   echoSkipped: boolean; // skip the echoed command line from PTY
+  lastCommand: string;  // last command sent (for MCP state sync)
+  recentCommands: Array<{ cmd: string; output: string; cwd: string; timestamp: number }>; // last 20 commands
 }
 
 const tabStates = new Map<string, TabState>();
@@ -57,6 +59,8 @@ function getTabState(tabId: string, initialCwd: string): TabState {
       isRunning: false,
       initialized: false,
       echoSkipped: false,
+      lastCommand: "",
+      recentCommands: [],
     };
     tabStates.set(tabId, state);
   }
@@ -230,6 +234,18 @@ function TerminalTabContent({
         ts.isRunning = false;
         ts.echoSkipped = false;
         setIsRunning(false);
+
+        // Sync terminal state for MCP server
+        if (ts.lastCommand) {
+          const entry = {
+            cmd: ts.lastCommand,
+            output: output.slice(0, 2000),
+            cwd: newCwd || cwd,
+            timestamp: Date.now(),
+          };
+          ts.recentCommands = [...ts.recentCommands, entry].slice(-20);
+          writeTerminalState(projectId, { commands: ts.recentCommands }).catch(() => {});
+        }
       }
     });
 
@@ -284,6 +300,7 @@ function TerminalTabContent({
       ts.initialized = true;
       ts.outputBuffer = "";
       ts.echoSkipped = false;
+      ts.lastCommand = trimmedCmd;
 
       // Write the command + completion marker to the PTY
       const markerCmd = `${trimmedCmd}; echo "${CMD_END_MARKER}$?${PWD_MARKER}$(pwd)"`;

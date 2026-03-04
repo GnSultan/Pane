@@ -1,1 +1,14 @@
-when the todo list is expanded, let's remove the word todo 3/6, we don't necessarily need it since we can see everything we want to see, when collapsed we go back to the todo, how does that sound
+also the approve plan that claude sends to me, we agreed that the button go was never to show on the ui, it was supposed to be a confirmation for claude code to exit plan mode and continue building with consent, also the button shouldn't have the word go, we could use a word like good to go instead of just go, it would be a much better ui experience
+
+the shortcut cmd+/ for switching between chat and editor is only working one way, only going to editor and makes it back to chat, it was supposed to work as a toggle, back and forth
+
+
+PTY worker exited with code 1
+
+i have idea, should we find another cursor type instead of the one we have right now? what about the old _ cursor? i haven't seen a lot people use that, maybe it could do us really good
+
+so, my terminal can't do brew commands, why. it bugs me, we don't want a user not being able to confidently just depend on pane's cli to do what they want to do
+
+so the task tracking is working, but there's a problem, so what it does in the number is show how many tasks have been completed, so when there are about 5 tasks and claude is in the 4th task, it shows 3/5 which means 3 of 5 have completed, but it should be showing the current task which is 4/5. just the number is wrong, the task itself is right, when you expand the task component you see exactly where claude is but the number logic doesn't complement this behaviour, also when you expand the task component, the numbers should be gone because we don't need them either, just like we didn't need to see the word tasks
+
+also, i'm thinking about setting up automatic new release detection, we want every time i build something, a new version, a new release, we need a smooth experience to update the app, just like what we did with claude code update, let's think about this

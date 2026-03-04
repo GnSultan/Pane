@@ -2,7 +2,9 @@ import { useState, useEffect, useRef, memo } from "react";
 import { Conversation } from "./Conversation";
 import { FileViewer } from "./FileViewer";
 import { Terminal } from "./Terminal";
+import { Profile } from "./Profile";
 import { useProjectsStore } from "../../stores/projects";
+import { useWorkspaceStore } from "../../stores/workspace";
 import { getClaudePlanInfo } from "../../lib/tauri-commands";
 
 // Visibility is toggled via direct DOM manipulation — bypasses React entirely.
@@ -54,6 +56,7 @@ function formatModelName(model: string | null): string {
 export function Workspace() {
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const projectOrder = useProjectsStore((s) => s.projectOrder);
+  const profileOpen = useWorkspaceStore((s) => s.profileOpen);
   const activeMode = useProjectsStore((s) => {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
@@ -95,17 +98,17 @@ export function Workspace() {
       {/* Content — one view at a time, using absolute + visibility so the
           browser keeps layout cached and mode switching is instant both ways. */}
       <div className="h-full relative">
-        <div className={`absolute inset-0 ${activeMode !== "conversation" ? "invisible" : ""}`}>
+        <div className={`absolute inset-0 ${activeMode !== "conversation" || profileOpen ? "invisible" : ""}`}>
           {[...mountedIds].map((id) => (
             <ConversationLayer key={id} projectId={id} />
           ))}
         </div>
 
-        <div className={`absolute inset-0 flex flex-col ${activeMode !== "viewer" ? "invisible" : ""}`}>
+        <div className={`absolute inset-0 flex flex-col ${activeMode !== "viewer" || profileOpen ? "invisible" : ""}`}>
           <FileViewer />
         </div>
 
-        <div className={`absolute inset-0 flex ${activeMode !== "terminal" ? "invisible" : ""}`}>
+        <div className={`absolute inset-0 flex ${activeMode !== "terminal" || profileOpen ? "invisible" : ""}`}>
           {projectOrder.map((id) => (
             <div
               key={id}
@@ -115,6 +118,11 @@ export function Workspace() {
               <ProjectTerminal projectId={id} />
             </div>
           ))}
+        </div>
+
+        {/* Profile — takes over workspace when open */}
+        <div className={`absolute inset-0 bg-pane-bg ${!profileOpen ? "invisible" : ""}`}>
+          <Profile />
         </div>
       </div>
     </div>

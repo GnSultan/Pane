@@ -37,6 +37,7 @@ export interface Project {
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
   hasUnreadCompletion: boolean; // true when background task completes, cleared when project becomes active
+  recentFiles: string[]; // last 20 opened files (FIFO)
   terminalTabs: TerminalTab[];
   activeTerminalTabId: string | null;
   checkpoints: CheckpointMeta[];
@@ -60,6 +61,7 @@ function createProject(root: string): Project {
     git: { branch: null, fileStatuses: new Map(), dirtyDirs: new Set(), isGitRepo: false },
     fileIndex: { files: [], lastIndexed: 0, isLoading: false },
     hasUnreadCompletion: false,
+    recentFiles: [],
     terminalTabs: [],
     activeTerminalTabId: null,
     checkpoints: [],
@@ -139,6 +141,8 @@ interface ProjectsState {
   setPendingPlanApproval: (projectId: string, pending: boolean) => void;
   setIsPlanning: (projectId: string, isPlanning: boolean) => void;
   updateLastToolUseInput: (projectId: string, input: Record<string, unknown>) => void;
+  setContextPressure: (projectId: string, tokens: number, pressure: import("../lib/claude-types").ContextPressure) => void;
+  setCachedBrief: (projectId: string, brief: string) => void;
 
   // Terminal tabs
   addTerminalTab: (projectId: string, tab: TerminalTab) => void;
@@ -280,11 +284,15 @@ function createProjectsStore() {
   // File viewer
   openFile: (projectId, path, content) =>
     set((state) =>
-      updateProject(state, projectId, () => ({
-        activeFilePath: path,
-        activeFileContent: content,
-        mode: "viewer" as const,
-      })),
+      updateProject(state, projectId, (p) => {
+        const recent = [path, ...p.recentFiles.filter(f => f !== path)].slice(0, 20);
+        return {
+          activeFilePath: path,
+          activeFileContent: content,
+          mode: "viewer" as const,
+          recentFiles: recent,
+        };
+      }),
     ),
 
   updateFileContent: (projectId, content) =>
@@ -572,6 +580,20 @@ function createProjectsStore() {
       }),
     ),
 
+  setContextPressure: (projectId, tokens, pressure) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => ({
+        conversation: { ...p.conversation, contextTokens: tokens, contextPressure: pressure },
+      })),
+    ),
+
+  setCachedBrief: (projectId, brief) =>
+    set((state) =>
+      updateProject(state, projectId, (p) => ({
+        conversation: { ...p.conversation, cachedBrief: brief },
+      })),
+    ),
+
   restoreConversation: (projectId, messages, sessionId) =>
     set((state) =>
       updateProject(state, projectId, () => ({
@@ -588,6 +610,9 @@ function createProjectsStore() {
           pendingPlanApproval: false,
           isProcessActive: false,
           lastActivity: Date.now(),
+          contextTokens: 0,
+          contextPressure: "none",
+          cachedBrief: "",
         },
       })),
     ),

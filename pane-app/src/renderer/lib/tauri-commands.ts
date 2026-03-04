@@ -104,6 +104,7 @@ export async function getGitLog(
 export interface ProjectSessionState {
   expanded_dirs: string[];
   active_file_path: string | null;
+  recent_files?: string[];
 }
 
 export interface UserSettings {
@@ -320,4 +321,175 @@ export async function getCheckpointDiff(
 
 export async function deleteProjectCheckpoints(projectId: string): Promise<void> {
   return electronAPI.invoke("delete_project_checkpoints", { projectId });
+}
+
+// --- Pane Intelligence Layer: State + Memory ---
+
+export interface EditorState {
+  activeFile: string | null;
+  content: string | null;
+  recentFiles: string[];
+}
+
+export interface TerminalCommand {
+  cmd: string;
+  output: string;
+  cwd: string;
+  timestamp: number;
+}
+
+export interface TerminalState {
+  commands: TerminalCommand[];
+}
+
+export interface ProjectState {
+  name: string;
+  root: string;
+  gitBranch: string | null;
+  topLevelFiles: string[];
+}
+
+export async function writeEditorState(projectId: string, data: EditorState): Promise<void> {
+  return electronAPI.invoke("write_editor_state", { projectId, data });
+}
+
+export async function writeTerminalState(projectId: string, data: TerminalState): Promise<void> {
+  return electronAPI.invoke("write_terminal_state", { projectId, data });
+}
+
+export async function writeProjectState(projectId: string, data: ProjectState): Promise<void> {
+  return electronAPI.invoke("write_project_state", { projectId, data });
+}
+
+export async function recordMemoryEvents(
+  projectId: string,
+  events: import("./claude-types").MemoryEvent[],
+): Promise<void> {
+  return electronAPI.invoke("record_memory_events", { projectId, events });
+}
+
+export async function generateBrief(projectId: string): Promise<string> {
+  return electronAPI.invoke("generate_brief", { projectId });
+}
+
+export async function readBrief(projectId: string): Promise<string> {
+  return electronAPI.invoke("read_brief", { projectId });
+}
+
+// --- Pane Brain Engine ---
+
+export interface BrainSearchResult {
+  id: string;
+  name: string;
+  type: string;
+  content: string;
+  confidence: number;
+  score: number;
+  age: string;
+}
+
+export async function brainIndexEvents(
+  projectId: string,
+  events: import("./claude-types").MemoryEvent[],
+): Promise<{ indexed: number; deduplicated: number }> {
+  return electronAPI.invoke("brain_index_events", { projectId, events });
+}
+
+export async function brainSearch(
+  query: string,
+  projectId: string,
+  limit?: number,
+): Promise<{ results: BrainSearchResult[] }> {
+  return electronAPI.invoke("brain_search", { query, projectId, limit: limit ?? 10 });
+}
+
+export async function brainContextualSearch(
+  projectId: string,
+  query: string,
+  fileContext?: string,
+): Promise<{ memories: BrainSearchResult[]; tensions: unknown[] }> {
+  return electronAPI.invoke("brain_contextual_search", { projectId, query, fileContext });
+}
+
+export async function brainGetStats(): Promise<{
+  node_count: number;
+  edge_count: number;
+  version_count: number;
+}> {
+  return electronAPI.invoke("brain_get_stats");
+}
+
+export interface IntelligenceStats {
+  totalNodes: number;
+  highConfidence: number;
+  lowConfidence: number;
+  totalEdges: number;
+  crossProjectEdges: number;
+  connectedNodes: number;
+  byType: Record<string, number>;
+}
+
+export async function brainGetIntelligenceStats(
+  projectId: string,
+): Promise<{ stats: IntelligenceStats | null }> {
+  return electronAPI.invoke("brain_get_intelligence_stats", { projectId });
+}
+
+// --- Profile ---
+
+export interface UserProfile {
+  identity: { name: string; bio: string; role: string; avatar: string | null } | null;
+  preferences: {
+    coding: Record<string, { confidence: number; source: string; content: string }>;
+    communication: Record<string, unknown>;
+    tools: Record<string, { confidence: number; source: string; content: string }>;
+  } | null;
+  antiPatterns: { patterns: Array<{ error: string; fix: string; confidence: number; source: string }> } | null;
+  style: { verbosity: string; planFirst: boolean } | null;
+  rules: string;
+  philosophy: string;
+}
+
+export async function brainGetProfile(): Promise<{ profile: UserProfile }> {
+  return electronAPI.invoke("brain_get_profile");
+}
+
+export async function brainAddRule(rule: string): Promise<{ added: boolean; reason?: string }> {
+  return electronAPI.invoke("brain_add_rule", { rule });
+}
+
+export async function brainUpdatePhilosophy(text: string): Promise<{ updated: boolean }> {
+  return electronAPI.invoke("brain_update_philosophy", { text });
+}
+
+export async function brainUpdateRules(text: string): Promise<{ updated: boolean }> {
+  return electronAPI.invoke("brain_update_rules", { text });
+}
+
+export async function brainExtractProfile(): Promise<void> {
+  return electronAPI.invoke("brain_extract_profile");
+}
+
+// --- Identity ---
+
+export interface UserIdentity {
+  name: string;
+  bio: string;
+  role: string;
+  avatar: string | null;
+}
+
+export async function brainUpdateIdentity(identity: Partial<UserIdentity>): Promise<{ updated: boolean }> {
+  return electronAPI.invoke("brain_update_identity", { identity });
+}
+
+export async function brainSaveAvatar(
+  base64Data: string,
+  mimeType: string,
+): Promise<{ path: string }> {
+  return electronAPI.invoke("brain_save_avatar", { base64Data, mimeType });
+}
+
+export async function brainGetAvatar(): Promise<{ base64: string | null; mime: string | null }> {
+  return electronAPI.invoke("brain_get_avatar");
 }

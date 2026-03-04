@@ -34,11 +34,37 @@ function SearchIcon() {
   );
 }
 
-function SettingsIcon() {
+function ProfileAvatar() {
+  const avatarDataUrl = useWorkspaceStore((s) => s.profileAvatarDataUrl);
+  const profileName = useWorkspaceStore((s) => s.profileName);
+
+  const initials = profileName
+    ? profileName.split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2)
+    : "";
+
+  if (avatarDataUrl) {
+    return (
+      <img
+        src={avatarDataUrl}
+        alt=""
+        className="w-5 h-5 rounded-full object-cover"
+      />
+    );
+  }
+
+  if (initials) {
+    return (
+      <div className="w-5 h-5 rounded-full bg-pane-text/[0.08] flex items-center justify-center">
+        <span className="font-mono text-pane-text" style={{ fontSize: "8px", lineHeight: 1 }}>{initials}</span>
+      </div>
+    );
+  }
+
+  // Default: person silhouette
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="8" cy="8" r="2.5" />
-      <path d="M8 2v2M8 12v2M14 8h-2M4 8H2" />
+      <circle cx="8" cy="6" r="2.5" />
+      <path d="M3.5 14c0-2.485 2.015-4.5 4.5-4.5s4.5 2.015 4.5 4.5" />
     </svg>
   );
 }
@@ -111,6 +137,7 @@ export function ControlPanel() {
     return s.projects.get(s.activeProjectId)?.root;
   });
 
+  const profileOpen = useWorkspaceStore((s) => s.profileOpen);
   const [gitPanelActive, setGitPanelActive] = useState(false);
 
   // Auto-close git panel when project changes or isn't a git repo
@@ -136,7 +163,7 @@ export function ControlPanel() {
 
   return (
     <div
-      className="no-select flex flex-col h-full bg-pane-bg rounded-3xl font-panel outline-none ring-1 ring-pane-border/40"
+      className="no-select flex flex-col h-full bg-pane-bg rounded-2xl font-panel outline-none ring-1 ring-pane-border/40"
       data-panel="control"
       tabIndex={0}
     >
@@ -186,8 +213,9 @@ export function ControlPanel() {
         />
         <div className="ml-auto">
           <ToolbarButton
-            icon={<SettingsIcon />}
-            onClick={() => window.dispatchEvent(new CustomEvent("pane:open-settings"))}
+            icon={<ProfileAvatar />}
+            active={profileOpen}
+            onClick={() => useWorkspaceStore.getState().toggleProfile()}
           />
         </div>
       </div>

@@ -1,7 +1,7 @@
 import { useCallback, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
-import { sendToClaude, abortClaude, createCheckpoint, deleteProjectCheckpoints } from "../lib/tauri-commands";
+import { sendToClaude, abortClaude, createCheckpoint, deleteProjectCheckpoints, recordMemoryEvents, generateBrief, brainIndexEvents, brainContextualSearch } from "../lib/tauri-commands";
 import type {
   ClaudeStreamEvent,
   ClaudeStreamMessage,
@@ -11,6 +11,7 @@ import type {
   ThinkingBlock,
   ServerToolUseBlock,
   WebSearchToolResultBlock,
+  MemoryEvent,
 } from "../lib/claude-types";
 
 let messageIdCounter = 0;
@@ -99,25 +100,33 @@ function fixPartialJson(s: string): string {
 }
 
 /**
- * Build a condensed briefing from the last N messages and active todos.
+ * Build a condensed briefing from accumulated project memory + last N messages.
  * Used to seed a fresh session when context window is hit.
+ * Incorporates the cached brief (from generateBrief) so accumulated wisdom survives.
  */
 function buildContinuationBrief(projectId: string): string {
   const project = useProjectsStore.getState().projects.get(projectId);
   if (!project) return "Continue from where you left off.";
 
-  const { messages, todos } = project.conversation;
+  const { messages, todos, cachedBrief } = project.conversation;
+
+  const parts: string[] = [];
+
+  // Prepend accumulated project memory from brief.md
+  if (cachedBrief) {
+    parts.push(cachedBrief);
+    parts.push("");
+  }
+
+  parts.push("---");
+  parts.push("The previous session hit the context window limit. Continuing automatically.");
+  parts.push("");
+  parts.push("## Recent conversation");
+  parts.push("");
 
   // Last ~6 user+assistant pairs
   const convoMsgs = messages.filter((m) => m.type === "user" || m.type === "assistant");
   const recent = convoMsgs.slice(-12);
-
-  const parts: string[] = [
-    "The previous session hit the context window limit. Continuing automatically.",
-    "",
-    "## Recent conversation",
-    "",
-  ];
 
   for (const msg of recent) {
     if (msg.type === "user") {
@@ -153,9 +162,178 @@ function buildContinuationBrief(projectId: string): string {
   return parts.join("\n");
 }
 
+/**
+ * Extract memory events from the latest turn's messages.
+ * Scans from the last user message to end of conversation for:
+ * - File edits (Edit/Write tool uses)
+ * - Errors + error→fix pairs
+ * - Commands (Bash tool uses, truncated not dropped)
+ * - Decisions auto-detected from assistant text
+ * - Session summary (last assistant text)
+ */
+function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
+  const events: MemoryEvent[] = [];
+  const now = Date.now();
+
+  // Find the last user message — everything after is "this turn"
+  let turnStart = messages.length - 1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.type === "user") { turnStart = i; break; }
+  }
+  const turnMessages = messages.slice(turnStart);
+
+  // Track last error for error→fix pair detection
+  let lastError: string | null = null;
+  let lastErrorTool: string | null = null;
+
+  for (const msg of turnMessages) {
+    for (const block of msg.content) {
+      // File edits
+      if (block.type === "tool_use") {
+        const tool = block as ToolUseBlock;
+
+        // Skip pane_remember — MCP server already writes these to events.jsonl
+        if (tool.name === "pane_remember") continue;
+
+        if (tool.name === "Edit" || tool.name === "Write") {
+          const filePath = (tool.input.file_path as string) || (tool.input.path as string) || "unknown";
+          events.push({
+            type: "file_edit",
+            content: `${tool.name}: ${filePath}`,
+            timestamp: now,
+            source: "auto",
+            metadata: { file: filePath, tool: tool.name },
+          });
+        }
+        // Commands — truncate instead of dropping long ones
+        if (tool.name === "Bash") {
+          const cmd = (tool.input.command as string) || "";
+          if (cmd) {
+            events.push({
+              type: "command",
+              content: cmd.length > 200 ? cmd.slice(0, 200) + "..." : cmd,
+              timestamp: now,
+              source: "auto",
+              metadata: { tool: "Bash" },
+            });
+          }
+        }
+
+        // Error→fix detection: if we have a pending error and see a successful
+        // tool_use of the same tool, emit an error_fix pair
+        if (lastError && lastErrorTool && tool.name === lastErrorTool) {
+          events.push({
+            type: "error_fix",
+            content: `Fixed: ${lastError.slice(0, 150)}`,
+            timestamp: now,
+            source: "auto",
+            metadata: { original_error: lastError.slice(0, 200) },
+          });
+          lastError = null;
+          lastErrorTool = null;
+        }
+      }
+      // Errors from tool results
+      if (block.type === "tool_result" && (block as { is_error?: boolean }).is_error) {
+        const content = (block as { content: string }).content || "";
+        if (content.length < 500) {
+          events.push({
+            type: "error",
+            content: content.slice(0, 300),
+            timestamp: now,
+            source: "auto",
+          });
+          // Track for error→fix pairing
+          lastError = content.slice(0, 300);
+          // Try to find which tool this result belongs to
+          const toolUseId = (block as { tool_use_id?: string }).tool_use_id;
+          if (toolUseId) {
+            for (const m of turnMessages) {
+              for (const b of m.content) {
+                if (b.type === "tool_use" && (b as ToolUseBlock).id === toolUseId) {
+                  lastErrorTool = (b as ToolUseBlock).name;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Decision detection from assistant text
+  const decisionPatterns = [
+    /(?:I'll|I will|Let's|Going to|chose|choosing|decided|using|switched to)\s+(.{10,150})/gi,
+    /(?:instead of|rather than|over)\s+(.{10,100})/gi,
+  ];
+
+  const lastAssistant = [...turnMessages].reverse().find(m => m.type === "assistant");
+  if (lastAssistant) {
+    const textBlocks = lastAssistant.content.filter(b => b.type === "text");
+    if (textBlocks.length > 0) {
+      const fullText = textBlocks
+        .map(b => (b as { type: "text"; text: string }).text)
+        .join("\n")
+        .trim();
+
+      // Extract decisions
+      const seenDecisions = new Set<string>();
+      for (const pattern of decisionPatterns) {
+        pattern.lastIndex = 0;
+        let match;
+        while ((match = pattern.exec(fullText)) !== null) {
+          const decision = match[1]?.trim();
+          if (decision && decision.length >= 10 && !seenDecisions.has(decision)) {
+            seenDecisions.add(decision);
+            events.push({
+              type: "decision",
+              content: decision.length > 150 ? decision.slice(0, 150) + "..." : decision,
+              timestamp: now,
+              source: "auto",
+            });
+          }
+          // Cap at 3 decisions per turn to avoid noise
+          if (seenDecisions.size >= 3) break;
+        }
+        if (seenDecisions.size >= 3) break;
+      }
+
+      // Session summary
+      if (fullText.length > 20) {
+        events.push({
+          type: "summary",
+          content: fullText.length > 500 ? fullText.slice(0, 500) + "..." : fullText,
+          timestamp: now,
+          source: "auto",
+        });
+      }
+    }
+  }
+
+  return events;
+}
+
+// Context window sizes by model family (input tokens)
+const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+  opus: 200000,
+  sonnet: 200000,
+  haiku: 200000,
+};
+
+function getContextLimit(model: string | null): number {
+  if (!model) return 200000;
+  const lower = model.toLowerCase();
+  for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
+    if (lower.includes(key)) return limit;
+  }
+  return 200000;
+}
+
 export function useClaude(projectId: string) {
   const abortingRef = useRef(false);
   const continuationRef = useRef<string | null>(null);
+  // Proactive continuation: set to true when context hits 85%, consumed on next processEnded
+  const proactiveContinuationRef = useRef(false);
 
   const sendMessage = useCallback(
     async (prompt: string) => {
@@ -246,6 +424,14 @@ export function useClaude(projectId: string) {
                 assistantMessageAdded,
               );
 
+              // Arm proactive continuation when context pressure hits high
+              if (msg.type === "result") {
+                const proj = useProjectsStore.getState().projects.get(projectId);
+                if (proj?.conversation.contextPressure === "high" && !proactiveContinuationRef.current) {
+                  proactiveContinuationRef.current = true;
+                }
+              }
+
               // Safety: if Claude sent a final result but the process hangs,
               // force-clear processing state after 5 seconds.
               if (msg.type === "result" && !resultSafetyTimer) {
@@ -262,6 +448,35 @@ export function useClaude(projectId: string) {
 
           case "processEnded": {
             finishProcessing();
+
+            // --- Intelligence Layer: extract memory + regenerate brief + index brain ---
+            try {
+              const proj = useProjectsStore.getState().projects.get(projectId);
+              if (proj && proj.conversation.messages.length > 1) {
+                const memEvents = extractMemoryEvents(proj.conversation.messages);
+                if (memEvents.length > 0) {
+                  recordMemoryEvents(projectId, memEvents).catch(() => {});
+                  // Feed events into the brain knowledge graph
+                  brainIndexEvents(projectId, memEvents).catch(() => {});
+                }
+                // Generate brief and cache it for enhanced continuation
+                generateBrief(projectId).then((brief) => {
+                  if (brief) {
+                    useProjectsStore.getState().setCachedBrief(projectId, brief);
+                  }
+                }).catch(() => {});
+              }
+            } catch {}
+
+            // --- Proactive continuation at 85% context pressure ---
+            if (proactiveContinuationRef.current && !continuationRef.current) {
+              proactiveContinuationRef.current = false;
+              const brief = buildContinuationBrief(projectId);
+              useProjectsStore.getState().clearConversation(projectId);
+              window.dispatchEvent(new CustomEvent("pane:context-refreshed", { detail: { projectId } }));
+              setTimeout(() => sendMessage(brief), 50);
+              return; // Skip normal flow — continuation takes over
+            }
             break;
           }
 
@@ -285,6 +500,15 @@ export function useClaude(projectId: string) {
       };
 
       try {
+        // Proactive injection: trigger brain contextual search before spawning Claude.
+        // Writes ~/.pane/brain/context/{projectId}.json which claude-worker reads.
+        // Fire-and-forget with short timeout — don't delay the user.
+        const activeFile = project.activeFilePath || undefined;
+        await Promise.race([
+          brainContextualSearch(projectId, prompt, activeFile).catch(() => {}),
+          new Promise(resolve => setTimeout(resolve, 500)),
+        ]);
+
         const selectedModel = useWorkspaceStore.getState().selectedModel;
         await sendToClaude(
           projectId,
@@ -468,6 +692,15 @@ function handleClaudeMessage(
           msg.usage?.output_tokens,
           msg.num_turns,
         );
+
+        // Track context window usage for pressure indicator
+        if (msg.usage?.input_tokens) {
+          const model = store.projects.get(projectId)?.conversation.model ?? null;
+          const limit = getContextLimit(model);
+          const ratio = msg.usage.input_tokens / limit;
+          const pressure = ratio >= 0.85 ? "high" : ratio >= 0.70 ? "building" : "none";
+          store.setContextPressure(projectId, msg.usage.input_tokens, pressure);
+        }
 
         // Text-based plan detection: with --dangerously-skip-permissions,
         // EnterPlanMode/ExitPlanMode tools won't fire. Detect plan from text.

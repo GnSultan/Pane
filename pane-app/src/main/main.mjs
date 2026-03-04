@@ -937,6 +937,305 @@ function registerCheckpointHandlers() {
     } catch {}
   });
 }
+// --- State + Memory handlers for Pane Intelligence Layer ---
+// Writes state to ~/.pane/state/{projectId}/ for the MCP server to read.
+// Writes memory to ~/.pane/memory/{projectId}/ for cross-session persistence.
+function registerStateHandlers() {
+  function stateDir(projectId) {
+    return path.join(os.homedir(), ".pane", "state", projectId);
+  }
+
+  async function writeStateFile(projectId, filename, data) {
+    const dir = stateDir(projectId);
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(path.join(dir, filename), JSON.stringify(data), "utf-8");
+  }
+
+  ipcMain.handle("write_editor_state", async (_event, args) => {
+    await writeStateFile(args.projectId, "editor.json", args.data);
+  });
+
+  ipcMain.handle("write_terminal_state", async (_event, args) => {
+    await writeStateFile(args.projectId, "terminal.json", args.data);
+  });
+
+  ipcMain.handle("write_project_state", async (_event, args) => {
+    await writeStateFile(args.projectId, "project.json", args.data);
+  });
+}
+
+function registerMemoryHandlers() {
+  const MEMORY_MAX_EVENTS = 500;
+
+  function memoryDir(projectId) {
+    return path.join(os.homedir(), ".pane", "memory", projectId);
+  }
+
+  ipcMain.handle("record_memory_events", async (_event, args) => {
+    const { projectId, events } = args;
+    const dir = memoryDir(projectId);
+    await fs.promises.mkdir(dir, { recursive: true });
+    const lines = events.map(e => JSON.stringify(e)).join("\n") + "\n";
+    await fs.promises.appendFile(path.join(dir, "events.jsonl"), lines, "utf-8");
+
+    // Prune to last N events
+    try {
+      const content = await fs.promises.readFile(path.join(dir, "events.jsonl"), "utf-8");
+      const allLines = content.trim().split("\n").filter(Boolean);
+      if (allLines.length > MEMORY_MAX_EVENTS) {
+        const pruned = allLines.slice(-MEMORY_MAX_EVENTS).join("\n") + "\n";
+        await fs.promises.writeFile(path.join(dir, "events.jsonl"), pruned, "utf-8");
+      }
+    } catch {}
+  });
+
+  ipcMain.handle("generate_brief", async (_event, args) => {
+    const { projectId } = args;
+    const dir = memoryDir(projectId);
+    const eventsPath = path.join(dir, "events.jsonl");
+    let content;
+    try { content = await fs.promises.readFile(eventsPath, "utf-8"); }
+    catch { return ""; }
+
+    const events = content.trim().split("\n").map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
+
+    // Take last 50 events for the brief
+    const recent = events.slice(-50);
+    if (recent.length === 0) return "";
+
+    // Group by type
+    const decisions = recent.filter(e => e.type === "decision");
+    const lessons = recent.filter(e => e.type === "lesson");
+    const errors = recent.filter(e => e.type === "error");
+    const errorFixes = recent.filter(e => e.type === "error_fix");
+    const fileEdits = recent.filter(e => e.type === "file_edit");
+    const commands = recent.filter(e => e.type === "command");
+    const summaries = recent.filter(e => e.type === "summary");
+
+    const parts = ["## Pane Project Memory"];
+
+    if (decisions.length > 0) {
+      parts.push("\n### Recent decisions");
+      // Deduplicate similar decisions
+      const seen = new Set();
+      for (const d of decisions.slice(-8)) {
+        const key = d.content.slice(0, 50).toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          parts.push(`- ${d.content}`);
+        }
+      }
+    }
+
+    if (lessons.length > 0) {
+      parts.push("\n### Lessons learned");
+      for (const l of lessons.slice(-5)) parts.push(`- ${l.content}`);
+    }
+
+    if (errorFixes.length > 0) {
+      parts.push("\n### Error fixes");
+      for (const e of errorFixes.slice(-3)) parts.push(`- ${e.content}`);
+    } else if (errors.length > 0) {
+      parts.push("\n### Recent errors");
+      for (const e of errors.slice(-3)) parts.push(`- ${e.content}`);
+    }
+
+    // Count file edit frequency
+    if (fileEdits.length > 0) {
+      const fileCounts = {};
+      for (const e of fileEdits) {
+        const file = e.metadata?.file || "unknown";
+        fileCounts[file] = (fileCounts[file] || 0) + 1;
+      }
+      const sorted = Object.entries(fileCounts).sort((a, b) => b[1] - a[1]).slice(0, 8);
+      parts.push("\n### Frequently modified files");
+      for (const [file, count] of sorted) parts.push(`- ${file} (${count} edits)`);
+    }
+
+    // Command frequency — group by base command, show counts
+    if (commands.length > 0) {
+      const cmdCounts = {};
+      for (const e of commands) {
+        // Normalize: take first 60 chars or first line as the key
+        const cmd = (e.content || "").split("\n")[0].slice(0, 60);
+        cmdCounts[cmd] = (cmdCounts[cmd] || 0) + 1;
+      }
+      const sorted = Object.entries(cmdCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      if (sorted.length > 0) {
+        parts.push("\n### Recent commands");
+        for (const [cmd, count] of sorted) {
+          parts.push(`- ${cmd}${count > 1 ? ` (${count}x)` : ""}`);
+        }
+      }
+    }
+
+    // Multi-summary rollup — combine last 3 summaries for richer context
+    if (summaries.length > 0) {
+      const recentSummaries = summaries.slice(-3);
+      if (recentSummaries.length === 1) {
+        parts.push("\n### Last session summary");
+        parts.push(recentSummaries[0].content);
+      } else {
+        parts.push("\n### Recent session summaries");
+        for (let i = 0; i < recentSummaries.length; i++) {
+          const label = i === recentSummaries.length - 1 ? "Latest" : `Previous`;
+          const summary = recentSummaries[i].content;
+          // Truncate each to ~200 chars to leave room
+          parts.push(`**${label}:** ${summary.length > 200 ? summary.slice(0, 200) + "..." : summary}`);
+        }
+      }
+    }
+
+    let brief = parts.join("\n");
+
+    // Section-aware truncation: cap at 3500 chars, break at last ### boundary
+    if (brief.length > 3500) {
+      const truncated = brief.slice(0, 3500);
+      const lastSection = truncated.lastIndexOf("\n###");
+      if (lastSection > 500) {
+        brief = truncated.slice(0, lastSection);
+      } else {
+        brief = truncated;
+      }
+    }
+
+    // Write brief to disk
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(path.join(dir, "brief.md"), brief, "utf-8");
+
+    return brief;
+  });
+
+  ipcMain.handle("read_brief", async (_event, args) => {
+    const { projectId } = args;
+    try {
+      return await fs.promises.readFile(path.join(memoryDir(projectId), "brief.md"), "utf-8");
+    } catch {
+      return "";
+    }
+  });
+}
+
+// --- Brain Engine (knowledge graph + embeddings + semantic search) ---
+let brainWorker = null;
+const brainPendingRequests = new Map();
+let brainRequestCounter = 0;
+
+function getBrainWorker() {
+  if (brainWorker && !brainWorker.killed) return brainWorker;
+  const workerPath = path.join(__dirname, "brain-engine.mjs");
+  brainWorker = utilityProcess.fork(workerPath);
+
+  brainWorker.on("message", (message) => {
+    // Route responses back to pending IPC requests
+    if (message.requestId && brainPendingRequests.has(message.requestId)) {
+      const resolve = brainPendingRequests.get(message.requestId);
+      brainPendingRequests.delete(message.requestId);
+      resolve(message);
+    }
+    // Forward tension alerts to renderer
+    if (message.type === "tensions_detected") {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) {
+          win.webContents.send("brain:tensions", message);
+        }
+      }
+    }
+  });
+
+  brainWorker.on("exit", (code) => {
+    console.warn(`[pane] Brain worker exited with code ${code}`);
+    brainWorker = null;
+    // Reject pending requests
+    for (const [id, resolve] of brainPendingRequests) {
+      resolve({ type: "error", error: "Brain worker exited" });
+    }
+    brainPendingRequests.clear();
+  });
+
+  return brainWorker;
+}
+
+function brainRequest(type, data, timeout = 30000) {
+  return new Promise((resolve) => {
+    const requestId = `brain-${++brainRequestCounter}`;
+    brainPendingRequests.set(requestId, resolve);
+    getBrainWorker().postMessage({ type, requestId, ...data });
+    // Timeout to prevent hanging
+    setTimeout(() => {
+      if (brainPendingRequests.has(requestId)) {
+        brainPendingRequests.delete(requestId);
+        resolve({ type: "error", error: "Brain request timed out" });
+      }
+    }, timeout);
+  });
+}
+
+function registerBrainHandlers() {
+  ipcMain.handle("brain_index_events", async (_event, args) => {
+    const { projectId, events } = args;
+    return brainRequest("index_events", { projectId, events });
+  });
+
+  ipcMain.handle("brain_search", async (_event, args) => {
+    const { query, projectId, limit } = args;
+    return brainRequest("search", { query, projectId, limit });
+  });
+
+  ipcMain.handle("brain_contextual_search", async (_event, args) => {
+    const { projectId, query, fileContext } = args;
+    return brainRequest("contextual_search", { projectId, query, fileContext });
+  });
+
+  ipcMain.handle("brain_get_related", async (_event, args) => {
+    const { nodeId } = args;
+    return brainRequest("get_related", { nodeId });
+  });
+
+  ipcMain.handle("brain_get_stats", async () => {
+    return brainRequest("get_stats", {});
+  });
+
+  ipcMain.handle("brain_get_intelligence_stats", async (_event, args) => {
+    const { projectId } = args;
+    return brainRequest("get_intelligence_stats", { projectId });
+  });
+
+  ipcMain.handle("brain_get_profile", async () => {
+    return brainRequest("get_profile", {});
+  });
+
+  ipcMain.handle("brain_add_rule", async (_event, args) => {
+    return brainRequest("add_rule", { rule: args.rule });
+  });
+
+  ipcMain.handle("brain_update_philosophy", async (_event, args) => {
+    return brainRequest("update_philosophy", { text: args.text });
+  });
+
+  ipcMain.handle("brain_update_rules", async (_event, args) => {
+    return brainRequest("update_rules", { text: args.text });
+  });
+
+  ipcMain.handle("brain_extract_profile", async () => {
+    return brainRequest("extract_profile", {});
+  });
+
+  ipcMain.handle("brain_update_identity", async (_event, args) => {
+    return brainRequest("update_identity", { identity: args.identity });
+  });
+
+  ipcMain.handle("brain_save_avatar", async (_event, args) => {
+    return brainRequest("save_avatar", { base64Data: args.base64Data, mimeType: args.mimeType });
+  });
+
+  ipcMain.handle("brain_get_avatar", async () => {
+    return brainRequest("get_avatar", {});
+  });
+}
+
 function registerIpcHandlers() {
   registerCommandHandlers();
   registerSettingsHandlers();
@@ -944,6 +1243,9 @@ function registerIpcHandlers() {
   registerWatcherHandlers();
   registerPtyHandlers();
   registerCheckpointHandlers();
+  registerStateHandlers();
+  registerMemoryHandlers();
+  registerBrainHandlers();
 }
 let mainWindow = null;
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
@@ -1004,6 +1306,7 @@ app.whenReady().then(() => {
   createWindow();
   getClaudeWorker(); // Pre-fork to hide first-use latency
   getPtyWorker();
+  getBrainWorker(); // Pre-fork: start loading SQLite + embedding model
   app.on("activate", () => {
     if (mainWindow) {
       mainWindow.show();

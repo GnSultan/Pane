@@ -206,7 +206,7 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
     return (
       <div className={`mb-10 group flex flex-col items-end ${animClass}`}>
         <div
-          className="px-5 py-4 rounded-3xl ring-1 ring-pane-border/40"
+          className="px-5 py-4 rounded-2xl ring-1 ring-pane-border/40"
           style={{ maxWidth: "65ch" }}
         >
           <p

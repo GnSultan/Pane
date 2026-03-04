@@ -209,14 +209,17 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
           {todos.length > 0 && (
             <button
               onClick={() => setTodoPanelOpen((v) => !v)}
-              className="text-pane-text-secondary font-mono hover:text-pane-text btn-press shrink-0"
+              className="text-pane-text-secondary font-mono hover:text-pane-text btn-press shrink-0 truncate"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
-              {todos.every((t) => t.status === "completed")
-                ? "done"
-                : todoPanelOpen
-                  ? `${todos.filter((t) => t.status === "completed").length}/${todos.length}`
-                  : `task ${todos.filter((t) => t.status === "completed").length}/${todos.length}`}
+              {todoPanelOpen
+                ? null
+                : (() => {
+                    const idx = todos.findIndex((t) => t.status === "in_progress");
+                    if (idx !== -1) return `${idx + 1} of ${todos.length} ${todos[idx]!.activeForm || todos[idx]!.content}`;
+                    if (todos.every((t) => t.status === "completed")) return "done";
+                    return null;
+                  })()}
             </button>
           )}
           <button
@@ -272,7 +275,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
 
       {/* The unified card — textarea body + toolbar strip */}
       {!pendingPlanApproval && (
-        <div className="bg-pane-bg rounded-3xl ring-1 ring-pane-border/40 overflow-hidden">
+        <div className="bg-pane-bg rounded-2xl ring-1 ring-pane-border/40 overflow-hidden">
           {/* Writing area */}
           <textarea
             ref={textareaRef}

@@ -31,10 +31,23 @@ interface WorkspaceState {
   theme: Theme;
   completionSound: string; // "none" | system sound name | custom file path
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
+  // Profile
+  profileOpen: boolean;
+  profileName: string;
+  profileBio: string;
+  profileRole: string;
+  profileAvatarDataUrl: string | null; // data:image/... URL for display
+  toggleProfile: () => void;
+  closeProfile: () => void;
+  // Claude updates
   claudeUpdateAvailable: boolean;
   claudeUpdateState: 'available' | 'updating' | 'updated' | 'restart' | null;
   claudeCurrentVersion: string | null;
   claudeNewVersion: string | null;
+  setProfileName: (name: string) => void;
+  setProfileBio: (bio: string) => void;
+  setProfileRole: (role: string) => void;
+  setProfileAvatarDataUrl: (url: string | null) => void;
   checkForClaudeUpdate: () => Promise<void>;
   triggerClaudeUpdate: () => Promise<void>;
   toggleControlPanel: () => void;
@@ -109,10 +122,21 @@ function createWorkspaceStore() {
   theme: "system" as Theme,
   completionSound: "none",
   selectedModel: "opus",
+  profileOpen: false,
+  profileName: "",
+  profileBio: "",
+  profileRole: "",
+  profileAvatarDataUrl: null,
+  toggleProfile: () => set((s) => ({ profileOpen: !s.profileOpen })),
+  closeProfile: () => set({ profileOpen: false }),
   claudeUpdateAvailable: false,
   claudeUpdateState: null,
   claudeCurrentVersion: null,
   claudeNewVersion: null,
+  setProfileName: (name: string) => set({ profileName: name }),
+  setProfileBio: (bio: string) => set({ profileBio: bio }),
+  setProfileRole: (role: string) => set({ profileRole: role }),
+  setProfileAvatarDataUrl: (url: string | null) => set({ profileAvatarDataUrl: url }),
   checkForClaudeUpdate: async () => {
     const { checkClaudeUpdate } = await import("../lib/tauri-commands");
     const result = await checkClaudeUpdate();

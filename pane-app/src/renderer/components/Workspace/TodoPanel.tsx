@@ -17,18 +17,35 @@ export function TodoPanel({ projectId, onCollapse }: TodoPanelProps) {
   if (todos.length === 0) return null;
 
   return (
-    <div className="mb-2 bg-pane-bg rounded-3xl ring-1 ring-pane-border/40 overflow-hidden animate-fadeSlideUp">
+    <div className="mb-2 bg-pane-bg rounded-2xl ring-1 ring-pane-border/40 overflow-hidden animate-fadeSlideUp">
       <div className="px-5 pt-4 pb-2 space-y-2.5">
         {todos.map((todo, i) => (
           <div key={i} className="flex items-start gap-3">
-            <div className="shrink-0 mt-[5px]">
-              {todo.status === "completed" ? (
-                <div className="w-1 h-1 rounded-full bg-pane-text-secondary/25" />
-              ) : todo.status === "in_progress" ? (
-                <div className="w-1 h-1 rounded-full bg-pane-text-secondary/60 animate-pulse" />
-              ) : (
-                <div className="w-1 h-1 rounded-full bg-pane-text-secondary/15" />
-              )}
+            <div className="shrink-0 mt-[3px]">
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                className={
+                  todo.status === "in_progress"
+                    ? "text-pane-text-secondary"
+                    : todo.status === "completed"
+                      ? "text-pane-text-secondary/25"
+                      : "text-pane-text-secondary/15"
+                }
+              >
+                <circle
+                  cx="12"
+                  cy="12"
+                  r="7"
+                  fill="none"
+                  strokeWidth="1.5"
+                  className={todo.status === "in_progress" ? "animate-circle-pulse" : ""}
+                  style={todo.status === "in_progress" ? { strokeWidth: 'var(--circle-stroke-width, 1.5)' } : undefined}
+                />
+              </svg>
             </div>
             <span
               className={`font-mono leading-snug ${

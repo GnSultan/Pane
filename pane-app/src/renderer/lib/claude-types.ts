@@ -190,6 +190,8 @@ export interface Todo {
   activeForm: string;
 }
 
+export type ContextPressure = "none" | "building" | "high";
+
 export interface ConversationState {
   messages: ConversationMessage[];
   sessionId: string | null;
@@ -204,6 +206,20 @@ export interface ConversationState {
   // Session lifecycle
   isProcessActive: boolean;  // Is the Claude CLI child process currently running?
   lastActivity: number;       // Timestamp of last user interaction with this project
+  // Context pressure tracking
+  contextTokens: number;          // Latest input_tokens from usage
+  contextPressure: ContextPressure;
+  // Cached brief from last generateBrief — used for enhanced continuation
+  cachedBrief: string;
+}
+
+// Memory event types for automatic extraction
+export interface MemoryEvent {
+  type: "file_edit" | "error" | "error_fix" | "decision" | "command" | "summary" | "lesson" | "pattern";
+  content: string;
+  timestamp: number;
+  source?: "auto" | "claude";
+  metadata?: Record<string, string>;
 }
 
 export function createEmptyConversation(): ConversationState {
@@ -220,5 +236,8 @@ export function createEmptyConversation(): ConversationState {
     pendingPlanApproval: false,
     isProcessActive: false,
     lastActivity: Date.now(),
+    contextTokens: 0,
+    contextPressure: "none",
+    cachedBrief: "",
   };
 }

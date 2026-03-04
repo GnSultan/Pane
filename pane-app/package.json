@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.2.56",
+  "version": "0.2.63",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -16,7 +16,7 @@
     "version:minor": "npm version minor --no-git-tag-version",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/renderer/",
-    "postinstall": "electron-rebuild -f -w node-pty"
+    "postinstall": "electron-rebuild -f --only node-pty,better-sqlite3"
   },
   "build": {
     "appId": "com.pane.ide",
@@ -38,11 +38,14 @@
       "src/main/main.mjs",
       "src/main/claude-worker.mjs",
       "src/main/pty-worker.mjs",
+      "src/main/pane-mcp-server.mjs",
+      "src/main/brain-engine.mjs",
       "src/preload/preload.mjs",
       "package.json"
     ],
     "asarUnpack": [
-      "node_modules/node-pty/**"
+      "node_modules/node-pty/**",
+      "node_modules/better-sqlite3/**"
     ],
     "directories": {
       "output": "dist"
@@ -53,7 +56,9 @@
     "@fontsource-variable/dm-sans": "^5.2.8",
     "@fontsource-variable/geist-mono": "^5.2.7",
     "@fontsource/geist-mono": "^5.2.7",
+    "@huggingface/transformers": "^3.8.1",
     "ace-builds": "^1.40.8",
+    "better-sqlite3": "^12.6.2",
     "chokidar": "^5.0.0",
     "electron-window-state": "^5.0.3",
     "fuse.js": "^7.1.0",
