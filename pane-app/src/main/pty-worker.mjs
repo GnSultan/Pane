@@ -18,7 +18,7 @@ function sendToMain(message) {
 function handleCreate({ ptyId, projectId, cwd }) {
   try {
     const userShell = process.env.SHELL || "/bin/zsh";
-    const pty = nodePty.spawn(userShell, [], {
+    const pty = nodePty.spawn(userShell, ["-l"], {
       name: "xterm-256color",
       cols: 120,
       rows: 30,

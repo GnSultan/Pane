@@ -42,7 +42,7 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
   return (
     <div
       ref={menuRef}
-      className="fixed z-50 bg-pane-surface border border-pane-border py-1 min-w-[160px] shadow-lg"
+      className="fixed z-50 bg-pane-bg ring-1 ring-pane-border/40 rounded-2xl overflow-hidden py-1 min-w-[160px]"
       style={{ left: adjustedX, top: adjustedY }}
       onClick={(e) => e.stopPropagation()}
     >
@@ -53,12 +53,13 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
             item.action();
             onClose();
           }}
-          className={`w-full text-left px-3 py-1.5 text-xs font-mono
+          className={`w-full text-left px-3 py-1.5 font-mono font-panel
             ${
               item.danger
                 ? "text-pane-error hover:bg-pane-error/10"
-                : "text-pane-text hover:bg-pane-text/[0.04]"
+                : "text-pane-text hover:bg-pane-text/[0.06]"
             }`}
+          style={{ fontSize: "var(--pane-panel-font-size)" }}
         >
           {item.label}
         </button>

@@ -60,6 +60,10 @@ export async function walkProjectFiles(root: string): Promise<string[]> {
   return electronAPI.invoke("walk_project_files", { root });
 }
 
+export async function renameFile(oldPath: string, newPath: string): Promise<void> {
+  return electronAPI.invoke("rename_file", { oldPath, newPath });
+}
+
 export async function deleteFile(path: string): Promise<void> {
   return electronAPI.invoke("delete_file", { path });
 }

@@ -2,7 +2,7 @@
 
 The lightest IDE ever built for Claude.
 
-Multiple projects. Multiple Claude sessions. One window. Ask for something, see it get done.
+Multiple threads. Multiple Claude sessions. One window. Ask for something, see it get done.
 
 No feature bloat. No panels you'll never open. No configuration rituals. Just a conversation, a file editor, and a terminal — everything an agentic coding session needs, nothing it doesn't.
 
@@ -10,13 +10,13 @@ No feature bloat. No panels you'll never open. No configuration rituals. Just a 
 
 ### What Pane does differently
 
-**Multi-project, single window.** Every other IDE treats a window as a project. Pane treats a window as a workspace. Switch between projects with Cmd+1/2/3 — each one keeps its own Claude session, conversation history, and terminal state. No new windows. No lost context.
+**Threads, not workspaces.** Every other IDE treats a window as a project. Pane treats a window as a collection of ongoing conversations. Each thread is a Claude session with its own history, context, and terminal state — you're not opening a project, you're picking up where you left off. Switch threads with Cmd+1/2/3. No new windows. No lost context.
 
 **Built for agentic coding.** Pane isn't a code editor with AI bolted on. It's a Claude session with a code editor built in. The conversation is the primary interface. The editor and terminal exist to support it.
 
 **Radically minimal.** Three modes: conversation, editor, terminal. Toggle with a keystroke. No sidebars you'll never use, no settings pages with 200 options, no marketplace of extensions. If you have to configure it, we failed.
 
-**Fast by architecture, not by spec.** Zero React re-renders on project switch. DOM-level visibility toggling. Viewport-only message painting. 120Hz native on ProMotion displays. Pane doesn't feel fast because of the hardware — it feels fast because of the decisions.
+**Fast by architecture, not by spec.** Zero React re-renders on thread switch. DOM-level visibility toggling. Viewport-only message painting. 120Hz native on ProMotion displays. Pane doesn't feel fast because of the hardware — it feels fast because of the decisions.
 
 ---
 
@@ -41,7 +41,7 @@ macOS only. For now.
 | Key | Action |
 |-----|--------|
 | `Cmd+/` | Toggle conversation / editor |
-| `Cmd+1-9` | Switch projects |
+| `Cmd+1-9` | Switch threads |
 | `Cmd+B` | Toggle sidebar |
 | `Cmd+P` | Open file |
 | `Cmd+K` | Focus chat |

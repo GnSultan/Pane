@@ -36,6 +36,13 @@ let thinkingFlushRaf = 0;
 let pendingToolInput: Record<string, unknown> | null = null;
 let toolInputFlushRaf = 0;
 
+// Tool JSON streaming guardrails:
+// - Parse at most once per frame (JSON.parse + fixPartialJson are expensive)
+// - Hard cap buffer growth to avoid runaway memory/CPU on huge tool inputs
+const MAX_STREAMING_TOOL_JSON_CHARS = 100_000;
+let toolJsonParseRaf = 0;
+let pendingToolJsonTruncated = false;
+
 // rAF throttle for TodoWrite updates — ensures todos update smoothly during streaming
 // instead of batching all updates until the end.
 let pendingTodos: import("../lib/claude-types").Todo[] | null = null;
@@ -47,6 +54,51 @@ function flushToolInput(projectId: string) {
     pendingToolInput = null;
   }
   toolInputFlushRaf = 0;
+}
+
+function scheduleToolJsonParse(projectId: string) {
+  if (toolJsonParseRaf) return;
+  toolJsonParseRaf = requestAnimationFrame(() => {
+    toolJsonParseRaf = 0;
+
+    if (pendingToolJsonTruncated) return;
+    if (!pendingToolJson) return;
+
+    const fixed = fixPartialJson(pendingToolJson);
+    try {
+      const parsed = JSON.parse(fixed) as Record<string, unknown>;
+
+      // TodoWrite detection stays inline — it only fires when input
+      // is fully parseable and triggers a different store method.
+      const store = useProjectsStore.getState();
+      const project = store.projects.get(projectId);
+      if (project) {
+        const msgs = project.conversation.messages;
+        const last = msgs[msgs.length - 1];
+        if (last && last.type === "assistant") {
+          const lastTool = [...last.content]
+            .reverse()
+            .find((b) => b.type === "tool_use") as ToolUseBlock | undefined;
+          if (lastTool?.name === "TodoWrite" && (parsed as any).todos) {
+            // Throttle todo updates via rAF to prevent React 18 batching all updates
+            // Deep clone to ensure Zustand detects updates even within todo objects
+            pendingTodos = ((parsed as any).todos as import("../lib/claude-types").Todo[]).map((t) => ({ ...t }));
+            if (!todosFlushRaf) {
+              todosFlushRaf = requestAnimationFrame(() => flushTodos(projectId));
+            }
+          }
+        }
+      }
+
+      // Throttle store update to once per animation frame
+      pendingToolInput = parsed;
+      if (!toolInputFlushRaf) {
+        toolInputFlushRaf = requestAnimationFrame(() => flushToolInput(projectId));
+      }
+    } catch {
+      // Still incomplete/unparseable — wait for more chunks
+    }
+  });
 }
 
 function flushTodos(projectId: string) {
@@ -865,6 +917,11 @@ function handleClaudeMessage(
         evt.content_block?.type === "tool_use"
       ) {
         pendingToolJson = "";
+        pendingToolJsonTruncated = false;
+        if (toolJsonParseRaf) {
+          cancelAnimationFrame(toolJsonParseRaf);
+          toolJsonParseRaf = 0;
+        }
         const toolBlock = evt.content_block as ToolUseBlock;
 
         if (!assistantMessageExists) {
@@ -913,40 +970,25 @@ function handleClaudeMessage(
         evt.delta?.type === "input_json_delta" &&
         evt.delta.partial_json
       ) {
+        if (pendingToolJsonTruncated) return assistantMessageExists;
+
         pendingToolJson += evt.delta.partial_json;
-        const fixed = fixPartialJson(pendingToolJson);
-        try {
-          const parsed = JSON.parse(fixed);
-
-          // TodoWrite detection stays inline — it only fires when input
-          // is fully parseable and triggers a different store method.
-          const project = store.projects.get(projectId);
-          if (project) {
-            const msgs = project.conversation.messages;
-            const last = msgs[msgs.length - 1];
-            if (last && last.type === "assistant") {
-              const lastTool = [...last.content]
-                .reverse()
-                .find((b) => b.type === "tool_use") as ToolUseBlock | undefined;
-              if (lastTool?.name === "TodoWrite" && parsed.todos) {
-                // Throttle todo updates via rAF to prevent React 18 batching all updates
-                // Deep clone to ensure Zustand detects updates even within todo objects
-                pendingTodos = (parsed.todos as import("../lib/claude-types").Todo[]).map(t => ({ ...t }));
-                if (!todosFlushRaf) {
-                  todosFlushRaf = requestAnimationFrame(() => flushTodos(projectId));
-                }
-              }
-            }
-          }
-
-          // Throttle store update to once per animation frame
-          pendingToolInput = parsed;
+        if (pendingToolJson.length > MAX_STREAMING_TOOL_JSON_CHARS) {
+          pendingToolJsonTruncated = true;
+          pendingToolJson = "";
+          pendingToolInput = {
+            __pane_truncated: true,
+            __pane_note:
+              "Tool input streaming truncated (too large). Full input may still be available in the final message.",
+          };
           if (!toolInputFlushRaf) {
             toolInputFlushRaf = requestAnimationFrame(() => flushToolInput(projectId));
           }
-        } catch {
-          // Even fixed JSON failed — truly unparseable fragment, wait for more
+          return assistantMessageExists;
         }
+
+        // Parse at most once per frame to avoid repeated O(n) scans + JSON.parse per chunk.
+        scheduleToolJsonParse(projectId);
         return assistantMessageExists;
       }
 

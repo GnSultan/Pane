@@ -100,7 +100,7 @@ function registerClaudeHandlers() {
   });
   ipcMain.handle("check_claude_version", async () => {
     try {
-      const { stdout } = await execFileAsync("claude", ["--version"]);
+      const { stdout } = await execFileAsync("claude", ["--version"], { env: getEnvWithPath() });
       const versionMatch = stdout.trim().match(/^([\d.]+)/);
       if (!versionMatch) return { current: null, error: "Could not parse version" };
       return { current: versionMatch[1], error: null };
@@ -111,7 +111,7 @@ function registerClaudeHandlers() {
   ipcMain.handle("check_claude_update", async () => {
     try {
       // Get current version from claude --version
-      const { stdout: versionOut } = await execFileAsync("claude", ["--version"]);
+      const { stdout: versionOut } = await execFileAsync("claude", ["--version"], { env: getEnvWithPath() });
       const currentMatch = versionOut.trim().match(/^([\d.]+)/);
       const current = currentMatch?.[1] ?? null;
 
@@ -205,6 +205,11 @@ function registerCommandHandlers() {
   ipcMain.handle(
     "read_directory_tree",
     async (_event, args) => {
+      const SKIP_DIRS = new Set([
+        "node_modules", "dist", "build", "out", ".next", "target",
+        ".turbo", "coverage", "__pycache__", ".cache", ".parcel-cache",
+        "vendor", ".gradle", ".dart_tool", "Pods",
+      ]);
       const result = {};
       async function readLevel(dirPath, depth) {
         try {
@@ -222,7 +227,7 @@ function registerCommandHandlers() {
               is_hidden: entry.name.startsWith("."),
               extension: isDir ? null : path.extname(entry.name).slice(1) || null
             });
-            if (isDir && depth < args.maxDepth && !entry.name.startsWith(".")) {
+            if (isDir && depth < args.maxDepth && !entry.name.startsWith(".") && !SKIP_DIRS.has(entry.name)) {
               subdirs.push(fullPath);
             }
           }
@@ -254,6 +259,9 @@ function registerCommandHandlers() {
   ipcMain.handle("write_file", async (_event, args) => {
     await fs.promises.mkdir(path.dirname(args.path), { recursive: true });
     await fs.promises.writeFile(args.path, args.content, "utf-8");
+  });
+  ipcMain.handle("rename_file", async (_event, args) => {
+    await fs.promises.rename(args.oldPath, args.newPath);
   });
   ipcMain.handle("delete_file", async (_event, args) => {
     // Move to Trash instead of permanent deletion

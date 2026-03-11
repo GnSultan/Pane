@@ -50,6 +50,11 @@ export const MarkdownText = memo(function MarkdownText({ text, isStreaming }: Ma
   // regex passes over the full accumulated text on every frame. For long messages
   // (summaries, plans), this exceeds 16ms and freezes the app.
   // Raw text renders in O(1). Full markdown parses once when streaming ends.
+  //
+  // However, "once" can still be too expensive for very large final summaries.
+  // In that case we keep the cheap plain-text rendering to avoid UI stalls.
+
+  const shouldParseMarkdown = !isStreaming && text.length <= 30_000;
 
   // Memoize cleaning during streaming — strip emojis AND markdown markers
   // This prevents visible transformation when streaming ends (### → styled heading, etc.)
@@ -66,11 +71,11 @@ export const MarkdownText = memo(function MarkdownText({ text, isStreaming }: Ma
   );
 
   const blocks = useMemo(
-    () => isStreaming ? null : parseBlocks(displayText),
-    [displayText, isStreaming],
+    () => (shouldParseMarkdown ? parseBlocks(displayText) : null),
+    [displayText, shouldParseMarkdown],
   );
 
-  if (isStreaming || !blocks) {
+  if (!blocks) {
     return (
       <p
         className="text-pane-text leading-[1.75] whitespace-pre-wrap mb-5"

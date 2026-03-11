@@ -66,9 +66,11 @@ export function Workspace() {
   );
   const [plan, setPlan] = useState<string | null>(null);
 
-  // Keep-alive: mount conversations on first visit, keep them in DOM after.
-  // First switch pays the mount cost; every switch after is just a visibility flip.
-  const [mountedIds, setMountedIds] = useState<Set<string>>(new Set());
+  // Keep-alive: pre-mount ALL projects at startup so every switch is a
+  // zero-cost visibility flip. New projects added later get mounted on first visit.
+  const [mountedIds, setMountedIds] = useState<Set<string>>(
+    () => new Set(useProjectsStore.getState().projectOrder)
+  );
   useEffect(() => {
     if (activeProjectId && !mountedIds.has(activeProjectId)) {
       setMountedIds((prev) => new Set(prev).add(activeProjectId));

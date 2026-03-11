@@ -1,7 +1,7 @@
 import { useEffect, useCallback, useState, useRef } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { useShallow } from "zustand/react/shallow";
-import { readDirectory, readDirectoryTree, readFile, deleteFile, revealInFinder, writeFile } from "../../lib/tauri-commands";
+import { readDirectory, readDirectoryTree, readFile, deleteFile, revealInFinder, writeFile, renameFile } from "../../lib/tauri-commands";
 import type { FileEntry } from "../../lib/tauri-commands";
 import { getParentDir } from "../../lib/file-utils";
 import { ContextMenu } from "../shared/ContextMenu";
@@ -44,7 +44,6 @@ export function FileTree() {
     if (!s.activeProjectId) return undefined;
     return s.projects.get(s.activeProjectId)?.root;
   });
-  // Get root entries only — each FileTreeNode fetches its own children
   const rootEntries = useProjectsStore(
     useShallow((s) => {
       if (!s.activeProjectId) return EMPTY_ENTRIES;
@@ -60,8 +59,8 @@ export function FileTree() {
 
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [newFileDir, setNewFileDir] = useState<string | null>(null);
+  const [renamingPath, setRenamingPath] = useState<string | null>(null);
 
-  // Listen for Cmd+N to create file at project root
   useEffect(() => {
     const handler = () => {
       if (root) setNewFileDir(root);
@@ -92,10 +91,8 @@ export function FileTree() {
     const filePath = `${dir}/${fileName}`;
     try {
       await writeFile(filePath, "");
-      // Reload directory to show new file
       const entries = await readDirectory(dir);
       useProjectsStore.getState().setDirContents(projectId, dir, entries);
-      // Open the new file
       useProjectsStore.getState().openFile(projectId, filePath, "");
     } catch (err) {
       console.error("Failed to create file:", err);
@@ -103,30 +100,27 @@ export function FileTree() {
     setNewFileDir(null);
   }, []);
 
-  // Load root directory when project becomes active
-  // Phase 1: Load root level immediately for fast first paint
-  // Phase 2: Deep preload remaining levels when idle
-  useEffect(() => {
-    if (!root || hasRootLoaded || !activeProjectId) return;
-    const id = activeProjectId;
-
-    // Load root level immediately — gives user something to see right away
-    readDirectory(root)
-      .then((entries) => {
-        useProjectsStore.getState().setDirContents(id, root, entries);
-        // Then deep-preload expanded subdirs when idle
-        requestIdleCallback(() => {
-          readDirectoryTree(root, 3)
-            .then((tree) => {
-              useProjectsStore.getState().batchSetDirContents(id, tree);
-            })
-            .catch(() => {});
-        });
-      })
-      .catch(() => {
-        loadDir(root);
-      });
-  }, [root, activeProjectId, hasRootLoaded, loadDir]);
+  const handleRename = useCallback(async (oldPath: string, newName: string) => {
+    const projectId = useProjectsStore.getState().activeProjectId;
+    if (!projectId || !newName.trim()) { setRenamingPath(null); return; }
+    const parentDir = getParentDir(oldPath);
+    const newPath = `${parentDir}/${newName.trim()}`;
+    if (newPath === oldPath) { setRenamingPath(null); return; }
+    try {
+      await renameFile(oldPath, newPath);
+      const entries = await readDirectory(parentDir);
+      useProjectsStore.getState().setDirContents(projectId, parentDir, entries);
+      const project = useProjectsStore.getState().projects.get(projectId);
+      if (project?.activeFilePath === oldPath) {
+        const content = await readFile(newPath);
+        useProjectsStore.getState().openFile(projectId, newPath, content);
+      }
+      useProjectsStore.getState().invalidateFileIndex(projectId);
+    } catch (err) {
+      console.error("Failed to rename:", err);
+    }
+    setRenamingPath(null);
+  }, []);
 
   const handleDelete = useCallback(async (filePath: string) => {
     try {
@@ -134,15 +128,12 @@ export function FileTree() {
       const store = useProjectsStore.getState();
       const p = activeProjectId ? store.projects.get(activeProjectId) : undefined;
       if (!p || !activeProjectId) return;
-      // Clear active file if it IS the deleted file, or is INSIDE a deleted directory
-      if (p.activeFilePath && (p.activeFilePath === filePath || p.activeFilePath.startsWith(filePath + "/"))) {
+      if (p.activeFilePath && p.activeFilePath === filePath) {
         store.clearFile(activeProjectId);
       }
-      // Reload the parent directory to reflect the deletion
       const parentDir = getParentDir(filePath);
       const entries = await readDirectory(parentDir);
       store.setDirContents(activeProjectId, parentDir, entries);
-      // Invalidate the file index so fuzzy finder picks up the change
       store.invalidateFileIndex(activeProjectId);
     } catch (err) {
       console.error("Failed to delete:", err);
@@ -160,49 +151,44 @@ export function FileTree() {
     (menu: ContextMenuState): ContextMenuItem[] => {
       const items: ContextMenuItem[] = [];
       if (menu.isDir) {
-        items.push({
-          label: "New File",
-          action: () => setNewFileDir(menu.path),
-        });
+        items.push({ label: "New File", action: () => setNewFileDir(menu.path) });
       }
-      items.push(
-        {
-          label: "Copy Path",
-          action: () => navigator.clipboard.writeText(menu.path),
-        },
-        {
-          label: "Reveal in Finder",
-          action: () => revealInFinder(menu.path).catch(console.error),
-        },
-        {
-          label: "Delete",
-          danger: true,
-          action: () => handleDelete(menu.path),
-        },
-      );
+      items.push({ label: "Rename", action: () => setRenamingPath(menu.path) });
+      items.push({ label: "Reveal in Finder", action: () => revealInFinder(menu.path).catch(console.error) });
+      if (!menu.isDir) {
+        items.push({ label: "Delete", danger: true, action: () => handleDelete(menu.path) });
+      }
       return items;
     },
     [handleDelete],
   );
 
-  const entries = rootEntries.length > 0 ? rootEntries : undefined;
+  // Load root directory when project becomes active
+  useEffect(() => {
+    if (!root || hasRootLoaded || !activeProjectId) return;
+    const id = activeProjectId;
 
-  const handleRootContextMenu = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    if (!root) return;
-    setContextMenu({
-      x: e.clientX,
-      y: e.clientY,
-      path: root,
-      isDir: true,
-    });
-  }, [root]);
+    readDirectory(root)
+      .then((entries) => {
+        useProjectsStore.getState().setDirContents(id, root, entries);
+        requestIdleCallback(() => {
+          readDirectoryTree(root, 3)
+            .then((tree) => {
+              useProjectsStore.getState().batchSetDirContents(id, tree);
+            })
+            .catch(() => {});
+        });
+      })
+      .catch(() => {
+        loadDir(root);
+      });
+  }, [root, activeProjectId, hasRootLoaded, loadDir]);
+
+  const entries = rootEntries.length > 0 ? rootEntries : undefined;
 
   return (
     <div
-      className="flex-1 overflow-y-auto overflow-x-hidden py-2 relative"
-      style={{ willChange: "transform" }}
-      onContextMenu={handleRootContextMenu}
+      className="flex-1 overflow-y-auto py-2 px-1 relative"
     >
       {newFileDir === root && (
         <NewFileInput
@@ -221,6 +207,9 @@ export function FileTree() {
           newFileDir={newFileDir}
           onCreateFile={handleCreateFile}
           onCancelCreate={() => setNewFileDir(null)}
+          renamingPath={renamingPath}
+          onRename={handleRename}
+          onCancelRename={() => setRenamingPath(null)}
         />
       ))}
       {contextMenu && (
@@ -246,11 +235,9 @@ function NewFileInput({
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [name, setName] = useState("");
-
   const mountedAt = useRef(Date.now());
 
   useEffect(() => {
-    // Delay focus slightly to avoid race with other focus effects
     const t = setTimeout(() => inputRef.current?.focus(), 50);
     return () => clearTimeout(t);
   }, []);
@@ -265,27 +252,65 @@ function NewFileInput({
         value={name}
         onChange={(e) => setName(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && name.trim()) {
-            onSubmit(name);
-          }
-          if (e.key === "Escape") {
-            onCancel();
-          }
+          if (e.key === "Enter" && name.trim()) onSubmit(name);
+          if (e.key === "Escape") onCancel();
         }}
         onBlur={() => {
-          // Don't cancel immediately on blur — user may have just triggered Cmd+N
-          // and something else stole focus briefly
           if (Date.now() - mountedAt.current < 300) return;
-          if (name.trim()) {
-            onSubmit(name);
-          } else {
-            onCancel();
-          }
+          if (name.trim()) onSubmit(name);
+          else onCancel();
         }}
         placeholder="filename"
         className="w-full bg-pane-bg border border-pane-border px-2 py-0.5
                     text-pane-text outline-none
                    placeholder:text-pane-text-secondary/30"
+        style={{ fontSize: "var(--pane-panel-font-size)" }}
+      />
+    </div>
+  );
+}
+
+function RenameInput({
+  currentName,
+  depth,
+  onSubmit,
+  onCancel,
+}: {
+  currentName: string;
+  depth: number;
+  onSubmit: (name: string) => void;
+  onCancel: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [name, setName] = useState(currentName);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }, 50);
+    return () => clearTimeout(t);
+  }, []);
+
+  return (
+    <div
+      className="flex items-center h-8"
+      style={{ paddingLeft: `${depth * 16 + 8 + 16}px`, paddingRight: "8px" }}
+    >
+      <input
+        ref={inputRef}
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && name.trim()) onSubmit(name.trim());
+          if (e.key === "Escape") onCancel();
+        }}
+        onBlur={() => {
+          if (name.trim() && name.trim() !== currentName) onSubmit(name.trim());
+          else onCancel();
+        }}
+        className="w-full bg-pane-bg border border-pane-border px-2 py-0.5
+                   text-pane-text outline-none"
         style={{ fontSize: "var(--pane-panel-font-size)" }}
       />
     </div>
@@ -300,6 +325,9 @@ function FileTreeNode({
   newFileDir,
   onCreateFile,
   onCancelCreate,
+  renamingPath,
+  onRename,
+  onCancelRename,
 }: {
   entry: FileEntry;
   depth: number;
@@ -308,10 +336,12 @@ function FileTreeNode({
   newFileDir: string | null;
   onCreateFile: (dir: string, name: string) => void;
   onCancelCreate: () => void;
+  renamingPath: string | null;
+  onRename: (oldPath: string, newName: string) => void;
+  onCancelRename: () => void;
 }) {
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
 
-  // Select only the specific booleans/primitives this node needs
   const isExpanded = useProjectsStore((s) => {
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.expandedDirs.has(entry.path) ?? false;
@@ -324,7 +354,6 @@ function FileTreeNode({
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.selectedPath === entry.path;
   });
-  // Children entries for this specific dir — useShallow for array stability
   const children = useProjectsStore(
     useShallow((s) => {
       if (!s.activeProjectId) return EMPTY_ENTRIES;
@@ -335,20 +364,15 @@ function FileTreeNode({
     if (!s.activeProjectId) return undefined;
     return s.projects.get(s.activeProjectId)?.git.fileStatuses.get(entry.path);
   });
-  // O(1) lookup via pre-computed dirtyDirs set instead of iterating all statuses
   const dirHasChanges = useProjectsStore((s) => {
     if (!entry.is_dir || !s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.git.dirtyDirs.has(entry.path) ?? false;
   });
-
-  // Check if this directory has been loaded (even if empty)
   const isDirLoaded = useProjectsStore((s) => {
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.dirContents.has(entry.path) ?? false;
   });
 
-  // Auto-load contents for dirs restored as expanded (e.g. after settings restore)
-  // Use isDirLoaded instead of hasChildren — empty dirs have no children but ARE loaded
   useEffect(() => {
     if (entry.is_dir && isExpanded && !isDirLoaded && !isLoading) {
       loadDir(entry.path);
@@ -357,30 +381,35 @@ function FileTreeNode({
 
   if (!activeProjectId) return null;
 
+  // Inline rename input replaces the row
+  if (renamingPath === entry.path) {
+    return (
+      <RenameInput
+        currentName={entry.name}
+        depth={depth}
+        onSubmit={(newName) => onRename(entry.path, newName)}
+        onCancel={onCancelRename}
+      />
+    );
+  }
+
   const handleClick = () => {
     const { toggleDir, setSelectedPath, openFile, setMode } = useProjectsStore.getState();
     if (entry.is_dir) {
-      // Immediate UI feedback - expand/collapse folder instantly
       toggleDir(activeProjectId, entry.path);
-
-      // Load directory contents in background - don't block UI
       if (!isExpanded && !isDirLoaded) {
         loadDir(entry.path).catch((err) => {
           console.error("Failed to load directory:", err);
         });
       }
     } else {
-      // Immediate UI feedback - select file
       setSelectedPath(activeProjectId, entry.path);
-
-      // Load content and open file - openFile() will set mode to viewer
       readFile(entry.path)
         .then((content) => {
           openFile(activeProjectId, entry.path, content);
         })
         .catch((err) => {
           console.error("Failed to read file:", err);
-          // On error, at least switch to viewer mode to show the error state
           setMode(activeProjectId, "viewer");
         });
     }
@@ -400,8 +429,8 @@ function FileTreeNode({
         onContextMenu={handleRightClick}
         className={`
           w-full flex items-center gap-1.5 h-8 truncate text-left btn-press
-          hover:bg-pane-text/[0.08] active:bg-pane-text/[0.12]
-          ${isSelected ? "bg-pane-text/[0.10] text-pane-text" : "text-pane-text"}
+          hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40 hover:rounded-xl
+          ${isSelected ? "bg-pane-text/[0.08] rounded-xl text-pane-text" : "text-pane-text"}
           ${entry.is_hidden ? "opacity-50" : ""}
         `}
         style={{ paddingLeft: `${depth * 16 + 8}px`, paddingRight: "8px", fontSize: "var(--pane-panel-font-size)" }}
@@ -442,6 +471,9 @@ function FileTreeNode({
               newFileDir={newFileDir}
               onCreateFile={onCreateFile}
               onCancelCreate={onCancelCreate}
+              renamingPath={renamingPath}
+              onRename={onRename}
+              onCancelRename={onCancelRename}
             />
           ))}
         </>

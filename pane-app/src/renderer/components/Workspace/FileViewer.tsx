@@ -54,6 +54,8 @@ export function FileViewer() {
 
   const editorRef = useRef<AceEditor>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scrollPositions = useRef<Map<string, { scrollTop: number; cursor: { row: number; column: number } }>>(new Map());
+  const prevFilePathRef = useRef<string | null>(null);
 
   const handleChange = useCallback(
     (content: string) => {
@@ -73,16 +75,32 @@ export function FileViewer() {
     [activeFilePath, activeProjectId],
   );
 
-  // Update editor content when file changes
+  // Update editor content when file changes, saving/restoring scroll position
   useEffect(() => {
     if (editorRef.current && activeFileContent !== null) {
       const editor = editorRef.current.editor;
       const currentValue = editor.getValue();
       if (currentValue !== activeFileContent) {
-        const cursorPos = editor.getCursorPosition();
+        // Save position for the file we're leaving
+        if (prevFilePathRef.current && prevFilePathRef.current !== activeFilePath) {
+          scrollPositions.current.set(prevFilePathRef.current, {
+            scrollTop: editor.session.getScrollTop(),
+            cursor: editor.getCursorPosition(),
+          });
+        }
+
         editor.setValue(activeFileContent, -1);
-        editor.moveCursorToPosition(cursorPos);
+
+        // Restore position if we've visited this file before
+        const saved = activeFilePath ? scrollPositions.current.get(activeFilePath) : null;
+        if (saved) {
+          requestAnimationFrame(() => {
+            editor.session.setScrollTop(saved.scrollTop);
+            editor.moveCursorToPosition(saved.cursor);
+          });
+        }
       }
+      prevFilePathRef.current = activeFilePath;
     }
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);

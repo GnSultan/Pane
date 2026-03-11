@@ -35,7 +35,7 @@ function ProjectRow({
       onPointerDown={(e) => onPointerDown(e, index)}
       className={`
         w-full flex items-center gap-1.5 h-8 px-2 truncate group btn-press
-        ${isActive ? "bg-pane-text/[0.10] text-pane-text" : "text-pane-text-secondary hover:bg-pane-text/[0.08] hover:text-pane-text active:bg-pane-text/[0.12]"}
+        ${isActive ? "bg-pane-text/[0.08] rounded-xl text-pane-text" : "text-pane-text-secondary hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40 hover:rounded-xl hover:text-pane-text"}
         ${isDragging ? "opacity-40" : ""}
         ${isDropTarget ? "border-t-2 border-pane-text/30" : "border-t-2 border-transparent"}
       `}
@@ -134,7 +134,7 @@ export function ProjectList() {
         className="w-full flex items-center h-8 px-2 btn-press text-pane-text-secondary hover:bg-pane-text/[0.08] hover:text-pane-text active:bg-pane-text/[0.12]"
         style={{ fontSize: "var(--pane-panel-font-size)" }}
       >
-        + add project
+        + new thread
       </button>
     </div>
   );

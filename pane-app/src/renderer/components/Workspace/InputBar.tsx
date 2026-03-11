@@ -102,6 +102,9 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
   const setSelectedModel = useWorkspaceStore((s) => s.setSelectedModel);
   const claudeUpdateState = useWorkspaceStore((s) => s.claudeUpdateState);
   const triggerClaudeUpdate = useWorkspaceStore((s) => s.triggerClaudeUpdate);
+  const contextPressure = useProjectsStore((s) => s.projects.get(projectId)?.conversation.contextPressure ?? "none");
+  const contextTokens = useProjectsStore((s) => s.projects.get(projectId)?.conversation.contextTokens ?? 0);
+  const contextPercent = contextTokens > 0 ? Math.min(Math.round((contextTokens / 200000) * 100), 99) : 0;
 
   const [planRejected, setPlanRejected] = useState(false);
 
@@ -178,7 +181,7 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
     <div className="shrink-0 px-4 bg-transparent">
 
       {/* Processing indicator — only exists when active, no reserved space */}
-      {(isProcessing || isFadingOut) && !pendingPlanApproval && (
+      {(isProcessing || isFadingOut) && !pendingPlanApproval && !todoPanelOpen && (
         <div className={`flex items-center gap-3 px-1 pb-3 ${isFadingOut ? 'animate-fadeOut' : 'animate-fadeIn'}`}>
           <svg
             width="20"
@@ -294,6 +297,11 @@ export function InputBar({ projectId, onSend, onAbort, isProcessing }: InputBarP
             className="h-9 flex items-center px-5 border-t border-pane-border shrink-0 bg-transparent font-mono text-pane-text-secondary"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
+            {contextPressure !== "none" && (
+              <span className={`mr-auto inline-flex items-center px-2 py-0.5 rounded-lg ring-1 ring-pane-border/40 bg-pane-surface ${contextPressure === "high" ? "text-pane-error" : "text-[var(--pane-terminal)]"}`}>
+                context {contextPercent}%
+              </span>
+            )}
             <div className="flex-1" />
             {claudeUpdateState === 'available' && (
               <button
