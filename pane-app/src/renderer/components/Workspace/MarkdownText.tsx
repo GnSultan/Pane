@@ -16,28 +16,7 @@ import type React from "react";
 const emojiPattern = /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]+/gu;
 
 function stripEmojis(text: string): string {
-  return text.replace(emojiPattern, "").replace(/  +/g, " ").trim();
-}
-
-// --- Markdown marker stripping for streaming ---
-
-function stripMarkdownMarkers(text: string): string {
-  return text
-    // Remove heading markers: ### Heading → Heading
-    .replace(/^#{1,6}\s+/gm, "")
-    // Remove list markers: - item or * item → item
-    .replace(/^[\s]*[-*]\s+/gm, "")
-    // Remove numbered list markers: 1. item → item
-    .replace(/^[\s]*\d+\.\s+/gm, "")
-    // Remove blockquote markers: > quote → quote
-    .replace(/^>\s?/gm, "")
-    // Remove horizontal rules: ---, ***, ___
-    .replace(/^[-*_]{3,}\s*$/gm, "")
-    // Remove code fence markers: ``` → (just remove the backticks, keep the code)
-    .replace(/^```\w*$/gm, "")
-    // Clean up extra whitespace
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return text.replace(emojiPattern, "").replace(/  +/g, " ");
 }
 
 interface MarkdownTextProps {
@@ -46,33 +25,16 @@ interface MarkdownTextProps {
 }
 
 export const MarkdownText = memo(function MarkdownText({ text, isStreaming }: MarkdownTextProps) {
-  // During streaming, skip markdown parsing entirely — parseBlocks runs O(n)
-  // regex passes over the full accumulated text on every frame. For long messages
-  // (summaries, plans), this exceeds 16ms and freezes the app.
-  // Raw text renders in O(1). Full markdown parses once when streaming ends.
+  // During streaming, we skip full block parsing (fences, tables, lists)
+  // because O(n) regex passes over the full text on every frame causes jank.
   //
-  // However, "once" can still be too expensive for very large final summaries.
-  // In that case we keep the cheap plain-text rendering to avoid UI stalls.
-
+  // However, we still want RICH INLINE FORMATTING (bold, code, links) so the
+  // stream feels alive and formatted (e.g. file paths in backticks).
   const shouldParseMarkdown = !isStreaming && text.length <= 30_000;
 
-  // Memoize cleaning during streaming — strip emojis AND markdown markers
-  // This prevents visible transformation when streaming ends (### → styled heading, etc.)
-  const displayText = useMemo(
-    () => {
-      if (isStreaming) {
-        const noEmojis = stripEmojis(text);
-        const noMarkdown = stripMarkdownMarkers(noEmojis);
-        return noMarkdown;
-      }
-      return text;
-    },
-    [text, isStreaming]
-  );
-
   const blocks = useMemo(
-    () => (shouldParseMarkdown ? parseBlocks(displayText) : null),
-    [displayText, shouldParseMarkdown],
+    () => (shouldParseMarkdown ? parseBlocks(text) : null),
+    [text, shouldParseMarkdown],
   );
 
   if (!blocks) {
@@ -84,7 +46,7 @@ export const MarkdownText = memo(function MarkdownText({ text, isStreaming }: Ma
           maxWidth: "65ch",
         }}
       >
-        {displayText}
+        {renderInline(text)}
       </p>
     );
   }

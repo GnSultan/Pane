@@ -1,0 +1,130 @@
+// Punk Engine layer (main process).
+//
+// The renderer should not know or care which "horsepower" is active (CLI, HTTP, etc).
+// This module exposes a stable IPC surface and a relay that streams events back
+// to the renderer on a per-project channel.
+
+import path from "node:path";
+import { BrowserWindow, utilityProcess, ipcMain } from "electron";
+
+const __dirname = import.meta.dirname;
+
+/**
+ * For now we only implement the CLI worker engine (existing claude-worker.mjs),
+ * but the interface is intentionally generic so we can add HTTP engines later.
+ */
+
+let punkWorker = null;
+const activeProjectIds = new Set();
+
+function getPunkWorker() {
+  if (punkWorker && !punkWorker.killed) return punkWorker;
+
+  // Existing worker stays as-is for now; it already emits the stream-json event shape.
+  const workerPath = path.join(__dirname, "claude-worker.mjs");
+  punkWorker = utilityProcess.fork(workerPath);
+
+  // setImmediate-based yielding for the relay — prevents the main process from
+  // blocking on a burst of messages.
+  const relayQueue = [];
+  let relayDraining = false;
+
+  function drainRelayQueue() {
+    if (relayQueue.length === 0) {
+      relayDraining = false;
+      return;
+    }
+    const { channel, event } = relayQueue.shift();
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send(channel, event);
+    }
+    if (relayQueue.length > 0) setImmediate(drainRelayQueue);
+    else relayDraining = false;
+  }
+
+  punkWorker.on("message", (message) => {
+    if (message.type !== "event") return;
+
+    if (message.event.event === "processEnded") {
+      activeProjectIds.delete(message.projectId);
+    }
+
+    // Renderer listens on claude-stream today; we keep the channel stable for now
+    // to avoid UI churn. We'll migrate to punk-stream in a later step.
+    const channel = `claude-stream:${message.projectId}`;
+
+    // Critical events bypass queue — must reach renderer immediately
+    if (message.event.event === "processEnded" || message.event.event === "error") {
+      while (relayQueue.length > 0) {
+        const { channel: ch, event } = relayQueue.shift();
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) win.webContents.send(ch, event);
+        }
+      }
+      relayDraining = false;
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send(channel, message.event);
+      }
+      return;
+    }
+
+    relayQueue.push({ channel, event: message.event });
+    if (!relayDraining) {
+      relayDraining = true;
+      setImmediate(drainRelayQueue);
+    }
+  });
+
+  punkWorker.on("exit", (code) => {
+    console.warn(`[pane] Punk worker exited with code ${code}`);
+    for (const projectId of activeProjectIds) {
+      const channel = `claude-stream:${projectId}`;
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) {
+          win.webContents.send(channel, {
+            event: "processEnded",
+            data: { exit_code: null },
+          });
+        }
+      }
+    }
+    activeProjectIds.clear();
+    punkWorker = null;
+  });
+
+  return punkWorker;
+}
+
+export function registerPunkHandlers() {
+  ipcMain.handle("send_to_punk", async (_event, args) => {
+    const { projectId, prompt, workingDir, sessionId, model } = args;
+    const worker = getPunkWorker();
+    activeProjectIds.add(projectId);
+    worker.postMessage({ type: "spawn", projectId, prompt, workingDir, sessionId, model });
+  });
+
+  ipcMain.handle("abort_punk", async (_event, args) => {
+    if (punkWorker && !punkWorker.killed) {
+      punkWorker.postMessage({ type: "abort", projectId: args.projectId });
+    }
+  });
+
+  ipcMain.handle("terminate_punk_session", async (_event, args) => {
+    if (punkWorker && !punkWorker.killed) {
+      punkWorker.postMessage({ type: "terminate", projectId: args.projectId });
+    }
+  });
+}
+
+export function preforkPunkWorker() {
+  getPunkWorker();
+}
+
+export function shutdownPunkWorker() {
+  if (punkWorker && !punkWorker.killed) {
+    punkWorker.postMessage({ type: "shutdown" });
+    punkWorker.kill();
+    punkWorker = null;
+  }
+}
+

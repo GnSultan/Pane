@@ -16,6 +16,7 @@ import "ace-builds/src-noconflict/mode-python";
 import "ace-builds/src-noconflict/mode-rust";
 import "ace-builds/src-noconflict/mode-jsx";
 import "ace-builds/src-noconflict/mode-tsx";
+import "ace-builds/src-noconflict/ext-language_tools";
 // Pane theme is in globals.css - no need to import Ace themes
 
 // Map file extensions to Ace modes
@@ -46,6 +47,10 @@ export function FileViewer() {
     if (!s.activeProjectId) return null;
     return s.projects.get(s.activeProjectId)?.activeFileContent ?? null;
   });
+  const scrollPositions = useProjectsStore((s) => {
+    if (!s.activeProjectId) return null;
+    return s.projects.get(s.activeProjectId)?.scrollPositions ?? null;
+  });
   const mode = useProjectsStore((s) => {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
@@ -54,7 +59,6 @@ export function FileViewer() {
 
   const editorRef = useRef<AceEditor>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const scrollPositions = useRef<Map<string, { scrollTop: number; cursor: { row: number; column: number } }>>(new Map());
   const prevFilePathRef = useRef<string | null>(null);
 
   const handleChange = useCallback(
@@ -80,24 +84,44 @@ export function FileViewer() {
     if (editorRef.current && activeFileContent !== null) {
       const editor = editorRef.current.editor;
       const currentValue = editor.getValue();
-      if (currentValue !== activeFileContent) {
+      
+      // Only update if content is actually different to avoid jumps during typing.
+      // We also check if we're switching files.
+      const isNewFile = prevFilePathRef.current !== activeFilePath;
+      
+      if (isNewFile || currentValue !== activeFileContent) {
+        const pos = editor.getCursorPosition();
+        const scrollTop = editor.session.getScrollTop();
+
         // Save position for the file we're leaving
-        if (prevFilePathRef.current && prevFilePathRef.current !== activeFilePath) {
-          scrollPositions.current.set(prevFilePathRef.current, {
-            scrollTop: editor.session.getScrollTop(),
-            cursor: editor.getCursorPosition(),
+        if (isNewFile && prevFilePathRef.current && activeProjectId) {
+          useProjectsStore.getState().setScrollPosition(activeProjectId, prevFilePathRef.current, {
+            scrollTop,
+            cursor: pos,
           });
         }
 
-        editor.setValue(activeFileContent, -1);
+        // Only setValue if it's a new file or the content is fundamentally different.
+        // For same-file updates (external or auto-save sync), we only update if 
+        // the content doesn't match to avoid interrupting the user.
+        if (isNewFile || currentValue !== activeFileContent) {
+          editor.setValue(activeFileContent, -1);
 
-        // Restore position if we've visited this file before
-        const saved = activeFilePath ? scrollPositions.current.get(activeFilePath) : null;
-        if (saved) {
-          requestAnimationFrame(() => {
-            editor.session.setScrollTop(saved.scrollTop);
-            editor.moveCursorToPosition(saved.cursor);
-          });
+          // Restore position
+          if (!isNewFile) {
+            // Same file (external update) — restore immediate position
+            editor.session.setScrollTop(scrollTop);
+            editor.moveCursorToPosition(pos);
+          } else {
+            // New file — restore its last known position
+            const saved = activeFilePath && scrollPositions ? scrollPositions.get(activeFilePath) : null;
+            if (saved) {
+              requestAnimationFrame(() => {
+                editor.session.setScrollTop(saved.scrollTop);
+                editor.moveCursorToPosition(saved.cursor);
+              });
+            }
+          }
         }
       }
       prevFilePathRef.current = activeFilePath;
@@ -105,7 +129,7 @@ export function FileViewer() {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
     }
-  }, [activeFilePath, activeFileContent]);
+  }, [activeFilePath, activeFileContent, activeProjectId, scrollPositions]);
 
   useEffect(() => {
     return () => {
@@ -118,7 +142,9 @@ export function FileViewer() {
   // Auto-focus editor when switching to viewer mode
   useEffect(() => {
     if (mode === "viewer" && editorRef.current) {
-      editorRef.current.editor.focus();
+      const editor = editorRef.current.editor;
+      editor.focus();
+      editor.renderer.updateCursor();
     }
   }, [mode]);
 
@@ -187,6 +213,7 @@ export function FileViewer() {
           indentedSoftWrap: false,
           scrollPastEnd: 0.8 as unknown as boolean,
           highlightSelectedWord: false,
+          cursorStyle: "ace",
         }}
         editorProps={{ $blockScrolling: true }}
       />

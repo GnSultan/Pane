@@ -18,6 +18,51 @@ interface TerminalLine {
 const CMD_END_MARKER = "___PANE_CMD_END___";
 const PWD_MARKER = "___PANE_PWD___";
 
+function measureCaretPos(
+  el: HTMLTextAreaElement,
+  container: HTMLElement,
+): { top: number; left: number; lineHeight: number } | null {
+  const sel = el.selectionStart;
+  if (sel === null) return null;
+
+  const computed = window.getComputedStyle(el);
+
+  const mirror = document.createElement("div");
+  mirror.setAttribute("aria-hidden", "true");
+  Object.assign(mirror.style, {
+    position: "absolute",
+    top: "0",
+    left: "0",
+    visibility: "hidden",
+    pointerEvents: "none",
+    width: el.clientWidth + "px",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    overflowWrap: "break-word",
+    padding: computed.padding,
+    font: computed.font,
+    letterSpacing: computed.letterSpacing,
+    lineHeight: computed.lineHeight,
+    boxSizing: computed.boxSizing,
+  });
+
+  mirror.appendChild(document.createTextNode(el.value.slice(0, sel)));
+  const marker = document.createElement("span");
+  marker.textContent = "\u200b"; // zero-width space
+  mirror.appendChild(marker);
+
+  container.appendChild(mirror);
+  const caretH = parseFloat(computed.fontSize) || 15;
+  const markerCenter = marker.offsetTop + marker.offsetHeight / 2;
+  const result = {
+    top: markerCenter - el.scrollTop - caretH / 2,
+    left: marker.offsetLeft,
+    lineHeight: caretH,
+  };
+  container.removeChild(mirror);
+  return result;
+}
+
 function shortenPath(fullPath: string, home: string): string {
   if (fullPath === home) return "~";
   if (fullPath.startsWith(home + "/")) return "~" + fullPath.slice(home.length);
@@ -144,9 +189,16 @@ function TerminalTabContent({
   const [isRunning, setIsRunning] = useState(state.isRunning);
   const [cwd, setCwd] = useState(state.cwd);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const [caretPos, setCaretPos] = useState<{
+    top: number;
+    left: number;
+    lineHeight: number;
+  } | null>(null);
+  const [textareaFocused, setTextareaFocused] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const caretContainerRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef(state);
 
   // Keep tabState in sync
@@ -263,6 +315,31 @@ function TerminalTabContent({
     };
   }, [tabId, projectId, workingDir]);
 
+  // Update static caret position
+  const updateCaret = useCallback(() => {
+    const el = inputRef.current;
+    const container = caretContainerRef.current;
+    if (!el || !container || document.activeElement !== el) {
+      setCaretPos(null);
+      return;
+    }
+    setCaretPos(measureCaretPos(el, container));
+  }, []);
+
+  // Reposition on every value change (covers typing)
+  useEffect(() => {
+    if (textareaFocused) updateCaret();
+  }, [command, textareaFocused, updateCaret]);
+
+  // Reposition on selection movement (arrows, mouse clicks, scroll)
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    const events = ["click", "keyup", "mouseup", "select", "scroll"];
+    events.forEach((e) => el.addEventListener(e, updateCaret));
+    return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
+  }, [updateCaret]);
+
   // Auto-scroll
   useEffect(() => {
     if (scrollRef.current) {
@@ -270,9 +347,9 @@ function TerminalTabContent({
     }
   }, [lines]);
 
-  // Focus input when tab becomes visible or command finishes
+  // Focus input when tab becomes visible or command finishes/starts
   useEffect(() => {
-    if (isVisible && !isRunning) {
+    if (isVisible) {
       inputRef.current?.focus();
     }
   }, [isVisible, isRunning]);
@@ -309,29 +386,51 @@ function TerminalTabContent({
     [tabId, isRunning, cwd, homeDir],
   );
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "c" && e.ctrlKey && isRunning) {
-      e.preventDefault();
-      writePty(tabId, "\x03");
-      // The interrupted command won't produce our completion marker,
-      // so clear running state after a short delay
-      const ts = stateRef.current;
-      setTimeout(() => {
-        if (ts.isRunning) {
-          // Flush any accumulated output
-          const pending = ts.outputBuffer.replace(/\^C\n?/g, "").trim();
-          if (pending) {
-            setLines((prev) => [
-              ...prev,
-              { type: "output", content: pending, timestamp: Date.now() },
-            ]);
-          }
-          ts.outputBuffer = "";
-          ts.isRunning = false;
-          ts.echoSkipped = false;
-          setIsRunning(false);
+  const abortCommand = useCallback(() => {
+    if (!isRunning) return;
+    writePty(tabId, "\x03");
+    // The interrupted command won't produce our completion marker,
+    // so clear running state after a short delay
+    const ts = stateRef.current;
+    setTimeout(() => {
+      if (ts.isRunning) {
+        // Flush any accumulated output
+        const pending = ts.outputBuffer.replace(/\^C\n?/g, "").trim();
+        if (pending) {
+          setLines((prev) => [
+            ...prev,
+            { type: "output", content: pending, timestamp: Date.now() },
+          ]);
         }
-      }, 200);
+        ts.outputBuffer = "";
+        ts.isRunning = false;
+        ts.echoSkipped = false;
+        setIsRunning(false);
+      }
+    }, 200);
+  }, [tabId, isRunning]);
+
+  // Global escape/ctrl+c listener when visible
+  useEffect(() => {
+    if (!isVisible || !isRunning) return;
+    const handleWindowKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" || (e.key === "c" && e.ctrlKey)) {
+        // Only intercept if we aren't already in the textarea (which has its own handler)
+        // or if we want to ensure it works regardless of focus.
+        if (document.activeElement?.tagName !== "TEXTAREA" && document.activeElement?.tagName !== "INPUT") {
+          e.preventDefault();
+          abortCommand();
+        }
+      }
+    };
+    window.addEventListener("keydown", handleWindowKeyDown);
+    return () => window.removeEventListener("keydown", handleWindowKeyDown);
+  }, [isVisible, isRunning, abortCommand]);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if ((e.key === "Escape" || (e.key === "c" && e.ctrlKey)) && isRunning) {
+      e.preventDefault();
+      abortCommand();
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -381,7 +480,7 @@ function TerminalTabContent({
               <span>return run</span>
               <span>up/down history</span>
               <span>cmd+L clear</span>
-              <span>ctrl+C cancel</span>
+              <span>esc / ctrl+C cancel</span>
             </div>
           </div>
         )}
@@ -418,21 +517,50 @@ function TerminalTabContent({
         >
           {displayPath} $
         </span>
-        <textarea
-          ref={inputRef}
-          value={command}
-          onChange={(e) => { setCommand(e.target.value); setHistoryIndex(-1); }}
-          onKeyDown={handleKeyDown}
-          disabled={isRunning}
-          placeholder=""
-          className="flex-1 bg-transparent border-none outline-none resize-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
-          style={{
-            fontSize: "var(--pane-font-size-base)",
-            minHeight: "2rem",
-            lineHeight: "2rem",
-          }}
-          rows={1}
-        />
+        <div ref={caretContainerRef} className="flex-1 relative">
+          <textarea
+            ref={inputRef}
+            value={command}
+            onChange={(e) => {
+              setCommand(e.target.value);
+              setHistoryIndex(-1);
+            }}
+            onKeyDown={handleKeyDown}
+            onFocus={() => {
+              setTextareaFocused(true);
+              updateCaret();
+            }}
+            onBlur={() => {
+              setTextareaFocused(false);
+              setCaretPos(null);
+            }}
+            readOnly={isRunning}
+            placeholder=""
+            className="w-full bg-transparent border-none outline-none resize-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
+            style={{
+              fontSize: "var(--pane-font-size-base)",
+              minHeight: "2rem",
+              lineHeight: "2rem",
+              caretColor: "transparent",
+            }}
+            rows={1}
+          />
+          {/* Static amber cursor */}
+          {textareaFocused && caretPos && (
+            <div
+              aria-hidden
+              style={{
+                position: "absolute",
+                top: caretPos.top,
+                left: caretPos.left,
+                width: 2,
+                height: caretPos.lineHeight,
+                background: "var(--pane-editor-cursor)",
+                pointerEvents: "none",
+              }}
+            />
+          )}
+        </div>
       </div>
     </div>
   );

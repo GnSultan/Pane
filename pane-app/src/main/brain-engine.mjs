@@ -83,6 +83,17 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
   `);
 
+  // Mind entries — separate exec so it runs cleanly as a migration on existing DBs
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS mind_entries (
+      id TEXT PRIMARY KEY,
+      content TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_mind_created ON mind_entries(created_at);
+  `);
+
   // Prepare statements for hot paths
   db._stmts = {
     insertNode: db.prepare(`
@@ -902,14 +913,14 @@ function writeProfileExport() {
     sections.push(idParts.join("\n"));
   }
 
-  // Explicit rules (highest priority)
-  if (rules && rules.trim().length > 0) {
-    sections.push("## Rules\n" + rules);
-  }
-
   // Philosophy
   if (philosophy && philosophy.trim().length > 0) {
     sections.push("## Design Philosophy\n" + philosophy);
+  }
+
+  // Explicit rules (highest priority)
+  if (rules && rules.trim().length > 0) {
+    sections.push("## Rules\n" + rules);
   }
 
   // Observed preferences (only if there are any)
@@ -1106,6 +1117,37 @@ process.parentPort.on("message", async ({ data }) => {
         } else {
           sendToMain({ type: "avatar_data", requestId: data.requestId, base64: null, mime: null });
         }
+        break;
+      }
+
+      case "mind_add": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const id = `mind-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        db.prepare(`INSERT INTO mind_entries (id, content) VALUES (?, ?)`).run(id, data.content);
+        const entry = db.prepare(`SELECT * FROM mind_entries WHERE id = ?`).get(id);
+        sendToMain({ type: "mind_entry", requestId: data.requestId, entry });
+        break;
+      }
+
+      case "mind_get_all": {
+        if (!db) { sendToMain({ type: "mind_entries", requestId: data.requestId, entries: [] }); break; }
+        const entries = db.prepare(`SELECT * FROM mind_entries ORDER BY updated_at DESC`).all();
+        sendToMain({ type: "mind_entries", requestId: data.requestId, entries });
+        break;
+      }
+
+      case "mind_update": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        db.prepare(`UPDATE mind_entries SET content = ?, updated_at = datetime('now') WHERE id = ?`).run(data.content, data.id);
+        const entry = db.prepare(`SELECT * FROM mind_entries WHERE id = ?`).get(data.id);
+        sendToMain({ type: "mind_entry", requestId: data.requestId, entry: entry ?? null });
+        break;
+      }
+
+      case "mind_delete": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        db.prepare(`DELETE FROM mind_entries WHERE id = ?`).run(data.id);
+        sendToMain({ type: "mind_deleted", requestId: data.requestId, id: data.id });
         break;
       }
 

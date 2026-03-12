@@ -18,7 +18,7 @@
   --font-panel: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
 
   /* Animations - fast and subtle for lightest IDE */
-  --animate-fadeSlideUp: fadeSlideUp 0.12s ease-out;
+  --animate-fadeSlideUp: fadeSlideUp 0.2s ease-out;
   --animate-pressScale: pressScale 0.08s ease-out;
   --animate-fadeIn: fadeIn 1.5s ease-out;
   --animate-fadeOut: fadeOut 1.5s ease-out forwards;
@@ -115,10 +115,10 @@
 
   @keyframes breathe {
     0%, 100% {
-      opacity: 0.96;
+      opacity: 1;
     }
     50% {
-      opacity: 1;
+      opacity: 0.4;
     }
   }
 }
@@ -343,10 +343,7 @@ html, body, #root {
   -webkit-app-region: no-drag;
 }
 
-/* Underscore cursor on all editable text */
-textarea, input[type="text"], input:not([type]) {
-  caret-shape: underscore;
-}
+
 
 /* Text selection — matches editor selection color */
 ::selection {
@@ -383,8 +380,9 @@ textarea, input[type="text"], input:not([type]) {
 
 .ace_cursor {
   color: var(--pane-editor-cursor) !important;
-  border-left: 0 !important;
-  border-bottom: 2px solid var(--pane-editor-cursor) !important;
+  border-left: 2px solid var(--pane-editor-cursor) !important;
+  opacity: 1 !important;
+  animation: none !important; /* Replaces native blink with static bar */
 }
 
 .ace_selection {
@@ -444,43 +442,51 @@ textarea, input[type="text"], input:not([type]) {
   border: 1px solid var(--pane-editor-search-match-active-border) !important;
 }
 
-/* Markdown syntax - monochromatic, no bright blues */
-.ace_markup.ace_heading {
+/* Markdown syntax - monochromatic, no bright colors */
+.ace_editor .ace_markup.ace_heading,
+.ace_editor .ace_markup.ace_heading.ace_1,
+.ace_editor .ace_markup.ace_heading.ace_2,
+.ace_editor .ace_markup.ace_heading.ace_3,
+.ace_editor .ace_markup.ace_heading.ace_4,
+.ace_editor .ace_markup.ace_heading.ace_5,
+.ace_editor .ace_markup.ace_heading.ace_6 {
   color: var(--pane-syn-keyword) !important;
   font-weight: 600 !important;
 }
 
-.ace_markup.ace_list {
+.ace_editor .ace_markup.ace_list,
+.ace_editor .ace_markup.ace_list.ace_bullet,
+.ace_editor .ace_variable.ace_list {
   color: var(--pane-syn-operator) !important;
 }
 
-.ace_link,
-.ace_url {
-  color: var(--pane-syn-string) !important;
-  text-decoration: none !important;
-}
-
-.ace_markup.ace_underline {
-  text-decoration: none !important;
-  color: var(--pane-syn-string) !important;
-}
-
-.ace_strong {
-  font-weight: 600 !important;
-  color: var(--pane-text) !important;
-}
-
-.ace_emphasis {
-  font-style: italic !important;
-  color: var(--pane-text) !important;
-}
-
-.ace_blockquote {
+.ace_editor .ace_markup.ace_quote,
+.ace_editor .ace_markup.ace_quote.ace_line {
   color: var(--pane-syn-comment) !important;
   font-style: italic !important;
 }
 
-.ace_code {
+.ace_editor .ace_markup.ace_underline.ace_link {
+  color: var(--pane-syn-string) !important;
+  text-decoration: none !important;
+}
+
+.ace_editor .ace_strong {
+  font-weight: 600 !important;
+  color: var(--pane-text) !important;
+}
+
+.ace_editor .ace_emphasis {
+  font-style: italic !important;
+  color: var(--pane-text) !important;
+}
+
+.ace_editor .ace_blockquote {
+  color: var(--pane-syn-comment) !important;
+  font-style: italic !important;
+}
+
+.ace_editor .ace_code {
   color: var(--pane-syn-number) !important;
   background-color: transparent !important;
 }

@@ -1,7 +1,7 @@
 import { useRef, useEffect, useCallback, useMemo, memo, useState } from "react";
 import { useProjectsStore } from "../../stores/projects";
-import { useClaude } from "../../hooks/useClaude";
-import { useClaudeWarmup } from "../../hooks/useClaudeWarmup";
+import { usePunk } from "../../hooks/useClaude";
+import { usePunkWarmup } from "../../hooks/useClaudeWarmup";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
 import type { ConversationMessage, ToolResultBlock, ToolUseBlock } from "../../lib/claude-types";
@@ -54,8 +54,8 @@ export const Conversation = memo(function Conversation({ projectId }: Conversati
   const error = useProjectsStore((s) => s.projects.get(projectId)?.conversation.error ?? null);
 
 
-  const { sendMessage, abortMessage } = useClaude(projectId);
-  useClaudeWarmup(projectId);
+  const { sendMessage, abortMessage } = usePunk(projectId);
+  usePunkWarmup(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
 

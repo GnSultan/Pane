@@ -5,6 +5,18 @@ import { GitStatus } from "./GitStatus";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 
+function MindIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      {/* Thought bubble body */}
+      <path d="M12.5 7c0-2.485-2.015-4.5-4.5-4.5S3.5 4.515 3.5 7c0 1.48.714 2.794 1.82 3.612C5.12 11.22 4.9 12 4.9 12s1.02-.38 1.7-.8A4.476 4.476 0 008 11.5c2.485 0 4.5-2.015 4.5-4.5z" />
+      {/* Trailing thought dots */}
+      <circle cx="4" cy="13" r="0.75" fill="currentColor" stroke="none" />
+      <circle cx="2.75" cy="14.25" r="0.5" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 // --- Inline SVG icons (16x16, outlined, unified) ---
 // Pane design language: consistent 1.5px stroke, simple geometry, harmonious system
 
@@ -138,6 +150,7 @@ export function ControlPanel() {
   });
 
   const profileOpen = useWorkspaceStore((s) => s.profileOpen);
+  const mindOpen = useWorkspaceStore((s) => s.mindOpen);
   const [gitPanelActive, setGitPanelActive] = useState(false);
 
   // Auto-close git panel when project changes or isn't a git repo
@@ -211,7 +224,12 @@ export function ControlPanel() {
           active={mode === "terminal"}
           onClick={() => handleSetMode("terminal")}
         />
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-0.5">
+          <ToolbarButton
+            icon={<MindIcon />}
+            active={mindOpen}
+            onClick={() => useWorkspaceStore.getState().toggleMind()}
+          />
           <ToolbarButton
             icon={<ProfileAvatar />}
             active={profileOpen}

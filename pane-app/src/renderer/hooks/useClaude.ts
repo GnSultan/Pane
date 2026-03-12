@@ -1,18 +1,28 @@
 import { useCallback, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
-import { sendToClaude, abortClaude, createCheckpoint, deleteProjectCheckpoints, recordMemoryEvents, generateBrief, brainIndexEvents, brainContextualSearch } from "../lib/tauri-commands";
+import {
+  sendToPunk,
+  abortPunk,
+  createCheckpoint,
+  deleteProjectCheckpoints,
+  recordMemoryEvents,
+  generateBrief,
+  brainIndexEvents,
+  brainContextualSearch,
+} from "../lib/tauri-commands";
 import type {
-  ClaudeStreamEvent,
-  ClaudeStreamMessage,
-  ConversationMessage,
+  PunkStreamEvent as ClaudeStreamEvent,
+  PunkStreamMessage as ClaudeStreamMessage,
+  PunkConversationMessage as ConversationMessage,
   ContentBlock,
   ToolUseBlock,
   ThinkingBlock,
   ServerToolUseBlock,
   WebSearchToolResultBlock,
   MemoryEvent,
-} from "../lib/claude-types";
+} from "../lib/punk-types";
+import { inferAgentIntent, chooseModelForIntent, type AgentIntent } from "../lib/agent-routing";
 
 let messageIdCounter = 0;
 function nextMessageId(): string {
@@ -370,9 +380,11 @@ const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   opus: 200000,
   sonnet: 200000,
   haiku: 200000,
+  "gemini-3": 2000000, // Gemini 3.x family defaults to 2M
+  "gemini-2": 1000000, // Gemini 2.x family defaults to 1M
 };
 
-function getContextLimit(model: string | null): number {
+export function getContextLimit(model: string | null): number {
   if (!model) return 200000;
   const lower = model.toLowerCase();
   for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
@@ -381,7 +393,7 @@ function getContextLimit(model: string | null): number {
   return 200000;
 }
 
-export function useClaude(projectId: string) {
+export function usePunk(projectId: string) {
   const abortingRef = useRef(false);
   const continuationRef = useRef<string | null>(null);
   // Proactive continuation: set to true when context hits 85%, consumed on next processEnded
@@ -393,6 +405,9 @@ export function useClaude(projectId: string) {
       const project = store.projects.get(projectId);
       if (!project) return;
       if (project.conversation.isProcessing) return;
+
+      // Ensure any background process (like warmup) is killed before we start
+      await abortPunk(projectId).catch(() => {});
 
       // Build user message (ID generated early for checkpoint linking)
       const messageId = nextMessageId();
@@ -436,10 +451,22 @@ export function useClaude(projectId: string) {
           clearTimeout(resultSafetyTimer);
           resultSafetyTimer = null;
         }
+        // Force-abort backend to ensure CLI processes are killed if we're timing out
+        abortPunk(projectId).catch(() => {});
+
         const s = useProjectsStore.getState();
         s.setConversationProcessing(projectId, false);
+        s.setConversationRoutedModel(projectId, null); // Reset routed model
         s.setLastMessageStreamingDone(projectId);
         s.setIsPlanning(projectId, false);
+
+        // Clear status message with a slight delay to match the fadeout timer
+        setTimeout(() => {
+          const current = useProjectsStore.getState().projects.get(projectId);
+          if (current && !current.conversation.isProcessing) {
+            useProjectsStore.getState().setConversationStatusMessage(projectId, null);
+          }
+        }, 1500);
 
         // Skip sound and notification if we're auto-continuing after context limit
         if (continuationRef.current) return;
@@ -461,9 +488,28 @@ export function useClaude(projectId: string) {
       };
 
       const handleEvent = (event: ClaudeStreamEvent) => {
+        // Reset safety timer on ANY event from Gemini — we only want to trigger
+        // if the pipe goes completely silent without a proper finish.
+        if (resultSafetyTimer) {
+          clearTimeout(resultSafetyTimer);
+          resultSafetyTimer = setTimeout(() => {
+            console.warn("[pane] resultSafetyTimer triggered — Gemini pipe went silent");
+            finishProcessing();
+          }, 5000);
+        }
+
         switch (event.event) {
           case "processStarted":
             break;
+
+          case "routing": {
+            const { model, thinking, intent } = event.data;
+            store.setConversationRoutedModel(projectId, model);
+            if (thinking && intent === "plan") {
+              store.setIsPlanning(projectId, true);
+            }
+            break;
+          }
 
           case "message": {
             try {
@@ -561,14 +607,28 @@ export function useClaude(projectId: string) {
           new Promise(resolve => setTimeout(resolve, 500)),
         ]);
 
+        // --- Agent routing: choose model based on intent (plan vs execute vs explain) ---
+        const conversation = project.conversation;
+        const intent: AgentIntent = inferAgentIntent({ prompt, conversation });
         const selectedModel = useWorkspaceStore.getState().selectedModel;
-        await sendToClaude(
+        const routedModel = chooseModelForIntent(selectedModel, intent);
+
+        // Start safety timer — if sendToPunk hangs or Gemini never replies,
+        // we'll clear the stuck UI state after 5 seconds.
+        resultSafetyTimer = setTimeout(() => {
+          console.warn("[pane] resultSafetyTimer triggered (initialization hang)");
+          finishProcessing();
+        }, 5000);
+
+        await sendToPunk(
           projectId,
           prompt,
           project.root,
           sessionId,
-          selectedModel,
+          routedModel,
           handleEvent,
+          intent,
+          conversation.messages,
         );
       } catch (err) {
         console.error("[pane] sendToClaude error:", err);
@@ -595,7 +655,7 @@ export function useClaude(projectId: string) {
     if (abortingRef.current) return;
     abortingRef.current = true;
     try {
-      await abortClaude(projectId);
+      await abortPunk(projectId);
     } finally {
       abortingRef.current = false;
       const store = useProjectsStore.getState();
@@ -613,6 +673,9 @@ export function useClaude(projectId: string) {
 
   return { sendMessage, abortMessage, clearConversation };
 }
+
+// Backwards-compatible alias while we complete the rename across the app.
+export const useClaude = usePunk;
 
 /**
  * Process a parsed stream-json message and update the store.
@@ -666,7 +729,18 @@ function handleClaudeMessage(
     }
 
     case "assistant": {
-      const finalContent = msg.message.content as ContentBlock[];
+      // Deduplicate tool_use blocks by ID in the final assistant message
+      const rawContent = msg.message.content as ContentBlock[];
+      const seenToolIds = new Set<string>();
+      const finalContent = rawContent.filter((block) => {
+        if (block.type === "tool_use") {
+          const id = (block as ToolUseBlock).id;
+          if (seenToolIds.has(id)) return false;
+          seenToolIds.add(id);
+        }
+        return true;
+      });
+
       if (assistantMessageExists) {
         // Merge: preserve streamed blocks that aren't in the final content
         const project = store.projects.get(projectId);
@@ -826,6 +900,7 @@ function handleClaudeMessage(
         evt.delta?.type === "text_delta" &&
         evt.delta.text
       ) {
+        store.setConversationStatusMessage(projectId, null);
         if (!assistantMessageExists) {
           const placeholder: ConversationMessage = {
             id: nextMessageId(),
@@ -851,6 +926,7 @@ function handleClaudeMessage(
         evt.delta?.type === "thinking_delta" &&
         evt.delta.thinking
       ) {
+        store.setConversationStatusMessage(projectId, "thinking...");
         if (!assistantMessageExists) {
           const placeholder: ConversationMessage = {
             id: nextMessageId(),
@@ -924,6 +1000,15 @@ function handleClaudeMessage(
         }
         const toolBlock = evt.content_block as ToolUseBlock;
 
+        // Set status message based on tool name
+        let status = `using ${toolBlock.name.toLowerCase()}...`;
+        if (toolBlock.name === "read_file" || toolBlock.name === "Read") status = "reading file...";
+        if (toolBlock.name === "replace" || toolBlock.name === "Edit") status = "editing file...";
+        if (toolBlock.name === "write_file" || toolBlock.name === "Write") status = "writing file...";
+        if (toolBlock.name === "grep_search" || toolBlock.name === "Grep") status = "searching...";
+        if (toolBlock.name === "run_shell_command" || toolBlock.name === "Bash") status = "running command...";
+        store.setConversationStatusMessage(projectId, status);
+
         if (!assistantMessageExists) {
           // Claude started this turn directly with a tool call (no text/thinking first).
           // Create a placeholder so TodoWrite detection and tool rendering work correctly.
@@ -941,10 +1026,16 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              store.updateLastAssistantContent(projectId, [
-                ...last.content,
-                toolBlock,
-              ]);
+              // Avoid duplicate tool_use blocks with the same ID (can happen with some backends)
+              const alreadyExists = last.content.some(
+                (b) => b.type === "tool_use" && (b as ToolUseBlock).id === toolBlock.id
+              );
+              if (!alreadyExists) {
+                store.updateLastAssistantContent(projectId, [
+                  ...last.content,
+                  toolBlock,
+                ]);
+              }
             }
           }
         }
@@ -1024,6 +1115,23 @@ function handleClaudeMessage(
             if (last && last.type === "assistant") {
               const newContent = [...last.content, evt.content_block as WebSearchToolResultBlock];
               store.updateLastAssistantContent(projectId, newContent);
+            }
+          }
+        }
+        return assistantMessageExists;
+      }
+
+      // Block finished
+      if (evt.type === "content_block_stop") {
+        const project = store.projects.get(projectId);
+        if (project) {
+          const msgs = project.conversation.messages;
+          const last = msgs[msgs.length - 1];
+          if (last && last.type === "assistant") {
+            const lastBlock = last.content[last.content.length - 1];
+            if (lastBlock && (lastBlock.type === "tool_use" || lastBlock.type === "server_tool_use")) {
+              // Tool finished, transition back to generic thinking until next turn/block
+              store.setConversationStatusMessage(projectId, "thinking...");
             }
           }
         }

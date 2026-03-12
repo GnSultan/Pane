@@ -3,9 +3,9 @@ import { Conversation } from "./Conversation";
 import { FileViewer } from "./FileViewer";
 import { Terminal } from "./Terminal";
 import { Profile } from "./Profile";
+import { Mind } from "./Mind";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
-import { getClaudePlanInfo } from "../../lib/tauri-commands";
 
 // Visibility is toggled via direct DOM manipulation — bypasses React entirely.
 // The Conversation inside is memo'd + never subscribes to activeProjectId,
@@ -43,28 +43,20 @@ function ProjectTerminal({ projectId }: { projectId: string }) {
   return <Terminal projectId={projectId} workingDir={root} />;
 }
 
-function formatModelName(model: string | null): string {
-  if (!model) return "";
-  const match = model.match(/(haiku|sonnet|opus)-(\d+)-(\d+)/i);
-  if (match) {
-    const name = match[1]!.charAt(0).toUpperCase() + match[1]!.slice(1);
-    return `${name} ${match[2]}.${match[3]}`;
-  }
-  return model;
-}
-
 export function Workspace() {
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const projectOrder = useProjectsStore((s) => s.projectOrder);
   const profileOpen = useWorkspaceStore((s) => s.profileOpen);
+  const mindOpen = useWorkspaceStore((s) => s.mindOpen);
   const activeMode = useProjectsStore((s) => {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
   });
-  const model = useProjectsStore((s) =>
-    s.activeProjectId ? s.projects.get(s.activeProjectId)?.conversation.model ?? null : null
-  );
-  const [plan, setPlan] = useState<string | null>(null);
+
+  const claudeUpdateState = useWorkspaceStore((s) => s.claudeUpdateState);
+  const triggerClaudeUpdate = useWorkspaceStore((s) => s.triggerClaudeUpdate);
+  const geminiUpdateState = useWorkspaceStore((s) => s.geminiUpdateState);
+  const triggerGeminiUpdate = useWorkspaceStore((s) => s.triggerGeminiUpdate);
 
   // Keep-alive: pre-mount ALL projects at startup so every switch is a
   // zero-cost visibility flip. New projects added later get mounted on first visit.
@@ -77,23 +69,80 @@ export function Workspace() {
     }
   }, [activeProjectId]);
 
-  useEffect(() => {
-    getClaudePlanInfo().then(setPlan).catch(() => setPlan(null));
-  }, []);
-
-  const modelDisplay = formatModelName(model);
-  const showHeader = !!(modelDisplay || plan) && activeMode !== "viewer";
+  const showUpdate = (!!claudeUpdateState || !!geminiUpdateState) && activeMode !== "viewer";
 
   return (
     <div className="h-full relative">
-      {/* Header — floats over content, no layout displacement */}
-      {showHeader && (
-        <div className="absolute top-0 right-0 h-8 flex items-center justify-end px-4 text-xs text-pane-text/80 font-medium z-10 pointer-events-none">
-          <div className="flex items-center gap-2">
-            {plan && <span>Claude {plan}</span>}
-            {plan && modelDisplay && <span className="text-pane-text/40">·</span>}
-            {modelDisplay && <span>{modelDisplay}</span>}
-          </div>
+      {/* Top Notification Bar — floats over content, only for system-level alerts */}
+      {showUpdate && (
+        <div className="absolute top-0 left-0 right-0 h-9 flex items-center justify-end px-4 z-50 pointer-events-none gap-2">
+          {/* Claude Update Pill */}
+          {claudeUpdateState && (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown">
+              {claudeUpdateState === "available" && (
+                <button
+                  onClick={() => triggerClaudeUpdate()}
+                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
+                  claude update available
+                </button>
+              )}
+              {claudeUpdateState === "updating" && (
+                <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
+                  installing claude...
+                </span>
+              )}
+              {claudeUpdateState === "updated" && (
+                <span className="text-[11px] font-mono text-pane-status-added">
+                  claude complete
+                </span>
+              )}
+              {claudeUpdateState === "restart" && (
+                <button
+                  onClick={() => window.location.reload()}
+                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
+                  restart claude
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Gemini Update Pill */}
+          {geminiUpdateState && (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown">
+              {geminiUpdateState === "available" && (
+                <button
+                  onClick={() => triggerGeminiUpdate()}
+                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
+                  gemini update available
+                </button>
+              )}
+              {geminiUpdateState === "updating" && (
+                <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
+                  installing gemini...
+                </span>
+              )}
+              {geminiUpdateState === "updated" && (
+                <span className="text-[11px] font-mono text-pane-status-added">
+                  gemini complete
+                </span>
+              )}
+              {geminiUpdateState === "restart" && (
+                <button
+                  onClick={() => window.location.reload()}
+                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
+                  restart gemini
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -120,6 +169,11 @@ export function Workspace() {
               <ProjectTerminal projectId={id} />
             </div>
           ))}
+        </div>
+
+        {/* Mind — takes over workspace when open */}
+        <div className={`absolute inset-0 bg-pane-bg ${!mindOpen ? "invisible" : ""}`}>
+          <Mind />
         </div>
 
         {/* Profile — takes over workspace when open */}

@@ -233,9 +233,17 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
 
   if (message.type === "assistant") {
     // Filter out TodoWrite tool calls — they render in TodoPanel only
-    const filteredContent = message.content.filter(
-      (b) => b.type !== "tool_use" || (b as ToolUseBlock).name !== "TodoWrite"
-    );
+    // Also deduplicate tool_use blocks by ID (robustness against backend issues)
+    const seenToolIds = new Set<string>();
+    const filteredContent = message.content.filter((b) => {
+      if (b.type === "tool_use") {
+        const tool = b as ToolUseBlock;
+        if (tool.name === "TodoWrite") return false;
+        if (seenToolIds.has(tool.id)) return false;
+        seenToolIds.add(tool.id);
+      }
+      return true;
+    });
 
     // Group consecutive text/thinking blocks, but tools always get their own group
     type GroupType = "text" | "tool" | "thinking";
@@ -303,7 +311,7 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
             const toolBlock = block as ToolUseBlock;
             const result = toolResults.get(toolBlock.id);
             return (
-              <div key={toolBlock.id} className="my-0.5">
+              <div key={gi} className="my-0.5">
                 <ToolActivity
                   toolUse={toolBlock}
                   toolResult={result}
@@ -320,7 +328,7 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
                 (b as WebSearchToolResultBlock).tool_use_id === serverBlock.id,
             ) as WebSearchToolResultBlock | undefined;
             return (
-              <div key={serverBlock.id} className="my-0.5">
+              <div key={gi} className="my-0.5">
                 <ServerToolActivity
                   block={serverBlock}
                   searchResult={searchResult}

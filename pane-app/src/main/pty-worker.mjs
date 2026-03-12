@@ -6,10 +6,37 @@
 // See: https://github.com/microsoft/vscode/issues/243952
 
 import __cjs_mod__ from "node:module";
+import os from "node:os";
+import fs from "node:fs";
+import path from "node:path";
+
 const require2 = __cjs_mod__.createRequire(import.meta.url);
 const nodePty = require2("node-pty");
 
 const activePtys = new Map();
+
+function getEnvWithPath() {
+  const home = os.homedir();
+  // Add all nvm node version bin dirs
+  const nvmVersionsDir = path.join(home, ".nvm", "versions", "node");
+  const nvmBins = [];
+  try {
+    const versions = fs.readdirSync(nvmVersionsDir);
+    for (const v of versions) {
+      nvmBins.push(path.join(nvmVersionsDir, v, "bin"));
+    }
+  } catch {}
+  const extra = [
+    ...nvmBins,
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/usr/bin",
+    "/bin",
+  ];
+  const existing = process.env.PATH || "";
+  const combined = [...extra, ...existing.split(":")].filter(Boolean).join(":");
+  return { ...process.env, PATH: combined };
+}
 
 function sendToMain(message) {
   process.parentPort.postMessage(message);
@@ -23,7 +50,7 @@ function handleCreate({ ptyId, projectId, cwd }) {
       cols: 120,
       rows: 30,
       cwd,
-      env: { ...process.env }
+      env: getEnvWithPath()
     });
 
     const dataDisposable = pty.onData((data) => {

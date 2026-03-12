@@ -148,6 +148,18 @@ export interface ClaudeEventProcessEnded {
   data: { exit_code: number | null };
 }
 
+export interface PunkEventRouting {
+  event: "routing";
+  data: {
+    intent: string;
+    confidence: number;
+    reason: string;
+    provider: string;
+    model: string;
+    thinking: boolean;
+  };
+}
+
 export interface ClaudeEventError {
   event: "error";
   data: { message: string };
@@ -157,6 +169,7 @@ export type ClaudeStreamEvent =
   | ClaudeEventMessage
   | ClaudeEventProcessStarted
   | ClaudeEventProcessEnded
+  | PunkEventRouting
   | ClaudeEventError;
 
 // Parsed conversation message for the UI
@@ -196,6 +209,7 @@ export interface ConversationState {
   messages: ConversationMessage[];
   sessionId: string | null;
   model: string | null;
+  routedModel: string | null; // Model chosen by smart router for current request
   serviceTier: string | null;
   isProcessing: boolean;
   isPlanning: boolean;
@@ -211,6 +225,7 @@ export interface ConversationState {
   contextPressure: ContextPressure;
   // Cached brief from last generateBrief — used for enhanced continuation
   cachedBrief: string;
+  statusMessage: string | null;
 }
 
 // Memory event types for automatic extraction
@@ -227,6 +242,7 @@ export function createEmptyConversation(): ConversationState {
     messages: [],
     sessionId: null,
     model: null,
+    routedModel: null,
     serviceTier: null,
     isProcessing: false,
     isPlanning: false,
@@ -239,5 +255,6 @@ export function createEmptyConversation(): ConversationState {
     contextTokens: 0,
     contextPressure: "none",
     cachedBrief: "",
+    statusMessage: null,
   };
 }

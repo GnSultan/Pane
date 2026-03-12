@@ -15,7 +15,10 @@ export async function readDirectory(path: string): Promise<FileEntry[]> {
   return electronAPI.invoke("read_directory", { path });
 }
 
-export async function readDirectoryTree(path: string, maxDepth: number): Promise<Record<string, FileEntry[]>> {
+export async function readDirectoryTree(
+  path: string,
+  maxDepth: number,
+): Promise<Record<string, FileEntry[]>> {
   return electronAPI.invoke("read_directory_tree", { path, maxDepth });
 }
 
@@ -60,7 +63,10 @@ export async function walkProjectFiles(root: string): Promise<string[]> {
   return electronAPI.invoke("walk_project_files", { root });
 }
 
-export async function renameFile(oldPath: string, newPath: string): Promise<void> {
+export async function renameFile(
+  oldPath: string,
+  newPath: string,
+): Promise<void> {
   return electronAPI.invoke("rename_file", { oldPath, newPath });
 }
 
@@ -109,6 +115,7 @@ export interface ProjectSessionState {
   expanded_dirs: string[];
   active_file_path: string | null;
   recent_files?: string[];
+  scroll_positions?: Record<string, { scrollTop: number; cursor: { row: number; column: number } }>;
 }
 
 export interface UserSettings {
@@ -120,11 +127,27 @@ export interface UserSettings {
   panel_font_size: number | null;
   editor_font_size: number | null;
   font_weight: number | null;
-  keybindings: Record<string, { mod: boolean; shift: boolean; alt: boolean; key: string }> | null;
+  keybindings: Record<
+    string,
+    { mod: boolean; shift: boolean; alt: boolean; key: string }
+  > | null;
   theme: string | null;
   panel_width: number | null;
   completion_sound: string | null;
   selected_model: string | null;
+  punk_backend: string;
+  http_provider?: string;
+  http_api_key?: string;
+  http_api_keys?: Record<string, string>;
+  http_base_url?: string;
+  http_base_urls?: Record<string, string>;
+  intent_routing?: {
+    plan: { provider: string; model: string; thinking: boolean };
+    execute: { provider: string; model: string; thinking: boolean };
+    explain: { provider: string; model: string; thinking: boolean };
+    other: { provider: string; model: string; thinking: boolean };
+  };
+  intent_auto_route?: boolean;
 }
 
 export async function loadSettings(): Promise<UserSettings> {
@@ -137,13 +160,15 @@ export async function saveSettings(settings: UserSettings): Promise<void> {
 
 // Claude process management
 
-export async function sendToClaude(
+export async function sendToPunk(
   projectId: string,
   prompt: string,
   workingDir: string,
   sessionId: string | null,
   model: string | null,
   onEvent: (event: ClaudeStreamEvent) => void,
+  intent?: string,
+  history?: any[],
 ): Promise<void> {
   // Self-cleaning listener — stays active until processEnded or error
   let cleanup: (() => void) | null = null;
@@ -157,37 +182,48 @@ export async function sendToClaude(
   const { port1, port2 } = new MessageChannel();
 
   port2.onmessage = () => {
-    if (queue.length === 0) { draining = false; return; }
+    if (queue.length === 0) {
+      draining = false;
+      return;
+    }
     const event = queue.shift()!;
     onEvent(event);
     if (queue.length > 0) port1.postMessage(null);
     else draining = false;
   };
 
-  cleanup = electronAPI.on(`claude-stream:${projectId}`, (event: ClaudeStreamEvent) => {
-    // Critical events bypass queue — must process immediately.
-    // Drain queued events FIRST so ordering is preserved (they happened before
-    // this terminal event). Then process the terminal event itself.
-    if (event.event === "processEnded" || event.event === "error") {
-      while (queue.length > 0) onEvent(queue.shift()!);
-      onEvent(event);
-      draining = false;
-      port1.close();
-      port2.close();
-      setTimeout(() => cleanup?.(), 0);
-      return;
-    }
-    queue.push(event);
-    if (!draining) { draining = true; port1.postMessage(null); }
-  });
+  cleanup = electronAPI.on(
+    `claude-stream:${projectId}`,
+    (event: ClaudeStreamEvent) => {
+      // Critical events bypass queue — must process immediately.
+      // Drain queued events FIRST so ordering is preserved (they happened before
+      // this terminal event). Then process the terminal event itself.
+      if (event.event === "processEnded" || event.event === "error") {
+        while (queue.length > 0) onEvent(queue.shift()!);
+        onEvent(event);
+        draining = false;
+        port1.close();
+        port2.close();
+        setTimeout(() => cleanup?.(), 0);
+        return;
+      }
+      queue.push(event);
+      if (!draining) {
+        draining = true;
+        port1.postMessage(null);
+      }
+    },
+  );
 
   try {
-    await electronAPI.invoke("send_to_claude", {
+    await electronAPI.invoke("send_to_punk", {
       projectId,
       prompt,
       workingDir,
       sessionId,
       model,
+      intent,
+      history,
     });
   } catch (err) {
     port1.close();
@@ -197,12 +233,19 @@ export async function sendToClaude(
   }
 }
 
-export async function abortClaude(projectId: string): Promise<void> {
-  return electronAPI.invoke("abort_claude", { projectId });
+// Backwards-compatible alias while we transition naming in the app.
+export const sendToClaude = sendToPunk;
+
+export async function abortPunk(projectId: string): Promise<void> {
+  return electronAPI.invoke("abort_punk", { projectId });
 }
 
 export async function terminateClaudeSession(projectId: string): Promise<void> {
-  return electronAPI.invoke("terminate_claude_session", { projectId });
+  return electronAPI.invoke("terminate_punk_session", { projectId });
+}
+
+export async function reinitializePunkBackend(backend?: string): Promise<void> {
+  return electronAPI.invoke("reinitialize_punk_backend", { backend });
 }
 
 export async function setWindowTitle(title: string): Promise<void> {
@@ -211,7 +254,11 @@ export async function setWindowTitle(title: string): Promise<void> {
 
 // PTY terminal management
 
-export async function createPty(ptyId: string, projectId: string, cwd: string): Promise<void> {
+export async function createPty(
+  ptyId: string,
+  projectId: string,
+  cwd: string,
+): Promise<void> {
   return electronAPI.invoke("pty_create", { ptyId, projectId, cwd });
 }
 
@@ -223,15 +270,23 @@ export async function destroyPty(ptyId: string): Promise<void> {
   return electronAPI.invoke("pty_destroy", { ptyId });
 }
 
-export async function destroyAllPtysForProject(projectId: string): Promise<void> {
+export async function destroyAllPtysForProject(
+  projectId: string,
+): Promise<void> {
   return electronAPI.invoke("pty_destroy_project", { projectId });
 }
 
-export function onPtyData(ptyId: string, cb: (data: string) => void): () => void {
+export function onPtyData(
+  ptyId: string,
+  cb: (data: string) => void,
+): () => void {
   return electronAPI.on(`pty-data:${ptyId}`, cb);
 }
 
-export function onPtyExit(ptyId: string, cb: (info: { exitCode: number }) => void): () => void {
+export function onPtyExit(
+  ptyId: string,
+  cb: (info: { exitCode: number }) => void,
+): () => void {
   return electronAPI.on(`pty-exit:${ptyId}`, cb);
 }
 
@@ -269,6 +324,38 @@ export async function updateClaude(): Promise<ClaudeUpdateResult> {
   return electronAPI.invoke("update_claude");
 }
 
+// Gemini process management
+
+export interface GeminiVersionInfo {
+  current: string | null;
+  error: string | null;
+}
+
+export interface GeminiUpdateInfo {
+  updateAvailable: boolean;
+  currentVersion: string | null;
+  newVersion: string | null;
+  error: string | null;
+}
+
+export interface GeminiUpdateResult {
+  success: boolean;
+  output: string;
+  error: string | null;
+}
+
+export async function checkGeminiVersion(): Promise<GeminiVersionInfo> {
+  return electronAPI.invoke("check_gemini_version");
+}
+
+export async function checkGeminiUpdate(): Promise<GeminiUpdateInfo> {
+  return electronAPI.invoke("check_gemini_update");
+}
+
+export async function updateGemini(): Promise<GeminiUpdateResult> {
+  return electronAPI.invoke("update_gemini");
+}
+
 // --- File Checkpoints ---
 
 export interface CheckpointResult {
@@ -298,7 +385,11 @@ export async function createCheckpoint(
   workingDir: string,
   messageId: string,
 ): Promise<CheckpointResult> {
-  return electronAPI.invoke("create_checkpoint", { projectId, workingDir, messageId });
+  return electronAPI.invoke("create_checkpoint", {
+    projectId,
+    workingDir,
+    messageId,
+  });
 }
 
 export async function restoreCheckpoint(
@@ -306,7 +397,11 @@ export async function restoreCheckpoint(
   checkpointId: string,
   workingDir: string,
 ): Promise<RestoreResult> {
-  return electronAPI.invoke("restore_checkpoint", { projectId, checkpointId, workingDir });
+  return electronAPI.invoke("restore_checkpoint", {
+    projectId,
+    checkpointId,
+    workingDir,
+  });
 }
 
 export async function listCheckpoints(
@@ -320,10 +415,16 @@ export async function getCheckpointDiff(
   checkpointId: string,
   workingDir: string,
 ): Promise<{ files: CheckpointDiffFile[] }> {
-  return electronAPI.invoke("get_checkpoint_diff", { projectId, checkpointId, workingDir });
+  return electronAPI.invoke("get_checkpoint_diff", {
+    projectId,
+    checkpointId,
+    workingDir,
+  });
 }
 
-export async function deleteProjectCheckpoints(projectId: string): Promise<void> {
+export async function deleteProjectCheckpoints(
+  projectId: string,
+): Promise<void> {
   return electronAPI.invoke("delete_project_checkpoints", { projectId });
 }
 
@@ -353,15 +454,24 @@ export interface ProjectState {
   topLevelFiles: string[];
 }
 
-export async function writeEditorState(projectId: string, data: EditorState): Promise<void> {
+export async function writeEditorState(
+  projectId: string,
+  data: EditorState,
+): Promise<void> {
   return electronAPI.invoke("write_editor_state", { projectId, data });
 }
 
-export async function writeTerminalState(projectId: string, data: TerminalState): Promise<void> {
+export async function writeTerminalState(
+  projectId: string,
+  data: TerminalState,
+): Promise<void> {
   return electronAPI.invoke("write_terminal_state", { projectId, data });
 }
 
-export async function writeProjectState(projectId: string, data: ProjectState): Promise<void> {
+export async function writeProjectState(
+  projectId: string,
+  data: ProjectState,
+): Promise<void> {
   return electronAPI.invoke("write_project_state", { projectId, data });
 }
 
@@ -404,7 +514,11 @@ export async function brainSearch(
   projectId: string,
   limit?: number,
 ): Promise<{ results: BrainSearchResult[] }> {
-  return electronAPI.invoke("brain_search", { query, projectId, limit: limit ?? 10 });
+  return electronAPI.invoke("brain_search", {
+    query,
+    projectId,
+    limit: limit ?? 10,
+  });
 }
 
 export async function brainContextualSearch(
@@ -412,7 +526,11 @@ export async function brainContextualSearch(
   query: string,
   fileContext?: string,
 ): Promise<{ memories: BrainSearchResult[]; tensions: unknown[] }> {
-  return electronAPI.invoke("brain_contextual_search", { projectId, query, fileContext });
+  return electronAPI.invoke("brain_contextual_search", {
+    projectId,
+    query,
+    fileContext,
+  });
 }
 
 export async function brainGetStats(): Promise<{
@@ -442,13 +560,31 @@ export async function brainGetIntelligenceStats(
 // --- Profile ---
 
 export interface UserProfile {
-  identity: { name: string; bio: string; role: string; avatar: string | null } | null;
-  preferences: {
-    coding: Record<string, { confidence: number; source: string; content: string }>;
-    communication: Record<string, unknown>;
-    tools: Record<string, { confidence: number; source: string; content: string }>;
+  identity: {
+    name: string;
+    bio: string;
+    role: string;
+    avatar: string | null;
   } | null;
-  antiPatterns: { patterns: Array<{ error: string; fix: string; confidence: number; source: string }> } | null;
+  preferences: {
+    coding: Record<
+      string,
+      { confidence: number; source: string; content: string }
+    >;
+    communication: Record<string, unknown>;
+    tools: Record<
+      string,
+      { confidence: number; source: string; content: string }
+    >;
+  } | null;
+  antiPatterns: {
+    patterns: Array<{
+      error: string;
+      fix: string;
+      confidence: number;
+      source: string;
+    }>;
+  } | null;
   style: { verbosity: string; planFirst: boolean } | null;
   rules: string;
   philosophy: string;
@@ -458,15 +594,21 @@ export async function brainGetProfile(): Promise<{ profile: UserProfile }> {
   return electronAPI.invoke("brain_get_profile");
 }
 
-export async function brainAddRule(rule: string): Promise<{ added: boolean; reason?: string }> {
+export async function brainAddRule(
+  rule: string,
+): Promise<{ added: boolean; reason?: string }> {
   return electronAPI.invoke("brain_add_rule", { rule });
 }
 
-export async function brainUpdatePhilosophy(text: string): Promise<{ updated: boolean }> {
+export async function brainUpdatePhilosophy(
+  text: string,
+): Promise<{ updated: boolean }> {
   return electronAPI.invoke("brain_update_philosophy", { text });
 }
 
-export async function brainUpdateRules(text: string): Promise<{ updated: boolean }> {
+export async function brainUpdateRules(
+  text: string,
+): Promise<{ updated: boolean }> {
   return electronAPI.invoke("brain_update_rules", { text });
 }
 
@@ -483,7 +625,9 @@ export interface UserIdentity {
   avatar: string | null;
 }
 
-export async function brainUpdateIdentity(identity: Partial<UserIdentity>): Promise<{ updated: boolean }> {
+export async function brainUpdateIdentity(
+  identity: Partial<UserIdentity>,
+): Promise<{ updated: boolean }> {
   return electronAPI.invoke("brain_update_identity", { identity });
 }
 
@@ -494,6 +638,34 @@ export async function brainSaveAvatar(
   return electronAPI.invoke("brain_save_avatar", { base64Data, mimeType });
 }
 
-export async function brainGetAvatar(): Promise<{ base64: string | null; mime: string | null }> {
+export async function brainGetAvatar(): Promise<{
+  base64: string | null;
+  mime: string | null;
+}> {
   return electronAPI.invoke("brain_get_avatar");
+}
+
+// --- Mind ---
+
+export interface MindEntry {
+  id: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function brainMindAdd(content: string): Promise<{ entry: MindEntry }> {
+  return electronAPI.invoke("brain_mind_add", { content });
+}
+
+export async function brainMindGetAll(): Promise<{ entries: MindEntry[] }> {
+  return electronAPI.invoke("brain_mind_get_all");
+}
+
+export async function brainMindUpdate(id: string, content: string): Promise<{ entry: MindEntry | null }> {
+  return electronAPI.invoke("brain_mind_update", { id, content });
+}
+
+export async function brainMindDelete(id: string): Promise<{ id: string }> {
+  return electronAPI.invoke("brain_mind_delete", { id });
 }

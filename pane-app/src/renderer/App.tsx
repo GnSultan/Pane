@@ -55,6 +55,7 @@ function App() {
   const fuzzyFinderOpen = useWorkspaceStore((s) => s.fuzzyFinderOpen);
   const toggleFileSearch = useWorkspaceStore((s) => s.toggleFileSearch);
   const fileSearchOpen = useWorkspaceStore((s) => s.fileSearchOpen);
+  const toggleMind = useWorkspaceStore((s) => s.toggleMind);
 
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
 
@@ -62,9 +63,10 @@ function App() {
   useGitStatus();
   useSettingsPersistence();
 
-  // Check for Claude updates on app launch
+  // Check for updates on app launch
   useEffect(() => {
     useWorkspaceStore.getState().checkForClaudeUpdate();
+    useWorkspaceStore.getState().checkForGeminiUpdate();
   }, []);
 
   // Update window title when active project changes
@@ -76,6 +78,13 @@ function App() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Cmd+M — toggle Mind (hardcoded, not rebindable)
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "m") {
+        e.preventDefault();
+        toggleMind();
+        return;
+      }
+
       // Cmd+1-9 — project switching (hardcoded, not rebindable)
       if ((e.metaKey || e.ctrlKey) && e.key >= "1" && e.key <= "9") {
         const index = parseInt(e.key) - 1;
@@ -89,28 +98,47 @@ function App() {
 
       const bindings = resolveBindings(useWorkspaceStore.getState().keybindings);
       const action = matchAction(e, bindings);
-      if (!action) return;
+      
+      // Special-case: Cmd+/ (and Ctrl+/) MUST be blocked to prevent Ace from commenting code.
+      const isCmdSlash = (e.metaKey || e.ctrlKey) && (e.key === "/" || e.code === "Slash");
+      if (isCmdSlash) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      
+      if (!action && !isCmdSlash) return;
 
-      e.preventDefault();
+      // Always prevent default for recognized actions to avoid editor side-effects
+      if (action) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
 
-      switch (action) {
+      const finalAction = action || (isCmdSlash ? "toggle-mode" : null);
+      if (!finalAction) return;
+
+      switch (finalAction) {
         case "toggle-panel":
           toggleControlPanel();
           break;
         case "toggle-mode": {
-          const { activeProjectId, setMode, projects } = useProjectsStore.getState();
+          const { activeProjectId, projects, toggleMode } = useProjectsStore.getState();
           if (activeProjectId) {
             const project = projects.get(activeProjectId);
             if (!project) return;
-            // Only toggle between conversation and viewer — requires an open file
-            if (project.mode === "conversation") {
-              if (!project.activeFilePath) return;
-              setMode(activeProjectId, "viewer");
-              window.dispatchEvent(new CustomEvent("pane:focus-editor"));
-            } else {
-              setMode(activeProjectId, "conversation");
-              window.dispatchEvent(new CustomEvent("pane:focus-input"));
-            }
+            
+            // Toggle using the store logic which handles fallback to terminal if no file
+            toggleMode(activeProjectId);
+            
+            // Dispatch focus events based on the NEW mode (need to get it after toggle)
+            setTimeout(() => {
+              const updatedProject = useProjectsStore.getState().projects.get(activeProjectId);
+              if (updatedProject?.mode === "viewer") {
+                window.dispatchEvent(new CustomEvent("pane:focus-editor"));
+              } else if (updatedProject?.mode === "conversation") {
+                window.dispatchEvent(new CustomEvent("pane:focus-input"));
+              }
+            }, 0);
           }
           break;
         }

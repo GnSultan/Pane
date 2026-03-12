@@ -1,5 +1,12 @@
 import path from "node:path";
-import { ipcMain, BrowserWindow, shell, dialog, app, utilityProcess } from "electron";
+import {
+  ipcMain,
+  BrowserWindow,
+  shell,
+  dialog,
+  app,
+  utilityProcess,
+} from "electron";
 import windowStateKeeper from "electron-window-state";
 import { execFile } from "node:child_process";
 import os from "node:os";
@@ -7,102 +14,45 @@ import fs from "node:fs";
 import { promisify } from "node:util";
 import ignore from "ignore";
 import chokidar from "chokidar";
+import {
+  registerPunkHandlers,
+  preforkPunkWorker,
+  shutdownPunkWorker,
+  punkEngine,
+} from "./punk-engine.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
-// Claude CLI runs in a UtilityProcess to keep the main thread free.
-// Main process is a thin relay — never touches JSON.parse or Claude data.
-let claudeWorker = null;
-const activeProjectIds = new Set();
-function getClaudeWorker() {
-  if (claudeWorker && !claudeWorker.killed) return claudeWorker;
-  const workerPath = path.join(__dirname, "claude-worker.mjs");
-  claudeWorker = utilityProcess.fork(workerPath);
-  // setImmediate-based yielding for the relay — prevents the main process from
-  // blocking on a burst of messages (e.g., context compaction dumps 30+ messages).
-  // Without yielding, each webContents.send() does a synchronous structured clone,
-  // and the main process can't handle input events until the entire burst clears.
-  const relayQueue = [];
-  let relayDraining = false;
-
-  function drainRelayQueue() {
-    if (relayQueue.length === 0) { relayDraining = false; return; }
-    const { channel, event } = relayQueue.shift();
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) win.webContents.send(channel, event);
-    }
-    if (relayQueue.length > 0) setImmediate(drainRelayQueue);
-    else relayDraining = false;
-  }
-
-  claudeWorker.on("message", (message) => {
-    if (message.type === "event") {
-      if (message.event.event === "processEnded") {
-        activeProjectIds.delete(message.projectId);
-      }
-      const channel = `claude-stream:${message.projectId}`;
-
-      // Critical events bypass queue — must reach renderer immediately
-      if (message.event.event === "processEnded" || message.event.event === "error") {
-        // Drain any queued events first so ordering is preserved
-        while (relayQueue.length > 0) {
-          const { channel: ch, event } = relayQueue.shift();
-          for (const win of BrowserWindow.getAllWindows()) {
-            if (!win.isDestroyed()) win.webContents.send(ch, event);
-          }
-        }
-        relayDraining = false;
-        for (const win of BrowserWindow.getAllWindows()) {
-          if (!win.isDestroyed()) win.webContents.send(channel, message.event);
-        }
-        return;
-      }
-
-      relayQueue.push({ channel, event: message.event });
-      if (!relayDraining) { relayDraining = true; setImmediate(drainRelayQueue); }
-    }
-  });
-  claudeWorker.on("exit", (code) => {
-    console.warn(`[pane] Claude worker exited with code ${code}`);
-    for (const projectId of activeProjectIds) {
-      const channel = `claude-stream:${projectId}`;
-      const windows = BrowserWindow.getAllWindows();
-      for (const win of windows) {
-        if (!win.isDestroyed()) {
-          win.webContents.send(channel, {
-            event: "processEnded",
-            data: { exit_code: null }
-          });
-        }
-      }
-    }
-    activeProjectIds.clear();
-    claudeWorker = null;
-  });
-  return claudeWorker;
-}
+// Punk engine runs in a UtilityProcess to keep the main thread free.
+// Main process is a thin relay — never touches JSON.parse or model output.
 function registerClaudeHandlers() {
+  // Punk is the default engine; keep these names for backwards compatibility.
+  registerPunkHandlers();
   ipcMain.handle("send_to_claude", async (_event, args) => {
-    const { projectId, prompt, workingDir, sessionId, model } = args;
-    const worker = getClaudeWorker();
-    activeProjectIds.add(projectId);
-    worker.postMessage({ type: "spawn", projectId, prompt, workingDir, sessionId, model });
+    const { projectId, prompt, workingDir, sessionId, model, intent } = args;
+    await punkEngine.spawn({
+      projectId,
+      prompt,
+      workingDir,
+      sessionId,
+      model,
+      intent,
+    });
   });
   ipcMain.handle("abort_claude", async (_event, args) => {
-    if (claudeWorker && !claudeWorker.killed) {
-      claudeWorker.postMessage({ type: "abort", projectId: args.projectId });
-    }
+    await punkEngine.abort(args.projectId);
   });
   ipcMain.handle("terminate_claude_session", async (_event, args) => {
-    if (claudeWorker && !claudeWorker.killed) {
-      claudeWorker.postMessage({ type: "terminate", projectId: args.projectId });
-    }
+    await punkEngine.terminate(args.projectId);
   });
   ipcMain.handle("check_claude_version", async () => {
     try {
-      const { stdout } = await execFileAsync("claude", ["--version"], { env: getEnvWithPath() });
+      const { stdout } = await execFileAsync("claude", ["--version"], {
+        env: getEnvWithPath(),
+      });
       const versionMatch = stdout.trim().match(/^([\d.]+)/);
-      if (!versionMatch) return { current: null, error: "Could not parse version" };
+      if (!versionMatch)
+        return { current: null, error: "Could not parse version" };
       return { current: versionMatch[1], error: null };
     } catch (error) {
       return { current: null, error: error.message };
@@ -111,22 +61,45 @@ function registerClaudeHandlers() {
   ipcMain.handle("check_claude_update", async () => {
     try {
       // Get current version from claude --version
-      const { stdout: versionOut } = await execFileAsync("claude", ["--version"], { env: getEnvWithPath() });
+      const { stdout: versionOut } = await execFileAsync(
+        "claude",
+        ["--version"],
+        { env: getEnvWithPath() },
+      );
       const currentMatch = versionOut.trim().match(/^([\d.]+)/);
       const current = currentMatch?.[1] ?? null;
 
       // Get latest version from npm registry (no install, just metadata)
-      const { stdout: npmOut } = await execFileAsync("npm", ["show", "@anthropic-ai/claude-code", "version"], { timeout: 15000, env: getEnvWithPath() });
+      const { stdout: npmOut } = await execFileAsync(
+        "npm",
+        ["show", "@anthropic-ai/claude-code", "version"],
+        { timeout: 15000, env: getEnvWithPath() },
+      );
       const latest = npmOut.trim() || null;
 
       if (!current || !latest) {
-        return { updateAvailable: false, currentVersion: current, newVersion: null, error: null };
+        return {
+          updateAvailable: false,
+          currentVersion: current,
+          newVersion: null,
+          error: null,
+        };
       }
 
       const updateAvailable = latest !== current;
-      return { updateAvailable, currentVersion: current, newVersion: updateAvailable ? latest : null, error: null };
+      return {
+        updateAvailable,
+        currentVersion: current,
+        newVersion: updateAvailable ? latest : null,
+        error: null,
+      };
     } catch (error) {
-      return { updateAvailable: false, currentVersion: null, newVersion: null, error: error.message };
+      return {
+        updateAvailable: false,
+        currentVersion: null,
+        newVersion: null,
+        error: error.message,
+      };
     }
   });
   ipcMain.handle("update_claude", async () => {
@@ -134,7 +107,10 @@ function registerClaudeHandlers() {
       const env = getEnvWithPath();
 
       // Find where claude is globally installed
-      const { stdout: prefixOut } = await execFileAsync("npm", ["root", "-g"], { env, timeout: 10000 });
+      const { stdout: prefixOut } = await execFileAsync("npm", ["root", "-g"], {
+        env,
+        timeout: 10000,
+      });
       const globalRoot = prefixOut.trim(); // e.g. /Users/x/.nvm/.../lib/node_modules
       const pkgDir = path.join(globalRoot, "@anthropic-ai", "claude-code");
 
@@ -143,8 +119,94 @@ function registerClaudeHandlers() {
 
       // Fresh install
       const { stdout, stderr } = await execFileAsync(
-        "npm", ["install", "-g", "@anthropic-ai/claude-code@latest"],
-        { timeout: 120000, env }
+        "npm",
+        ["install", "-g", "@anthropic-ai/claude-code@latest"],
+        { timeout: 120000, env },
+      );
+      return { success: true, output: stdout + stderr, error: null };
+    } catch (error) {
+      const output = (error.stdout || "") + (error.stderr || "");
+      return { success: false, output, error: error.message };
+    }
+  });
+
+  ipcMain.handle("check_gemini_version", async () => {
+    try {
+      const { stdout } = await execFileAsync("gemini", ["-v"], {
+        env: getEnvWithPath(),
+      });
+      const versionMatch = stdout.trim().match(/^([\d.]+)/);
+      if (!versionMatch)
+        return { current: null, error: "Could not parse version" };
+      return { current: versionMatch[1], error: null };
+    } catch (error) {
+      return { current: null, error: error.message };
+    }
+  });
+
+  ipcMain.handle("check_gemini_update", async () => {
+    try {
+      // Get current version from gemini -v
+      const { stdout: versionOut } = await execFileAsync("gemini", ["-v"], {
+        env: getEnvWithPath(),
+      });
+      const currentMatch = versionOut.trim().match(/^([\d.]+)/);
+      const current = currentMatch?.[1] ?? null;
+
+      // Get latest version from npm registry
+      const { stdout: npmOut } = await execFileAsync(
+        "npm",
+        ["show", "@google/gemini-cli", "version"],
+        { timeout: 15000, env: getEnvWithPath() },
+      );
+      const latest = npmOut.trim() || null;
+
+      if (!current || !latest) {
+        return {
+          updateAvailable: false,
+          currentVersion: current,
+          newVersion: null,
+          error: null,
+        };
+      }
+
+      const updateAvailable = latest !== current;
+      return {
+        updateAvailable,
+        currentVersion: current,
+        newVersion: updateAvailable ? latest : null,
+        error: null,
+      };
+    } catch (error) {
+      return {
+        updateAvailable: false,
+        currentVersion: null,
+        newVersion: null,
+        error: error.message,
+      };
+    }
+  });
+
+  ipcMain.handle("update_gemini", async () => {
+    try {
+      const env = getEnvWithPath();
+
+      // Find where gemini is globally installed
+      const { stdout: prefixOut } = await execFileAsync("npm", ["root", "-g"], {
+        env,
+        timeout: 10000,
+      });
+      const globalRoot = prefixOut.trim();
+      const pkgDir = path.join(globalRoot, "@google", "gemini-cli");
+
+      // Remove existing install directory
+      await fs.promises.rm(pkgDir, { recursive: true, force: true });
+
+      // Fresh install
+      const { stdout, stderr } = await execFileAsync(
+        "npm",
+        ["install", "-g", "@google/gemini-cli@latest"],
+        { timeout: 120000, env },
       );
       return { success: true, output: stdout + stderr, error: null };
     } catch (error) {
@@ -181,7 +243,7 @@ function getEnvWithPath() {
 function registerCommandHandlers() {
   ipcMain.handle("read_directory", async (_event, args) => {
     const dirEntries = await fs.promises.readdir(args.path, {
-      withFileTypes: true
+      withFileTypes: true,
     });
     const entries = [];
     for (const entry of dirEntries) {
@@ -193,7 +255,7 @@ function registerCommandHandlers() {
         path: fullPath,
         is_dir: isDir,
         is_hidden: entry.name.startsWith("."),
-        extension: isDir ? null : path.extname(entry.name).slice(1) || null
+        extension: isDir ? null : path.extname(entry.name).slice(1) || null,
       });
     }
     entries.sort((a, b) => {
@@ -202,48 +264,63 @@ function registerCommandHandlers() {
     });
     return entries;
   });
-  ipcMain.handle(
-    "read_directory_tree",
-    async (_event, args) => {
-      const SKIP_DIRS = new Set([
-        "node_modules", "dist", "build", "out", ".next", "target",
-        ".turbo", "coverage", "__pycache__", ".cache", ".parcel-cache",
-        "vendor", ".gradle", ".dart_tool", "Pods",
-      ]);
-      const result = {};
-      async function readLevel(dirPath, depth) {
-        try {
-          const dirEntries = await fs.promises.readdir(dirPath, { withFileTypes: true });
-          const entries = [];
-          const subdirs = [];
-          for (const entry of dirEntries) {
-            if (entry.name === ".DS_Store") continue;
-            const fullPath = path.join(dirPath, entry.name);
-            const isDir = entry.isDirectory();
-            entries.push({
-              name: entry.name,
-              path: fullPath,
-              is_dir: isDir,
-              is_hidden: entry.name.startsWith("."),
-              extension: isDir ? null : path.extname(entry.name).slice(1) || null
-            });
-            if (isDir && depth < args.maxDepth && !entry.name.startsWith(".") && !SKIP_DIRS.has(entry.name)) {
-              subdirs.push(fullPath);
-            }
-          }
-          entries.sort((a, b) => {
-            if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
-            return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+  ipcMain.handle("read_directory_tree", async (_event, args) => {
+    const SKIP_DIRS = new Set([
+      "node_modules",
+      "dist",
+      "build",
+      "out",
+      ".next",
+      "target",
+      ".turbo",
+      "coverage",
+      "__pycache__",
+      ".cache",
+      ".parcel-cache",
+      "vendor",
+      ".gradle",
+      ".dart_tool",
+      "Pods",
+    ]);
+    const result = {};
+    async function readLevel(dirPath, depth) {
+      try {
+        const dirEntries = await fs.promises.readdir(dirPath, {
+          withFileTypes: true,
+        });
+        const entries = [];
+        const subdirs = [];
+        for (const entry of dirEntries) {
+          if (entry.name === ".DS_Store") continue;
+          const fullPath = path.join(dirPath, entry.name);
+          const isDir = entry.isDirectory();
+          entries.push({
+            name: entry.name,
+            path: fullPath,
+            is_dir: isDir,
+            is_hidden: entry.name.startsWith("."),
+            extension: isDir ? null : path.extname(entry.name).slice(1) || null,
           });
-          result[dirPath] = entries;
-          await Promise.all(subdirs.map((sub) => readLevel(sub, depth + 1)));
-        } catch {
+          if (
+            isDir &&
+            depth < args.maxDepth &&
+            !entry.name.startsWith(".") &&
+            !SKIP_DIRS.has(entry.name)
+          ) {
+            subdirs.push(fullPath);
+          }
         }
-      }
-      await readLevel(args.path, 0);
-      return result;
+        entries.sort((a, b) => {
+          if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+          return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+        });
+        result[dirPath] = entries;
+        await Promise.all(subdirs.map((sub) => readLevel(sub, depth + 1)));
+      } catch {}
     }
-  );
+    await readLevel(args.path, 0);
+    return result;
+  });
   ipcMain.handle("read_file", async (_event, args) => {
     const stat = await fs.promises.stat(args.path);
     if (stat.size > 5 * 1024 * 1024) {
@@ -276,7 +353,9 @@ function registerCommandHandlers() {
       await execAsync(script);
     } catch (error) {
       // If AppleScript fails, fall back to permanent deletion with explicit confirmation
-      throw new Error(`Failed to move to Trash: ${error.message}. File was NOT deleted.`);
+      throw new Error(
+        `Failed to move to Trash: ${error.message}. File was NOT deleted.`,
+      );
     }
   });
   ipcMain.handle("get_home_dir", () => os.homedir());
@@ -298,10 +377,12 @@ function registerCommandHandlers() {
     const files = [];
     const ig = ignore();
     try {
-      const gitignore = await fs.promises.readFile(path.join(args.root, ".gitignore"), "utf-8");
+      const gitignore = await fs.promises.readFile(
+        path.join(args.root, ".gitignore"),
+        "utf-8",
+      );
       ig.add(gitignore);
-    } catch {
-    }
+    } catch {}
     ig.add(".git");
     async function walk(dir, depth) {
       if (depth > 20) return;
@@ -327,89 +408,96 @@ function registerCommandHandlers() {
     files.sort();
     return files;
   });
-  ipcMain.handle(
-    "search_in_files",
-    async (_event, args) => {
-      const max = args.maxResults ?? 200;
-      const queryLower = args.query.toLowerCase();
-      const results = [];
-      const ig = ignore();
+  ipcMain.handle("search_in_files", async (_event, args) => {
+    const max = args.maxResults ?? 200;
+    const queryLower = args.query.toLowerCase();
+    const results = [];
+    const ig = ignore();
+    try {
+      const gitignore = await fs.promises.readFile(
+        path.join(args.root, ".gitignore"),
+        "utf-8",
+      );
+      ig.add(gitignore);
+    } catch {}
+    ig.add(".git");
+    async function walk(dir, depth) {
+      if (depth > 20 || results.length >= max) return;
+      let entries;
       try {
-        const gitignore = await fs.promises.readFile(path.join(args.root, ".gitignore"), "utf-8");
-        ig.add(gitignore);
+        entries = await fs.promises.readdir(dir, { withFileTypes: true });
       } catch {
+        return;
       }
-      ig.add(".git");
-      async function walk(dir, depth) {
-        if (depth > 20 || results.length >= max) return;
-        let entries;
-        try {
-          entries = await fs.promises.readdir(dir, { withFileTypes: true });
-        } catch {
-          return;
-        }
-        for (const entry of entries) {
-          if (results.length >= max) break;
-          const fullPath = path.join(dir, entry.name);
-          const relativePath = path.relative(args.root, fullPath);
-          if (ig.ignores(relativePath)) continue;
-          if (entry.isDirectory()) {
-            if (ig.ignores(`${relativePath}/`)) continue;
-            await walk(fullPath, depth + 1);
-          } else if (entry.isFile()) {
-            try {
-              const stat = await fs.promises.stat(fullPath);
-              if (stat.size > 2 * 1024 * 1024) continue;
-            } catch {
-              continue;
+      for (const entry of entries) {
+        if (results.length >= max) break;
+        const fullPath = path.join(dir, entry.name);
+        const relativePath = path.relative(args.root, fullPath);
+        if (ig.ignores(relativePath)) continue;
+        if (entry.isDirectory()) {
+          if (ig.ignores(`${relativePath}/`)) continue;
+          await walk(fullPath, depth + 1);
+        } else if (entry.isFile()) {
+          try {
+            const stat = await fs.promises.stat(fullPath);
+            if (stat.size > 2 * 1024 * 1024) continue;
+          } catch {
+            continue;
+          }
+          let content;
+          try {
+            content = await fs.promises.readFile(fullPath);
+          } catch {
+            continue;
+          }
+          const checkLen = Math.min(content.length, 512);
+          let isBinary = false;
+          for (let i = 0; i < checkLen; i++) {
+            if (content[i] === 0) {
+              isBinary = true;
+              break;
             }
-            let content;
-            try {
-              content = await fs.promises.readFile(fullPath);
-            } catch {
-              continue;
-            }
-            const checkLen = Math.min(content.length, 512);
-            let isBinary = false;
-            for (let i = 0; i < checkLen; i++) {
-              if (content[i] === 0) {
-                isBinary = true;
-                break;
-              }
-            }
-            if (isBinary) continue;
-            const text = content.toString("utf-8");
-            const lines = text.split("\n");
-            for (let i = 0; i < lines.length; i++) {
-              if (results.length >= max) break;
-              if (lines[i].toLowerCase().includes(queryLower)) {
-                results.push({
-                  file_path: relativePath,
-                  absolute_path: fullPath,
-                  line_number: i + 1,
-                  line_content: lines[i].slice(0, 200)
-                });
-              }
+          }
+          if (isBinary) continue;
+          const text = content.toString("utf-8");
+          const lines = text.split("\n");
+          for (let i = 0; i < lines.length; i++) {
+            if (results.length >= max) break;
+            if (lines[i].toLowerCase().includes(queryLower)) {
+              results.push({
+                file_path: relativePath,
+                absolute_path: fullPath,
+                line_number: i + 1,
+                line_content: lines[i].slice(0, 200),
+              });
             }
           }
         }
       }
-      await walk(args.root, 0);
-      return results;
     }
-  );
+    await walk(args.root, 0);
+    return results;
+  });
   ipcMain.handle("get_git_status", async (_event, args) => {
     let branch;
     try {
-      const { stdout } = await execFileAsync("git", ["symbolic-ref", "--short", "HEAD"], {
-        cwd: args.path
-      });
+      const { stdout } = await execFileAsync(
+        "git",
+        ["symbolic-ref", "--short", "HEAD"],
+        {
+          cwd: args.path,
+        },
+      );
       branch = stdout.trim();
     } catch {
       try {
-        const { stdout } = await execFileAsync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-          cwd: args.path
-        });
+        const { stdout } = await execFileAsync(
+          "git",
+          ["rev-parse", "--abbrev-ref", "HEAD"],
+          {
+            cwd: args.path,
+          },
+        );
         branch = stdout.trim();
       } catch {
         branch = "master";
@@ -417,9 +505,13 @@ function registerCommandHandlers() {
     }
     const files = {};
     try {
-      const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-unormal"], {
-        cwd: args.path
-      });
+      const { stdout } = await execFileAsync(
+        "git",
+        ["status", "--porcelain=v1", "-unormal"],
+        {
+          cwd: args.path,
+        },
+      );
       for (const line of stdout.split("\n")) {
         if (line.length < 4) continue;
         const statusCode = line.slice(0, 2).trim();
@@ -430,8 +522,7 @@ function registerCommandHandlers() {
         }
         files[filePath] = statusCode;
       }
-    } catch {
-    }
+    } catch {}
     return { branch, files };
   });
   ipcMain.handle("get_git_log", async (_event, args) => {
@@ -440,7 +531,7 @@ function registerCommandHandlers() {
       const { stdout } = await execFileAsync(
         "git",
         ["log", `-${max}`, "--pretty=format:%h%s%an%ar"],
-        { cwd: args.path }
+        { cwd: args.path },
       );
       const commits = [];
       for (const line of stdout.split("\n")) {
@@ -450,7 +541,7 @@ function registerCommandHandlers() {
             hash: parts[0],
             message: parts[1],
             author: parts[2],
-            date: parts[3]
+            date: parts[3],
           });
         }
       }
@@ -462,7 +553,9 @@ function registerCommandHandlers() {
   ipcMain.handle("git_commit", async (_event, args) => {
     try {
       await execFileAsync("git", ["add", "-A"], { cwd: args.path });
-      await execFileAsync("git", ["commit", "-m", args.message], { cwd: args.path });
+      await execFileAsync("git", ["commit", "-m", args.message], {
+        cwd: args.path,
+      });
       return { success: true };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -508,7 +601,7 @@ function registerCommandHandlers() {
     const win = BrowserWindow.getFocusedWindow();
     if (!win) return null;
     const result = await dialog.showOpenDialog(win, {
-      properties: ["openDirectory"]
+      properties: ["openDirectory"],
     });
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
@@ -521,7 +614,8 @@ function registerCommandHandlers() {
 
       // Infer plan from available fields
       let plan = null;
-      const hasSubscription = config.oauthAccount?.billingType === "stripe_subscription";
+      const hasSubscription =
+        config.oauthAccount?.billingType === "stripe_subscription";
       const hasExtraUsage = config.oauthAccount?.hasExtraUsageEnabled === true;
 
       if (hasSubscription && hasExtraUsage) {
@@ -557,7 +651,15 @@ const defaultSettings = {
   font_weight: null,
   keybindings: null,
   theme: null,
-  panel_width: null
+  panel_width: null,
+  punk_backend: "http",
+  http_provider: "deepseek",
+  http_api_key: "",
+  http_base_url: "",
+  selected_model: null,
+  completion_sound: null,
+  intent_routing: null,
+  intent_auto_route: true,
 };
 function registerSettingsHandlers() {
   ipcMain.handle("load_settings", async () => {
@@ -572,7 +674,21 @@ function registerSettingsHandlers() {
   ipcMain.handle("save_settings", async (_event, args) => {
     const filePath = settingsPath();
     await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.promises.writeFile(filePath, JSON.stringify(args.settings, null, 2), "utf-8");
+
+    let existing = {};
+    try {
+      const content = await fs.promises.readFile(filePath, "utf-8");
+      if (content.trim().length > 0) existing = JSON.parse(content);
+    } catch {}
+
+    const merged = { ...existing, ...args.settings };
+    const json = JSON.stringify(merged, null, 2);
+
+    // Atomic write: write to a temp file then rename.
+    // A crash or HMR kill mid-write can never zero the real settings file.
+    const tmpPath = filePath + ".tmp";
+    await fs.promises.writeFile(tmpPath, json, "utf-8");
+    await fs.promises.rename(tmpPath, filePath);
   });
 }
 // PTY runs in a UtilityProcess to isolate node-pty crashes from the main process.
@@ -626,11 +742,20 @@ function registerPtyHandlers() {
   ipcMain.handle("pty_create", async (_event, args) => {
     const worker = getPtyWorker();
     activePtyIds.add(args.ptyId);
-    worker.postMessage({ type: "create", ptyId: args.ptyId, projectId: args.projectId, cwd: args.cwd });
+    worker.postMessage({
+      type: "create",
+      ptyId: args.ptyId,
+      projectId: args.projectId,
+      cwd: args.cwd,
+    });
   });
   ipcMain.handle("pty_write", async (_event, args) => {
     if (ptyWorker && !ptyWorker.killed) {
-      ptyWorker.postMessage({ type: "write", ptyId: args.ptyId, data: args.data });
+      ptyWorker.postMessage({
+        type: "write",
+        ptyId: args.ptyId,
+        data: args.data,
+      });
     }
   });
   ipcMain.handle("pty_destroy", async (_event, args) => {
@@ -641,7 +766,10 @@ function registerPtyHandlers() {
   });
   ipcMain.handle("pty_destroy_project", async (_event, args) => {
     if (ptyWorker && !ptyWorker.killed) {
-      ptyWorker.postMessage({ type: "destroy_project", projectId: args.projectId });
+      ptyWorker.postMessage({
+        type: "destroy_project",
+        projectId: args.projectId,
+      });
     }
   });
 }
@@ -650,11 +778,7 @@ function registerPtyHandlers() {
 // because node-pty lives in the PTY worker, not here.
 app.on("before-quit", () => {
   forceQuit = true;
-  if (claudeWorker && !claudeWorker.killed) {
-    claudeWorker.postMessage({ type: "shutdown" });
-    claudeWorker.kill();
-    claudeWorker = null;
-  }
+  shutdownPunkWorker();
   if (ptyWorker && !ptyWorker.killed) {
     // Send shutdown and let the worker exit gracefully — it needs time to
     // dispose native ThreadSafeFunction handles before environment teardown.
@@ -693,7 +817,7 @@ function registerWatcherHandlers() {
     const watcher = chokidar.watch(args.path, {
       ignoreInitial: true,
       ignored: [
-        /(^|[/\\])\../,            // dotfiles (.git, .DS_Store, etc.)
+        /(^|[/\\])\../, // dotfiles (.git, .DS_Store, etc.)
         /node_modules/,
         /\.next\//,
         /dist\//,
@@ -701,15 +825,15 @@ function registerWatcherHandlers() {
         /out\//,
         /target\//,
         /\.turbo\//,
-        /coverage\//
+        /coverage\//,
       ],
       persistent: true,
       usePolling: false,
       depth: 3,
       awaitWriteFinish: {
         stabilityThreshold: 300,
-        pollInterval: 100
-      }
+        pollInterval: 100,
+      },
     });
     watcher.on("error", (err) => {
       console.error("Chokidar watcher error:", err.message);
@@ -745,7 +869,9 @@ function registerCheckpointHandlers() {
     // Must be a git repo
     let headCommit = null;
     try {
-      const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workingDir });
+      const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+        cwd: workingDir,
+      });
       headCommit = stdout.trim();
     } catch {
       return { id: null, fileCount: 0 };
@@ -754,7 +880,11 @@ function registerCheckpointHandlers() {
     // Get dirty + untracked files
     let porcelain = "";
     try {
-      const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-unormal"], { cwd: workingDir });
+      const { stdout } = await execFileAsync(
+        "git",
+        ["status", "--porcelain=v1", "-unormal"],
+        { cwd: workingDir },
+      );
       porcelain = stdout;
     } catch {
       return { id: null, fileCount: 0 };
@@ -772,7 +902,10 @@ function registerCheckpointHandlers() {
 
     // Read file contents (skip binary, large files)
     const files = [];
-    for (const { relativePath, gitStatus } of entries.slice(0, CHECKPOINT_MAX_FILES)) {
+    for (const { relativePath, gitStatus } of entries.slice(
+      0,
+      CHECKPOINT_MAX_FILES,
+    )) {
       const fullPath = path.join(workingDir, relativePath);
       try {
         const stat = await fs.promises.stat(fullPath);
@@ -782,54 +915,106 @@ function registerCheckpointHandlers() {
         const checkLen = Math.min(buffer.length, 512);
         let isBinary = false;
         for (let i = 0; i < checkLen; i++) {
-          if (buffer[i] === 0) { isBinary = true; break; }
+          if (buffer[i] === 0) {
+            isBinary = true;
+            break;
+          }
         }
         if (isBinary) continue;
-        files.push({ relativePath, content: buffer.toString("utf-8"), gitStatus });
+        files.push({
+          relativePath,
+          content: buffer.toString("utf-8"),
+          gitStatus,
+        });
       } catch {
         files.push({ relativePath, content: null, gitStatus });
       }
     }
 
-    const checkpoint = { id: cpId, timestamp: Date.now(), projectId, headCommit, files, messageId };
+    const checkpoint = {
+      id: cpId,
+      timestamp: Date.now(),
+      projectId,
+      headCommit,
+      files,
+      messageId,
+    };
     const dir = checkpointDir(projectId);
     await fs.promises.mkdir(dir, { recursive: true });
-    await fs.promises.writeFile(path.join(dir, `${cpId}.json`), JSON.stringify(checkpoint), "utf-8");
+    await fs.promises.writeFile(
+      path.join(dir, `${cpId}.json`),
+      JSON.stringify(checkpoint),
+      "utf-8",
+    );
 
     // Prune old checkpoints
     try {
-      const all = (await fs.promises.readdir(dir)).filter(f => f.startsWith("cp-") && f.endsWith(".json")).sort();
+      const all = (await fs.promises.readdir(dir))
+        .filter((f) => f.startsWith("cp-") && f.endsWith(".json"))
+        .sort();
       if (all.length > CHECKPOINT_KEEP) {
         const remove = all.slice(0, all.length - CHECKPOINT_KEEP);
-        await Promise.all(remove.map(f => fs.promises.unlink(path.join(dir, f)).catch(() => {})));
+        await Promise.all(
+          remove.map((f) =>
+            fs.promises.unlink(path.join(dir, f)).catch(() => {}),
+          ),
+        );
       }
     } catch {}
 
     // Update manifest for external tools (punk-records reads this)
     try {
-      const remaining = (await fs.promises.readdir(dir)).filter(f => f.startsWith("cp-") && f.endsWith(".json")).sort();
+      const remaining = (await fs.promises.readdir(dir))
+        .filter((f) => f.startsWith("cp-") && f.endsWith(".json"))
+        .sort();
       const manifest = [];
       for (const f of remaining) {
         try {
           const raw = await fs.promises.readFile(path.join(dir, f), "utf-8");
           const cp = JSON.parse(raw);
-          manifest.push({ id: cp.id, timestamp: cp.timestamp, messageId: cp.messageId, fileCount: cp.files.length, headCommit: cp.headCommit, workingDir });
+          manifest.push({
+            id: cp.id,
+            timestamp: cp.timestamp,
+            messageId: cp.messageId,
+            fileCount: cp.files.length,
+            headCommit: cp.headCommit,
+            workingDir,
+          });
         } catch {}
       }
-      await fs.promises.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ projectId, projectRoot: workingDir, checkpoints: manifest }), "utf-8");
+      await fs.promises.writeFile(
+        path.join(dir, "manifest.json"),
+        JSON.stringify({
+          projectId,
+          projectRoot: workingDir,
+          checkpoints: manifest,
+        }),
+        "utf-8",
+      );
     } catch {}
 
-    return { id: cpId, fileCount: files.length, timestamp: checkpoint.timestamp };
+    return {
+      id: cpId,
+      fileCount: files.length,
+      timestamp: checkpoint.timestamp,
+    };
   });
 
   ipcMain.handle("restore_checkpoint", async (_event, args) => {
     const { projectId, checkpointId, workingDir } = args;
     let checkpoint;
     try {
-      const raw = await fs.promises.readFile(path.join(checkpointDir(projectId), `${checkpointId}.json`), "utf-8");
+      const raw = await fs.promises.readFile(
+        path.join(checkpointDir(projectId), `${checkpointId}.json`),
+        "utf-8",
+      );
       checkpoint = JSON.parse(raw);
     } catch {
-      return { success: false, error: "Checkpoint not found", restoredFiles: [] };
+      return {
+        success: false,
+        error: "Checkpoint not found",
+        restoredFiles: [],
+      };
     }
 
     const restored = [];
@@ -839,7 +1024,10 @@ function registerCheckpointHandlers() {
       const fullPath = path.join(workingDir, file.relativePath);
       try {
         if (file.content === null) {
-          try { await fs.promises.unlink(fullPath); restored.push({ path: file.relativePath, action: "deleted" }); } catch {}
+          try {
+            await fs.promises.unlink(fullPath);
+            restored.push({ path: file.relativePath, action: "deleted" });
+          } catch {}
         } else {
           await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
           await fs.promises.writeFile(fullPath, file.content, "utf-8");
@@ -851,8 +1039,12 @@ function registerCheckpointHandlers() {
     // Restore clean tracked files Claude modified (not in checkpoint) from git HEAD
     if (checkpoint.headCommit) {
       try {
-        const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-unormal"], { cwd: workingDir });
-        const cpPaths = new Set(checkpoint.files.map(f => f.relativePath));
+        const { stdout } = await execFileAsync(
+          "git",
+          ["status", "--porcelain=v1", "-unormal"],
+          { cwd: workingDir },
+        );
+        const cpPaths = new Set(checkpoint.files.map((f) => f.relativePath));
         for (const line of stdout.split("\n")) {
           if (line.length < 4) continue;
           const sc = line.slice(0, 2).trim();
@@ -864,7 +1056,11 @@ function registerCheckpointHandlers() {
             restored.push({ path: fp, action: "orphaned_new" });
           } else {
             try {
-              await execFileAsync("git", ["checkout", checkpoint.headCommit, "--", fp], { cwd: workingDir });
+              await execFileAsync(
+                "git",
+                ["checkout", checkpoint.headCommit, "--", fp],
+                { cwd: workingDir },
+              );
               restored.push({ path: fp, action: "git_restored" });
             } catch {}
           }
@@ -883,9 +1079,17 @@ function registerCheckpointHandlers() {
       for (const entry of entries) {
         if (!entry.startsWith("cp-") || !entry.endsWith(".json")) continue;
         try {
-          const raw = await fs.promises.readFile(path.join(checkpointDir(projectId), entry), "utf-8");
+          const raw = await fs.promises.readFile(
+            path.join(checkpointDir(projectId), entry),
+            "utf-8",
+          );
           const cp = JSON.parse(raw);
-          metas.push({ id: cp.id, timestamp: cp.timestamp, messageId: cp.messageId, fileCount: cp.files.length });
+          metas.push({
+            id: cp.id,
+            timestamp: cp.timestamp,
+            messageId: cp.messageId,
+            fileCount: cp.files.length,
+          });
         } catch {}
       }
       metas.sort((a, b) => a.timestamp - b.timestamp);
@@ -899,7 +1103,10 @@ function registerCheckpointHandlers() {
     const { projectId, checkpointId, workingDir } = args;
     let checkpoint;
     try {
-      const raw = await fs.promises.readFile(path.join(checkpointDir(projectId), `${checkpointId}.json`), "utf-8");
+      const raw = await fs.promises.readFile(
+        path.join(checkpointDir(projectId), `${checkpointId}.json`),
+        "utf-8",
+      );
       checkpoint = JSON.parse(raw);
     } catch {
       return { files: [] };
@@ -908,20 +1115,32 @@ function registerCheckpointHandlers() {
     for (const file of checkpoint.files) {
       let currentContent = null;
       try {
-        currentContent = await fs.promises.readFile(path.join(workingDir, file.relativePath), "utf-8");
+        currentContent = await fs.promises.readFile(
+          path.join(workingDir, file.relativePath),
+          "utf-8",
+        );
       } catch {}
       if (currentContent !== file.content) {
         diffs.push({
           relativePath: file.relativePath,
-          status: currentContent === null ? "deleted" : file.content === null ? "created" : "modified",
+          status:
+            currentContent === null
+              ? "deleted"
+              : file.content === null
+                ? "created"
+                : "modified",
         });
       }
     }
     // Also check for new untracked files not in checkpoint
     if (checkpoint.headCommit) {
       try {
-        const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-unormal"], { cwd: workingDir });
-        const cpPaths = new Set(checkpoint.files.map(f => f.relativePath));
+        const { stdout } = await execFileAsync(
+          "git",
+          ["status", "--porcelain=v1", "-unormal"],
+          { cwd: workingDir },
+        );
+        const cpPaths = new Set(checkpoint.files.map((f) => f.relativePath));
         for (const line of stdout.split("\n")) {
           if (line.length < 4) continue;
           const sc = line.slice(0, 2).trim();
@@ -941,7 +1160,10 @@ function registerCheckpointHandlers() {
 
   ipcMain.handle("delete_project_checkpoints", async (_event, args) => {
     try {
-      await fs.promises.rm(checkpointDir(args.projectId), { recursive: true, force: true });
+      await fs.promises.rm(checkpointDir(args.projectId), {
+        recursive: true,
+        force: true,
+      });
     } catch {}
   });
 }
@@ -956,7 +1178,11 @@ function registerStateHandlers() {
   async function writeStateFile(projectId, filename, data) {
     const dir = stateDir(projectId);
     await fs.promises.mkdir(dir, { recursive: true });
-    await fs.promises.writeFile(path.join(dir, filename), JSON.stringify(data), "utf-8");
+    await fs.promises.writeFile(
+      path.join(dir, filename),
+      JSON.stringify(data),
+      "utf-8",
+    );
   }
 
   ipcMain.handle("write_editor_state", async (_event, args) => {
@@ -983,16 +1209,27 @@ function registerMemoryHandlers() {
     const { projectId, events } = args;
     const dir = memoryDir(projectId);
     await fs.promises.mkdir(dir, { recursive: true });
-    const lines = events.map(e => JSON.stringify(e)).join("\n") + "\n";
-    await fs.promises.appendFile(path.join(dir, "events.jsonl"), lines, "utf-8");
+    const lines = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    await fs.promises.appendFile(
+      path.join(dir, "events.jsonl"),
+      lines,
+      "utf-8",
+    );
 
     // Prune to last N events
     try {
-      const content = await fs.promises.readFile(path.join(dir, "events.jsonl"), "utf-8");
+      const content = await fs.promises.readFile(
+        path.join(dir, "events.jsonl"),
+        "utf-8",
+      );
       const allLines = content.trim().split("\n").filter(Boolean);
       if (allLines.length > MEMORY_MAX_EVENTS) {
         const pruned = allLines.slice(-MEMORY_MAX_EVENTS).join("\n") + "\n";
-        await fs.promises.writeFile(path.join(dir, "events.jsonl"), pruned, "utf-8");
+        await fs.promises.writeFile(
+          path.join(dir, "events.jsonl"),
+          pruned,
+          "utf-8",
+        );
       }
     } catch {}
   });
@@ -1002,25 +1239,36 @@ function registerMemoryHandlers() {
     const dir = memoryDir(projectId);
     const eventsPath = path.join(dir, "events.jsonl");
     let content;
-    try { content = await fs.promises.readFile(eventsPath, "utf-8"); }
-    catch { return ""; }
+    try {
+      content = await fs.promises.readFile(eventsPath, "utf-8");
+    } catch {
+      return "";
+    }
 
-    const events = content.trim().split("\n").map(line => {
-      try { return JSON.parse(line); } catch { return null; }
-    }).filter(Boolean);
+    const events = content
+      .trim()
+      .split("\n")
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
 
     // Take last 50 events for the brief
     const recent = events.slice(-50);
     if (recent.length === 0) return "";
 
     // Group by type
-    const decisions = recent.filter(e => e.type === "decision");
-    const lessons = recent.filter(e => e.type === "lesson");
-    const errors = recent.filter(e => e.type === "error");
-    const errorFixes = recent.filter(e => e.type === "error_fix");
-    const fileEdits = recent.filter(e => e.type === "file_edit");
-    const commands = recent.filter(e => e.type === "command");
-    const summaries = recent.filter(e => e.type === "summary");
+    const decisions = recent.filter((e) => e.type === "decision");
+    const lessons = recent.filter((e) => e.type === "lesson");
+    const errors = recent.filter((e) => e.type === "error");
+    const errorFixes = recent.filter((e) => e.type === "error_fix");
+    const fileEdits = recent.filter((e) => e.type === "file_edit");
+    const commands = recent.filter((e) => e.type === "command");
+    const summaries = recent.filter((e) => e.type === "summary");
 
     const parts = ["## Pane Project Memory"];
 
@@ -1057,9 +1305,12 @@ function registerMemoryHandlers() {
         const file = e.metadata?.file || "unknown";
         fileCounts[file] = (fileCounts[file] || 0) + 1;
       }
-      const sorted = Object.entries(fileCounts).sort((a, b) => b[1] - a[1]).slice(0, 8);
+      const sorted = Object.entries(fileCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8);
       parts.push("\n### Frequently modified files");
-      for (const [file, count] of sorted) parts.push(`- ${file} (${count} edits)`);
+      for (const [file, count] of sorted)
+        parts.push(`- ${file} (${count} edits)`);
     }
 
     // Command frequency — group by base command, show counts
@@ -1070,7 +1321,9 @@ function registerMemoryHandlers() {
         const cmd = (e.content || "").split("\n")[0].slice(0, 60);
         cmdCounts[cmd] = (cmdCounts[cmd] || 0) + 1;
       }
-      const sorted = Object.entries(cmdCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      const sorted = Object.entries(cmdCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5);
       if (sorted.length > 0) {
         parts.push("\n### Recent commands");
         for (const [cmd, count] of sorted) {
@@ -1088,10 +1341,13 @@ function registerMemoryHandlers() {
       } else {
         parts.push("\n### Recent session summaries");
         for (let i = 0; i < recentSummaries.length; i++) {
-          const label = i === recentSummaries.length - 1 ? "Latest" : `Previous`;
+          const label =
+            i === recentSummaries.length - 1 ? "Latest" : `Previous`;
           const summary = recentSummaries[i].content;
           // Truncate each to ~200 chars to leave room
-          parts.push(`**${label}:** ${summary.length > 200 ? summary.slice(0, 200) + "..." : summary}`);
+          parts.push(
+            `**${label}:** ${summary.length > 200 ? summary.slice(0, 200) + "..." : summary}`,
+          );
         }
       }
     }
@@ -1119,7 +1375,10 @@ function registerMemoryHandlers() {
   ipcMain.handle("read_brief", async (_event, args) => {
     const { projectId } = args;
     try {
-      return await fs.promises.readFile(path.join(memoryDir(projectId), "brief.md"), "utf-8");
+      return await fs.promises.readFile(
+        path.join(memoryDir(projectId), "brief.md"),
+        "utf-8",
+      );
     } catch {
       return "";
     }
@@ -1236,11 +1495,30 @@ function registerBrainHandlers() {
   });
 
   ipcMain.handle("brain_save_avatar", async (_event, args) => {
-    return brainRequest("save_avatar", { base64Data: args.base64Data, mimeType: args.mimeType });
+    return brainRequest("save_avatar", {
+      base64Data: args.base64Data,
+      mimeType: args.mimeType,
+    });
   });
 
   ipcMain.handle("brain_get_avatar", async () => {
     return brainRequest("get_avatar", {});
+  });
+
+  ipcMain.handle("brain_mind_add", async (_event, args) => {
+    return brainRequest("mind_add", { content: args.content });
+  });
+
+  ipcMain.handle("brain_mind_get_all", async () => {
+    return brainRequest("mind_get_all", {});
+  });
+
+  ipcMain.handle("brain_mind_update", async (_event, args) => {
+    return brainRequest("mind_update", { id: args.id, content: args.content });
+  });
+
+  ipcMain.handle("brain_mind_delete", async (_event, args) => {
+    return brainRequest("mind_delete", { id: args.id });
   });
 }
 
@@ -1258,12 +1536,14 @@ function registerIpcHandlers() {
 let mainWindow = null;
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
 function getAssetPath(...paths) {
-  return isDev ? path.join(__dirname, "../../electron/assets", ...paths) : path.join(process.resourcesPath, "assets", ...paths);
+  return isDev
+    ? path.join(__dirname, "../../electron/assets", ...paths)
+    : path.join(process.resourcesPath, "assets", ...paths);
 }
 function createWindow() {
   const windowState = windowStateKeeper({
     defaultWidth: 1200,
-    defaultHeight: 800
+    defaultHeight: 800,
   });
   const iconPath = getAssetPath("icon.png");
   mainWindow = new BrowserWindow({
@@ -1282,8 +1562,8 @@ function createWindow() {
       preload: path.join(__dirname, "../preload/preload.mjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
-    }
+      sandbox: false,
+    },
   });
   windowState.manage(mainWindow);
   mainWindow.once("ready-to-show", () => {
@@ -1295,7 +1575,7 @@ function createWindow() {
   });
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
+    mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
     mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   }
@@ -1312,7 +1592,7 @@ function createWindow() {
 app.whenReady().then(() => {
   registerIpcHandlers();
   createWindow();
-  getClaudeWorker(); // Pre-fork to hide first-use latency
+  preforkPunkWorker(); // Pre-fork to hide first-use latency
   getPtyWorker();
   getBrainWorker(); // Pre-fork: start loading SQLite + embedding model
   app.on("activate", () => {
@@ -1329,6 +1609,4 @@ app.on("window-all-closed", () => {
 function getMainWindow() {
   return mainWindow;
 }
-export {
-  getMainWindow
-};
+export { getMainWindow };

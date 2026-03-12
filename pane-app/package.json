@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.2.70",
+  "version": "0.2.97",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -36,7 +36,7 @@
     "files": [
       "out/**/*",
       "src/main/main.mjs",
-      "src/main/claude-worker.mjs",
+      "src/main/cli-worker.mjs",
       "src/main/pty-worker.mjs",
       "src/main/pane-mcp-server.mjs",
       "src/main/brain-engine.mjs",

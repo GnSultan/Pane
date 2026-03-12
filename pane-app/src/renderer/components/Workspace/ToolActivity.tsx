@@ -36,24 +36,31 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
 
   switch (name) {
     case "Read":
+    case "read_file":
       return shortenPath((input.file_path as string) || "file");
     case "Edit":
+    case "replace":
       return (input.file_path as string)?.split("/").pop() || "file";
     case "Write":
+    case "write_file":
       return (input.file_path as string)?.split("/").pop() || "file";
-    case "Bash": {
+    case "Bash":
+    case "run_shell_command": {
       const cmd = (input.command as string) || "";
       return cmd.length > 80 ? cmd.slice(0, 80) + "..." : cmd;
     }
     case "Glob":
+    case "glob":
       return (input.pattern as string) || "";
     case "Grep":
+    case "grep_search":
       return `"${(input.pattern as string) || ""}"`;
     case "TodoWrite":
       return "todos";
     case "Task":
       return (input.description as string) || "subagent";
     case "WebSearch":
+    case "google_web_search":
       return (input.query as string) || "";
     case "EnterPlanMode":
       return "entering plan mode";
@@ -69,15 +76,22 @@ function getToolLabel(name: string): string {
   if (mcp) return mcp.server;
 
   switch (name) {
-    case "Read": return "read";
-    case "Glob": return "glob";
-    case "Grep": return "grep";
-    case "Edit": return "edit";
-    case "Write": return "write";
-    case "Bash": return "bash";
+    case "Read":
+    case "read_file": return "read";
+    case "Glob":
+    case "glob": return "glob";
+    case "Grep":
+    case "grep_search": return "grep";
+    case "Edit":
+    case "replace": return "edit";
+    case "Write":
+    case "write_file": return "write";
+    case "Bash":
+    case "run_shell_command": return "bash";
     case "Task": return "task";
     case "TodoWrite": return "todo";
-    case "WebSearch": return "search";
+    case "WebSearch":
+    case "google_web_search": return "search";
     case "EnterPlanMode": return "plan";
     case "ExitPlanMode": return "plan";
     default: return name.toLowerCase();
@@ -268,14 +282,18 @@ function renderExpandedInput(name: string, input: Record<string, unknown>) {
   }
   switch (name) {
     case "Edit":
+    case "replace":
       return <ExpandedEditInput input={input} />;
     case "Write":
+    case "write_file":
       return <ExpandedWriteInput input={input} />;
     case "TodoWrite":
       return <ExpandedTodoInput input={input} />;
     case "Read":
+    case "read_file":
       return <ExpandedReadInput input={input} />;
     case "Bash":
+    case "run_shell_command":
       return <ExpandedBashInput input={input} />;
     default:
       return <ExpandedDefaultInput input={input} />;
@@ -301,8 +319,8 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
   // 4. Read/Bash/Grep/Glob/Search → always collapsed (quiet unless clicked)
   // 5. Everything else → collapsed by default
 
-  const alwaysExpanded = ["Edit", "Write", "Bash"];
-  const alwaysCollapsed = ["Read", "Grep", "Glob", "WebSearch", "Task"];
+  const alwaysExpanded = ["Edit", "Write", "Bash", "replace", "write_file", "run_shell_command"];
+  const alwaysCollapsed = ["Read", "Grep", "Glob", "WebSearch", "Task", "read_file", "grep_search", "glob", "google_web_search"];
 
   const expanded = userToggle !== null
     ? userToggle
@@ -358,7 +376,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
 
           {/* Hide tool result for Edit/Write - the input already shows what changed.
               Only show results for errors or tools where the output matters (Read, Bash, etc.) */}
-          {toolResult && !["Edit", "Write"].includes(toolUse.name) && (
+          {toolResult && !["Edit", "Write", "replace", "write_file"].includes(toolUse.name) && (
             <pre
               className={`font-mono p-2.5 overflow-x-auto
                           max-h-[250px] overflow-y-auto border leading-[1.6]
@@ -377,7 +395,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
             </pre>
           )}
           {/* Always show errors, even for Edit/Write */}
-          {toolResult?.is_error && ["Edit", "Write"].includes(toolUse.name) && (
+          {toolResult?.is_error && ["Edit", "Write", "replace", "write_file"].includes(toolUse.name) && (
             <pre
               className="font-mono p-2.5 overflow-x-auto max-h-[250px] overflow-y-auto border leading-[1.6]
                          text-pane-error bg-[var(--pane-error-bg)] border-[var(--pane-error-border)]"
