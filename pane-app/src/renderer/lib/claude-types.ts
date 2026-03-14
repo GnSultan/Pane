@@ -51,13 +51,20 @@ export interface WebSearchToolResultBlock {
   content: WebSearchResult[] | WebSearchToolResultError;
 }
 
+export interface JsonBlock {
+  type: "json";
+  json: Record<string, unknown> | Array<unknown>;
+  raw?: string;
+}
+
 export type ContentBlock =
   | TextBlock
   | ToolUseBlock
   | ToolResultBlock
   | ThinkingBlock
   | ServerToolUseBlock
-  | WebSearchToolResultBlock;
+  | WebSearchToolResultBlock
+  | JsonBlock;
 
 // Top-level message types from stream-json
 
@@ -114,7 +121,7 @@ export interface StreamEvent {
     type: string;
     index?: number;
     delta?: {
-      type: string;
+      type: "text_delta" | "thinking_delta" | "partial_json_delta";
       text?: string;
       thinking?: string;
       signature?: string;
@@ -214,14 +221,15 @@ export interface ConversationState {
   isProcessing: boolean;
   isPlanning: boolean;
   isReady: boolean;
+  isRestored: boolean; // true once loaded from disk at startup
   error: string | null;
   todos: Todo[];
   pendingPlanApproval: boolean;
   // Session lifecycle
-  isProcessActive: boolean;  // Is the Claude CLI child process currently running?
-  lastActivity: number;       // Timestamp of last user interaction with this project
+  isProcessActive: boolean; // Is the Claude CLI child process currently running?
+  lastActivity: number; // Timestamp of last user interaction with this project
   // Context pressure tracking
-  contextTokens: number;          // Latest input_tokens from usage
+  contextTokens: number; // Latest input_tokens from usage
   contextPressure: ContextPressure;
   // Cached brief from last generateBrief — used for enhanced continuation
   cachedBrief: string;
@@ -230,7 +238,15 @@ export interface ConversationState {
 
 // Memory event types for automatic extraction
 export interface MemoryEvent {
-  type: "file_edit" | "error" | "error_fix" | "decision" | "command" | "summary" | "lesson" | "pattern";
+  type:
+    | "file_edit"
+    | "error"
+    | "error_fix"
+    | "decision"
+    | "command"
+    | "summary"
+    | "lesson"
+    | "pattern";
   content: string;
   timestamp: number;
   source?: "auto" | "claude";
@@ -246,7 +262,8 @@ export function createEmptyConversation(): ConversationState {
     serviceTier: null,
     isProcessing: false,
     isPlanning: false,
-    isReady: false,  // Will be set to true by warmup after initial message completes
+    isReady: false, // Will be set to true by warmup after initial message completes
+    isRestored: false,
     error: null,
     todos: [],
     pendingPlanApproval: false,

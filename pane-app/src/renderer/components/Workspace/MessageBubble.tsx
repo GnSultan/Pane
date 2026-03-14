@@ -6,6 +6,7 @@ import type {
   ThinkingBlock,
   ServerToolUseBlock,
   WebSearchToolResultBlock,
+  JsonBlock,
 } from "../../lib/claude-types";
 import { restoreCheckpoint, getCheckpointDiff } from "../../lib/tauri-commands";
 import type { CheckpointDiffFile } from "../../lib/tauri-commands";
@@ -14,10 +15,46 @@ import { setRestoreInProgress } from "../../hooks/useFileWatcher";
 import { ToolActivity, ServerToolActivity } from "./ToolActivity";
 import { MarkdownText } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
+import {
+  StreamingIndicator,
+  // CompactStreamingIndicator,
+} from "./StreamingIndicator";
 
 // No CSS containment — content-visibility: auto causes visible pop-in stutter
 // when messages scroll into view, which is worse than the layout cost it saves.
 // With memo'd React components, the DOM is stable and scroll is compositor-driven.
+
+// CSS animations for streaming
+const style = document.createElement("style");
+style.textContent = `
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .streaming-message {
+    animation: slideIn 0.2s ease-out;
+  }
+
+  .streaming-text {
+    animation: fadeIn 0.1s ease-out;
+  }
+
+  .thinking-pulse {
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+`;
+document.head.appendChild(style);
 
 function getMessageText(message: ConversationMessage): string {
   return message.content
@@ -31,24 +68,52 @@ function formatTokenCount(count: number): string {
   return String(count);
 }
 
-function CopyButton({ onClick, copied }: { onClick: () => void; copied: boolean }) {
+function CopyButton({
+  onClick,
+  copied,
+}: {
+  onClick: () => void;
+  copied: boolean;
+}) {
   return (
     <button
-      onClick={(e) => { e.stopPropagation(); onClick(); }}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
       className={`opacity-0 group-hover:opacity-100 btn-press
         w-7 h-7 flex items-center justify-center rounded shrink-0
-        ${copied
-          ? "text-pane-text-secondary"
-          : "text-pane-text-secondary/50 hover:text-pane-text-secondary hover:bg-pane-text/[0.06]"
+        ${
+          copied
+            ? "text-pane-text-secondary"
+            : "text-pane-text-secondary/50 hover:text-pane-text-secondary hover:bg-pane-text/[0.06]"
         }`}
       title="Copy"
     >
       {copied ? (
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 16 16"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
           <polyline points="3 8.5 6.5 12 13 4" />
         </svg>
       ) : (
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 16 16"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
           <rect x="5.5" y="5.5" width="8" height="8" rx="1" />
           <path d="M10.5 5.5V3.5a1 1 0 00-1-1h-6a1 1 0 00-1 1v6a1 1 0 001 1h2" />
         </svg>
@@ -79,7 +144,11 @@ function CheckpointIndicator({
       const project = useProjectsStore.getState().projects.get(projectId);
       if (project) {
         try {
-          const d = await getCheckpointDiff(projectId, checkpointId, project.root);
+          const d = await getCheckpointDiff(
+            projectId,
+            checkpointId,
+            project.root,
+          );
           setDiff(d.files);
         } catch {
           setDiff([]);
@@ -127,7 +196,10 @@ function CheckpointIndicator({
                    hover:text-pane-text-secondary font-mono btn-press"
         style={{ fontSize: "var(--pane-font-size-xs)" }}
       >
-        <span className="w-1 h-1 rounded-full" style={{ background: "var(--pane-terminal)" }} />
+        <span
+          className="w-1 h-1 rounded-full"
+          style={{ background: "var(--pane-terminal)" }}
+        />
         checkpoint
       </button>
       {expanded && diff !== null && (
@@ -170,11 +242,35 @@ interface MessageBubbleProps {
   projectId: string;
 }
 
-export function MessageBubble({ message, toolResults, projectId }: MessageBubbleProps) {
+function JsonBlockDisplay({ block }: { block: JsonBlock }) {
+  return (
+    <div className="my-6">
+      <div className="text-[10px] font-mono text-pane-text-secondary/40 mb-2 uppercase tracking-[0.1em]">
+        JSON OBJECT
+      </div>
+      <pre
+        className="font-mono text-pane-text-secondary bg-pane-bg
+                   p-5 overflow-x-auto max-h-[500px]
+                   overflow-y-auto border border-pane-border/60 leading-[1.6]"
+        style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
+      >
+        {block.json ? JSON.stringify(block.json, null, 2) : block.raw}
+      </pre>
+    </div>
+  );
+}
+
+export function MessageBubble({
+  message,
+  toolResults,
+  projectId,
+}: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   // Only animate on first mount — not when scrolling through old messages
   const isNewRef = useRef(true);
-  useEffect(() => { isNewRef.current = false; }, []);
+  useEffect(() => {
+    isNewRef.current = false;
+  }, []);
   const animClass = isNewRef.current ? "animate-fadeSlideUp" : "";
 
   // Graceful completion: track when streaming just ended to add settle animation
@@ -194,10 +290,13 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
   const handleCopy = useCallback(() => {
     const text = getMessageText(message);
     if (!text) return;
-    navigator.clipboard.writeText(text).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
-    }).catch(() => {});
+    navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      })
+      .catch(() => {});
   }, [message]);
 
   if (message.type === "user") {
@@ -218,7 +317,10 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
         </div>
         <div className="flex items-center justify-end gap-2 mt-1">
           {message.checkpointId && (
-            <CheckpointIndicator checkpointId={message.checkpointId} projectId={projectId} />
+            <CheckpointIndicator
+              checkpointId={message.checkpointId}
+              projectId={projectId}
+            />
           )}
           <CopyButton onClick={handleCopy} copied={copied} />
         </div>
@@ -245,8 +347,33 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
       return true;
     });
 
+    // Check if this is a DeepSeek R1 response with reasoning
+    const hasThinking = message.content.some((b) => b.type === "thinking");
+    const isDeepSeekR1 = hasThinking && message.isStreaming;
+
+    // Get provider info for streaming indicator
+    const project = useProjectsStore.getState().projects.get(projectId);
+    const routedModel = project?.conversation.routedModel || "";
+    // Parse the routedModel string to extract provider and model
+    // Format is usually "provider:model" or just "model"
+    let provider = "deepseek";
+    let model = "";
+    if (routedModel) {
+      if (routedModel.includes(":")) {
+        const parts = routedModel.split(":");
+        provider = parts[0] || "deepseek";
+        model = parts.slice(1).join(":");
+      } else {
+        model = routedModel;
+        // Try to infer provider from model name
+        if (model.includes("claude")) provider = "anthropic";
+        else if (model.includes("gemini")) provider = "gemini";
+        else if (model.includes("deepseek")) provider = "deepseek";
+      }
+    }
+
     // Group consecutive text/thinking blocks, but tools always get their own group
-    type GroupType = "text" | "tool" | "thinking";
+    type GroupType = "text" | "tool" | "thinking" | "json";
     const groups: { type: GroupType; blocks: typeof message.content }[] = [];
     for (const block of filteredContent) {
       let groupType: GroupType;
@@ -258,23 +385,45 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
         block.type === "web_search_tool_result"
       ) {
         groupType = "tool";
+      } else if (block.type === "json") {
+        groupType = "json";
       } else {
         groupType = "text";
       }
       const last = groups[groups.length - 1];
       // Only group consecutive text or thinking blocks together
-      // Tools always get their own group (one tool per line)
-      if (last && last.type === groupType && groupType !== "tool") {
+      // Tools and JSON always get their own group
+      if (
+        last &&
+        last.type === groupType &&
+        groupType !== "tool" &&
+        groupType !== "json"
+      ) {
         last.blocks.push(block);
       } else {
         groups.push({ type: groupType, blocks: [block] });
       }
     }
 
-    const hasText = message.content.some((b) => b.type === "text");
+    const hasVisibleContent = message.content.some(
+      (b) => b.type === "text" || b.type === "json",
+    );
 
     return (
-      <div className={`group ${animClass} ${hasText ? "mb-10" : "mb-1"}`}>
+      <div
+        className={`group ${animClass} ${hasVisibleContent ? "mb-10" : "mb-1"} ${message.isStreaming ? "streaming-message" : ""}`}
+      >
+        {/* Streaming indicator for DeepSeek and other providers */}
+        {message.isStreaming && (
+          <StreamingIndicator
+            isStreaming={message.isStreaming}
+            isReasoning={isDeepSeekR1}
+            provider={provider}
+            model={model}
+            speed="medium"
+          />
+        )}
+
         {groups.map((group, gi) => {
           if (group.type === "thinking") {
             return (
@@ -292,15 +441,35 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
 
           if (group.type === "text") {
             return (
-              <div key={gi} className="font-sans" style={{ fontWeight: "var(--pane-font-weight)" }}>
+              <div
+                key={gi}
+                className="font-sans"
+                style={{ fontWeight: "var(--pane-font-weight)" }}
+              >
                 {group.blocks.map((block, i) => {
                   const text = (block as { type: "text"; text: string }).text;
                   return (
-                    <div key={i}>
-                      <MarkdownText text={text} isStreaming={message.isStreaming} />
+                    <div
+                      key={i}
+                      className={message.isStreaming ? "streaming-text" : ""}
+                    >
+                      <MarkdownText
+                        text={text}
+                        isStreaming={message.isStreaming}
+                      />
                     </div>
                   );
                 })}
+              </div>
+            );
+          }
+
+          if (group.type === "json") {
+            return (
+              <div key={gi}>
+                {group.blocks.map((block, i) => (
+                  <JsonBlockDisplay key={i} block={block as JsonBlock} />
+                ))}
               </div>
             );
           }
@@ -312,10 +481,7 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
             const result = toolResults.get(toolBlock.id);
             return (
               <div key={gi} className="my-0.5">
-                <ToolActivity
-                  toolUse={toolBlock}
-                  toolResult={result}
-                />
+                <ToolActivity toolUse={toolBlock} toolResult={result} />
               </div>
             );
           }
@@ -347,7 +513,8 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
               justCompleted ? "opacity-0" : "opacity-100"
             }`}
           >
-            {(message.costUsd !== undefined || message.durationMs !== undefined) && (
+            {(message.costUsd !== undefined ||
+              message.durationMs !== undefined) && (
               <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary tracking-wider">
                 {message.costUsd !== undefined && (
                   <span>${message.costUsd.toFixed(4)}</span>
@@ -355,11 +522,13 @@ export function MessageBubble({ message, toolResults, projectId }: MessageBubble
                 {message.durationMs !== undefined && (
                   <span>{(message.durationMs / 1000).toFixed(1)}s</span>
                 )}
-                {message.inputTokens !== undefined && message.outputTokens !== undefined && (
-                  <span>
-                    {formatTokenCount(message.inputTokens)} in / {formatTokenCount(message.outputTokens)} out
-                  </span>
-                )}
+                {message.inputTokens !== undefined &&
+                  message.outputTokens !== undefined && (
+                    <span>
+                      {formatTokenCount(message.inputTokens)} in /{" "}
+                      {formatTokenCount(message.outputTokens)} out
+                    </span>
+                  )}
                 {message.numTurns !== undefined && message.numTurns > 1 && (
                   <span>{message.numTurns} turns</span>
                 )}

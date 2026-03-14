@@ -197,6 +197,11 @@ interface ProjectsState {
     projectId: string,
     input: Record<string, unknown>,
   ) => void;
+  updateLastAssistantJson: (
+    projectId: string,
+    json: any,
+    raw: string,
+  ) => void;
   setContextPressure: (
     projectId: string,
     tokens: number,
@@ -688,6 +693,25 @@ function createProjectsStore() {
         }),
       ),
 
+    updateLastAssistantJson: (projectId, json, raw) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const msgs = [...p.conversation.messages];
+          const last = msgs[msgs.length - 1];
+          if (last && last.type === "assistant") {
+            const blocks = [...last.content];
+            for (let i = blocks.length - 1; i >= 0; i--) {
+              if (blocks[i]!.type === "json") {
+                blocks[i] = { type: "json", json, raw };
+                break;
+              }
+            }
+            msgs[msgs.length - 1] = { ...last, content: blocks };
+          }
+          return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
     setContextPressure: (projectId, tokens, pressure) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -718,6 +742,7 @@ function createProjectsStore() {
             isProcessing: false,
             isPlanning: false,
             isReady: false,
+            isRestored: true,
             error: null,
             todos: [],
             pendingPlanApproval: false,

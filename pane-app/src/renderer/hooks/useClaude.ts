@@ -1,6 +1,7 @@
 import { useCallback, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
+
 import {
   sendToPunk,
   abortPunk,
@@ -10,6 +11,9 @@ import {
   generateBrief,
   brainIndexEvents,
   brainContextualSearch,
+  brainClearSessionPins,
+  sessionMergeState,
+  sessionClearState,
 } from "../lib/tauri-commands";
 import type {
   PunkStreamEvent as ClaudeStreamEvent,
@@ -22,48 +26,62 @@ import type {
   WebSearchToolResultBlock,
   MemoryEvent,
 } from "../lib/punk-types";
-import { inferAgentIntent, chooseModelForIntent, type AgentIntent } from "../lib/agent-routing";
+import {
+  inferAgentIntent,
+  chooseModelForIntent,
+  type AgentIntent,
+} from "../lib/agent-routing";
 
 let messageIdCounter = 0;
 function nextMessageId(): string {
   return `msg-${Date.now()}-${++messageIdCounter}`;
 }
 
-// Accumulates partial JSON fragments for streaming tool inputs.
-// Safe as module-level: JS is single-threaded, tool blocks stream sequentially,
-// and isProcessing guard prevents concurrent streams per project.
-let pendingToolJson = "";
-
-// Throttle streaming text/thinking deltas to batch rapid updates into single renders.
-// Accumulates text and flushes via rAF so we get at most one store update per frame.
 let pendingTextDelta = "";
 let pendingThinkingDelta = "";
 let textFlushRaf = 0;
 let thinkingFlushRaf = 0;
-
-// rAF throttle for tool input mutations — same pattern as text/thinking.
-// Accumulates parsed tool input, flushes once per frame instead of on every delta.
 let pendingToolInput: Record<string, unknown> | null = null;
 let toolInputFlushRaf = 0;
 
-// Tool JSON streaming guardrails:
-// - Parse at most once per frame (JSON.parse + fixPartialJson are expensive)
-// - Hard cap buffer growth to avoid runaway memory/CPU on huge tool inputs
+let pendingJsonDelta = "";
+let jsonFlushRaf = 0;
+let isStreamingJson = false;
+
 const MAX_STREAMING_TOOL_JSON_CHARS = 100_000;
 let toolJsonParseRaf = 0;
+let pendingToolJson = "";
 let pendingToolJsonTruncated = false;
 
-// rAF throttle for TodoWrite updates — ensures todos update smoothly during streaming
-// instead of batching all updates until the end.
 let pendingTodos: import("../lib/claude-types").Todo[] | null = null;
 let todosFlushRaf = 0;
 
 function flushToolInput(projectId: string) {
   if (pendingToolInput) {
-    useProjectsStore.getState().updateLastToolUseInput(projectId, pendingToolInput);
+    useProjectsStore
+      .getState()
+      .updateLastToolUseInput(projectId, pendingToolInput);
     pendingToolInput = null;
   }
   toolInputFlushRaf = 0;
+}
+
+function flushJsonDelta(projectId: string) {
+  if (pendingJsonDelta) {
+    const fixed = fixPartialJson(pendingJsonDelta);
+    try {
+      const parsed = JSON.parse(fixed);
+      useProjectsStore
+        .getState()
+        .updateLastAssistantJson(projectId, parsed, pendingJsonDelta);
+    } catch {
+      // Still show the raw text if it doesn't parse yet
+      useProjectsStore
+        .getState()
+        .updateLastAssistantJson(projectId, null, pendingJsonDelta);
+    }
+  }
+  jsonFlushRaf = 0;
 }
 
 function scheduleToolJsonParse(projectId: string) {
@@ -78,8 +96,6 @@ function scheduleToolJsonParse(projectId: string) {
     try {
       const parsed = JSON.parse(fixed) as Record<string, unknown>;
 
-      // TodoWrite detection stays inline — it only fires when input
-      // is fully parseable and triggers a different store method.
       const store = useProjectsStore.getState();
       const project = store.projects.get(projectId);
       if (project) {
@@ -90,23 +106,26 @@ function scheduleToolJsonParse(projectId: string) {
             .reverse()
             .find((b) => b.type === "tool_use") as ToolUseBlock | undefined;
           if (lastTool?.name === "TodoWrite" && (parsed as any).todos) {
-            // Throttle todo updates via rAF to prevent React 18 batching all updates
-            // Deep clone to ensure Zustand detects updates even within todo objects
-            pendingTodos = ((parsed as any).todos as import("../lib/claude-types").Todo[]).map((t) => ({ ...t }));
+            pendingTodos = (
+              (parsed as any).todos as import("../lib/claude-types").Todo[]
+            ).map((t) => ({ ...t }));
             if (!todosFlushRaf) {
-              todosFlushRaf = requestAnimationFrame(() => flushTodos(projectId));
+              todosFlushRaf = requestAnimationFrame(() =>
+                flushTodos(projectId),
+              );
             }
           }
         }
       }
 
-      // Throttle store update to once per animation frame
       pendingToolInput = parsed;
       if (!toolInputFlushRaf) {
-        toolInputFlushRaf = requestAnimationFrame(() => flushToolInput(projectId));
+        toolInputFlushRaf = requestAnimationFrame(() =>
+          flushToolInput(projectId),
+        );
       }
     } catch {
-      // Still incomplete/unparseable — wait for more chunks
+      // Still incomplete
     }
   });
 }
@@ -121,7 +140,9 @@ function flushTodos(projectId: string) {
 
 function flushTextDelta(projectId: string) {
   if (pendingTextDelta) {
-    useProjectsStore.getState().appendToLastAssistantText(projectId, pendingTextDelta);
+    useProjectsStore
+      .getState()
+      .appendToLastAssistantText(projectId, pendingTextDelta);
     pendingTextDelta = "";
   }
   textFlushRaf = 0;
@@ -129,16 +150,14 @@ function flushTextDelta(projectId: string) {
 
 function flushThinkingDelta(projectId: string) {
   if (pendingThinkingDelta) {
-    useProjectsStore.getState().appendToLastAssistantThinking(projectId, pendingThinkingDelta);
+    useProjectsStore
+      .getState()
+      .appendToLastAssistantThinking(projectId, pendingThinkingDelta);
     pendingThinkingDelta = "";
   }
   thinkingFlushRaf = 0;
 }
 
-/**
- * Close unclosed delimiters in partial JSON so incomplete streaming input
- * can be parsed and displayed progressively. Same approach as Zed's partial_json_fixer.
- */
 function fixPartialJson(s: string): string {
   let inString = false;
   let escape = false;
@@ -146,13 +165,22 @@ function fixPartialJson(s: string): string {
 
   for (let i = 0; i < s.length; i++) {
     const ch = s[i]!;
-    if (escape) { escape = false; continue; }
-    if (ch === '\\' && inString) { escape = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "" && inString) {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
     if (inString) continue;
-    if (ch === '{') stack.push('}');
-    else if (ch === '[') stack.push(']');
-    else if (ch === '}' || ch === ']') stack.pop();
+    if (ch === "{") stack.push("}");
+    else if (ch === "[") stack.push("]");
+    else if (ch === "}" || ch === "]") stack.pop();
   }
 
   let result = s;
@@ -161,11 +189,6 @@ function fixPartialJson(s: string): string {
   return result;
 }
 
-/**
- * Build a condensed briefing from accumulated project memory + last N messages.
- * Used to seed a fresh session when context window is hit.
- * Incorporates the cached brief (from generateBrief) so accumulated wisdom survives.
- */
 function buildContinuationBrief(projectId: string): string {
   const project = useProjectsStore.getState().projects.get(projectId);
   if (!project) return "Continue from where you left off.";
@@ -174,20 +197,22 @@ function buildContinuationBrief(projectId: string): string {
 
   const parts: string[] = [];
 
-  // Prepend accumulated project memory from brief.md
   if (cachedBrief) {
     parts.push(cachedBrief);
     parts.push("");
   }
 
   parts.push("---");
-  parts.push("The previous session hit the context window limit. Continuing automatically.");
+  parts.push(
+    "The previous session hit the context window limit. Continuing automatically.",
+  );
   parts.push("");
   parts.push("## Recent conversation");
   parts.push("");
 
-  // Last ~6 user+assistant pairs
-  const convoMsgs = messages.filter((m) => m.type === "user" || m.type === "assistant");
+  const convoMsgs = messages.filter(
+    (m) => m.type === "user" || m.type === "assistant",
+  );
   const recent = convoMsgs.slice(-12);
 
   for (const msg of recent) {
@@ -211,7 +236,9 @@ function buildContinuationBrief(projectId: string): string {
     }
   }
 
-  const activeTodos = todos.filter((t) => t.status === "in_progress" || t.status === "pending");
+  const activeTodos = todos.filter(
+    (t) => t.status === "in_progress" || t.status === "pending",
+  );
   if (activeTodos.length > 0) {
     parts.push("", "## Pending tasks");
     for (const todo of activeTodos) {
@@ -224,41 +251,34 @@ function buildContinuationBrief(projectId: string): string {
   return parts.join("\n");
 }
 
-/**
- * Extract memory events from the latest turn's messages.
- * Scans from the last user message to end of conversation for:
- * - File edits (Edit/Write tool uses)
- * - Errors + error→fix pairs
- * - Commands (Bash tool uses, truncated not dropped)
- * - Decisions auto-detected from assistant text
- * - Session summary (last assistant text)
- */
 function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
   const events: MemoryEvent[] = [];
   const now = Date.now();
 
-  // Find the last user message — everything after is "this turn"
   let turnStart = messages.length - 1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]!.type === "user") { turnStart = i; break; }
+    if (messages[i]!.type === "user") {
+      turnStart = i;
+      break;
+    }
   }
   const turnMessages = messages.slice(turnStart);
 
-  // Track last error for error→fix pair detection
   let lastError: string | null = null;
   let lastErrorTool: string | null = null;
 
   for (const msg of turnMessages) {
     for (const block of msg.content) {
-      // File edits
       if (block.type === "tool_use") {
         const tool = block as ToolUseBlock;
 
-        // Skip pane_remember — MCP server already writes these to events.jsonl
         if (tool.name === "pane_remember") continue;
 
         if (tool.name === "Edit" || tool.name === "Write") {
-          const filePath = (tool.input.file_path as string) || (tool.input.path as string) || "unknown";
+          const filePath =
+            (tool.input.file_path as string) ||
+            (tool.input.path as string) ||
+            "unknown";
           events.push({
             type: "file_edit",
             content: `${tool.name}: ${filePath}`,
@@ -267,7 +287,6 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
             metadata: { file: filePath, tool: tool.name },
           });
         }
-        // Commands — truncate instead of dropping long ones
         if (tool.name === "Bash") {
           const cmd = (tool.input.command as string) || "";
           if (cmd) {
@@ -281,8 +300,6 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
           }
         }
 
-        // Error→fix detection: if we have a pending error and see a successful
-        // tool_use of the same tool, emit an error_fix pair
         if (lastError && lastErrorTool && tool.name === lastErrorTool) {
           events.push({
             type: "error_fix",
@@ -295,8 +312,10 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
           lastErrorTool = null;
         }
       }
-      // Errors from tool results
-      if (block.type === "tool_result" && (block as { is_error?: boolean }).is_error) {
+      if (
+        block.type === "tool_result" &&
+        (block as { is_error?: boolean }).is_error
+      ) {
         const content = (block as { content: string }).content || "";
         if (content.length < 500) {
           events.push({
@@ -305,14 +324,15 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
             timestamp: now,
             source: "auto",
           });
-          // Track for error→fix pairing
           lastError = content.slice(0, 300);
-          // Try to find which tool this result belongs to
           const toolUseId = (block as { tool_use_id?: string }).tool_use_id;
           if (toolUseId) {
             for (const m of turnMessages) {
               for (const b of m.content) {
-                if (b.type === "tool_use" && (b as ToolUseBlock).id === toolUseId) {
+                if (
+                  b.type === "tool_use" &&
+                  (b as ToolUseBlock).id === toolUseId
+                ) {
                   lastErrorTool = (b as ToolUseBlock).name;
                 }
               }
@@ -323,48 +343,54 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
     }
   }
 
-  // Decision detection from assistant text
   const decisionPatterns = [
     /(?:I'll|I will|Let's|Going to|chose|choosing|decided|using|switched to)\s+(.{10,150})/gi,
     /(?:instead of|rather than|over)\s+(.{10,100})/gi,
   ];
 
-  const lastAssistant = [...turnMessages].reverse().find(m => m.type === "assistant");
+  const lastAssistant = [...turnMessages]
+    .reverse()
+    .find((m) => m.type === "assistant");
   if (lastAssistant) {
-    const textBlocks = lastAssistant.content.filter(b => b.type === "text");
+    const textBlocks = lastAssistant.content.filter((b) => b.type === "text");
     if (textBlocks.length > 0) {
       const fullText = textBlocks
-        .map(b => (b as { type: "text"; text: string }).text)
+        .map((b) => (b as { type: "text"; text: string }).text)
         .join("\n")
         .trim();
 
-      // Extract decisions
       const seenDecisions = new Set<string>();
       for (const pattern of decisionPatterns) {
         pattern.lastIndex = 0;
         let match;
         while ((match = pattern.exec(fullText)) !== null) {
           const decision = match[1]?.trim();
-          if (decision && decision.length >= 10 && !seenDecisions.has(decision)) {
+          if (
+            decision &&
+            decision.length >= 10 &&
+            !seenDecisions.has(decision)
+          ) {
             seenDecisions.add(decision);
             events.push({
               type: "decision",
-              content: decision.length > 150 ? decision.slice(0, 150) + "..." : decision,
+              content:
+                decision.length > 150
+                  ? decision.slice(0, 150) + "..."
+                  : decision,
               timestamp: now,
               source: "auto",
             });
           }
-          // Cap at 3 decisions per turn to avoid noise
           if (seenDecisions.size >= 3) break;
         }
         if (seenDecisions.size >= 3) break;
       }
 
-      // Session summary
       if (fullText.length > 20) {
         events.push({
           type: "summary",
-          content: fullText.length > 500 ? fullText.slice(0, 500) + "..." : fullText,
+          content:
+            fullText.length > 500 ? fullText.slice(0, 500) + "..." : fullText,
           timestamp: now,
           source: "auto",
         });
@@ -375,13 +401,99 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
   return events;
 }
 
-// Context window sizes by model family (input tokens)
+function extractSessionDelta(messages: ConversationMessage[]) {
+  const now = Date.now();
+  const workingSet: { path: string; purpose?: string }[] = [];
+  const decisions: { content: string }[] = [];
+  const recentActions: { type: string; content: string; timestamp: number }[] =
+    [];
+
+  let turnStart = messages.length - 1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.type === "user") {
+      turnStart = i;
+      break;
+    }
+  }
+  const turnMessages = messages.slice(turnStart);
+
+  for (const msg of turnMessages) {
+    for (const block of msg.content) {
+      if (block.type === "tool_use") {
+        const tool = block as ToolUseBlock;
+        if (
+          tool.name === "Edit" ||
+          tool.name === "Write" ||
+          tool.name === "Read"
+        ) {
+          const filePath =
+            (tool.input.file_path as string) ||
+            (tool.input.path as string) ||
+            (tool.input.target_file as string) ||
+            "";
+          if (filePath) {
+            workingSet.push({ path: filePath });
+            recentActions.push({
+              type: tool.name.toLowerCase(),
+              content: filePath,
+              timestamp: now,
+            });
+          }
+        }
+        if (tool.name === "Bash") {
+          const cmd = (tool.input.command as string) || "";
+          if (cmd)
+            recentActions.push({
+              type: "command",
+              content: cmd.slice(0, 120),
+              timestamp: now,
+            });
+        }
+      }
+    }
+  }
+
+  const lastAssistant = [...turnMessages]
+    .reverse()
+    .find((m) => m.type === "assistant");
+  if (lastAssistant) {
+    const text = lastAssistant.content
+      .filter((b) => b.type === "text")
+      .map((b) => (b as { type: "text"; text: string }).text)
+      .join("\n");
+
+    const decisionPatterns = [
+      /(?:I'll|I will|We'll|Let's|Going to|chose|choosing|decided|using|switched to)\s+(.{15,120})/gi,
+    ];
+    const seen = new Set<string>();
+    for (const pattern of decisionPatterns) {
+      pattern.lastIndex = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        const d = match[1]?.trim();
+        if (d && d.length >= 15 && !seen.has(d.slice(0, 40).toLowerCase())) {
+          seen.add(d.slice(0, 40).toLowerCase());
+          decisions.push({
+            content: d.length > 120 ? d.slice(0, 120) + "..." : d,
+          });
+          if (seen.size >= 3) break;
+        }
+      }
+      if (seen.size >= 3) break;
+    }
+  }
+
+  if (!workingSet.length && !decisions.length && !recentActions.length)
+    return null;
+  return { workingSet, decisions, recentActions };
+}
+
 const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   opus: 200000,
   sonnet: 200000,
   haiku: 200000,
-  "gemini-3": 2000000, // Gemini 3.x family defaults to 2M
-  "gemini-2": 1000000, // Gemini 2.x family defaults to 1M
+  "gemini-3": 2000000,
+  "gemini-2": 1000000,
 };
 
 export function getContextLimit(model: string | null): number {
@@ -396,7 +508,6 @@ export function getContextLimit(model: string | null): number {
 export function usePunk(projectId: string) {
   const abortingRef = useRef(false);
   const continuationRef = useRef<string | null>(null);
-  // Proactive continuation: set to true when context hits 85%, consumed on next processEnded
   const proactiveContinuationRef = useRef(false);
 
   const sendMessage = useCallback(
@@ -406,10 +517,8 @@ export function usePunk(projectId: string) {
       if (!project) return;
       if (project.conversation.isProcessing) return;
 
-      // Ensure any background process (like warmup) is killed before we start
       await abortPunk(projectId).catch(() => {});
 
-      // Build user message (ID generated early for checkpoint linking)
       const messageId = nextMessageId();
       const userMessage: ConversationMessage = {
         id: messageId,
@@ -419,7 +528,6 @@ export function usePunk(projectId: string) {
         isStreaming: false,
       };
 
-      // Snapshot files before Claude touches anything (3s timeout — never block the user)
       try {
         const cpResult = await Promise.race([
           createCheckpoint(projectId, project.root, messageId),
@@ -436,7 +544,9 @@ export function usePunk(projectId: string) {
             fileCount: cpResult.fileCount,
           });
         }
-      } catch {}
+      } catch {
+        // ignore
+      }
 
       store.addConversationMessage(projectId, userMessage);
       store.setConversationProcessing(projectId, true);
@@ -451,30 +561,27 @@ export function usePunk(projectId: string) {
           clearTimeout(resultSafetyTimer);
           resultSafetyTimer = null;
         }
-        // Force-abort backend to ensure CLI processes are killed if we're timing out
         abortPunk(projectId).catch(() => {});
 
         const s = useProjectsStore.getState();
         s.setConversationProcessing(projectId, false);
-        s.setConversationRoutedModel(projectId, null); // Reset routed model
+        s.setConversationRoutedModel(projectId, null);
         s.setLastMessageStreamingDone(projectId);
         s.setIsPlanning(projectId, false);
 
-        // Clear status message with a slight delay to match the fadeout timer
         setTimeout(() => {
           const current = useProjectsStore.getState().projects.get(projectId);
           if (current && !current.conversation.isProcessing) {
-            useProjectsStore.getState().setConversationStatusMessage(projectId, null);
+            useProjectsStore
+              .getState()
+              .setConversationStatusMessage(projectId, null);
           }
         }, 1500);
 
-        // Skip sound and notification if we're auto-continuing after context limit
         if (continuationRef.current) return;
 
-        // Play completion sound when processing finishes
         useWorkspaceStore.getState().playCompletionSound();
 
-        // Show notification badge if this isn't the active project
         if (s.activeProjectId !== projectId) {
           const proj = s.projects.get(projectId);
           if (proj) {
@@ -488,14 +595,14 @@ export function usePunk(projectId: string) {
       };
 
       const handleEvent = (event: ClaudeStreamEvent) => {
-        // Reset safety timer on ANY event from Gemini — we only want to trigger
-        // if the pipe goes completely silent without a proper finish.
         if (resultSafetyTimer) {
           clearTimeout(resultSafetyTimer);
           resultSafetyTimer = setTimeout(() => {
-            console.warn("[pane] resultSafetyTimer triggered — Gemini pipe went silent");
+            console.warn(
+              "[pane] resultSafetyTimer triggered — Gemini pipe went silent",
+            );
             finishProcessing();
-          }, 5000);
+          }, 300000);
         }
 
         switch (event.event) {
@@ -513,7 +620,6 @@ export function usePunk(projectId: string) {
 
           case "message": {
             try {
-              // Main process pre-parses JSON; fall back to raw_json if needed
               const msg: ClaudeStreamMessage =
                 event.data.parsed ?? JSON.parse(event.data.raw_json!);
               assistantMessageAdded = handleClaudeMessage(
@@ -522,21 +628,25 @@ export function usePunk(projectId: string) {
                 assistantMessageAdded,
               );
 
-              // Arm proactive continuation when context pressure hits high
               if (msg.type === "result") {
-                const proj = useProjectsStore.getState().projects.get(projectId);
-                if (proj?.conversation.contextPressure === "high" && !proactiveContinuationRef.current) {
+                const proj = useProjectsStore
+                  .getState()
+                  .projects.get(projectId);
+                if (
+                  proj?.conversation.contextPressure === "high" &&
+                  !proactiveContinuationRef.current
+                ) {
                   proactiveContinuationRef.current = true;
                 }
               }
 
-              // Safety: if Claude sent a final result but the process hangs,
-              // force-clear processing state after 5 seconds.
               if (msg.type === "result" && !resultSafetyTimer) {
                 resultSafetyTimer = setTimeout(() => {
-                  console.warn("[pane] Process hung after result — force-clearing processing state");
+                  console.warn(
+                    "[pane] Process hung after result — force-clearing processing state",
+                  );
                   finishProcessing();
-                }, 5000);
+                }, 30000);
               }
             } catch (e) {
               console.error("Failed to parse claude message:", e);
@@ -547,44 +657,59 @@ export function usePunk(projectId: string) {
           case "processEnded": {
             finishProcessing();
 
-            // --- Intelligence Layer: extract memory + regenerate brief + index brain ---
             try {
               const proj = useProjectsStore.getState().projects.get(projectId);
               if (proj && proj.conversation.messages.length > 1) {
-                const memEvents = extractMemoryEvents(proj.conversation.messages);
+                const memEvents = extractMemoryEvents(
+                  proj.conversation.messages,
+                );
                 if (memEvents.length > 0) {
                   recordMemoryEvents(projectId, memEvents).catch(() => {});
-                  // Feed events into the brain knowledge graph
                   brainIndexEvents(projectId, memEvents).catch(() => {});
                 }
-                // Generate brief and cache it for enhanced continuation
-                generateBrief(projectId).then((brief) => {
-                  if (brief) {
-                    useProjectsStore.getState().setCachedBrief(projectId, brief);
-                  }
-                }).catch(() => {});
-              }
-            } catch {}
+                generateBrief(projectId)
+                  .then((brief) => {
+                    if (brief) {
+                      useProjectsStore
+                        .getState()
+                        .setCachedBrief(projectId, brief);
+                    }
+                  })
+                  .catch(() => {});
 
-            // --- Proactive continuation at 85% context pressure ---
+                const sessionDelta = extractSessionDelta(
+                  proj.conversation.messages,
+                );
+                if (sessionDelta) {
+                  sessionMergeState(projectId, sessionDelta).catch(() => {});
+                }
+              }
+            } catch {
+              // ignore
+            }
+
             if (proactiveContinuationRef.current && !continuationRef.current) {
               proactiveContinuationRef.current = false;
               const brief = buildContinuationBrief(projectId);
               useProjectsStore.getState().clearConversation(projectId);
-              window.dispatchEvent(new CustomEvent("pane:context-refreshed", { detail: { projectId } }));
-              setTimeout(() => sendMessage(brief), 50);
-              return; // Skip normal flow — continuation takes over
+              brainClearSessionPins(projectId).catch(() => {});
+              window.dispatchEvent(
+                new CustomEvent("pane:context-refreshed", {
+                  detail: { projectId },
+                }),
+              );
+              setTimeout(() => sendMessage(brief), 100);
+              return;
             }
             break;
           }
 
           case "error": {
-            const isContextLimit = /context window|context length|maximum context/i.test(
-              event.data.message,
-            );
+            const isContextLimit =
+              /context window|context length|maximum context/i.test(
+                event.data.message,
+              );
             if (isContextLimit) {
-              // Build brief now while conversation state is still intact.
-              // Don't surface an error — auto-continuation takes over after processEnded.
               continuationRef.current = buildContinuationBrief(projectId);
             } else {
               const s = useProjectsStore.getState();
@@ -598,27 +723,35 @@ export function usePunk(projectId: string) {
       };
 
       try {
-        // Proactive injection: trigger brain contextual search before spawning Claude.
-        // Writes ~/.pane/brain/context/{projectId}.json which claude-worker reads.
-        // Fire-and-forget with short timeout — don't delay the user.
-        const activeFile = project.activeFilePath || undefined;
-        await Promise.race([
-          brainContextualSearch(projectId, prompt, activeFile).catch(() => {}),
-          new Promise(resolve => setTimeout(resolve, 500)),
-        ]);
-
-        // --- Agent routing: choose model based on intent (plan vs execute vs explain) ---
         const conversation = project.conversation;
         const intent: AgentIntent = inferAgentIntent({ prompt, conversation });
+
+        const activeFile = project.activeFilePath || undefined;
+        await Promise.race([
+          brainContextualSearch(
+            projectId,
+            prompt,
+            activeFile,
+            intent,
+            project.root,
+          ).catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 500)),
+        ]);
         const selectedModel = useWorkspaceStore.getState().selectedModel;
+        const selectedModelThinking =
+          useWorkspaceStore.getState().selectedModelThinking;
+        const selectedModelProvider =
+          useWorkspaceStore.getState().selectedModelProvider;
         const routedModel = chooseModelForIntent(selectedModel, intent);
 
-        // Start safety timer — if sendToPunk hangs or Gemini never replies,
-        // we'll clear the stuck UI state after 5 seconds.
         resultSafetyTimer = setTimeout(() => {
-          console.warn("[pane] resultSafetyTimer triggered (initialization hang)");
+          console.warn(
+            "[pane] resultSafetyTimer triggered (initialization hang)",
+          );
           finishProcessing();
         }, 5000);
+
+        const truncatedHistory = conversation.messages.slice(-20);
 
         await sendToPunk(
           projectId,
@@ -628,7 +761,9 @@ export function usePunk(projectId: string) {
           routedModel,
           handleEvent,
           intent,
-          conversation.messages,
+          truncatedHistory,
+          selectedModelThinking,
+          selectedModelProvider,
         );
       } catch (err) {
         console.error("[pane] sendToClaude error:", err);
@@ -637,14 +772,10 @@ export function usePunk(projectId: string) {
         store.setConversationProcessing(projectId, false);
       }
 
-      // Auto-continuation after context window limit:
-      // Build brief was stored in continuationRef by the error handler.
-      // Clear the session and fire a fresh one with the condensed handoff.
       if (continuationRef.current) {
         const brief = continuationRef.current;
         continuationRef.current = null;
         useProjectsStore.getState().clearConversation(projectId);
-        // Let state settle before starting the new session
         setTimeout(() => sendMessage(brief), 50);
       }
     },
@@ -669,18 +800,15 @@ export function usePunk(projectId: string) {
     useProjectsStore.getState().clearConversation(projectId);
     useProjectsStore.getState().clearCheckpoints(projectId);
     deleteProjectCheckpoints(projectId).catch(() => {});
+    brainClearSessionPins(projectId).catch(() => {});
+    sessionClearState(projectId).catch(() => {});
   }, [projectId]);
 
   return { sendMessage, abortMessage, clearConversation };
 }
 
-// Backwards-compatible alias while we complete the rename across the app.
 export const useClaude = usePunk;
 
-/**
- * Process a parsed stream-json message and update the store.
- * Returns whether an assistant message now exists in the conversation.
- */
 function handleClaudeMessage(
   msg: ClaudeStreamMessage,
   projectId: string,
@@ -688,8 +816,6 @@ function handleClaudeMessage(
 ): boolean {
   const store = useProjectsStore.getState();
 
-  // Flush any buffered streaming deltas before processing a new message type
-  // (assistant/user/result messages replace or finalize content)
   if (msg.type !== "stream_event") {
     if (pendingTextDelta) {
       cancelAnimationFrame(textFlushRaf);
@@ -707,10 +833,13 @@ function handleClaudeMessage(
       cancelAnimationFrame(todosFlushRaf);
       flushTodos(projectId);
     }
+    if (pendingJsonDelta) {
+      cancelAnimationFrame(jsonFlushRaf);
+      flushJsonDelta(projectId);
+    }
+    isStreamingJson = false;
   }
 
-  // Large messages (>100KB) are skipped in the worker to avoid structured clone freeze.
-  // They send a stub with { type, skipped: true } — nothing to render.
   if ("skipped" in msg) {
     return assistantMessageExists;
   }
@@ -722,14 +851,12 @@ function handleClaudeMessage(
         if (msg.model) {
           store.setConversationModel(projectId, msg.model);
         }
-        // Mark conversation as ready once we have the model
         store.setConversationReady(projectId, true);
       }
       return assistantMessageExists;
     }
 
     case "assistant": {
-      // Deduplicate tool_use blocks by ID in the final assistant message
       const rawContent = msg.message.content as ContentBlock[];
       const seenToolIds = new Set<string>();
       const finalContent = rawContent.filter((block) => {
@@ -742,28 +869,36 @@ function handleClaudeMessage(
       });
 
       if (assistantMessageExists) {
-        // Merge: preserve streamed blocks that aren't in the final content
         const project = store.projects.get(projectId);
         if (project) {
           const msgs = project.conversation.messages;
           const last = msgs[msgs.length - 1];
           if (last && last.type === "assistant") {
-            const streamedTextBlocks = last.content.filter((b) => b.type === "text");
-            const streamedThinkingBlocks = last.content.filter((b) => b.type === "thinking");
+            const streamedTextBlocks = last.content.filter(
+              (b) => b.type === "text",
+            );
+            const streamedThinkingBlocks = last.content.filter(
+              (b) => b.type === "thinking",
+            );
             const finalHasText = finalContent.some((b) => b.type === "text");
-            const finalHasThinking = finalContent.some((b) => b.type === "thinking");
+            const finalHasThinking = finalContent.some(
+              (b) => b.type === "thinking",
+            );
 
             let merged = finalContent;
-            // If we streamed thinking but final has none, prepend streamed thinking
             if (streamedThinkingBlocks.length > 0 && !finalHasThinking) {
               merged = [...streamedThinkingBlocks, ...merged];
             }
-            // If we streamed text but final has no text blocks, prepend streamed text
             if (streamedTextBlocks.length > 0 && !finalHasText) {
-              // Insert text blocks after any thinking blocks
-              const thinkingEnd = merged.findIndex((b) => b.type !== "thinking");
+              const thinkingEnd = merged.findIndex(
+                (b) => b.type !== "thinking",
+              );
               const insertAt = thinkingEnd === -1 ? merged.length : thinkingEnd;
-              merged = [...merged.slice(0, insertAt), ...streamedTextBlocks, ...merged.slice(insertAt)];
+              merged = [
+                ...merged.slice(0, insertAt),
+                ...streamedTextBlocks,
+                ...merged.slice(insertAt),
+              ];
             }
             store.updateLastAssistantContent(projectId, merged);
           } else {
@@ -774,10 +909,12 @@ function handleClaudeMessage(
         }
         store.setLastMessageStreamingDone(projectId);
 
-        // Auto-clear todos if all completed
         if (project) {
           const todos = project.conversation.todos;
-          if (todos.length > 0 && todos.every((t) => t.status === "completed")) {
+          if (
+            todos.length > 0 &&
+            todos.every((t) => t.status === "completed")
+          ) {
             store.setConversationTodos(projectId, []);
           }
         }
@@ -795,7 +932,6 @@ function handleClaudeMessage(
     }
 
     case "user": {
-      // Auto-generated tool results — add as system type for rendering
       const toolResultMsg: ConversationMessage = {
         id: nextMessageId(),
         type: "system",
@@ -804,7 +940,6 @@ function handleClaudeMessage(
         isStreaming: false,
       };
       store.addConversationMessage(projectId, toolResultMsg);
-      // Next assistant turn starts fresh
       return false;
     }
 
@@ -819,17 +954,16 @@ function handleClaudeMessage(
           msg.num_turns,
         );
 
-        // Track context window usage for pressure indicator
         if (msg.usage?.input_tokens) {
-          const model = store.projects.get(projectId)?.conversation.model ?? null;
+          const model =
+            store.projects.get(projectId)?.conversation.model ?? null;
           const limit = getContextLimit(model);
           const ratio = msg.usage.input_tokens / limit;
-          const pressure = ratio >= 0.85 ? "high" : ratio >= 0.70 ? "building" : "none";
+          const pressure =
+            ratio >= 0.85 ? "high" : ratio >= 0.7 ? "building" : "none";
           store.setContextPressure(projectId, msg.usage.input_tokens, pressure);
         }
 
-        // Text-based plan detection: with --dangerously-skip-permissions,
-        // EnterPlanMode/ExitPlanMode tools won't fire. Detect plan from text.
         const project = store.projects.get(projectId);
         if (project) {
           const msgs = project.conversation.messages;
@@ -840,30 +974,25 @@ function handleClaudeMessage(
               .map((b) => (b as { type: "text"; text: string }).text)
               .join("\n")
               .trim();
-            // Detect plan prompts like "Ready to proceed" / "send 'go'" etc.
             if (
-              /ready to proceed|send ['"]go['"]/i.test(
-                fullText.slice(-200),
-              )
+              /ready to proceed|send ['"]go['"]/i.test(fullText.slice(-200))
             ) {
               store.setPendingPlanApproval(projectId, true);
             }
           }
         }
       } else if (msg.subtype !== "success") {
-        // "interrupted" is expected — user abort or warmup silent abort. Not an error.
         if (msg.subtype === "interrupted") return assistantMessageExists;
 
         console.warn("[pane] Claude non-success result:", msg.subtype, msg);
 
-        // Don't overwrite a more specific error already set by the error event
-        // (stderr output arrives as an error event before the result message)
         const existing = store.projects.get(projectId)?.conversation.error;
         if (!existing) {
           const detail = msg.error?.trim() || msg.result?.trim();
           store.setConversationError(
             projectId,
-            detail || `Claude exited unexpectedly (${msg.subtype ?? "unknown"})`,
+            detail ||
+              `Claude exited unexpectedly (${msg.subtype ?? "unknown"})`,
           );
         }
       }
@@ -873,8 +1002,6 @@ function handleClaudeMessage(
     case "stream_event": {
       const evt = msg.event;
 
-      // Flush pending deltas before any content_block_start
-      // (new blocks need the accumulated text written first)
       if (evt.type === "content_block_start") {
         if (pendingTextDelta) {
           cancelAnimationFrame(textFlushRaf);
@@ -894,13 +1021,42 @@ function handleClaudeMessage(
         }
       }
 
-      // Streaming text — throttled to one store update per animation frame
       if (
         evt.type === "content_block_delta" &&
         evt.delta?.type === "text_delta" &&
         evt.delta.text
       ) {
         store.setConversationStatusMessage(projectId, null);
+
+        // JSON detection: if message starts with { or [, switch to JSON streaming mode
+        if (
+          !assistantMessageExists &&
+          (evt.delta.text.trim().startsWith("{") ||
+            evt.delta.text.trim().startsWith("["))
+        ) {
+          isStreamingJson = true;
+          pendingJsonDelta = evt.delta.text;
+          const placeholder: ConversationMessage = {
+            id: nextMessageId(),
+            type: "assistant",
+            content: [{ type: "json", json: {}, raw: evt.delta.text }],
+            timestamp: Date.now(),
+            isStreaming: true,
+          };
+          store.addConversationMessage(projectId, placeholder);
+          return true;
+        }
+
+        if (isStreamingJson) {
+          pendingJsonDelta += evt.delta.text;
+          if (!jsonFlushRaf) {
+            jsonFlushRaf = requestAnimationFrame(() =>
+              flushJsonDelta(projectId),
+            );
+          }
+          return true;
+        }
+
         if (!assistantMessageExists) {
           const placeholder: ConversationMessage = {
             id: nextMessageId(),
@@ -914,13 +1070,14 @@ function handleClaudeMessage(
         } else {
           pendingTextDelta += evt.delta.text;
           if (!textFlushRaf) {
-            textFlushRaf = requestAnimationFrame(() => flushTextDelta(projectId));
+            textFlushRaf = requestAnimationFrame(() =>
+              flushTextDelta(projectId),
+            );
           }
           return true;
         }
       }
 
-      // Streaming thinking — throttled to one store update per animation frame
       if (
         evt.type === "content_block_delta" &&
         evt.delta?.type === "thinking_delta" &&
@@ -940,16 +1097,17 @@ function handleClaudeMessage(
         } else {
           pendingThinkingDelta += evt.delta.thinking;
           if (!thinkingFlushRaf) {
-            thinkingFlushRaf = requestAnimationFrame(() => flushThinkingDelta(projectId));
+            thinkingFlushRaf = requestAnimationFrame(() =>
+              flushThinkingDelta(projectId),
+            );
           }
           return true;
         }
       }
 
-      // Thinking signature
       if (
         evt.type === "content_block_delta" &&
-        evt.delta?.type === "signature_delta" &&
+        evt.delta?.type === "text_delta" &&
         evt.delta.signature
       ) {
         if (assistantMessageExists) {
@@ -958,7 +1116,6 @@ function handleClaudeMessage(
         return assistantMessageExists;
       }
 
-      // Thinking block start
       if (
         evt.type === "content_block_start" &&
         evt.content_block?.type === "thinking"
@@ -979,7 +1136,10 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              const newContent = [...last.content, evt.content_block as ThinkingBlock];
+              const newContent = [
+                ...last.content,
+                evt.content_block as ThinkingBlock,
+              ];
               store.updateLastAssistantContent(projectId, newContent);
             }
           }
@@ -987,7 +1147,6 @@ function handleClaudeMessage(
         return assistantMessageExists;
       }
 
-      // Tool use block start
       if (
         evt.type === "content_block_start" &&
         evt.content_block?.type === "tool_use"
@@ -1000,18 +1159,20 @@ function handleClaudeMessage(
         }
         const toolBlock = evt.content_block as ToolUseBlock;
 
-        // Set status message based on tool name
         let status = `using ${toolBlock.name.toLowerCase()}...`;
-        if (toolBlock.name === "read_file" || toolBlock.name === "Read") status = "reading file...";
-        if (toolBlock.name === "replace" || toolBlock.name === "Edit") status = "editing file...";
-        if (toolBlock.name === "write_file" || toolBlock.name === "Write") status = "writing file...";
-        if (toolBlock.name === "grep_search" || toolBlock.name === "Grep") status = "searching...";
-        if (toolBlock.name === "run_shell_command" || toolBlock.name === "Bash") status = "running command...";
+        if (toolBlock.name === "read_file" || toolBlock.name === "Read")
+          status = "reading file...";
+        if (toolBlock.name === "replace" || toolBlock.name === "Edit")
+          status = "editing file...";
+        if (toolBlock.name === "write_file" || toolBlock.name === "Write")
+          status = "writing file...";
+        if (toolBlock.name === "grep_search" || toolBlock.name === "Grep")
+          status = "searching...";
+        if (toolBlock.name === "run_shell_command" || toolBlock.name === "Bash")
+          status = "running command...";
         store.setConversationStatusMessage(projectId, status);
 
         if (!assistantMessageExists) {
-          // Claude started this turn directly with a tool call (no text/thinking first).
-          // Create a placeholder so TodoWrite detection and tool rendering work correctly.
           const placeholder: ConversationMessage = {
             id: nextMessageId(),
             type: "assistant",
@@ -1026,9 +1187,10 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              // Avoid duplicate tool_use blocks with the same ID (can happen with some backends)
               const alreadyExists = last.content.some(
-                (b) => b.type === "tool_use" && (b as ToolUseBlock).id === toolBlock.id
+                (b) =>
+                  b.type === "tool_use" &&
+                  (b as ToolUseBlock).id === toolBlock.id,
               );
               if (!alreadyExists) {
                 store.updateLastAssistantContent(projectId, [
@@ -1047,18 +1209,13 @@ function handleClaudeMessage(
           store.setPendingPlanApproval(projectId, true);
           store.setIsPlanning(projectId, false);
         }
-        // With --dangerously-skip-permissions, plan tools won't fire.
-        // Plan detection via text pattern happens in the "result" handler.
 
         return true;
       }
 
-      // Streaming tool input (input_json_delta)
-      // Uses fixPartialJson to close unclosed delimiters so partial inputs
-      // are visible during streaming. Store updates are rAF-throttled.
       if (
         evt.type === "content_block_delta" &&
-        evt.delta?.type === "input_json_delta" &&
+        evt.delta?.type === "partial_json_delta" &&
         evt.delta.partial_json
       ) {
         if (pendingToolJsonTruncated) return assistantMessageExists;
@@ -1073,17 +1230,17 @@ function handleClaudeMessage(
               "Tool input streaming truncated (too large). Full input may still be available in the final message.",
           };
           if (!toolInputFlushRaf) {
-            toolInputFlushRaf = requestAnimationFrame(() => flushToolInput(projectId));
+            toolInputFlushRaf = requestAnimationFrame(() =>
+              flushToolInput(projectId),
+            );
           }
           return assistantMessageExists;
         }
 
-        // Parse at most once per frame to avoid repeated O(n) scans + JSON.parse per chunk.
         scheduleToolJsonParse(projectId);
         return assistantMessageExists;
       }
 
-      // Server tool use block start (web search, etc.)
       if (
         evt.type === "content_block_start" &&
         evt.content_block?.type === "server_tool_use"
@@ -1094,7 +1251,10 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              const newContent = [...last.content, evt.content_block as ServerToolUseBlock];
+              const newContent = [
+                ...last.content,
+                evt.content_block as ServerToolUseBlock,
+              ];
               store.updateLastAssistantContent(projectId, newContent);
             }
           }
@@ -1102,7 +1262,6 @@ function handleClaudeMessage(
         return assistantMessageExists;
       }
 
-      // Web search tool result
       if (
         evt.type === "content_block_start" &&
         evt.content_block?.type === "web_search_tool_result"
@@ -1113,7 +1272,10 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              const newContent = [...last.content, evt.content_block as WebSearchToolResultBlock];
+              const newContent = [
+                ...last.content,
+                evt.content_block as WebSearchToolResultBlock,
+              ];
               store.updateLastAssistantContent(projectId, newContent);
             }
           }
@@ -1121,7 +1283,6 @@ function handleClaudeMessage(
         return assistantMessageExists;
       }
 
-      // Block finished
       if (evt.type === "content_block_stop") {
         const project = store.projects.get(projectId);
         if (project) {
@@ -1129,8 +1290,11 @@ function handleClaudeMessage(
           const last = msgs[msgs.length - 1];
           if (last && last.type === "assistant") {
             const lastBlock = last.content[last.content.length - 1];
-            if (lastBlock && (lastBlock.type === "tool_use" || lastBlock.type === "server_tool_use")) {
-              // Tool finished, transition back to generic thinking until next turn/block
+            if (
+              lastBlock &&
+              (lastBlock.type === "tool_use" ||
+                lastBlock.type === "server_tool_use")
+            ) {
               store.setConversationStatusMessage(projectId, "thinking...");
             }
           }
