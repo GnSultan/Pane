@@ -220,9 +220,9 @@ function parseBlocks(text: string): Block[] {
 
 // --- Block rendering ---
 
-const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|codebase_investigator|cli_help|generalist|read|write|edit|grep|bash|search|todo|task";
-const PATH_REGEX = new RegExp(`(?:^|\\s)((?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|${TOOL_NAMES})`, "g");
-const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^(?:${TOOL_NAMES})$`);
+const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|codebase_investigator|cli_help|generalist|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
+const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|${TOOL_NAMES})(?::)?)`, "g");
+const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^(?:${TOOL_NAMES})(?::)?$`);
 
 function renderBlock(block: Block, key: number) {
   switch (block.type) {
@@ -242,7 +242,7 @@ function renderBlock(block: Block, key: number) {
             className={`font-mono overflow-x-auto leading-[1.75] px-5 py-4 rounded-sm ${
               isSpecial 
                 ? "text-pane-error" 
-                : "text-pane-text/85 bg-pane-surface/30"
+                : "text-pane-text/85"
             }`}
             style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
           >
@@ -287,7 +287,7 @@ function renderBlock(block: Block, key: number) {
       return (
         <hr
           key={key}
-          className="border-none border-t border-pane-border/30 my-8"
+          className="border-none my-8"
         />
       );
 
@@ -295,7 +295,7 @@ function renderBlock(block: Block, key: number) {
       return (
         <div
           key={key}
-          className="my-4 pl-4 border-l-2 border-pane-text-secondary/20"
+          className="my-4 pl-4"
         >
           <p
             className="text-pane-text-secondary leading-[1.75] italic"
@@ -319,7 +319,7 @@ function renderBlock(block: Block, key: number) {
                   <th
                     key={j}
                     className="text-left text-pane-text-secondary/70 font-medium
-                               px-3 py-1.5 border-b border-pane-border/40"
+                               px-3 py-1.5"
                   >
                     {renderInline(h)}
                   </th>
@@ -332,8 +332,7 @@ function renderBlock(block: Block, key: number) {
                   {row.map((cell, ci) => (
                     <td
                       key={ci}
-                      className="text-pane-text/80 px-3 py-1.5
-                                 border-b border-pane-border/20"
+                      className="text-pane-text/80 px-3 py-1.5"
                     >
                       {renderInline(cell)}
                     </td>
@@ -490,7 +489,7 @@ function renderIncrementalBlock(block: IncrementalBlock, key: number) {
             </div>
           )}
           <pre
-            className="font-mono text-pane-text/85 bg-pane-bg/40
+            className="font-mono text-pane-text/85
                         px-5 py-4 overflow-x-auto leading-[1.75] rounded-sm"
             style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
           >
@@ -654,7 +653,7 @@ function renderInline(text: string): (string | React.JSX.Element)[] {
         parts.push(
           <code
             key={key}
-            className="font-mono bg-pane-surface/50 border border-pane-border/15 px-1.5 py-0.5 text-pane-text/80 rounded-sm"
+            className="font-mono px-1.5 py-0.5 text-pane-text/80 rounded-sm"
             style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
           >
             {codeContent}
