@@ -1,6 +1,10 @@
 import { create } from "zustand";
 import type { ActionId, KeyBinding } from "../lib/keybindings";
-import { DEFAULT_ROUTING, type IntentRouting } from "../lib/models";
+import {
+  DEFAULT_BACKEND_ROUTING,
+  type IntentRouting,
+  type BackendRouting,
+} from "../lib/models";
 
 const DEFAULT_FONT_SIZE = 15;
 const DEFAULT_PANEL_FONT_SIZE = 13;
@@ -32,11 +36,13 @@ interface WorkspaceState {
   theme: Theme;
   completionSound: string; // "none" | system sound name | custom file path
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
-  punkBackend: string; // "http" | "cli"
+  selectedModelProvider: string; // The provider for the current model
+  selectedModelThinking: boolean;
+  punkBackend: string; // "http" | "gemini-cli" | "claude-cli"
   httpProvider: string; // "deepseek" | "kimi" | "anthropic" | etc.
   httpApiKeys: Record<string, string>;
   httpBaseUrls: Record<string, string>;
-  intentRouting: IntentRouting;
+  intentRouting: BackendRouting;
   intentAutoRoute: boolean;
   // Mind
   mindOpen: boolean;
@@ -98,12 +104,16 @@ interface WorkspaceState {
   setTheme: (theme: Theme) => void;
   setCompletionSound: (sound: string) => void;
   playCompletionSound: () => void;
-  setSelectedModel: (model: string) => void;
+  setSelectedModel: (
+    model: string,
+    thinking?: boolean,
+    provider?: string,
+  ) => void;
   setPunkBackend: (backend: string) => void;
   setHttpProvider: (provider: string) => void;
   setHttpApiKeys: (keys: Record<string, string>) => void;
   setHttpBaseUrls: (urls: Record<string, string>) => void;
-  getEffectiveRouting: () => IntentRouting;
+  getEffectiveRouting: () => IntentRouting | undefined;
   setIntentRouting: (routing: IntentRouting | null) => void;
   setIntentAutoRoute: (autoRoute: boolean) => void;
 }
@@ -161,19 +171,28 @@ function createWorkspaceStore() {
     keybindings: null,
     theme: "system" as Theme,
     completionSound: "none",
-    selectedModel: "deepseek-chat",
-    punkBackend: "http",
+    selectedModel: "auto-gemini-3",
+    selectedModelProvider: "gemini",
+    selectedModelThinking: false,
+    punkBackend: "gemini-cli",
     httpProvider: "deepseek",
     httpApiKeys: {},
     httpBaseUrls: {},
-    intentRouting: DEFAULT_ROUTING,
+    intentRouting: DEFAULT_BACKEND_ROUTING,
     intentAutoRoute: true,
+    // Mind
+    mindOpen: false,
+    toggleMind: () =>
+      set((state) => ({ mindOpen: !state.mindOpen, profileOpen: false })),
+    closeMind: () => set({ mindOpen: false }),
+    // Profile
     profileOpen: false,
     profileName: "",
     profileBio: "",
     profileRole: "",
     profileAvatarDataUrl: null,
-    toggleProfile: () => set((s) => ({ profileOpen: !s.profileOpen, mindOpen: false })),
+    toggleProfile: () =>
+      set((s) => ({ profileOpen: !s.profileOpen, mindOpen: false })),
     closeProfile: () => set({ profileOpen: false }),
     claudeUpdateAvailable: false,
     claudeUpdateState: null,
@@ -212,8 +231,10 @@ function createWorkspaceStore() {
       const { updateClaude } = await import("../lib/tauri-commands");
       const result = await updateClaude();
       if (result.success) {
-        set({ claudeUpdateState: "updated", claudeUpdateAvailable: false });
-        setTimeout(() => set({ claudeUpdateState: "restart" }), 1500);
+        set({ claudeUpdateState: "updated" });
+        setTimeout(() => {
+          set({ claudeUpdateState: "restart", claudeUpdateAvailable: false });
+        }, 2000);
       } else {
         // keep showing available so user can retry, but don't silently swallow the error
         set({ claudeUpdateState: "available" });
@@ -243,8 +264,10 @@ function createWorkspaceStore() {
       const { updateGemini } = await import("../lib/tauri-commands");
       const result = await updateGemini();
       if (result.success) {
-        set({ geminiUpdateState: "updated", geminiUpdateAvailable: false });
-        setTimeout(() => set({ geminiUpdateState: "restart" }), 1500);
+        set({ geminiUpdateState: "updated" });
+        setTimeout(() => {
+          set({ geminiUpdateState: "restart", geminiUpdateAvailable: false });
+        }, 2000);
       } else {
         set({ geminiUpdateState: "available" });
       }
@@ -373,7 +396,16 @@ function createWorkspaceStore() {
         sound: completionSound,
       });
     },
-    setSelectedModel: (model: string) => set({ selectedModel: model }),
+    setSelectedModel: (
+      model: string,
+      thinking: boolean = false,
+      provider?: string,
+    ) =>
+      set((state) => ({
+        selectedModel: model,
+        selectedModelThinking: thinking,
+        selectedModelProvider: provider || state.selectedModelProvider,
+      })),
     setPunkBackend: (backend: string) => set({ punkBackend: backend }),
     setHttpProvider: (provider: string) => set({ httpProvider: provider }),
     setHttpApiKeys: (keys: Record<string, string>) =>
@@ -382,18 +414,30 @@ function createWorkspaceStore() {
       set({ httpBaseUrls: urls }),
     getEffectiveRouting: () => {
       const { punkBackend, intentRouting } = get();
-      if (punkBackend === "gemini-cli") {
-        return DEFAULT_ROUTING;
-      }
-      return intentRouting;
+      // Ensure we always have a valid routing object for the current backend
+      return (
+        intentRouting[punkBackend] ||
+        DEFAULT_BACKEND_ROUTING[punkBackend] ||
+        DEFAULT_BACKEND_ROUTING["http"]
+      );
     },
-    setIntentRouting: (routing) =>
-      set({ intentRouting: routing ?? DEFAULT_ROUTING }),
+    setIntentRouting: (routing) => {
+      if (!routing) return;
+      const { punkBackend, intentRouting } = get();
+      const defaultForBackend =
+        DEFAULT_BACKEND_ROUTING[punkBackend] || DEFAULT_BACKEND_ROUTING["http"];
+
+      set({
+        intentRouting: {
+          ...intentRouting,
+          [punkBackend]: {
+            ...defaultForBackend,
+            ...routing,
+          },
+        },
+      });
+    },
     setIntentAutoRoute: (autoRoute) => set({ intentAutoRoute: autoRoute }),
-    // Mind
-    mindOpen: false,
-    toggleMind: () => set((state) => ({ mindOpen: !state.mindOpen, profileOpen: false })),
-    closeMind: () => set({ mindOpen: false }),
   }));
 }
 

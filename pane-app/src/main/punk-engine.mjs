@@ -24,25 +24,23 @@ const __dirname = import.meta.dirname;
 // ============================================================================
 
 const DEFAULT_INTENT_ROUTING = {
-  plan: {
-    provider: "gemini",
-    model: "auto-gemini-3",
-    thinking: false,
+  "gemini-cli": {
+    plan: { provider: "gemini", model: "auto-gemini-3", thinking: false },
+    execute: { provider: "gemini", model: "auto-gemini-3", thinking: false },
+    explain: { provider: "gemini", model: "auto-gemini-3", thinking: false },
+    other: { provider: "gemini", model: "auto-gemini-3", thinking: false },
   },
-  execute: {
-    provider: "gemini",
-    model: "auto-gemini-3",
-    thinking: false,
+  "claude-cli": {
+    plan: { provider: "anthropic", model: "opus", thinking: false },
+    execute: { provider: "anthropic", model: "sonnet", thinking: false },
+    explain: { provider: "anthropic", model: "sonnet", thinking: false },
+    other: { provider: "anthropic", model: "sonnet", thinking: false },
   },
-  explain: {
-    provider: "gemini",
-    model: "auto-gemini-3",
-    thinking: false,
-  },
-  other: {
-    provider: "gemini",
-    model: "auto-gemini-3",
-    thinking: false,
+  "http": {
+    plan: { provider: "deepseek", model: "deepseek-v3.2-speciale", thinking: false },
+    execute: { provider: "deepseek", model: "deepseek-v3.2", thinking: false },
+    explain: { provider: "deepseek", model: "deepseek-v3.2", thinking: false },
+    other: { provider: "deepseek", model: "deepseek-v3.2", thinking: false },
   },
 };
 
@@ -57,6 +55,7 @@ const DEFAULT_INTENT_ROUTING = {
  * @property {string} workingDir
  * @property {string|null} sessionId
  * @property {string|null} model
+ * @property {string} [requestId]       - Unique request ID to prevent event leakage
  * @property {string|null} [provider]   - Provider override from intent routing
  * @property {'plan'|'execute'|'explain'|'other'|null} [intent] - Classified intent
  * @property {boolean} [thinking]       - Whether to enable thinking/reasoning mode
@@ -68,12 +67,14 @@ const DEFAULT_INTENT_ROUTING = {
  * @typedef {Object} PunkEvent
  * @property {string} event - "message" | "processStarted" | "processEnded" | "error" | "routing"
  * @property {any} data
+ * @property {string} [requestId] - Associated request ID
  */
 
 /**
  * @callback EventCallback
  * @param {string} projectId
  * @param {PunkEvent} event
+ * @param {string} [requestId]
  * @returns {void}
  */
 
@@ -86,7 +87,7 @@ class CliBackend extends PunkBackend {
     super(onEvent);
     this.worker = null;
     this.command = command;
-    this.activeProjectIds = new Set();
+    this.activeRequests = new Map(); // requestId -> projectId
   }
 
   getWorker() {
@@ -100,22 +101,22 @@ class CliBackend extends PunkBackend {
     this.worker.on("message", (message) => {
       if (message.type !== "event") return;
       if (message.event.event === "processEnded") {
-        this.activeProjectIds.delete(message.projectId);
+        this.activeRequests.delete(message.requestId);
       }
-      this.onEvent(message.projectId, message.event);
+      this.onEvent(message.projectId, message.event, message.requestId);
     });
 
     this.worker.on("exit", (code) => {
       console.warn(
         `[punk] CLI worker for ${this.command} exited with code ${code}`,
       );
-      for (const projectId of this.activeProjectIds) {
+      for (const [requestId, projectId] of this.activeRequests.entries()) {
         this.onEvent(projectId, {
           event: "processEnded",
           data: { exit_code: null },
-        });
+        }, requestId);
       }
-      this.activeProjectIds.clear();
+      this.activeRequests.clear();
       this.worker = null;
     });
 
@@ -124,7 +125,7 @@ class CliBackend extends PunkBackend {
 
   async spawn(request) {
     const worker = this.getWorker();
-    this.activeProjectIds.add(request.projectId);
+    this.activeRequests.set(request.requestId, request.projectId);
     worker.postMessage({
       type: "spawn",
       projectId: request.projectId,
@@ -135,6 +136,7 @@ class CliBackend extends PunkBackend {
       intent: request.intent,
       history: request.history,
       command: this.command,
+      requestId: request.requestId,
     });
   }
 
@@ -142,14 +144,20 @@ class CliBackend extends PunkBackend {
     if (this.worker && !this.worker.killed) {
       this.worker.postMessage({ type: "abort", projectId });
     }
-    this.activeProjectIds.delete(projectId);
+    // Clean up all requests for this project
+    for (const [rid, pid] of this.activeRequests.entries()) {
+      if (pid === projectId) this.activeRequests.delete(rid);
+    }
   }
 
   async terminate(projectId) {
     if (this.worker && !this.worker.killed) {
       this.worker.postMessage({ type: "terminate", projectId });
     }
-    this.activeProjectIds.delete(projectId);
+    // Clean up all requests for this project
+    for (const [rid, pid] of this.activeRequests.entries()) {
+      if (pid === projectId) this.activeRequests.delete(rid);
+    }
   }
 
   async shutdown() {
@@ -158,7 +166,7 @@ class CliBackend extends PunkBackend {
       this.worker.kill();
       this.worker = null;
     }
-    this.activeProjectIds.clear();
+    this.activeRequests.clear();
   }
 }
 
@@ -169,7 +177,6 @@ class CliBackend extends PunkBackend {
 class PunkEngine {
   constructor() {
     this.backend = null;
-    this.activeProjectIds = new Set();
     this.relayQueue = [];
     this.relayDraining = false;
   }
@@ -185,8 +192,8 @@ class PunkEngine {
       backendType = settings.punk_backend || "http";
     }
 
-    const onEvent = (projectId, event) =>
-      this.handleBackendEvent(projectId, event);
+    const onEvent = (projectId, event, requestId) =>
+      this.handleBackendEvent(projectId, event, requestId);
 
     switch (backendType) {
       case "cli": // old value
@@ -209,7 +216,6 @@ class PunkEngine {
       await this.backend.shutdown().catch(() => {});
       this.backend = null;
     }
-    this.activeProjectIds.clear();
     await this.initialize(backendOverride);
   }
 
@@ -232,28 +238,18 @@ class PunkEngine {
         "utf-8",
       );
       const settings = JSON.parse(content);
-      if (settings.intent_routing) {
-        return {
-          plan: {
-            ...DEFAULT_INTENT_ROUTING.plan,
-            ...settings.intent_routing.plan,
-          },
-          execute: {
-            ...DEFAULT_INTENT_ROUTING.execute,
-            ...settings.intent_routing.execute,
-          },
-          explain: settings.intent_routing.explain ? {
-            ...DEFAULT_INTENT_ROUTING.explain,
-            ...settings.intent_routing.explain,
-          } : undefined,
-          other: settings.intent_routing.other ? {
-            ...DEFAULT_INTENT_ROUTING.other,
-            ...settings.intent_routing.other,
-          } : undefined,
-        };
+      const backend = settings.punk_backend || "http";
+      
+      if (settings.intent_routing && settings.intent_routing[backend]) {
+        // Strict mapping: follow user settings for this SPECIFIC backend
+        return settings.intent_routing[backend];
       }
     } catch {}
-    return DEFAULT_INTENT_ROUTING;
+    
+    // Last-resort fallback to default mapping for the active backend
+    const settings = await this.loadSettings();
+    const backend = settings.punk_backend || "http";
+    return DEFAULT_INTENT_ROUTING[backend] || DEFAULT_INTENT_ROUTING["http"];
   }
 
   async loadIntentAutoRoute() {
@@ -270,18 +266,19 @@ class PunkEngine {
     return true; // default to auto-route enabled
   }
 
-  handleBackendEvent(projectId, event) {
-    if (event.event === "processEnded") this.activeProjectIds.delete(projectId);
-
+  handleBackendEvent(projectId, event, requestId) {
     const channel = `claude-stream:${projectId}`;
+    
+    // Attach requestId to the event so the renderer can filter it
+    const enrichedEvent = { ...event, requestId };
 
     if (event.event === "processEnded" || event.event === "error") {
       this.flushRelayQueue();
-      this.sendToRenderer(channel, event);
+      this.sendToRenderer(channel, enrichedEvent);
       return;
     }
 
-    this.relayQueue.push({ channel, event });
+    this.relayQueue.push({ channel, event: enrichedEvent });
     this.drainRelayQueue();
   }
 
@@ -319,64 +316,56 @@ class PunkEngine {
 
   async spawn(request) {
     if (!this.backend) await this.initialize();
-    this.activeProjectIds.add(request.projectId);
 
     let resolvedRequest = { ...request };
 
     // Always classify intent for system prompt and logging
-    // Prefer passed intent from renderer (state-aware) if available
     const classification = classifyIntent(request.prompt);
     if (!resolvedRequest.intent) {
       resolvedRequest.intent = classification.intent;
     }
 
-    // Apply smart routing for HTTP backend OR Gemini CLI backend
+    const isHttp = this.backend instanceof HttpBackend;
     const isGeminiCli = this.backend instanceof CliBackend && this.backend.command === "gemini";
-    if (this.backend instanceof HttpBackend || isGeminiCli) {
+
+    if (isHttp || isGeminiCli) {
       const autoRoute = await this.loadIntentAutoRoute();
+      const routing = await this.loadIntentRouting();
+      const intentRoute = routing[resolvedRequest.intent] || routing["execute"];
 
       if (autoRoute) {
-        let route;
-        if (isGeminiCli) {
-          // For Gemini CLI, leverage its internal auto-routing by default
-          route = { provider: "gemini", model: "auto-gemini-3", thinking: false };
-        } else {
-          const routing = await this.loadIntentRouting();
-          route = routing[resolvedRequest.intent] || routing["execute"];
-        }
-
-        resolvedRequest = {
-          ...resolvedRequest,
-          provider: route.provider,
-          model: route.model,
-          thinking: route.thinking ?? false,
-        };
-
-        this.handleBackendEvent(request.projectId, {
-          event: "routing",
-          data: {
-            intent: resolvedRequest.intent,
-            confidence: classification.confidence,
-            reason: classification.reason,
-            provider: route.provider,
-            model: route.model,
-            thinking: route.thinking ?? false,
-          },
-        });
-
-        console.log(
-          `[punk] intent=${resolvedRequest.intent} (${(classification.confidence * 100).toFixed(0)}%) → ${route.provider}/${route.model}` +
-            (route.thinking ? " [thinking]" : "") +
-            ` | ${classification.reason}`,
-        );
-      } else {
-        // Auto-route disabled: use provided model or default
-        // Still log the intent classification for transparency
-        console.log(
-          `[punk] intent=${resolvedRequest.intent} (${(classification.confidence * 100).toFixed(0)}%) → auto-route disabled, using model=${request.model || "default"}` +
-            ` | ${classification.reason}`,
-        );
+        // AUTO-ROUTE: Use the mapped intent from settings
+        resolvedRequest.provider = intentRoute.provider;
+        resolvedRequest.model = intentRoute.model;
+        resolvedRequest.thinking = intentRoute.thinking ?? false;
+      } else if (!resolvedRequest.model) {
+        // NO AUTO-ROUTE + NO EXPLICIT MODEL: Use the intent's default as fallback
+        resolvedRequest.provider = intentRoute.provider;
+        resolvedRequest.model = intentRoute.model;
+        resolvedRequest.thinking = intentRoute.thinking ?? false;
+      } else if (!resolvedRequest.provider) {
+        // NO AUTO-ROUTE + HAS MODEL + NO PROVIDER: Infer provider from intent default
+        // (This handles legacy UI or edge cases)
+        resolvedRequest.provider = intentRoute.provider;
       }
+
+      this.handleBackendEvent(request.projectId, {
+        event: "routing",
+        data: {
+          intent: resolvedRequest.intent,
+          confidence: classification.confidence,
+          reason: classification.reason,
+          provider: resolvedRequest.provider,
+          model: resolvedRequest.model,
+          thinking: resolvedRequest.thinking ?? false,
+        },
+      }, request.requestId);
+
+      console.log(
+        `[punk] intent=${resolvedRequest.intent} (${(classification.confidence * 100).toFixed(0)}%) → ${resolvedRequest.provider}/${resolvedRequest.model}` +
+          (resolvedRequest.thinking ? " [thinking]" : "") +
+          ` | ${classification.reason}`,
+      );
     }
 
     await this.backend.spawn(resolvedRequest);
@@ -384,17 +373,14 @@ class PunkEngine {
 
   async abort(projectId) {
     if (this.backend) await this.backend.abort(projectId);
-    this.activeProjectIds.delete(projectId);
   }
 
   async terminate(projectId) {
     if (this.backend) await this.backend.terminate(projectId);
-    this.activeProjectIds.delete(projectId);
   }
 
   async shutdown() {
     if (this.backend) await this.backend.shutdown();
-    this.activeProjectIds.clear();
   }
 }
 
@@ -408,7 +394,7 @@ export async function registerPunkHandlers() {
   await punkEngine.initialize();
 
   ipcMain.handle("send_to_punk", async (_event, args) => {
-    const { projectId, prompt, workingDir, sessionId, model, intent, history } =
+    const { projectId, prompt, workingDir, sessionId, model, intent, history, requestId, thinking, provider } =
       args;
     await punkEngine.spawn({
       projectId,
@@ -418,6 +404,9 @@ export async function registerPunkHandlers() {
       model,
       intent,
       history,
+      requestId,
+      thinking,
+      provider,
     });
   });
 

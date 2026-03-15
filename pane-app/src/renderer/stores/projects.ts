@@ -154,6 +154,11 @@ interface ProjectsState {
     projectId: string,
     message: ConversationMessage,
   ) => void;
+  updateMessageContent: (
+    projectId: string,
+    messageId: string,
+    content: ContentBlock[],
+  ) => void;
   updateLastAssistantContent: (
     projectId: string,
     content: ContentBlock[],
@@ -196,11 +201,6 @@ interface ProjectsState {
   updateLastToolUseInput: (
     projectId: string,
     input: Record<string, unknown>,
-  ) => void;
-  updateLastAssistantJson: (
-    projectId: string,
-    json: any,
-    raw: string,
   ) => void;
   setContextPressure: (
     projectId: string,
@@ -472,6 +472,16 @@ function createProjectsStore() {
         })),
       ),
 
+    updateMessageContent: (projectId, messageId, content) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const msgs = p.conversation.messages.map((m) =>
+            m.id === messageId ? { ...m, content } : m,
+          );
+          return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
     updateLastAssistantContent: (projectId, content) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
@@ -684,25 +694,6 @@ function createProjectsStore() {
             for (let i = blocks.length - 1; i >= 0; i--) {
               if (blocks[i]!.type === "tool_use") {
                 blocks[i] = { ...blocks[i]!, input } as ToolUseBlock;
-                break;
-              }
-            }
-            msgs[msgs.length - 1] = { ...last, content: blocks };
-          }
-          return { conversation: { ...p.conversation, messages: msgs } };
-        }),
-      ),
-
-    updateLastAssistantJson: (projectId, json, raw) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
-          const last = msgs[msgs.length - 1];
-          if (last && last.type === "assistant") {
-            const blocks = [...last.content];
-            for (let i = blocks.length - 1; i >= 0; i--) {
-              if (blocks[i]!.type === "json") {
-                blocks[i] = { type: "json", json, raw };
                 break;
               }
             }

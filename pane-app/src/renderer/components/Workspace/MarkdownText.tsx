@@ -12,8 +12,9 @@ import type React from "react";
 
 // --- Emoji stripping ---
 
-// eslint-disable-next-line no-misleading-character-class -- intentional Unicode range for emoji stripping
-const emojiPattern = /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]+/gu;
+const emojiPattern =
+  // eslint-disable-next-line no-misleading-character-class -- intentional Unicode range for emoji stripping
+  /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]/gu;
 
 function stripEmojis(text: string): string {
   return text.replace(emojiPattern, "").replace(/  +/g, " ");
@@ -24,18 +25,34 @@ interface MarkdownTextProps {
   isStreaming?: boolean;
 }
 
-export const MarkdownText = memo(function MarkdownText({ text, isStreaming }: MarkdownTextProps) {
-  // During streaming, we skip full block parsing (fences, tables, lists)
-  // because O(n) regex passes over the full text on every frame causes jank.
-  //
-  // However, we still want RICH INLINE FORMATTING (bold, code, links) so the
-  // stream feels alive and formatted (e.g. file paths in backticks).
+export const MarkdownText = memo(function MarkdownText({
+  text,
+  isStreaming,
+}: MarkdownTextProps) {
+  // During streaming, we use incremental parsing to provide rich formatting
+  // without the performance cost of full document parsing on every frame.
+  // We parse inline formatting (bold, code, links) and detect simple block
+  // boundaries for a better streaming experience.
   const shouldParseMarkdown = !isStreaming && text.length <= 30_000;
+  const shouldParseIncremental = isStreaming;
 
   const blocks = useMemo(
     () => (shouldParseMarkdown ? parseBlocks(text) : null),
     [text, shouldParseMarkdown],
   );
+
+  const incrementalBlocks = useMemo(
+    () => (shouldParseIncremental ? parseIncremental(text) : null),
+    [text, shouldParseIncremental],
+  );
+
+  if (incrementalBlocks) {
+    return (
+      <div className="space-y-4">
+        {incrementalBlocks.map((block, i) => renderIncrementalBlock(block, i))}
+      </div>
+    );
+  }
 
   if (!blocks) {
     return (
@@ -64,6 +81,16 @@ type Block =
   | { type: "blockquote"; content: string }
   | { type: "table"; headers: string[]; rows: string[][] }
   | { type: "paragraph"; content: string };
+
+// Incremental block types for streaming
+type IncrementalBlock =
+  | { type: "code_start"; lang: string }
+  | { type: "code_chunk"; content: string }
+  | { type: "code_end" }
+  | { type: "heading"; level: number; content: string }
+  | { type: "paragraph_chunk"; content: string }
+  | { type: "list_item"; content: string; ordered: boolean }
+  | { type: "inline"; content: string };
 
 function parseBlocks(text: string): Block[] {
   const lines = text.split("\n");
@@ -113,11 +140,16 @@ function parseBlocks(text: string): Block[] {
       i + 1 < lines.length &&
       /^\|[-:\s|]+\|$/.test(lines[i + 1]!)
     ) {
-      const headerCells = line.split("|").slice(1, -1).map((c) => c.trim());
+      const headerCells = line
+        .split("|")
+        .slice(1, -1)
+        .map((c) => c.trim());
       i += 2; // skip header + separator
       const rows: string[][] = [];
       while (i < lines.length && lines[i]!.startsWith("|")) {
-        const cells = lines[i]!.split("|").slice(1, -1).map((c) => c.trim());
+        const cells = lines[i]!.split("|")
+          .slice(1, -1)
+          .map((c) => c.trim());
         rows.push(cells);
         i++;
       }
@@ -128,7 +160,10 @@ function parseBlocks(text: string): Block[] {
     // Blockquote
     if (line.startsWith("> ") || line === ">") {
       const quoteLines: string[] = [];
-      while (i < lines.length && (lines[i]!.startsWith("> ") || lines[i]! === ">")) {
+      while (
+        i < lines.length &&
+        (lines[i]!.startsWith("> ") || lines[i]! === ">")
+      ) {
         quoteLines.push(lines[i]!.replace(/^>\s?/, ""));
         i++;
       }
@@ -185,9 +220,17 @@ function parseBlocks(text: string): Block[] {
 
 // --- Block rendering ---
 
+const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|codebase_investigator|cli_help|generalist|read|write|edit|grep|bash|search|todo|task";
+const PATH_REGEX = new RegExp(`(?:^|\\s)((?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|${TOOL_NAMES})`, "g");
+const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^(?:${TOOL_NAMES})$`);
+
 function renderBlock(block: Block, key: number) {
   switch (block.type) {
-    case "code":
+    case "code": {
+      const trimmedContent = block.content.trim();
+      const isSingleLine = !trimmedContent.includes("\n");
+      const isSpecial = isSingleLine && SPECIAL_REGEX.test(trimmedContent);
+
       return (
         <div key={key} className="my-6">
           {block.lang && (
@@ -196,15 +239,18 @@ function renderBlock(block: Block, key: number) {
             </div>
           )}
           <pre
-            className="font-mono text-pane-text/85 bg-pane-bg
-                        border border-pane-border/60 px-5 py-4
-                        overflow-x-auto leading-[1.75]"
+            className={`font-mono overflow-x-auto leading-[1.75] px-5 py-4 rounded-sm ${
+              isSpecial 
+                ? "text-pane-error" 
+                : "text-pane-text/85 bg-pane-surface/30"
+            }`}
             style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
           >
             {block.content}
           </pre>
         </div>
       );
+    }
 
     case "heading": {
       const styles: Record<number, { fontSize: string; className: string }> = {
@@ -323,11 +369,199 @@ function renderBlock(block: Block, key: number) {
       return (
         <p
           key={key}
-          className="text-pane-text leading-[1.75] mb-5"
+          className="text-pane-text leading-[1.75] mb-5 break-words"
           style={{ fontSize: "var(--pane-font-size)", maxWidth: "65ch" }}
         >
           {renderInline(block.content)}
         </p>
+      );
+  }
+}
+
+// --- Incremental parsing for streaming ---
+
+function parseIncremental(text: string): IncrementalBlock[] {
+  const lines = text.split("\n");
+  const blocks: IncrementalBlock[] = [];
+  let i = 0;
+  let inCodeBlock = false;
+  let currentCodeContent: string[] = [];
+
+  // Helper to flush code block if we're in one
+  const flushCodeBlock = () => {
+    if (inCodeBlock && currentCodeContent.length > 0) {
+      blocks.push({
+        type: "code_chunk",
+        content: currentCodeContent.join("\n"),
+      });
+      currentCodeContent = [];
+    }
+  };
+
+  while (i < lines.length) {
+    const line = lines[i]!;
+
+    // Code fence detection
+    const fenceMatch = line.match(/^```(\w*)/);
+    if (fenceMatch && !inCodeBlock) {
+      // Start of code block
+      flushCodeBlock();
+      inCodeBlock = true;
+      const currentCodeLang = fenceMatch[1] ?? "";
+      blocks.push({ type: "code_start", lang: currentCodeLang });
+      i++;
+      continue;
+    } else if (line.startsWith("```") && inCodeBlock) {
+      // End of code block
+      flushCodeBlock();
+      inCodeBlock = false;
+      blocks.push({ type: "code_end" });
+      i++;
+      continue;
+    }
+
+    if (inCodeBlock) {
+      // Inside code block - accumulate lines
+      currentCodeContent.push(line);
+      i++;
+      continue;
+    }
+
+    // Heading detection
+    const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
+    if (headingMatch) {
+      flushCodeBlock();
+      blocks.push({
+        type: "heading",
+        level: headingMatch[1]!.length,
+        content: headingMatch[2]!,
+      });
+      i++;
+      continue;
+    }
+
+    // List item detection
+    const listMatch = line.match(/^(\s*)([-*]|\d+\.)\s+(.+)/);
+    if (listMatch) {
+      flushCodeBlock();
+      const ordered = /^\d+\./.test(listMatch[2]!);
+      blocks.push({
+        type: "list_item",
+        content: listMatch[3]!,
+        ordered,
+      });
+      i++;
+      continue;
+    }
+
+    // Regular text - break into chunks for better streaming
+    flushCodeBlock();
+    if (line.trim() !== "") {
+      // Break long lines into smaller chunks for smoother streaming
+      const maxChunkLength = 200;
+      if (line.length > maxChunkLength) {
+        for (let j = 0; j < line.length; j += maxChunkLength) {
+          const chunk = line.slice(j, j + maxChunkLength);
+          blocks.push({ type: "inline", content: chunk });
+        }
+      } else {
+        blocks.push({ type: "inline", content: line });
+      }
+    }
+    i++;
+  }
+
+  // Flush any remaining code content
+  flushCodeBlock();
+
+  return blocks;
+}
+
+// --- Incremental block rendering ---
+
+function renderIncrementalBlock(block: IncrementalBlock, key: number) {
+  switch (block.type) {
+    case "code_start":
+      return (
+        <div key={key} className="my-4">
+          {block.lang && (
+            <div className="text-[10px] font-mono text-pane-text-secondary/40 mb-2 uppercase tracking-[0.1em]">
+              {block.lang}
+            </div>
+          )}
+          <pre
+            className="font-mono text-pane-text/85 bg-pane-bg/40
+                        px-5 py-4 overflow-x-auto leading-[1.75] rounded-sm"
+            style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
+          >
+            {/* Content will be added by code_chunk blocks */}
+          </pre>
+        </div>
+      );
+
+    case "code_chunk":
+      return (
+        <code key={key} className="font-mono text-pane-text/85 whitespace-pre">
+          {block.content}
+          {block.content.endsWith("\n") ? "" : "\n"}
+        </code>
+      );
+
+    case "code_end":
+      return null; // Already handled by code_start structure
+
+    case "heading": {
+      const styles: Record<number, { fontSize: string; className: string }> = {
+        1: {
+          fontSize: "calc(var(--pane-font-size) + 4px)",
+          className: "font-semibold mt-8 mb-4 tracking-[-0.02em]",
+        },
+        2: {
+          fontSize: "calc(var(--pane-font-size) + 2px)",
+          className: "font-semibold mt-7 mb-3 tracking-[-0.02em]",
+        },
+        3: {
+          fontSize: "calc(var(--pane-font-size) + 1px)",
+          className: "font-medium mt-6 mb-3 tracking-[-0.01em]",
+        },
+        4: {
+          fontSize: "var(--pane-font-size)",
+          className: "font-medium mt-5 mb-2 uppercase tracking-[0.05em]",
+        },
+      };
+      const s = styles[block.level] ?? styles[3]!;
+      return (
+        <div
+          key={key}
+          className={`text-pane-text ${s.className}`}
+          style={{ fontSize: s.fontSize }}
+        >
+          {renderInline(block.content)}
+        </div>
+      );
+    }
+
+    case "list_item":
+      return (
+        <li
+          key={key}
+          className="text-pane-text leading-[1.7] my-1"
+          style={{ fontSize: "var(--pane-font-size)" }}
+        >
+          {renderInline(block.content)}
+        </li>
+      );
+
+    case "paragraph_chunk":
+    case "inline":
+      return (
+        <span
+          key={key}
+          className="text-pane-text leading-[1.75] whitespace-pre-wrap break-words animate-fadeIn"
+          style={{ fontSize: "var(--pane-font-size)" }}
+        >
+          {renderInline(block.content)}
+        </span>
       );
   }
 }
@@ -342,10 +576,43 @@ function renderInline(text: string): (string | React.JSX.Element)[] {
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
+  const renderTextWithPaths = (txt: string, startIndex: number) => {
+    let txtIdx = 0;
+    let pMatch: RegExpExecArray | null;
+    const result: (string | React.JSX.Element)[] = [];
+
+    // Reset regex state since it's global
+    PATH_REGEX.lastIndex = 0;
+
+    while ((pMatch = PATH_REGEX.exec(txt)) !== null) {
+      const matchFull = pMatch[0];
+      const matchPath = pMatch[1]!;
+      const matchStart = pMatch.index + (matchFull.indexOf(matchPath));
+
+      if (matchStart > txtIdx) {
+        result.push(txt.slice(txtIdx, matchStart));
+      }
+      result.push(
+        <code
+          key={`path-${startIndex}-${matchStart}`}
+          className="font-mono text-pane-error"
+          style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
+        >
+          {matchPath}
+        </code>
+      );
+      txtIdx = matchStart + matchPath.length;
+    }
+    if (txtIdx < txt.length) {
+      result.push(txt.slice(txtIdx));
+    }
+    return result;
+  };
+
   while ((match = regex.exec(cleaned)) !== null) {
-    // Push preceding text
+    // Push preceding text with path detection
     if (match.index > lastIndex) {
-      parts.push(cleaned.slice(lastIndex, match.index));
+      parts.push(...renderTextWithPaths(cleaned.slice(lastIndex, match.index), lastIndex));
     }
 
     const token = match[0];
@@ -369,17 +636,33 @@ function renderInline(text: string): (string | React.JSX.Element)[] {
         );
       }
     } else if (token.startsWith("`")) {
-      parts.push(
-        <code
-          key={key}
-          className="font-mono bg-pane-bg border border-pane-border/60
-                     px-1.5 py-0.5 text-pane-text/80"
-          style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
-        >
-          {token.slice(1, -1)}
-        </code>,
-      );
-    } else if (token.startsWith("**")) {
+      const codeContent = token.slice(1, -1);
+      const trimmed = codeContent.trim();
+      const isSpecial = SPECIAL_REGEX.test(trimmed);
+
+      if (isSpecial) {
+        parts.push(
+          <code
+            key={key}
+            className="font-mono text-pane-error"
+            style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
+          >
+            {codeContent}
+          </code>,
+        );
+      } else {
+        parts.push(
+          <code
+            key={key}
+            className="font-mono bg-pane-surface/50 border border-pane-border/15 px-1.5 py-0.5 text-pane-text/80 rounded-sm"
+            style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
+          >
+            {codeContent}
+          </code>,
+        );
+      }
+    }
+ else if (token.startsWith("**")) {
       parts.push(
         <strong key={key} className="font-semibold text-pane-text">
           {token.slice(2, -2)}
@@ -396,9 +679,9 @@ function renderInline(text: string): (string | React.JSX.Element)[] {
     lastIndex = match.index + token.length;
   }
 
-  // Remaining text
+  // Remaining text with path detection
   if (lastIndex < cleaned.length) {
-    parts.push(cleaned.slice(lastIndex));
+    parts.push(...renderTextWithPaths(cleaned.slice(lastIndex), lastIndex));
   }
 
   return parts;

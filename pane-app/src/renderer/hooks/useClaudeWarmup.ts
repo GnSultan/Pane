@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
 import { sendToPunk, abortPunk } from "../lib/tauri-commands";
@@ -6,37 +6,51 @@ import type { PunkStreamEvent, PunkStreamMessage } from "../lib/punk-types";
 
 /**
  * Warms up the Punk engine for a project by sending an initial message.
- *
- * Two modes:
- * - Fresh session (no prior messages): sends "ready", waits for full response,
- *   then clears the warmup message. Eliminates first-message cold-start latency.
- * - Restored session (has messages, but model unknown): resumes existing session,
- *   aborts immediately after the init event. Just enough to get the model name
- *   for the header — no message ever appears in the conversation.
  */
 export function usePunkWarmup(projectId: string) {
-  const hasWarmedUp = useRef(false);
+  // Subscribe to project existence and restoration state
+  const project = useProjectsStore((s) => s.projects.get(projectId));
+  const isRestored = project?.conversation.isRestored ?? false;
+  const isReady = project?.conversation.isReady ?? false;
+  const hasModel = !!project?.conversation.model;
 
   useEffect(() => {
     const store = useProjectsStore.getState();
-    const project = store.projects.get(projectId);
+    
+    // CRITICAL: Wait until the project exists AND has been restored from disk.
+    // If we start warmup before restoration, we risk overwriting the history.
+    if (!project || !isRestored) return;
 
-    // Skip if already done, no project, or model is already known (saved from disk)
-    if (
-      hasWarmedUp.current ||
-      !project ||
-      (project.conversation.model && project.conversation.isReady)
-    ) {
-      return;
-    }
+    // Skip if model is already known and we're ready (saved from disk)
+    if (hasModel && isReady) return;
 
-    hasWarmedUp.current = true;
-
-    const isRestored = project.conversation.messages.length > 0;
+    // We use a local flag to prevent double-warmup within the same mount cycle
+    // but the hook itself will re-run if isRestored or projectId changes.
+    let warmingUp = false;
 
     const warmup = async () => {
+      if (warmingUp) return;
+      warmingUp = true;
+
       let capturedSessionId: string | null = null;
       let capturedModel: string | null = null;
+      let warmupSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const finishWarmup = () => {
+        if (warmupSafetyTimer) {
+          clearTimeout(warmupSafetyTimer);
+          warmupSafetyTimer = null;
+        }
+        store.setConversationReady(projectId, true);
+        warmingUp = false;
+      };
+
+      // Set a safety timer — if Gemini hangs during warmup, don't leave the UI spinning forever
+      warmupSafetyTimer = setTimeout(() => {
+        console.warn(`[pane] Warmup safety timer triggered for project ${projectId}`);
+        finishWarmup();
+        abortPunk(projectId).catch(() => {});
+      }, 5000); // 5s max for warmup
 
       const handleEvent = (event: PunkStreamEvent) => {
         if (event.event === "message") {
@@ -50,13 +64,14 @@ export function usePunkWarmup(projectId: string) {
 
               store.setConversationSessionId(projectId, capturedSessionId);
               if (capturedModel) store.setConversationModel(projectId, capturedModel);
-              store.setConversationReady(projectId, true);
+              
+              const currentProject = useProjectsStore.getState().projects.get(projectId);
+              const hasHistory = (currentProject?.conversation.messages.length || 0) > 0;
 
-              if (isRestored) {
-                // Model captured — abort before the engine processes the message.
-                // The "ready" prompt goes through but we stop before any response
-                // is added to the conversation. UI stays clean.
+              if (hasHistory) {
+                // Session resumed — abort immediately after getting metadata
                 abortPunk(projectId).catch(() => {});
+                finishWarmup();
               }
             }
           } catch (e) {
@@ -66,55 +81,51 @@ export function usePunkWarmup(projectId: string) {
 
         if (event.event === "error") {
           console.error("[pane] Punk warmup error event:", event.data.message);
-          store.setConversationReady(projectId, true);
+          finishWarmup();
         }
 
-        // Safety net: if the process exits without ever emitting an init message
-        // (e.g. Gemini CLI error, wrong flags, missing auth), ensure isReady is
-        // set so the UI never shows an infinite spinner.
         if (event.event === "processEnded") {
-          store.setConversationReady(projectId, true);
-        }
+          const currentProject = useProjectsStore.getState().projects.get(projectId);
+          const hasHistory = (currentProject?.conversation.messages.length || 0) > 0;
 
-        // Fresh session only: clear the warmup message after Claude responds
-        if (event.event === "processEnded" && !isRestored) {
-          const currentProject = store.projects.get(projectId);
-          // Only clear if we're not currently processing a REAL user message.
-          // If the user started typing/sending before warmup finished, we should
-          // just leave the state alone or risk wiping their new turn.
-          if (
-            currentProject &&
-            !currentProject.conversation.isProcessing &&
-            currentProject.conversation.messages.length > 0
-          ) {
-            store.clearConversation(projectId);
-            if (capturedSessionId)
-              store.setConversationSessionId(projectId, capturedSessionId);
-            if (capturedModel)
-              store.setConversationModel(projectId, capturedModel);
+          // Fresh session: clear the "ready" response after it finishes
+          if (!hasHistory) {
+            if (
+              currentProject &&
+              !currentProject.conversation.isProcessing &&
+              currentProject.conversation.messages.length > 0
+            ) {
+              store.clearConversation(projectId);
+              if (capturedSessionId) store.setConversationSessionId(projectId, capturedSessionId);
+              if (capturedModel) store.setConversationModel(projectId, capturedModel);
+            }
           }
+          
+          finishWarmup();
         }
       };
 
       try {
         const selectedModel = useWorkspaceStore.getState().selectedModel;
+        const currentProject = useProjectsStore.getState().projects.get(projectId);
+        const hasHistoryInitially = (currentProject?.conversation.messages.length || 0) > 0;
+
         await sendToPunk(
           projectId,
           "ready",
           project.root,
-          // Restored sessions resume existing session to avoid starting a new one
-          isRestored ? project.conversation.sessionId : null,
+          hasHistoryInitially ? project.conversation.sessionId : null,
           selectedModel,
           handleEvent,
         );
       } catch (err) {
         console.error("[pane] Punk warmup failed:", err);
-        store.setConversationReady(projectId, true);
+        finishWarmup();
       }
     };
 
     warmup();
-  }, [projectId]);
+  }, [projectId, isRestored, hasModel, isReady]);
 }
 
 // Backwards-compatible alias while we complete the rename across the app.

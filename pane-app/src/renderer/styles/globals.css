@@ -19,8 +19,9 @@
 
   /* Animations - fast and subtle for lightest IDE */
   --animate-fadeSlideUp: fadeSlideUp 0.2s ease-out;
+  --animate-fadeSlideDown: fadeSlideDown 0.2s ease-out;
   --animate-pressScale: pressScale 0.08s ease-out;
-  --animate-fadeIn: fadeIn 1.5s ease-out;
+  --animate-fadeIn: fadeIn 2.5s ease-out;
   --animate-fadeOut: fadeOut 1.5s ease-out forwards;
   --animate-circle-pulse: circle-pulse 2.5s ease-in-out infinite;
   --animate-dot-1: orbit-1 3s ease-in-out infinite;
@@ -38,6 +39,17 @@
     from {
       opacity: 0;
       transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes fadeSlideDown {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
     }
     to {
       opacity: 1;
@@ -115,10 +127,12 @@
 
   @keyframes breathe {
     0%, 100% {
-      opacity: 1;
+      opacity: 0.3;
+      transform: scale(0.95);
     }
     50% {
-      opacity: 0.4;
+      opacity: 0.8;
+      transform: scale(1.05);
     }
   }
 }
@@ -339,7 +353,7 @@ html, body, #root {
 [data-tauri-drag-region] input,
 [data-tauri-drag-region] textarea,
 [data-tauri-drag-region] select,
-[data-tauri-drag-region] [data-no-drag] {
+[data-no-drag] {
   -webkit-app-region: no-drag;
 }
 

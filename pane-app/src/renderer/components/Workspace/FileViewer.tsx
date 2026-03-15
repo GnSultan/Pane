@@ -189,7 +189,7 @@ export function FileViewer() {
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="flex-1 min-h-0 w-full max-w-[780px] mx-auto">
+      <div className="flex-1 min-h-0 w-full max-w-[780px] mx-auto relative z-20" data-no-drag>
       <AceEditor
         ref={editorRef}
         mode={getModeForFile(activeFilePath)}

@@ -105,15 +105,16 @@ function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
   return (
     <div
       className="font-mono overflow-x-auto max-h-[300px] overflow-y-auto
-                 border border-pane-border bg-pane-bg leading-[1.6]"
+                 bg-pane-terminal/[0.04] leading-[1.6] rounded-sm
+                 ring-1 ring-pane-border/40 shadow-[0_0_12px_rgba(74,71,66,0.2)]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
-      <div className="px-2.5 py-1.5 text-pane-text-secondary border-b border-pane-border/30">
+      <div className="px-2.5 py-1.5 text-pane-terminal bg-pane-terminal/[0.06] border-b border-pane-border/10">
         {shortenPath(filePath)}
       </div>
       {oldStr && (
         <pre
-          className="px-2.5 py-1.5 whitespace-pre-wrap break-words border-b border-pane-border/20"
+          className="px-2.5 py-1.5 whitespace-pre-wrap break-words border-t border-pane-border/10"
           style={{ color: "var(--pane-status-deleted)", opacity: 0.7 }}
         >
           {oldStr}
@@ -121,7 +122,7 @@ function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
       )}
       {newStr && (
         <pre
-          className="px-2.5 py-1.5 whitespace-pre-wrap break-words"
+          className="px-2.5 py-1.5 whitespace-pre-wrap break-words border-t border-pane-border/10"
           style={{ color: "var(--pane-status-added)", opacity: 0.8 }}
         >
           {newStr}
@@ -138,16 +139,17 @@ function ExpandedWriteInput({ input }: { input: Record<string, unknown> }) {
   return (
     <div
       className="font-mono overflow-x-auto max-h-[300px] overflow-y-auto
-                 border border-pane-border bg-pane-bg leading-[1.6]"
+                 bg-pane-terminal/[0.04] leading-[1.6] rounded-sm
+                 ring-1 ring-pane-border/40 shadow-[0_0_12px_rgba(74,71,66,0.2)]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
-      <div className="px-2.5 py-1.5 text-pane-text-secondary border-b border-pane-border/30">
+      <div className="px-2.5 py-1.5 text-pane-terminal bg-pane-terminal/[0.06] border-b border-pane-border/10">
         {shortenPath(filePath)}
-        <span className="ml-2" style={{ color: "var(--pane-status-added)" }}>
+        <span className="ml-2 opacity-60">
           {lineCount} lines
         </span>
       </div>
-      <pre className="px-2.5 py-1.5 text-pane-text-secondary whitespace-pre-wrap break-words">
+      <pre className="px-2.5 py-1.5 text-pane-text-secondary whitespace-pre-wrap break-words border-t border-pane-border/10">
         {content.length > 3000
           ? content.slice(0, 3000) + "\n... (truncated)"
           : content}
@@ -161,13 +163,17 @@ function ExpandedTodoInput({ input }: { input: Record<string, unknown> }) {
   return (
     <div
       className="font-mono overflow-y-auto max-h-[300px]
-                 border border-pane-border bg-pane-bg leading-[1.6]"
+                 bg-pane-terminal/[0.04] leading-[1.6] rounded-sm
+                 ring-1 ring-pane-border/40 shadow-[0_0_12px_rgba(74,71,66,0.2)]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
+      <div className="px-2.5 py-1.5 text-pane-terminal bg-pane-terminal/[0.06] border-b border-pane-border/10">
+        todos
+      </div>
       {todos.map((todo, i) => (
         <div
           key={i}
-          className="flex items-start gap-2 px-2.5 py-1 border-b border-pane-border/15 last:border-b-0"
+          className="flex items-start gap-2 px-2.5 py-1 border-b border-pane-border/10 last:border-b-0"
         >
           <span className="shrink-0 mt-0.5">
             {todo.status === "completed"
@@ -197,8 +203,9 @@ function ExpandedDefaultInput({ input }: { input: Record<string, unknown> }) {
   return (
     <pre
       className="font-mono text-pane-text-secondary
-                 bg-pane-bg p-2.5 overflow-x-auto max-h-[250px]
-                 overflow-y-auto border border-pane-border leading-[1.6]"
+                 bg-pane-terminal/[0.04] p-2.5 overflow-x-auto max-h-[250px]
+                 overflow-y-auto leading-[1.6] rounded-sm
+                 ring-1 ring-pane-border/40 shadow-[0_0_12px_rgba(74,71,66,0.2)]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
       {JSON.stringify(input, null, 2)}
@@ -206,16 +213,34 @@ function ExpandedDefaultInput({ input }: { input: Record<string, unknown> }) {
   );
 }
 
-function ExpandedReadInput({ input }: { input: Record<string, unknown> }) {
+function ExpandedReadInput({ input, result }: { input: Record<string, unknown>; result?: ToolResultBlock }) {
   const filePath = (input.file_path as string) || "";
+  const content = (result?.content as string) || "";
+  const hasContent = !!content && !result?.is_error;
+  const lineCount = hasContent ? content.split("\n").length : 0;
+
   return (
     <div
-      className="font-mono border border-pane-border bg-pane-bg leading-[1.6]"
+      className="font-mono overflow-x-auto max-h-[300px] overflow-y-auto
+                 bg-pane-terminal/[0.04] leading-[1.6] rounded-sm
+                 ring-1 ring-pane-border/40 shadow-[0_0_12px_rgba(74,71,66,0.2)]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
-      <div className="px-2.5 py-1.5 text-pane-text-secondary">
+      <div className="px-2.5 py-1.5 text-pane-terminal bg-pane-terminal/[0.06]">
         {shortenPath(filePath)}
+        {hasContent && (
+          <span className="ml-2 opacity-60">
+            {lineCount} lines
+          </span>
+        )}
       </div>
+      {hasContent && (
+        <pre className="px-2.5 py-1.5 text-pane-text-secondary whitespace-pre-wrap break-words border-t border-pane-border/10">
+          {content.length > 3000
+            ? content.slice(0, 3000) + "\n... (truncated)"
+            : content}
+        </pre>
+      )}
     </div>
   );
 }
@@ -234,8 +259,9 @@ function ExpandedBashInput({ input }: { input: Record<string, unknown> }) {
   return (
     <button
       onClick={handleCopy}
-      className="w-full text-left font-mono border border-pane-border bg-pane-bg leading-[1.6]
-                 hover:bg-pane-text/[0.02] transition-colors group"
+      className="w-full text-left font-mono bg-pane-terminal/[0.04] leading-[1.6]
+                 hover:bg-pane-terminal/[0.08] transition-colors group rounded-sm
+                 ring-1 ring-pane-border/40 shadow-[0_0_12px_rgba(74,71,66,0.2)]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
       title="click to copy"
     >
@@ -256,27 +282,30 @@ function ExpandedMcpInput({ input, toolName }: { input: Record<string, unknown>;
   );
   return (
     <div
-      className="font-mono border border-pane-border bg-pane-bg leading-[1.6]"
+      className="font-mono bg-pane-terminal/[0.04] leading-[1.6] rounded-sm
+                 ring-1 ring-pane-border/40 shadow-[0_0_12px_rgba(74,71,66,0.2)]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
       {mcp && (
-        <div className="px-2.5 py-1.5 text-pane-text-secondary border-b border-pane-border/30">
+        <div className="px-2.5 py-1.5 text-pane-text-secondary border-b border-pane-border/10 bg-pane-terminal/[0.06]">
           {mcp.server} / {mcp.tool}
         </div>
       )}
-      {entries.map(([key, val]) => (
-        <div key={key} className="flex gap-2 px-2.5 py-0.5 border-b border-pane-border/10 last:border-b-0">
-          <span className="text-pane-text-secondary shrink-0">{key.replace(/_/g, " ")}</span>
-          <span className="text-pane-text-secondary truncate">
-            {typeof val === "string" ? val : JSON.stringify(val)}
-          </span>
-        </div>
-      ))}
+      <div className="py-1">
+        {entries.map(([key, val]) => (
+          <div key={key} className="flex gap-2 px-2.5 py-0.5 border-b border-pane-border/5 last:border-b-0">
+            <span className="text-pane-text-secondary shrink-0">{key.replace(/_/g, " ")}</span>
+            <span className="text-pane-text-secondary truncate">
+              {typeof val === "string" ? val : JSON.stringify(val)}
+            </span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
-function renderExpandedInput(name: string, input: Record<string, unknown>) {
+function renderExpandedInput(name: string, input: Record<string, unknown>, result?: ToolResultBlock) {
   if (parseMcpName(name)) {
     return <ExpandedMcpInput input={input} toolName={name} />;
   }
@@ -291,7 +320,7 @@ function renderExpandedInput(name: string, input: Record<string, unknown>) {
       return <ExpandedTodoInput input={input} />;
     case "Read":
     case "read_file":
-      return <ExpandedReadInput input={input} />;
+      return <ExpandedReadInput input={input} result={result} />;
     case "Bash":
     case "run_shell_command":
       return <ExpandedBashInput input={input} />;
@@ -300,14 +329,35 @@ function renderExpandedInput(name: string, input: Record<string, unknown>) {
   }
 }
 
+function formatToolOutput(content: any): string {
+  if (typeof content !== "string") {
+    return JSON.stringify(content, null, 2);
+  }
+
+  const trimmed = content.trim();
+  if (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  ) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      // Fall back to raw content if not valid JSON
+    }
+  }
+
+  return content.length > 5000
+    ? content.slice(0, 5000) + "\n... (truncated)"
+    : content;
+}
+
 export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
-  // Capture summary on first render only — prevents shape-shifting when toolUse object updates
-  // Even if the toolUse reference changes, the summary stays frozen to what was first displayed
+  // Summary updates as parameters stream in, then stabilizes once complete
   const summary = useMemo(
     () => summarizeTool(toolUse.name, toolUse.input),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [] // Empty deps = compute once, never recompute
+    [toolUse.name, toolUse.input]
   );
   const isComplete = !!toolResult;
   const isFailed = toolResult?.is_error ?? false;
@@ -319,8 +369,8 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
   // 4. Read/Bash/Grep/Glob/Search → always collapsed (quiet unless clicked)
   // 5. Everything else → collapsed by default
 
-  const alwaysExpanded = ["Edit", "Write", "Bash", "replace", "write_file", "run_shell_command"];
-  const alwaysCollapsed = ["Read", "Grep", "Glob", "WebSearch", "Task", "read_file", "grep_search", "glob", "google_web_search"];
+  const alwaysExpanded = ["Edit", "Write", "replace", "write_file"];
+  const alwaysCollapsed = ["Read", "Bash", "Grep", "Glob", "WebSearch", "Task", "read_file", "run_shell_command", "grep_search", "glob", "google_web_search"];
 
   const expanded = userToggle !== null
     ? userToggle
@@ -352,12 +402,15 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
           className={`w-1 h-1 rounded-full shrink-0 ${
             isFailed ? "bg-pane-error" :
             isComplete ? "" :
-            "animate-pulse"
+            "animate-fadeIn"
           }`}
           style={
             isFailed ? {} :
             isComplete ? { backgroundColor: `color-mix(in srgb, ${accentColor} 40%, transparent)` } :
-            { backgroundColor: `color-mix(in srgb, ${accentColor} 60%, transparent)` }
+            { 
+              backgroundColor: `color-mix(in srgb, ${accentColor} 60%, transparent)`,
+              animation: "breathe 2.5s ease-in-out infinite",
+            }
           }
         />
         <span className="shrink-0 opacity-70" style={{ color: accentColor }}>{label}</span>
@@ -372,38 +425,34 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
           className="mb-0.5 space-y-1 border-l-2 pl-3"
           style={{ borderLeftColor: `color-mix(in srgb, ${accentColor} 15%, transparent)` }}
         >
-          {renderExpandedInput(toolUse.name, toolUse.input)}
+          {renderExpandedInput(toolUse.name, toolUse.input, toolResult)}
 
-          {/* Hide tool result for Edit/Write - the input already shows what changed.
-              Only show results for errors or tools where the output matters (Read, Bash, etc.) */}
-          {toolResult && !["Edit", "Write", "replace", "write_file"].includes(toolUse.name) && (
+          {/* Hide tool result for Edit/Write/Read - the input already shows what changed or was read.
+              Only show results for errors or tools where the output matters (Bash, Grep, etc.) */}
+          {toolResult && !["Edit", "Write", "Read", "replace", "write_file", "read_file"].includes(toolUse.name) && (
             <pre
               className={`font-mono p-2.5 overflow-x-auto
-                          max-h-[250px] overflow-y-auto border leading-[1.6]
+                          max-h-[250px] overflow-y-auto leading-[1.6] rounded-sm
+                          ring-1 shadow-[0_0_12px_rgba(74,71,66,0.2)]
                           ${
                             toolResult.is_error
-                              ? "text-pane-error bg-[var(--pane-error-bg)] border-[var(--pane-error-border)]"
-                              : "text-pane-text-secondary bg-pane-bg border-pane-border/40"
+                              ? "text-pane-error bg-[var(--pane-error-bg)] ring-pane-error/40 shadow-[0_0_12px_rgba(166,114,114,0.25)]"
+                              : "text-pane-text-secondary bg-pane-terminal/[0.02] ring-pane-border/40 shadow-[0_0_12px_rgba(74,71,66,0.2)]"
                           }`}
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
-              {typeof toolResult.content === "string"
-                ? toolResult.content.length > 5000
-                  ? toolResult.content.slice(0, 5000) + "\n... (truncated)"
-                  : toolResult.content
-                : JSON.stringify(toolResult.content, null, 2)}
+              {formatToolOutput(toolResult.content)}
             </pre>
           )}
-          {/* Always show errors, even for Edit/Write */}
-          {toolResult?.is_error && ["Edit", "Write", "replace", "write_file"].includes(toolUse.name) && (
+          {/* Always show errors, even for Edit/Write/Read */}
+          {toolResult?.is_error && ["Edit", "Write", "Read", "replace", "write_file", "read_file"].includes(toolUse.name) && (
             <pre
-              className="font-mono p-2.5 overflow-x-auto max-h-[250px] overflow-y-auto border leading-[1.6]
-                         text-pane-error bg-[var(--pane-error-bg)] border-[var(--pane-error-border)]"
+              className="font-mono p-2.5 overflow-x-auto max-h-[250px] overflow-y-auto
+                         text-pane-error bg-[var(--pane-error-bg)]
+                         leading-[1.6] rounded-sm ring-1 ring-pane-error/40 shadow-[0_0_12px_rgba(166,114,114,0.25)]"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
-              {typeof toolResult.content === "string"
-                ? toolResult.content
-                : JSON.stringify(toolResult.content, null, 2)}
+              {formatToolOutput(toolResult.content)}
             </pre>
           )}
         </div>
@@ -425,7 +474,6 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
   // Capture query on first render only — prevents shape-shifting
   const query = useMemo(
     () => (block.input?.query as string) || block.name,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // Empty deps = compute once, never recompute
   );
   const isComplete = !!searchResult;
@@ -452,12 +500,15 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
           className={`w-1 h-1 rounded-full shrink-0 ${
             isError ? "bg-pane-error" :
             isComplete ? "" :
-            "animate-pulse"
+            "animate-fadeIn"
           }`}
           style={
             isError ? {} :
             isComplete ? { backgroundColor: `color-mix(in srgb, ${accentColor} 40%, transparent)` } :
-            { backgroundColor: `color-mix(in srgb, ${accentColor} 60%, transparent)` }
+            { 
+              backgroundColor: `color-mix(in srgb, ${accentColor} 60%, transparent)`,
+              animation: "breathe 2.5s ease-in-out infinite",
+            }
           }
         />
         <span className="shrink-0 opacity-70" style={{ color: accentColor }}>search</span>
@@ -475,15 +526,16 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
           {isError ? (
             <div
               className="font-mono px-2.5 py-1.5 text-pane-error
-                         bg-[var(--pane-error-bg)] border border-[var(--pane-error-border)]"
+                         bg-[var(--pane-error-bg)] rounded-sm
+                         ring-1 ring-pane-error/40 shadow-[0_0_12px_rgba(166,114,114,0.25)]"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
               {(searchResult.content as WebSearchToolResultError).error_code}
             </div>
           ) : (
             <div
-              className="font-mono border border-pane-border bg-pane-bg
-                         max-h-[250px] overflow-y-auto"
+              className="font-mono bg-pane-terminal/[0.04] max-h-[250px] overflow-y-auto rounded-sm
+                         ring-1 ring-pane-border/40 shadow-[0_0_12px_rgba(74,71,66,0.2)]"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
               {(searchResult.content as WebSearchResult[]).map((result, i) => (
@@ -493,7 +545,7 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex flex-col px-2.5 py-1.5
-                             border-b border-pane-border/15 last:border-b-0
+                             border-b border-pane-border/10 last:border-b-0
                              hover:bg-pane-text/[0.03]"
                 >
                   <span className="text-pane-terminal truncate">{result.title}</span>

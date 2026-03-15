@@ -13,22 +13,47 @@ export interface IntentRouting {
   other: { provider: string; model: string; thinking: boolean };
 }
 
-export const DEFAULT_ROUTING: IntentRouting = {
-  plan: {
-    provider: "gemini",
-    model: "auto-gemini-3",
-    thinking: false,
-  },
+// Map of backendId -> Routing configuration
+export type BackendRouting = Record<string, IntentRouting>;
+
+export const DEFAULT_GEMINI_CLI_ROUTING: IntentRouting = {
+  plan: { provider: "gemini", model: "auto-gemini-3", thinking: false },
   execute: { provider: "gemini", model: "auto-gemini-3", thinking: false },
-  explain: {
-    provider: "gemini",
-    model: "auto-gemini-3",
-    thinking: false,
-  },
+  explain: { provider: "gemini", model: "auto-gemini-3", thinking: false },
   other: { provider: "gemini", model: "auto-gemini-3", thinking: false },
 };
 
+export const DEFAULT_HTTP_ROUTING: IntentRouting = {
+  plan: { provider: "deepseek", model: "deepseek-v3.2-speciale", thinking: false },
+  execute: { provider: "deepseek", model: "deepseek-v3.2", thinking: false },
+  explain: { provider: "deepseek", model: "deepseek-v3.2", thinking: false },
+  other: { provider: "deepseek", model: "deepseek-v3.2", thinking: false },
+};
+
+export const DEFAULT_CLAUDE_CLI_ROUTING: IntentRouting = {
+  plan: { provider: "anthropic", model: "opus", thinking: false },
+  execute: { provider: "anthropic", model: "sonnet", thinking: false },
+  explain: { provider: "anthropic", model: "sonnet", thinking: false },
+  other: { provider: "anthropic", model: "sonnet", thinking: false },
+};
+
+export const DEFAULT_BACKEND_ROUTING: BackendRouting = {
+  "gemini-cli": DEFAULT_GEMINI_CLI_ROUTING,
+  "claude-cli": DEFAULT_CLAUDE_CLI_ROUTING,
+  "http": DEFAULT_HTTP_ROUTING,
+};
+
+// Deprecated — use DEFAULT_BACKEND_ROUTING instead
+export const DEFAULT_ROUTING = DEFAULT_GEMINI_CLI_ROUTING;
+
 export const THINKING_ENGINES: EngineOption[] = [
+  {
+    label: "DeepSeek V3.2 Speciale",
+    provider: "deepseek",
+    model: "deepseek-v3.2-speciale",
+    thinking: false,
+    requiresKey: "deepseek",
+  },
   {
     label: "Gemini 3",
     provider: "gemini",
@@ -89,6 +114,13 @@ export const THINKING_ENGINES: EngineOption[] = [
 
 export const BUILDING_ENGINES: EngineOption[] = [
   {
+    label: "DeepSeek V3.2",
+    provider: "deepseek",
+    model: "deepseek-v3.2",
+    thinking: false,
+    requiresKey: "deepseek",
+  },
+  {
     label: "Gemini 3",
     provider: "gemini",
     model: "auto-gemini-3",
@@ -142,6 +174,8 @@ export const PROVIDER_MODELS: Record<
     { value: "haiku", label: "Claude 3.5 Haiku" },
   ],
   deepseek: [
+    { value: "deepseek-v3.2", label: "DeepSeek V3.2" },
+    { value: "deepseek-v3.2-speciale", label: "DeepSeek V3.2 Speciale" },
     { value: "deepseek-chat", label: "DeepSeek V3" },
     { value: "deepseek-reasoner", label: "DeepSeek R1" },
   ],
@@ -164,6 +198,7 @@ export function engineKey(e: EngineOption) {
   return `${e.provider}::${e.model}`;
 }
 
-export function keyFromRoute(route: { provider: string; model: string }) {
+export function keyFromRoute(route: { provider: string; model: string } | undefined | null) {
+  if (!route) return "none::none";
   return `${route.provider}::${route.model}`;
 }

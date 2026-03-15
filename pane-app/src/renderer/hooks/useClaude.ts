@@ -21,6 +21,7 @@ import type {
   PunkConversationMessage as ConversationMessage,
   ContentBlock,
   ToolUseBlock,
+  ToolResultBlock,
   ThinkingBlock,
   ServerToolUseBlock,
   WebSearchToolResultBlock,
@@ -37,62 +38,66 @@ function nextMessageId(): string {
   return `msg-${Date.now()}-${++messageIdCounter}`;
 }
 
-let pendingTextDelta = "";
-let pendingThinkingDelta = "";
-let textFlushRaf = 0;
-let thinkingFlushRaf = 0;
-let pendingToolInput: Record<string, unknown> | null = null;
-let toolInputFlushRaf = 0;
-
-let pendingJsonDelta = "";
-let jsonFlushRaf = 0;
-let isStreamingJson = false;
-
-const MAX_STREAMING_TOOL_JSON_CHARS = 100_000;
-let toolJsonParseRaf = 0;
-let pendingToolJson = "";
-let pendingToolJsonTruncated = false;
-
-let pendingTodos: import("../lib/claude-types").Todo[] | null = null;
-let todosFlushRaf = 0;
-
-function flushToolInput(projectId: string) {
-  if (pendingToolInput) {
-    useProjectsStore
-      .getState()
-      .updateLastToolUseInput(projectId, pendingToolInput);
-    pendingToolInput = null;
-  }
-  toolInputFlushRaf = 0;
+interface StreamingState {
+  pendingTextDelta: string;
+  pendingThinkingDelta: string;
+  textFlushRaf: number;
+  thinkingFlushRaf: number;
+  pendingToolInput: Record<string, unknown> | null;
+  toolInputFlushRaf: number;
+  toolJsonParseRaf: number;
+  pendingToolJson: string;
+  pendingToolJsonTruncated: boolean;
+  pendingTodos: import("../lib/claude-types").Todo[] | null;
+  todosFlushRaf: number;
 }
 
-function flushJsonDelta(projectId: string) {
-  if (pendingJsonDelta) {
-    const fixed = fixPartialJson(pendingJsonDelta);
-    try {
-      const parsed = JSON.parse(fixed);
-      useProjectsStore
-        .getState()
-        .updateLastAssistantJson(projectId, parsed, pendingJsonDelta);
-    } catch {
-      // Still show the raw text if it doesn't parse yet
-      useProjectsStore
-        .getState()
-        .updateLastAssistantJson(projectId, null, pendingJsonDelta);
-    }
+const streamingStates = new Map<string, StreamingState>();
+
+function getStreamingState(projectId: string): StreamingState {
+  let state = streamingStates.get(projectId);
+  if (!state) {
+    state = {
+      pendingTextDelta: "",
+      pendingThinkingDelta: "",
+      textFlushRaf: 0,
+      thinkingFlushRaf: 0,
+      pendingToolInput: null,
+      toolInputFlushRaf: 0,
+      toolJsonParseRaf: 0,
+      pendingToolJson: "",
+      pendingToolJsonTruncated: false,
+      pendingTodos: null,
+      todosFlushRaf: 0,
+    };
+    streamingStates.set(projectId, state);
   }
-  jsonFlushRaf = 0;
+  return state;
+}
+
+const MAX_STREAMING_TOOL_JSON_CHARS = 100_000;
+
+function flushToolInput(projectId: string) {
+  const state = getStreamingState(projectId);
+  if (state.pendingToolInput) {
+    useProjectsStore
+      .getState()
+      .updateLastToolUseInput(projectId, state.pendingToolInput);
+    state.pendingToolInput = null;
+  }
+  state.toolInputFlushRaf = 0;
 }
 
 function scheduleToolJsonParse(projectId: string) {
-  if (toolJsonParseRaf) return;
-  toolJsonParseRaf = requestAnimationFrame(() => {
-    toolJsonParseRaf = 0;
+  const state = getStreamingState(projectId);
+  if (state.toolJsonParseRaf) return;
+  state.toolJsonParseRaf = requestAnimationFrame(() => {
+    state.toolJsonParseRaf = 0;
 
-    if (pendingToolJsonTruncated) return;
-    if (!pendingToolJson) return;
+    if (state.pendingToolJsonTruncated) return;
+    if (!state.pendingToolJson) return;
 
-    const fixed = fixPartialJson(pendingToolJson);
+    const fixed = fixPartialJson(state.pendingToolJson);
     try {
       const parsed = JSON.parse(fixed) as Record<string, unknown>;
 
@@ -106,11 +111,11 @@ function scheduleToolJsonParse(projectId: string) {
             .reverse()
             .find((b) => b.type === "tool_use") as ToolUseBlock | undefined;
           if (lastTool?.name === "TodoWrite" && (parsed as any).todos) {
-            pendingTodos = (
+            state.pendingTodos = (
               (parsed as any).todos as import("../lib/claude-types").Todo[]
             ).map((t) => ({ ...t }));
-            if (!todosFlushRaf) {
-              todosFlushRaf = requestAnimationFrame(() =>
+            if (!state.todosFlushRaf) {
+              state.todosFlushRaf = requestAnimationFrame(() =>
                 flushTodos(projectId),
               );
             }
@@ -118,9 +123,9 @@ function scheduleToolJsonParse(projectId: string) {
         }
       }
 
-      pendingToolInput = parsed;
-      if (!toolInputFlushRaf) {
-        toolInputFlushRaf = requestAnimationFrame(() =>
+      state.pendingToolInput = parsed;
+      if (!state.toolInputFlushRaf) {
+        state.toolInputFlushRaf = requestAnimationFrame(() =>
           flushToolInput(projectId),
         );
       }
@@ -131,31 +136,110 @@ function scheduleToolJsonParse(projectId: string) {
 }
 
 function flushTodos(projectId: string) {
-  if (pendingTodos) {
-    useProjectsStore.getState().setConversationTodos(projectId, pendingTodos);
-    pendingTodos = null;
+  const state = getStreamingState(projectId);
+  if (state.pendingTodos) {
+    useProjectsStore.getState().setConversationTodos(projectId, state.pendingTodos);
+    state.pendingTodos = null;
   }
-  todosFlushRaf = 0;
+  state.todosFlushRaf = 0;
 }
 
 function flushTextDelta(projectId: string) {
-  if (pendingTextDelta) {
+  const state = getStreamingState(projectId);
+  if (state.pendingTextDelta) {
+    // Bleed logic: release a portion of the buffer to create a smooth typewriter effect.
+    // If the buffer is large, we speed up slightly, but we always keep it calm.
+    const buffer = state.pendingTextDelta;
+    const len = buffer.length;
+    
+    // Release between 1 and 4 characters per frame depending on buffer size.
+    // Capping at 4 ensures it never feels like a sudden jump.
+    const charsToRelease = Math.min(len, Math.max(1, Math.min(4, Math.floor(len / 8))));
+    const toFlush = buffer.slice(0, charsToRelease);
+    state.pendingTextDelta = buffer.slice(charsToRelease);
+
     useProjectsStore
       .getState()
-      .appendToLastAssistantText(projectId, pendingTextDelta);
-    pendingTextDelta = "";
+      .appendToLastAssistantText(projectId, toFlush);
   }
-  textFlushRaf = 0;
+
+  if (state.pendingTextDelta) {
+    state.textFlushRaf = requestAnimationFrame(() => flushTextDelta(projectId));
+  } else {
+    state.textFlushRaf = 0;
+  }
+}
+
+function resetStreamingState(projectId: string, flush = false) {
+  const state = getStreamingState(projectId);
+  if (flush) {
+    if (state.pendingTextDelta) {
+      cancelAnimationFrame(state.textFlushRaf);
+      // Final flush of remaining text
+      useProjectsStore
+        .getState()
+        .appendToLastAssistantText(projectId, state.pendingTextDelta);
+      state.pendingTextDelta = "";
+    }
+    if (state.pendingThinkingDelta) {
+      cancelAnimationFrame(state.thinkingFlushRaf);
+      // Final flush of remaining thinking
+      useProjectsStore
+        .getState()
+        .appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
+      state.pendingThinkingDelta = "";
+    }
+    if (state.pendingToolInput) {
+      cancelAnimationFrame(state.toolInputFlushRaf);
+      flushToolInput(projectId);
+    }
+    if (state.pendingTodos) {
+      cancelAnimationFrame(state.todosFlushRaf);
+      flushTodos(projectId);
+    }
+  }
+
+  if (state.textFlushRaf) cancelAnimationFrame(state.textFlushRaf);
+  if (state.thinkingFlushRaf) cancelAnimationFrame(state.thinkingFlushRaf);
+  if (state.toolInputFlushRaf) cancelAnimationFrame(state.toolInputFlushRaf);
+  if (state.toolJsonParseRaf) cancelAnimationFrame(state.toolJsonParseRaf);
+  if (state.todosFlushRaf) cancelAnimationFrame(state.todosFlushRaf);
+
+  state.pendingTextDelta = "";
+  state.pendingThinkingDelta = "";
+  state.pendingToolInput = null;
+  state.pendingToolJson = "";
+  state.pendingToolJsonTruncated = false;
+  state.pendingTodos = null;
+
+  state.textFlushRaf = 0;
+  state.thinkingFlushRaf = 0;
+  state.toolInputFlushRaf = 0;
+  state.toolJsonParseRaf = 0;
+  state.todosFlushRaf = 0;
 }
 
 function flushThinkingDelta(projectId: string) {
-  if (pendingThinkingDelta) {
+  const state = getStreamingState(projectId);
+  if (state.pendingThinkingDelta) {
+    const buffer = state.pendingThinkingDelta;
+    const len = buffer.length;
+    
+    // Thinking can bleed a bit faster than text, but still capped for calmness.
+    const charsToRelease = Math.min(len, Math.max(1, Math.min(6, Math.floor(len / 6))));
+    const toFlush = buffer.slice(0, charsToRelease);
+    state.pendingThinkingDelta = buffer.slice(charsToRelease);
+
     useProjectsStore
       .getState()
-      .appendToLastAssistantThinking(projectId, pendingThinkingDelta);
-    pendingThinkingDelta = "";
+      .appendToLastAssistantThinking(projectId, toFlush);
   }
-  thinkingFlushRaf = 0;
+
+  if (state.pendingThinkingDelta) {
+    state.thinkingFlushRaf = requestAnimationFrame(() => flushThinkingDelta(projectId));
+  } else {
+    state.thinkingFlushRaf = 0;
+  }
 }
 
 function fixPartialJson(s: string): string {
@@ -518,6 +602,7 @@ export function usePunk(projectId: string) {
       if (project.conversation.isProcessing) return;
 
       await abortPunk(projectId).catch(() => {});
+      resetStreamingState(projectId);
 
       const messageId = nextMessageId();
       const userMessage: ConversationMessage = {
@@ -793,6 +878,7 @@ export function usePunk(projectId: string) {
       store.setConversationProcessing(projectId, false);
       store.setLastMessageStreamingDone(projectId);
       store.setIsPlanning(projectId, false);
+      resetStreamingState(projectId);
     }
   }, [projectId]);
 
@@ -815,29 +901,10 @@ function handleClaudeMessage(
   assistantMessageExists: boolean,
 ): boolean {
   const store = useProjectsStore.getState();
+  const state = getStreamingState(projectId);
 
   if (msg.type !== "stream_event") {
-    if (pendingTextDelta) {
-      cancelAnimationFrame(textFlushRaf);
-      flushTextDelta(projectId);
-    }
-    if (pendingThinkingDelta) {
-      cancelAnimationFrame(thinkingFlushRaf);
-      flushThinkingDelta(projectId);
-    }
-    if (pendingToolInput) {
-      cancelAnimationFrame(toolInputFlushRaf);
-      flushToolInput(projectId);
-    }
-    if (pendingTodos) {
-      cancelAnimationFrame(todosFlushRaf);
-      flushTodos(projectId);
-    }
-    if (pendingJsonDelta) {
-      cancelAnimationFrame(jsonFlushRaf);
-      flushJsonDelta(projectId);
-    }
-    isStreamingJson = false;
+    resetStreamingState(projectId, true);
   }
 
   if ("skipped" in msg) {
@@ -932,10 +999,38 @@ function handleClaudeMessage(
     }
 
     case "user": {
+      const project = store.projects.get(projectId);
+      const newContent = msg.message.content as ContentBlock[];
+      const newToolResult = newContent.find(
+        (b) => b.type === "tool_result",
+      ) as ToolResultBlock | undefined;
+
+      if (project && newToolResult) {
+        const msgs = project.conversation.messages;
+        // Search backwards for a matching system message with this tool_use_id
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i]!;
+          if (m.type === "system") {
+            const hasMatch = m.content.some(
+              (b) =>
+                b.type === "tool_result" &&
+                (b as ToolResultBlock).tool_use_id ===
+                  newToolResult.tool_use_id,
+            );
+            if (hasMatch) {
+              store.updateMessageContent(projectId, m.id, newContent);
+              return false;
+            }
+          }
+          // Optimization: don't look too far back
+          if (msgs.length - i > 15) break;
+        }
+      }
+
       const toolResultMsg: ConversationMessage = {
         id: nextMessageId(),
         type: "system",
-        content: msg.message.content as ContentBlock[],
+        content: newContent,
         timestamp: Date.now(),
         isStreaming: false,
       };
@@ -1003,20 +1098,20 @@ function handleClaudeMessage(
       const evt = msg.event;
 
       if (evt.type === "content_block_start") {
-        if (pendingTextDelta) {
-          cancelAnimationFrame(textFlushRaf);
+        if (state.pendingTextDelta) {
+          cancelAnimationFrame(state.textFlushRaf);
           flushTextDelta(projectId);
         }
-        if (pendingThinkingDelta) {
-          cancelAnimationFrame(thinkingFlushRaf);
+        if (state.pendingThinkingDelta) {
+          cancelAnimationFrame(state.thinkingFlushRaf);
           flushThinkingDelta(projectId);
         }
-        if (pendingToolInput) {
-          cancelAnimationFrame(toolInputFlushRaf);
+        if (state.pendingToolInput) {
+          cancelAnimationFrame(state.toolInputFlushRaf);
           flushToolInput(projectId);
         }
-        if (pendingTodos) {
-          cancelAnimationFrame(todosFlushRaf);
+        if (state.pendingTodos) {
+          cancelAnimationFrame(state.todosFlushRaf);
           flushTodos(projectId);
         }
       }
@@ -1027,35 +1122,6 @@ function handleClaudeMessage(
         evt.delta.text
       ) {
         store.setConversationStatusMessage(projectId, null);
-
-        // JSON detection: if message starts with { or [, switch to JSON streaming mode
-        if (
-          !assistantMessageExists &&
-          (evt.delta.text.trim().startsWith("{") ||
-            evt.delta.text.trim().startsWith("["))
-        ) {
-          isStreamingJson = true;
-          pendingJsonDelta = evt.delta.text;
-          const placeholder: ConversationMessage = {
-            id: nextMessageId(),
-            type: "assistant",
-            content: [{ type: "json", json: {}, raw: evt.delta.text }],
-            timestamp: Date.now(),
-            isStreaming: true,
-          };
-          store.addConversationMessage(projectId, placeholder);
-          return true;
-        }
-
-        if (isStreamingJson) {
-          pendingJsonDelta += evt.delta.text;
-          if (!jsonFlushRaf) {
-            jsonFlushRaf = requestAnimationFrame(() =>
-              flushJsonDelta(projectId),
-            );
-          }
-          return true;
-        }
 
         if (!assistantMessageExists) {
           const placeholder: ConversationMessage = {
@@ -1068,9 +1134,9 @@ function handleClaudeMessage(
           store.addConversationMessage(projectId, placeholder);
           return true;
         } else {
-          pendingTextDelta += evt.delta.text;
-          if (!textFlushRaf) {
-            textFlushRaf = requestAnimationFrame(() =>
+          state.pendingTextDelta += evt.delta.text;
+          if (!state.textFlushRaf) {
+            state.textFlushRaf = requestAnimationFrame(() =>
               flushTextDelta(projectId),
             );
           }
@@ -1095,9 +1161,9 @@ function handleClaudeMessage(
           store.addConversationMessage(projectId, placeholder);
           return true;
         } else {
-          pendingThinkingDelta += evt.delta.thinking;
-          if (!thinkingFlushRaf) {
-            thinkingFlushRaf = requestAnimationFrame(() =>
+          state.pendingThinkingDelta += evt.delta.thinking;
+          if (!state.thinkingFlushRaf) {
+            state.thinkingFlushRaf = requestAnimationFrame(() =>
               flushThinkingDelta(projectId),
             );
           }
@@ -1151,11 +1217,11 @@ function handleClaudeMessage(
         evt.type === "content_block_start" &&
         evt.content_block?.type === "tool_use"
       ) {
-        pendingToolJson = "";
-        pendingToolJsonTruncated = false;
-        if (toolJsonParseRaf) {
-          cancelAnimationFrame(toolJsonParseRaf);
-          toolJsonParseRaf = 0;
+        state.pendingToolJson = "";
+        state.pendingToolJsonTruncated = false;
+        if (state.toolJsonParseRaf) {
+          cancelAnimationFrame(state.toolJsonParseRaf);
+          state.toolJsonParseRaf = 0;
         }
         const toolBlock = evt.content_block as ToolUseBlock;
 
@@ -1218,19 +1284,19 @@ function handleClaudeMessage(
         evt.delta?.type === "partial_json_delta" &&
         evt.delta.partial_json
       ) {
-        if (pendingToolJsonTruncated) return assistantMessageExists;
+        if (state.pendingToolJsonTruncated) return assistantMessageExists;
 
-        pendingToolJson += evt.delta.partial_json;
-        if (pendingToolJson.length > MAX_STREAMING_TOOL_JSON_CHARS) {
-          pendingToolJsonTruncated = true;
-          pendingToolJson = "";
-          pendingToolInput = {
+        state.pendingToolJson += evt.delta.partial_json;
+        if (state.pendingToolJson.length > MAX_STREAMING_TOOL_JSON_CHARS) {
+          state.pendingToolJsonTruncated = true;
+          state.pendingToolJson = "";
+          state.pendingToolInput = {
             __pane_truncated: true,
             __pane_note:
               "Tool input streaming truncated (too large). Full input may still be available in the final message.",
           };
-          if (!toolInputFlushRaf) {
-            toolInputFlushRaf = requestAnimationFrame(() =>
+          if (!state.toolInputFlushRaf) {
+            state.toolInputFlushRaf = requestAnimationFrame(() =>
               flushToolInput(projectId),
             );
           }

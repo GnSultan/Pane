@@ -656,6 +656,8 @@ const defaultSettings = {
   http_provider: "deepseek",
   http_api_key: "",
   http_base_url: "",
+  http_api_keys: {},
+  http_base_urls: {},
   selected_model: null,
   completion_sound: null,
   intent_routing: null,
@@ -1385,6 +1387,79 @@ function registerMemoryHandlers() {
   });
 }
 
+// --- Session Context (per-project active state for context compilation) ---
+function registerSessionHandlers() {
+  const SESSION_DIR = path.join(os.homedir(), ".pane", "session");
+
+  ipcMain.handle("session_merge_state", async (_event, args) => {
+    const { projectId, delta } = args;
+    const stateDir = path.join(SESSION_DIR, projectId);
+    const statePath = path.join(stateDir, "state.json");
+
+    let current = {
+      activeTask: null, workingSet: [], decisions: [],
+      recentActions: [], turnCount: 0, lastProvider: null, lastIntent: null,
+      startedAt: Date.now(),
+    };
+    try { current = JSON.parse(await fs.promises.readFile(statePath, "utf-8")); } catch {}
+
+    // Active task
+    if (delta.activeTask !== undefined) {
+      current.activeTask = delta.activeTask ? { ...current.activeTask, ...delta.activeTask } : null;
+    }
+    // Working set: upsert by path, cap at 10
+    if (delta.workingSet?.length) {
+      for (const file of delta.workingSet) {
+        const idx = current.workingSet.findIndex(f => f.path === file.path);
+        if (idx >= 0) {
+          current.workingSet[idx] = { ...current.workingSet[idx], ...file, touches: (current.workingSet[idx].touches || 0) + 1 };
+        } else {
+          current.workingSet.push({ ...file, touches: 1 });
+        }
+      }
+      current.workingSet.sort((a, b) => (b.touches || 0) - (a.touches || 0));
+      current.workingSet = current.workingSet.slice(0, 10);
+    }
+    // Decisions: prepend new, deduplicate, cap at 8
+    if (delta.decisions?.length) {
+      for (const d of delta.decisions) {
+        const key = d.content.slice(0, 60).toLowerCase();
+        const dupe = current.decisions.some(x => x.content.slice(0, 60).toLowerCase() === key);
+        if (!dupe) current.decisions.unshift({ content: d.content, timestamp: Date.now() });
+      }
+      current.decisions = current.decisions.slice(0, 8);
+    }
+    // Recent actions: prepend, cap at 8
+    if (delta.recentActions?.length) {
+      current.recentActions = [...delta.recentActions, ...current.recentActions].slice(0, 8);
+    }
+    if (delta.turnCount !== undefined) current.turnCount = delta.turnCount;
+    if (delta.lastProvider) current.lastProvider = delta.lastProvider;
+    if (delta.lastIntent)   current.lastIntent = delta.lastIntent;
+    if (delta.gitStatus !== undefined) current.gitStatus = delta.gitStatus;
+
+    await fs.promises.mkdir(stateDir, { recursive: true });
+    await fs.promises.writeFile(statePath, JSON.stringify(current, null, 2), "utf-8");
+    return current;
+  });
+
+  ipcMain.handle("session_clear_state", async (_event, args) => {
+    const { projectId } = args;
+    const statePath = path.join(SESSION_DIR, projectId, "state.json");
+    const blank = { activeTask: null, workingSet: [], decisions: [], recentActions: [],
+      turnCount: 0, lastProvider: null, lastIntent: null, startedAt: Date.now() };
+    await fs.promises.mkdir(path.dirname(statePath), { recursive: true });
+    await fs.promises.writeFile(statePath, JSON.stringify(blank, null, 2), "utf-8");
+    return blank;
+  });
+
+  ipcMain.handle("session_read_state", async (_event, args) => {
+    const statePath = path.join(SESSION_DIR, args.projectId, "state.json");
+    try { return JSON.parse(await fs.promises.readFile(statePath, "utf-8")); }
+    catch { return null; }
+  });
+}
+
 // --- Brain Engine (knowledge graph + embeddings + semantic search) ---
 let brainWorker = null;
 const brainPendingRequests = new Map();
@@ -1452,8 +1527,23 @@ function registerBrainHandlers() {
   });
 
   ipcMain.handle("brain_contextual_search", async (_event, args) => {
-    const { projectId, query, fileContext } = args;
-    return brainRequest("contextual_search", { projectId, query, fileContext });
+    const { projectId, query, fileContext, intent, projectRoot } = args;
+    // Auto-trigger file indexing fire-and-forget when projectRoot is known.
+    // brain-engine deduplicates via indexedProjects Set — safe to call every time.
+    if (projectRoot) {
+      brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
+    }
+    return brainRequest("contextual_search", { projectId, query, fileContext, intent, projectRoot: projectRoot || null });
+  });
+
+  ipcMain.handle("brain_session_pins_clear", async (_event, args) => {
+    const { projectId } = args;
+    return brainRequest("session_pins_clear", { projectId });
+  });
+
+  ipcMain.handle("brain_index_project_files", async (_event, args) => {
+    const { projectId, projectRoot } = args;
+    return brainRequest("index_project_files", { projectId, projectRoot });
   });
 
   ipcMain.handle("brain_get_related", async (_event, args) => {
@@ -1514,7 +1604,7 @@ function registerBrainHandlers() {
   });
 
   ipcMain.handle("brain_mind_update", async (_event, args) => {
-    return brainRequest("mind_update", { id: args.id, content: args.content });
+    return brainRequest("mind_update", { id: args.id, content: args.content, completed: args.completed });
   });
 
   ipcMain.handle("brain_mind_delete", async (_event, args) => {
@@ -1531,6 +1621,7 @@ function registerIpcHandlers() {
   registerCheckpointHandlers();
   registerStateHandlers();
   registerMemoryHandlers();
+  registerSessionHandlers();
   registerBrainHandlers();
 }
 let mainWindow = null;
@@ -1587,6 +1678,13 @@ function createWindow() {
   });
   mainWindow.on("closed", () => {
     mainWindow = null;
+  });
+
+  mainWindow.webContents.on("render-process-gone", (event, details) => {
+    console.error(`[pane] Renderer process gone: ${details.reason} (${details.exitCode})`);
+    if (details.reason === "crashed" || details.reason === "oom") {
+      console.warn("[pane] Renderer crashed or OOM, reload might be needed.");
+    }
   });
 }
 app.whenReady().then(() => {

@@ -1,0 +1,67 @@
+{
+  "project_roots": [
+    "/Users/macbook/Pane",
+    "/Users/macbook/punk-record",
+    "/Users/macbook/elimuafrica",
+    "/Users/macbook/narrative-engine",
+    "/Users/macbook/pulse",
+    "/Users/macbook/aslam-portfolio",
+    "/Users/macbook/Documents/elimu 2024/Cowork"
+  ],
+  "active_project_root": "/Users/macbook/Pane",
+  "control_panel_visible": true,
+  "project_states": {
+    "/Users/macbook/Pane": {
+      "expanded_dirs": [],
+      "active_file_path": null,
+      "recent_files": []
+    },
+    "/Users/macbook/punk-record": {
+      "expanded_dirs": [],
+      "active_file_path": null,
+      "recent_files": []
+    },
+    "/Users/macbook/elimuafrica": {
+      "expanded_dirs": [],
+      "active_file_path": null,
+      "recent_files": []
+    },
+    "/Users/macbook/narrative-engine": {
+      "expanded_dirs": [],
+      "active_file_path": null,
+      "recent_files": []
+    },
+    "/Users/macbook/pulse": {
+      "expanded_dirs": [],
+      "active_file_path": null,
+      "recent_files": []
+    },
+    "/Users/macbook/aslam-portfolio": {
+      "expanded_dirs": [],
+      "active_file_path": null,
+      "recent_files": []
+    },
+    "/Users/macbook/Documents/elimu 2024/Cowork": {
+      "expanded_dirs": [],
+      "active_file_path": null,
+      "recent_files": []
+    }
+  },
+  "font_size": 19,
+  "panel_font_size": 16,
+  "editor_font_size": 21,
+  "font_weight": 300,
+  "keybindings": null,
+  "theme": "system",
+  "panel_width": 287.8515625,
+  "completion_sound": "Submarine",
+  "selected_model": "sonnet",
+  "punk_backend": "http",
+  "http_provider": "deepseek",
+  "http_api_keys": {
+    "deepseek": "test-api-key-1234567890"
+  },
+  "http_base_urls": {},
+  "http_api_key": "test-api-key-1234567890",
+  "http_base_url": ""
+}

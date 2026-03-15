@@ -16,7 +16,7 @@ import { ToolActivity, ServerToolActivity } from "./ToolActivity";
 import { MarkdownText } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
 import {
-  StreamingIndicator,
+  // StreamingIndicator,
   // CompactStreamingIndicator,
 } from "./StreamingIndicator";
 
@@ -38,20 +38,20 @@ style.textContent = `
   }
 
   @keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
+    from { opacity: 0; filter: blur(1.5px); transform: translateY(1px); }
+    to { opacity: 1; filter: blur(0); transform: translateY(0); }
   }
 
   .streaming-message {
-    animation: slideIn 0.2s ease-out;
+    animation: slideIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   .streaming-text {
-    animation: fadeIn 0.1s ease-out;
+    animation: fadeIn 2.5s cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   .thinking-pulse {
-    animation: pulse 1.5s ease-in-out infinite;
+    animation: pulse 2.0s ease-in-out infinite;
   }
 `;
 document.head.appendChild(style);
@@ -243,18 +243,18 @@ interface MessageBubbleProps {
 }
 
 function JsonBlockDisplay({ block }: { block: JsonBlock }) {
+  const jsonStr = block.json ? JSON.stringify(block.json, null, 2) : block.raw;
   return (
     <div className="my-6">
       <div className="text-[10px] font-mono text-pane-text-secondary/40 mb-2 uppercase tracking-[0.1em]">
-        JSON OBJECT
+        json
       </div>
       <pre
-        className="font-mono text-pane-text-secondary bg-pane-bg
-                   p-5 overflow-x-auto max-h-[500px]
-                   overflow-y-auto border border-pane-border/60 leading-[1.6]"
+        className="font-mono text-pane-text/85 bg-pane-bg/40
+                   px-5 py-4 overflow-x-auto leading-[1.75] rounded-sm"
         style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
       >
-        {block.json ? JSON.stringify(block.json, null, 2) : block.raw}
+        {jsonStr}
       </pre>
     </div>
   );
@@ -348,29 +348,7 @@ export function MessageBubble({
     });
 
     // Check if this is a DeepSeek R1 response with reasoning
-    const hasThinking = message.content.some((b) => b.type === "thinking");
-    const isDeepSeekR1 = hasThinking && message.isStreaming;
-
-    // Get provider info for streaming indicator
-    const project = useProjectsStore.getState().projects.get(projectId);
-    const routedModel = project?.conversation.routedModel || "";
-    // Parse the routedModel string to extract provider and model
-    // Format is usually "provider:model" or just "model"
-    let provider = "deepseek";
-    let model = "";
-    if (routedModel) {
-      if (routedModel.includes(":")) {
-        const parts = routedModel.split(":");
-        provider = parts[0] || "deepseek";
-        model = parts.slice(1).join(":");
-      } else {
-        model = routedModel;
-        // Try to infer provider from model name
-        if (model.includes("claude")) provider = "anthropic";
-        else if (model.includes("gemini")) provider = "gemini";
-        else if (model.includes("deepseek")) provider = "deepseek";
-      }
-    }
+    // const hasThinking = message.content.some((b) => b.type === "thinking");
 
     // Group consecutive text/thinking blocks, but tools always get their own group
     type GroupType = "text" | "tool" | "thinking" | "json";
@@ -413,17 +391,6 @@ export function MessageBubble({
       <div
         className={`group ${animClass} ${hasVisibleContent ? "mb-10" : "mb-1"} ${message.isStreaming ? "streaming-message" : ""}`}
       >
-        {/* Streaming indicator for DeepSeek and other providers */}
-        {message.isStreaming && (
-          <StreamingIndicator
-            isStreaming={message.isStreaming}
-            isReasoning={isDeepSeekR1}
-            provider={provider}
-            model={model}
-            speed="medium"
-          />
-        )}
-
         {groups.map((group, gi) => {
           if (group.type === "thinking") {
             return (

@@ -17,11 +17,440 @@ const PROFILE_DIR = path.join(os.homedir(), ".pane", "profile");
 const EXPORTS_DIR = path.join(BRAIN_DIR, "exports");
 const MODEL_CACHE = path.join(BRAIN_DIR, "models");
 
+const SETTINGS_PATH = path.join(os.homedir(), ".pane", "settings.json");
+
 // --- State ---
 let db = null;
 let embedder = null;
 let embedderLoading = false;
 let embedderReady = false;
+
+// Tracks which projects have completed a full initial index this session.
+const indexedProjects = new Set();
+
+// Tracks files that failed summarization during this session.
+// Maps projectId -> Set of absolute file paths to retry on next call.
+const failedFiles = new Map();
+
+// --- Settings Reader ---
+
+function readSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+// --- File Summarization via LLM ---
+
+// Skip files that are noise — not meaningful architectural signal.
+const SKIP_EXTENSIONS = new Set([
+  ".lock", ".log", ".map", ".min.js", ".min.css",
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+  ".woff", ".woff2", ".ttf", ".eot",
+  ".zip", ".tar", ".gz", ".dmg", ".exe",
+  ".db", ".sqlite", ".sqlite3",
+]);
+
+const SKIP_DIRS = new Set([
+  "node_modules", ".git", "dist", "out", "build", "release",
+  ".cache", ".parcel-cache", ".next", ".nuxt", "coverage",
+  "__pycache__", ".venv", "venv", ".tox",
+]);
+
+const MEANINGFUL_EXTENSIONS = new Set([
+  ".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx",
+  ".py", ".rs", ".go", ".java", ".kt", ".swift",
+  ".rb", ".php", ".cs", ".cpp", ".c", ".h",
+  ".vue", ".svelte",
+  ".sh", ".bash",
+  ".json", ".yaml", ".yml", ".toml",
+  ".md", ".txt",
+  ".sql",
+]);
+
+function shouldIndexFile(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const base = path.basename(filePath).toLowerCase();
+  if (SKIP_EXTENSIONS.has(ext)) return false;
+  if (base.endsWith(".min.js") || base.endsWith(".min.css")) return false;
+  if (base === "package-lock.json" || base === "yarn.lock" || base === "pnpm-lock.yaml") return false;
+  if (!MEANINGFUL_EXTENSIONS.has(ext)) return false;
+  return true;
+}
+
+function walkProjectFiles(rootDir, maxFiles = 200) {
+  const results = [];
+  const queue = [rootDir];
+
+  while (queue.length > 0 && results.length < maxFiles) {
+    const dir = queue.shift();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { continue; }
+
+    for (const entry of entries) {
+      if (results.length >= maxFiles) break;
+      if (entry.name.startsWith(".")) continue; // skip hidden
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) queue.push(fullPath);
+      } else if (entry.isFile()) {
+        if (shouldIndexFile(fullPath)) results.push(fullPath);
+      }
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Build an ordered list of all available providers to try.
+ * HTTP first (no subprocess overhead), CLI last as final fallback.
+ */
+function buildProviderChain(settings) {
+  const keys = settings.http_api_keys || {};
+  const chain = [];
+
+  if (keys.gemini) chain.push({ type: "http", provider: "gemini", apiKey: keys.gemini, model: "gemini-flash-latest" });
+  if (keys.anthropic) chain.push({ type: "http", provider: "anthropic", apiKey: keys.anthropic, model: "claude-haiku-4-5-20251001" });
+  if (keys.deepseek) chain.push({ type: "http", provider: "deepseek", apiKey: keys.deepseek, model: "deepseek-v3.2" });
+  if (keys.openai) chain.push({ type: "http", provider: "openai", apiKey: keys.openai, model: "gpt-4o-mini" });
+
+  // CLI backends as final fallback
+  const backend = settings.punk_backend || "";
+  if (backend === "claude-cli" || backend === "cli") chain.push({ type: "cli", command: "claude" });
+  else if (backend === "gemini-cli") chain.push({ type: "cli", command: "gemini" });
+
+  return chain;
+}
+
+/**
+ * Ask the LLM to describe a file in 2-3 sentences.
+ * Tries each provider in the chain in order — moves to the next on any failure.
+ * Returns the description string, or null if all providers fail.
+ */
+async function summarizeFile(filePath, projectRoot, providerChain) {
+  let fileContent;
+  try {
+    const raw = fs.readFileSync(filePath, "utf-8");
+    // Cap at ~400 lines — first 400 lines is enough semantic signal
+    fileContent = raw.split("\n").slice(0, 400).join("\n");
+  } catch {
+    return null;
+  }
+
+  if (fileContent.trim().length < 20) return null;
+
+  const relativePath = path.relative(projectRoot, filePath);
+  const prompt = [
+    `File: ${relativePath}`,
+    ``,
+    `\`\`\``,
+    fileContent.slice(0, 8000), // ~2000 tokens max
+    `\`\`\``,
+    ``,
+    `Describe what this file does in 2-3 sentences. Be specific about its role in the codebase — mention key responsibilities, what it owns, and how it relates to other parts of the system. No preamble, just the description.`,
+  ].join("\n");
+
+  for (const provider of providerChain) {
+    try {
+      let result = null;
+      if (provider.type === "http") {
+        result = await summarizeViaHttp(prompt, provider);
+      } else if (provider.type === "cli") {
+        result = await summarizeViaCli(prompt, provider.command);
+      }
+      if (result && result.trim().length > 10) return result.trim();
+      // Result was empty — try next provider
+      console.warn(`[brain] ${provider.provider || provider.command} returned empty for ${relativePath}, trying next provider`);
+    } catch (err) {
+      console.warn(`[brain] ${provider.provider || provider.command} failed for ${relativePath}: ${err.message}, trying next provider`);
+    }
+  }
+
+  console.error(`[brain] All providers failed for ${relativePath}`);
+  return null;
+}
+
+async function summarizeViaHttp(prompt, { provider, apiKey, model }) {
+  const { default: https } = await import("node:https");
+
+  const makeRequest = (url, body, headers) => new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const data = JSON.stringify(body);
+    const req = https.request({
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data), ...headers },
+    }, (res) => {
+      let raw = "";
+      res.on("data", c => raw += c);
+      res.on("end", () => {
+        try { 
+          const parsed = JSON.parse(raw);
+          if (res.statusCode >= 400) {
+            console.error(`[brain] HTTP ${res.statusCode} from ${urlObj.hostname}:`, JSON.stringify(parsed));
+            reject(new Error(`HTTP ${res.statusCode}`));
+          } else {
+            resolve(parsed);
+          }
+        }
+        catch { 
+          console.error(`[brain] Failed to parse JSON from ${urlObj.hostname}:`, raw.slice(0, 500));
+          reject(new Error(`Bad JSON from ${urlObj.hostname}`)); 
+        }
+      });
+    });
+    req.on("error", reject);
+    req.write(data);
+    req.end();
+  });
+
+  if (provider === "gemini") {
+    const resp = await makeRequest(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      { 
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        systemInstruction: {
+          parts: [{ text: "You are a helpful assistant that summarizes code files. Provide clear, concise descriptions of the file's role and responsibilities." }]
+        },
+        safetySettings: [
+          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+        ]
+      },
+      {},
+    );
+    return resp?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+  }
+
+  if (provider === "anthropic") {
+    const resp = await makeRequest(
+      "https://api.anthropic.com/v1/messages",
+      { model, max_tokens: 256, messages: [{ role: "user", content: prompt }] },
+      { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+    );
+    return resp?.content?.[0]?.text?.trim() || null;
+  }
+
+  if (provider === "deepseek") {
+    const resp = await makeRequest(
+      "https://api.deepseek.com/v1/chat/completions",
+      { model, max_tokens: 256, messages: [{ role: "user", content: prompt }] },
+      { "Authorization": `Bearer ${apiKey}` },
+    );
+    return resp?.choices?.[0]?.message?.content?.trim() || null;
+  }
+
+  if (provider === "openai") {
+    const resp = await makeRequest(
+      "https://api.openai.com/v1/chat/completions",
+      { model, max_tokens: 256, messages: [{ role: "user", content: prompt }] },
+      { "Authorization": `Bearer ${apiKey}` },
+    );
+    return resp?.choices?.[0]?.message?.content?.trim() || null;
+  }
+
+  return null;
+}
+
+async function summarizeViaCli(prompt, command) {
+  const { spawn } = await import("node:child_process");
+  const home = os.homedir();
+  const nvmBins = [];
+  try {
+    const versions = fs.readdirSync(path.join(home, ".nvm", "versions", "node"));
+    for (const v of versions) nvmBins.push(path.join(home, ".nvm", "versions", "node", v, "bin"));
+  } catch {}
+  const PATH = [...nvmBins, "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", process.env.PATH || ""].join(":");
+
+  return new Promise((resolve) => {
+    let args, output = "";
+    if (command === "claude") {
+      // Claude CLI: --output-format text gives plain stdout, --no-tools disables agentic tool use
+      args = ["-p", prompt, "--output-format", "text", "--no-tools"];
+    } else {
+      // Gemini CLI: plain -p gives plain text stdout. No --no-tools flag exists.
+      args = ["-p", prompt];
+    }
+
+    const child = spawn(command, args, { env: { ...process.env, PATH }, timeout: 30000 });
+    child.stdout.on("data", d => output += d.toString());
+    child.on("close", () => resolve(output.trim() || null));
+    child.on("error", () => resolve(null));
+  });
+}
+
+/**
+ * Walk the project, summarize each unindexed file, store as 'file' nodes.
+ * Runs in the background — safe to call fire-and-forget.
+ */
+async function indexProjectFiles(projectId, projectRoot) {
+  if (!db) return;
+
+  const settings = readSettings();
+  const providerChain = buildProviderChain(settings);
+  if (providerChain.length === 0) {
+    console.log(`[brain] No LLM provider available for file indexing of ${projectId}`);
+    return;
+  }
+
+  // Determine which files to attempt this run:
+  // - First call for this project this session: full walk minus already-indexed
+  // - Subsequent calls: only files that failed last time (mid-session retry)
+  let toIndex;
+  const pending = failedFiles.get(projectId);
+
+  if (!indexedProjects.has(projectId)) {
+    // Initial pass — walk the project tree
+    indexedProjects.add(projectId);
+
+    const files = walkProjectFiles(projectRoot);
+    if (files.length === 0) return;
+
+    // Compare each file's mtime against what's stored in the DB.
+    // Re-index if: (a) never indexed, or (b) file modified since last index.
+    const existingNodes = db.prepare(
+      `SELECT name, content FROM nodes WHERE entity_type = 'file' AND project_id = ?`
+    ).all(projectId);
+
+    // Build map: relativePath -> stored mtime
+    const storedMtimes = new Map();
+    for (const node of existingNodes) {
+      try {
+        const c = JSON.parse(node.content || "{}");
+        if (c.mtime) storedMtimes.set(node.name, c.mtime);
+      } catch {}
+    }
+
+    toIndex = files.filter(f => {
+      const rel = path.relative(projectRoot, f);
+      const stored = storedMtimes.get(rel);
+      if (!stored) return true; // Never indexed
+      try {
+        const mtime = fs.statSync(f).mtimeMs;
+        return mtime > stored; // Modified since last index
+      } catch {
+        return false; // Can't stat — skip
+      }
+    });
+
+    const changedCount = toIndex.filter(f => storedMtimes.has(path.relative(projectRoot, f))).length;
+    const newCount = toIndex.length - changedCount;
+
+    if (toIndex.length === 0) {
+      console.log(`[brain] All ${files.length} files up to date for ${projectId}`);
+      return;
+    }
+    console.log(`[brain] Indexing ${toIndex.length} files for ${projectId} (${newCount} new, ${changedCount} changed) | chain: ${providerChain.map(p => p.provider || p.command).join(" → ")}`);
+  } else if (pending && pending.size > 0) {
+    // Retry pass — only files that failed last time
+    toIndex = Array.from(pending);
+    console.log(`[brain] Retrying ${toIndex.length} previously failed files for ${projectId}`);
+    pending.clear(); // Clear before re-attempt so new failures repopulate cleanly
+  } else {
+    return; // Already indexed, nothing failed — nothing to do
+  }
+
+  let indexed = 0;
+  const nowFailed = failedFiles.get(projectId) || new Set();
+  failedFiles.set(projectId, nowFailed);
+
+  for (const filePath of toIndex) {
+    const relativePath = path.relative(projectRoot, filePath);
+    const description = await summarizeFile(filePath, projectRoot, providerChain);
+
+    if (!description) {
+      nowFailed.add(filePath); // Remember for mid-session retry
+      continue;
+    }
+
+    const id = nodeId("file", relativePath);
+    const embedding = await embed(description);
+    const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
+
+    // Store mtime so we can detect changes on future startups
+    let mtime = 0;
+    try { mtime = fs.statSync(filePath).mtimeMs; } catch {}
+
+    try {
+      db.prepare(`
+        INSERT INTO nodes (id, name, entity_type, project_id, content, embedding, confidence, version)
+        VALUES (?, ?, 'file', ?, ?, ?, 1.0, 1)
+        ON CONFLICT(id) DO UPDATE SET
+          content = excluded.content,
+          embedding = excluded.embedding,
+          updated_at = datetime('now')
+      `).run(id, relativePath, projectId, JSON.stringify({ text: description, path: filePath, mtime }), embeddingBuffer);
+      indexed++;
+      nowFailed.delete(filePath); // Successfully indexed — remove from failed set
+    } catch (err) {
+      console.error(`[brain] Failed to store file node for ${relativePath}:`, err.message);
+      nowFailed.add(filePath);
+    }
+  }
+
+  const stillFailing = nowFailed.size;
+  console.log(`[brain] Indexed ${indexed}/${toIndex.length} files for ${projectId}${
+    stillFailing > 0 ? ` (${stillFailing} failed, will retry on next request)` : ""
+  }`);
+}
+
+/**
+ * Semantic search over indexed file nodes for a project.
+ * Returns files most relevant to the query, sorted by similarity.
+ */
+async function findRelevantFiles(query, projectId, limit = 5) {
+  if (!db) return [];
+
+  const fileNodes = db.prepare(
+    `SELECT * FROM nodes WHERE entity_type = 'file' AND project_id = ? AND embedding IS NOT NULL`
+  ).all(projectId);
+
+  if (fileNodes.length === 0) return [];
+
+  // If embedder ready: semantic search. Otherwise: keyword fallback.
+  const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+
+  const queryEmbedding = embedderReady ? await embed(query) : null;
+  const results = [];
+
+  for (const node of fileNodes) {
+    const content = JSON.parse(node.content || "{}");
+    const description = content.text || "";
+    const filePath = node.name; // relative path
+
+    let score = 0;
+
+    if (queryEmbedding && node.embedding) {
+      const nodeEmb = new Float32Array(node.embedding.buffer, node.embedding.byteOffset, node.embedding.byteLength / 4);
+      score = cosineSimilarity(queryEmbedding, nodeEmb);
+    } else {
+      // Keyword fallback: score by path + description word match
+      const text = (filePath + " " + description).toLowerCase();
+      score = queryWords.length > 0
+        ? queryWords.filter(w => text.includes(w)).length / queryWords.length
+        : 0;
+    }
+
+    if (score > 0.3) {
+      results.push({
+        path: filePath,
+        description,
+        score,
+        confidence: node.confidence,
+      });
+    }
+  }
+
+  results.sort((a, b) => b.score - a.score);
+  return results.slice(0, limit);
+}
 
 // --- Communication with main process ---
 function sendToMain(message) {
@@ -88,11 +517,21 @@ function initDatabase() {
     CREATE TABLE IF NOT EXISTS mind_entries (
       id TEXT PRIMARY KEY,
       content TEXT NOT NULL,
+      completed INTEGER DEFAULT 0,
+      embedding BLOB,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_mind_created ON mind_entries(created_at);
   `);
+
+  // Migrations for existing mind_entries table
+  try {
+    db.exec("ALTER TABLE mind_entries ADD COLUMN completed INTEGER DEFAULT 0");
+  } catch (err) { /* ignore if exists */ }
+  try {
+    db.exec("ALTER TABLE mind_entries ADD COLUMN embedding BLOB");
+  } catch (err) { /* ignore if exists */ }
 
   // Prepare statements for hot paths
   db._stmts = {
@@ -185,6 +624,8 @@ async function loadEmbedder() {
     embedderReady = true;
     sendToMain({ type: "embedder_ready" });
     console.log("[brain] Embedding model loaded");
+    // Index profile atoms now that embedder is ready
+    indexProfileAtoms().catch(err => console.error("[brain] Profile atom indexing failed:", err.message));
   } catch (err) {
     console.error("[brain] Failed to load embedding model:", err.message);
     // Brain still works without embeddings — just no semantic search
@@ -303,7 +744,64 @@ async function indexEvents(projectId, events) {
   // Write search export after indexing
   writeSearchExport(projectId);
 
+  // Update session pins if anything meaningful was indexed
+  const hasSignificantEvents = events.some(e => ["decision", "lesson", "error_fix"].includes(e.type));
+  if (hasSignificantEvents) updateSessionPins(projectId);
+
   return { indexed, deduplicated };
+}
+
+// --- Session Pins: live high-confidence commitments that survive context window resets ---
+
+function sessionPinsPath(projectId) {
+  return path.join(MEMORY_DIR, projectId, "session-pins.json");
+}
+
+/**
+ * Rebuild session pins from the knowledge graph.
+ * Queries top-confidence decisions/lessons for this project.
+ * Called after every indexEvents that touches significant event types.
+ */
+function updateSessionPins(projectId) {
+  if (!db) return;
+  try {
+    const rows = db.prepare(`
+      SELECT id, name, entity_type, content, confidence, access_count
+      FROM nodes
+      WHERE project_id = ? AND entity_type IN ('decision', 'lesson', 'error_fix')
+        AND confidence >= 0.78
+      ORDER BY confidence DESC, access_count DESC
+      LIMIT 12
+    `).all(projectId);
+
+    if (rows.length === 0) return;
+
+    const pins = rows.map(r => {
+      let text = r.name;
+      try {
+        const parsed = JSON.parse(r.content);
+        if (parsed.text && parsed.text.length > text.length) text = parsed.text;
+      } catch {}
+      return { type: r.entity_type, content: text, confidence: r.confidence };
+    });
+
+    fs.mkdirSync(path.join(MEMORY_DIR, projectId), { recursive: true });
+    fs.writeFileSync(sessionPinsPath(projectId), JSON.stringify(pins, null, 2), "utf-8");
+  } catch (err) {
+    console.error("[brain] updateSessionPins failed:", err.message);
+  }
+}
+
+function readSessionPins(projectId) {
+  try {
+    return JSON.parse(fs.readFileSync(sessionPinsPath(projectId), "utf-8"));
+  } catch {
+    return [];
+  }
+}
+
+function clearSessionPins(projectId) {
+  try { fs.unlinkSync(sessionPinsPath(projectId)); } catch {}
 }
 
 // --- Backfill: Index existing events.jsonl files ---
@@ -568,56 +1066,68 @@ function decayStaleNodes(projectId) {
 
 // --- Contextual Search (for proactive injection) ---
 
-async function contextualSearch(query, fileContext, projectId) {
-  if (!db) return { memories: [], tensions: [] };
+async function contextualSearch(query, fileContext, projectId, intent, projectRoot) {
+  if (!db) return { memories: [], tensions: [], profileAtoms: [], relevantFiles: [] };
 
-  // Combine query + file context for richer search
+  // Embed the query once — used for both project search and profile atom search
+  const queryEmbedding = embedderReady ? await embed(query) : null;
+
+  // Profile atoms: always retrieve regardless of intent or directive nature.
+  // These are about HOW to work, not WHAT to do — relevant to every request.
+  const profileAtoms = queryEmbedding ? searchProfileAtoms(queryEmbedding, 4) : [];
+
+  // Short imperative prompts don't need project brain context — user is directing
+  const trimmed = query.trim();
+  const isDirective = trimmed.length < 65 && /^(add|remove|fix|update|change|delete|create|make|move|rename|refactor|run|install|build|deploy|write|edit|show|get|find|check|use|switch|enable|disable|set|reset|clear|open|close)/i.test(trimmed);
+  // Relevant files: always retrieve if we have indexed files for this project
+  const relevantFiles = projectRoot ? await findRelevantFiles(query, projectId, 5) : [];
+
+  if (isDirective) return { memories: [], tensions: [], profileAtoms, relevantFiles };
+
+  // Combine query + active file path for richer semantic search
   const searchText = fileContext ? `${query} ${fileContext}` : query;
-  const memories = await search(searchText, projectId, 5);
+  const candidates = await search(searchText, projectId, 8);
 
-  // Filter for high-value results only (decisions, lessons, error_fixes, patterns)
-  const valuable = memories.filter(m =>
-    ["decision", "lesson", "pattern", "error_fix"].includes(m.type) && m.score > 0.3
-  );
+  // Intent-aware type and confidence filters
+  // execute: only rock-solid lessons/patterns, no tensions, no old decisions
+  // explain: only patterns and lessons that clarify, no tensions
+  // plan: broader, tensions allowed but only very high confidence
+  // other: same as execute
+  let allowedTypes, confidenceFloor, allowTensions, maxAge;
+  if (intent === "plan") {
+    allowedTypes = ["decision", "lesson", "pattern", "error_fix"];
+    confidenceFloor = 0.80;
+    allowTensions = true;
+    maxAge = 60; // days
+  } else if (intent === "explain") {
+    allowedTypes = ["pattern", "lesson"];
+    confidenceFloor = 0.75;
+    allowTensions = false;
+    maxAge = 90;
+  } else {
+    // execute / other — follow the user's lead, stay out of the way
+    allowedTypes = ["lesson", "pattern", "error_fix"];
+    confidenceFloor = 0.80;
+    allowTensions = false;
+    maxAge = 30; // only recent, resolved issues are likely still relevant
+  }
 
-  // Detect tensions: does the current query relate to past decisions in conflicting ways?
+  const cutoff = new Date(Date.now() - maxAge * 86400000).toISOString();
+  const valuable = candidates.filter(m =>
+    allowedTypes.includes(m.type) &&
+    (m.confidence || 0) >= confidenceFloor &&
+    m.score > 0.45 &&
+    (m.updated_at || m.created_at || "9999") >= cutoff
+  ).slice(0, 3);
+
+  // Tensions only for plan intent, and only very high confidence past decisions
   let tensions = [];
-  if (embedderReady && query.length > 10) {
-    // Treat the query as a potential new direction and compare against past decisions
-    tensions = await detectTensions(projectId, [{ type: "decision", content: query }]);
+  if (allowTensions && embedderReady && query.length > 10) {
+    const raw = await detectTensions(projectId, [{ type: "decision", content: query }]);
+    tensions = (raw || []).filter(t => (t.pastConfidence || 0) >= 0.85).slice(0, 1);
   }
 
-  // Also include cross-project insights if relevant
-  let crossProjectHits = [];
-  if (embedderReady && valuable.length > 0) {
-    const otherNodes = db._stmts.getHighConfidenceNodes.all(projectId);
-    if (otherNodes.length > 0) {
-      const queryEmbedding = await embed(searchText);
-      if (queryEmbedding) {
-        for (const other of otherNodes) {
-          if (!other.embedding) continue;
-          const otherEmbedding = new Float32Array(other.embedding.buffer, other.embedding.byteOffset, other.embedding.byteLength / 4);
-          const sim = cosineSimilarity(queryEmbedding, otherEmbedding);
-          if (sim > 0.5) {
-            const content = JSON.parse(other.content || "{}").text || other.name;
-            crossProjectHits.push({
-              id: other.id,
-              name: other.name,
-              type: other.entity_type,
-              content: content.slice(0, 200),
-              confidence: other.confidence,
-              score: sim,
-              project: other.project_id,
-            });
-          }
-        }
-        crossProjectHits.sort((a, b) => b.score - a.score);
-        crossProjectHits = crossProjectHits.slice(0, 3);
-      }
-    }
-  }
-
-  return { memories: valuable, tensions, crossProjectInsights: crossProjectHits };
+  return { memories: valuable, tensions, profileAtoms, relevantFiles };
 }
 
 // --- Search Export (for MCP server) ---
@@ -626,9 +1136,10 @@ function writeSearchExport(projectId) {
   if (!db) return;
   try {
     const nodes = db._stmts.getAllProjectNodes.all(projectId);
+    const mindEntries = db.prepare(`SELECT * FROM mind_entries`).all();
+
     const exported = nodes.map(n => {
       const content = JSON.parse(n.content || "{}").text || n.name;
-      // Convert embedding BLOB to float array for MCP server
       let embeddingArray = null;
       if (n.embedding) {
         const floats = new Float32Array(n.embedding.buffer, n.embedding.byteOffset, n.embedding.byteLength / 4);
@@ -644,6 +1155,24 @@ function writeSearchExport(projectId) {
       };
     });
 
+    // Add global mind entries to the project export
+    for (const m of mindEntries) {
+      let embeddingArray = null;
+      if (m.embedding) {
+        const floats = new Float32Array(m.embedding.buffer, m.embedding.byteOffset, m.embedding.byteLength / 4);
+        embeddingArray = Array.from(floats);
+      }
+      exported.push({
+        id: m.id,
+        name: "Mind Thought",
+        type: "mind",
+        content: m.content,
+        confidence: 0.9, // Human-authored mind entries are high-confidence
+        embedding: embeddingArray,
+        completed: !!m.completed,
+      });
+    }
+
     fs.mkdirSync(EXPORTS_DIR, { recursive: true });
     fs.writeFileSync(path.join(EXPORTS_DIR, `${projectId}.json`), JSON.stringify(exported));
   } catch (err) {
@@ -653,8 +1182,8 @@ function writeSearchExport(projectId) {
 
 // --- Contextual Export (for claude-worker brief injection) ---
 
-async function writeContextualExport(projectId, query, fileContext) {
-  const result = await contextualSearch(query || "", fileContext || "", projectId);
+async function writeContextualExport(projectId, query, fileContext, intent, projectRoot) {
+  const result = await contextualSearch(query || "", fileContext || "", projectId, intent || "other", projectRoot || null);
 
   try {
     fs.mkdirSync(path.join(BRAIN_DIR, "context"), { recursive: true });
@@ -696,6 +1225,111 @@ function getIntelligenceStats(projectId) {
     connectedNodes: withEdges.size,
     byType: allNodes.reduce((acc, n) => { acc[n.entity_type] = (acc[n.entity_type] || 0) + 1; return acc; }, {}),
   };
+}
+
+// --- Profile Atomization: index identity/philosophy/rules/anti-patterns as retrievable nodes ---
+
+const PROFILE_ATOM_TYPE = "profile_atom";
+
+/**
+ * Parse all profile files into individual atomic nodes and embed them.
+ * Each principle, rule, anti-pattern becomes its own searchable node.
+ * Deletes old atoms first — profile changes are infrequent, rebuild is safe.
+ */
+async function indexProfileAtoms() {
+  if (!db || !embedderReady) return;
+
+  try {
+    db.prepare(`DELETE FROM nodes WHERE entity_type = ?`).run(PROFILE_ATOM_TYPE);
+
+    const identity = readProfileJson("identity.json");
+    const philosophy = readProfileMd("philosophy.md");
+    const rules = readProfileMd("rules.md");
+    const antiPatterns = readProfileJson("anti-patterns.json");
+
+    const atoms = [];
+
+    // Identity bio as an atom — gives context on who this person is
+    if (identity?.bio && identity.bio.length > 10) {
+      atoms.push({ text: identity.bio, facet: "identity" });
+    }
+
+    // Philosophy: each double-newline-separated paragraph = one principle atom
+    if (philosophy) {
+      const paragraphs = philosophy.split(/\n\n+/).filter(p => p.trim().length > 20);
+      for (const p of paragraphs) {
+        atoms.push({ text: p.trim(), facet: "philosophy" });
+      }
+    }
+
+    // Rules: each non-empty line = one rule atom
+    if (rules) {
+      const lines = rules.split(/\n/).filter(l => l.trim().length > 10);
+      for (const l of lines) {
+        const text = l.trim().replace(/^[-*•]\s*/, "");
+        if (text.length > 10) atoms.push({ text, facet: "rule" });
+      }
+    }
+
+    // Anti-patterns: error + fix combined into one atom for semantic coherence
+    if (antiPatterns?.patterns) {
+      for (const ap of antiPatterns.patterns) {
+        if (ap.error && ap.fix) {
+          atoms.push({ text: `Avoid: ${ap.error} — Instead: ${ap.fix}`, facet: "anti_pattern" });
+        }
+      }
+    }
+
+    let indexed = 0;
+    for (const atom of atoms) {
+      if (atom.text.length < 10) continue;
+      const id = nodeId(PROFILE_ATOM_TYPE, atom.text);
+      const embedding = await embed(atom.text);
+      const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
+      db._stmts.insertNode.run(
+        id, atom.text.slice(0, 80), PROFILE_ATOM_TYPE, null,
+        JSON.stringify({ text: atom.text, facet: atom.facet }),
+        embeddingBuffer, 1.0
+      );
+      indexed++;
+    }
+
+    console.log(`[brain] Indexed ${indexed} profile atoms`);
+  } catch (err) {
+    console.error("[brain] indexProfileAtoms error:", err.message);
+  }
+}
+
+/**
+ * Semantic search over profile atoms only.
+ * Returns atoms sorted by cosine similarity to the query embedding.
+ */
+function searchProfileAtoms(queryEmbedding, limit = 5) {
+  if (!db || !queryEmbedding) return [];
+
+  const atoms = db.prepare(
+    `SELECT * FROM nodes WHERE entity_type = ? AND embedding IS NOT NULL`
+  ).all(PROFILE_ATOM_TYPE);
+
+  const results = [];
+  for (const atom of atoms) {
+    const atomEmbedding = new Float32Array(
+      atom.embedding.buffer, atom.embedding.byteOffset, atom.embedding.byteLength / 4
+    );
+    const similarity = cosineSimilarity(queryEmbedding, atomEmbedding);
+    if (similarity > 0.28) {
+      const content = JSON.parse(atom.content || "{}");
+      results.push({
+        id: atom.id,
+        facet: content.facet || "unknown",
+        content: content.text || atom.name,
+        score: similarity,
+      });
+    }
+  }
+
+  results.sort((a, b) => b.score - a.score);
+  return results.slice(0, limit);
 }
 
 // --- Profile System: learned + explicit preferences ---
@@ -846,6 +1480,7 @@ function addExplicitRule(rule) {
   content += `\n- ${rule}`;
   fs.writeFileSync(rulesPath, content);
   writeProfileExport();
+  indexProfileAtoms().catch(() => {});
   return { added: true };
 }
 
@@ -853,6 +1488,7 @@ function addExplicitRule(rule) {
 function updatePhilosophy(text) {
   fs.writeFileSync(path.join(PROFILE_DIR, "philosophy.md"), text);
   writeProfileExport();
+  indexProfileAtoms().catch(() => {});
   return { updated: true };
 }
 
@@ -860,6 +1496,7 @@ function updatePhilosophy(text) {
 function updateRules(text) {
   fs.writeFileSync(path.join(PROFILE_DIR, "rules.md"), text);
   writeProfileExport();
+  indexProfileAtoms().catch(() => {});
   return { updated: true };
 }
 
@@ -869,6 +1506,7 @@ function updateIdentity(identity) {
   const updated = { ...current, ...identity };
   fs.writeFileSync(path.join(PROFILE_DIR, "identity.json"), JSON.stringify(updated, null, 2));
   writeProfileExport();
+  indexProfileAtoms().catch(() => {});
   return { updated: true };
 }
 
@@ -1030,8 +1668,29 @@ process.parentPort.on("message", async ({ data }) => {
       }
 
       case "contextual_search": {
-        const result = await writeContextualExport(data.projectId, data.query, data.fileContext);
+        const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null);
         sendToMain({ type: "contextual_result", requestId: data.requestId, ...result });
+        break;
+      }
+
+      case "index_project_files": {
+        // Fire-and-forget: respond immediately, index in background
+        sendToMain({ type: "index_project_files_ack", requestId: data.requestId });
+        indexProjectFiles(data.projectId, data.projectRoot).catch(err =>
+          console.error("[brain] indexProjectFiles error:", err.message)
+        );
+        break;
+      }
+
+      case "session_pins_get": {
+        const pins = readSessionPins(data.projectId);
+        sendToMain({ type: "session_pins_result", requestId: data.requestId, pins });
+        break;
+      }
+
+      case "session_pins_clear": {
+        clearSessionPins(data.projectId);
+        sendToMain({ type: "session_pins_cleared", requestId: data.requestId });
         break;
       }
 
@@ -1091,6 +1750,12 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
+      case "reindex_profile_atoms": {
+        await indexProfileAtoms();
+        sendToMain({ type: "profile_atoms_indexed", requestId: data.requestId });
+        break;
+      }
+
       case "update_identity": {
         const result = updateIdentity(data.identity);
         sendToMain({ type: "identity_result", requestId: data.requestId, ...result });
@@ -1123,7 +1788,9 @@ process.parentPort.on("message", async ({ data }) => {
       case "mind_add": {
         if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
         const id = `mind-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-        db.prepare(`INSERT INTO mind_entries (id, content) VALUES (?, ?)`).run(id, data.content);
+        const embedding = await embed(data.content);
+        const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
+        db.prepare(`INSERT INTO mind_entries (id, content, embedding) VALUES (?, ?, ?)`).run(id, data.content, embeddingBuffer);
         const entry = db.prepare(`SELECT * FROM mind_entries WHERE id = ?`).get(id);
         sendToMain({ type: "mind_entry", requestId: data.requestId, entry });
         break;
@@ -1131,14 +1798,26 @@ process.parentPort.on("message", async ({ data }) => {
 
       case "mind_get_all": {
         if (!db) { sendToMain({ type: "mind_entries", requestId: data.requestId, entries: [] }); break; }
-        const entries = db.prepare(`SELECT * FROM mind_entries ORDER BY updated_at DESC`).all();
+        const entries = db.prepare(`SELECT * FROM mind_entries ORDER BY completed ASC, updated_at DESC`).all();
         sendToMain({ type: "mind_entries", requestId: data.requestId, entries });
         break;
       }
 
       case "mind_update": {
         if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
-        db.prepare(`UPDATE mind_entries SET content = ?, updated_at = datetime('now') WHERE id = ?`).run(data.content, data.id);
+        let embeddingBuffer = null;
+        if (data.content !== undefined) {
+          const embedding = await embed(data.content);
+          embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
+        }
+
+        if (data.content !== undefined && data.completed !== undefined) {
+          db.prepare(`UPDATE mind_entries SET content = ?, completed = ?, embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(data.content, data.completed ? 1 : 0, embeddingBuffer, data.id);
+        } else if (data.content !== undefined) {
+          db.prepare(`UPDATE mind_entries SET content = ?, embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(data.content, embeddingBuffer, data.id);
+        } else if (data.completed !== undefined) {
+          db.prepare(`UPDATE mind_entries SET completed = ?, updated_at = datetime('now') WHERE id = ?`).run(data.completed ? 1 : 0, data.id);
+        }
         const entry = db.prepare(`SELECT * FROM mind_entries WHERE id = ?`).get(data.id);
         sendToMain({ type: "mind_entry", requestId: data.requestId, entry: entry ?? null });
         break;

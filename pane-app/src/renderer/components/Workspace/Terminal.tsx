@@ -1,5 +1,14 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { createPty, writePty, destroyPty, destroyAllPtysForProject, onPtyData, onPtyExit, getHomeDir, writeTerminalState } from "../../lib/tauri-commands";
+import {
+  createPty,
+  writePty,
+  destroyPty,
+  destroyAllPtysForProject,
+  onPtyData,
+  onPtyExit,
+  getHomeDir,
+  writeTerminalState,
+} from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";
 import type { TerminalTab } from "../../stores/projects";
 import stripAnsi from "strip-ansi";
@@ -87,8 +96,13 @@ interface TabState {
   isRunning: boolean;
   initialized: boolean; // suppress initial shell prompt
   echoSkipped: boolean; // skip the echoed command line from PTY
-  lastCommand: string;  // last command sent (for MCP state sync)
-  recentCommands: Array<{ cmd: string; output: string; cwd: string; timestamp: number }>; // last 20 commands
+  lastCommand: string; // last command sent (for MCP state sync)
+  recentCommands: Array<{
+    cmd: string;
+    output: string;
+    cwd: string;
+    timestamp: number;
+  }>; // last 20 commands
 }
 
 const tabStates = new Map<string, TabState>();
@@ -130,7 +144,10 @@ function TerminalTabBar({
   if (tabs.length <= 1) return null;
 
   return (
-    <div className="shrink-0 flex items-center gap-1 px-10 pt-2 pb-1">
+    <div
+      className="shrink-0 flex items-center gap-1 px-10 pt-2 pb-1 relative z-20"
+      data-no-drag
+    >
       {tabs.map((tab) => (
         <button
           key={tab.id}
@@ -256,13 +273,18 @@ function TerminalTabContent({
       if (markerIdx !== -1) {
         // Extract output before the marker
         let output = ts.outputBuffer.slice(0, markerIdx);
-        const afterMarker = ts.outputBuffer.slice(markerIdx + CMD_END_MARKER.length);
+        const afterMarker = ts.outputBuffer.slice(
+          markerIdx + CMD_END_MARKER.length,
+        );
 
         // Parse exit code and pwd from: exitCode___PANE_PWD___/path/to/dir
         const pwdIdx = afterMarker.indexOf(PWD_MARKER);
         let newCwd = "";
         if (pwdIdx !== -1) {
-          const pwdStr = afterMarker.slice(pwdIdx + PWD_MARKER.length).split("\n")[0]?.trim();
+          const pwdStr = afterMarker
+            .slice(pwdIdx + PWD_MARKER.length)
+            .split("\n")[0]
+            ?.trim();
           if (pwdStr) {
             newCwd = pwdStr;
           }
@@ -296,7 +318,9 @@ function TerminalTabContent({
             timestamp: Date.now(),
           };
           ts.recentCommands = [...ts.recentCommands, entry].slice(-20);
-          writeTerminalState(projectId, { commands: ts.recentCommands }).catch(() => {});
+          writeTerminalState(projectId, { commands: ts.recentCommands }).catch(
+            () => {},
+          );
         }
       }
     });
@@ -354,6 +378,11 @@ function TerminalTabContent({
     }
   }, [isVisible, isRunning]);
 
+  const clearTerminal = useCallback(() => {
+    setLines([]);
+    stateRef.current.lines = [];
+  }, []);
+
   const runCommand = useCallback(
     (cmd: string) => {
       if (!cmd.trim() || isRunning) return;
@@ -369,7 +398,11 @@ function TerminalTabContent({
       const displayPath = shortenPath(cwd, homeDir);
       setLines((prev) => [
         ...prev,
-        { type: "command", content: `${displayPath} $ ${trimmedCmd}`, timestamp: Date.now() },
+        {
+          type: "command",
+          content: `${displayPath} $ ${trimmedCmd}`,
+          timestamp: Date.now(),
+        },
       ]);
       setCommand("");
       setIsRunning(true);
@@ -417,7 +450,10 @@ function TerminalTabContent({
       if (e.key === "Escape" || (e.key === "c" && e.ctrlKey)) {
         // Only intercept if we aren't already in the textarea (which has its own handler)
         // or if we want to ensure it works regardless of focus.
-        if (document.activeElement?.tagName !== "TEXTAREA" && document.activeElement?.tagName !== "INPUT") {
+        if (
+          document.activeElement?.tagName !== "TEXTAREA" &&
+          document.activeElement?.tagName !== "INPUT"
+        ) {
           e.preventDefault();
           abortCommand();
         }
@@ -438,13 +474,15 @@ function TerminalTabContent({
       runCommand(command);
     } else if (e.key === "l" && e.metaKey) {
       e.preventDefault();
-      setLines([]);
-      stateRef.current.lines = [];
+      clearTerminal();
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       const history = stateRef.current.history;
       if (history.length === 0) return;
-      const newIdx = historyIndex === -1 ? history.length - 1 : Math.max(0, historyIndex - 1);
+      const newIdx =
+        historyIndex === -1
+          ? history.length - 1
+          : Math.max(0, historyIndex - 1);
       setHistoryIndex(newIdx);
       setCommand(history[newIdx]!);
     } else if (e.key === "ArrowDown") {
@@ -465,48 +503,70 @@ function TerminalTabContent({
   const displayPath = shortenPath(cwd, homeDir);
 
   return (
-    <div className="flex flex-col h-full w-full" style={{ display: isVisible ? "flex" : "none" }}>
-      {/* Terminal output area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 px-10 py-8" style={{ willChange: "transform" }}>
-        {lines.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full select-none gap-6">
-            <span
-              className="text-pane-text-secondary/40 font-mono tracking-[0.25em] uppercase"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              terminal
-            </span>
-            <div className="flex items-center gap-6 text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-              <span>return run</span>
-              <span>up/down history</span>
-              <span>cmd+L clear</span>
-              <span>esc / ctrl+C cancel</span>
-            </div>
-          </div>
-        )}
-
-        {lines.map((line, i) => (
-          <div
-            key={`${line.timestamp}-${i}`}
-            className={`font-mono whitespace-pre-wrap mb-1 ${
-              line.type === "command"
-                ? "text-pane-text"
-                : line.type === "error"
-                  ? "text-pane-error"
-                  : "text-pane-text-secondary"
-            }`}
-            style={{ fontSize: "var(--pane-font-size-base)" }}
+    <div
+      className="flex flex-col h-full w-full"
+      style={{ display: isVisible ? "flex" : "none" }}
+    >
+      <div className="flex-1 relative min-h-0" data-no-drag>
+        {lines.length > 0 && (
+          <button
+            onClick={clearTerminal}
+            className="absolute top-8 right-10 text-pane-text-secondary/30 hover:text-pane-text-secondary font-mono text-[10px] uppercase tracking-wider z-30 transition-colors"
+            title="Clear terminal (Cmd+L)"
           >
-            {line.content}
-          </div>
-        ))}
-
-        {isRunning && (
-          <div className="flex items-center gap-2 text-pane-text-secondary/50 font-mono mt-2">
-            <span className="inline-block w-1 h-3 bg-pane-text-secondary/50 animate-pulse" />
-            <span style={{ fontSize: "var(--pane-font-size-sm)" }}>running...</span>
-          </div>
+            clear
+          </button>
         )}
+        <div
+          ref={scrollRef}
+          className="h-full overflow-y-auto overflow-x-hidden px-10 py-8 relative z-20"
+          style={{ willChange: "transform" }}
+        >
+          {lines.length === 0 && (
+            <div className="flex flex-col items-center justify-center h-full select-none gap-6">
+              <span
+                className="text-pane-text-secondary/40 font-mono tracking-[0.25em] uppercase"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+              >
+                terminal
+              </span>
+              <div
+                className="flex items-center gap-6 text-pane-text-secondary/30 font-mono"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                <span>return run</span>
+                <span>up/down history</span>
+                <span>cmd+L clear</span>
+                <span>esc / ctrl+C cancel</span>
+              </div>
+            </div>
+          )}
+
+          {lines.map((line, i) => (
+            <div
+              key={`${line.timestamp}-${i}`}
+              className={`font-mono whitespace-pre-wrap break-words mb-1 ${
+                line.type === "command"
+                  ? "text-pane-text"
+                  : line.type === "error"
+                    ? "text-pane-error"
+                    : "text-pane-text-secondary"
+              }`}
+              style={{ fontSize: "var(--pane-font-size-base)" }}
+            >
+              {line.content}
+            </div>
+          ))}
+
+          {isRunning && (
+            <div className="flex items-center gap-2 text-pane-text-secondary/50 font-mono mt-2">
+              <span className="inline-block w-1 h-3 bg-pane-text-secondary/50 animate-pulse" />
+              <span style={{ fontSize: "var(--pane-font-size-sm)" }}>
+                running...
+              </span>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Command input with cwd prompt */}
@@ -570,12 +630,18 @@ function TerminalTabContent({
 
 export function Terminal({ projectId, workingDir }: TerminalProps) {
   const [homeDir, setHomeDir] = useState("");
-  const tabs = useProjectsStore((s) => s.projects.get(projectId)?.terminalTabs ?? []);
-  const activeTabId = useProjectsStore((s) => s.projects.get(projectId)?.activeTerminalTabId ?? null);
+  const tabs = useProjectsStore(
+    (s) => s.projects.get(projectId)?.terminalTabs ?? [],
+  );
+  const activeTabId = useProjectsStore(
+    (s) => s.projects.get(projectId)?.activeTerminalTabId ?? null,
+  );
 
   // Get home dir on mount
   useEffect(() => {
-    getHomeDir().then(setHomeDir).catch(() => {});
+    getHomeDir()
+      .then(setHomeDir)
+      .catch(() => {});
   }, []);
 
   // Auto-create first tab on mount
@@ -584,7 +650,11 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
     const project = store.projects.get(projectId);
     if (project && project.terminalTabs.length === 0) {
       const id = nextTabId(projectId);
-      store.addTerminalTab(projectId, { id, title: tabTitle(0), isAlive: true });
+      store.addTerminalTab(projectId, {
+        id,
+        title: tabTitle(0),
+        isAlive: true,
+      });
     }
   }, [projectId]);
 
@@ -600,7 +670,11 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
     const project = store.projects.get(projectId);
     const index = project ? project.terminalTabs.length : 0;
     const id = nextTabId(projectId);
-    store.addTerminalTab(projectId, { id, title: tabTitle(index), isAlive: true });
+    store.addTerminalTab(projectId, {
+      id,
+      title: tabTitle(index),
+      isAlive: true,
+    });
   }, [projectId]);
 
   const handleCloseTab = useCallback(

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pane": {
+      "command": "node",
+      "args": [
+        "/Applications/Pane.app/Contents/Resources/app.asar/out/main/pane-mcp-server.mjs"
+      ],
+      "env": {
+        "PANE_PROJECT_ID": "pane",
+        "PANE_PROJECT_ROOT": "/Users/macbook/Pane"
+      }
+    }
+  }
+}

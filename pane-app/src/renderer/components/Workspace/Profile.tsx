@@ -1,11 +1,12 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { useWorkspaceStore } from "../../stores/workspace";
+import { useShallow } from "zustand/react/shallow";
 import {
   THINKING_ENGINES,
   BUILDING_ENGINES,
   engineKey,
   keyFromRoute,
-  DEFAULT_ROUTING,
+  DEFAULT_BACKEND_ROUTING,
   type EngineOption,
 } from "../../lib/models";
 import {
@@ -495,8 +496,7 @@ function AiEnginesSection({
   httpApiKeys: Record<string, string>;
 }) {
   const punkBackend = useWorkspaceStore((s) => s.punkBackend);
-  const storeRouting = useWorkspaceStore((s) => s.intentRouting);
-  const routing = useWorkspaceStore((s) => s.getEffectiveRouting());
+  const routing = useWorkspaceStore(useShallow((s) => s.getEffectiveRouting()));
 
   const isGeminiBackend = punkBackend === "gemini-cli";
 
@@ -504,7 +504,8 @@ function AiEnginesSection({
     () =>
       THINKING_ENGINES.filter((o) => {
         if (isGeminiBackend) return o.provider === "gemini";
-        return true; // Show everything else in HTTP mode
+        // If not gemini-cli, hide models starting with "auto-"
+        return !o.model.startsWith("auto-");
       }),
     [isGeminiBackend],
   );
@@ -513,7 +514,8 @@ function AiEnginesSection({
     () =>
       BUILDING_ENGINES.filter((o) => {
         if (isGeminiBackend) return o.provider === "gemini";
-        return true; // Show everything else in HTTP mode
+        // If not gemini-cli, hide models starting with "auto-"
+        return !o.model.startsWith("auto-");
       }),
     [isGeminiBackend],
   );
@@ -523,54 +525,91 @@ function AiEnginesSection({
   const setIntentAutoRoute = useWorkspaceStore((s) => s.setIntentAutoRoute);
 
   const handleThinkingChange = (opt: EngineOption) => {
-    const base = storeRouting ?? DEFAULT_ROUTING;
     const next = {
-      ...base,
       plan: {
         provider: opt.provider,
         model: opt.model,
         thinking: opt.thinking,
       },
+      execute:
+        routing?.execute ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
+        DEFAULT_BACKEND_ROUTING["http"]!.execute,
+      explain:
+        routing?.explain ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
+        DEFAULT_BACKEND_ROUTING["http"]!.explain,
+      other:
+        routing?.other ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
+        DEFAULT_BACKEND_ROUTING["http"]!.other,
     };
     setIntentRouting(next);
-    const { punkBackend } = useWorkspaceStore.getState();
     reinitializePunkBackend(punkBackend).catch(() => {});
   };
 
   const handleBuildingChange = (opt: EngineOption) => {
-    const base = storeRouting ?? DEFAULT_ROUTING;
     const next = {
-      ...base,
+      plan:
+        routing?.plan ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
+        DEFAULT_BACKEND_ROUTING["http"]!.plan,
       execute: {
         provider: opt.provider,
         model: opt.model,
         thinking: opt.thinking,
       },
+      explain:
+        routing?.explain ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
+        DEFAULT_BACKEND_ROUTING["http"]!.explain,
+      other:
+        routing?.other ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
+        DEFAULT_BACKEND_ROUTING["http"]!.other,
     };
     setIntentRouting(next);
-    const { punkBackend } = useWorkspaceStore.getState();
     reinitializePunkBackend(punkBackend).catch(() => {});
   };
 
   const handleExplainChange = (opt: EngineOption) => {
-    const base = storeRouting ?? DEFAULT_ROUTING;
     const next = {
-      ...base,
+      plan:
+        routing?.plan ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
+        DEFAULT_BACKEND_ROUTING["http"]!.plan,
+      execute:
+        routing?.execute ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
+        DEFAULT_BACKEND_ROUTING["http"]!.execute,
       explain: {
         provider: opt.provider,
         model: opt.model,
         thinking: opt.thinking,
       },
+      other:
+        routing?.other ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
+        DEFAULT_BACKEND_ROUTING["http"]!.other,
     };
     setIntentRouting(next);
-    const { punkBackend } = useWorkspaceStore.getState();
     reinitializePunkBackend(punkBackend).catch(() => {});
   };
 
   const handleOtherChange = (opt: EngineOption) => {
-    const base = storeRouting ?? DEFAULT_ROUTING;
     const next = {
-      ...base,
+      plan:
+        routing?.plan ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
+        DEFAULT_BACKEND_ROUTING["http"]!.plan,
+      execute:
+        routing?.execute ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
+        DEFAULT_BACKEND_ROUTING["http"]!.execute,
+      explain:
+        routing?.explain ||
+        DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
+        DEFAULT_BACKEND_ROUTING["http"]!.explain,
       other: {
         provider: opt.provider,
         model: opt.model,
@@ -578,7 +617,6 @@ function AiEnginesSection({
       },
     };
     setIntentRouting(next);
-    const { punkBackend } = useWorkspaceStore.getState();
     reinitializePunkBackend(punkBackend).catch(() => {});
   };
 
@@ -589,20 +627,45 @@ function AiEnginesSection({
   };
 
   const thinkingEngine =
-    filteredThinking.find((o) => keyFromRoute(o) === keyFromRoute(routing.plan)) ??
-    (filteredThinking[0] as EngineOption);
+    filteredThinking.find(
+      (o) =>
+        keyFromRoute(o) ===
+        keyFromRoute(
+          routing?.plan ||
+            DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
+            DEFAULT_BACKEND_ROUTING["http"]!.plan,
+        ),
+    ) ?? filteredThinking[0]!;
   const buildingEngine =
     filteredBuilding.find(
-      (o) => keyFromRoute(o) === keyFromRoute(routing.execute),
-    ) ?? (filteredBuilding[0] as EngineOption);
+      (o) =>
+        keyFromRoute(o) ===
+        keyFromRoute(
+          routing?.execute ||
+            DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
+            DEFAULT_BACKEND_ROUTING["http"]!.execute,
+        ),
+    ) ?? filteredBuilding[0]!;
   const explainingEngine =
     filteredThinking.find(
-      (o) => keyFromRoute(o) === keyFromRoute(routing.explain),
-    ) ?? (filteredThinking[0] as EngineOption);
+      (o) =>
+        keyFromRoute(o) ===
+        keyFromRoute(
+          routing?.explain ||
+            DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
+            DEFAULT_BACKEND_ROUTING["http"]!.explain,
+        ),
+    ) ?? filteredThinking[0]!;
   const otherEngine =
     filteredBuilding.find(
-      (o) => keyFromRoute(o) === keyFromRoute(routing.other),
-    ) ?? (filteredBuilding[0] as EngineOption);
+      (o) =>
+        keyFromRoute(o) ===
+        keyFromRoute(
+          routing?.other ||
+            DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
+            DEFAULT_BACKEND_ROUTING["http"]!.other,
+        ),
+    ) ?? filteredBuilding[0]!;
 
   const missingThinkingKey = !httpApiKeys[thinkingEngine.requiresKey];
   const missingBuildingKey = !httpApiKeys[buildingEngine.requiresKey];
@@ -727,7 +790,8 @@ function AiEnginesSection({
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ no API key for {explainingEngine.requiresKey} — add it below
+                  ⚠ no API key for {explainingEngine.requiresKey} — add it
+                  below
                 </span>
               )}
             </div>
@@ -776,7 +840,6 @@ function AiEnginesSection({
         )}
       </div>
     </div>
-
   );
 }
 
@@ -962,11 +1025,18 @@ export function Profile() {
 
     // Sync provider and model for Gemini CLI to ensure UI reflects the switch
     if (backend === "gemini-cli") {
-      useWorkspaceStore.getState().setHttpProvider("gemini");
-      useWorkspaceStore.getState().setSelectedModel("auto-gemini-3");
+      useWorkspaceStore
+        .getState()
+        .setSelectedModel("auto-gemini-3", false, "gemini");
     } else if (backend === "claude-cli") {
-      useWorkspaceStore.getState().setHttpProvider("anthropic");
-      useWorkspaceStore.getState().setSelectedModel("sonnet");
+      useWorkspaceStore
+        .getState()
+        .setSelectedModel("sonnet", false, "anthropic");
+    } else if (backend === "http") {
+      // Default to DeepSeek for HTTP if no prior selection
+      useWorkspaceStore
+        .getState()
+        .setSelectedModel("deepseek-v3.2", false, "deepseek");
     }
 
     await reinitializePunkBackend(backend).catch(() => {});
@@ -1051,7 +1121,30 @@ export function Profile() {
     : "";
 
   return (
-    <div className="h-full overflow-y-auto px-10 pt-8 pb-48">
+    <div
+      className="h-full overflow-y-auto overflow-x-hidden px-10 pt-8 pb-48 relative z-20"
+      data-no-drag
+    >
+      {/* Close button — fixed top-right, always accessible while scrolling */}
+      <button
+        onClick={() => useWorkspaceStore.getState().closeProfile()}
+        data-no-drag
+        className="fixed top-8 right-10 w-7 h-7 flex items-center justify-center rounded text-pane-text-secondary/25 hover:text-pane-text hover:bg-pane-text/[0.06] transition-colors z-50"
+        title="Close (Esc)"
+      >
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 12 12"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        >
+          <path d="M2 2l8 8M10 2l-8 8" />
+        </svg>
+      </button>
+
       <div className="max-w-md mx-auto">
         {/* Avatar + Identity */}
         <div className="flex flex-col items-center gap-3 mb-10">

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ThinkingBlock } from "../../lib/claude-types";
+import { MarkdownText } from "./MarkdownText";
 
 interface ThinkingBlockProps {
   block: ThinkingBlock;
@@ -22,16 +23,20 @@ export function ThinkingBlockDisplay({ block, isStreaming }: ThinkingBlockProps)
         style={{ fontSize: "var(--pane-font-size-sm)" }}
       >
         <span
-          className={`w-1 h-1 rounded-full shrink-0 ${isStreaming ? "animate-pulse" : ""}`}
+          className={`w-1 h-1 rounded-full shrink-0 ${isStreaming ? "animate-fadeIn" : ""}`}
           style={{
             backgroundColor: isStreaming
               ? "color-mix(in srgb, var(--pane-text-secondary) 60%, transparent)"
               : "color-mix(in srgb, var(--pane-text-secondary) 25%, transparent)",
+            animation: isStreaming ? "breathe 4s ease-in-out infinite" : "none",
           }}
         />
         <span className="opacity-50">thinking</span>
         {isStreaming && (
-          <span className="inline-block w-[2px] h-[10px] bg-pane-text-secondary/40 ml-0.5 animate-pulse" />
+          <span
+            className="inline-block w-[2px] h-[10px] bg-pane-text-secondary/40 ml-0.5"
+            style={{ animation: "breathe 3s ease-in-out infinite" }}
+          />
         )}
       </button>
 
@@ -39,12 +44,15 @@ export function ThinkingBlockDisplay({ block, isStreaming }: ThinkingBlockProps)
         <div
           className="mt-1 mb-2 pl-3 border-l border-pane-text-secondary/15
                      text-pane-text-secondary/50 font-mono leading-[1.7]
-                     max-h-[300px] overflow-y-auto whitespace-pre-wrap"
+                     max-h-[300px] overflow-y-auto"
           style={{ fontSize: "var(--pane-font-size-sm)" }}
         >
-          {thinkingText}
+          <MarkdownText text={thinkingText} isStreaming={isStreaming} />
           {isStreaming && (
-            <span className="inline-block w-[2px] h-[10px] bg-pane-text-secondary/40 ml-0.5 animate-pulse" />
+            <span
+              className="inline-block w-[2px] h-[10px] bg-pane-text-secondary/40 ml-0.5"
+              style={{ animation: "breathe 3s ease-in-out infinite" }}
+            />
           )}
         </div>
       )}

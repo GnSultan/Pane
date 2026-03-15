@@ -9,6 +9,7 @@ import {
   THINKING_ENGINES,
   BUILDING_ENGINES,
   keyFromRoute,
+  DEFAULT_BACKEND_ROUTING,
 } from "../../lib/models";
 import { getContextLimit } from "../../hooks/useClaude";
 
@@ -33,18 +34,18 @@ function measureCaretPos(
 
   const computed = window.getComputedStyle(el);
 
-  const mirror = document.createElement('div');
-  mirror.setAttribute('aria-hidden', 'true');
+  const mirror = document.createElement("div");
+  mirror.setAttribute("aria-hidden", "true");
   Object.assign(mirror.style, {
-    position: 'absolute',
-    top: '0',
-    left: '0',
-    visibility: 'hidden',
-    pointerEvents: 'none',
-    width: el.clientWidth + 'px',
-    whiteSpace: 'pre-wrap',
-    wordBreak: 'break-word',
-    overflowWrap: 'break-word',
+    position: "absolute",
+    top: "0",
+    left: "0",
+    visibility: "hidden",
+    pointerEvents: "none",
+    width: el.clientWidth + "px",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    overflowWrap: "break-word",
     padding: computed.padding,
     font: computed.font,
     letterSpacing: computed.letterSpacing,
@@ -53,8 +54,8 @@ function measureCaretPos(
   });
 
   mirror.appendChild(document.createTextNode(el.value.slice(0, sel)));
-  const marker = document.createElement('span');
-  marker.textContent = '\u200b'; // zero-width space — no visual impact
+  const marker = document.createElement("span");
+  marker.textContent = "\u200b"; // zero-width space — no visual impact
   mirror.appendChild(marker);
 
   container.appendChild(mirror);
@@ -90,38 +91,56 @@ function ModelPicker({
   onChange,
   autoRoute,
   onToggleAutoRoute,
-  routing,
   isProcessing,
 }: {
   value: string;
-  onChange: (v: string) => void;
+  onChange: (v: string, thinking?: boolean) => void;
   autoRoute: boolean;
   onToggleAutoRoute: (v: boolean) => void;
-  routing: any;
   isProcessing?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const punkBackend = useWorkspaceStore((s) => s.punkBackend);
+  const routing = useWorkspaceStore(useShallow((s) => s.getEffectiveRouting()));
 
   const filteredProviderModels = useMemo(() => {
     const isGeminiBackend = punkBackend === "gemini-cli";
     return Object.fromEntries(
-      Object.entries(PROVIDER_MODELS).filter(([provider]) => {
-        // If we are on Gemini CLI, ONLY show Gemini models
-        if (isGeminiBackend) return provider === "gemini";
-        // If we are on HTTP or other backends, show EVERYTHING
-        return true;
-      }),
+      Object.entries(PROVIDER_MODELS)
+        .map(([provider, models]) => {
+          // If we are on Gemini CLI, keep only the Gemini provider and keep auto models.
+          if (isGeminiBackend) {
+            if (provider !== "gemini") return [provider, []];
+            return [provider, models];
+          }
+
+          // If we are NOT on Gemini CLI (e.g. HTTP), keep all providers
+          // but filter out any model starting with "auto-" as those are CLI-only.
+          const filtered = models.filter((m) => !m.value.startsWith("auto-"));
+          return [provider, filtered];
+        })
+        .filter(([_, models]) => models && models.length > 0),
     );
   }, [punkBackend]);
 
   const allModels = useMemo(() => {
-    const models: Array<{ value: string; label: string; provider: string }> = [];
+    const models: Array<{
+      value: string;
+      label: string;
+      provider: string;
+      thinking?: boolean;
+    }> = [];
     Object.entries(filteredProviderModels).forEach(([provider, list]) => {
-      list.forEach((m) => {
-        models.push({ ...m, provider });
-      });
+      if (Array.isArray(list)) {
+        list.forEach((m: any) => {
+          // Find if this model exists in THINKING_ENGINES to get its thinking flag
+          const thinkingEntry = THINKING_ENGINES.find(
+            (e) => e.provider === provider && e.model === m.value,
+          );
+          models.push({ ...m, provider, thinking: thinkingEntry?.thinking });
+        });
+      }
     });
     return models;
   }, [filteredProviderModels]);
@@ -141,12 +160,34 @@ function ModelPicker({
     return () => document.removeEventListener("mousedown", handler);
   }, [open]);
 
+  const activeRouting = (routing ||
+    DEFAULT_BACKEND_ROUTING[punkBackend] ||
+    DEFAULT_BACKEND_ROUTING["http"])!;
+
   const activeThinking =
-    THINKING_ENGINES.find((o) => keyFromRoute(o) === keyFromRoute(routing?.plan ?? {})) ??
-    THINKING_ENGINES[0]!;
+    THINKING_ENGINES.find(
+      (o) => keyFromRoute(o) === keyFromRoute(activeRouting.plan),
+    ) ??
+    THINKING_ENGINES.find(
+      (o) =>
+        keyFromRoute(o) ===
+        keyFromRoute(
+          DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ??
+            DEFAULT_BACKEND_ROUTING["http"]?.plan,
+        ),
+    )!;
   const activeBuilding =
-    BUILDING_ENGINES.find((o) => keyFromRoute(o) === keyFromRoute(routing?.execute ?? {})) ??
-    BUILDING_ENGINES[0]!;
+    BUILDING_ENGINES.find(
+      (o) => keyFromRoute(o) === keyFromRoute(activeRouting.execute),
+    ) ??
+    BUILDING_ENGINES.find(
+      (o) =>
+        keyFromRoute(o) ===
+        keyFromRoute(
+          DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ??
+            DEFAULT_BACKEND_ROUTING["http"]?.execute,
+        ),
+    )!;
 
   const thinkingLabel = activeThinking.label.split(" — ")[0]!.toLowerCase();
   const buildingLabel = activeBuilding.label.split(" — ")[0]!.toLowerCase();
@@ -174,10 +215,19 @@ function ModelPicker({
       }
     }
     return `${thinkingLabel} + ${buildingLabel}`;
-  }, [isRedundant, thinkingLabel, buildingLabel, activeThinking.provider, activeBuilding.provider]);
+  }, [
+    isRedundant,
+    thinkingLabel,
+    buildingLabel,
+    activeThinking.provider,
+    activeBuilding.provider,
+  ]);
 
-  const showSpecificModel = autoRoute && isProcessing && current && !current.value.startsWith("auto-");
-  const labelToShow = showSpecificModel ? current.label.toLowerCase() : displayLabel;
+  const showSpecificModel =
+    autoRoute && isProcessing && current && !current.value.startsWith("auto-");
+  const labelToShow = showSpecificModel
+    ? current.label.toLowerCase()
+    : displayLabel;
 
   return (
     <div ref={ref} className="relative flex items-center">
@@ -219,8 +269,12 @@ function ModelPicker({
               }`}
             >
               <div className="flex flex-col gap-0.5">
-                <span className="font-mono text-[13px] font-medium">Smart Routing</span>
-                <span className="text-[10px] text-pane-text-secondary/60">Auto-pick best model</span>
+                <span className="font-mono text-[13px] font-medium">
+                  Smart Routing
+                </span>
+                <span className="text-[10px] text-pane-text-secondary/60">
+                  Auto-pick best model
+                </span>
               </div>
               {autoRoute && (
                 <div className="w-1.5 h-1.5 rounded-full bg-pane-status-added" />
@@ -231,31 +285,41 @@ function ModelPicker({
 
             {/* Individual Models grouped by provider */}
             <div className="max-h-[300px] overflow-y-auto custom-scrollbar">
-              {Object.entries(filteredProviderModels).map(([provider, models]) => (
+              {Object.entries(filteredProviderModels).map(([provider]) => (
                 <div key={provider} className="flex flex-col mb-2">
                   <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-pane-text-secondary/40 font-mono">
                     {provider}
                   </div>
-                  {models.map((model) => (
-                    <button
-                      key={model.value}
-                      onClick={() => {
-                        onToggleAutoRoute(false);
-                        onChange(model.value);
-                        setOpen(false);
-                      }}
-                      className={`flex items-center justify-between w-full px-3 py-1.5 rounded-xl text-left transition-colors ${
-                        !autoRoute && model.value === value
-                          ? "bg-pane-text/[0.08] text-pane-text"
-                          : "text-pane-text-secondary hover:bg-pane-text/[0.04] hover:text-pane-text"
-                      }`}
-                    >
-                      <span className="font-mono text-[12px]">{model.label.toLowerCase()}</span>
-                      {!autoRoute && model.value === value && (
-                        <div className="w-1 h-1 rounded-full bg-pane-text" />
-                      )}
-                    </button>
-                  ))}
+                  {allModels
+                    .filter((m) => m.provider === provider)
+                    .map((model) => (
+                      <button
+                        key={model.value}
+                        onClick={() => {
+                          onChange(model.value, model.thinking);
+                          setOpen(false);
+                        }}
+                        className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-mono text-left transition-colors ${
+                          !autoRoute && model.value === value
+                            ? "bg-pane-text/10 text-pane-text"
+                            : "text-pane-text-secondary hover:bg-pane-text/[0.04] hover:text-pane-text"
+                        }`}
+                      >
+                        <div className="flex flex-col">
+                          <span className="font-mono text-[12px]">
+                            {model.label.toLowerCase()}
+                          </span>
+                          {model.thinking && (
+                            <span className="text-[9px] text-pane-status-added/60 uppercase tracking-tighter">
+                              thinking mode
+                            </span>
+                          )}
+                        </div>
+                        {!autoRoute && model.value === value && (
+                          <div className="w-1.5 h-1.5 rounded-full bg-pane-text" />
+                        )}
+                      </button>
+                    ))}
                 </div>
               ))}
             </div>
@@ -304,7 +368,7 @@ export function InputBar({
   const setHttpProvider = useWorkspaceStore((s) => s.setHttpProvider);
   const intentAutoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
   const setIntentAutoRoute = useWorkspaceStore((s) => s.setIntentAutoRoute);
-  const intentRouting = useWorkspaceStore((s) => s.getEffectiveRouting());
+  // const intentRouting = useWorkspaceStore((s) => s.getEffectiveRouting());
 
   const contextPressure = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.contextPressure ?? "none",
@@ -325,19 +389,16 @@ export function InputBar({
   const [planRejected, setPlanRejected] = useState(false);
 
   // Handle model change and sync provider
-  const handleModelChange = useCallback((modelValue: string) => {
-    setSelectedModel(modelValue);
-    // Find provider for this model to keep store in sync
-    for (const [provider, models] of Object.entries(PROVIDER_MODELS)) {
-      if (models.some(m => m.value === modelValue)) {
-        setHttpProvider(provider);
-        break;
-      }
-    }
-  }, [setSelectedModel, setHttpProvider]);
+  const handleModelChange = useCallback(
+    (modelValue: string, thinking: boolean = false, provider?: string) => {
+      setSelectedModel(modelValue, thinking, provider);
+      if (provider) setHttpProvider(provider);
+    },
+    [setSelectedModel, setHttpProvider],
+  );
 
   // Handle graceful fadeout of processing indicator
-// ... (rest of the component remains similar, but using the new ModelPicker)
+  // ... (rest of the component remains similar, but using the new ModelPicker)
 
   // Handle graceful fadeout of processing indicator
   useEffect(() => {
@@ -370,7 +431,7 @@ export function InputBar({
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    const events = ['click', 'keyup', 'mouseup', 'select', 'scroll'];
+    const events = ["click", "keyup", "mouseup", "select", "scroll"];
     events.forEach((e) => el.addEventListener(e, updateCaret));
     return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
   }, [updateCaret]);
@@ -393,14 +454,24 @@ export function InputBar({
     return () => window.removeEventListener("pane:focus-input", handler);
   }, []);
 
-  // Auto-resize textarea
-  useEffect(() => {
+  // Auto-resize textarea — always floor at minH so it never collapses to one line.
+  // Setting to "1px" first forces scrollHeight to report the true content height.
+  // Runs on mount ([] dep) to stamp the initial height before first paint,
+  // and on every value change to grow/shrink with content.
+  const applyTextareaHeight = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
-    el.style.height = "auto";
+    const minH = 96;
     const maxH = window.innerHeight * 0.4;
-    el.style.height = Math.min(el.scrollHeight, maxH) + "px";
-  }, [value]);
+    // Don't collapse below minH — set to 1px only to measure scrollHeight,
+    // then immediately restore to the correct height in the same frame.
+    el.style.height = "1px";
+    el.style.height = Math.min(Math.max(el.scrollHeight, minH), maxH) + "px";
+  }, []);
+
+  useEffect(() => {
+    applyTextareaHeight();
+  }, [value, applyTextareaHeight]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -434,7 +505,7 @@ export function InputBar({
   }, [projectId]);
 
   return (
-    <div className="shrink-0 px-4 bg-transparent">
+    <div className="bg-transparent">
       {/* Processing indicator — only exists when active, no reserved space */}
       {(isProcessing || isFadingOut) &&
         !pendingPlanApproval &&
@@ -460,14 +531,12 @@ export function InputBar({
                 style={{ strokeWidth: "var(--circle-stroke-width, 1.5)" }}
               />
             </svg>
-            {(statusMessage || isPlanning) && (
-              <span
-                className="text-pane-text-secondary font-mono"
-                style={{ fontSize: "var(--pane-font-size-sm)" }}
-              >
-                {statusMessage || "planning"}
-              </span>
-            )}
+            <span
+              className="text-pane-text-secondary font-mono"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              {statusMessage || (isPlanning ? "planning" : "responding")}
+            </span>
             {todos.length > 0 && (
               <button
                 onClick={() => setTodoPanelOpen((v) => !v)}
@@ -475,10 +544,15 @@ export function InputBar({
                 style={{ fontSize: "var(--pane-font-size-sm)" }}
               >
                 {(() => {
-                  const completedCount = todos.filter((t) => t.status === "completed").length;
+                  const completedCount = todos.filter(
+                    (t) => t.status === "completed",
+                  ).length;
                   const totalCount = todos.length;
-                  const inProgressIdx = todos.findIndex((t) => t.status === "in_progress");
-                  const currentIdx = inProgressIdx !== -1 ? inProgressIdx : completedCount;
+                  const inProgressIdx = todos.findIndex(
+                    (t) => t.status === "in_progress",
+                  );
+                  const currentIdx =
+                    inProgressIdx !== -1 ? inProgressIdx : completedCount;
 
                   const displayIdx = Math.min(currentIdx, totalCount - 1);
                   const currentTask = todos[displayIdx];
@@ -544,16 +618,25 @@ export function InputBar({
 
       {/* The unified card — textarea body + toolbar strip */}
       {!pendingPlanApproval && (
-        <div className="bg-pane-bg rounded-2xl ring-1 ring-pane-border/40 relative">
+        <div className="bg-pane-bg rounded-2xl ring-1 ring-pane-border/40 relative shadow-[0_0_12px_rgba(74,71,66,0.15)]">
           {/* Writing area — relative container anchors the static caret overlay */}
-          <div ref={caretContainerRef} className="relative overflow-hidden rounded-t-2xl">
+          <div
+            ref={caretContainerRef}
+            className="relative overflow-hidden rounded-t-2xl"
+          >
             <textarea
               ref={textareaRef}
               value={value}
               onChange={(e) => setValue(e.target.value)}
               onKeyDown={handleKeyDown}
-              onFocus={() => { setTextareaFocused(true); updateCaret(); }}
-              onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
+              onFocus={() => {
+                setTextareaFocused(true);
+                updateCaret();
+              }}
+              onBlur={() => {
+                setTextareaFocused(false);
+                setCaretPos(null);
+              }}
               placeholder={
                 isProcessing
                   ? ""
@@ -563,21 +646,27 @@ export function InputBar({
               }
               className="w-full bg-transparent text-pane-text font-mono
                          resize-none outline-none placeholder:text-pane-text-secondary
-                         leading-[1.75] px-5 pt-4 pb-3 min-h-[96px] max-h-[40vh] overflow-y-auto"
-              style={{ fontSize: 'var(--pane-font-size)', caretColor: 'transparent' }}
+                         leading-[1.75] px-5 pt-4 pb-3 overflow-y-auto overflow-x-hidden"
+              style={{
+                fontSize: "var(--pane-font-size)",
+                caretColor: "transparent",
+                minHeight: "96px",
+                maxHeight: "40vh",
+                height: "96px",
+              }}
             />
             {/* Static amber cursor — replaces the native blinking caret */}
             {textareaFocused && caretPos && (
               <div
                 aria-hidden
                 style={{
-                  position: 'absolute',
+                  position: "absolute",
                   top: caretPos.top,
                   left: caretPos.left,
                   width: 2,
                   height: caretPos.lineHeight,
-                  background: 'var(--pane-editor-cursor)',
-                  pointerEvents: 'none',
+                  background: "var(--pane-editor-cursor)",
+                  pointerEvents: "none",
                 }}
               />
             )}
@@ -586,11 +675,11 @@ export function InputBar({
           {/* Toolbar strip */}
           <div
             className="h-9 flex items-center px-5 border-t border-pane-border shrink-0 bg-transparent font-mono text-pane-text-secondary"
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
             {contextPressure !== "none" && (
               <span
-                className={`mr-auto inline-flex items-center px-2 py-0.5 rounded-lg ring-1 ring-pane-border/40 bg-pane-surface ${contextPressure === "high" ? "text-pane-error" : "text-[var(--pane-terminal)]"}`}
+                className={`mr-auto transition-colors ${contextPressure === "high" ? "text-pane-error" : "text-pane-text-secondary/60"}`}
               >
                 context {contextPercent}%
               </span>
@@ -601,7 +690,6 @@ export function InputBar({
               onChange={handleModelChange}
               autoRoute={intentAutoRoute}
               onToggleAutoRoute={setIntentAutoRoute}
-              routing={intentRouting}
               isProcessing={isProcessing}
             />
           </div>

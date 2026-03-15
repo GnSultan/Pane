@@ -48,4 +48,16 @@ copyFileSync(
   `${projectRoot}/src/main/punk-backend.mjs`,
   `${projectRoot}/out/main/punk-backend.mjs`,
 );
+copyFileSync(
+  `${projectRoot}/src/main/session-context.mjs`,
+  `${projectRoot}/out/main/session-context.mjs`,
+);
+copyFileSync(
+  `${projectRoot}/src/main/pane-mcp-server.mjs`,
+  `${projectRoot}/out/main/pane-mcp-server.mjs`,
+);
+copyFileSync(
+  `${projectRoot}/src/main/tool-executor.mjs`,
+  `${projectRoot}/out/main/tool-executor.mjs`,
+);
 console.log("✓ Compiled scripts copied successfully");

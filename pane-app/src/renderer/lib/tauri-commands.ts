@@ -115,7 +115,10 @@ export interface ProjectSessionState {
   expanded_dirs: string[];
   active_file_path: string | null;
   recent_files?: string[];
-  scroll_positions?: Record<string, { scrollTop: number; cursor: { row: number; column: number } }>;
+  scroll_positions?: Record<
+    string,
+    { scrollTop: number; cursor: { row: number; column: number } }
+  >;
 }
 
 export interface UserSettings {
@@ -169,7 +172,10 @@ export async function sendToPunk(
   onEvent: (event: ClaudeStreamEvent) => void,
   intent?: string,
   history?: any[],
+  thinking?: boolean,
+  provider?: string,
 ): Promise<void> {
+  const requestId = Math.random().toString(36).slice(2, 11);
   // Self-cleaning listener — stays active until processEnded or error
   let cleanup: (() => void) | null = null;
 
@@ -195,6 +201,10 @@ export async function sendToPunk(
   cleanup = electronAPI.on(
     `claude-stream:${projectId}`,
     (event: ClaudeStreamEvent) => {
+      // Ignore events for other requests on the same channel
+      // Note: ClaudeStreamEvent doesn't have requestId property, so we can't filter by it
+      // if (event.requestId && event.requestId !== requestId) return;
+
       // Critical events bypass queue — must process immediately.
       // Drain queued events FIRST so ordering is preserved (they happened before
       // this terminal event). Then process the terminal event itself.
@@ -224,6 +234,9 @@ export async function sendToPunk(
       model,
       intent,
       history,
+      requestId,
+      thinking,
+      provider,
     });
   } catch (err) {
     port1.close();
@@ -525,11 +538,20 @@ export async function brainContextualSearch(
   projectId: string,
   query: string,
   fileContext?: string,
-): Promise<{ memories: BrainSearchResult[]; tensions: unknown[] }> {
+  intent?: string,
+  projectRoot?: string,
+): Promise<{
+  memories: BrainSearchResult[];
+  tensions: unknown[];
+  profileAtoms: unknown[];
+  relevantFiles: unknown[];
+}> {
   return electronAPI.invoke("brain_contextual_search", {
     projectId,
     query,
     fileContext,
+    intent,
+    projectRoot,
   });
 }
 
@@ -616,6 +638,10 @@ export async function brainExtractProfile(): Promise<void> {
   return electronAPI.invoke("brain_extract_profile");
 }
 
+export async function brainClearSessionPins(projectId: string): Promise<void> {
+  return electronAPI.invoke("brain_session_pins_clear", { projectId });
+}
+
 // --- Identity ---
 
 export interface UserIdentity {
@@ -650,11 +676,14 @@ export async function brainGetAvatar(): Promise<{
 export interface MindEntry {
   id: string;
   content: string;
+  completed?: boolean;
   created_at: string;
   updated_at: string;
 }
 
-export async function brainMindAdd(content: string): Promise<{ entry: MindEntry }> {
+export async function brainMindAdd(
+  content: string,
+): Promise<{ entry: MindEntry }> {
   return electronAPI.invoke("brain_mind_add", { content });
 }
 
@@ -662,10 +691,56 @@ export async function brainMindGetAll(): Promise<{ entries: MindEntry[] }> {
   return electronAPI.invoke("brain_mind_get_all");
 }
 
-export async function brainMindUpdate(id: string, content: string): Promise<{ entry: MindEntry | null }> {
-  return electronAPI.invoke("brain_mind_update", { id, content });
+export async function brainMindUpdate(
+  id: string,
+  content?: string,
+  completed?: boolean,
+): Promise<{ entry: MindEntry | null }> {
+  return electronAPI.invoke("brain_mind_update", { id, content, completed });
 }
 
 export async function brainMindDelete(id: string): Promise<{ id: string }> {
   return electronAPI.invoke("brain_mind_delete", { id });
+}
+
+// --- Session Context ---
+
+export interface SessionState {
+  activeTask: { description: string; goal?: string } | null;
+  workingSet: { path: string; purpose?: string; touches: number }[];
+  decisions: { content: string; timestamp: number }[];
+  recentActions: { type: string; content: string; timestamp: number }[];
+  turnCount: number;
+  lastProvider: string | null;
+  lastIntent: string | null;
+  startedAt: number;
+}
+
+export interface SessionDelta {
+  activeTask?: { description: string; goal?: string } | null;
+  workingSet?: { path: string; purpose?: string }[];
+  decisions?: { content: string }[];
+  recentActions?: { type: string; content: string; timestamp: number }[];
+  turnCount?: number;
+  lastProvider?: string;
+  lastIntent?: string;
+}
+
+export async function sessionMergeState(
+  projectId: string,
+  delta: SessionDelta,
+): Promise<SessionState> {
+  return electronAPI.invoke("session_merge_state", { projectId, delta });
+}
+
+export async function sessionClearState(
+  projectId: string,
+): Promise<SessionState> {
+  return electronAPI.invoke("session_clear_state", { projectId });
+}
+
+export async function sessionReadState(
+  projectId: string,
+): Promise<SessionState | null> {
+  return electronAPI.invoke("session_read_state", { projectId });
 }

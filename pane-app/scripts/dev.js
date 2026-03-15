@@ -48,6 +48,18 @@ function copyCompiled() {
     `${projectRoot}/src/main/punk-backend.mjs`,
     `${projectRoot}/out/main/punk-backend.mjs`,
   );
+  copyFileSync(
+    `${projectRoot}/src/main/session-context.mjs`,
+    `${projectRoot}/out/main/session-context.mjs`,
+  );
+  copyFileSync(
+    `${projectRoot}/src/main/pane-mcp-server.mjs`,
+    `${projectRoot}/out/main/pane-mcp-server.mjs`,
+  );
+  copyFileSync(
+    `${projectRoot}/src/main/tool-executor.mjs`,
+    `${projectRoot}/out/main/tool-executor.mjs`,
+  );
   console.log("✓ Compiled scripts copied");
 }
 
@@ -178,6 +190,45 @@ watch(`${projectRoot}/src/main/punk-backend.mjs`, () => {
       `${projectRoot}/out/main/punk-backend.mjs`,
     );
     console.log("✓ punk-backend.mjs copied");
+  } catch (err) {
+    console.error("Copy failed:", err.message);
+  }
+});
+
+watch(`${projectRoot}/src/main/session-context.mjs`, () => {
+  console.log("🔄 session-context.mjs changed, copying...");
+  try {
+    copyFileSync(
+      `${projectRoot}/src/main/session-context.mjs`,
+      `${projectRoot}/out/main/session-context.mjs`,
+    );
+    console.log("✓ session-context.mjs copied");
+  } catch (err) {
+    console.error("Copy failed:", err.message);
+  }
+});
+
+watch(`${projectRoot}/src/main/pane-mcp-server.mjs`, () => {
+  console.log("🔄 pane-mcp-server.mjs changed, copying...");
+  try {
+    copyFileSync(
+      `${projectRoot}/src/main/pane-mcp-server.mjs`,
+      `${projectRoot}/out/main/pane-mcp-server.mjs`,
+    );
+    console.log("✓ pane-mcp-server.mjs copied");
+  } catch (err) {
+    console.error("Copy failed:", err.message);
+  }
+});
+
+watch(`${projectRoot}/src/main/tool-executor.mjs`, () => {
+  console.log("🔄 tool-executor.mjs changed, copying...");
+  try {
+    copyFileSync(
+      `${projectRoot}/src/main/tool-executor.mjs`,
+      `${projectRoot}/out/main/tool-executor.mjs`,
+    );
+    console.log("✓ tool-executor.mjs copied");
   } catch (err) {
     console.error("Copy failed:", err.message);
   }

@@ -23,11 +23,6 @@ export function TaskNotification() {
       };
 
       setNotifications((prev) => [...prev, notification]);
-
-      // Auto-dismiss after 5 seconds
-      setTimeout(() => {
-        setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
-      }, 5000);
     };
 
     window.addEventListener("pane:task-complete", handler);
