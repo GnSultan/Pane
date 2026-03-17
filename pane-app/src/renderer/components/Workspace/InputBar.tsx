@@ -684,10 +684,10 @@ export function InputBar({
             )}
             <button
               onClick={onAbort}
-              className="text-pane-text-secondary font-mono hover:text-pane-text ml-auto btn-press"
+              className="text-pane-error font-mono hover:text-pane-error/80 ml-auto btn-press"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
-              esc
+              stop
             </button>
           </div>
         )}

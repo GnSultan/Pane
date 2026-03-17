@@ -101,9 +101,22 @@ function getToolLabel(name: string): string {
 function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
   const oldStr = (input.old_string as string) || "";
   const newStr = (input.new_string as string) || "";
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Scroll to bottom to show the replacement section
+  useEffect(() => {
+    if (containerRef.current && newStr) {
+      const container = containerRef.current;
+      // Scroll to bottom after a brief delay to ensure content is rendered
+      setTimeout(() => {
+        container.scrollTop = container.scrollHeight;
+      }, 50);
+    }
+  }, [newStr]);
 
   return (
     <div
+      ref={containerRef}
       className="font-mono overflow-x-auto max-h-[400px] overflow-y-auto
                  leading-[1.6] space-y-0"
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}

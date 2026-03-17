@@ -85,6 +85,20 @@ export function FileViewer() {
           console.error("Auto-save failed:", err);
         }
       }, 800);
+      
+      // Scroll to bottom to show the last edit position
+      if (editorRef.current) {
+        const editor = editorRef.current.editor;
+        const session = editor.session;
+        const lineCount = session.getLength();
+        const lineHeight = editor.renderer.lineHeight;
+        const scrollerHeight = editor.renderer.scroller.clientHeight;
+        
+        // Calculate scroll position to show the bottom of the file
+        // Keep the last few lines visible
+        const targetScrollTop = (lineCount * lineHeight) - (scrollerHeight * 0.7);
+        editor.session.setScrollTop(Math.max(0, targetScrollTop));
+      }
     },
     [activeFilePath, activeProjectId],
   );
@@ -237,6 +251,22 @@ export function FileViewer() {
     };
     window.addEventListener("pane:focus-editor", handler);
     return () => window.removeEventListener("pane:focus-editor", handler);
+  }, []);
+
+  // Listen for scroll-to-line event (from FuzzyFinder code search)
+  useEffect(() => {
+    const handler = (e: CustomEvent) => {
+      const { line } = e.detail;
+      if (line && editorRef.current) {
+        const editor = editorRef.current.editor;
+        // Scroll to the line (0-indexed, so subtract 1)
+        const row = Math.max(0, line - 1);
+        editor.scrollToRow(row);
+        editor.gotoLine(row, 0, true);
+      }
+    };
+    window.addEventListener("pane:scroll-to-line", handler as EventListener);
+    return () => window.removeEventListener("pane:scroll-to-line", handler as EventListener);
   }, []);
 
   // Set top scroll margin to ~45% of editor height so the first line sits
