@@ -126,10 +126,7 @@ function ToolbarButton({ icon, active, disabled, onClick, tooltip }: {
 
   const handleMouseEnter = () => {
     if (tooltip) {
-      const timer = setTimeout(() => {
-        setShowTooltip(true);
-      }, 3000); // 3 second delay
-      setTooltipTimer(timer);
+      setShowTooltip(true);
     }
   };
 
