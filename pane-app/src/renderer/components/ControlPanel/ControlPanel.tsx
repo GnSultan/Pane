@@ -241,52 +241,52 @@ export function ControlPanel() {
           icon={<ConversationIcon />}
           active={mode === "conversation"}
           onClick={() => handleSetMode("conversation")}
-          tooltip="Conversation mode"
+          tooltip="Conversation"
         />
         <ToolbarButton
           icon={<FileIcon />}
           active={mode === "viewer"}
           disabled={!activeFilePath}
           onClick={() => handleSetMode("viewer")}
-          tooltip="File viewer mode"
+          tooltip="Editor"
         />
         <ToolbarButton
           icon={<SearchIcon />}
           onClick={() => useWorkspaceStore.getState().toggleFuzzyFinder()}
-          tooltip="Open fuzzy finder"
+          tooltip="Search"
         />
         {isGitRepo && (
           <ToolbarButton
             icon={<GitIcon />}
             active={gitPanelActive}
             onClick={toggleGit}
-            tooltip="Toggle Git panel"
+            tooltip="Git"
           />
         )}
         <ToolbarButton
           icon={<TerminalIcon />}
           active={mode === "terminal"}
           onClick={() => handleSetMode("terminal")}
-          tooltip="Open terminal"
+          tooltip="Terminal"
         />
         <ToolbarButton
           icon={<ChangeHistoryIcon />}
           active={useWorkspaceStore((s) => s.changeHistoryOpen)}
           onClick={() => useWorkspaceStore.getState().toggleChangeHistory()}
-          tooltip="View change history"
+          tooltip="Change history"
         />
         <div className="ml-auto flex items-center gap-0.5">
           <ToolbarButton
             icon={<MindIcon />}
             active={mindOpen}
             onClick={() => useWorkspaceStore.getState().toggleMind()}
-            tooltip="Open Mind panel"
+            tooltip="Mind"
           />
           <ToolbarButton
             icon={<ProfileAvatar />}
             active={profileOpen}
             onClick={() => useWorkspaceStore.getState().toggleProfile()}
-            tooltip="Open Profile"
+            tooltip="Profile"
           />
         </div>
       </div>
