@@ -324,13 +324,13 @@ function ModelPicker({
     <div ref={ref} className="relative flex items-center">
       <button
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-1.5 text-pane-text btn-press select-none group"
+        className="flex items-center gap-1.5 text-pane-text-secondary btn-press select-none group"
         style={{ fontSize: "var(--pane-font-size-xs)" }}
       >
         <div
-          className={`w-1.5 h-1.5 rounded-full transition-colors ${autoRoute ? "bg-pane-status-added" : "bg-pane-text"}`}
+          className={`w-1.5 h-1.5 rounded-full transition-colors ${autoRoute ? "bg-pane-status-added" : "bg-pane-text-secondary"}`}
         />
-        <span className="flex items-center gap-1.5 transition-colors group-hover:text-pane-text">
+        <span className="flex items-center gap-1.5 transition-colors group-hover:text-pane-text-secondary">
           {autoRoute ? (
             <span className="flex items-center gap-1.5">
               <span className="text-pane-text-secondary/60">auto</span>

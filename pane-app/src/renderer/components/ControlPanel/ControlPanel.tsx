@@ -114,26 +114,58 @@ function ChangeHistoryIcon() {
 
 // --- Toolbar button ---
 
-function ToolbarButton({ icon, active, disabled, onClick }: {
+function ToolbarButton({ icon, active, disabled, onClick, tooltip }: {
   icon: ReactNode;
   active?: boolean;
   disabled?: boolean;
   onClick: () => void;
+  tooltip?: string;
 }) {
+  const [showTooltip, setShowTooltip] = useState(false);
+  const [tooltipTimer, setTooltipTimer] = useState<NodeJS.Timeout | null>(null);
+
+  const handleMouseEnter = () => {
+    if (tooltip) {
+      const timer = setTimeout(() => {
+        setShowTooltip(true);
+      }, 3000); // 3 second delay
+      setTooltipTimer(timer);
+    }
+  };
+
+  const handleMouseLeave = () => {
+    if (tooltipTimer) {
+      clearTimeout(tooltipTimer);
+      setTooltipTimer(null);
+    }
+    setShowTooltip(false);
+  };
+
   return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`w-7 h-7 flex items-center justify-center rounded-xl
-        ${disabled
-          ? "text-pane-text-secondary opacity-30 cursor-default"
-          : active
-            ? "text-pane-text bg-pane-text/[0.08]"
-            : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04]"
-        }`}
+    <div 
+      className="relative flex items-center"
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
     >
-      {icon}
-    </button>
+      <button
+        onClick={onClick}
+        disabled={disabled}
+        className={`w-7 h-7 flex items-center justify-center rounded-xl
+          ${disabled
+            ? "text-pane-text-secondary opacity-30 cursor-default"
+            : active
+              ? "text-pane-text bg-pane-text/[0.08]"
+              : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04]"
+          }`}
+      >
+        {icon}
+      </button>
+      {showTooltip && tooltip && (
+        <div className="absolute left-full ml-2 px-2 py-1 bg-pane-bg border border-pane-border/40 rounded-lg text-pane-text-secondary text-[11px] whitespace-nowrap shadow-lg z-50">
+          {tooltip}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -212,44 +244,52 @@ export function ControlPanel() {
           icon={<ConversationIcon />}
           active={mode === "conversation"}
           onClick={() => handleSetMode("conversation")}
+          tooltip="Conversation mode"
         />
         <ToolbarButton
           icon={<FileIcon />}
           active={mode === "viewer"}
           disabled={!activeFilePath}
           onClick={() => handleSetMode("viewer")}
+          tooltip="File viewer mode"
         />
         <ToolbarButton
           icon={<SearchIcon />}
           onClick={() => useWorkspaceStore.getState().toggleFuzzyFinder()}
+          tooltip="Open fuzzy finder"
         />
         {isGitRepo && (
           <ToolbarButton
             icon={<GitIcon />}
             active={gitPanelActive}
             onClick={toggleGit}
+            tooltip="Toggle Git panel"
           />
         )}
         <ToolbarButton
           icon={<TerminalIcon />}
           active={mode === "terminal"}
           onClick={() => handleSetMode("terminal")}
+          tooltip="Open terminal"
         />
         <ToolbarButton
           icon={<ChangeHistoryIcon />}
           active={useWorkspaceStore((s) => s.changeHistoryOpen)}
           onClick={() => useWorkspaceStore.getState().toggleChangeHistory()}
+          tooltip="View change history"
         />
         <div className="ml-auto flex items-center gap-0.5">
           <ToolbarButton
             icon={<MindIcon />}
             active={mindOpen}
             onClick={() => useWorkspaceStore.getState().toggleMind()}
+            tooltip="Open Mind panel"
           />
           <ToolbarButton
             icon={<ProfileAvatar />}
             active={profileOpen}
             onClick={() => useWorkspaceStore.getState().toggleProfile()}
+            tooltip="Open Profile"
           />
         </div>
       </div>
