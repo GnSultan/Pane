@@ -4,6 +4,7 @@ import { FileViewer } from "./FileViewer";
 import { Terminal } from "./Terminal";
 import { Profile } from "./Profile";
 import { Mind } from "./Mind";
+import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 
@@ -48,6 +49,7 @@ export function Workspace() {
   const projectOrder = useProjectsStore((s) => s.projectOrder);
   const mindOpen = useWorkspaceStore((s) => s.mindOpen);
   const profileOpen = useWorkspaceStore((s) => s.profileOpen);
+  const changeHistoryOpen = useWorkspaceStore((s) => s.changeHistoryOpen);
   const activeMode = useProjectsStore((s) => {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
@@ -69,17 +71,17 @@ export function Workspace() {
     <div className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
       {/* Content — one view at a time, using absolute + visibility so the
           browser keeps layout cached and mode switching is instant both ways. */}
-      <div className={`absolute inset-0 ${activeMode !== "conversation" || profileOpen || mindOpen ? "hidden" : ""}`}>
+      <div className={`absolute inset-0 ${activeMode !== "conversation" || profileOpen || mindOpen || changeHistoryOpen ? "hidden" : ""}`}>
         {[...mountedIds].map((id) => (
           <ConversationLayer key={id} projectId={id} />
         ))}
       </div>
 
-        <div className={`absolute inset-0 flex flex-col ${activeMode !== "viewer" || profileOpen || mindOpen ? "hidden" : ""}`}>
+        <div className={`absolute inset-0 flex flex-col ${activeMode !== "viewer" || profileOpen || mindOpen || changeHistoryOpen ? "hidden" : ""}`}>
           <FileViewer />
         </div>
 
-        <div className={`absolute inset-0 flex ${activeMode !== "terminal" || profileOpen || mindOpen ? "hidden" : ""}`}>
+        <div className={`absolute inset-0 flex ${activeMode !== "terminal" || profileOpen || mindOpen || changeHistoryOpen ? "hidden" : ""}`}>
           {projectOrder.map((id) => (
             <div
               key={id}
@@ -100,6 +102,16 @@ export function Workspace() {
       <div className={`absolute inset-0 ${!profileOpen ? "hidden" : ""}`}>
         <Profile />
       </div>
+
+      {/* ChangeHistory — takes over workspace when open */}
+      {activeProjectId && (
+        <div className={`absolute inset-0 bg-pane-bg z-10 ${!changeHistoryOpen ? "hidden" : ""}`}>
+          <ChangeHistoryPanel
+            projectId={activeProjectId}
+            onCollapse={() => useWorkspaceStore.getState().closeChangeHistory()}
+          />
+        </div>
+      )}
     </div>
   );
 }

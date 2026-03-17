@@ -17,6 +17,14 @@ interface SyntaxToken {
   content: string;
 }
 
+// Helper function to escape special regex characters
+function escapeRegExp(str: string): string {
+  const specialChars = "*+?^${}()|[]\\";
+  return str.split('').map(char => 
+    specialChars.includes(char) ? '\\' + char : char
+  ).join('');
+}
+
 function highlightSyntax(code: string, language: string): SyntaxToken[] {
   const tokens: SyntaxToken[] = [];
   
@@ -29,7 +37,7 @@ function highlightSyntax(code: string, language: string): SyntaxToken[] {
     // Numbers
     { pattern: /\b(\d+\.?\d*)\b/g, type: "number" as const },
     // Keywords (language-specific)
-    { pattern: new RegExp(`\\b(${getKeywords(language).join('|')})\\b`, "g"), type: "keyword" as const },
+    { pattern: new RegExp(`\\b(${getKeywords(language).map(escapeRegExp).join('|')})\\b`, "g"), type: "keyword" as const },
     // Function calls
     { pattern: /\b([a-zA-Z_]\w*)\s*\(/g, type: "function" as const },
     // Operators

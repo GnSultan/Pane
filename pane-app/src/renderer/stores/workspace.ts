@@ -61,6 +61,10 @@ interface WorkspaceState {
   profileAvatarDataUrl: string | null; // data:image/... URL for display
   toggleProfile: () => void;
   closeProfile: () => void;
+  // ChangeHistory
+  changeHistoryOpen: boolean;
+  toggleChangeHistory: () => void;
+  closeChangeHistory: () => void;
   // Claude updates
   claudeUpdateAvailable: boolean;
   claudeUpdateState: "available" | "updating" | "updated" | "restart" | null;
@@ -237,6 +241,12 @@ function createWorkspaceStore() {
     toggleProfile: () =>
       set((s) => ({ profileOpen: !s.profileOpen, mindOpen: false })),
     closeProfile: () => set({ profileOpen: false }),
+    // ChangeHistory
+    changeHistoryOpen: false,
+    toggleChangeHistory: () =>
+      set((state) => ({ changeHistoryOpen: !state.changeHistoryOpen })),
+    closeChangeHistory: () => set({ changeHistoryOpen: false }),
+    // Claude updates
     claudeUpdateAvailable: false,
     claudeUpdateState: null,
     claudeCurrentVersion: null,

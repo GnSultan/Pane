@@ -101,6 +101,17 @@ function TerminalIcon() {
   );
 }
 
+function ChangeHistoryIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="8" r="5" />
+      <path d="M8 5v2.5l1.5 1" />
+      <path d="M3 8h1.5" />
+      <path d="M11.5 8H13" />
+    </svg>
+  );
+}
+
 // --- Toolbar button ---
 
 function ToolbarButton({ icon, active, disabled, onClick }: {
@@ -223,6 +234,11 @@ export function ControlPanel() {
           icon={<TerminalIcon />}
           active={mode === "terminal"}
           onClick={() => handleSetMode("terminal")}
+        />
+        <ToolbarButton
+          icon={<ChangeHistoryIcon />}
+          active={useWorkspaceStore((s) => s.changeHistoryOpen)}
+          onClick={() => useWorkspaceStore.getState().toggleChangeHistory()}
         />
         <div className="ml-auto flex items-center gap-0.5">
           <ToolbarButton
