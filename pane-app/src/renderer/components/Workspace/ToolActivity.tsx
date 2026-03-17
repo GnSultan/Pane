@@ -122,7 +122,7 @@ function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
     >
       {oldStr && (
-        <div className="px-5 py-4">
+        <div className="px-4 py-4">
           <div className="text-[9px] uppercase tracking-wider mb-2 text-pane-text-secondary/40">
             Original
           </div>
@@ -132,7 +132,7 @@ function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
         </div>
       )}
       {newStr && (
-        <div className="px-5 py-4 border-t border-pane-text-secondary/10">
+        <div className="px-4 py-4 border-t border-pane-text-secondary/10">
           <div className="text-[9px] uppercase tracking-wider mb-2 text-pane-text-secondary/40">
             Replacement
           </div>
@@ -152,7 +152,7 @@ function ExpandedWriteInput({ input }: { input: Record<string, unknown> }) {
                  leading-[1.6]"
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
     >
-      <div className="px-5 py-4">
+      <div className="px-4 py-4">
         <MarkdownText 
           text={`\`\`\`ts\n${content.length > 5000 ? content.slice(0, 5000) + "\n... (truncated)" : content}\n\`\`\``} 
         />
@@ -172,7 +172,7 @@ function ExpandedTodoInput({ input }: { input: Record<string, unknown> }) {
       {todos.map((todo, i) => (
         <div
           key={i}
-          className="flex items-start gap-2 px-5 py-4"
+          className="flex items-start gap-2 px-4 py-4"
         >
           <span className="shrink-0 mt-0.5">
             {todo.status === "completed"
@@ -201,7 +201,7 @@ function ExpandedTodoInput({ input }: { input: Record<string, unknown> }) {
 function ExpandedDefaultInput({ input }: { input: Record<string, unknown> }) {
   return (
     <div
-      className="px-5 py-4 font-mono overflow-x-auto max-h-[400px] overflow-y-auto leading-[1.6]"
+      className="px-4 py-4 font-mono overflow-x-auto max-h-[400px] overflow-y-auto leading-[1.6]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
       {JSON.stringify(input, null, 2)}
@@ -220,7 +220,7 @@ function ExpandedReadInput({ result }: { result?: ToolResultBlock }) {
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
     >
       {hasContent && (
-        <div className="px-5 py-4">
+        <div className="px-4 py-4">
           <MarkdownText 
             text={`\`\`\`ts\n${content.length > 5000 ? content.slice(0, 5000) + "\n... (truncated)" : content}\n\`\`\``} 
           />
@@ -249,7 +249,7 @@ function ExpandedBashInput({ input }: { input: Record<string, unknown> }) {
       style={{ fontSize: "var(--pane-font-size-sm)" }}
       title="click to copy"
     >
-      <pre className="px-5 py-4 text-pane-text-secondary whitespace-pre-wrap break-words flex items-start justify-between gap-2">
+      <pre className="px-4 py-4 text-pane-text-secondary whitespace-pre-wrap break-words flex items-start justify-between gap-2">
         <span>$ {cmd}</span>
         <span className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-pane-text-secondary/50">
           {copied ? "✓" : "copy"}
@@ -270,13 +270,13 @@ function ExpandedMcpInput({ input, toolName }: { input: Record<string, unknown>;
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
       {mcp && (
-        <div className="px-5 py-4 text-pane-text-secondary border-b border-pane-text-secondary/10">
+        <div className="px-4 py-4 text-pane-text-secondary border-b border-pane-text-secondary/10">
           {mcp.server} / {mcp.tool}
         </div>
       )}
       <div>
         {entries.map(([key, val]) => (
-          <div key={key} className="flex gap-2 px-5 py-4 border-b border-pane-border/5 last:border-b-0">
+          <div key={key} className="flex gap-2 px-4 py-4 border-b border-pane-border/5 last:border-b-0">
             <span className="text-pane-text-secondary shrink-0">{key.replace(/_/g, " ")}</span>
             <span className="text-pane-text-secondary truncate">
               {typeof val === "string" ? val : JSON.stringify(val)}
@@ -423,7 +423,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
         onClick={() => setUserToggle(expanded ? false : true)}
         className="flex items-center gap-2.5 text-pane-text-secondary font-mono
                    hover:text-pane-text w-full text-left
-                   h-10 leading-none px-5 group"
+                   h-10 leading-none px-4 group"
         style={{
           fontSize: "var(--pane-font-size-sm)",
           minHeight: '2.5rem'
@@ -459,7 +459,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
               Only show results for errors or tools where the output matters (Bash, Grep, etc.) */}
           {toolResult && !["Edit", "Write", "Read", "replace", "write_file", "read_file"].includes(toolUse.name) && (
             <div
-              className={`px-5 py-4 overflow-x-auto max-h-[250px] overflow-y-auto leading-[1.6]
+              className={`px-4 py-4 overflow-x-auto max-h-[250px] overflow-y-auto leading-[1.6]
                           ${
                             toolResult.is_error
                               ? "text-pane-error"
@@ -473,7 +473,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
           {/* Always show errors, even for Edit/Write/Read */}
           {toolResult?.is_error && ["Edit", "Write", "Read", "replace", "write_file", "read_file"].includes(toolUse.name) && (
             <div
-              className="px-5 py-4 overflow-x-auto max-h-[250px] overflow-y-auto
+              className="px-4 py-4 overflow-x-auto max-h-[250px] overflow-y-auto
                          text-pane-error
                          leading-[1.6]"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
@@ -518,7 +518,7 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-2.5 text-pane-text-secondary font-mono
                    hover:text-pane-text w-full text-left
-                   h-10 leading-none px-5 group"
+                   h-10 leading-none px-4 group"
         style={{
           fontSize: "var(--pane-font-size-sm)",
           minHeight: '2.5rem'
@@ -545,7 +545,7 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
 
       {expanded && searchResult && (
         <div
-          className="px-5 py-4"
+          className="px-4 py-4"
         >
           {isError ? (
             <div
@@ -565,7 +565,7 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
                   href={result.url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="flex flex-col py-2.5 -mx-5 px-5
+                  className="flex flex-col py-2.5 -mx-4 px-4
                              border-b border-pane-border/10 last:border-b-0
                              hover:bg-pane-text/[0.03]"
                 >

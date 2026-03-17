@@ -297,6 +297,20 @@ export function MessageBubble({
 
   if (message.type === "user") {
     const text = getMessageText(message);
+    const [isExpanded, setIsExpanded] = useState(false);
+    const [showExpand, setShowExpand] = useState(false);
+    const textRef = useRef<HTMLParagraphElement>(null);
+
+    useEffect(() => {
+      if (textRef.current) {
+        const lineHeight = 24; // Approximate line height
+        const maxLines = 10; // Maximum lines before showing expand button
+        const maxHeight = lineHeight * maxLines;
+        setShowExpand(textRef.current.scrollHeight > maxHeight);
+      }
+    }, [text]);
+
+    const truncatedText = isExpanded || !showExpand ? text : text.split('\n').slice(0, 10).join('\n');
 
     return (
       <div className={`mb-10 group flex flex-col items-end ${animClass}`}>
@@ -305,11 +319,24 @@ export function MessageBubble({
           style={{ maxWidth: "65ch" }}
         >
           <p
+            ref={textRef}
             className="text-pane-text font-mono leading-[1.75] whitespace-pre-wrap"
-            style={{ fontSize: "var(--pane-font-size)" }}
+            style={{ 
+              fontSize: "var(--pane-font-size)",
+              maxHeight: isExpanded ? 'none' : 'calc(24px * 10)',
+              overflow: isExpanded ? 'visible' : 'hidden'
+            }}
           >
-            {text}
+            {truncatedText}
           </p>
+          {showExpand && (
+            <button
+              onClick={() => setIsExpanded(!isExpanded)}
+              className="mt-2 text-pane-text-secondary/60 hover:text-pane-text-secondary text-xs font-mono"
+            >
+              {isExpanded ? 'collapse' : 'expand'}
+            </button>
+          )}
         </div>
         <div className="flex items-center justify-end gap-2 mt-1">
           {message.checkpointId && (
