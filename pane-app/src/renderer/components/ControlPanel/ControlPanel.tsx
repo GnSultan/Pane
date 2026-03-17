@@ -273,7 +273,7 @@ export function ControlPanel() {
           icon={<ChangeHistoryIcon />}
           active={useWorkspaceStore((s) => s.changeHistoryOpen)}
           onClick={() => useWorkspaceStore.getState().toggleChangeHistory()}
-          tooltip="Change history"
+          tooltip="History"
         />
         <div className="ml-auto flex items-center gap-0.5">
           <ToolbarButton
