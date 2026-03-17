@@ -30,6 +30,16 @@ export function usePunkWarmup(projectId: string) {
 
     const warmup = async () => {
       if (warmingUp) return;
+
+      const selectedModel = useWorkspaceStore.getState().selectedModel;
+      const isFreeModel = selectedModel?.endsWith(":free");
+
+      // Skip warmup for free models to save daily quota
+      if (isFreeModel) {
+        store.setConversationReady(projectId, true);
+        return;
+      }
+
       warmingUp = true;
 
       let capturedSessionId: string | null = null;

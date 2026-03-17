@@ -5,18 +5,37 @@
 // Debug: Log service data on startup
 console.log("[cli-worker] Starting with serviceData:", process.serviceData);
 
-import { spawn } from "node:child_process";
+import { spawn, exec } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
-import { compileContext } from "./session-context.mjs";
+import { promisify } from "node:util";
+import { compileContext, mergeState } from "./session-context.mjs";
 
+const execAsync = promisify(exec);
 const __dirname = import.meta.dirname;
 
 const activeProcesses = new Map();
 const requestStates = new Map(); // requestId -> { lastText: "", lastThought: "" }
+
+async function getGitStatus(workingDir) {
+  try {
+    const { stdout: branchOut } = await execAsync(
+      "git symbolic-ref --short HEAD || git rev-parse --abbrev-ref HEAD",
+      { cwd: workingDir },
+    );
+    const branch = branchOut.trim();
+    const { stdout: statusOut } = await execAsync(
+      "git status --porcelain=v1 -unormal",
+      { cwd: workingDir },
+    );
+    return { branch, summary: statusOut.trim() || "(clean)" };
+  } catch {
+    return null;
+  }
+}
 
 function getEnvWithPath() {
   const home = os.homedir();
@@ -264,7 +283,9 @@ function handleGeminiLine(projectId, line, requestId) {
       const isError = parsed.status === "error" || parsed.status === "failure";
       const rawOutput = parsed.output;
       const currentFullOutput =
-        typeof rawOutput === "string" ? rawOutput : JSON.stringify(rawOutput ?? "");
+        typeof rawOutput === "string"
+          ? rawOutput
+          : JSON.stringify(rawOutput ?? "");
 
       if (parsed.delta === true) {
         const lastOutput = state.toolResults.get(toolId) || "";
@@ -280,7 +301,7 @@ function handleGeminiLine(projectId, line, requestId) {
 
         if (!increment) break;
 
-        // Note: Renderer-side tool_result streaming is simplified — we send a single block 
+        // Note: Renderer-side tool_result streaming is simplified — we send a single block
         // that gets updated. This keeps the UI logic unified with Claude.
         sendToMain({
           type: "event",
@@ -399,6 +420,7 @@ async function handleSpawn({
   history,
   command: messageCommand,
   requestId,
+  todos,
 }) {
   const command =
     messageCommand || (process.serviceData && process.serviceData.command);
@@ -418,6 +440,20 @@ async function handleSpawn({
   }
 
   const historyLength = history ? history.length : 0;
+  const gitStatus = await getGitStatus(workingDir);
+
+  // Update session state before compileContext
+  const stateUpdate = {
+    lastProvider: command === "claude" ? "claude-cli" : "gemini-cli",
+    lastIntent: intent,
+    turnCount: historyLength / 2 + 1,
+    gitStatus,
+  };
+  if (todos) {
+    stateUpdate.todos = todos;
+  }
+  mergeState(projectId, stateUpdate);
+
   const context = compileContext(projectId, intent, historyLength);
   const systemPrompt = context.full;
 
@@ -512,15 +548,36 @@ async function handleSpawn({
       if (turns.length > 0) {
         const lines = ["## Previous conversation\n"];
         for (const msg of turns) {
-          const text = msg.content
-            .filter((b) => b.type === "text")
-            .map((b) => b.text)
-            .join("\n");
-          if (!text) continue;
           const role = msg.type === "user" ? "User" : "Assistant";
-          // Aggressive truncation per message to keep prompt small
-          const capped = text.length > 600 ? text.slice(0, 600) + "…" : text;
-          lines.push(`${role}: ${capped}`);
+
+          // Extract both text and thinking blocks, with appropriate truncation per type
+          const textBlocks = msg.content.filter((b) => b.type === "text");
+          const thinkingBlocks = msg.content.filter((b) => b.type === "thinking");
+
+          let messageParts: string[] = [];
+
+          // Add text blocks (truncated more aggressively)
+          if (textBlocks.length > 0) {
+            const fullText = textBlocks.map((b) => b.text).join("\n").trim();
+            if (fullText) {
+              const capped = fullText.length > 600 ? fullText.slice(0, 600) + "…" : fullText;
+              messageParts.push(capped);
+            }
+          }
+
+          // Add thinking blocks (also truncated, but slightly more generous)
+          if (thinkingBlocks.length > 0) {
+            const fullThinking = thinkingBlocks.map((b) => b.thinking).join("\n").trim();
+            if (fullThinking) {
+              const capped = fullThinking.length > 800 ? fullThinking.slice(0, 800) + "…" : fullThinking;
+              // Format thinking distinctly
+              messageParts.push(`⟨thinking⟩\n${capped}\n⟨/thinking⟩`);
+            }
+          }
+
+          if (messageParts.length === 0) continue;
+
+          lines.push(`${role}: ${messageParts.join("\n\n")}`);
         }
         lines.push("\n---\n");
         historyPreamble = lines.join("\n");

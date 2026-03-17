@@ -187,7 +187,7 @@ function EntryItem({
     return (
       <div
         onClick={() => editRef.current?.focus()}
-        className={`mb-3 rounded-2xl ring-1 px-5 py-4 bg-pane-bg/50 transition-all cursor-text
+        className={`mb-3 rounded-xl ring-1 px-5 py-4 bg-pane-bg/50 transition-all cursor-text
           ${textareaFocused ? "ring-pane-text/10 ring-2" : "ring-pane-text/20"}
         `}
       >
@@ -264,7 +264,7 @@ function EntryItem({
 
   return (
     <div
-      className={`group mb-3 rounded-2xl ring-1 ring-pane-border/40 px-5 py-4 hover:ring-pane-border/70 transition-all ${entry.completed ? "opacity-40" : ""}`}
+      className={`group mb-3 rounded-xl ring-1 ring-pane-border/40 px-5 py-4 hover:ring-pane-border/70 transition-all ${entry.completed ? "opacity-40" : ""}`}
     >
       <div className="flex items-start gap-4">
         {/* Completion Toggle */}
@@ -588,7 +588,7 @@ export function Mind() {
         {/* ── Compose zone ── */}
         <div
           onClick={() => textareaRef.current?.focus()}
-          className={`rounded-2xl ring-1 px-5 py-4 bg-pane-bg mb-12 transition-all cursor-text
+          className={`rounded-xl ring-1 px-5 py-4 bg-pane-bg mb-12 transition-all cursor-text
             ${textareaFocused ? "ring-pane-text/10 ring-2" : "ring-pane-border/40"}
           `}
         >

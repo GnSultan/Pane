@@ -176,7 +176,7 @@ export function ControlPanel() {
 
   return (
     <div
-      className="no-select flex flex-col h-full bg-pane-bg rounded-2xl font-panel outline-none ring-1 ring-pane-border/40"
+      className="no-select flex flex-col h-full bg-pane-bg rounded-xl font-panel outline-none ring-1 ring-pane-border/40"
       data-panel="control"
       tabIndex={0}
     >
@@ -184,7 +184,7 @@ export function ControlPanel() {
       <div className="h-12 shrink-0" />
 
       {/* Project list */}
-      <div className="border-b border-pane-border py-2">
+      <div className="py-2">
         <ProjectList />
       </div>
 
@@ -196,7 +196,7 @@ export function ControlPanel() {
       )}
 
       {/* Toolbar */}
-      <div className="h-9 flex items-center gap-1 px-2 border-t border-pane-border shrink-0">
+      <div className="h-9 flex items-center gap-1 px-2 shrink-0">
         <ToolbarButton
           icon={<ConversationIcon />}
           active={mode === "conversation"}

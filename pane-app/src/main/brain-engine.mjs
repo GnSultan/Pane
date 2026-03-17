@@ -113,15 +113,63 @@ function buildProviderChain(settings) {
   const keys = settings.http_api_keys || {};
   const chain = [];
 
-  if (keys.gemini) chain.push({ type: "http", provider: "gemini", apiKey: keys.gemini, model: "gemini-flash-latest" });
-  if (keys.anthropic) chain.push({ type: "http", provider: "anthropic", apiKey: keys.anthropic, model: "claude-haiku-4-5-20251001" });
-  if (keys.deepseek) chain.push({ type: "http", provider: "deepseek", apiKey: keys.deepseek, model: "deepseek-v3.2" });
-  if (keys.openai) chain.push({ type: "http", provider: "openai", apiKey: keys.openai, model: "gpt-4o-mini" });
+  // OpenRouter Free Models (Multi-stage fallback)
+  if (keys.openrouter) {
+    chain.push({
+      type: "http",
+      provider: "openrouter",
+      apiKey: keys.openrouter,
+      model: "stepfun/step-3.5-flash:free",
+    });
+    chain.push({
+      type: "http",
+      provider: "openrouter",
+      apiKey: keys.openrouter,
+      model: "nvidia/nemotron-3-super-120b-a12b:free",
+    });
+    chain.push({
+      type: "http",
+      provider: "openrouter",
+      apiKey: keys.openrouter,
+      model: "minimax/minimax-m2.5:free",
+    });
+  }
+
+  if (keys.gemini)
+    chain.push({
+      type: "http",
+      provider: "gemini",
+      apiKey: keys.gemini,
+      model: "gemini-flash-latest",
+    });
+  if (keys.anthropic)
+    chain.push({
+      type: "http",
+      provider: "anthropic",
+      apiKey: keys.anthropic,
+      model: "claude-haiku-4-5-20251001",
+    });
+  if (keys.deepseek)
+    chain.push({
+      type: "http",
+      provider: "deepseek",
+      apiKey: keys.deepseek,
+      model: "deepseek-chat",
+    });
+  if (keys.openai)
+    chain.push({
+      type: "http",
+      provider: "openai",
+      apiKey: keys.openai,
+      model: "gpt-4o-mini",
+    });
 
   // CLI backends as final fallback
   const backend = settings.punk_backend || "";
-  if (backend === "claude-cli" || backend === "cli") chain.push({ type: "cli", command: "claude" });
-  else if (backend === "gemini-cli") chain.push({ type: "cli", command: "gemini" });
+  if (backend === "claude-cli" || backend === "cli")
+    chain.push({ type: "cli", command: "claude" });
+  else if (backend === "gemini-cli")
+    chain.push({ type: "cli", command: "gemini" });
 
   return chain;
 }
@@ -243,6 +291,20 @@ async function summarizeViaHttp(prompt, { provider, apiKey, model }) {
       "https://api.deepseek.com/v1/chat/completions",
       { model, max_tokens: 256, messages: [{ role: "user", content: prompt }] },
       { "Authorization": `Bearer ${apiKey}` },
+    );
+    return resp?.choices?.[0]?.message?.content?.trim() || null;
+  }
+
+  if (provider === "openrouter") {
+    console.log(`[brain] summarizing with ${model} via openrouter...`);
+    const resp = await makeRequest(
+      "https://openrouter.ai/api/v1/chat/completions",
+      { model, max_tokens: 256, messages: [{ role: "user", content: prompt }] },
+      { 
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://pane.app",
+        "X-Title": "Pane Brain"
+      },
     );
     return resp?.choices?.[0]?.message?.content?.trim() || null;
   }

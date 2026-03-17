@@ -82,69 +82,65 @@ const MAX_OUTPUT_SIZE = 100 * 1024; // 100KB max output
 const COMMAND_TIMEOUT_MS = 30000; // 30 seconds for commands
 const DEFAULT_ENCODING = "utf-8";
 
-// Safe command patterns (whitelist approach)
-const SAFE_COMMAND_PATTERNS = [
-  // Build tools
-  /^(npm|yarn|pnpm|bun)\s+/,
-  /^(make|cmake|meson|ninja)\s+/,
-  /^(cargo|go|rustc|gcc|g\+\+|clang|clang\+\+)\s+/,
-
-  // Package managers
-  /^(pip|pip3|python3?\s+-m\s+pip)\s+/,
-  /^(gem|bundle)\s+/,
-  /^(apt-get|apt|yum|dnf|pacman|brew)\s+(install|update|upgrade|remove)/,
-
-  // Version control
-  /^(git|hg|svn)\s+/,
-
-  // File operations (safe versions)
-  /^(ls|find|grep|awk|sed|cat|head|tail|wc|du|df)\s+/,
-  /^(mkdir|rmdir|cp|mv|rm\s+(-[^r]*|[^-].*))\s+/,
-  /^(chmod|chown)\s+[0-7]{3,4}\s+/,
-
-  // Process management
-  /^(ps|top|htop|kill\s+-[^9]\S*)\s+/,
-
-  // Network (safe)
-  /^(curl|wget)\s+(-[^X]*|[^-].*)\s+/,
-  /^(ping|traceroute|dig|nslookup)\s+/,
-
-  // System info
-  /^(uname|whoami|hostname|date|cal)\s*/,
-
-  // Project-specific
-  /^(node|python|python3|ruby|perl|php|java)\s+/,
-];
-
 // Dangerous command patterns (blacklist)
 const DANGEROUS_COMMAND_PATTERNS = [
-  /rm\s+.*-r/,
-  /rm\s+.*-f/,
-  /rm\s+.*-rf/,
-  /rm\s+.*-rf/,
-  /rm\s+.*\.\./,
-  /rm\s+\/\s*$/,
-  /rm\s+-\w*rf/,
-  /dd\s+if=/,
-  /mkfs/,
-  /fdisk/,
-  /format/,
-  /shutdown/,
-  /halt/,
-  /reboot/,
-  /init\s+[06]/,
-  />\s*\/dev\/sd/,
-  /cat\s+>\s*\/dev\/sd/,
-  /chmod\s+[0-7]{3,4}\s+.*\/\.\./,
-  /chown\s+.*\/\.\./,
-  /curl\s+.*-X\s+(POST|PUT|DELETE).*\s+https?:\/\/localhost/,
-  /wget\s+.*--post-.*\s+https?:\/\/localhost/,
-  /nc\s+.*-e/,
-  /bash\s+.*<\(/,
-  /eval\s+/,
-  /exec\s+/,
-  /source\s+.*[;&|]/,
+  /rm\s+.*-rf?\s+\//, // Root deletion
+  /rm\s+.*-rf?\s+\*/, // Catch-all deletion
+  /rm\s+.*\.\.\//,    // Relative deletion
+  /mkfs/,             // Disk formatting
+  /dd\s+if=.*(of=\/dev\/(sd|xvd|vd|nvme|loop|nbd))/, // Raw disk writing to block devices
+  /passwd/,           // Password changing
+  /shutdown|reboot/,  // System control
+  /chmod\s+.*777/,    // Dangerous permissions
+  // Block writes to system devices EXCEPT harmless ones
+  // Allowed: /dev/null, /dev/zero, /dev/random, /dev/urandom, /dev/stdin, /dev/stdout, /dev/stderr, /dev/fd/
+  />\s*\/dev\/(?!null|zero|random|urandom|stdin|stdout|stderr|fd\/)/,
 ];
+
+/**
+ * Validates a shell command for safety.
+ *
+ * Switch to Blacklist approach: Allow everything EXCEPT explicitly dangerous
+ * patterns and attempts to escape the project directory.
+ */
+function validateCommand(command, projectRoot) {
+  const trimmed = command.trim();
+  if (!trimmed) return { valid: false, error: "Empty command" };
+
+  // 1. Check against blacklist
+  for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
+    if (pattern.test(trimmed)) {
+      return {
+        valid: false,
+        error: `Command contains dangerous pattern: ${pattern}`,
+      };
+    }
+  }
+
+  // 2. Check for attempts to escape directory
+  // Allow 'node_modules/..' as it's common in npm operations.
+  if (trimmed.includes("..") && !trimmed.includes("node_modules/..")) {
+    if (trimmed.includes("../../")) {
+      return {
+        valid: false,
+        error: "Path traversal detected (attempt to escape project)",
+      };
+    }
+  }
+
+  // 3. Block absolute paths to system directories
+  const systemPaths = ["/etc/", "/var/", "/bin/", "/sbin/", "/usr/", "/root/"];
+  for (const sysPath of systemPaths) {
+    if (trimmed.includes(sysPath) && !trimmed.includes(projectRoot)) {
+      return {
+        valid: false,
+        error: `Attempt to access system directory: ${sysPath}`,
+      };
+    }
+  }
+
+  return { valid: true };
+}
 
 // ============================================================================
 // Tool Executor Class
@@ -209,70 +205,7 @@ export class ToolExecutor {
    * Validate a shell command for safety
    */
   validateCommand(command) {
-    if (!command || typeof command !== "string") {
-      return { valid: false, error: "Empty or invalid command" };
-    }
-
-    const trimmed = command.trim();
-
-    // Check against blacklist
-    for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
-      if (pattern.test(trimmed)) {
-        return {
-          valid: false,
-          error: `Command contains dangerous pattern: ${pattern}`,
-        };
-      }
-    }
-
-    // Check against whitelist (optional - can be more permissive if needed)
-    let isSafe = false;
-    for (const pattern of SAFE_COMMAND_PATTERNS) {
-      if (pattern.test(trimmed)) {
-        isSafe = true;
-        break;
-      }
-    }
-
-    if (!isSafe) {
-      // Allow simple piping/redirecting if the base command is safe
-      if (trimmed.includes("|") || trimmed.includes(">") || trimmed.includes("&")) {
-        const baseCmd = trimmed.split(/[|>&]/)[0].trim();
-        let baseSafe = false;
-        for (const pattern of SAFE_COMMAND_PATTERNS) {
-          if (pattern.test(baseCmd)) {
-            baseSafe = true;
-            break;
-          }
-        }
-        if (!baseSafe) {
-          return { valid: false, error: "Base command does not match safe patterns" };
-        }
-      } else {
-        return { valid: false, error: "Command does not match safe patterns" };
-      }
-    }
-
-    // Check for attempts to escape directory
-    if (trimmed.includes("..") && !trimmed.includes("node_modules/..")) {
-      // Allow 'node_modules/..' for npm operations
-      if (!/node_modules\/\.\./.test(trimmed)) {
-        return {
-          valid: false,
-          error: "Command contains parent directory reference (..)",
-        };
-      }
-    }
-
-    // Check for absolute path traversal
-    if (trimmed.startsWith("/") && !trimmed.startsWith(this.projectRoot)) {
-      return {
-        valid: false,
-        error: "Command attempts to access files outside project",
-      };
-    }
-
-    return { valid: true };
+    return validateCommand(command, this.projectRoot);
   }
 
   /**

@@ -11,7 +11,7 @@ const DEFAULT_PANEL_FONT_SIZE = 13;
 const DEFAULT_EDITOR_FONT_SIZE = 14;
 const DEFAULT_FONT_WEIGHT = 400;
 
-type Theme = "dark" | "light" | "pure" | "system";
+export type Theme = "dark" | "light" | "pure" | "system";
 
 function getSystemTheme(): "dark" | "light" {
   return window.matchMedia("(prefers-color-scheme: dark)").matches
@@ -44,6 +44,11 @@ interface WorkspaceState {
   httpBaseUrls: Record<string, string>;
   intentRouting: BackendRouting;
   intentAutoRoute: boolean;
+  openRouterModels: Array<{ id: string; name: string; context_length: number }>;
+  allModels: Record<string, Array<{ id: string; name: string; context_length: number }>>;
+  fetchOpenRouterModels: () => Promise<void>;
+  fetchAllModels: () => Promise<void>;
+  refreshAllModels: () => Promise<void>;
   // Mind
   mindOpen: boolean;
   toggleMind: () => void;
@@ -171,15 +176,53 @@ function createWorkspaceStore() {
     keybindings: null,
     theme: "system" as Theme,
     completionSound: "none",
-    selectedModel: "auto-gemini-3",
-    selectedModelProvider: "gemini",
-    selectedModelThinking: false,
-    punkBackend: "gemini-cli",
-    httpProvider: "deepseek",
+    selectedModel: "stepfun/step-3.5-flash:free",
+    selectedModelProvider: "openrouter",
+    selectedModelThinking: true,
+    punkBackend: "http",
+    httpProvider: "openrouter",
     httpApiKeys: {},
     httpBaseUrls: {},
     intentRouting: DEFAULT_BACKEND_ROUTING,
     intentAutoRoute: true,
+    openRouterModels: [],
+    allModels: {},
+    fetchOpenRouterModels: async () => {
+      const { getOpenRouterModels } = await import("../lib/tauri-commands");
+      try {
+        const models = await getOpenRouterModels();
+        set({ 
+          openRouterModels: models,
+          allModels: { ...get().allModels, openrouter: models }
+        });
+      } catch (err) {
+        console.error("Failed to fetch OpenRouter models:", err);
+      }
+    },
+    fetchAllModels: async () => {
+      const { getAllModels } = await import("../lib/tauri-commands");
+      try {
+        const models = await getAllModels();
+        set({ 
+          allModels: models,
+          openRouterModels: models.openrouter || []
+        });
+      } catch (err) {
+        console.error("Failed to fetch all models:", err);
+      }
+    },
+    refreshAllModels: async () => {
+      const { refreshAllModels } = await import("../lib/tauri-commands");
+      try {
+        const models = await refreshAllModels();
+        set({ 
+          allModels: models,
+          openRouterModels: models.openrouter || []
+        });
+      } catch (err) {
+        console.error("Failed to refresh all models:", err);
+      }
+    },
     // Mind
     mindOpen: false,
     toggleMind: () =>
@@ -408,8 +451,13 @@ function createWorkspaceStore() {
       })),
     setPunkBackend: (backend: string) => set({ punkBackend: backend }),
     setHttpProvider: (provider: string) => set({ httpProvider: provider }),
-    setHttpApiKeys: (keys: Record<string, string>) =>
-      set({ httpApiKeys: keys }),
+    setHttpApiKeys: (keys: Record<string, string>) => {
+      set({ httpApiKeys: keys });
+      // If openrouter key was just added/changed, fetch models
+      if (keys["openrouter"]) {
+        get().fetchOpenRouterModels();
+      }
+    },
     setHttpBaseUrls: (urls: Record<string, string>) =>
       set({ httpBaseUrls: urls }),
     getEffectiveRouting: () => {
@@ -451,6 +499,14 @@ export const useWorkspaceStore: ReturnType<typeof createWorkspaceStore> =
     }
     return store;
   })();
+
+// Listen for background model updates from the main process
+(window as any).electronAPI.on("pane:models-updated", (models: any) => {
+  useWorkspaceStore.setState({ 
+    allModels: models,
+    openRouterModels: models.openrouter || []
+  });
+});
 
 // Listen for OS theme changes — re-apply when in system mode
 const systemMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");

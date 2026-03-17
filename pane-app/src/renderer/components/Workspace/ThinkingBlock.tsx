@@ -1,59 +1,98 @@
-import { useState } from "react";
+import { useRef, useEffect, useState } from "react";
 import type { ThinkingBlock } from "../../lib/claude-types";
 import { MarkdownText } from "./MarkdownText";
+import { MicroIndicator } from "../shared";
 
 interface ThinkingBlockProps {
   block: ThinkingBlock;
   isStreaming: boolean;
 }
 
-export function ThinkingBlockDisplay({ block, isStreaming }: ThinkingBlockProps) {
-  const [expanded, setExpanded] = useState(false);
+/**
+ * Renders LLM thinking/reasoning blocks as muted text.
+ * No redundant "thinking" label — just subtle reasoning context.
+ */
+export function ThinkingBlockDisplay({
+  block,
+  isStreaming,
+}: ThinkingBlockProps) {
   const thinkingText = block.thinking;
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [userToggle, setUserToggle] = useState<boolean | null>(null);
+
+  // Start collapsed by default, user can expand to see thinking
+  const isExpanded = userToggle !== null ? userToggle : false;
+
+  // Breathing animation during streaming when collapsed
+  const [isBreathing, setIsBreathing] = useState(isStreaming);
+  useEffect(() => {
+    setIsBreathing(isStreaming && !isExpanded);
+  }, [isStreaming, isExpanded]);
+
+  // Internal auto-scroll for the thinking block itself
+  useEffect(() => {
+    if (isStreaming && contentRef.current) {
+      contentRef.current.scrollTop = contentRef.current.scrollHeight;
+    }
+  }, [thinkingText, isStreaming]);
 
   if (!thinkingText.trim() && !isStreaming) return null;
 
   return (
-    <div className="my-1">
+    <div
+      className={`group rounded-md border transition-all duration-200 ${isExpanded ? 'border-[var(--pane-border-soft)] bg-[var(--pane-bg)] mb-6' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-4'}`}
+    >
       <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-1.5 text-pane-text-secondary/50 font-mono
-                   hover:text-pane-text-secondary w-full text-left
-                   h-5 leading-none"
-        style={{ fontSize: "var(--pane-font-size-sm)" }}
+        onClick={() => setUserToggle(!isExpanded)}
+        className="flex items-center gap-2.5 h-12 leading-none px-6 hover:text-pane-text transition-colors w-full text-left"
+        style={{ minHeight: '3rem' }}
       >
-        <span
-          className={`w-1 h-1 rounded-full shrink-0 ${isStreaming ? "animate-fadeIn" : ""}`}
-          style={{
-            backgroundColor: isStreaming
-              ? "color-mix(in srgb, var(--pane-text-secondary) 60%, transparent)"
-              : "color-mix(in srgb, var(--pane-text-secondary) 25%, transparent)",
-            animation: isStreaming ? "breathe 4s ease-in-out infinite" : "none",
-          }}
+        <MicroIndicator
+          variant={isStreaming ? "strong" : "subtle"}
+          animate={isStreaming}
+          size={5}
+          ariaLabel={isStreaming ? "thinking" : "reasoning complete"}
         />
-        <span className="opacity-50">thinking</span>
-        {isStreaming && (
-          <span
-            className="inline-block w-[2px] h-[10px] bg-pane-text-secondary/40 ml-0.5"
-            style={{ animation: "breathe 3s ease-in-out infinite" }}
-          />
-        )}
-      </button>
-
-      {expanded && (
-        <div
-          className="mt-1 mb-2 pl-3 border-l border-pane-text-secondary/15
-                     text-pane-text-secondary/50 font-mono leading-[1.7]
-                     max-h-[300px] overflow-y-auto"
+        <span
+          className="font-mono mr-1"
           style={{ fontSize: "var(--pane-font-size-sm)" }}
         >
-          <MarkdownText text={thinkingText} isStreaming={isStreaming} />
-          {isStreaming && (
-            <span
-              className="inline-block w-[2px] h-[10px] bg-pane-text-secondary/40 ml-0.5"
-              style={{ animation: "breathe 3s ease-in-out infinite" }}
-            />
-          )}
+          <span 
+            className={
+              isBreathing 
+                ? "text-pane-text-secondary/40 animate-pulse" 
+                : isStreaming 
+                  ? "text-pane-text-secondary/50" 
+                  : "text-pane-text-secondary/30"
+            }
+          >
+            {isStreaming ? "thinking..." : "reasoning"}
+          </span>
+        </span>
+        <span 
+          className="ml-auto shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-pane-text-secondary/20 font-mono"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          {isExpanded ? "collapse" : "expand"}
+        </span>
+      </button>
+
+      {isExpanded && (
+        <div
+          ref={contentRef}
+          className="px-10 py-8 space-y-3
+                     text-pane-text-secondary/60 leading-[1.8]
+                     max-h-[500px] overflow-y-auto selection:bg-pane-text-secondary/10"
+          style={{
+            fontSize: "var(--pane-font-size-sm)",
+            fontFamily: "var(--font-mono)",
+          }}
+        >
+          <MarkdownText
+            text={thinkingText}
+            isStreaming={isStreaming}
+            isThinking
+          />
         </div>
       )}
     </div>

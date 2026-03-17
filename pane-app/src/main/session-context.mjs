@@ -3,8 +3,8 @@
  *
  * Instead of handing off conversation history between providers, Pane owns
  * the context. LLMs are stateless workers. Each one receives a compiled
- * snapshot of what's happening right now. When you switch from DeepSeek R1
- * to DeepSeek V3, V3 doesn't need to be briefed — the state is already there.
+ * snapshot of what's happening right now. When you switch from DeepSeek Reasoner
+ * to DeepSeek Chat (V3), Chat doesn't need to be briefed — the state is already there.
  *
  * State lives at: ~/.pane/session/{projectId}/state.json
  * Context exports from brain live at: ~/.pane/brain/context/{projectId}.json
@@ -34,6 +34,9 @@ function defaultState() {
     // What the LLM is actively working on right now
     activeTask: null,       // { description: string, goal?: string }
 
+    // Project TODO list
+    todos: [],              // { content: string, status: string, activeForm?: string }[]
+
     // Files currently in play — sorted by touch count (most active first)
     workingSet: [],         // [{ path, purpose?, touches }]
 
@@ -51,6 +54,97 @@ function defaultState() {
     lastIntent: null,
     startedAt: Date.now(),
   };
+}
+
+export const MODEL_CONTEXT_LIMITS = {
+  opus: 200000,
+  sonnet: 200000,
+  haiku: 200000,
+  "gemini-3": 2000000,
+  "gemini-2": 1000000,
+  "gemini-1.5": 1000000,
+  "deepseek-v3": 128000,
+  "deepseek-chat": 128000,
+  "deepseek-reasoner": 128000,
+  qwen3: 262144,
+  "moonshot": 128000,
+  openrouter: 128000,
+  // Specific OpenRouter model context windows
+  "anthropic/claude-3.5-sonnet": 200000,
+  "deepseek/deepseek-r1": 128000,
+  "deepseek/deepseek-chat": 128000,
+  "qwen/qwen3-coder": 262144,
+  "qwen/qwen3-coder:free": 262144,
+  "stepfun/step-3.5-flash:free": 128000,
+  "meta-llama/llama-3.3-70b-instruct:free": 128000,
+  "nousresearch/hermes-3-llama-3.1-405b:free": 128000,
+  "arcee-ai/trinity-mini:free": 131072,
+  "qwen/qwen3-next-80b-a3b-instruct:free": 262144,
+  "openai/gpt-oss-120b:free": 131072,
+  "z-ai/glm-4.5-air:free": 131072,
+  "xiaomi/mimo-v2-flash": 128000,
+  "google/gemini-2.0-flash-001": 1000000,
+};
+
+/**
+ * Get context window limit for a model.
+ * Tries exact match first, then partial matches from most to least specific.
+ */
+export function getContextLimit(model) {
+  if (!model) return 200000;
+  
+  const lower = model.toLowerCase();
+  
+  // First, try exact match for the full model string
+  if (MODEL_CONTEXT_LIMITS[lower]) {
+    return MODEL_CONTEXT_LIMITS[lower];
+  }
+  
+  // Try exact match with the model as-is (case-sensitive)
+  if (MODEL_CONTEXT_LIMITS[model]) {
+    return MODEL_CONTEXT_LIMITS[model];
+  }
+  
+  // Try partial matches from most specific to least specific
+  const partialMatches = [
+    "anthropic/claude-3.5-sonnet",
+    "deepseek/deepseek-r1",
+    "deepseek/deepseek-chat",
+    "qwen/qwen3-coder",
+    "qwen/qwen3-next",
+    "arcee-ai/trinity-mini",
+    "openai/gpt-oss-120b",
+    "z-ai/glm-4.5-air",
+    "stepfun/step-3.5-flash",
+    "meta-llama/llama-3.3",
+    "nousresearch/hermes-3",
+    "xiaomi/mimo-v2",
+    "google/gemini-2.0",
+    "gemini-3",
+    "gemini-1.5",
+    "opus",
+    "sonnet",
+    "haiku",
+    "deepseek",
+    "qwen3",
+    "moonshot",
+    "openrouter",
+  ];
+  
+  for (const pattern of partialMatches) {
+    if (lower.includes(pattern)) {
+      const result = MODEL_CONTEXT_LIMITS[pattern];
+      if (result !== undefined) return result;
+    }
+  }
+  
+  // Fallback: check for provider-level defaults
+  if (lower.includes("openrouter")) return MODEL_CONTEXT_LIMITS["openrouter"] ?? 200000;
+  if (lower.includes("anthropic")) return MODEL_CONTEXT_LIMITS["sonnet"] ?? 200000; // Default to sonnet
+  if (lower.includes("gemini")) return MODEL_CONTEXT_LIMITS["gemini-1.5"] ?? 200000; // Default to 1.5
+  if (lower.includes("deepseek")) return MODEL_CONTEXT_LIMITS["deepseek-chat"] ?? 200000;
+  
+  return 200000; // Final fallback
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +220,7 @@ export function mergeState(projectId, delta) {
     state.recentActions = [...delta.recentActions, ...state.recentActions].slice(0, 8);
   }
 
+  if (delta.todos)                   state.todos = delta.todos;
   if (delta.turnCount !== undefined) state.turnCount = delta.turnCount;
   if (delta.lastProvider)           state.lastProvider = delta.lastProvider;
   if (delta.lastIntent)             state.lastIntent = delta.lastIntent;
@@ -192,6 +287,29 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
     "## Visual & UX Standards",
     "- When implementing UI, prioritize a modern, polished aesthetic with consistent spacing and platform-appropriate design.",
     "- Prefer platform-native primitives and avoid heavy external dependencies unless already established in the project.",
+    "",
+    "# Available Sub-Agents",
+    "",
+    "Sub-agents are specialized expert agents. Each sub-agent is available as a tool of the same name. You MUST delegate tasks to the sub-agent with the most relevant expertise.",
+    "",
+    "<available_subagents>",
+    "  <subagent>",
+    "    <name>codebase_investigator</name>",
+    "    <description>The specialized tool for codebase analysis, architectural mapping, and understanding system-wide dependencies.",
+    "    Invoke this tool for tasks like vague requests, bug root-cause analysis, system refactoring, comprehensive feature implementation or to answer questions about the codebase that require investigation.",
+    "    It returns a structured report with key file paths, symbols, and actionable architectural insights.</description>",
+    "  </subagent>",
+    "  <subagent>",
+    "    <name>cli_help</name>",
+    "    <description>Specialized in answering questions about how users use you, (Gemini CLI): features, documentation, and current runtime configuration.</description>",
+    "  </subagent>",
+    "  <subagent>",
+    "    <name>generalist</name>",
+    "    <description>A general-purpose AI agent with access to all tools. Highly recommended for tasks that are turn-intensive or involve processing large amounts of data. Use this to keep the main session history lean and efficient. Excellent for: batch refactoring/error fixing across multiple files, running commands with high-volume output, and speculative investigations.</description>",
+    "  </subagent>",
+    "</available_subagents>",
+    "",
+    "Remember that the closest relevant sub-agent should still be used even if its expertise is broader than the given task.",
   ].join("\n");
 
   stableParts.unshift(coreInstructions, "");
@@ -217,7 +335,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   } catch {}
 
   // Profile atoms: semantically closest principles to THIS request
-  const atoms = brainCtx.profileAtoms || [];
+  const atoms = (brainCtx.profileAtoms || []).slice(0, 5);
   if (atoms.length > 0) {
     stableParts.push("How they think — relevant to this request:");
     for (const atom of atoms) stableParts.push(`- ${atom.content}`);
@@ -241,7 +359,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   }
 
   // Relevant files from brain index (LLM-described architecture map)
-  const relevantFiles = brainCtx.relevantFiles || [];
+  const relevantFiles = (brainCtx.relevantFiles || []).slice(0, 5);
   if (relevantFiles.length > 0) {
     stableParts.push("Files relevant to this request:");
     for (const f of relevantFiles) stableParts.push(`- ${f.path} — ${f.description}`);
@@ -289,6 +407,15 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   if (state.activeTask) {
     dynamicParts.push(`Active task: ${state.activeTask.description}`);
     if (state.activeTask.goal) dynamicParts.push(`Goal: ${state.activeTask.goal}`);
+    dynamicParts.push("");
+  }
+
+  if (state.todos?.length > 0) {
+    dynamicParts.push("Project TODOs:");
+    for (const t of state.todos) {
+      const mark = t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[/]" : "[ ]";
+      dynamicParts.push(`${mark} ${t.content}`);
+    }
     dynamicParts.push("");
   }
 
@@ -364,10 +491,11 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
 
   const stable  = stableParts.filter(Boolean).join("\n");
   const dynamic = dynamicParts.filter(Boolean).join("\n");
+  const full = [stable, dynamic].filter(Boolean).join("\n") || coreInstructions;
 
   return {
     stable,
     dynamic,
-    full: [stable, dynamic].filter(Boolean).join("\n"),
+    full,
   };
 }

@@ -63,6 +63,9 @@ export const Conversation = memo(function Conversation({
   const isProcessing = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.isProcessing ?? false,
   );
+  const isThinking = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.statusMessage === "thinking...",
+  );
   const isReady = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.isReady ?? false,
   );
@@ -74,6 +77,8 @@ export const Conversation = memo(function Conversation({
   usePunkWarmup(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
+
+  const isActive = isProcessing || isThinking;
 
   // Context refresh toast — shows briefly when proactive continuation fires
   const [showRefreshToast, setShowRefreshToast] = useState(false);
@@ -137,10 +142,10 @@ export const Conversation = memo(function Conversation({
     return () => container.removeEventListener("scroll", handleScroll);
   }, [isReady]);
 
-  // rAF loop: while processing + following, continuously pin to bottom.
+  // rAF loop: while active + following, continuously pin to bottom.
   const rafRef = useRef(0);
   useEffect(() => {
-    if (!isProcessing) return;
+    if (!isActive) return;
     const tick = () => {
       if (followRef.current && scrollRef.current) {
         scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -149,7 +154,7 @@ export const Conversation = memo(function Conversation({
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [isProcessing]);
+  }, [isActive]);
 
   // Scroll to bottom on send — re-engages follow
   const scrollToBottom = useCallback(() => {

@@ -36,6 +36,16 @@ macOS only. For now.
 
 ---
 
+### Features
+
+**Syntax Highlighting**: Code blocks display with proper syntax highlighting for JavaScript, TypeScript, Python, HTML, CSS, JSON, and more. Uses Pane's native design language with subtle surface backgrounds that blend seamlessly with the interface — no harsh black backgrounds that violate the minimal aesthetic.
+
+**Context Window Management**: Automatic conversation compaction prevents hitting file size limits while preserving critical context and decision markers.
+
+**Model-Specific Context Limits**: Accurate context windows for all supported models (Gemini: 1M-2M tokens, Claude: 200K tokens, DeepSeek: 128K tokens, etc.).
+
+---
+
 ### Shortcuts
 
 | Key | Action |

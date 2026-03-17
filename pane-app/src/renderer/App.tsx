@@ -71,10 +71,13 @@ function App() {
   useGitStatus();
   useSettingsPersistence();
 
-  // Check for updates on app launch
+  // Check for updates and fetch models on app launch
   useEffect(() => {
     useWorkspaceStore.getState().checkForClaudeUpdate();
     useWorkspaceStore.getState().checkForGeminiUpdate();
+    
+    // Initial fetch of models (cached or background)
+    useWorkspaceStore.getState().fetchAllModels();
   }, []);
 
   // Update window title when active project changes
@@ -316,85 +319,6 @@ function App() {
         data-tauri-drag-region
       />
 
-      {/* Top Notification Bar — floats over content, only for system-level alerts */}
-      {showUpdate && (
-        <div className="absolute top-0 left-0 right-0 h-9 flex items-center justify-end px-4 z-40 pointer-events-none gap-2">
-          {/* Claude Update Pill */}
-          {claudeUpdateState && (
-            <div
-              data-no-drag
-              className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown"
-            >
-              {claudeUpdateState === "available" && (
-                <button
-                  onClick={() => triggerClaudeUpdate()}
-                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
-                  claude update available
-                </button>
-              )}
-              {claudeUpdateState === "updating" && (
-                <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
-                  installing claude...
-                </span>
-              )}
-              {claudeUpdateState === "updated" && (
-                <span className="text-[11px] font-mono text-pane-status-added">
-                  claude complete
-                </span>
-              )}
-              {claudeUpdateState === "restart" && (
-                <button
-                  onClick={() => window.location.reload()}
-                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
-                  restart claude
-                </button>
-              )}
-            </div>
-          )}
-
-          {/* Gemini Update Pill */}
-          {geminiUpdateState && (
-            <div
-              data-no-drag
-              className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown"
-            >
-              {geminiUpdateState === "available" && (
-                <button
-                  onClick={() => triggerGeminiUpdate()}
-                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
-                  gemini update available
-                </button>
-              )}
-              {geminiUpdateState === "updating" && (
-                <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
-                  installing gemini...
-                </span>
-              )}
-              {geminiUpdateState === "updated" && (
-                <span className="text-[11px] font-mono text-pane-status-added">
-                  gemini complete
-                </span>
-              )}
-              {geminiUpdateState === "restart" && (
-                <button
-                  onClick={() => window.location.reload()}
-                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
-                  restart gemini
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
       <div className="flex h-full pt-2 pb-2 pl-2 gap-1">
         {controlPanelVisible && (
           <>
@@ -404,7 +328,85 @@ function App() {
             <ResizeHandle />
           </>
         )}
-        <div className="flex-1 min-w-0 pr-2 h-full">
+        <div className="flex-1 min-w-0 pr-2 h-full relative">
+          {/* Update notification bar — positioned absolutely within workspace area */}
+          {showUpdate && (
+            <div className="absolute top-0 left-0 right-0 h-9 flex items-center justify-end px-4 z-40 pointer-events-none gap-2">
+              {/* Claude Update Pill */}
+              {claudeUpdateState && (
+                <div
+                  data-no-drag
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown"
+                >
+                  {claudeUpdateState === "available" && (
+                    <button
+                      onClick={() => triggerClaudeUpdate()}
+                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
+                    >
+                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
+                      claude update available
+                    </button>
+                  )}
+                  {claudeUpdateState === "updating" && (
+                    <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
+                      installing claude...
+                    </span>
+                  )}
+                  {claudeUpdateState === "updated" && (
+                    <span className="text-[11px] font-mono text-pane-status-added">
+                      claude complete
+                    </span>
+                  )}
+                  {claudeUpdateState === "restart" && (
+                    <button
+                      onClick={() => window.location.reload()}
+                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
+                    >
+                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
+                      restart claude
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Gemini Update Pill */}
+              {geminiUpdateState && (
+                <div
+                  data-no-drag
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown"
+                >
+                  {geminiUpdateState === "available" && (
+                    <button
+                      onClick={() => triggerGeminiUpdate()}
+                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
+                    >
+                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
+                      gemini update available
+                    </button>
+                  )}
+                  {geminiUpdateState === "updating" && (
+                    <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
+                      installing gemini...
+                    </span>
+                  )}
+                  {geminiUpdateState === "updated" && (
+                    <span className="text-[11px] font-mono text-pane-status-added">
+                      gemini complete
+                    </span>
+                  )}
+                  {geminiUpdateState === "restart" && (
+                    <button
+                      onClick={() => window.location.reload()}
+                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
+                    >
+                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
+                      restart gemini
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
           <Workspace />
         </div>
       </div>

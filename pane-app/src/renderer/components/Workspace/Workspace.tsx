@@ -66,7 +66,7 @@ export function Workspace() {
   }, [activeProjectId]);
 
   return (
-    <div className="h-full relative bg-pane-bg rounded-2xl ring-1 ring-pane-border/40 overflow-hidden">
+    <div className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
       {/* Content — one view at a time, using absolute + visibility so the
           browser keeps layout cached and mode switching is instant both ways. */}
       <div className={`absolute inset-0 ${activeMode !== "conversation" || profileOpen || mindOpen ? "hidden" : ""}`}>

@@ -55,7 +55,7 @@
   "theme": "system",
   "panel_width": 287.8515625,
   "completion_sound": "Submarine",
-  "selected_model": "sonnet",
+  "selected_model": "deepseek-chat",
   "punk_backend": "http",
   "http_provider": "deepseek",
   "http_api_keys": {

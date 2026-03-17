@@ -3,7 +3,7 @@
     "pane": {
       "command": "node",
       "args": [
-        "/Applications/Pane.app/Contents/Resources/app.asar/out/main/pane-mcp-server.mjs"
+        "/Users/macbook/Pane/pane-app/out/main/pane-mcp-server.mjs"
       ],
       "env": {
         "PANE_PROJECT_ID": "pane",

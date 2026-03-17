@@ -20,6 +20,7 @@ import {
   shutdownPunkWorker,
   punkEngine,
 } from "./punk-engine.mjs";
+import { modelManager } from "./model-manager.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -331,11 +332,14 @@ function registerCommandHandlers() {
     for (let i = 0; i < checkLen; i++) {
       if (buffer[i] === 0) throw new Error("Binary file — cannot display");
     }
-    return buffer.toString("utf-8");
+    // Convert to string and strip any trailing null bytes that might have 
+    // been added by file system oddities or previous bugs.
+    return buffer.toString("utf-8").replace(/\0+$/, "");
   });
   ipcMain.handle("write_file", async (_event, args) => {
     await fs.promises.mkdir(path.dirname(args.path), { recursive: true });
-    await fs.promises.writeFile(args.path, args.content, "utf-8");
+    // Using 'w' flag explicitly to ensure truncation, though writeFile default is 'w'
+    await fs.promises.writeFile(args.path, args.content, { encoding: "utf-8", flag: "w" });
   });
   ipcMain.handle("rename_file", async (_event, args) => {
     await fs.promises.rename(args.oldPath, args.newPath);
@@ -1626,6 +1630,8 @@ function registerIpcHandlers() {
 }
 let mainWindow = null;
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
+console.log('[DEBUG] ELECTRON_RENDERER_URL:', process.env.ELECTRON_RENDERER_URL);
+console.log('[DEBUG] isDev:', isDev);
 function getAssetPath(...paths) {
   return isDev
     ? path.join(__dirname, "../../electron/assets", ...paths)
@@ -1689,6 +1695,7 @@ function createWindow() {
 }
 app.whenReady().then(() => {
   registerIpcHandlers();
+  modelManager.initialize();
   createWindow();
   preforkPunkWorker(); // Pre-fork to hide first-use latency
   getPtyWorker();

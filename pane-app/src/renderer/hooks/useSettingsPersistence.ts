@@ -13,21 +13,26 @@ import {
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/claude-types";
-import { useWorkspaceStore } from "../stores/workspace";
+import { useWorkspaceStore, type Theme } from "../stores/workspace";
 import { useProjectsStore } from "../stores/projects";
-import { DEFAULT_BACKEND_ROUTING, type IntentRouting } from "../lib/models";
-
-// Module-level flag: only save settings after they've been successfully loaded.
-// This prevents cleanup saves from overwriting the file with default store values
-// during app reload or HMR.
-let settingsLoaded = false;
-let paneDir = "";
+import type { ActionId, KeyBinding } from "../lib/keybindings";
+import {
+  DEFAULT_BACKEND_ROUTING,
+  type IntentRouting,
+  type BackendRouting,
+  PROVIDER_MODELS,
+} from "../lib/models";
 
 // App readiness gate — other hooks (git, watcher) wait for this before starting
 let resolveAppReady: () => void;
 export const appReadyPromise = new Promise<void>((resolve) => {
   resolveAppReady = resolve;
 });
+
+// Use a ref for settingsLoaded to avoid HMR resets if possible,
+// but for now let's just make sure it's reliable.
+let settingsLoadedGlobal = false;
+let paneDir = "";
 
 // --- Conversation persistence helpers ---
 
@@ -51,11 +56,81 @@ async function saveConversation(
   conversation: PersistedConversation,
 ): Promise<void> {
   if (!paneDir) return;
+  
   const data: PersistedConversation = {
     sessionId: conversation.sessionId,
     model: conversation.model,
     messages: conversation.messages,
   };
+  
+  const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+  const THRESHOLD_SIZE = 4 * 1024 * 1024; // 4MB (compact before hitting limit)
+  
+  // Function to calculate JSON size
+  const calculateSize = (obj: unknown) => new Blob([JSON.stringify(obj)]).size;
+  
+  let jsonSize = calculateSize(data);
+  
+  // Check if the conversation would exceed the threshold
+  if (jsonSize > THRESHOLD_SIZE) {
+    console.warn(`[persistence] Conversation size ${jsonSize} bytes exceeds threshold, compacting...`);
+    
+    const messages = data.messages;
+    const originalCount = messages.length;
+    let keepCount = Math.min(100, originalCount);
+    
+    // Aggressive compaction if still too large
+    if (jsonSize > MAX_FILE_SIZE) {
+      console.log(`[persistence] File exceeds maximum size, applying aggressive compaction`);
+      keepCount = Math.min(50, originalCount);
+    }
+    
+    // Keep only recent messages
+    data.messages = messages.slice(-keepCount);
+    
+    jsonSize = calculateSize(data);
+    const reduction = ((originalCount - keepCount) / originalCount * 100).toFixed(1);
+    console.log(`[persistence] Compacted: ${originalCount} → ${keepCount} messages (${reduction}% reduction)`);
+    console.log(`[persistence] New size: ${jsonSize} bytes`);
+    
+    // If still too large after basic compaction, apply aggressive truncation
+    if (jsonSize > MAX_FILE_SIZE) {
+      console.log(`[persistence] Still too large, truncating content fields...`);
+      
+      // Truncate large content fields in the remaining messages
+      data.messages = data.messages.map((msg) => {
+        if (msg.content && typeof msg.content === 'object') {
+          // Handle array content (typical for Claude/OpenAI format)
+          const content = Array.isArray(msg.content) ? msg.content : [msg.content];
+          const truncatedContent = content.map((item) => {
+            if (typeof item === 'object' && item !== null && 'text' in item && typeof item.text === 'string') {
+              // Truncate text fields to 2000 chars
+              const text = item.text;
+              if (text && text.length > 2000) {
+                return {
+                  ...item,
+                  text: text.substring(0, 1500) + '\n\n... [truncated] ...\n\n' + text.substring(text.length - 500)
+                };
+              }
+            }
+            return item;
+          });
+          return { ...msg, content: truncatedContent };
+        }
+        return msg;
+      });
+      
+      jsonSize = calculateSize(data);
+      console.log(`[persistence] After content truncation: ${jsonSize} bytes`);
+    }
+  }
+  
+  // Final safety check - if still too large, log an error
+  if (jsonSize > MAX_FILE_SIZE) {
+    console.error(`[persistence] ERROR: Unable to compact conversation to under 5MB (final size: ${jsonSize} bytes)`);
+    // Still save it, but the file may not be readable
+  }
+  
   await writeFile(conversationPath(projectId), JSON.stringify(data));
 }
 
@@ -65,17 +140,101 @@ async function loadConversation(
   if (!paneDir) return null;
   try {
     const content = await readFile(conversationPath(projectId));
-    return JSON.parse(content) as PersistedConversation;
-  } catch {
+    
+    // Check file size before parsing
+    const fileSize = content.length;
+    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+    
+    if (fileSize > MAX_FILE_SIZE) {
+      console.warn(`[persistence] Conversation file is ${fileSize} bytes, exceeding 5MB limit`);
+      console.log(`[persistence] Attempting to compact before loading...`);
+      
+      // Try to parse and compact the conversation
+      try {
+        const parsed = JSON.parse(content.trim()) as PersistedConversation;
+        
+        if (parsed.messages && parsed.messages.length > 100) {
+          console.log(`[persistence] Compacting ${parsed.messages.length} messages to 100 most recent`);
+          parsed.messages = parsed.messages.slice(-100);
+          
+          // Save the compacted version
+          await saveConversation(projectId, parsed);
+          console.log(`[persistence] Compacted conversation saved`);
+          
+          return parsed;
+        }
+      } catch (parseErr) {
+        console.error(`[persistence] Failed to parse large conversation file:`, parseErr);
+        
+        // If we can't even parse it, try a more aggressive approach
+        console.log(`[persistence] Attempting emergency recovery by extracting messages...`);
+        
+        // Simple message extraction - find message objects in the file
+        const messageMatches = content.match(/\{"id":\s*"[^"]*"[^}]*"type":\s*"[^"]*"[^}]*"content":[^}]*\}/g);
+        if (messageMatches && messageMatches.length > 0) {
+          console.log(`[persistence] Found ${messageMatches.length} message objects`);
+          
+          // Try to parse and keep only the last 50
+          const messages: ConversationMessage[] = [];
+          const startIdx = Math.max(0, messageMatches.length - 50);
+          
+          for (let i = startIdx; i < messageMatches.length; i++) {
+            const match = messageMatches[i];
+            if (!match) continue; // Safety check
+            
+            try {
+              const msg = JSON.parse(match) as ConversationMessage;
+              messages.push(msg);
+            } catch {
+              // Skip invalid messages
+            }
+          }
+          
+          if (messages.length > 0) {
+            console.log(`[persistence] Recovered ${messages.length} messages`);
+            
+            // Try to extract model from the original content if possible
+            let model: string | null = null;
+            try {
+              const fullParse = JSON.parse(content.trim()) as { model?: string };
+              model = fullParse?.model || null;
+            } catch {
+              // Can't parse full content, model will be null
+            }
+            
+            const recovered: PersistedConversation = {
+              sessionId: null,
+              model: model,
+              messages: messages
+            };
+            
+            // Save the recovered version
+            await saveConversation(projectId, recovered);
+            console.log(`[persistence] Recovered conversation saved`);
+            
+            return recovered;
+          }
+        }
+        
+        return null;
+      }
+    }
+    
+    // File is within limits, parse normally
+    return JSON.parse(content.trim()) as PersistedConversation;
+  } catch (err) {
+    console.error(`[persistence] Failed to load conversation for ${projectId}:`, err);
     return null;
   }
 }
 
 export function useSettingsPersistence() {
   const loadedRef = useRef(false);
+  const savingDisabled = useRef(true);
 
   // Load on mount
   useEffect(() => {
+    savingDisabled.current = true;
     loadSettings()
       .then(async (settings) => {
         const ws = useWorkspaceStore.getState();
@@ -94,8 +253,8 @@ export function useSettingsPersistence() {
           ws.setEditorFontSize(settings.editor_font_size);
         if (settings.font_weight) ws.setFontWeight(settings.font_weight);
         if (settings.keybindings)
-          ws.setKeybindingsRaw(settings.keybindings as any);
-        if (settings.theme) ws.setTheme(settings.theme as any);
+          ws.setKeybindingsRaw(settings.keybindings as Partial<Record<ActionId, KeyBinding>>);
+        if (settings.theme) ws.setTheme(settings.theme as Theme);
         if (settings.panel_width) ws.setControlPanelWidth(settings.panel_width);
         if (settings.completion_sound)
           ws.setCompletionSound(settings.completion_sound);
@@ -104,18 +263,17 @@ export function useSettingsPersistence() {
         const backend =
           (settings.punk_backend === "cli"
             ? "gemini-cli"
-            : settings.punk_backend) || "gemini-cli";
+            : settings.punk_backend) || "http";
         ws.setPunkBackend(backend);
 
         if (settings.http_provider) ws.setHttpProvider(settings.http_provider);
 
         // API keys & Base URLs
         const apiKeys: Record<string, string> = settings.http_api_keys || {};
-        if (
-          settings.http_api_key &&
-          !apiKeys[settings.http_provider || "deepseek"]
-        ) {
-          apiKeys[settings.http_provider || "deepseek"] = settings.http_api_key;
+        // Only use the legacy single key if the map doesn't already have one for that provider
+        const provider = settings.http_provider || "deepseek";
+        if (settings.http_api_key && !apiKeys[provider]) {
+          apiKeys[provider] = settings.http_api_key;
         }
         ws.setHttpApiKeys(apiKeys);
         ws.setHttpBaseUrls(settings.http_base_urls || {});
@@ -124,39 +282,66 @@ export function useSettingsPersistence() {
         if (settings.selected_model) {
           let model = settings.selected_model;
           if (model === "gemini-2.5-pro" || model === "gemini-1.5-pro-latest")
-            model = "gemini-3.1-pro";
+            model = "gemini-3.1-pro-preview";
           if (
             model === "gemini-2.5-flash" ||
             model === "gemini-1.5-flash-latest"
           )
-            model = "gemini-3.1-flash";
-          ws.setSelectedModel(model, false, ws.selectedModelProvider);
+            model = "gemini-3-flash-preview";
+
+          // Determine correct provider for the model
+          let provider =
+            settings.selected_model_provider || ws.selectedModelProvider;
+
+          // Validate that provider matches model
+          // Check if model belongs to a different provider than what's saved
+          for (const [prov, models] of Object.entries(PROVIDER_MODELS)) {
+            if (models.some((m: { value: string; label: string }) => m.value === model)) {
+              // Found the correct provider for this model
+              if (provider !== prov) {
+                console.warn(
+                  `[settings] Correcting provider mismatch: model "${model}" belongs to provider "${prov}" but settings has "${provider}"`,
+                );
+                provider = prov;
+              }
+              break;
+            }
+          }
+
+          ws.setSelectedModel(model, false, provider);
         }
 
         // 3. Routing Migration & Validation
-        const rawRouting = settings.intent_routing as any;
-        const healedRouting: Record<string, any> = JSON.parse(
+        const rawRouting = settings.intent_routing as unknown as BackendRouting | IntentRouting | null;
+        const healedRouting: BackendRouting = JSON.parse(
           JSON.stringify(DEFAULT_BACKEND_ROUTING),
         );
 
         if (rawRouting) {
           const isLegacyFlat =
-            rawRouting.plan &&
-            rawRouting.execute &&
-            !rawRouting["http"] &&
-            !rawRouting["gemini-cli"];
+            'plan' in rawRouting &&
+            'execute' in rawRouting &&
+            !('http' in rawRouting) &&
+            !('gemini-cli' in rawRouting);
 
           if (isLegacyFlat) {
             // Assign legacy settings to the active backend
-            healedRouting[backend] = { ...rawRouting };
+            // rawRouting is IntentRouting here, not BackendRouting
+            healedRouting[backend] = { 
+              plan: (rawRouting as IntentRouting).plan,
+              execute: (rawRouting as IntentRouting).execute,
+              explain: (rawRouting as IntentRouting).explain,
+              other: (rawRouting as IntentRouting).other,
+            };
           } else {
             // Merge existing backend maps into our canonical defaults
-            for (const key of Object.keys(rawRouting)) {
+            const backendRouting = rawRouting as BackendRouting;
+            for (const key of Object.keys(backendRouting)) {
               const normalizedKey = key === "cli" ? "gemini-cli" : key;
               if (healedRouting[normalizedKey]) {
                 healedRouting[normalizedKey] = {
                   ...healedRouting[normalizedKey],
-                  ...rawRouting[key],
+                  ...backendRouting[key],
                 };
               }
             }
@@ -167,9 +352,9 @@ export function useSettingsPersistence() {
             const r =
               healedRouting["gemini-cli"]?.[intent as keyof IntentRouting];
 
-            if (r.provider === "gemini" && !r.model.startsWith("auto-")) {
+            if (r && r.provider === "gemini" && !r.model.startsWith("auto-")) {
               if (r.model.includes("pro")) r.model = "auto-gemini-3";
-              else r.model = "auto-gemini-2.5";
+              else r.model = "auto-gemini-3";
             }
           });
         }
@@ -191,6 +376,7 @@ export function useSettingsPersistence() {
               const saved = await loadConversation(tentativeId).catch(
                 () => null,
               );
+              console.log(`[persistence] preloaded project ${tentativeId} from ${root}, hasSaved=${!!saved}, msgCount=${saved?.messages.length || 0}`);
               return { root, saved };
             }),
           );
@@ -198,12 +384,16 @@ export function useSettingsPersistence() {
           let activeId: string | null = null;
           const projectIds: string[] = [];
           for (const { root, saved } of preloaded) {
-            const id = addProject(root);
+            const tentativeId = precomputeProjectId(root);
+            const id = addProject(root); // Returns the actual ID used in the store
             projectIds.push(id);
             if (root === settings.active_project_root) activeId = id;
 
+            console.log(`[persistence] project ${root}: tentativeId=${tentativeId}, actualId=${id}, hasSaved=${!!saved}`);
+
+            const ps = useProjectsStore.getState();
             if (saved && saved.messages.length > 0) {
-              const ps = useProjectsStore.getState();
+              console.log(`[persistence] restoring conversation for ${id} (saved messages: ${saved.messages.length})`);
               ps.restoreConversation(id, saved.messages, saved.sessionId);
               if (saved.model) {
                 ps.setConversationModel(id, saved.model);
@@ -217,6 +407,11 @@ export function useSettingsPersistence() {
             }
           }
           if (activeId) setActiveProject(activeId);
+
+          // Mark all as restored AFTER the loops so usePunkWarmup can start safely
+          for (const id of projectIds) {
+            useProjectsStore.getState().setConversationRestored(id, true);
+          }
 
           const restoreProjectState = (idx: number) => {
             if (idx >= projectIds.length) return;
@@ -272,8 +467,9 @@ export function useSettingsPersistence() {
         }
 
         // 5. Cleanup and final signals
-        settingsLoaded = true;
+        settingsLoadedGlobal = true;
         loadedRef.current = true;
+        savingDisabled.current = false;
         resolveAppReady();
 
         brainGetProfile()
@@ -308,7 +504,7 @@ export function useSettingsPersistence() {
   // Save on changes
   useEffect(() => {
     const save = () => {
-      if (!settingsLoaded) return;
+      if (!settingsLoadedGlobal || savingDisabled.current) return;
 
       const ws = useWorkspaceStore.getState();
       const ps = useProjectsStore.getState();
@@ -345,13 +541,13 @@ export function useSettingsPersistence() {
         panel_width: ws.controlPanelWidth,
         completion_sound: ws.completionSound,
         selected_model: ws.selectedModel,
-        // selected_model_provider: ws.selectedModelProvider, // Removed - not part of UserSettings type
+        selected_model_provider: ws.selectedModelProvider,
 
         punk_backend: ws.punkBackend,
         http_provider: ws.httpProvider,
         http_api_keys: ws.httpApiKeys,
         http_base_urls: ws.httpBaseUrls,
-        intent_routing: ws.intentRouting as any,
+        intent_routing: ws.intentRouting as BackendRouting,
         intent_auto_route: ws.intentAutoRoute,
       }).catch((err) => console.error("[persistence] Save failed:", err));
     };
@@ -421,7 +617,7 @@ export function useSettingsPersistence() {
     });
 
     const unsubConversation = useProjectsStore.subscribe((state, prev) => {
-      if (!settingsLoaded) return;
+      if (!settingsLoadedGlobal) return;
       for (const id of state.projectOrder) {
         const p = state.projects.get(id);
         const pp = prev.projects.get(id);
@@ -454,7 +650,6 @@ export function useSettingsPersistence() {
       clearInterval(interval);
       if (debounceTimer) clearTimeout(debounceTimer);
       if (loadedRef.current) save();
-      settingsLoaded = false;
     };
   }, []);
 }

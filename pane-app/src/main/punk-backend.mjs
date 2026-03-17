@@ -1,4 +1,3 @@
-
 // PunkBackend base class - extracted to avoid circular dependencies
 // All backends (CLI, HTTP, future) must implement this contract.
 

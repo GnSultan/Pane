@@ -12,6 +12,22 @@
   --color-pane-status-renamed: var(--pane-status-renamed);
   --color-pane-status-untracked: var(--pane-status-untracked);
   --color-pane-error: var(--pane-error);
+  --color-pane-syn-structure: var(--pane-syn-structure);
+  --color-pane-syn-keyword: var(--pane-syn-keyword);
+  --color-pane-syn-data: var(--pane-syn-data);
+  --color-pane-syn-data: var(--pane-syn-data);
+  --color-pane-syn-data-number: var(--pane-syn-data-number);
+  --color-pane-syn-identity: var(--pane-syn-identity);
+  --color-pane-syn-function: var(--pane-syn-function);
+  --color-pane-syn-type: var(--pane-syn-type);
+  --color-pane-syn-comment: var(--pane-syn-comment);
+  --color-pane-syn-operator: var(--pane-syn-operator);
+  --color-pane-syn-property: var(--pane-syn-property);
+  --color-pane-syn-variable: var(--pane-syn-variable);
+  --color-pane-syn-tag: var(--pane-syn-tag);
+  --color-pane-syn-attribute: var(--pane-syn-attribute);
+  --color-pane-syn-string: var(--pane-syn-data);
+  --color-pane-syn-number: var(--pane-syn-data-number);
 
   --font-mono: "Geist Mono Variable", ui-monospace, monospace;
   --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -35,105 +51,107 @@
   --animate-dot-9: orbit-3 2.95s ease-in-out 0.15s infinite;
   --animate-dot-10: orbit-1 3.15s ease-in-out 0.25s infinite;
 
-  @keyframes fadeSlideUp {
-    from {
-      opacity: 0;
-      transform: translateY(4px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
+}
 
-  @keyframes fadeSlideDown {
-    from {
-      opacity: 0;
-      transform: translateY(-4px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
+/* Keyframe definitions - must be at global level, not inside @theme */
+@keyframes fadeSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
   }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 
-  @keyframes fadeIn {
-    from {
-      opacity: 0;
-    }
-    to {
-      opacity: 1;
-    }
+@keyframes fadeSlideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
   }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 
-  @keyframes fadeOut {
-    0% {
-      opacity: 1;
-    }
-    100% {
-      opacity: 0;
-    }
+@keyframes fadeIn {
+  from {
+    opacity: 0;
   }
+  to {
+    opacity: 1;
+  }
+}
 
-  @keyframes dot-pulse {
-    0%, 100% {
-      opacity: 0.25;
-      transform: scale(0.7);
-    }
-    50% {
-      opacity: 1;
-      transform: scale(1.3);
-    }
+@keyframes fadeOut {
+  0% {
+    opacity: 1;
   }
+  100% {
+    opacity: 0;
+  }
+}
 
-  @keyframes orbit-1 {
-    from { transform: rotate(0deg) translateX(7px) rotate(0deg) scale(0.7); opacity: 0.3; }
-    50% { transform: rotate(180deg) translateX(7px) rotate(-180deg) scale(1.2); opacity: 1; }
-    to { transform: rotate(360deg) translateX(7px) rotate(-360deg) scale(0.7); opacity: 0.3; }
+@keyframes dot-pulse {
+  0%, 100% {
+    opacity: 0.25;
+    transform: scale(0.7);
   }
-  @keyframes orbit-2 {
-    from { transform: rotate(0deg) translateX(6px) rotate(0deg) scale(0.8); opacity: 0.4; }
-    50% { transform: rotate(180deg) translateX(6px) rotate(-180deg) scale(1.1); opacity: 0.9; }
-    to { transform: rotate(360deg) translateX(6px) rotate(-360deg) scale(0.8); opacity: 0.4; }
+  50% {
+    opacity: 1;
+    transform: scale(1.3);
   }
-  @keyframes orbit-3 {
-    from { transform: rotate(0deg) translateX(8px) rotate(0deg) scale(0.75); opacity: 0.35; }
-    50% { transform: rotate(180deg) translateX(8px) rotate(-180deg) scale(1.15); opacity: 0.95; }
-    to { transform: rotate(360deg) translateX(8px) rotate(-360deg) scale(0.75); opacity: 0.35; }
-  }
+}
 
-  @keyframes pressScale {
-    0% {
-      transform: scale(1);
-    }
-    50% {
-      transform: scale(0.95);
-    }
-    100% {
-      transform: scale(1);
-    }
-  }
+@keyframes orbit-1 {
+  from { transform: rotate(0deg) translateX(7px) rotate(0deg) scale(0.7); opacity: 0.3; }
+  50% { transform: rotate(180deg) translateX(7px) rotate(-180deg) scale(1.2); opacity: 1; }
+  to { transform: rotate(360deg) translateX(7px) rotate(-360deg) scale(0.7); opacity: 0.3; }
+}
+@keyframes orbit-2 {
+  from { transform: rotate(0deg) translateX(6px) rotate(0deg) scale(0.8); opacity: 0.4; }
+  50% { transform: rotate(180deg) translateX(6px) rotate(-180deg) scale(1.1); opacity: 0.9; }
+  to { transform: rotate(360deg) translateX(6px) rotate(-360deg) scale(0.8); opacity: 0.4; }
+}
+@keyframes orbit-3 {
+  from { transform: rotate(0deg) translateX(8px) rotate(0deg) scale(0.75); opacity: 0.35; }
+  50% { transform: rotate(180deg) translateX(8px) rotate(-180deg) scale(1.15); opacity: 0.95; }
+  to { transform: rotate(360deg) translateX(8px) rotate(-360deg) scale(0.75); opacity: 0.35; }
+}
 
-  @keyframes circle-pulse {
-    0%, 100% {
-      opacity: 0.4;
-      --circle-stroke-width: 1.5;
-    }
-    50% {
-      opacity: 1;
-      --circle-stroke-width: 2;
-    }
+@keyframes pressScale {
+  0% {
+    transform: scale(1);
   }
+  50% {
+    transform: scale(0.95);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
 
-  @keyframes breathe {
-    0%, 100% {
-      opacity: 0.3;
-      transform: scale(0.95);
-    }
-    50% {
-      opacity: 0.8;
-      transform: scale(1.05);
-    }
+@keyframes circle-pulse {
+  0%, 100% {
+    opacity: 0.4;
+    --circle-stroke-width: 1.5;
+  }
+  50% {
+    opacity: 1;
+    --circle-stroke-width: 2;
+  }
+}
+
+@keyframes breathe {
+  0%, 100% {
+    opacity: 0.3;
+    transform: scale(0.95);
+  }
+  50% {
+    opacity: 0.8;
+    transform: scale(1.05);
   }
 }
 
@@ -158,6 +176,7 @@
 
   /* Semantic — muted, never alarming */
   --pane-status-added: #8A9A6C;
+  --pane-status-added-bg: rgba(138, 154, 108, 0.1);
   --pane-status-modified: #B8A56A;
   --pane-status-deleted: #A67272;
   --pane-status-renamed: #7E97AA;
@@ -184,17 +203,36 @@
   --pane-editor-search-match-border: rgba(184, 165, 106, 0.3);
   --pane-editor-search-match-active: rgba(184, 165, 106, 0.25);
   --pane-editor-search-match-active-border: rgba(184, 165, 106, 0.5);
-  /* Monochromatic syntax - warm grays with subtle amber accents */
-  --pane-syn-keyword: #A8A59E;
-  --pane-syn-string: #C9AE6E;
-  --pane-syn-number: #B8A56A;
+  /* Enhanced syntax palette - semantic distinction with high contrast */
+  /* Structure & Flow - blue-gray for control flow */
+  --pane-syn-structure: #7A8B9C;
+  --pane-syn-keyword: #7A8B9C;
+  --pane-syn-operator: #7A8B9C;
+  
+  /* Data & Literals - warm amber for values */
+  --pane-syn-data: #C9AE6E;
+  --pane-syn-data-number: #B8A56A;
+  
+  /* Identity & Names - use red accent for visual distinction */
+  --pane-syn-identity: var(--pane-status-deleted);
+  --pane-syn-property: var(--pane-status-deleted);
+  --pane-syn-variable: var(--pane-status-deleted);
+  
+  /* Functions - subtle accent */
+  --pane-syn-function: #9BA8B8;
+  
+  /* Types & Classes - distinguished blue-gray */
+  --pane-syn-type: #8A95A5;
+  
+  /* Comments - very muted */
   --pane-syn-comment: #5A5752;
-  --pane-syn-function: #C8C5BE;
-  --pane-syn-type: #9D9A93;
-  --pane-syn-operator: #8A877F;
-  --pane-syn-property: #C8C5BE;
-  --pane-syn-tag: #A8A59E;
+  
+  /* JSX/HTML specific - red accent for tags */
+  --pane-syn-tag: var(--pane-status-deleted);
   --pane-syn-attribute: #B8A56A;
+
+  /* Border softness - theme-specific */
+  --pane-border-soft: rgba(74, 71, 66, 0.4);  /* In dark theme, this is 40% of the dark border */
 }
 
 [data-theme="light"] {
@@ -211,6 +249,7 @@
 
   /* Semantic — light */
   --pane-status-added: #5B7040;
+  --pane-status-added-bg: rgba(91, 112, 64, 0.1);
   --pane-status-modified: #8A7530;
   --pane-status-deleted: #8C4A4A;
   --pane-status-renamed: #4A708A;
@@ -237,17 +276,36 @@
   --pane-editor-search-match-border: rgba(138, 111, 32, 0.25);
   --pane-editor-search-match-active: rgba(138, 111, 32, 0.20);
   --pane-editor-search-match-active-border: rgba(138, 111, 32, 0.4);
-  /* Monochromatic syntax - deep grays with rich amber accents */
-  --pane-syn-keyword: #5A5752;
-  --pane-syn-string: #8A6F20;
-  --pane-syn-number: #9A7F30;
+  /* Enhanced syntax palette - semantic distinction for light theme */
+  /* Structure & Flow - blue-gray for control flow */
+  --pane-syn-structure: #5A6B7C;
+  --pane-syn-keyword: #5A6B7C;
+  --pane-syn-operator: #5A6B7C;
+  
+  /* Data & Literals - rich amber for values */
+  --pane-syn-data: #8A6F20;
+  --pane-syn-data-number: #9A7F30;
+  
+  /* Identity & Names - use red accent for visual distinction */
+  --pane-syn-identity: var(--pane-status-deleted);
+  --pane-syn-property: var(--pane-status-deleted);
+  --pane-syn-variable: var(--pane-status-deleted);
+  
+  /* Functions - subtle blue accent */
+  --pane-syn-function: #4A5B6C;
+  
+  /* Types & Classes - distinguished blue-gray */
+  --pane-syn-type: #5A6A7A;
+  
+  /* Comments - muted */
   --pane-syn-comment: #A5A29A;
-  --pane-syn-function: #2C2B28;
-  --pane-syn-type: #6A6762;
-  --pane-syn-operator: #8A877F;
-  --pane-syn-property: #2C2B28;
+  
+  /* JSX/HTML specific */
   --pane-syn-tag: #5A5752;
   --pane-syn-attribute: #9A7F30;
+
+  /* Border softness - theme-specific */
+  --pane-border-soft: rgba(184, 182, 175, 0.5);  /* In light theme, this is 50% of the light border */
 }
 
 [data-theme="pure"] {
@@ -263,6 +321,7 @@
 
   /* Semantic — high contrast */
   --pane-status-added: #2D7A3A;
+  --pane-status-added-bg: rgba(45, 122, 58, 0.1);
   --pane-status-modified: #7A6520;
   --pane-status-deleted: #9A3333;
   --pane-status-renamed: #2A5A7A;
@@ -289,17 +348,36 @@
   --pane-editor-search-match-border: rgba(180, 150, 30, 0.30);
   --pane-editor-search-match-active: rgba(180, 150, 30, 0.22);
   --pane-editor-search-match-active-border: rgba(180, 150, 30, 0.45);
-  /* Monochromatic syntax - deeper grays, stronger amber */
-  --pane-syn-keyword: #4A4A4A;
-  --pane-syn-string: #7A5F10;
-  --pane-syn-number: #8A6F20;
-  --pane-syn-comment: #B0B0B0;
-  --pane-syn-function: #1A1A1A;
-  --pane-syn-type: #5A5A5A;
-  --pane-syn-operator: #808080;
-  --pane-syn-property: #1A1A1A;
+  /* Enhanced syntax palette - high contrast with semantic distinction */
+  /* Structure & Flow - blue-gray for control flow */
+  --pane-syn-structure: #4A5A6A;
+  --pane-syn-keyword: #4A5A6A;
+  --pane-syn-operator: #4A5A6A;
+  
+  /* Data & Literals - rich amber for values */
+  --pane-syn-data: #7A5F10;
+  --pane-syn-data-number: #8A6F20;
+  
+  /* Identity & Names - dark warm gray for readability */
+  --pane-syn-identity: #2C2B28;
+  --pane-syn-property: #2C2B28;
+  --pane-syn-variable: #2C2B28;
+  
+  /* Functions - dark blue accent */
+  --pane-syn-function: #3A4A5A;
+  
+  /* Types & Classes - blue-gray */
+  --pane-syn-type: #4A5A6A;
+  
+  /* Comments - medium gray for reduced glare */
+  --pane-syn-comment: #767676;
+  
+  /* JSX/HTML specific */
   --pane-syn-tag: #4A4A4A;
   --pane-syn-attribute: #8A6F20;
+
+  /* Border softness - theme-specific */
+  --pane-border-soft: rgba(192, 192, 192, 0.5);  /* In pure theme, this is 50% of the pure border */
 }
 
 html, body, #root {
@@ -311,6 +389,7 @@ html, body, #root {
   color: var(--pane-text);
   font-family: var(--font-sans);
   font-weight: var(--pane-font-weight);
+
 
 }
 
@@ -403,17 +482,17 @@ html, body, #root {
   background-color: var(--pane-editor-selection) !important;
 }
 
-/* Syntax highlighting - monochromatic with subtle amber accents */
+/* Enhanced syntax highlighting - semantic distinction */
 .ace_keyword {
-  color: var(--pane-syn-keyword) !important;
+  color: var(--pane-syn-structure) !important;
 }
 
 .ace_string {
-  color: var(--pane-syn-string) !important;
+  color: var(--pane-syn-data) !important;
 }
 
 .ace_constant.ace_numeric {
-  color: var(--pane-syn-number) !important;
+  color: var(--pane-syn-data-number) !important;
 }
 
 .ace_comment {
@@ -435,15 +514,80 @@ html, body, #root {
 }
 
 .ace_variable {
-  color: var(--pane-text) !important;
+  color: var(--pane-syn-identity) !important;
 }
 
 .ace_entity.ace_name.ace_tag {
-  color: var(--pane-syn-keyword) !important;
+  color: var(--pane-syn-tag) !important;
 }
 
 .ace_entity.ace_other.ace_attribute-name {
+  color: var(--pane-syn-attribute) !important;
+}
+
+/* JSX-specific tokens */
+.ace_jsx {
+  color: var(--pane-syn-identity) !important;
+}
+
+.ace_jsx .ace_tag {
+  color: var(--pane-syn-tag) !important;
+}
+
+.ace_jsx .ace_attribute-name {
+  color: var(--pane-syn-attribute) !important;
+}
+
+.ace_jsx .ace_string {
+  color: var(--pane-syn-string) !important;
+}
+
+/* Override textmate theme colors with Pane semantic colors */
+.ace-tm .ace_keyword,
+.ace-tm .ace_storage {
+  color: var(--pane-syn-structure) !important;
+}
+
+.ace-tm .ace_string {
+  color: var(--pane-syn-string) !important;
+}
+
+.ace-tm .ace_constant.ace_numeric {
+  color: var(--pane-syn-number) !important;
+}
+
+.ace-tm .ace_comment {
+  color: var(--pane-syn-comment) !important;
+  font-style: italic;
+}
+
+.ace-tm .ace_support.ace_function {
   color: var(--pane-syn-function) !important;
+}
+
+.ace-tm .ace_support.ace_type,
+.ace-tm .ace_support.ace_class {
+  color: var(--pane-syn-type) !important;
+}
+
+.ace-tm .ace_keyword.ace_operator {
+  color: var(--pane-syn-operator) !important;
+}
+
+.ace-tm .ace_variable {
+  color: var(--pane-syn-identity) !important;
+}
+
+.ace-tm .ace_entity.ace_name.ace_function {
+  color: var(--pane-syn-function) !important;
+}
+
+.ace-tm .ace_constant {
+  color: var(--pane-syn-number) !important;
+}
+
+.ace-tm .ace_support.ace_constant {
+  color: var(--pane-syn-number) !important;
 }
 
 .ace_search {
@@ -504,3 +648,5 @@ html, body, #root {
   color: var(--pane-syn-number) !important;
   background-color: transparent !important;
 }
+/* test comment */
+/* test comment 2 */

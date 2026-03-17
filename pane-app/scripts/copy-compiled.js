@@ -41,6 +41,14 @@ copyFileSync(
   `${projectRoot}/out/main/http-backend.mjs`,
 );
 copyFileSync(
+  `${projectRoot}/src/main/context-manager.mjs`,
+  `${projectRoot}/out/main/context-manager.mjs`,
+);
+copyFileSync(
+  `${projectRoot}/src/main/model-manager.mjs`,
+  `${projectRoot}/out/main/model-manager.mjs`,
+);
+copyFileSync(
   `${projectRoot}/src/main/classify-intent.mjs`,
   `${projectRoot}/out/main/classify-intent.mjs`,
 );

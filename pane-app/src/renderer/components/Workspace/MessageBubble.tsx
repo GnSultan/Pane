@@ -15,10 +15,6 @@ import { setRestoreInProgress } from "../../hooks/useFileWatcher";
 import { ToolActivity, ServerToolActivity } from "./ToolActivity";
 import { MarkdownText } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
-import {
-  // StreamingIndicator,
-  // CompactStreamingIndicator,
-} from "./StreamingIndicator";
 
 // No CSS containment — content-visibility: auto causes visible pop-in stutter
 // when messages scroll into view, which is worse than the layout cost it saves.
@@ -305,7 +301,7 @@ export function MessageBubble({
     return (
       <div className={`mb-10 group flex flex-col items-end ${animClass}`}>
         <div
-          className="px-5 py-4 rounded-2xl ring-1 ring-pane-border/40"
+          className="px-5 py-4 rounded-lg ring-1 ring-pane-border/40"
           style={{ maxWidth: "65ch" }}
         >
           <p
@@ -389,12 +385,12 @@ export function MessageBubble({
 
     return (
       <div
-        className={`group ${animClass} ${hasVisibleContent ? "mb-10" : "mb-1"} ${message.isStreaming ? "streaming-message" : ""}`}
+        className={`group ${animClass} ${hasVisibleContent ? "mb-12" : "mb-4"} ${message.isStreaming ? "streaming-message" : ""}`}
       >
         {groups.map((group, gi) => {
           if (group.type === "thinking") {
             return (
-              <div key={gi}>
+              <div key={gi} className="space-y-3">
                 {group.blocks.map((block, i) => (
                   <ThinkingBlockDisplay
                     key={i}

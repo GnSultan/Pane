@@ -2,7 +2,9 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { getGitLog, getGitStatus } from "../../lib/tauri-commands";
 import type { GitCommit, GitStatusInfo } from "../../lib/tauri-commands";
 
-const electronAPI = (window as any).electronAPI;
+import type { ElectronAPI } from '../../lib/electron';
+
+const electronAPI = window.electronAPI as ElectronAPI;
 
 interface GitStatusProps {
   root: string;
@@ -32,7 +34,7 @@ function CommitRow({ commit: c }: { commit: GitCommit }) {
 
   return (
     <div
-      className="flex items-baseline gap-2 py-0.5 px-3 hover:bg-pane-surface/50 cursor-default"
+      className="flex items-baseline gap-2 py-0.5 px-3 cursor-default"
       style={{ fontSize: "var(--pane-panel-font-size-sm)" }}
       onMouseEnter={() => setHovered(true)}
     >
@@ -224,7 +226,7 @@ export function GitStatus({ root }: GitStatusProps) {
             fileEntries.map(([path, statusCode]) => (
               <div
                 key={path}
-                className="flex items-baseline gap-2 px-3 py-0.5 hover:bg-pane-surface/50"
+                className="flex items-baseline gap-2 px-3 py-0.5"
                 style={{ fontSize: "var(--pane-panel-font-size-sm)" }}
               >
                 <span className="text-pane-accent-secondary shrink-0 w-6">

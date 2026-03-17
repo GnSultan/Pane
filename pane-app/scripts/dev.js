@@ -41,6 +41,14 @@ function copyCompiled() {
     `${projectRoot}/out/main/http-backend.mjs`,
   );
   copyFileSync(
+    `${projectRoot}/src/main/context-manager.mjs`,
+    `${projectRoot}/out/main/context-manager.mjs`,
+  );
+  copyFileSync(
+    `${projectRoot}/src/main/model-manager.mjs`,
+    `${projectRoot}/out/main/model-manager.mjs`,
+  );
+  copyFileSync(
     `${projectRoot}/src/main/classify-intent.mjs`,
     `${projectRoot}/out/main/classify-intent.mjs`,
   );
@@ -68,6 +76,7 @@ const vite = spawn("npx", ["electron-vite", "dev"], {
   cwd: projectRoot,
   stdio: "pipe",
   shell: true,
+  env: { ...process.env, ELECTRON_RENDERER_URL: process.env.ELECTRON_RENDERER_URL || "http://localhost:5173" },
 });
 
 let buildDetected = false;
@@ -164,6 +173,19 @@ watch(`${projectRoot}/src/main/http-backend.mjs`, () => {
       `${projectRoot}/out/main/http-backend.mjs`,
     );
     console.log("✓ http-backend.mjs copied");
+  } catch (err) {
+    console.error("Copy failed:", err.message);
+  }
+});
+
+watch(`${projectRoot}/src/main/model-manager.mjs`, () => {
+  console.log("🔄 model-manager.mjs changed, copying...");
+  try {
+    copyFileSync(
+      `${projectRoot}/src/main/model-manager.mjs`,
+      `${projectRoot}/out/main/model-manager.mjs`,
+    );
+    console.log("✓ model-manager.mjs copied");
   } catch (err) {
     console.error("Copy failed:", err.message);
   }

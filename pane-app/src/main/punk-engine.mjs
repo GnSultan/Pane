@@ -12,6 +12,7 @@ import { BrowserWindow, utilityProcess, ipcMain } from "electron";
 import { classifyIntent } from "./classify-intent.mjs";
 import { HttpBackend } from "./http-backend.mjs";
 import { PunkBackend } from "./punk-backend.mjs";
+import { modelManager } from "./model-manager.mjs";
 
 // Node.js globals for utility process
 const { AbortController, fetch, TextDecoder, setImmediate, console } =
@@ -36,11 +37,27 @@ const DEFAULT_INTENT_ROUTING = {
     explain: { provider: "anthropic", model: "sonnet", thinking: false },
     other: { provider: "anthropic", model: "sonnet", thinking: false },
   },
-  "http": {
-    plan: { provider: "deepseek", model: "deepseek-v3.2-speciale", thinking: false },
-    execute: { provider: "deepseek", model: "deepseek-v3.2", thinking: false },
-    explain: { provider: "deepseek", model: "deepseek-v3.2", thinking: false },
-    other: { provider: "deepseek", model: "deepseek-v3.2", thinking: false },
+  http: {
+    plan: {
+      provider: "openrouter",
+      model: "stepfun/step-3.5-flash:free",
+      thinking: true,
+    },
+    execute: {
+      provider: "openrouter",
+      model: "stepfun/step-3.5-flash:free",
+      thinking: true,
+    },
+    explain: {
+      provider: "openrouter",
+      model: "stepfun/step-3.5-flash:free",
+      thinking: true,
+    },
+    other: {
+      provider: "openrouter",
+      model: "stepfun/step-3.5-flash:free",
+      thinking: true,
+    },
   },
 };
 
@@ -61,6 +78,7 @@ const DEFAULT_INTENT_ROUTING = {
  * @property {boolean} [thinking]       - Whether to enable thinking/reasoning mode
  * @property {Array<any>} [history]      - Conversation history
  * @property {string|null} [profile]    - Future: explicit profile override
+ * @property {Array<{content: string, status: string, activeForm?: string}>} [todos] - Current todos from conversation state
  */
 
 /**
@@ -111,10 +129,14 @@ class CliBackend extends PunkBackend {
         `[punk] CLI worker for ${this.command} exited with code ${code}`,
       );
       for (const [requestId, projectId] of this.activeRequests.entries()) {
-        this.onEvent(projectId, {
-          event: "processEnded",
-          data: { exit_code: null },
-        }, requestId);
+        this.onEvent(
+          projectId,
+          {
+            event: "processEnded",
+            data: { exit_code: null },
+          },
+          requestId,
+        );
       }
       this.activeRequests.clear();
       this.worker = null;
@@ -137,6 +159,7 @@ class CliBackend extends PunkBackend {
       history: request.history,
       command: this.command,
       requestId: request.requestId,
+      todos: request.todos,
     });
   }
 
@@ -239,13 +262,13 @@ class PunkEngine {
       );
       const settings = JSON.parse(content);
       const backend = settings.punk_backend || "http";
-      
+
       if (settings.intent_routing && settings.intent_routing[backend]) {
         // Strict mapping: follow user settings for this SPECIFIC backend
         return settings.intent_routing[backend];
       }
     } catch {}
-    
+
     // Last-resort fallback to default mapping for the active backend
     const settings = await this.loadSettings();
     const backend = settings.punk_backend || "http";
@@ -268,7 +291,7 @@ class PunkEngine {
 
   handleBackendEvent(projectId, event, requestId) {
     const channel = `claude-stream:${projectId}`;
-    
+
     // Attach requestId to the event so the renderer can filter it
     const enrichedEvent = { ...event, requestId };
 
@@ -326,7 +349,8 @@ class PunkEngine {
     }
 
     const isHttp = this.backend instanceof HttpBackend;
-    const isGeminiCli = this.backend instanceof CliBackend && this.backend.command === "gemini";
+    const isGeminiCli =
+      this.backend instanceof CliBackend && this.backend.command === "gemini";
 
     if (isHttp || isGeminiCli) {
       const autoRoute = await this.loadIntentAutoRoute();
@@ -334,32 +358,54 @@ class PunkEngine {
       const intentRoute = routing[resolvedRequest.intent] || routing["execute"];
 
       if (autoRoute) {
-        // AUTO-ROUTE: Use the mapped intent from settings
+        // CASE 1: Smart Routing is enabled in settings. Use the intent map.
         resolvedRequest.provider = intentRoute.provider;
         resolvedRequest.model = intentRoute.model;
         resolvedRequest.thinking = intentRoute.thinking ?? false;
-      } else if (!resolvedRequest.model) {
-        // NO AUTO-ROUTE + NO EXPLICIT MODEL: Use the intent's default as fallback
+        console.log(
+          `[punk] smart-routing to: ${resolvedRequest.model} (provider=${resolvedRequest.provider}, thinking=${resolvedRequest.thinking})`,
+        );
+      } else if (resolvedRequest.model) {
+        // CASE 2: Smart Routing is OFF. Use the specific model sent by the UI.
+        console.log(
+          `[punk] using selected model: ${resolvedRequest.model} (provider=${resolvedRequest.provider}, thinking=${resolvedRequest.thinking})`,
+        );
+      } else {
+        // CASE 3: Fallback to intent default
         resolvedRequest.provider = intentRoute.provider;
         resolvedRequest.model = intentRoute.model;
         resolvedRequest.thinking = intentRoute.thinking ?? false;
-      } else if (!resolvedRequest.provider) {
-        // NO AUTO-ROUTE + HAS MODEL + NO PROVIDER: Infer provider from intent default
-        // (This handles legacy UI or edge cases)
-        resolvedRequest.provider = intentRoute.provider;
+        console.log(
+          `[punk] fallback to intent default: ${resolvedRequest.model}`,
+        );
       }
 
-      this.handleBackendEvent(request.projectId, {
-        event: "routing",
-        data: {
-          intent: resolvedRequest.intent,
-          confidence: classification.confidence,
-          reason: classification.reason,
-          provider: resolvedRequest.provider,
-          model: resolvedRequest.model,
-          thinking: resolvedRequest.thinking ?? false,
+      // FORCE OpenRouter for any model with a slash (e.g. xiaomi/mimo-v2-flash)
+      if (
+        resolvedRequest.model?.includes("/") &&
+        resolvedRequest.provider !== "openrouter"
+      ) {
+        console.log(
+          `[punk] forcing openrouter provider for model ${resolvedRequest.model}`,
+        );
+        resolvedRequest.provider = "openrouter";
+      }
+
+      this.handleBackendEvent(
+        request.projectId,
+        {
+          event: "routing",
+          data: {
+            intent: resolvedRequest.intent,
+            confidence: classification.confidence,
+            reason: classification.reason,
+            provider: resolvedRequest.provider,
+            model: resolvedRequest.model,
+            thinking: resolvedRequest.thinking ?? false,
+          },
         },
-      }, request.requestId);
+        request.requestId,
+      );
 
       console.log(
         `[punk] intent=${resolvedRequest.intent} (${(classification.confidence * 100).toFixed(0)}%) → ${resolvedRequest.provider}/${resolvedRequest.model}` +
@@ -368,7 +414,15 @@ class PunkEngine {
       );
     }
 
-    await this.backend.spawn(resolvedRequest);
+    try {
+      console.log(
+        `[punk] spawn attempt: ${resolvedRequest.provider}/${resolvedRequest.model} (thinking=${resolvedRequest.thinking})`,
+      );
+      await this.backend.spawn(resolvedRequest);
+    } catch (err) {
+      console.error(`[punk] spawn failed: ${err.message}`);
+      throw err;
+    }
   }
 
   async abort(projectId) {
@@ -382,6 +436,10 @@ class PunkEngine {
   async shutdown() {
     if (this.backend) await this.backend.shutdown();
   }
+
+  async getOpenRouterModels() {
+    return await modelManager.refreshModels("openrouter").then(() => modelManager.models["openrouter"] || []);
+  }
 }
 
 // ============================================================================
@@ -394,8 +452,19 @@ export async function registerPunkHandlers() {
   await punkEngine.initialize();
 
   ipcMain.handle("send_to_punk", async (_event, args) => {
-    const { projectId, prompt, workingDir, sessionId, model, intent, history, requestId, thinking, provider } =
-      args;
+    const {
+      projectId,
+      prompt,
+      workingDir,
+      sessionId,
+      model,
+      intent,
+      history,
+      requestId,
+      thinking,
+      provider,
+      todos,
+    } = args;
     await punkEngine.spawn({
       projectId,
       prompt,
@@ -407,6 +476,7 @@ export async function registerPunkHandlers() {
       requestId,
       thinking,
       provider,
+      todos,
     });
   });
 
@@ -420,6 +490,14 @@ export async function registerPunkHandlers() {
 
   ipcMain.handle("reinitialize_punk_backend", async (_event, args) => {
     await punkEngine.reinitialize(args?.backend);
+  });
+
+  ipcMain.handle("get_openrouter_models", async () => {
+    return await modelManager.models["openrouter"] || [];
+  });
+
+  ipcMain.handle("get_all_models", async () => {
+    return await modelManager.models;
   });
 }
 

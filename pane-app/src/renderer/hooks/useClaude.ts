@@ -1,6 +1,7 @@
 import { useCallback, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
+import type { Todo } from "../lib/claude-types";
 
 import {
   sendToPunk,
@@ -32,6 +33,7 @@ import {
   chooseModelForIntent,
   type AgentIntent,
 } from "../lib/agent-routing";
+import { getContextLimit } from "../lib/models";
 
 let messageIdCounter = 0;
 function nextMessageId(): string {
@@ -107,12 +109,17 @@ function scheduleToolJsonParse(projectId: string) {
         const msgs = project.conversation.messages;
         const last = msgs[msgs.length - 1];
         if (last && last.type === "assistant") {
-          const lastTool = [...last.content]
-            .reverse()
-            .find((b) => b.type === "tool_use") as ToolUseBlock | undefined;
-          if (lastTool?.name === "TodoWrite" && (parsed as any).todos) {
+          // Check all tools in the last message, not just the last tool
+          // This ensures we capture TodoWrite even if there are multiple tools
+          const toolUses = last.content.filter(
+            (b) => b.type === "tool_use"
+          ) as ToolUseBlock[];
+          
+          // Find the TodoWrite tool and extract todos from parsed input
+          const todoWriteTool = toolUses.find((t) => t.name === "TodoWrite");
+          if (todoWriteTool && Array.isArray(parsed.todos)) {
             state.pendingTodos = (
-              (parsed as any).todos as import("../lib/claude-types").Todo[]
+              parsed.todos as import("../lib/claude-types").Todo[]
             ).map((t) => ({ ...t }));
             if (!state.todosFlushRaf) {
               state.todosFlushRaf = requestAnimationFrame(() =>
@@ -138,7 +145,9 @@ function scheduleToolJsonParse(projectId: string) {
 function flushTodos(projectId: string) {
   const state = getStreamingState(projectId);
   if (state.pendingTodos) {
-    useProjectsStore.getState().setConversationTodos(projectId, state.pendingTodos);
+    useProjectsStore
+      .getState()
+      .setConversationTodos(projectId, state.pendingTodos);
     state.pendingTodos = null;
   }
   state.todosFlushRaf = 0;
@@ -151,16 +160,17 @@ function flushTextDelta(projectId: string) {
     // If the buffer is large, we speed up slightly, but we always keep it calm.
     const buffer = state.pendingTextDelta;
     const len = buffer.length;
-    
+
     // Release between 1 and 4 characters per frame depending on buffer size.
     // Capping at 4 ensures it never feels like a sudden jump.
-    const charsToRelease = Math.min(len, Math.max(1, Math.min(4, Math.floor(len / 8))));
+    const charsToRelease = Math.min(
+      len,
+      Math.max(1, Math.min(4, Math.floor(len / 8))),
+    );
     const toFlush = buffer.slice(0, charsToRelease);
     state.pendingTextDelta = buffer.slice(charsToRelease);
 
-    useProjectsStore
-      .getState()
-      .appendToLastAssistantText(projectId, toFlush);
+    useProjectsStore.getState().appendToLastAssistantText(projectId, toFlush);
   }
 
   if (state.pendingTextDelta) {
@@ -224,9 +234,12 @@ function flushThinkingDelta(projectId: string) {
   if (state.pendingThinkingDelta) {
     const buffer = state.pendingThinkingDelta;
     const len = buffer.length;
-    
+
     // Thinking can bleed a bit faster than text, but still capped for calmness.
-    const charsToRelease = Math.min(len, Math.max(1, Math.min(6, Math.floor(len / 6))));
+    const charsToRelease = Math.min(
+      len,
+      Math.max(1, Math.min(6, Math.floor(len / 6))),
+    );
     const toFlush = buffer.slice(0, charsToRelease);
     state.pendingThinkingDelta = buffer.slice(charsToRelease);
 
@@ -236,7 +249,9 @@ function flushThinkingDelta(projectId: string) {
   }
 
   if (state.pendingThinkingDelta) {
-    state.thinkingFlushRaf = requestAnimationFrame(() => flushThinkingDelta(projectId));
+    state.thinkingFlushRaf = requestAnimationFrame(() =>
+      flushThinkingDelta(projectId),
+    );
   } else {
     state.thinkingFlushRaf = 0;
   }
@@ -271,68 +286,6 @@ function fixPartialJson(s: string): string {
   if (inString) result += '"';
   while (stack.length) result += stack.pop();
   return result;
-}
-
-function buildContinuationBrief(projectId: string): string {
-  const project = useProjectsStore.getState().projects.get(projectId);
-  if (!project) return "Continue from where you left off.";
-
-  const { messages, todos, cachedBrief } = project.conversation;
-
-  const parts: string[] = [];
-
-  if (cachedBrief) {
-    parts.push(cachedBrief);
-    parts.push("");
-  }
-
-  parts.push("---");
-  parts.push(
-    "The previous session hit the context window limit. Continuing automatically.",
-  );
-  parts.push("");
-  parts.push("## Recent conversation");
-  parts.push("");
-
-  const convoMsgs = messages.filter(
-    (m) => m.type === "user" || m.type === "assistant",
-  );
-  const recent = convoMsgs.slice(-12);
-
-  for (const msg of recent) {
-    if (msg.type === "user") {
-      const text = msg.content
-        .filter((b): b is { type: "text"; text: string } => b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-        .trim();
-      if (text) parts.push(`**User:** ${text}`);
-    } else if (msg.type === "assistant") {
-      const text = msg.content
-        .filter((b): b is { type: "text"; text: string } => b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-        .trim();
-      if (text) {
-        const truncated = text.length > 600 ? text.slice(0, 600) + "…" : text;
-        parts.push(`**You (Claude):** ${truncated}`);
-      }
-    }
-  }
-
-  const activeTodos = todos.filter(
-    (t) => t.status === "in_progress" || t.status === "pending",
-  );
-  if (activeTodos.length > 0) {
-    parts.push("", "## Pending tasks");
-    for (const todo of activeTodos) {
-      const marker = todo.status === "in_progress" ? "→" : "·";
-      parts.push(`${marker} ${todo.content}`);
-    }
-  }
-
-  parts.push("", "Pick up exactly where you left off and continue the work.");
-  return parts.join("\n");
 }
 
 function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
@@ -485,7 +438,10 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
   return events;
 }
 
-function extractSessionDelta(messages: ConversationMessage[]) {
+function extractSessionDelta(
+  messages: ConversationMessage[],
+  todos: Todo[],
+) {
   const now = Date.now();
   const workingSet: { path: string; purpose?: string }[] = [];
   const decisions: { content: string }[] = [];
@@ -567,32 +523,18 @@ function extractSessionDelta(messages: ConversationMessage[]) {
     }
   }
 
-  if (!workingSet.length && !decisions.length && !recentActions.length)
+  if (
+    !workingSet.length &&
+    !decisions.length &&
+    !recentActions.length &&
+    !todos?.length
+  )
     return null;
-  return { workingSet, decisions, recentActions };
-}
-
-const MODEL_CONTEXT_LIMITS: Record<string, number> = {
-  opus: 200000,
-  sonnet: 200000,
-  haiku: 200000,
-  "gemini-3": 2000000,
-  "gemini-2": 1000000,
-};
-
-export function getContextLimit(model: string | null): number {
-  if (!model) return 200000;
-  const lower = model.toLowerCase();
-  for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
-    if (lower.includes(key)) return limit;
-  }
-  return 200000;
+  return { workingSet, decisions, recentActions, todos: todos || [] };
 }
 
 export function usePunk(projectId: string) {
   const abortingRef = useRef(false);
-  const continuationRef = useRef<string | null>(null);
-  const proactiveContinuationRef = useRef(false);
 
   const sendMessage = useCallback(
     async (prompt: string) => {
@@ -663,8 +605,6 @@ export function usePunk(projectId: string) {
           }
         }, 1500);
 
-        if (continuationRef.current) return;
-
         useWorkspaceStore.getState().playCompletionSound();
 
         if (s.activeProjectId !== projectId) {
@@ -713,18 +653,6 @@ export function usePunk(projectId: string) {
                 assistantMessageAdded,
               );
 
-              if (msg.type === "result") {
-                const proj = useProjectsStore
-                  .getState()
-                  .projects.get(projectId);
-                if (
-                  proj?.conversation.contextPressure === "high" &&
-                  !proactiveContinuationRef.current
-                ) {
-                  proactiveContinuationRef.current = true;
-                }
-              }
-
               if (msg.type === "result" && !resultSafetyTimer) {
                 resultSafetyTimer = setTimeout(() => {
                   console.warn(
@@ -764,6 +692,7 @@ export function usePunk(projectId: string) {
 
                 const sessionDelta = extractSessionDelta(
                   proj.conversation.messages,
+                  proj.conversation.todos,
                 );
                 if (sessionDelta) {
                   sessionMergeState(projectId, sessionDelta).catch(() => {});
@@ -772,36 +701,71 @@ export function usePunk(projectId: string) {
             } catch {
               // ignore
             }
-
-            if (proactiveContinuationRef.current && !continuationRef.current) {
-              proactiveContinuationRef.current = false;
-              const brief = buildContinuationBrief(projectId);
-              useProjectsStore.getState().clearConversation(projectId);
-              brainClearSessionPins(projectId).catch(() => {});
-              window.dispatchEvent(
-                new CustomEvent("pane:context-refreshed", {
-                  detail: { projectId },
-                }),
-              );
-              setTimeout(() => sendMessage(brief), 100);
-              return;
-            }
             break;
           }
 
           case "error": {
-            const isContextLimit =
-              /context window|context length|maximum context/i.test(
-                event.data.message,
-              );
-            if (isContextLimit) {
-              continuationRef.current = buildContinuationBrief(projectId);
-            } else {
-              const s = useProjectsStore.getState();
-              s.setConversationError(projectId, event.data.message);
-              s.setConversationProcessing(projectId, false);
-              s.setIsPlanning(projectId, false);
+            const s = useProjectsStore.getState();
+            s.setConversationError(projectId, event.data.message);
+            s.setConversationProcessing(projectId, false);
+            s.setIsPlanning(projectId, false);
+
+            // RETRY LOGIC: Restore the failed prompt to the InputBar
+            // We use a custom event that InputBar listens to
+            const retryEvt = new CustomEvent("pane:retry-prompt", {
+              detail: { projectId, prompt },
+            });
+            window.dispatchEvent(retryEvt);
+
+            // Also remove the failed user message from the history so it's not doubled on retry
+            const project = s.projects.get(projectId);
+            if (project) {
+              const msgs = project.conversation.messages;
+              const lastMsg = msgs[msgs.length - 1];
+              if (msgs.length > 0 && lastMsg && lastMsg.type === "user") {
+                s.removeLastConversationMessage(projectId);
+              }
             }
+            break;
+          }
+
+          case "compaction_start": {
+            console.log(
+              `[frontend] Starting conversation compaction: ${event.data.reason}`,
+            );
+            // Optional: Show a brief indicator in the UI
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              `Compressing conversation...`,
+            );
+            break;
+          }
+
+          case "compaction_complete": {
+            const { originalCount, compactedCount, tokensSaved, totalCompactions } = event.data;
+            console.log(
+              `[frontend] Compaction complete: ${originalCount} → ${compactedCount} messages, ` +
+              `${tokensSaved} tokens saved, total compactions: ${totalCompactions}`,
+            );
+            // Clear the compaction status message
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(projectId, null);
+            break;
+          }
+
+          case "todos_updated": {
+            const { todos } = event.data;
+            const s = useProjectsStore.getState();
+            s.setConversationTodos(projectId, todos);
+            break;
+          }
+
+          case "activeTask_updated": {
+            const { activeTask } = event.data;
+            // Update the status message with the active task
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(projectId, activeTask.description);
             break;
           }
         }
@@ -837,6 +801,7 @@ export function usePunk(projectId: string) {
         }, 5000);
 
         const truncatedHistory = conversation.messages.slice(-20);
+        const todos = conversation.todos;
 
         await sendToPunk(
           projectId,
@@ -849,19 +814,13 @@ export function usePunk(projectId: string) {
           truncatedHistory,
           selectedModelThinking,
           selectedModelProvider,
+          todos,
         );
       } catch (err) {
         console.error("[pane] sendToClaude error:", err);
         const errMsg = err instanceof Error ? err.message : String(err);
         store.setConversationError(projectId, errMsg);
         store.setConversationProcessing(projectId, false);
-      }
-
-      if (continuationRef.current) {
-        const brief = continuationRef.current;
-        continuationRef.current = null;
-        useProjectsStore.getState().clearConversation(projectId);
-        setTimeout(() => sendMessage(brief), 50);
       }
     },
     [projectId],
@@ -1001,9 +960,9 @@ function handleClaudeMessage(
     case "user": {
       const project = store.projects.get(projectId);
       const newContent = msg.message.content as ContentBlock[];
-      const newToolResult = newContent.find(
-        (b) => b.type === "tool_result",
-      ) as ToolResultBlock | undefined;
+      const newToolResult = newContent.find((b) => b.type === "tool_result") as
+        | ToolResultBlock
+        | undefined;
 
       if (project && newToolResult) {
         const msgs = project.conversation.messages;
@@ -1161,6 +1120,22 @@ function handleClaudeMessage(
           store.addConversationMessage(projectId, placeholder);
           return true;
         } else {
+          // Ensure there's a thinking block to append to
+          const project = store.projects.get(projectId);
+          if (project) {
+            const msgs = project.conversation.messages;
+            const last = msgs[msgs.length - 1];
+            if (last && last.type === "assistant") {
+              const blocks = [...last.content];
+              const lastBlock = blocks[blocks.length - 1];
+              if (!lastBlock || lastBlock.type !== "thinking") {
+                // Add a new thinking block if the last block isn't thinking
+                blocks.push({ type: "thinking", thinking: "" });
+                store.updateLastAssistantContent(projectId, blocks);
+              }
+            }
+          }
+          
           state.pendingThinkingDelta += evt.delta.thinking;
           if (!state.thinkingFlushRaf) {
             state.thinkingFlushRaf = requestAnimationFrame(() =>
@@ -1202,11 +1177,17 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              const newContent = [
-                ...last.content,
-                evt.content_block as ThinkingBlock,
-              ];
-              store.updateLastAssistantContent(projectId, newContent);
+              const blocks = [...last.content];
+              // Check if the last block is already a thinking block
+              const lastBlock = blocks[blocks.length - 1];
+              if (lastBlock && lastBlock.type === "thinking") {
+                // If so, reuse it instead of creating a new one
+                // This prevents multiple thinking blocks from being created
+              } else {
+                // Only add a new thinking block if the last one isn't already thinking
+                blocks.push(evt.content_block as ThinkingBlock);
+                store.updateLastAssistantContent(projectId, blocks);
+              }
             }
           }
         }

@@ -12,6 +12,7 @@ const { AbortController, fetch, TextDecoder, console } = globalThis;
 import { PunkBackend } from "./punk-backend.mjs";
 import { ToolExecutor } from "./tool-executor.mjs";
 import { compileContext, mergeState } from "./session-context.mjs";
+import contextManager from "./context-manager.mjs";
 
 // ============================================================================
 // HTTP Backend (Kimi/DeepSeek/Anthropic/etc.)
@@ -22,18 +23,47 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "run_shell_command",
-      description: "Execute a shell command in the project directory. Use this for building, testing, or verifying changes.",
+      description:
+        "Execute a shell command in the project directory. Use this for building, testing, or verifying changes.",
       parameters: {
         type: "object",
         properties: {
-          command: { type: "string", description: "The shell command to execute" },
-          description: { type: "string", description: "A brief description of the command's purpose" },
-          dir_path: { type: "string", description: "The directory to run the command in (defaults to project root)" },
-          is_background: { type: "boolean", description: "Set to true to run the command in the background" }
+          command: {
+            type: "string",
+            description: "The shell command to execute",
+          },
+          description: {
+            type: "string",
+            description: "A brief description of the command's purpose",
+          },
+          dir_path: {
+            type: "string",
+            description:
+              "The directory to run the command in (defaults to project root)",
+          },
+          is_background: {
+            type: "boolean",
+            description: "Set to true to run the command in the background",
+          },
         },
-        required: ["command"]
-      }
-    }
+        required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "evaluate_js",
+      description:
+        "Evaluate a JavaScript expression in the context of the backend. Use this for diagnostic tasks or testing internal logic.",
+      parameters: {
+        type: "object",
+        properties: {
+          code: { type: "string", description: "The JS code to evaluate" },
+        },
+        required: ["code"],
+      },
+    },
   },
   {
     type: "function",
@@ -44,45 +74,65 @@ const TOOL_DEFINITIONS = [
         type: "object",
         properties: {
           file_path: { type: "string", description: "Path to file" },
-          start_line: { type: "number", description: "Optional: 1-based line number to start reading from" },
-          end_line: { type: "number", description: "Optional: 1-based line number to end reading at" }
+          start_line: {
+            type: "number",
+            description: "Optional: 1-based line number to start reading from",
+          },
+          end_line: {
+            type: "number",
+            description: "Optional: 1-based line number to end reading at",
+          },
         },
-        required: ["file_path"]
-      }
-    }
+        required: ["file_path"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "write_file",
-      description: "Write the full contents to a file. Overwrites existing files.",
+      description:
+        "Write the full contents to a file. Overwrites existing files.",
       parameters: {
         type: "object",
         properties: {
           file_path: { type: "string", description: "Path to file" },
-          content: { type: "string", description: "The complete content to write" }
+          content: {
+            type: "string",
+            description: "The complete content to write",
+          },
         },
-        required: ["file_path", "content"]
-      }
-    }
+        required: ["file_path", "content"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "replace",
-      description: "Edit an existing file by replacing a block of lines with new content. Exact match for old_string is required.",
+      description:
+        "Edit an existing file by replacing a block of lines with new content. Exact match for old_string is required.",
       parameters: {
         type: "object",
         properties: {
           file_path: { type: "string", description: "Path to file" },
-          instruction: { type: "string", description: "A clear, semantic instruction for the code change" },
-          old_string: { type: "string", description: "Exact lines to be replaced (can be multiple lines)" },
+          instruction: {
+            type: "string",
+            description: "A clear, semantic instruction for the code change",
+          },
+          old_string: {
+            type: "string",
+            description: "Exact lines to be replaced (can be multiple lines)",
+          },
           new_string: { type: "string", description: "New lines to insert" },
-          allow_multiple: { type: "boolean", description: "If true, replace all occurrences of old_string" }
+          allow_multiple: {
+            type: "boolean",
+            description: "If true, replace all occurrences of old_string",
+          },
         },
-        required: ["file_path", "instruction", "old_string", "new_string"]
-      }
-    }
+        required: ["file_path", "instruction", "old_string", "new_string"],
+      },
+    },
   },
   {
     type: "function",
@@ -92,11 +142,11 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          dir_path: { type: "string", description: "Path to directory" }
+          dir_path: { type: "string", description: "Path to directory" },
         },
-        required: ["dir_path"]
-      }
-    }
+        required: ["dir_path"],
+      },
+    },
   },
   {
     type: "function",
@@ -106,12 +156,18 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          pattern: { type: "string", description: "The glob pattern to search for" },
-          dir_path: { type: "string", description: "Optional: The directory to search within" }
+          pattern: {
+            type: "string",
+            description: "The glob pattern to search for",
+          },
+          dir_path: {
+            type: "string",
+            description: "Optional: The directory to search within",
+          },
         },
-        required: ["pattern"]
-      }
-    }
+        required: ["pattern"],
+      },
+    },
   },
   {
     type: "function",
@@ -121,27 +177,39 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          pattern: { type: "string", description: "The regular expression pattern to search for" },
-          dir_path: { type: "string", description: "Optional: Directory or file to search (defaults to project root)" },
-          include_pattern: { type: "string", description: "Optional: Glob pattern to filter files (e.g., '*.ts')" }
+          pattern: {
+            type: "string",
+            description: "The regular expression pattern to search for",
+          },
+          dir_path: {
+            type: "string",
+            description:
+              "Optional: Directory or file to search (defaults to project root)",
+          },
+          include_pattern: {
+            type: "string",
+            description:
+              "Optional: Glob pattern to filter files (e.g., '*.ts')",
+          },
         },
-        required: ["pattern"]
-      }
-    }
+        required: ["pattern"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "google_web_search",
-      description: "Performs a grounded Google Search to find information across the internet.",
+      description:
+        "Performs a grounded Google Search to find information across the internet.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "The search query" }
+          query: { type: "string", description: "The search query" },
         },
-        required: ["query"]
-      }
-    }
+        required: ["query"],
+      },
+    },
   },
   {
     type: "function",
@@ -151,141 +219,174 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          prompt: { type: "string", description: "A string containing the URL(s) and specific analysis instructions" }
+          prompt: {
+            type: "string",
+            description:
+              "A string containing the URL(s) and specific analysis instructions",
+          },
         },
-        required: ["prompt"]
-      }
-    }
+        required: ["prompt"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_project_context",
-      description: "Get project name, root path, git branch, and top-level file list. Use this to orient yourself in the project.",
-      parameters: { type: "object", properties: {} }
-    }
+      description:
+        "Get project name, root path, git branch, and top-level file list. Use this to orient yourself in the project.",
+      parameters: { type: "object", properties: {} },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_open_files",
-      description: "Get the file currently open in Pane's editor, including its full content and recent file history.",
-      parameters: { type: "object", properties: {} }
-    }
+      description:
+        "Get the file currently open in Pane's editor, including its full content and recent file history.",
+      parameters: { type: "object", properties: {} },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_recent_terminal",
-      description: "Get recent terminal commands and their outputs from Pane's terminal.",
-      parameters: { type: "object", properties: {} }
-    }
+      description:
+        "Get recent terminal commands and their outputs from Pane's terminal.",
+      parameters: { type: "object", properties: {} },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_recall",
-      description: "Search project memory for past decisions, lessons, patterns, errors, and file edits from previous sessions.",
+      description:
+        "Search project memory for past decisions, lessons, patterns, errors, and file edits from previous sessions.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Search terms to filter memories. Leave empty for recent history." }
-        }
-      }
-    }
+          query: {
+            type: "string",
+            description:
+              "Search terms to filter memories. Leave empty for recent history.",
+          },
+        },
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_remember",
-      description: "Save something to project memory for future sessions — a decision, lesson, pattern, or important observation.",
+      description:
+        "Save something to project memory for future sessions — a decision, lesson, pattern, or important observation.",
       parameters: {
         type: "object",
         properties: {
           type: {
             type: "string",
             enum: ["decision", "lesson", "pattern", "error_fix"],
-            description: "Category of memory"
+            description: "Category of memory",
           },
-          content: { type: "string", description: "What to remember — be specific and include context" }
+          content: {
+            type: "string",
+            description: "What to remember — be specific and include context",
+          },
         },
-        required: ["type", "content"]
-      }
-    }
+        required: ["type", "content"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_recall_all",
-      description: "Search memory across ALL projects — find patterns, decisions, and lessons from other projects that may be relevant here.",
+      description:
+        "Search memory across ALL projects — find patterns, decisions, and lessons from other projects that may be relevant here.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Search terms to find across all projects." }
+          query: {
+            type: "string",
+            description: "Search terms to find across all projects.",
+          },
         },
-        required: ["query"]
-      }
-    }
+        required: ["query"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_brief",
-      description: "Read the project's accumulated memory brief — decisions, lessons, frequently modified files, and last session summary.",
-      parameters: { type: "object", properties: {} }
-    }
+      description:
+        "Read the project's accumulated memory brief — decisions, lessons, frequently modified files, and last session summary.",
+      parameters: { type: "object", properties: {} },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_checkpoints",
-      description: "List available file checkpoints for this project. Each checkpoint is a snapshot of file state before a Claude edit.",
-      parameters: { type: "object", properties: {} }
-    }
+      description:
+        "List available file checkpoints for this project. Each checkpoint is a snapshot of file state before a Claude edit.",
+      parameters: { type: "object", properties: {} },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_knowledge_graph",
-      description: "View the project's knowledge graph — nodes (decisions, patterns, lessons, errors) and their connections, including cross-project pattern links.",
-      parameters: { type: "object", properties: {} }
-    }
+      description:
+        "View the project's knowledge graph — nodes (decisions, patterns, lessons, errors) and their connections, including cross-project pattern links.",
+      parameters: { type: "object", properties: {} },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_cross_project",
-      description: "Find patterns, decisions, and lessons from OTHER projects that are relevant to the current work.",
+      description:
+        "Find patterns, decisions, and lessons from OTHER projects that are relevant to the current work.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "What to search for across other projects." }
+          query: {
+            type: "string",
+            description: "What to search for across other projects.",
+          },
         },
-        required: ["query"]
-      }
-    }
+        required: ["query"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_profile",
-      description: "View the user's profile — learned preferences, explicit rules, design philosophy, and known anti-patterns.",
-      parameters: { type: "object", properties: {} }
-    }
+      description:
+        "View the user's profile — learned preferences, explicit rules, design philosophy, and known anti-patterns.",
+      parameters: { type: "object", properties: {} },
+    },
   },
   {
     type: "function",
     function: {
       name: "pane_set_rule",
-      description: "Add an explicit rule to the user's profile. Rules override observed preferences.",
+      description:
+        "Add an explicit rule to the user's profile. Rules override observed preferences.",
       parameters: {
         type: "object",
         properties: {
-          rule: { type: "string", description: "The rule to add, e.g. 'always use bun instead of npm' or 'never auto-commit'" }
+          rule: {
+            type: "string",
+            description:
+              "The rule to add, e.g. 'always use bun instead of npm' or 'never auto-commit'",
+          },
         },
-        required: ["rule"]
-      }
-    }
+        required: ["rule"],
+      },
+    },
   },
   {
     type: "function",
@@ -295,17 +396,21 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          philosophy: { type: "string", description: "The full design philosophy text (replaces existing)" }
+          philosophy: {
+            type: "string",
+            description: "The full design philosophy text (replaces existing)",
+          },
         },
-        required: ["philosophy"]
-      }
-    }
+        required: ["philosophy"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "TodoWrite",
-      description: "Update the project's TODO list. Use this to track progress and plan future steps.",
+      description:
+        "Update the project's TODO list. Use this to track progress and plan future steps.",
       parameters: {
         type: "object",
         properties: {
@@ -314,108 +419,144 @@ const TOOL_DEFINITIONS = [
             items: {
               type: "object",
               properties: {
-                content: { type: "string", description: "The task description" },
-                status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "Current status" },
-                activeForm: { type: "string", description: "Optional: A shorter 'ing' form for the status bar (e.g. 'writing tests')" }
+                content: {
+                  type: "string",
+                  description: "The task description",
+                },
+                status: {
+                  type: "string",
+                  enum: ["pending", "in_progress", "completed"],
+                  description: "Current status",
+                },
+                activeForm: {
+                  type: "string",
+                  description:
+                    "Optional: A shorter 'ing' form for the status bar (e.g. 'writing tests')",
+                },
               },
-              required: ["content", "status"]
-            }
-          }
+              required: ["content", "status"],
+            },
+          },
         },
-        required: ["todos"]
-      }
-    }
+        required: ["todos"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "Task",
-      description: "Set the active task that you are currently working on. This is displayed in the Pane status bar.",
+      description:
+        "Set the active task that you are currently working on. This is displayed in the Pane status bar.",
       parameters: {
         type: "object",
         properties: {
-          task: { type: "string", description: "The task description (e.g. 'Fixing login bug')" }
+          task: {
+            type: "string",
+            description: "The task description (e.g. 'Fixing login bug')",
+          },
         },
-        required: ["task"]
-      }
-    }
+        required: ["task"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "activate_skill",
-      description: "Activates a specialized agent skill by name. Returns the skill's instructions.",
+      description:
+        "Activates a specialized agent skill by name. Returns the skill's instructions.",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "The name of the skill to activate" }
+          name: {
+            type: "string",
+            description: "The name of the skill to activate",
+          },
         },
-        required: ["name"]
-      }
-    }
+        required: ["name"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "save_memory",
-      description: "Persists global preferences or facts across ALL future sessions. Use this for recurring instructions like coding styles or personal facts. Do NOT use for session-specific context.",
+      description:
+        "Persists global preferences or facts across ALL future sessions. Use this for recurring instructions like coding styles or personal facts. Do NOT use for session-specific context.",
       parameters: {
         type: "object",
         properties: {
-          fact: { type: "string", description: "A concise, global fact or preference (e.g., 'I prefer using tabs')" }
+          fact: {
+            type: "string",
+            description:
+              "A concise, global fact or preference (e.g., 'I prefer using tabs')",
+          },
         },
-        required: ["fact"]
-      }
-    }
+        required: ["fact"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "codebase_investigator",
-      description: "Delegate complex codebase analysis, architectural mapping, or bug root-cause investigation to a specialized sub-agent.",
+      description:
+        "Delegate complex codebase analysis, architectural mapping, or bug root-cause investigation to a specialized sub-agent.",
       parameters: {
         type: "object",
         properties: {
-          objective: { type: "string", description: "A comprehensive description of the research goal" }
+          objective: {
+            type: "string",
+            description: "A comprehensive description of the research goal",
+          },
         },
-        required: ["objective"]
-      }
-    }
+        required: ["objective"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "generalist",
-      description: "Delegate repetitive batch tasks or high-volume data processing to a general-purpose sub-agent.",
+      description:
+        "Delegate repetitive batch tasks or high-volume data processing to a general-purpose sub-agent.",
       parameters: {
         type: "object",
         properties: {
-          request: { type: "string", description: "The task or question for the generalist agent" }
+          request: {
+            type: "string",
+            description: "The task or question for the generalist agent",
+          },
         },
-        required: ["request"]
-      }
-    }
+        required: ["request"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "cli_help",
-      description: "Answers questions about Gemini CLI features, documentation, and configuration.",
+      description:
+        "Answers questions about Gemini CLI features, documentation, and configuration.",
       parameters: {
         type: "object",
         properties: {
-          question: { type: "string", description: "The question about Gemini CLI" }
+          question: {
+            type: "string",
+            description: "The question about Gemini CLI",
+          },
         },
-        required: ["question"]
-      }
-    }
-  }
+        required: ["question"],
+      },
+    },
+  },
 ];
 
-const ANTHROPIC_TOOLS = TOOL_DEFINITIONS.map(td => ({
+const ANTHROPIC_TOOLS = TOOL_DEFINITIONS.map((td) => ({
   name: td.function.name,
   description: td.function.description,
-  input_schema: td.function.parameters
+  input_schema: td.function.parameters,
 }));
 
 export class HttpBackend extends PunkBackend {
@@ -466,6 +607,9 @@ export class HttpBackend extends PunkBackend {
         baseUrl = settings.http_base_url;
       }
 
+      console.log(
+        `[http] getApiConfig: provider=${provider}, hasKey=${!!apiKey}, baseUrl=${baseUrl}`,
+      );
       return { provider, apiKey, baseUrl };
     } catch {
       return {
@@ -488,11 +632,26 @@ export class HttpBackend extends PunkBackend {
   normalizeMessages(messages, provider) {
     const isAnthropic = provider === "anthropic";
     const isGemini = provider === "gemini";
-    const isOpenAI = provider === "deepseek" || provider === "kimi";
+    const isOpenAI =
+      provider === "deepseek" ||
+      provider === "kimi" ||
+      provider === "openrouter";
+
+    const preFiltered = [];
+    // COLLAPSE CONSECUTIVE USER MESSAGES (Retry inflation fix)
+    for (const msg of messages) {
+      const last = preFiltered[preFiltered.length - 1];
+      if (msg.role === "user" && last?.role === "user") {
+        preFiltered[preFiltered.length - 1] = msg; // Keep the newest one
+      } else {
+        preFiltered.push(msg);
+      }
+    }
 
     const normalized = [];
+    const pendingToolCallIds = new Set();
 
-    for (const msg of messages) {
+    for (const msg of preFiltered) {
       const { role, content } = msg;
 
       if (role === "system") {
@@ -500,156 +659,139 @@ export class HttpBackend extends PunkBackend {
         continue;
       }
 
+      // --- 1. HANDLE ASSISTANT MESSAGES ---
+      if (role === "assistant") {
+        if (typeof content === "string") {
+          normalized.push(msg);
+        } else if (Array.isArray(content)) {
+          if (isOpenAI) {
+            const text = content
+              .filter((c) => c.type === "text")
+              .map((c) => c.text)
+              .join("\n");
+            const toolUses = content.filter((c) => c.type === "tool_use");
+            const assistantMsg = { role: "assistant", content: text || "" };
+
+            if (toolUses.length > 0 || msg.tool_calls) {
+              const calls =
+                msg.tool_calls ||
+                toolUses.map((tu) => ({
+                  id: tu.id,
+                  type: "function",
+                  function: {
+                    name: tu.name,
+                    arguments:
+                      typeof tu.input === "string"
+                        ? tu.input
+                        : JSON.stringify(tu.input),
+                  },
+                }));
+              assistantMsg.tool_calls = calls;
+              calls.forEach((tc) => pendingToolCallIds.add(tc.id));
+            }
+            normalized.push(assistantMsg);
+          } else {
+            normalized.push(msg);
+          }
+        }
+        continue;
+      }
+
+      // --- 2. HANDLE TOOL RESULTS (Strict Sequence Check) ---
+      if (
+        role === "tool" ||
+        (role === "user" &&
+          Array.isArray(content) &&
+          content.some((c) => c.type === "tool_result"))
+      ) {
+        const results = [];
+        if (role === "tool" && !Array.isArray(content)) {
+          results.push(msg);
+        } else if (Array.isArray(content)) {
+          content.forEach((c) => {
+            if (c.type === "tool_result") {
+              results.push({
+                role: "tool",
+                tool_call_id: c.tool_use_id,
+                name: c.name,
+                content:
+                  typeof c.content === "string"
+                    ? c.content
+                    : JSON.stringify(c.content),
+                is_error: c.is_error,
+              });
+            }
+          });
+        }
+
+        if (isOpenAI) {
+          // OpenAI: MUST be individual messages with 'tool' role
+          // and MUST follow assistant tool_calls
+          for (const res of results) {
+            if (pendingToolCallIds.has(res.tool_call_id)) {
+              normalized.push(res);
+              pendingToolCallIds.delete(res.tool_call_id);
+            } else {
+              console.warn(
+                `[http] Pruning orphaned tool result for ${res.tool_call_id}`,
+              );
+            }
+          }
+        } else {
+          normalized.push(msg);
+        }
+        continue;
+      }
+
+      // --- 3. HANDLE USER MESSAGES ---
       if (role === "user") {
         if (typeof content === "string") {
           normalized.push(msg);
-          continue;
-        }
-
-        if (Array.isArray(content)) {
-          // Canonical content is an array of text, tool_result, etc.
-          const textBlocks = content.filter(c => c.type === "text").map(c => c.text).join("\n");
-          const toolResults = content.filter(c => c.type === "tool_result");
-
+        } else if (Array.isArray(content)) {
+          const text = content
+            .filter((c) => c.type === "text")
+            .map((c) => c.text)
+            .join("\n");
           if (isOpenAI) {
-            // OpenAI: tool results must be separate messages with role: "tool"
-            // If there's text, send it as a user message first (or combine)
-            if (textBlocks) {
-              normalized.push({ role: "user", content: textBlocks });
-            }
-            for (const tr of toolResults) {
-              normalized.push({
-                role: "tool",
-                tool_call_id: tr.tool_use_id,
-                content: tr.content
-              });
-            }
-          } else if (isGemini) {
-            // Gemini: tool results MUST immediately follow the model message with tool calls.
-            // All tool results for the same model turn must be in ONE message.
-            if (toolResults.length > 0) {
-              normalized.push({
-                role: "tool",
-                tool_results: toolResults.map(tr => ({
-                  name: tr.name,
-                  content: tr.content,
-                  is_error: tr.is_error
-                }))
-              });
-            }
-            if (textBlocks) {
-              normalized.push({ role: "user", content: textBlocks });
-            }
-          } else if (isAnthropic) {
-            // Anthropic: can handle text and tool_results in the same user message
-            normalized.push({
-              role: "user",
-              content: content.map(c => {
-                if (c.type === "text") return { type: "text", text: c.text };
-                if (c.type === "tool_result") {
-                  return {
-                    type: "tool_result",
-                    tool_use_id: c.tool_use_id,
-                    content: c.content,
-                    is_error: c.is_error
-                  };
-                }
-                return c;
-              })
-            });
+            if (text) normalized.push({ role: "user", content: text });
           } else {
-            // Default (Gemini or others)
-            normalized.push({ role: "user", content: textBlocks || "(tool results)" });
+            normalized.push(msg);
           }
         }
-      } else if (role === "assistant") {
-        if (typeof content === "string") {
-          normalized.push(msg);
-          continue;
-        }
+        continue;
+      }
+    }
 
-        if (Array.isArray(content)) {
-          const textBlocks = content.filter(c => c.type === "text").map(c => c.text).join("\n");
-          const thinkingBlocks = content.filter(c => c.type === "thinking").map(c => c.thinking).join("\n");
-          const toolUses = content.filter(c => c.type === "tool_use");
-
-          if (isOpenAI) {
-            const assistantMsg = { role: "assistant", content: textBlocks || null };
-            if (toolUses.length > 0) {
-              assistantMsg.tool_calls = toolUses.map(tu => ({
-                id: tu.id,
-                type: "function",
-                function: {
-                  name: tu.name,
-                  arguments: typeof tu.input === "string" ? tu.input : JSON.stringify(tu.input)
-                }
-              }));
-            }
-            normalized.push(assistantMsg);
-          } else if (isGemini) {
-            const assistantMsg = { role: "assistant", content: textBlocks || null, thinking: thinkingBlocks || null };
-            if (toolUses.length > 0) {
-              assistantMsg.tool_calls = toolUses.map(tu => ({
-                id: tu.id,
-                name: tu.name,
-                input: tu.input
-              }));
-            }
-            normalized.push(assistantMsg);
-          } else if (isAnthropic) {
-            const anthropicContent = [];
-            if (thinkingBlocks) anthropicContent.push({ type: "thinking", thinking: thinkingBlocks });
-            if (textBlocks) anthropicContent.push({ type: "text", text: textBlocks });
-            for (const tu of toolUses) {
-              anthropicContent.push({
-                type: "tool_use",
-                id: tu.id,
-                name: tu.name,
-                input: tu.input
-              });
-            }
-            normalized.push({ role: "assistant", content: anthropicContent });
-          } else {
-            normalized.push({ role: "assistant", content: textBlocks });
-          }
-        }
-      } else if (role === "tool" && isOpenAI) {
-        normalized.push(msg);
+    // --- 4. AUTO-HEAL: Close orphaned tool calls ---
+    if (isOpenAI && pendingToolCallIds.size > 0) {
+      console.warn(
+        `[http] history sequence error: ${pendingToolCallIds.size} tool calls missing results. Healing...`,
+      );
+      for (const id of pendingToolCallIds) {
+        normalized.push({
+          role: "tool",
+          tool_call_id: id,
+          content:
+            "Error: Turn was interrupted before tool result could be processed.",
+          is_error: true,
+        });
       }
     }
 
     return normalized;
   }
 
-  getHistoryPreamble(history) {
-    if (!history || history.length === 0) return "";
-
-    const turns = history
-      .filter((m) => m.type === "user" || m.type === "assistant")
-      .slice(-10);
-    
-    if (turns.length === 0) return "";
-
-    const lines = ["## Previous conversation\n"];
-    for (const msg of turns) {
-      const text = msg.content
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join("\n");
-      if (!text) continue;
-      const role = msg.type === "user" ? "User" : "Assistant";
-      const capped = text.length > 600 ? text.slice(0, 600) + "…" : text;
-      lines.push(`${role}: ${capped}`);
-    }
-    lines.push("\n---\n");
-    return lines.join("\n");
-  }
-
   async getGitStatus(workingDir) {
     try {
-      const { stdout: branchOut } = await execAsync("git symbolic-ref --short HEAD || git rev-parse --abbrev-ref HEAD", { cwd: workingDir });
+      const { stdout: branchOut } = await execAsync(
+        "git symbolic-ref --short HEAD || git rev-parse --abbrev-ref HEAD",
+        { cwd: workingDir },
+      );
       const branch = branchOut.trim();
-      const { stdout: statusOut } = await execAsync("git status --porcelain=v1 -unormal", { cwd: workingDir });
+      const { stdout: statusOut } = await execAsync(
+        "git status --porcelain=v1 -unormal",
+        { cwd: workingDir },
+      );
       return { branch, summary: statusOut.trim() || "(clean)" };
     } catch {
       return null;
@@ -660,47 +802,59 @@ export class HttpBackend extends PunkBackend {
     const abortController = new AbortController();
     this.activeRequests.set(request.projectId, abortController);
 
-    this.onEvent(request.projectId, { event: "processStarted", data: null }, request.requestId);
+    this.onEvent(
+      request.projectId,
+      { event: "processStarted", data: null },
+      request.requestId,
+    );
 
     try {
       const apiConfig = await this.getApiConfig(request.provider || null);
+      console.log(
+        `[http] spawn: request.provider=${request.provider}, resolved.provider=${apiConfig.provider}, model=${request.model}, hasKey=${!!apiConfig.apiKey}, prefix=${apiConfig.apiKey?.slice(0, 10)}`,
+      );
       this.validateApiConfig(apiConfig);
 
       const gitStatus = await this.getGitStatus(request.workingDir);
 
       const historyLength = request.history ? request.history.length : 0;
-      
+
       // Update session state before compileContext
-      mergeState(request.projectId, {
+      const stateUpdate = {
         lastProvider: apiConfig.provider,
         lastIntent: request.intent,
-        turnCount: (historyLength / 2) + 1,
-        gitStatus
-      });
+        turnCount: historyLength / 2 + 1,
+        gitStatus,
+      };
+      if (request.todos) {
+        stateUpdate.todos = request.todos;
+      }
+      mergeState(request.projectId, stateUpdate);
 
-      const context = compileContext(request.projectId, request.intent, historyLength);
+      const context = compileContext(
+        request.projectId,
+        request.intent,
+        historyLength,
+      );
       let systemPrompt = context.full;
 
-      if (apiConfig.provider === "gemini") {
-        const preamble = this.getHistoryPreamble(request.history);
-        if (preamble) {
-          systemPrompt = `${systemPrompt}\n\n${preamble}`;
-        }
-      }
-
       // Emit synthetic init event after config is validated
-      this.onEvent(request.projectId, {
-        event: "message",
-        data: {
-          parsed: {
-            type: "system",
-            subtype: "init",
-            session_id: request.sessionId || `http-${Date.now()}`,
-            tools: TOOL_DEFINITIONS,
-            model: request.model || this.getDefaultModel(apiConfig.provider),
+      this.onEvent(
+        request.projectId,
+        {
+          event: "message",
+          data: {
+            parsed: {
+              type: "system",
+              subtype: "init",
+              session_id: request.sessionId || `http-${Date.now()}`,
+              tools: TOOL_DEFINITIONS,
+              model: request.model || this.getDefaultModel(apiConfig.provider),
+            },
           },
         },
-      }, request.requestId);
+        request.requestId,
+      );
 
       const messages = [{ role: "system", content: systemPrompt }];
 
@@ -709,24 +863,79 @@ export class HttpBackend extends PunkBackend {
           if (msg.type === "user") {
             messages.push({
               role: "user",
-              content: msg.content
+              content: msg.content,
             });
           } else if (msg.type === "assistant") {
             messages.push({ role: "assistant", content: msg.content });
+          } else if (msg.type === "system") {
+            // In Pane history, 'system' role is used for tool results (from local workers)
+            messages.push({ role: "tool", content: msg.content });
           }
         }
       }
 
-      messages.push({ role: "user", content: [{ type: "text", text: request.prompt }] });
+      console.log(
+        `[http] Loaded ${messages.length} messages from history (roles: ${messages.map((m) => m.role).join(", ")})`,
+      );
+
+      // Auto-compact conversation if context pressure is high
+      const compactionCheck = contextManager.shouldAutoCompact(messages, request.model);
+      if (compactionCheck.shouldCompact) {
+        console.log(
+          `[http] Auto-compacting conversation: ${compactionCheck.reason}, strategy: ${compactionCheck.strategy}`
+        );
+        
+        // Notify frontend that compaction is starting
+        this.onEvent(request.projectId, {
+          event: "compaction_start",
+          data: {
+            reason: compactionCheck.reason,
+            strategy: compactionCheck.strategy,
+          },
+        });
+        
+        const compactedMessages = await contextManager.compactConversation(
+          messages,
+          request.model,
+          compactionCheck.strategy
+        );
+        
+        const stats = contextManager.getStats();
+        console.log(
+          `[http] Compaction result: ${messages.length} → ${compactedMessages.length} messages ` +
+          `(saved ~${stats.tokensSaved} tokens, total compactions: ${stats.totalCompactions})`
+        );
+        
+        // Send compaction completion event
+        this.onEvent(request.projectId, {
+          event: "compaction_complete",
+          data: {
+            originalCount: messages.length,
+            compactedCount: compactedMessages.length,
+            tokensSaved: stats.tokensSaved,
+            totalCompactions: stats.totalCompactions,
+          },
+        });
+        
+        // Replace messages with compacted version
+        messages.splice(0, messages.length, ...compactedMessages);
+      }
+
+      messages.push({
+        role: "user",
+        content: [{ type: "text", text: request.prompt }],
+      });
 
       let turn = 0;
-      const maxTurns = 10;
+      const maxTurns = 100;
 
       while (turn < maxTurns) {
         turn++;
+
         const state = {
           accumulated: "",
           toolUses: new Map(),
+          finishReason: null,
         };
         this.requestStates.set(request.projectId, state);
 
@@ -737,7 +946,15 @@ export class HttpBackend extends PunkBackend {
           max_tokens: 4096,
         };
 
-        if (apiConfig.provider === "deepseek" || apiConfig.provider === "kimi") {
+        if (apiConfig.provider === "openrouter") {
+          body.repetition_penalty = 1.1;
+        }
+
+        if (
+          apiConfig.provider === "deepseek" ||
+          apiConfig.provider === "kimi" ||
+          apiConfig.provider === "openrouter"
+        ) {
           body.tools = TOOL_DEFINITIONS;
         } else if (apiConfig.provider === "anthropic") {
           body.tools = ANTHROPIC_TOOLS;
@@ -748,19 +965,69 @@ export class HttpBackend extends PunkBackend {
           body.max_tokens = 8192;
         }
 
-        const { url, headers, finalBody } = this.prepareRequest(apiConfig, body, request);
+        if (request.thinking && apiConfig.provider === "openrouter") {
+          // OpenRouter standard reasoning toggle
+          body.include_reasoning = true;
+        }
 
-        const response = await fetch(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(finalBody || body),
-          signal: abortController.signal,
-        });
+        const { url, headers, finalBody } = this.prepareRequest(
+          apiConfig,
+          body,
+          request,
+        );
+
+        // --- RETRY LOOP FOR TRANSIENT ERRORS ---
+        let response;
+        let attempt = 0;
+        const maxAttempts = 3;
+
+        while (attempt <= maxAttempts) {
+          try {
+            response = await fetch(url, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(finalBody || body),
+              signal: abortController.signal,
+            });
+
+            // If it's a transient error (5xx or 429), retry
+            if (
+              !response.ok &&
+              (response.status >= 500 || response.status === 429) &&
+              attempt < maxAttempts
+            ) {
+              const delay = Math.pow(2, attempt) * 1000;
+              console.warn(
+                `[http] Transient error ${response.status}. Retrying in ${delay}ms (Attempt ${attempt + 1}/${maxAttempts})...`,
+              );
+              await new Promise((resolve) => setTimeout(resolve, delay));
+              attempt++;
+              continue;
+            }
+
+            // Not a transient error, or we're out of attempts
+            break;
+          } catch (err) {
+            if (err.name === "AbortError") throw err;
+            if (attempt < maxAttempts) {
+              const delay = Math.pow(2, attempt) * 1000;
+              console.warn(
+                `[http] Fetch failed: ${err.message}. Retrying in ${delay}ms...`,
+              );
+              await new Promise((resolve) => setTimeout(resolve, delay));
+              attempt++;
+              continue;
+            }
+            throw err;
+          }
+        }
+        // --- END RETRY LOOP ---
 
         if (!response.ok) {
           const errorText = await response
             .text()
             .catch(() => response.statusText);
+          console.error(`[http] API Error: ${response.status} - ${errorText}`);
           throw new Error(`HTTP ${response.status}: ${errorText}`);
         }
 
@@ -769,7 +1036,6 @@ export class HttpBackend extends PunkBackend {
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let buffer = "";
-        let hasEmittedContent = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -791,9 +1057,11 @@ export class HttpBackend extends PunkBackend {
                 request.projectId,
                 parsed,
                 apiConfig.provider,
-                request.requestId
+                request.requestId,
               );
-              if (emitted) hasEmittedContent = true;
+              if (emitted) {
+                // Content was emitted
+              }
             } catch (err) {
               console.error("[punk] Failed to parse SSE data:", err, data);
             }
@@ -820,24 +1088,53 @@ export class HttpBackend extends PunkBackend {
         }
 
         // Final assistant message for this turn
-        this.onEvent(request.projectId, {
-          event: "message",
-          data: {
-            parsed: {
-              type: "assistant",
-              message: { content: finalContent },
+        this.onEvent(
+          request.projectId,
+          {
+            event: "message",
+            data: {
+              parsed: {
+                type: "assistant",
+                message: { content: finalContent },
+              },
             },
           },
-        }, request.requestId);
+          request.requestId,
+        );
 
         messages.push({ role: "assistant", content: finalContent });
 
-        // If no tools, we're done
-        if (state.toolUses.size === 0) break;
+        // LOOP CONTROL
+        const hasTools = state.toolUses.size > 0;
+        const hasContent = state.accumulated.trim().length > 0;
+        const isLengthLimited = state.finishReason === "length";
+        const isToolCalls = state.finishReason === "tool_calls";
+
+        // If no reason to continue, break
+        if (!hasTools && !isLengthLimited && !isToolCalls) break;
+
+        // If it was just a length limit without tools, we continue immediately
+        // BUT ONLY IF we actually got some content, otherwise we are likely in a loop
+        if (isLengthLimited && !hasTools) {
+          if (!hasContent) {
+            console.warn(
+              `[http] Stopping turn ${turn} - length limit hit but no content or tools produced.`,
+            );
+            break;
+          }
+          console.log(
+            `[http] Auto-continuing turn ${turn} due to length limit`,
+          );
+          continue;
+        }
 
         // Execute tools
-        const executor = this.getToolExecutor(request.projectId, request.workingDir);
+        const executor = this.getToolExecutor(
+          request.projectId,
+          request.workingDir,
+        );
         const toolResults = [];
+        let needsStateRefresh = false;
 
         for (const tool of state.toolUses.values()) {
           let parsedInput = {};
@@ -847,62 +1144,179 @@ export class HttpBackend extends PunkBackend {
             parsedInput = tool.input;
           }
 
-          const result = await executor.executeTool(tool.id, tool.name, parsedInput);
+          let result;
+          if (tool.name === "evaluate_js") {
+            try {
+              const { getContextLimit } = await import("./session-context.mjs");
+              const fn = new Function(
+                "getContextLimit",
+                "TOOL_DEFINITIONS",
+                `return (${parsedInput.code})`,
+              );
+              const val = fn(getContextLimit, TOOL_DEFINITIONS);
+              result = { success: true, output: JSON.stringify(val, null, 2) };
+            } catch (err) {
+              result = { success: false, error: err.message };
+            }
+          } else {
+            result = await executor.executeTool(
+              tool.id,
+              tool.name,
+              parsedInput,
+            );
+          }
           const isError = !result.success;
           const content = result.output || result.error || "";
 
+          if (
+            !isError &&
+            [
+              "run_shell_command",
+              "write_file",
+              "replace",
+              "bash",
+              "TodoWrite",
+              "Task",
+            ].includes(tool.name)
+          ) {
+            needsStateRefresh = true;
+            if (tool.name === "TodoWrite" && parsedInput.todos) {
+              // Normalize todos format - handle both string[] and Todo[] formats
+              let normalizedTodos;
+              if (Array.isArray(parsedInput.todos)) {
+                if (typeof parsedInput.todos[0] === "string") {
+                  // Convert string array to Todo objects with default status
+                  normalizedTodos = parsedInput.todos.map((content) => ({
+                    content,
+                    status: "pending",
+                    activeForm: content.split(" ").slice(0, 2).join(" ") + "...",
+                  }));
+                } else {
+                  // Already in correct format
+                  normalizedTodos = parsedInput.todos;
+                }
+              } else {
+                normalizedTodos = parsedInput.todos;
+              }
+              
+              mergeState(request.projectId, { todos: normalizedTodos });
+              // Send updated todos to frontend
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "todos_updated",
+                  data: { todos: normalizedTodos },
+                },
+                request.requestId,
+              );
+            }
+            if (
+              tool.name === "Task" &&
+              (parsedInput.task || parsedInput.description)
+            ) {
+              mergeState(request.projectId, {
+                activeTask: {
+                  description: parsedInput.task || parsedInput.description,
+                },
+              });
+              // Send updated activeTask to frontend
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "activeTask_updated",
+                  data: { activeTask: { description: parsedInput.task || parsedInput.description } },
+                },
+                request.requestId,
+              );
+            }
+          }
+
           // Emit tool_result as a "user" message to match CLI worker
-          this.onEvent(request.projectId, {
-            event: "message",
-            data: {
-              parsed: {
-                type: "user",
-                message: {
-                  content: [
-                    {
-                      type: "tool_result",
-                      tool_use_id: tool.id,
-                      name: tool.name,
-                      content,
-                      is_error: isError,
-                    },
-                  ],
+          this.onEvent(
+            request.projectId,
+            {
+              event: "message",
+              data: {
+                parsed: {
+                  type: "user",
+                  message: {
+                    content: [
+                      {
+                        type: "tool_result",
+                        tool_use_id: tool.id,
+                        name: tool.name,
+                        content,
+                        is_error: isError,
+                      },
+                    ],
+                  },
                 },
               },
             },
-          }, request.requestId);
+            request.requestId,
+          );
 
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: tool.id,
+          // --- PUSH AS CANONICAL TOOL ROLE ---
+          messages.push({
+            role: "tool",
+            tool_call_id: tool.id,
             name: tool.name,
             content,
             is_error: isError,
           });
         }
 
-        messages.push({ role: "user", content: toolResults });
+        if (needsStateRefresh) {
+          const gitStatus = await this.getGitStatus(request.workingDir);
+          mergeState(request.projectId, { gitStatus });
+
+          // Re-compile context to get updated system prompt for the next request in this turn
+          const context = compileContext(
+            request.projectId,
+            request.intent,
+            messages.length, // use current length
+          );
+          if (messages.length > 0 && messages[0].role === "system") {
+            messages[0].content = context.full;
+          }
+        }
       }
 
-      this.onEvent(request.projectId, {
-        event: "processEnded",
-        data: { exit_code: 0 },
-      }, request.requestId);
+      this.onEvent(
+        request.projectId,
+        {
+          event: "processEnded",
+          data: { exit_code: 0 },
+        },
+        request.requestId,
+      );
     } catch (error) {
       if (error.name === "AbortError") {
-        this.onEvent(request.projectId, {
-          event: "processEnded",
-          data: { exit_code: null },
-        }, request.requestId);
+        this.onEvent(
+          request.projectId,
+          {
+            event: "processEnded",
+            data: { exit_code: null },
+          },
+          request.requestId,
+        );
       } else {
-        this.onEvent(request.projectId, {
-          event: "error",
-          data: { message: error.message },
-        }, request.requestId);
-        this.onEvent(request.projectId, {
-          event: "processEnded",
-          data: { exit_code: 1 },
-        }, request.requestId);
+        this.onEvent(
+          request.projectId,
+          {
+            event: "error",
+            data: { message: error.message },
+          },
+          request.requestId,
+        );
+        this.onEvent(
+          request.projectId,
+          {
+            event: "processEnded",
+            data: { exit_code: 1 },
+          },
+          request.requestId,
+        );
       }
     } finally {
       this.activeRequests.delete(request.projectId);
@@ -910,11 +1324,30 @@ export class HttpBackend extends PunkBackend {
     }
   }
 
-  prepareRequest(apiConfig, body, request = {}) {
+  prepareRequest(apiConfig, body) {
     let url, headers;
-    let finalBody = null;
+    let finalBody = body;
 
     switch (apiConfig.provider) {
+      case "openrouter":
+        url =
+          apiConfig.baseUrl || "https://openrouter.ai/api/v1/chat/completions";
+        headers = {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiConfig.apiKey}`,
+          "HTTP-Referer": "https://pane.app",
+          "X-Title": "Pane IDE",
+        };
+        // Disable default OpenRouter transforms (like middle-out) to avoid prompt manipulation
+        // and explicitly allow data collection to bypass restrictive 404 guardrails on free models.
+        finalBody = {
+          ...body,
+          transforms: [],
+          data_collection: "allow",
+          zdr: false,
+        };
+        break;
+
       case "deepseek":
         url =
           apiConfig.baseUrl || "https://api.deepseek.com/v1/chat/completions";
@@ -923,6 +1356,7 @@ export class HttpBackend extends PunkBackend {
           Authorization: `Bearer ${apiConfig.apiKey}`,
         };
         break;
+
       case "kimi":
         url =
           apiConfig.baseUrl || "https://api.moonshot.cn/v1/chat/completions";
@@ -931,22 +1365,36 @@ export class HttpBackend extends PunkBackend {
           Authorization: `Bearer ${apiConfig.apiKey}`,
         };
         break;
-      case "gemini": {
-        url = `https://generativelanguage.googleapis.com/v1beta/models/${body.model}:streamGenerateContent`;
-        headers = { "Content-Type": "application/json" };
-        // Gemini has no separate API key header, it's in the URL
-        url += `?key=${apiConfig.apiKey}`;
 
-        // Gemini uses a different body structure and needs history
+      case "anthropic": {
+        url = apiConfig.baseUrl || "https://api.anthropic.com/v1/messages";
+        headers = {
+          "Content-Type": "application/json",
+          "x-api-key": apiConfig.apiKey,
+          "anthropic-version": "2023-06-01",
+        };
+        const sysMsg = body.messages.find((m) => m.role === "system");
+        const anthropicBody = { ...body };
+        anthropicBody.messages = body.messages.filter(
+          (m) => m.role !== "system",
+        );
+        if (sysMsg) {
+          anthropicBody.system = sysMsg.content;
+        }
+        finalBody = anthropicBody;
+        break;
+      }
+
+      case "gemini": {
+        url = `https://generativelanguage.googleapis.com/v1beta/models/${body.model}:streamGenerateContent?alt=sse`;
+        headers = { "Content-Type": "application/json" };
+        url += `&key=${apiConfig.apiKey}`;
+
         const contents = [];
-        // Gemini uses "user" and "model" roles
         const normalized = this.normalizeMessages(body.messages, "gemini");
         for (const msg of normalized) {
           if (msg.role === "user") {
-            contents.push({
-              role: "user",
-              parts: [{ text: msg.content }]
-            });
+            contents.push({ role: "user", parts: [{ text: msg.content }] });
           } else if (msg.role === "assistant") {
             const parts = [];
             if (msg.thinking) parts.push({ thought: msg.thinking });
@@ -956,8 +1404,11 @@ export class HttpBackend extends PunkBackend {
                 parts.push({
                   functionCall: {
                     name: tu.name,
-                    args: typeof tu.input === "string" ? JSON.parse(tu.input) : tu.input
-                  }
+                    args:
+                      typeof tu.input === "string"
+                        ? JSON.parse(tu.input)
+                        : tu.input,
+                  },
                 });
               }
             }
@@ -965,63 +1416,59 @@ export class HttpBackend extends PunkBackend {
           } else if (msg.role === "tool") {
             contents.push({
               role: "function",
-              parts: msg.tool_results.map(tr => ({
+              parts: msg.tool_results.map((tr) => ({
                 functionResponse: {
                   name: tr.name,
-                  response: { content: tr.content, is_error: tr.is_error }
-                }
-              }))
+                  response: { content: tr.content, is_error: tr.is_error },
+                },
+              })),
             });
           }
         }
 
-          finalBody = {
-            contents,
-            tools: [
-              {
-                functionDeclarations: TOOL_DEFINITIONS.map((td) => ({
-                  name: td.function.name,
-                  description: td.function.description,
-                  parameters: td.function.parameters,
-                })),
-              },
-            ],
-            systemInstruction: {
-              parts: body.messages
-                .filter((m) => m.role === "system")
-                .map((m) => ({ text: m.content })),
+        finalBody = {
+          contents,
+          tools: [
+            {
+              functionDeclarations: TOOL_DEFINITIONS.map((td) => ({
+                name: td.function.name,
+                description: td.function.description,
+                parameters: td.function.parameters,
+              })),
             },
-            safetySettings: [
-              { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-              { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" },
-            ],
-            generationConfig: {
-              temperature: 0,
-              topP: 0.95,
-              topK: 64,
-              maxOutputTokens: 16384,
-              responseMimeType: "text/plain",
+          ],
+          systemInstruction: {
+            parts: body.messages
+              .filter((m) => m.role === "system")
+              .map((m) => ({ text: m.content })),
+          },
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            {
+              category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+              threshold: "BLOCK_NONE",
             },
-          };
-          break;
-        }
-      case "anthropic":
-        url = apiConfig.baseUrl || "https://api.anthropic.com/v1/messages";
-        headers = {
-          "Content-Type": "application/json",
-          "x-api-key": apiConfig.apiKey,
-          "anthropic-version": "2023-06-01",
+            {
+              category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+              threshold: "BLOCK_NONE",
+            },
+            {
+              category: "HARM_CATEGORY_CIVIC_INTEGRITY",
+              threshold: "BLOCK_NONE",
+            },
+          ],
+          generationConfig: {
+            temperature: 0,
+            topP: 0.95,
+            topK: 64,
+            maxOutputTokens: 16384,
+            responseMimeType: "text/plain",
+          },
         };
-        const sysMsg = body.messages.find(m => m.role === "system");
-        finalBody = { ...body };
-        finalBody.messages = body.messages.filter((m) => m.role !== "system");
-        if (sysMsg) {
-          finalBody.system = sysMsg.content;
-        }
         break;
+      }
+
       default:
         throw new Error(`Unsupported provider: ${apiConfig.provider}`);
     }
@@ -1032,13 +1479,15 @@ export class HttpBackend extends PunkBackend {
   getDefaultModel(provider) {
     switch (provider) {
       case "gemini":
-        return "gemini-flash-latest";
+        return "gemini-3-flash-preview";
       case "deepseek":
-        return "deepseek-v3.2";
+        return "deepseek-chat";
       case "kimi":
         return "moonshot-v1-128k";
       case "anthropic":
         return "claude-3-5-sonnet-20241022";
+      case "openrouter":
+        return "stepfun/step-3.5-flash:free";
       default:
         return "gpt-4";
     }
@@ -1047,11 +1496,22 @@ export class HttpBackend extends PunkBackend {
   mapModelName(provider, model) {
     if (!model) return this.getDefaultModel(provider);
 
+    if (provider === "openrouter") return model;
+
     if (provider === "gemini") {
       const map = {
         "auto-gemini-3": "gemini-3-flash-preview",
-        "gemini_flash": "gemini-flash-latest",
-        "gemini_pro": "gemini-pro-latest",
+        gemini_flash: "gemini-flash-latest",
+        gemini_pro: "gemini-pro-latest",
+      };
+      return map[model.toLowerCase()] || model;
+    }
+
+    if (provider === "deepseek") {
+      const map = {
+        "deepseek-v3": "deepseek-chat",
+        "deepseek-v3.2": "deepseek-chat",
+        "deepseek-v3.2-speciale": "deepseek-reasoner",
       };
       return map[model.toLowerCase()] || model;
     }
@@ -1078,18 +1538,23 @@ export class HttpBackend extends PunkBackend {
     let content = "";
     let thinking = "";
     let finishReason = null;
-    let toolUse = null;
     let toolDelta = null;
+    let emitted = false;
 
     switch (provider) {
+      case "openrouter":
       case "deepseek":
       case "kimi":
         if (event.choices?.[0]?.delta?.content)
           content = event.choices[0].delta.content;
-        
+
         // Support for reasoning_content (DeepSeek R1 reasoning)
         if (event.choices?.[0]?.delta?.reasoning_content)
           thinking = event.choices[0].delta.reasoning_content;
+
+        // Support for reasoning (OpenRouter standard)
+        if (event.choices?.[0]?.delta?.reasoning)
+          thinking = event.choices[0].delta.reasoning;
 
         if (event.choices?.[0]?.delta?.tool_calls) {
           const tc = event.choices[0].delta.tool_calls[0];
@@ -1100,31 +1565,40 @@ export class HttpBackend extends PunkBackend {
 
             if (toolId) {
               // Start of a new tool call
-              this.onEvent(projectId, {
-                event: "message",
-                data: {
-                  parsed: {
-                    type: "stream_event",
-                    event: {
-                      type: "content_block_start",
-                      index: state.toolUses.size + 1,
-                      content_block: {
-                        type: "tool_use",
-                        id: toolId,
-                        name: toolName,
-                        input: {},
+              this.onEvent(
+                projectId,
+                {
+                  event: "message",
+                  data: {
+                    parsed: {
+                      type: "stream_event",
+                      event: {
+                        type: "content_block_start",
+                        index: state.toolUses.size + 1,
+                        content_block: {
+                          type: "tool_use",
+                          id: toolId,
+                          name: toolName,
+                          input: {},
+                        },
                       },
                     },
                   },
                 },
-              }, requestId);
-              state.toolUses.set(toolId, { id: toolId, name: toolName, input: "" });
+                requestId,
+              );
+              state.toolUses.set(toolId, {
+                id: toolId,
+                name: toolName,
+                input: "",
+              });
             }
 
             if (toolArgs) {
               // Find the active tool (OpenAI-style APIs usually send one tool call at a time in a stream)
               // If toolId wasn't provided in this chunk, use the last one we saw
-              const activeToolId = toolId || Array.from(state.toolUses.keys()).pop();
+              const activeToolId =
+                toolId || Array.from(state.toolUses.keys()).pop();
               if (activeToolId) {
                 const tool = state.toolUses.get(activeToolId);
                 tool.input += toolArgs;
@@ -1133,7 +1607,8 @@ export class HttpBackend extends PunkBackend {
             }
           }
         }
-        finishReason = event.choices?.[0]?.finish_reason;
+        finishReason = event.choices?.[0]?.finish_reason || null;
+        if (finishReason) state.finishReason = finishReason;
         break;
 
       case "gemini":
@@ -1145,38 +1620,68 @@ export class HttpBackend extends PunkBackend {
               thinking = part.thought;
             } else if (part.functionCall) {
               const fc = part.functionCall;
-              const toolId = `gemini_${Date.now()}`; // Gemini doesn't always provide tool ID
+              // Generate unique ID per tool call to prevent collisions within a chunk
+              const toolId = `gemini_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
               const toolName = fc.name;
               const toolArgs = JSON.stringify(fc.args || {});
 
-              // Start of tool call
-              this.onEvent(projectId, {
-                event: "message",
-                data: {
-                  parsed: {
-                    type: "stream_event",
-                    event: {
-                      type: "content_block_start",
-                      index: state.toolUses.size + 1,
-                      content_block: {
-                        type: "tool_use",
-                        id: toolId,
-                        name: toolName,
-                        input: {},
+              // Emit start event immediately
+              this.onEvent(
+                projectId,
+                {
+                  event: "message",
+                  data: {
+                    parsed: {
+                      type: "stream_event",
+                      event: {
+                        type: "content_block_start",
+                        index: state.toolUses.size + 1,
+                        content_block: {
+                          type: "tool_use",
+                          id: toolId,
+                          name: toolName,
+                          input: {},
+                        },
                       },
                     },
                   },
                 },
-              }, requestId);
+                requestId,
+              );
 
-              // Gemini usually sends the whole tool call at once in a candidate part
-              // So we can just emit it as one chunk
-              state.toolUses.set(toolId, { id: toolId, name: toolName, input: toolArgs });
-              toolDelta = { id: toolId, partial_json: toolArgs };
+              state.toolUses.set(toolId, {
+                id: toolId,
+                name: toolName,
+                input: toolArgs,
+              });
+
+              // Emit delta immediately for the whole tool call (Gemini usually sends complete tool calls)
+              this.onEvent(
+                projectId,
+                {
+                  event: "message",
+                  data: {
+                    parsed: {
+                      type: "stream_event",
+                      event: {
+                        type: "content_block_delta",
+                        index: 0,
+                        delta: {
+                          type: "partial_json_delta",
+                          partial_json: toolArgs,
+                        },
+                      },
+                    },
+                  },
+                },
+                requestId,
+              );
+              emitted = true;
             }
           }
         }
-        finishReason = event.candidates?.[0]?.finishReason;
+        finishReason = event.candidates?.[0]?.finishReason || null;
+        if (finishReason) state.finishReason = finishReason;
         break;
 
       case "anthropic":
@@ -1197,24 +1702,28 @@ export class HttpBackend extends PunkBackend {
           event.content_block?.type === "tool_use"
         ) {
           const tb = event.content_block;
-          this.onEvent(projectId, {
-            event: "message",
-            data: {
-              parsed: {
-                type: "stream_event",
-                event: {
-                  type: "content_block_start",
-                  index: event.index,
-                  content_block: {
-                    type: "tool_use",
-                    id: tb.id,
-                    name: tb.name,
-                    input: {},
+          this.onEvent(
+            projectId,
+            {
+              event: "message",
+              data: {
+                parsed: {
+                  type: "stream_event",
+                  event: {
+                    type: "content_block_start",
+                    index: event.index,
+                    content_block: {
+                      type: "tool_use",
+                      id: tb.id,
+                      name: tb.name,
+                      input: {},
+                    },
                   },
                 },
               },
             },
-          }, requestId);
+            requestId,
+          );
           state.toolUses.set(tb.id, { id: tb.id, name: tb.name, input: "" });
         }
 
@@ -1227,68 +1736,84 @@ export class HttpBackend extends PunkBackend {
           if (activeToolId) {
             const tool = state.toolUses.get(activeToolId);
             tool.input += event.delta.partial_json;
-            toolDelta = { id: activeToolId, partial_json: event.delta.partial_json };
+            toolDelta = {
+              id: activeToolId,
+              partial_json: event.delta.partial_json,
+            };
           }
         }
 
-        if (event.type === "message_stop") finishReason = "stop";
+        if (event.type === "message_stop") {
+          state.finishReason = "stop";
+          finishReason = "stop";
+        }
         break;
     }
 
-    let emitted = false;
-
     if (toolDelta) {
-      this.onEvent(projectId, {
-        event: "message",
-        data: {
-          parsed: {
-            type: "stream_event",
-            event: {
-              type: "content_block_delta",
-              index: 0, // index doesn't strictly matter for our UI
-              delta: {
-                type: "partial_json_delta",
-                partial_json: toolDelta.partial_json,
+      this.onEvent(
+        projectId,
+        {
+          event: "message",
+          data: {
+            parsed: {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                index: 0, // index doesn't strictly matter for our UI
+                delta: {
+                  type: "partial_json_delta",
+                  partial_json: toolDelta.partial_json,
+                },
               },
             },
           },
         },
-      }, requestId);
+        requestId,
+      );
       emitted = true;
     }
 
     if (thinking) {
-      this.onEvent(projectId, {
-        event: "message",
-        data: {
-          parsed: {
-            type: "stream_event",
-            event: {
-              type: "content_block_delta",
-              index: 0,
-              delta: { type: "thinking_delta", thinking: thinking },
+      this.onEvent(
+        projectId,
+        {
+          event: "message",
+          data: {
+            parsed: {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                index: 0,
+                delta: { type: "thinking_delta", thinking: thinking },
+              },
             },
           },
         },
-      }, requestId);
+        requestId,
+      );
       emitted = true;
     }
 
     if (content) {
       state.accumulated += content;
-      this.onEvent(projectId, {
-        event: "message",
-        data: {
-          parsed: {
-            type: "stream_event",
-            event: {
-              type: "content_block_delta",
-              index: 0,
-              delta: { type: "text_delta", text: content },
+      this.onEvent(
+        projectId,
+        {
+          event: "message",
+          data: {
+            parsed: {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                index: 0,
+                delta: { type: "text_delta", text: content },
+              },
             },
           },
         },
-      }, requestId);
+        requestId,
+      );
       emitted = true;
     }
 
@@ -1298,11 +1823,14 @@ export class HttpBackend extends PunkBackend {
         finalContent.push({ type: "text", text: state.accumulated });
       }
       for (const tool of state.toolUses.values()) {
-        let parsedInput = {};
+        // Parse tool input if it's JSON
+        let parsedInput = tool.input;
         try {
-          parsedInput = JSON.parse(tool.input);
+          if (typeof tool.input === "string") {
+            parsedInput = JSON.parse(tool.input);
+          }
         } catch {
-          parsedInput = tool.input;
+          // Keep as-is if not valid JSON
         }
         finalContent.push({
           type: "tool_use",
@@ -1312,15 +1840,19 @@ export class HttpBackend extends PunkBackend {
         });
       }
 
-      this.onEvent(projectId, {
-        event: "message",
-        data: {
-          parsed: {
-            type: "assistant",
-            message: { content: finalContent },
+      this.onEvent(
+        projectId,
+        {
+          event: "message",
+          data: {
+            parsed: {
+              type: "assistant",
+              message: { content: finalContent },
+            },
           },
         },
-      }, requestId);
+        requestId,
+      );
       emitted = true;
     }
 
@@ -1344,5 +1876,41 @@ export class HttpBackend extends PunkBackend {
     for (const controller of this.activeRequests.values()) controller.abort();
     this.activeRequests.clear();
     this.requestStates.clear();
+  }
+
+  async getOpenRouterModels() {
+    const apiConfig = await this.getApiConfig("openrouter");
+    if (!apiConfig.apiKey) return [];
+
+    try {
+      const response = await fetch("https://openrouter.ai/api/v1/models", {
+        headers: {
+          Authorization: `Bearer ${apiConfig.apiKey}`,
+        },
+      });
+
+      if (!response.ok) return [];
+
+      const json = await response.json();
+      if (!json.data) return [];
+
+      return json.data
+        .filter((m) => {
+          const params = m.supported_parameters || [];
+          // Some models are free (pricing.prompt is "0" or 0)
+          const isFree = Number(m.pricing?.prompt) === 0;
+          const supportsTools =
+            params.includes("tools") || params.includes("tool_choice");
+          return isFree || supportsTools;
+        })
+        .map((m) => ({
+          id: m.id,
+          name: m.name,
+          context_length: m.context_length,
+        }));
+    } catch (err) {
+      console.error("[http] Failed to fetch OpenRouter models:", err);
+      return [];
+    }
   }
 }

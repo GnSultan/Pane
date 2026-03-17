@@ -173,12 +173,45 @@ export interface ClaudeEventError {
   data: { message: string };
 }
 
+export interface ClaudeEventCompactionStart {
+  event: "compaction_start";
+  data: { reason: string; strategy: string };
+}
+
+export interface ClaudeEventCompactionComplete {
+  event: "compaction_complete";
+  data: {
+    originalCount: number;
+    compactedCount: number;
+    tokensSaved: number;
+    totalCompactions: number;
+  };
+}
+
+export interface ClaudeEventTodosUpdated {
+  event: "todos_updated";
+  data: {
+    todos: Todo[];
+  };
+}
+
+export interface ClaudeEventActiveTaskUpdated {
+  event: "activeTask_updated";
+  data: {
+    activeTask: { description: string };
+  };
+}
+
 export type ClaudeStreamEvent =
   | ClaudeEventMessage
   | ClaudeEventProcessStarted
   | ClaudeEventProcessEnded
   | PunkEventRouting
-  | ClaudeEventError;
+  | ClaudeEventError
+  | ClaudeEventCompactionStart
+  | ClaudeEventCompactionComplete
+  | ClaudeEventTodosUpdated
+  | ClaudeEventActiveTaskUpdated;
 
 // Parsed conversation message for the UI
 
@@ -235,6 +268,11 @@ export interface ConversationState {
   // Cached brief from last generateBrief — used for enhanced continuation
   cachedBrief: string;
   statusMessage: string | null;
+  // Context compaction status
+  isCompacting: boolean;
+  lastCompactionAt: number | null;
+  compactionCount: number;
+  tokensSaved: number;
 }
 
 // Memory event types for automatic extraction
@@ -274,5 +312,9 @@ export function createEmptyConversation(): ConversationState {
     contextPressure: "none",
     cachedBrief: "",
     statusMessage: null,
+    isCompacting: false,
+    lastCompactionAt: null,
+    compactionCount: 0,
+    tokensSaved: 0,
   };
 }

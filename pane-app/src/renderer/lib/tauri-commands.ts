@@ -1,4 +1,4 @@
-import type { ClaudeStreamEvent } from "./claude-types";
+import type { ClaudeStreamEvent, ConversationMessage, Todo } from "./claude-types";
 
 // Electron IPC bridge
 const electronAPI = (window as any).electronAPI;
@@ -121,6 +121,8 @@ export interface ProjectSessionState {
   >;
 }
 
+import type { BackendRouting } from "./models";
+
 export interface UserSettings {
   project_roots: string[];
   active_project_root: string | null;
@@ -138,18 +140,14 @@ export interface UserSettings {
   panel_width: number | null;
   completion_sound: string | null;
   selected_model: string | null;
+  selected_model_provider?: string;
   punk_backend: string;
   http_provider?: string;
   http_api_key?: string;
   http_api_keys?: Record<string, string>;
   http_base_url?: string;
   http_base_urls?: Record<string, string>;
-  intent_routing?: {
-    plan: { provider: string; model: string; thinking: boolean };
-    execute: { provider: string; model: string; thinking: boolean };
-    explain: { provider: string; model: string; thinking: boolean };
-    other: { provider: string; model: string; thinking: boolean };
-  };
+  intent_routing?: BackendRouting;
   intent_auto_route?: boolean;
 }
 
@@ -171,9 +169,10 @@ export async function sendToPunk(
   model: string | null,
   onEvent: (event: ClaudeStreamEvent) => void,
   intent?: string,
-  history?: any[],
+  history?: ConversationMessage[],
   thinking?: boolean,
   provider?: string,
+  todos?: Todo[],
 ): Promise<void> {
   const requestId = Math.random().toString(36).slice(2, 11);
   // Self-cleaning listener — stays active until processEnded or error
@@ -237,6 +236,7 @@ export async function sendToPunk(
       requestId,
       thinking,
       provider,
+      todos,
     });
   } catch (err) {
     port1.close();
@@ -259,6 +259,24 @@ export async function terminateClaudeSession(projectId: string): Promise<void> {
 
 export async function reinitializePunkBackend(backend?: string): Promise<void> {
   return electronAPI.invoke("reinitialize_punk_backend", { backend });
+}
+
+export async function getOpenRouterModels(): Promise<
+  Array<{ id: string; name: string; context_length: number }>
+> {
+  return electronAPI.invoke("get_openrouter_models");
+}
+
+export async function getAllModels(): Promise<
+  Record<string, Array<{ id: string; name: string; context_length: number }>>
+> {
+  return electronAPI.invoke("get_all_models");
+}
+
+export async function refreshAllModels(): Promise<
+  Record<string, Array<{ id: string; name: string; context_length: number }>>
+> {
+  return electronAPI.invoke("refresh_all_models");
 }
 
 export async function setWindowTitle(title: string): Promise<void> {
@@ -718,12 +736,14 @@ export interface SessionState {
 
 export interface SessionDelta {
   activeTask?: { description: string; goal?: string } | null;
+  todos?: { content: string; status: string; activeForm?: string }[];
   workingSet?: { path: string; purpose?: string }[];
   decisions?: { content: string }[];
   recentActions?: { type: string; content: string; timestamp: number }[];
   turnCount?: number;
   lastProvider?: string;
   lastIntent?: string;
+  gitStatus?: { branch: string; summary: string } | null;
 }
 
 export async function sessionMergeState(

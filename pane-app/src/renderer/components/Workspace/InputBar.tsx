@@ -10,8 +10,9 @@ import {
   BUILDING_ENGINES,
   keyFromRoute,
   DEFAULT_BACKEND_ROUTING,
+  getContextLimit,
+  isThinkingModel,
 } from "../../lib/models";
-import { getContextLimit } from "../../hooks/useClaude";
 
 const EMPTY_TODOS: Todo[] = [];
 
@@ -100,13 +101,16 @@ function ModelPicker({
   isProcessing?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
   const ref = useRef<HTMLDivElement>(null);
   const punkBackend = useWorkspaceStore((s) => s.punkBackend);
+  const httpApiKeys = useWorkspaceStore((s) => s.httpApiKeys);
+  const openRouterModels = useWorkspaceStore((s) => s.openRouterModels);
   const routing = useWorkspaceStore(useShallow((s) => s.getEffectiveRouting()));
 
   const filteredProviderModels = useMemo(() => {
     const isGeminiBackend = punkBackend === "gemini-cli";
-    return Object.fromEntries(
+    const providers = Object.fromEntries(
       Object.entries(PROVIDER_MODELS)
         .map(([provider, models]) => {
           // If we are on Gemini CLI, keep only the Gemini provider and keep auto models.
@@ -115,14 +119,32 @@ function ModelPicker({
             return [provider, models];
           }
 
-          // If we are NOT on Gemini CLI (e.g. HTTP), keep all providers
-          // but filter out any model starting with "auto-" as those are CLI-only.
+          // If we are NOT on Gemini CLI (e.g. HTTP), only show providers with keys.
+          if (!httpApiKeys[provider]) return [provider, []];
+
+          // Special case for OpenRouter: merge hardcoded with dynamically fetched models
+          if (provider === "openrouter") {
+            if (openRouterModels.length > 0) {
+              // Convert fetched models to the expected format, merging with hardcoded labels if they match
+              const dynamicModels = openRouterModels.map((m) => {
+                const hardcoded = models.find((h) => h.value === m.id);
+                return {
+                  value: m.id,
+                  label: hardcoded ? hardcoded.label : m.name,
+                };
+              });
+              return [provider, dynamicModels];
+            }
+          }
+
+          // Filter out any model starting with "auto-" as those are CLI-only.
           const filtered = models.filter((m) => !m.value.startsWith("auto-"));
           return [provider, filtered];
         })
         .filter(([_, models]) => models && models.length > 0),
     );
-  }, [punkBackend]);
+    return providers;
+  }, [punkBackend, httpApiKeys, openRouterModels]);
 
   const allModels = useMemo(() => {
     const models: Array<{
@@ -133,17 +155,86 @@ function ModelPicker({
     }> = [];
     Object.entries(filteredProviderModels).forEach(([provider, list]) => {
       if (Array.isArray(list)) {
-        list.forEach((m: any) => {
-          // Find if this model exists in THINKING_ENGINES to get its thinking flag
-          const thinkingEntry = THINKING_ENGINES.find(
-            (e) => e.provider === provider && e.model === m.value,
-          );
-          models.push({ ...m, provider, thinking: thinkingEntry?.thinking });
+        list.forEach((m: { value: string; label: string }) => {
+          // Find if this model exists in THINKING_ENGINES or BUILDING_ENGINES to get its thinking flag,
+          // otherwise use the helper to guess.
+          const engineEntry =
+            THINKING_ENGINES.find(
+              (e) => e.provider === provider && e.model === m.value,
+            ) ||
+            BUILDING_ENGINES.find(
+              (e) => e.provider === provider && e.model === m.value,
+            );
+          const isThinking = engineEntry
+            ? engineEntry.thinking
+            : isThinkingModel(m.value);
+          models.push({ ...m, provider, thinking: isThinking });
         });
       }
     });
     return models;
   }, [filteredProviderModels]);
+
+  // Fuzzy search - matches characters in order but not necessarily consecutively
+  // Also calculates a relevance score for sorting results
+  const fuzzyScore = (text: string, query: string): number => {
+    const lowerText = text.toLowerCase();
+    const lowerQuery = query.toLowerCase().trim();
+    
+    if (!lowerQuery) return 0;
+    
+    let score = 0;
+    let queryIndex = 0;
+    let lastMatchIndex = -1;
+    
+    for (let i = 0; i < lowerText.length && queryIndex < lowerQuery.length; i++) {
+      if (lowerText[i] === lowerQuery[queryIndex]) {
+        // Bonus for consecutive matches
+        if (lastMatchIndex !== -1 && i === lastMatchIndex + 1) {
+          score += 5;
+        }
+        // Bonus for matching at start
+        if (i === 0 && queryIndex === 0) {
+          score += 10;
+        }
+        // Bonus for matching after separator (e.g., "claude" in "claude-3.5-sonnet")
+        if (lowerText[i - 1] === '-' || lowerText[i - 1] === ' ') {
+          score += 8;
+        }
+        score += 1;
+        lastMatchIndex = i;
+        queryIndex++;
+      }
+    }
+    
+    // Bonus for exact match
+    if (lowerText === lowerQuery) {
+      score += 20;
+    }
+    
+    return queryIndex === lowerQuery.length ? score : -1;
+  };
+
+  // Filter models based on search query
+  const filteredModels = useMemo(() => {
+    if (!searchQuery.trim()) return allModels;
+    const query = searchQuery.toLowerCase().trim();
+    
+    // Score and filter models
+    const scoredModels = allModels
+      .map((m) => {
+        const labelScore = fuzzyScore(m.label, query);
+        const valueScore = fuzzyScore(m.value, query);
+        const providerScore = fuzzyScore(m.provider, query);
+        const maxScore = Math.max(labelScore, valueScore, providerScore);
+        return { model: m, score: maxScore };
+      })
+      .filter(({ score }) => score >= 0)
+      .sort((a, b) => b.score - a.score) // Higher scores first
+      .map(({ model }) => model);
+    
+    return scoredModels;
+  }, [allModels, searchQuery]);
 
   const current = allModels.find((m) => m.value === value);
   const currentDisplay = current || { value: value, label: value || "Select" };
@@ -254,7 +345,7 @@ function ModelPicker({
       </button>
 
       {open && (
-        <div className="absolute bottom-full right-0 mb-2 w-64 bg-pane-bg border border-pane-border/40 rounded-2xl shadow-2xl overflow-hidden z-50 animate-fadeSlideUp">
+        <div className="absolute bottom-full right-0 mb-2 w-64 bg-pane-bg border border-pane-border/40 rounded-xl shadow-2xl overflow-hidden z-50 animate-fadeSlideUp">
           <div className="p-1.5 flex flex-col gap-0.5">
             {/* Smart Routing Toggle */}
             <button
@@ -262,7 +353,7 @@ function ModelPicker({
                 onToggleAutoRoute(!autoRoute);
                 setOpen(false);
               }}
-              className={`flex items-center justify-between w-full px-3 py-2 rounded-xl text-left transition-colors ${
+              className={`flex items-center justify-between w-full px-3 py-2 rounded-md text-left transition-colors ${
                 autoRoute
                   ? "bg-pane-text/[0.08] text-pane-text"
                   : "text-pane-text-secondary hover:bg-pane-text/[0.04] hover:text-pane-text"
@@ -285,43 +376,84 @@ function ModelPicker({
 
             {/* Individual Models grouped by provider */}
             <div className="max-h-[300px] overflow-y-auto custom-scrollbar">
-              {Object.entries(filteredProviderModels).map(([provider]) => (
+              {Object.entries(
+                filteredModels.reduce((acc, model) => {
+                  if (!acc[model.provider]) acc[model.provider] = [];
+                  acc[model.provider]?.push(model);
+                  return acc;
+                }, {} as Record<string, typeof filteredModels>),
+              ).map(([provider, models]) => (
                 <div key={provider} className="flex flex-col mb-2">
                   <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-pane-text-secondary/40 font-mono">
-                    {provider}
+                    {provider || "unknown"}
                   </div>
-                  {allModels
-                    .filter((m) => m.provider === provider)
-                    .map((model) => (
-                      <button
-                        key={model.value}
-                        onClick={() => {
-                          onChange(model.value, model.thinking);
-                          setOpen(false);
-                        }}
-                        className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-mono text-left transition-colors ${
-                          !autoRoute && model.value === value
-                            ? "bg-pane-text/10 text-pane-text"
-                            : "text-pane-text-secondary hover:bg-pane-text/[0.04] hover:text-pane-text"
-                        }`}
-                      >
-                        <div className="flex flex-col">
-                          <span className="font-mono text-[12px]">
-                            {model.label.toLowerCase()}
+                  {models?.map((model) => (
+                    <button
+                      key={model.value}
+                      onClick={() => {
+                        onChange(model.value, model.thinking);
+                        setOpen(false);
+                      }}
+                      className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-mono text-left transition-colors ${
+                        !autoRoute && model.value === value
+                          ? "bg-pane-text/10 text-pane-text"
+                          : "text-pane-text-secondary hover:bg-pane-text/[0.04] hover:text-pane-text"
+                      }`}
+                    >
+                      <div className="flex flex-col">
+                        <span className="font-mono text-[12px]">
+                          {model.label.toLowerCase()}
+                        </span>
+                        {model.thinking && (
+                          <span className="text-[9px] text-pane-status-added/60 uppercase tracking-tighter">
+                            thinking mode
                           </span>
-                          {model.thinking && (
-                            <span className="text-[9px] text-pane-status-added/60 uppercase tracking-tighter">
-                              thinking mode
-                            </span>
-                          )}
-                        </div>
-                        {!autoRoute && model.value === value && (
-                          <div className="w-1.5 h-1.5 rounded-full bg-pane-text" />
                         )}
-                      </button>
-                    ))}
+                      </div>
+                      {!autoRoute && model.value === value && (
+                        <div className="w-1.5 h-1.5 rounded-full bg-pane-text" />
+                      )}
+                    </button>
+                  ))}
                 </div>
               ))}
+            </div>
+
+            {/* Search bar at bottom - fixed like InputBar */}
+            <div className="sticky bottom-0 bg-pane-bg border-t border-pane-border/25">
+              <div className="flex items-center gap-2 px-3 py-2.5">
+                <svg
+                  className="w-3.5 h-3.5 text-pane-text-secondary/35 shrink-0"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+                  />
+                </svg>
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="search models..."
+                  className="flex-1 bg-transparent text-pane-text text-[11px] font-mono outline-none placeholder:text-pane-text-secondary/35"
+                  autoFocus
+                />
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery("")}
+                    className="text-pane-text-secondary/35 hover:text-pane-text-secondary/55 transition-colors"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -356,12 +488,6 @@ export function InputBar({
   );
   const pendingPlanApproval = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.pendingPlanApproval ?? false,
-  );
-  const isPlanning = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.isPlanning ?? false,
-  );
-  const statusMessage = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.statusMessage ?? null,
   );
   const selectedModel = useWorkspaceStore((s) => s.selectedModel);
   const setSelectedModel = useWorkspaceStore((s) => s.setSelectedModel);
@@ -531,12 +657,6 @@ export function InputBar({
                 style={{ strokeWidth: "var(--circle-stroke-width, 1.5)" }}
               />
             </svg>
-            <span
-              className="text-pane-text-secondary font-mono"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              {statusMessage || (isPlanning ? "planning" : "responding")}
-            </span>
             {todos.length > 0 && (
               <button
                 onClick={() => setTodoPanelOpen((v) => !v)}
@@ -618,11 +738,11 @@ export function InputBar({
 
       {/* The unified card — textarea body + toolbar strip */}
       {!pendingPlanApproval && (
-        <div className="bg-pane-bg rounded-2xl ring-1 ring-pane-border/40 relative shadow-[0_0_12px_rgba(74,71,66,0.15)]">
+        <div className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative shadow-[0_0_12px_rgba(74,71,66,0.15)]">
           {/* Writing area — relative container anchors the static caret overlay */}
           <div
             ref={caretContainerRef}
-            className="relative overflow-hidden rounded-t-2xl"
+            className="relative overflow-hidden"
           >
             <textarea
               ref={textareaRef}
@@ -672,14 +792,122 @@ export function InputBar({
             )}
           </div>
 
+          {/* Send button - top right corner of card */}
+          {value.trim().length > 0 && !isProcessing && (
+            <button
+              onClick={() => {
+                const trimmed = value.trim();
+                if (trimmed) {
+                  onSend(trimmed);
+                  setValue("");
+                  setPlanRejected(false);
+                }
+              }}
+              className="absolute top-2 right-2 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
+              title="Send message (Enter)"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="m5 9 7-7 7 7" />
+                <path d="M12 16V2" />
+                <circle cx="12" cy="21" r="1" />
+              </svg>
+            </button>
+          )}
+
           {/* Toolbar strip */}
           <div
-            className="h-9 flex items-center px-5 border-t border-pane-border shrink-0 bg-transparent font-mono text-pane-text-secondary"
+            className="h-9 flex items-center px-5 shrink-0 bg-transparent font-mono text-pane-text-secondary"
             style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
+            {/* Add path button */}
+            <button
+              onClick={() => {
+                try {
+                  // Trigger file/folder picker
+                  const input = document.createElement('input');
+                  input.type = 'file';
+                  input.multiple = true;
+                  // Try to enable directory selection (Electron/Tauri supports this)
+                  input.webkitdirectory = true;
+                  input.onchange = (e) => {
+                    const files = (e.target as HTMLInputElement).files;
+                    if (files && files.length > 0) {
+                      // When selecting a folder with webkitdirectory, files will contain
+                      // all files from that folder. We just want to show the folder name.
+                      
+                      // Extract unique top-level folder names from webkitRelativePath
+                      const folderNames = new Set<string>();
+                      
+                      Array.from(files).forEach(f => {
+                        if (f.webkitRelativePath) {
+                          // webkitRelativePath is "folderName/file.txt" or "folderName/subfolder/file.txt"
+                          const relativePath = f.webkitRelativePath;
+                          const parts = relativePath.split('/');
+                          if (parts.length > 0 && parts[0]) {
+                            folderNames.add(parts[0]);
+                          }
+                        }
+                      });
+                      
+                      // If we have folder names, use them with proper styling
+                      if (folderNames.size > 0) {
+                        const pathsText = Array.from(folderNames).map(p => {
+                          // Prepend ./ so the path matches SPECIAL_REGEX and gets styled with text-pane-error
+                          return `\`./${p}\``;
+                        }).join('\n');
+                        setValue(prev => prev ? `${prev}\n${pathsText}` : pathsText);
+                      } else {
+                        // Fallback for individual file selection
+                        const paths = Array.from(files).map(f => {
+                          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                          const path = (f as any).path || f.name;
+                          return `\`${path}\``;
+                        });
+                        const pathsText = paths.join('\n');
+                        setValue(prev => prev ? `${prev}\n${pathsText}` : pathsText);
+                      }
+                    }
+                  };
+                  input.onerror = () => {
+                    // Fallback for browsers that don't support directory selection
+                    input.webkitdirectory = false;
+                    input.click();
+                  };
+                  input.click();
+                } catch (err) {
+                  console.error('Failed to open file picker:', err);
+                }
+              }}
+              className="flex items-center gap-1.5 px-2 py-1 rounded text-pane-text-secondary/50 hover:text-pane-text-secondary hover:bg-pane-text/[0.04] transition-colors btn-press shrink-0"
+              title="Add file or folder path"
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+              <span>add path</span>
+            </button>
+            
             {contextPressure !== "none" && (
               <span
-                className={`mr-auto transition-colors ${contextPressure === "high" ? "text-pane-error" : "text-pane-text-secondary/60"}`}
+                className={`ml-4 mr-auto transition-colors ${contextPressure === "high" ? "text-pane-error" : "text-pane-text-secondary/60"}`}
               >
                 context {contextPercent}%
               </span>

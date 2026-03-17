@@ -17,7 +17,11 @@ import "ace-builds/src-noconflict/mode-rust";
 import "ace-builds/src-noconflict/mode-jsx";
 import "ace-builds/src-noconflict/mode-tsx";
 import "ace-builds/src-noconflict/ext-language_tools";
-// Pane theme is in globals.css - no need to import Ace themes
+// Import the custom Pane theme
+import "../../lib/pane-ace-theme";
+
+// Debug: Log when the theme is imported
+console.log('[FileViewer] Custom Pane theme imported');
 
 // Map file extensions to Ace modes
 function getModeForFile(filePath: string): string {
@@ -55,11 +59,17 @@ export function FileViewer() {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
   });
+  const isProcessing = useProjectsStore((s) => {
+    if (!s.activeProjectId) return false;
+    return s.projects.get(s.activeProjectId)?.conversation.isProcessing ?? false;
+  });
   const editorFontSize = useWorkspaceStore((s) => s.editorFontSize);
 
   const editorRef = useRef<AceEditor>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevFilePathRef = useRef<string | null>(null);
+  const followRef = useRef(true);
+  const rafRef = useRef(0);
 
   const handleChange = useCallback(
     (content: string) => {
@@ -110,8 +120,11 @@ export function FileViewer() {
           // Restore position
           if (!isNewFile) {
             // Same file (external update) — restore immediate position
-            editor.session.setScrollTop(scrollTop);
-            editor.moveCursorToPosition(pos);
+            // But only if we're not processing (agent editing) to allow auto-scrolling
+            if (!isProcessing) {
+              editor.session.setScrollTop(scrollTop);
+              editor.moveCursorToPosition(pos);
+            }
           } else {
             // New file — restore its last known position
             const saved = activeFilePath && scrollPositions ? scrollPositions.get(activeFilePath) : null;
@@ -129,7 +142,7 @@ export function FileViewer() {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
     }
-  }, [activeFilePath, activeFileContent, activeProjectId, scrollPositions]);
+  }, [activeFilePath, activeFileContent, activeProjectId, scrollPositions, isProcessing]);
 
   useEffect(() => {
     return () => {
@@ -137,6 +150,75 @@ export function FileViewer() {
         clearTimeout(saveTimerRef.current);
       }
     };
+  }, []);
+
+  // Auto-scroll to follow agent edits during processing
+  useEffect(() => {
+    if (!isProcessing || !editorRef.current) return;
+    
+    const editor = editorRef.current.editor;
+    const tick = () => {
+      if (followRef.current && editorRef.current) {
+        // Get current cursor position
+        const cursor = editor.getCursorPosition();
+        // Get the line count and scroll to keep the cursor visible
+        const lineHeight = editor.renderer.lineHeight;
+        const scrollTop = editor.session.getScrollTop();
+        const scrollerHeight = editor.renderer.scroller.clientHeight;
+        
+        // Calculate target scroll position to keep cursor in view
+        const cursorY = cursor.row * lineHeight;
+        const targetScrollTop = cursorY - scrollerHeight * 0.3; // Keep cursor at ~30% from top
+        
+        // Smooth scroll if needed
+        if (Math.abs(targetScrollTop - scrollTop) > lineHeight) {
+          editor.session.setScrollTop(targetScrollTop);
+        }
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [isProcessing]);
+
+  // Wheel listener: disengage follow on upward scroll
+  useEffect(() => {
+    if (!editorRef.current) return;
+    const editor = editorRef.current.editor;
+    const container = editor.renderer.scroller;
+    
+    const handleWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) followRef.current = false;
+    };
+    
+    container.addEventListener("wheel", handleWheel, { passive: true });
+    return () => container.removeEventListener("wheel", handleWheel);
+  }, []);
+
+  // Scroll listener: re-engage follow when user scrolls back to cursor position
+  useEffect(() => {
+    if (!editorRef.current) return;
+    const editor = editorRef.current.editor;
+    const container = editor.renderer.scroller;
+    
+    const handleScroll = () => {
+      if (!followRef.current && editorRef.current) {
+        const cursor = editor.getCursorPosition();
+        const lineHeight = editor.renderer.lineHeight;
+        const scrollTop = editor.session.getScrollTop();
+        const cursorY = cursor.row * lineHeight;
+        const distanceFromCursor = Math.abs(cursorY - scrollTop);
+        
+        // Re-engage follow if user scrolls near the cursor position
+        if (distanceFromCursor < lineHeight * 3) {
+          followRef.current = true;
+        }
+      }
+    };
+    
+    container.addEventListener("scroll", handleScroll, { passive: true });
+    return () => container.removeEventListener("scroll", handleScroll);
   }, []);
 
   // Auto-focus editor when switching to viewer mode
@@ -193,6 +275,7 @@ export function FileViewer() {
       <AceEditor
         ref={editorRef}
         mode={getModeForFile(activeFilePath)}
+        theme="pane"
         defaultValue={activeFileContent}
         onChange={handleChange}
         name="pane-editor"

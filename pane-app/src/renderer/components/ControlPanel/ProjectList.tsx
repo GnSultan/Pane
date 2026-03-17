@@ -2,7 +2,9 @@ import { useState, useCallback } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { detectProjectRoot } from "../../lib/tauri-commands";
 
-const electronAPI = (window as any).electronAPI;
+import type { ElectronAPI } from '../../lib/electron';
+
+const electronAPI = window.electronAPI as ElectronAPI;
 
 // Each row subscribes to its own primitive data — no inline objects in selectors
 function ProjectRow({

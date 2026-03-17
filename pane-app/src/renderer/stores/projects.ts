@@ -154,6 +154,7 @@ interface ProjectsState {
     projectId: string,
     message: ConversationMessage,
   ) => void;
+  removeLastConversationMessage: (projectId: string) => void;
   updateMessageContent: (
     projectId: string,
     messageId: string,
@@ -174,6 +175,7 @@ interface ProjectsState {
   ) => void;
   setConversationRoutedModel: (projectId: string, model: string | null) => void;
   setConversationReady: (projectId: string, isReady: boolean) => void;
+  setConversationRestored: (projectId: string, isRestored: boolean) => void;
   setConversationProcessing: (projectId: string, isProcessing: boolean) => void;
   setConversationError: (projectId: string, error: string | null) => void;
   setLastMessageStreamingDone: (projectId: string) => void;
@@ -206,6 +208,10 @@ interface ProjectsState {
     projectId: string,
     tokens: number,
     pressure: import("../lib/claude-types").ContextPressure,
+  ) => void;
+  setCompactionStatus: (
+    projectId: string,
+    status: { isCompacting?: boolean; lastCompactionAt?: number; compactionCount?: number; tokensSaved?: number },
   ) => void;
   setCachedBrief: (projectId: string, brief: string) => void;
 
@@ -472,6 +478,16 @@ function createProjectsStore() {
         })),
       ),
 
+    removeLastConversationMessage: (projectId) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: {
+            ...p.conversation,
+            messages: p.conversation.messages.slice(0, -1),
+          },
+        })),
+      ),
+
     updateMessageContent: (projectId, messageId, content) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
@@ -595,6 +611,13 @@ function createProjectsStore() {
         })),
       ),
 
+    setConversationRestored: (projectId, isRestored) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: { ...p.conversation, isRestored },
+        })),
+      ),
+
     setConversationProcessing: (projectId, isProcessing) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -714,6 +737,19 @@ function createProjectsStore() {
         })),
       ),
 
+    setCompactionStatus: (projectId, status) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: {
+            ...p.conversation,
+            isCompacting: status.isCompacting ?? p.conversation.isCompacting,
+            lastCompactionAt: status.lastCompactionAt ?? p.conversation.lastCompactionAt,
+            compactionCount: status.compactionCount ?? p.conversation.compactionCount,
+            tokensSaved: status.tokensSaved ?? p.conversation.tokensSaved,
+          },
+        })),
+      ),
+
     setCachedBrief: (projectId, brief) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -743,6 +779,10 @@ function createProjectsStore() {
             contextPressure: "none",
             cachedBrief: "",
             statusMessage: null,
+            isCompacting: false,
+            lastCompactionAt: null,
+            compactionCount: 0,
+            tokensSaved: 0,
           },
         })),
       ),

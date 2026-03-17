@@ -1,8 +1,10 @@
-import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  eslint.configs.recommended,
+  {
+    ignores: ["node_modules/**", "out/**", "dist/**", "src/renderer/lib/language-loader.ts"],
+  },
+  ...tseslint.configs.recommended,
   ...tseslint.configs.strict,
   {
     files: ["src/renderer/**/*.{ts,tsx}"],
@@ -31,8 +33,5 @@ export default tseslint.config(
       // Disabled — too noisy for React components with dynamic classes
       "@typescript-eslint/no-dynamic-delete": "off",
     },
-  },
-  {
-    ignores: ["node_modules/**", "out/**", "dist/**", "src/renderer/lib/language-loader.ts"],
   },
 );

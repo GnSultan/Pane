@@ -6,8 +6,8 @@
  * Classify the intent of a prompt as 'plan' or 'execute'.
  * Zero latency — pure heuristic, no LLM call.
  *
- * plan   → architectural/reasoning requests routed to deep-thinking model (DeepSeek V3.2 Speciale)
- * execute → implementation/generation requests routed to fast model (DeepSeek V3.2)
+ * plan   → architectural/reasoning requests routed to deep-thinking model (DeepSeek Reasoner)
+ * execute → implementation/generation requests routed to fast model (DeepSeek Chat)
  *
  * @param {string} prompt
  * @returns {{ intent: 'plan' | 'execute', confidence: number, reason: string }}
