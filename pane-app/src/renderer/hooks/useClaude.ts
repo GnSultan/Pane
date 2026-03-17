@@ -3,6 +3,16 @@ import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
 import type { Todo } from "../lib/claude-types";
 
+// ============================================================================
+// Model Execution Timeout Configuration
+// ============================================================================
+// These timeouts determine when to consider a model "hung" and force termination.
+// Increased values to prevent premature killing of long-running operations.
+// ============================================================================
+const MODEL_SAFETY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for silent stream
+const RESULT_PROCESSING_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes after result message
+const CHECKPOINT_TIMEOUT_MS = 3 * 1000; // 3 seconds for checkpoint creation
+
 import {
   sendToPunk,
   abortPunk,
@@ -559,7 +569,7 @@ export function usePunk(projectId: string) {
         const cpResult = await Promise.race([
           createCheckpoint(projectId, project.root, messageId),
           new Promise<{ id: null; fileCount: 0 }>((resolve) =>
-            setTimeout(() => resolve({ id: null, fileCount: 0 }), 3000),
+            setTimeout(() => resolve({ id: null, fileCount: 0 }), CHECKPOINT_TIMEOUT_MS),
           ),
         ]);
         if (cpResult.id) {
@@ -624,10 +634,10 @@ export function usePunk(projectId: string) {
           clearTimeout(resultSafetyTimer);
           resultSafetyTimer = setTimeout(() => {
             console.warn(
-              "[pane] resultSafetyTimer triggered — Gemini pipe went silent",
+              `[pane] resultSafetyTimer triggered — model stream went silent for ${MODEL_SAFETY_TIMEOUT_MS / 1000} seconds`,
             );
             finishProcessing();
-          }, 300000);
+          }, MODEL_SAFETY_TIMEOUT_MS);
         }
 
         switch (event.event) {
@@ -656,10 +666,10 @@ export function usePunk(projectId: string) {
               if (msg.type === "result" && !resultSafetyTimer) {
                 resultSafetyTimer = setTimeout(() => {
                   console.warn(
-                    "[pane] Process hung after result — force-clearing processing state",
+                    `[pane] Process hung after result message for ${RESULT_PROCESSING_TIMEOUT_MS / 1000} seconds — force-clearing processing state`,
                   );
                   finishProcessing();
-                }, 30000);
+                }, RESULT_PROCESSING_TIMEOUT_MS);
               }
             } catch (e) {
               console.error("Failed to parse claude message:", e);
@@ -784,7 +794,7 @@ export function usePunk(projectId: string) {
             intent,
             project.root,
           ).catch(() => {}),
-          new Promise((resolve) => setTimeout(resolve, 500)),
+          new Promise((resolve) => setTimeout(resolve, 1000)), // Increased from 500ms to 1 second
         ]);
         const selectedModel = useWorkspaceStore.getState().selectedModel;
         const selectedModelThinking =
@@ -793,12 +803,8 @@ export function usePunk(projectId: string) {
           useWorkspaceStore.getState().selectedModelProvider;
         const routedModel = chooseModelForIntent(selectedModel, intent);
 
-        resultSafetyTimer = setTimeout(() => {
-          console.warn(
-            "[pane] resultSafetyTimer triggered (initialization hang)",
-          );
-          finishProcessing();
-        }, 5000);
+        // Don't set an aggressive initial timeout - let models take the time they need
+        // The processStarted event will handle legitimate hangs
 
         const truncatedHistory = conversation.messages.slice(-20);
         const todos = conversation.todos;
