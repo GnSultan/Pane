@@ -178,6 +178,33 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
   },
   {
+    name: "pane_change_history",
+    description: "List the history of file changes made during this session. Shows the file, old content, new content, and timestamp for each change.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "pane_search_changes",
+    description: "Search for specific changes in the change history. Find changes by file path, content, or description.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query to find changes (matches file, content, or description)" },
+        file_path: { type: "string", description: "Filter changes to a specific file path" },
+      },
+    },
+  },
+  {
+    name: "pane_revert_change",
+    description: "Revert a specific change from the change history. This will restore the old content and remove the change from history.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        change_id: { type: "string", description: "The ID of the change to revert (use pane_change_history to find IDs)" },
+      },
+      required: ["change_id"],
+    },
+  },
+  {
     name: "pane_knowledge_graph",
     description: "View the project's knowledge graph — nodes (decisions, patterns, lessons, errors) and their connections, including cross-project pattern links. Shows the accumulated intelligence Pane has built from observing your work.",
     inputSchema: { type: "object", properties: {} },
@@ -394,6 +421,88 @@ async function handleToolCall(name, args) {
         return `${cp.id} — ${cp.fileCount} files${ago ? ` (${ago})` : ""}`;
       }).join("\n");
       return text(`${manifest.checkpoints.length} checkpoints:\n${out}`);
+    }
+
+    case "pane_change_history": {
+      const changeHistoryDir = path.join(PANE_DIR, "change-history", PROJECT_ID);
+      const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
+      let changes = [];
+      try { changes = await readJson(changeHistoryFile); }
+      catch { return text("No change history yet. Changes will be recorded as you edit files."); }
+
+      if (!changes || changes.length === 0) return text("No change history yet. Changes will be recorded as you edit files.");
+
+      const out = changes.map(c => {
+        const date = new Date(c.timestamp).toLocaleString();
+        const shortOld = c.oldString.length > 50 ? c.oldString.slice(0, 50) + "..." : c.oldString;
+        const shortNew = c.newString.length > 50 ? c.newString.slice(0, 50) + "..." : c.newString;
+        return `${c.id} — ${c.file}\n  ${date}\n  "${shortOld}" → "${shortNew}"`;
+      }).join("\n\n");
+      return text(`${changes.length} changes:\n\n${out}`);
+    }
+
+    case "pane_search_changes": {
+      const query = params.query;
+      const filePath = params.file_path;
+      const changeHistoryDir = path.join(PANE_DIR, "change-history", PROJECT_ID);
+      const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
+      let changes = [];
+      try { changes = await readJson(changeHistoryFile); }
+      catch { return text("No change history to search."); }
+
+      let filtered = changes;
+      if (filePath) {
+        filtered = filtered.filter(c => c.file === filePath);
+      }
+      if (query) {
+        const lowerQuery = query.toLowerCase();
+        filtered = filtered.filter(c => 
+          c.description?.toLowerCase().includes(lowerQuery) ||
+          c.oldString?.toLowerCase().includes(lowerQuery) ||
+          c.newString?.toLowerCase().includes(lowerQuery) ||
+          c.file.toLowerCase().includes(lowerQuery)
+        );
+      }
+
+      if (filtered.length === 0) return text("No matching changes found.");
+
+      const out = filtered.map(c => {
+        const date = new Date(c.timestamp).toLocaleString();
+        return `${c.id} — ${c.file}\n  ${date}\n  "${c.oldString}" → "${c.newString}"`;
+      }).join("\n\n");
+      return text(`${filtered.length} matching changes:\n\n${out}`);
+    }
+
+    case "pane_revert_change": {
+      const changeId = params.change_id;
+      const changeHistoryDir = path.join(PANE_DIR, "change-history", PROJECT_ID);
+      const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
+      let changes = [];
+      try { changes = await readJson(changeHistoryFile); }
+      catch { return text("Error: No change history found."); }
+
+      const changeIndex = changes.findIndex(c => c.id === changeId);
+      if (changeIndex === -1) return text(`Error: Change ${changeId} not found.`);
+
+      const change = changes[changeIndex];
+      const resolvedPath = path.isAbsolute(change.file) ? change.file : path.join(PROJECT_ROOT, change.file);
+
+      try {
+        const currentContent = await fs.promises.readFile(resolvedPath, "utf-8");
+        if (!currentContent.includes(change.newString)) {
+          return text("Error: File content doesn't match expected change. The file may have been modified since this change was made.");
+        }
+
+        const revertedContent = currentContent.replace(change.newString, change.oldString);
+        await fs.promises.writeFile(resolvedPath, revertedContent, "utf-8");
+
+        changes.splice(changeIndex, 1);
+        await fs.promises.writeFile(changeHistoryFile, JSON.stringify(changes, null, 2), "utf-8");
+
+        return text(`Successfully reverted change in ${change.file}`);
+      } catch (error) {
+        return text(`Error: ${error.message}`);
+      }
     }
 
     case "pane_knowledge_graph": {

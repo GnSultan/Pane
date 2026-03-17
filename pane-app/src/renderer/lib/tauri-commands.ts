@@ -459,6 +459,75 @@ export async function deleteProjectCheckpoints(
   return electronAPI.invoke("delete_project_checkpoints", { projectId });
 }
 
+// --- Change History ---
+
+export interface ChangeEntry {
+  id: string;
+  timestamp: number;
+  file: string;
+  oldString: string;
+  newString: string;
+  description?: string;
+}
+
+export interface ChangeHistoryResult {
+  changes: ChangeEntry[];
+}
+
+export async function recordChange(
+  projectId: string,
+  filePath: string,
+  oldString: string,
+  newString: string,
+  description?: string,
+  timestamp?: number,
+): Promise<{ id: string; success: boolean }> {
+  return electronAPI.invoke("record_change", {
+    projectId,
+    filePath,
+    oldString,
+    newString,
+    description,
+    timestamp,
+  });
+}
+
+export async function getChangeHistory(
+  projectId: string,
+): Promise<ChangeHistoryResult> {
+  return electronAPI.invoke("get_change_history", { projectId });
+}
+
+export async function revertChange(
+  projectId: string,
+  changeId: string,
+  workingDir: string,
+): Promise<{ success: boolean; output?: string; error?: string; file?: string }> {
+  return electronAPI.invoke("revert_change", {
+    projectId,
+    changeId,
+    workingDir,
+  });
+}
+
+export async function searchChanges(
+  projectId: string,
+  query?: string,
+  filePath?: string,
+): Promise<ChangeHistoryResult> {
+  return electronAPI.invoke("search_changes", {
+    projectId,
+    query,
+    filePath,
+  });
+}
+
+export async function deleteChangeHistory(
+  projectId: string,
+): Promise<{ success: boolean; error?: string }> {
+  return electronAPI.invoke("delete_change_history", { projectId });
+}
+
 // --- Pane Intelligence Layer: State + Memory ---
 
 export interface EditorState {

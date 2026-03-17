@@ -3,6 +3,7 @@ import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
+import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
 import type { Todo } from "../../lib/claude-types";
 import {
   PROVIDER_MODELS,
@@ -470,6 +471,7 @@ export function InputBar({
 }: InputBarProps) {
   const [value, setValue] = useState("");
   const [todoPanelOpen, setTodoPanelOpen] = useState(false);
+  const [changeHistoryPanelOpen, setChangeHistoryPanelOpen] = useState(false);
   const [isFadingOut, setIsFadingOut] = useState(false);
   const [caretPos, setCaretPos] = useState<{
     top: number;
@@ -683,6 +685,18 @@ export function InputBar({
               </button>
             )}
             <button
+              onClick={() => setChangeHistoryPanelOpen((v) => !v)}
+              className={`font-mono btn-press shrink-0 transition-colors ${
+                changeHistoryPanelOpen
+                  ? "text-pane-text"
+                  : "text-pane-text-secondary hover:text-pane-text"
+              }`}
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+              title="Change history"
+            >
+              history
+            </button>
+            <button
               onClick={onAbort}
               className="text-pane-error font-mono hover:text-pane-error/80 ml-auto btn-press"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
@@ -733,6 +747,13 @@ export function InputBar({
         <TodoPanel
           projectId={projectId}
           onCollapse={() => setTodoPanelOpen(false)}
+        />
+      )}
+
+      {changeHistoryPanelOpen && (
+        <ChangeHistoryPanel
+          projectId={projectId}
+          onCollapse={() => setChangeHistoryPanelOpen(false)}
         />
       )}
 

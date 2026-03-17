@@ -336,6 +336,54 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "pane_change_history",
+      description:
+        "List the history of file changes made during this session. Shows the file, old content, new content, and timestamp for each change.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_search_changes",
+      description:
+        "Search for specific changes in the change history. Find changes by file path, content, or description.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Search query to find changes (matches file, content, or description)",
+          },
+          file_path: {
+            type: "string",
+            description: "Filter changes to a specific file path",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_revert_change",
+      description:
+        "Revert a specific change from the change history. This will restore the old content and remove the change from history.",
+      parameters: {
+        type: "object",
+        properties: {
+          change_id: {
+            type: "string",
+            description: "The ID of the change to revert (use pane_change_history to find IDs)",
+          },
+        },
+        required: ["change_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "pane_knowledge_graph",
       description:
         "View the project's knowledge graph — nodes (decisions, patterns, lessons, errors) and their connections, including cross-project pattern links.",

@@ -1172,7 +1172,276 @@ function registerCheckpointHandlers() {
       });
     } catch {}
   });
+
+  // --- Change History Handlers ---
+  function changeHistoryDir(projectId) {
+    return path.join(os.homedir(), ".pane", "change-history", projectId);
+  }
+
+  function changeHistoryFile(projectId) {
+    return path.join(changeHistoryDir(projectId), "changes.json");
+  }
+
+  async function readChangeHistory(projectId) {
+    try {
+      const file = changeHistoryFile(projectId);
+      const data = await fs.promises.readFile(file, "utf-8");
+      return JSON.parse(data);
+    } catch {
+      return [];
+    }
+  }
+
+  async function writeChangeHistory(projectId, changes) {
+    const dir = changeHistoryDir(projectId);
+    await fs.promises.mkdir(dir, { recursive: true });
+    const file = changeHistoryFile(projectId);
+    await fs.promises.writeFile(file, JSON.stringify(changes, null, 2), "utf-8");
+  }
+
+  ipcMain.handle("record_change", async (_event, args) => {
+    const { projectId, filePath, oldString, newString, description, timestamp } = args;
+    
+    const changes = await readChangeHistory(projectId);
+    
+    const change = {
+      id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: timestamp || Date.now(),
+      file: filePath,
+      oldString,
+      newString,
+      description: description || "",
+    };
+    
+    changes.unshift(change); // Add to beginning (most recent first)
+    
+    // Keep only last 500 changes to prevent unbounded growth
+    const trimmed = changes.slice(0, 500);
+    
+    await writeChangeHistory(projectId, trimmed);
+    
+    return { id: change.id, success: true };
+  });
+
+  ipcMain.handle("get_change_history", async (_event, args) => {
+    const { projectId } = args;
+    const changes = await readChangeHistory(projectId);
+    return { changes };
+  });
+
+  ipcMain.handle("revert_change", async (_event, args) => {
+    const { projectId, changeId, workingDir } = args;
+    
+    const changes = await readChangeHistory(projectId);
+    const changeIndex = changes.findIndex((c) => c.id === changeId);
+    
+    if (changeIndex === -1) {
+      return { success: false, error: "Change not found" };
+    }
+    
+    const change = changes[changeIndex];
+    const resolvedPath = path.isAbsolute(change.file) 
+      ? change.file 
+      : path.join(workingDir, change.file);
+    
+    try {
+      const currentContent = await fs.promises.readFile(resolvedPath, "utf-8");
+      
+      // Verify the current content matches newString
+      if (!currentContent.includes(change.newString)) {
+        return { success: false, error: "File content doesn't match expected change" };
+      }
+      
+      // Revert: replace newString with oldString
+      const revertedContent = currentContent.replace(change.newString, change.oldString);
+      await fs.promises.writeFile(resolvedPath, revertedContent, "utf-8");
+      
+      // Remove the change from history
+      changes.splice(changeIndex, 1);
+      await writeChangeHistory(projectId, changes);
+      
+      return { 
+        success: true, 
+        output: `Reverted change in ${change.file}`,
+        file: change.file,
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle("search_changes", async (_event, args) => {
+    const { projectId, query, filePath } = args;
+    
+    const changes = await readChangeHistory(projectId);
+    let filtered = changes;
+    
+    if (filePath) {
+      filtered = filtered.filter((c) => c.file === filePath);
+    }
+    
+    if (query) {
+      const lowerQuery = query.toLowerCase();
+      filtered = filtered.filter((c) => 
+        c.description?.toLowerCase().includes(lowerQuery) ||
+        c.oldString?.toLowerCase().includes(lowerQuery) ||
+        c.newString?.toLowerCase().includes(lowerQuery) ||
+        c.file.toLowerCase().includes(lowerQuery)
+      );
+    }
+    
+    return { changes: filtered };
+  });
+
+  ipcMain.handle("delete_change_history", async (_event, args) => {
+    const { projectId } = args;
+    try {
+      await fs.promises.rm(changeHistoryDir(projectId), {
+        recursive: true,
+        force: true,
+      });
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
 }
+
+function registerChangeHistoryHandlers() {
+  // --- Change History Handlers ---
+  function changeHistoryDir(projectId) {
+    return path.join(os.homedir(), ".pane", "change-history", projectId);
+  }
+
+  function changeHistoryFile(projectId) {
+    return path.join(changeHistoryDir(projectId), "changes.json");
+  }
+
+  async function readChangeHistory(projectId) {
+    try {
+      const file = changeHistoryFile(projectId);
+      const data = await fs.promises.readFile(file, "utf-8");
+      return JSON.parse(data);
+    } catch {
+      return [];
+    }
+  }
+
+  async function writeChangeHistory(projectId, changes) {
+    const dir = changeHistoryDir(projectId);
+    await fs.promises.mkdir(dir, { recursive: true });
+    const file = changeHistoryFile(projectId);
+    await fs.promises.writeFile(file, JSON.stringify(changes, null, 2), "utf-8");
+  }
+
+  ipcMain.handle("record_change", async (_event, args) => {
+    const { projectId, filePath, oldString, newString, description, timestamp } = args;
+    
+    const changes = await readChangeHistory(projectId);
+    
+    const change = {
+      id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: timestamp || Date.now(),
+      file: filePath,
+      oldString,
+      newString,
+      description: description || "",
+    };
+    
+    changes.unshift(change); // Add to beginning (most recent first)
+    
+    // Keep only last 500 changes to prevent unbounded growth
+    const trimmed = changes.slice(0, 500);
+    
+    await writeChangeHistory(projectId, trimmed);
+    
+    return { id: change.id, success: true };
+  });
+
+  ipcMain.handle("get_change_history", async (_event, args) => {
+    const { projectId } = args;
+    const changes = await readChangeHistory(projectId);
+    return { changes };
+  });
+
+  ipcMain.handle("revert_change", async (_event, args) => {
+    const { projectId, changeId, workingDir } = args;
+    
+    const changes = await readChangeHistory(projectId);
+    const changeIndex = changes.findIndex((c) => c.id === changeId);
+    
+    if (changeIndex === -1) {
+      return { success: false, error: "Change not found" };
+    }
+    
+    const change = changes[changeIndex];
+    const resolvedPath = path.isAbsolute(change.file) 
+      ? change.file 
+      : path.join(workingDir, change.file);
+    
+    try {
+      const currentContent = await fs.promises.readFile(resolvedPath, "utf-8");
+      
+      // Verify the current content matches newString
+      if (!currentContent.includes(change.newString)) {
+        return { success: false, error: "File content doesn't match expected change" };
+      }
+      
+      // Revert: replace newString with oldString
+      const revertedContent = currentContent.replace(change.newString, change.oldString);
+      await fs.promises.writeFile(resolvedPath, revertedContent, "utf-8");
+      
+      // Remove the change from history
+      changes.splice(changeIndex, 1);
+      await writeChangeHistory(projectId, changes);
+      
+      return { 
+        success: true, 
+        output: `Reverted change in ${change.file}`,
+        file: change.file,
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle("search_changes", async (_event, args) => {
+    const { projectId, query, filePath } = args;
+    
+    const changes = await readChangeHistory(projectId);
+    let filtered = changes;
+    
+    if (filePath) {
+      filtered = filtered.filter((c) => c.file === filePath);
+    }
+    
+    if (query) {
+      const lowerQuery = query.toLowerCase();
+      filtered = filtered.filter((c) => 
+        c.description?.toLowerCase().includes(lowerQuery) ||
+        c.oldString?.toLowerCase().includes(lowerQuery) ||
+        c.newString?.toLowerCase().includes(lowerQuery) ||
+        c.file.toLowerCase().includes(lowerQuery)
+      );
+    }
+    
+    return { changes: filtered };
+  });
+
+  ipcMain.handle("delete_change_history", async (_event, args) => {
+    const { projectId } = args;
+    try {
+      await fs.promises.rm(changeHistoryDir(projectId), {
+        recursive: true,
+        force: true,
+      });
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+}
+
 // --- State + Memory handlers for Pane Intelligence Layer ---
 // Writes state to ~/.pane/state/{projectId}/ for the MCP server to read.
 // Writes memory to ~/.pane/memory/{projectId}/ for cross-session persistence.
@@ -1623,6 +1892,7 @@ function registerIpcHandlers() {
   registerWatcherHandlers();
   registerPtyHandlers();
   registerCheckpointHandlers();
+  registerChangeHistoryHandlers();
   registerStateHandlers();
   registerMemoryHandlers();
   registerSessionHandlers();

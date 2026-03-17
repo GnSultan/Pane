@@ -168,6 +168,50 @@ export class ToolExecutor {
   }
 
   /**
+   * Record a change in the change history
+   */
+  async recordChange(change) {
+    try {
+      const paneDir = path.join(os.homedir(), ".pane");
+      const changeHistoryDir = path.join(paneDir, "change-history", this.projectId);
+      const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
+      
+      // Read existing changes
+      let changes = [];
+      try {
+        const data = await fsPromises.readFile(changeHistoryFile, "utf-8");
+        changes = JSON.parse(data);
+      } catch {
+        // File doesn't exist or is corrupted, start with empty array
+      }
+      
+      // Add new change
+      const newChange = {
+        id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: change.timestamp || Date.now(),
+        file: change.filePath,
+        oldString: change.oldString,
+        newString: change.newString,
+        description: change.description || "",
+      };
+      
+      changes.unshift(newChange); // Add to beginning (most recent first)
+      
+      // Keep only last 500 changes
+      const trimmed = changes.slice(0, 500);
+      
+      // Write back to file
+      await fsPromises.mkdir(changeHistoryDir, { recursive: true });
+      await fsPromises.writeFile(changeHistoryFile, JSON.stringify(trimmed, null, 2), "utf-8");
+      
+      return { id: newChange.id, success: true };
+    } catch (error) {
+      console.error("Failed to record change:", error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
    * Get safe environment variables for command execution
    */
   getSafeEnvironment() {
@@ -536,6 +580,20 @@ export class ToolExecutor {
       // Replace
       const newContent = currentContent.replace(oldString, newString);
       await fsPromises.writeFile(resolvedPath, newContent, DEFAULT_ENCODING);
+
+      // Record the change in change history
+      try {
+        const relativePath = path.relative(this.projectRoot, resolvedPath);
+        await this.recordChange({
+          filePath: relativePath,
+          oldString,
+          newString,
+          timestamp: Date.now(),
+        });
+      } catch (recorderError) {
+        console.error("Failed to record change:", recorderError);
+        // Don't fail the operation if recording fails
+      }
 
       const stats = await fsPromises.stat(resolvedPath);
 
@@ -978,6 +1036,87 @@ export class ToolExecutor {
             return `${cp.id} — ${cp.fileCount} files`;
           }).join("\n");
           return { success: true, output: `${manifest.checkpoints.length} checkpoints:\n${out}`, toolId };
+        }
+
+        case "pane_change_history": {
+          const changeHistoryDir = path.join(paneDir, "change-history", this.projectId);
+          const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
+          let changes = [];
+          try { changes = JSON.parse(await fsPromises.readFile(changeHistoryFile, "utf-8")); }
+          catch { return { success: true, output: "No change history yet. Changes will be recorded as you edit files.", toolId }; }
+
+          if (!changes || changes.length === 0) return { success: true, output: "No change history yet. Changes will be recorded as you edit files.", toolId };
+
+          const out = changes.map(c => {
+            const date = new Date(c.timestamp).toLocaleString();
+            const shortOld = c.oldString.length > 50 ? c.oldString.slice(0, 50) + "..." : c.oldString;
+            const shortNew = c.newString.length > 50 ? c.newString.slice(0, 50) + "..." : c.newString;
+            return `${c.id} — ${c.file}\n  ${date}\n  "${shortOld}" → "${shortNew}"`;
+          }).join("\n\n");
+          return { success: true, output: `${changes.length} changes:\n\n${out}`, toolId };
+        }
+
+        case "pane_search_changes": {
+          const { query, file_path: filePath } = input;
+          const changeHistoryDir = path.join(paneDir, "change-history", this.projectId);
+          const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
+          let changes = [];
+          try { changes = JSON.parse(await fsPromises.readFile(changeHistoryFile, "utf-8")); }
+          catch { return { success: true, output: "No change history to search.", toolId }; }
+
+          let filtered = changes;
+          if (filePath) {
+            filtered = filtered.filter(c => c.file === filePath);
+          }
+          if (query) {
+            const lowerQuery = query.toLowerCase();
+            filtered = filtered.filter(c => 
+              c.description?.toLowerCase().includes(lowerQuery) ||
+              c.oldString?.toLowerCase().includes(lowerQuery) ||
+              c.newString?.toLowerCase().includes(lowerQuery) ||
+              c.file.toLowerCase().includes(lowerQuery)
+            );
+          }
+
+          if (filtered.length === 0) return { success: true, output: "No matching changes found.", toolId };
+
+          const out = filtered.map(c => {
+            const date = new Date(c.timestamp).toLocaleString();
+            return `${c.id} — ${c.file}\n  ${date}\n  "${c.oldString}" → "${c.newString}"`;
+          }).join("\n\n");
+          return { success: true, output: `${filtered.length} matching changes:\n\n${out}`, toolId };
+        }
+
+        case "pane_revert_change": {
+          const { change_id: changeId } = input;
+          const changeHistoryDir = path.join(paneDir, "change-history", this.projectId);
+          const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
+          let changes = [];
+          try { changes = JSON.parse(await fsPromises.readFile(changeHistoryFile, "utf-8")); }
+          catch { return { success: false, error: "No change history found.", toolId }; }
+
+          const changeIndex = changes.findIndex(c => c.id === changeId);
+          if (changeIndex === -1) return { success: false, error: `Change ${changeId} not found.`, toolId };
+
+          const change = changes[changeIndex];
+          const resolvedPath = path.isAbsolute(change.file) ? change.file : path.join(this.projectRoot, change.file);
+
+          try {
+            const currentContent = await fsPromises.readFile(resolvedPath, "utf-8");
+            if (!currentContent.includes(change.newString)) {
+              return { success: false, error: "File content doesn't match expected change. The file may have been modified since this change was made.", toolId };
+            }
+
+            const revertedContent = currentContent.replace(change.newString, change.oldString);
+            await fsPromises.writeFile(resolvedPath, revertedContent, "utf-8");
+
+            changes.splice(changeIndex, 1);
+            await fsPromises.writeFile(changeHistoryFile, JSON.stringify(changes, null, 2), "utf-8");
+
+            return { success: true, output: `Reverted change in ${change.file}`, toolId };
+          } catch (error) {
+            return { success: false, error: error.message, toolId };
+          }
         }
 
         case "pane_knowledge_graph": {
