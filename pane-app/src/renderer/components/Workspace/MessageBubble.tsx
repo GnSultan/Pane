@@ -15,6 +15,7 @@ import { setRestoreInProgress } from "../../hooks/useFileWatcher";
 import { ToolActivity, ServerToolActivity } from "./ToolActivity";
 import { MarkdownText } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
+import { PlanBlock } from "./PlanBlock";
 
 // No CSS containment — content-visibility: auto causes visible pop-in stutter
 // when messages scroll into view, which is worse than the layout cost it saves.
@@ -354,6 +355,15 @@ export function MessageBubble({
   // System messages (tool results) are hidden — matched to their parent tool_use
   if (message.type === "system") {
     return null;
+  }
+
+  // Plan messages — the blueprint Pane produced before execution
+  if (message.type === "plan" && message.planData) {
+    return (
+      <div className="px-4">
+        <PlanBlock planData={message.planData} />
+      </div>
+    );
   }
 
   if (message.type === "assistant") {

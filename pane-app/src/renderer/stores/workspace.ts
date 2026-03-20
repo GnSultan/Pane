@@ -49,22 +49,15 @@ interface WorkspaceState {
   fetchOpenRouterModels: () => Promise<void>;
   fetchAllModels: () => Promise<void>;
   refreshAllModels: () => Promise<void>;
-  // Mind
-  mindOpen: boolean;
-  toggleMind: () => void;
-  closeMind: () => void;
-  // Profile
-  profileOpen: boolean;
+  // Overlay — mutually exclusive workspace-level spaces (mind, profile, history)
+  overlay: "mind" | "profile" | "history" | null;
+  setOverlay: (overlay: "mind" | "profile" | "history" | null) => void;
+  toggleOverlay: (overlay: "mind" | "profile" | "history") => void;
+  // Profile data
   profileName: string;
   profileBio: string;
   profileRole: string;
   profileAvatarDataUrl: string | null; // data:image/... URL for display
-  toggleProfile: () => void;
-  closeProfile: () => void;
-  // ChangeHistory
-  changeHistoryOpen: boolean;
-  toggleChangeHistory: () => void;
-  closeChangeHistory: () => void;
   // Claude updates
   claudeUpdateAvailable: boolean;
   claudeUpdateState: "available" | "updating" | "updated" | "restart" | null;
@@ -227,25 +220,15 @@ function createWorkspaceStore() {
         console.error("Failed to refresh all models:", err);
       }
     },
-    // Mind
-    mindOpen: false,
-    toggleMind: () =>
-      set((state) => ({ mindOpen: !state.mindOpen, profileOpen: false })),
-    closeMind: () => set({ mindOpen: false }),
-    // Profile
-    profileOpen: false,
+    // Overlay
+    overlay: null,
+    setOverlay: (o) => set({ overlay: o }),
+    toggleOverlay: (o) => set((state) => ({ overlay: state.overlay === o ? null : o })),
+    // Profile data
     profileName: "",
     profileBio: "",
     profileRole: "",
     profileAvatarDataUrl: null,
-    toggleProfile: () =>
-      set((s) => ({ profileOpen: !s.profileOpen, mindOpen: false })),
-    closeProfile: () => set({ profileOpen: false }),
-    // ChangeHistory
-    changeHistoryOpen: false,
-    toggleChangeHistory: () =>
-      set((state) => ({ changeHistoryOpen: !state.changeHistoryOpen })),
-    closeChangeHistory: () => set({ changeHistoryOpen: false }),
     // Claude updates
     claudeUpdateAvailable: false,
     claudeUpdateState: null,

@@ -383,7 +383,8 @@ function EngineSelect({
       // Special-case: gemini provider is only shown if there's a key in httpApiKeys
       // OR if we're in gemini-cli mode (where keys are managed by the CLI environment).
       const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini-cli";
-      if (!httpApiKeys?.[opt.provider] && !(isGeminiBackend && opt.provider === "gemini")) return;
+      const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-cli";
+      if (!httpApiKeys?.[opt.provider] && !(isGeminiBackend && opt.provider === "gemini") && !(isClaudeBackend && opt.provider === "anthropic")) return;
 
       if (!groups[opt.provider]) groups[opt.provider] = [];
       groups[opt.provider]!.push(opt);
@@ -471,29 +472,32 @@ function AiEnginesSection({
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
 
   const isGeminiBackend = punkBackend === "gemini-cli";
+  const isClaudeBackend = punkBackend === "claude-cli";
 
   const filteredThinking = useMemo(
     () =>
       THINKING_ENGINES.filter((o) => {
         if (isGeminiBackend) return o.provider === "gemini";
+        if (isClaudeBackend) return o.provider === "anthropic";
         // If not gemini-cli, hide models starting with "auto-"
         if (o.model.startsWith("auto-")) return false;
         // Require API key in HTTP mode (except for providers that support background fetching)
         return o.provider === "openrouter" || !!httpApiKeys?.[o.provider];
       }),
-    [isGeminiBackend, httpApiKeys],
+    [isGeminiBackend, isClaudeBackend, httpApiKeys],
   );
 
   const filteredBuilding = useMemo(
     () =>
       BUILDING_ENGINES.filter((o) => {
         if (isGeminiBackend) return o.provider === "gemini";
+        if (isClaudeBackend) return o.provider === "anthropic";
         // If not gemini-cli, hide models starting with "auto-"
         if (o.model.startsWith("auto-")) return false;
         // Require API key in HTTP mode (except for providers that support background fetching)
         return o.provider === "openrouter" || !!httpApiKeys?.[o.provider];
       }),
-    [isGeminiBackend, httpApiKeys],
+    [isGeminiBackend, isClaudeBackend, httpApiKeys],
   );
 
   const autoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
@@ -740,7 +744,7 @@ function AiEnginesSection({
                   )}
                 </div>
               </div>
-              {!isGeminiBackend && missingThinkingKey && (
+              {!isGeminiBackend && !isClaudeBackend && missingThinkingKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
@@ -774,7 +778,7 @@ function AiEnginesSection({
                   onChange={handleBuildingChange}
                 />
               </div>
-              {!isGeminiBackend && missingBuildingKey && (
+              {!isGeminiBackend && !isClaudeBackend && missingBuildingKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
@@ -808,7 +812,7 @@ function AiEnginesSection({
                   onChange={handleExplainChange}
                 />
               </div>
-              {!isGeminiBackend && missingExplainingKey && (
+              {!isGeminiBackend && !isClaudeBackend && missingExplainingKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
@@ -843,7 +847,7 @@ function AiEnginesSection({
                   onChange={handleOtherChange}
                 />
               </div>
-              {!isGeminiBackend && missingOtherKey && (
+              {!isGeminiBackend && !isClaudeBackend && missingOtherKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
@@ -1148,7 +1152,7 @@ export function Profile() {
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        useWorkspaceStore.getState().closeProfile();
+        useWorkspaceStore.getState().setOverlay(null);
       }
     };
     window.addEventListener("keydown", handler);
@@ -1275,7 +1279,7 @@ export function Profile() {
     >
       {/* Close button — fixed top-right, always accessible while scrolling */}
       <button
-        onClick={() => useWorkspaceStore.getState().closeProfile()}
+        onClick={() => useWorkspaceStore.getState().setOverlay(null)}
         data-no-drag
         className="fixed top-8 right-12 w-7 h-7 flex items-center justify-center rounded text-pane-text-secondary/25 hover:text-pane-text hover:bg-pane-text/[0.06] transition-colors z-50"
         title="Close (Esc)"

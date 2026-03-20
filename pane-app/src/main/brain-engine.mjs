@@ -11,6 +11,18 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 
+import {
+  initSymbolTables,
+  indexFileSymbols,
+  indexProjectSymbols,
+  findSymbols,
+  findRelevantSymbols,
+  getFileSymbols,
+  writeSymbolExport,
+  updateSynthesis,
+  readSynthesis,
+} from "./symbol-index.mjs";
+
 const BRAIN_DIR = path.join(os.homedir(), ".pane", "brain");
 const MEMORY_DIR = path.join(os.homedir(), ".pane", "memory");
 const PROFILE_DIR = path.join(os.homedir(), ".pane", "profile");
@@ -106,70 +118,55 @@ function walkProjectFiles(rootDir, maxFiles = 200) {
 }
 
 /**
- * Build an ordered list of all available providers to try.
- * HTTP first (no subprocess overhead), CLI last as final fallback.
+ * Build an ordered list of providers to try for indexing/summarization.
+ *
+ * Priority: whatever the user is actively using comes first.
+ * - If punk_backend is claude-cli or gemini-cli → CLI goes first
+ * - If punk_backend is http → active HTTP provider goes first
+ * Other configured providers follow as fallback.
  */
 function buildProviderChain(settings) {
   const keys = settings.http_api_keys || {};
   const chain = [];
+  const backend = settings.punk_backend || "http";
 
-  // OpenRouter Free Models (Multi-stage fallback)
-  if (keys.openrouter) {
+  // CLI-first: user is running claude-cli or gemini-cli — use that directly.
+  // No HTTP overhead, no extra API key, same model they're already paying for.
+  if (backend === "claude-cli" || backend === "cli") {
+    chain.push({ type: "cli", command: "claude" });
+  } else if (backend === "gemini-cli") {
+    chain.push({ type: "cli", command: "gemini" });
+  }
+
+  // HTTP provider — either primary (if backend is http) or fallback (if backend is cli)
+  const activeProvider = settings.http_provider || "";
+  const activeKey = keys[activeProvider] || settings.http_api_key || "";
+
+  const cheapModels = {
+    openrouter: "google/gemini-2.0-flash-001",
+    deepseek: "deepseek-chat",
+    anthropic: "claude-haiku-4-5-20251001",
+    openai: "gpt-4o-mini",
+    gemini: "gemini-flash-latest",
+    kimi: "moonshot-v1-8k",
+  };
+
+  if (activeKey && activeProvider) {
     chain.push({
       type: "http",
-      provider: "openrouter",
-      apiKey: keys.openrouter,
-      model: "stepfun/step-3.5-flash:free",
-    });
-    chain.push({
-      type: "http",
-      provider: "openrouter",
-      apiKey: keys.openrouter,
-      model: "nvidia/nemotron-3-super-120b-a12b:free",
-    });
-    chain.push({
-      type: "http",
-      provider: "openrouter",
-      apiKey: keys.openrouter,
-      model: "minimax/minimax-m2.5:free",
+      provider: activeProvider,
+      apiKey: activeKey,
+      model: cheapModels[activeProvider] || "deepseek-chat",
     });
   }
 
-  if (keys.gemini)
-    chain.push({
-      type: "http",
-      provider: "gemini",
-      apiKey: keys.gemini,
-      model: "gemini-flash-latest",
-    });
-  if (keys.anthropic)
-    chain.push({
-      type: "http",
-      provider: "anthropic",
-      apiKey: keys.anthropic,
-      model: "claude-haiku-4-5-20251001",
-    });
-  if (keys.deepseek)
-    chain.push({
-      type: "http",
-      provider: "deepseek",
-      apiKey: keys.deepseek,
-      model: "deepseek-chat",
-    });
-  if (keys.openai)
-    chain.push({
-      type: "http",
-      provider: "openai",
-      apiKey: keys.openai,
-      model: "gpt-4o-mini",
-    });
-
-  // CLI backends as final fallback
-  const backend = settings.punk_backend || "";
-  if (backend === "claude-cli" || backend === "cli")
-    chain.push({ type: "cli", command: "claude" });
-  else if (backend === "gemini-cli")
-    chain.push({ type: "cli", command: "gemini" });
+  // Other configured HTTP providers as further fallback
+  for (const [provider, model] of Object.entries(cheapModels)) {
+    if (provider === activeProvider) continue;
+    if (keys[provider]) {
+      chain.push({ type: "http", provider, apiKey: keys[provider], model });
+    }
+  }
 
   return chain;
 }
@@ -574,6 +571,9 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
   `);
 
+  // Symbol index + synthesis tables (Layer 1 + Layer 3)
+  initSymbolTables(db);
+
   // Mind entries — separate exec so it runs cleanly as a migration on existing DBs
   db.exec(`
     CREATE TABLE IF NOT EXISTS mind_entries (
@@ -663,7 +663,7 @@ function initDatabase() {
   };
 }
 
-// --- Embedder (lazy-loaded, WASM-based) ---
+// --- Embedder (lazy-loaded, single-threaded WASM to avoid em-pthread leak) ---
 
 async function loadEmbedder() {
   if (embedderReady || embedderLoading) return;
@@ -673,9 +673,23 @@ async function loadEmbedder() {
     // Dynamic import — @huggingface/transformers is pure ESM
     const { pipeline, env } = await import("@huggingface/transformers");
 
-    // Cache models locally
     env.cacheDir = MODEL_CACHE;
-    // Use WASM backend (no native ONNX needed)
+
+    // CRITICAL: prevent em-pthread thread accumulation.
+    //
+    // The default WASM backend (ort-wasm-simd-threaded) spawns Emscripten pthread
+    // workers via node:worker_threads. These workers accumulate across embed()
+    // calls and are never reaped. After ~minutes of use, the process hits macOS's
+    // 4095-thread limit and SIGABRTs, crashing the entire Electron app.
+    //
+    // proxy=false  → no proxy Worker spawned (the primary source of leaking threads)
+    // numThreads=1 → ONNX selects the non-threaded WASM binary (ort-wasm-simd.wasm)
+    //                instead of ort-wasm-simd-threaded.jsep.mjs, so zero em-pthread
+    //                workers are created regardless of how many embed() calls are made.
+    //
+    // NOTE: onnxruntime-node (native C++) was tried but fails in Electron UtilityProcess
+    // ("Unsupported device: cpu. Should be one of: .") — native EP not registered there.
+    env.backends.onnx.wasm.proxy = false;
     env.backends.onnx.wasm.numThreads = 1;
 
     embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
@@ -1175,12 +1189,21 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
   }
 
   const cutoff = new Date(Date.now() - maxAge * 86400000).toISOString();
-  const valuable = candidates.filter(m =>
-    allowedTypes.includes(m.type) &&
-    (m.confidence || 0) >= confidenceFloor &&
-    m.score > 0.45 &&
-    (m.updated_at || m.created_at || "9999") >= cutoff
-  ).slice(0, 3);
+  const recentCutoff = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 60 minutes
+
+  const valuable = candidates.filter(m => {
+    if (!allowedTypes.includes(m.type)) return false;
+    if (m.score <= 0.40) return false;
+
+    // Recency bypass: nodes from the last 60 minutes are immediately available
+    // regardless of confidence — within-session learning should be usable now
+    const createdAt = m.age || m.created_at || "";
+    if (createdAt >= recentCutoff && m.score > 0.40) return true;
+
+    // Standard path: confidence + age filter
+    return (m.confidence || 0) >= confidenceFloor &&
+      (m.updated_at || createdAt || "9999") >= cutoff;
+  }).slice(0, 5);
 
   // Tensions only for plan intent, and only very high confidence past decisions
   let tensions = [];
@@ -1189,7 +1212,40 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
     tensions = (raw || []).filter(t => (t.pastConfidence || 0) >= 0.85).slice(0, 1);
   }
 
-  return { memories: valuable, tensions, profileAtoms, relevantFiles };
+  // Active Mind entries: human-authored thoughts, high signal
+  let mindEntries = [];
+  try {
+    const activeMinds = db.prepare(
+      `SELECT id, content, embedding FROM mind_entries WHERE completed = 0 ORDER BY updated_at DESC LIMIT 10`
+    ).all();
+
+    if (queryEmbedding && activeMinds.length > 0) {
+      // Semantic filter: only include mind entries relevant to this query
+      const scored = [];
+      for (const m of activeMinds) {
+        if (m.embedding) {
+          const mEmb = new Float32Array(m.embedding.buffer, m.embedding.byteOffset, m.embedding.byteLength / 4);
+          const sim = cosineSimilarity(queryEmbedding, mEmb);
+          if (sim > 0.35) scored.push({ content: m.content, score: sim });
+        } else {
+          // No embedding — keyword fallback
+          const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+          const text = m.content.toLowerCase();
+          const hit = words.length > 0 ? words.filter(w => text.includes(w)).length / words.length : 0;
+          if (hit > 0.3) scored.push({ content: m.content, score: hit });
+        }
+      }
+      scored.sort((a, b) => b.score - a.score);
+      mindEntries = scored.slice(0, 3);
+    } else if (activeMinds.length <= 3) {
+      // Few entries — include all (user clearly wants them active)
+      mindEntries = activeMinds.map(m => ({ content: m.content, score: 0.9 }));
+    }
+  } catch (err) {
+    console.error("[brain] Mind entry query failed:", err.message);
+  }
+
+  return { memories: valuable, tensions, profileAtoms, relevantFiles, mindEntries };
 }
 
 // --- Search Export (for MCP server) ---
@@ -1246,6 +1302,28 @@ function writeSearchExport(projectId) {
 
 async function writeContextualExport(projectId, query, fileContext, intent, projectRoot) {
   const result = await contextualSearch(query || "", fileContext || "", projectId, intent || "other", projectRoot || null);
+
+  // Layer 1: Symbol map — resolve symbols mentioned in the query
+  if (db && query) {
+    try {
+      result.relevantSymbols = findRelevantSymbols(db, projectId, query);
+    } catch {
+      result.relevantSymbols = [];
+    }
+  } else {
+    result.relevantSymbols = [];
+  }
+
+  // Layer 3: Synthesis — cached project DNA narrative
+  if (db) {
+    try {
+      result.synthesis = readSynthesis(db, projectId) || null;
+    } catch {
+      result.synthesis = null;
+    }
+  } else {
+    result.synthesis = null;
+  }
 
   try {
     fs.mkdirSync(path.join(BRAIN_DIR, "context"), { recursive: true });
@@ -1720,6 +1798,16 @@ process.parentPort.on("message", async ({ data }) => {
           extractPreferences();
         }
 
+        // Layer 3: Synthesis — regenerate when significant events indexed.
+        // updateSynthesis() is fast (4 SQL reads + hash check) so always run.
+        // The internal hash check makes it idempotent — no DB write if unchanged.
+        const hasMeaningfulEvents = data.events.some(e =>
+          ["decision", "lesson", "pattern", "error_fix"].includes(e.type)
+        );
+        if (hasMeaningfulEvents) {
+          updateSynthesis(db, data.projectId);
+        }
+
         break;
       }
 
@@ -1738,9 +1826,71 @@ process.parentPort.on("message", async ({ data }) => {
       case "index_project_files": {
         // Fire-and-forget: respond immediately, index in background
         sendToMain({ type: "index_project_files_ack", requestId: data.requestId });
-        indexProjectFiles(data.projectId, data.projectRoot).catch(err =>
-          console.error("[brain] indexProjectFiles error:", err.message)
-        );
+
+        // Symbol indexing runs first (fast, no LLM) — file summarization runs in parallel
+        Promise.all([
+          // Layer 1: Symbol index (regex, no LLM, fast)
+          (async () => {
+            if (!db) return;
+            try {
+              const { added, files_changed } = indexProjectSymbols(db, data.projectId, data.projectRoot, walkProjectFiles);
+              if (added > 0 || files_changed > 0) {
+                writeSymbolExport(db, data.projectId, BRAIN_DIR);
+                // Regenerate synthesis after symbol indexing (Layer 3)
+                updateSynthesis(db, data.projectId);
+              }
+            } catch (err) {
+              console.error("[brain] symbol indexing error:", err.message);
+            }
+          })(),
+          // LLM file summarization (slow, requires provider)
+          indexProjectFiles(data.projectId, data.projectRoot).catch(err =>
+            console.error("[brain] indexProjectFiles error:", err.message)
+          ),
+        ]);
+        break;
+      }
+
+      case "find_symbols": {
+        if (!db) { sendToMain({ type: "symbols_result", requestId: data.requestId, symbols: [] }); break; }
+        const symbols = findSymbols(db, data.projectId, data.query, {
+          kind: data.kind,
+          file: data.file,
+          limit: data.limit || 20,
+        });
+        sendToMain({ type: "symbols_result", requestId: data.requestId, symbols });
+        break;
+      }
+
+      case "get_file_symbols": {
+        if (!db) { sendToMain({ type: "file_symbols_result", requestId: data.requestId, symbols: [] }); break; }
+        const fileSyms = getFileSymbols(db, data.projectId, data.filePath);
+        sendToMain({ type: "file_symbols_result", requestId: data.requestId, symbols: fileSyms });
+        break;
+      }
+
+      case "reindex_file_symbols": {
+        // Called when a specific file changes (from file watcher)
+        if (!db) { sendToMain({ type: "file_symbols_reindexed", requestId: data.requestId }); break; }
+        try {
+          const result = indexFileSymbols(db, data.projectId, data.filePath, data.projectRoot);
+          if (!result.skipped) {
+            writeSymbolExport(db, data.projectId, BRAIN_DIR);
+            updateSynthesis(db, data.projectId);
+          }
+          sendToMain({ type: "file_symbols_reindexed", requestId: data.requestId, ...result });
+        } catch (err) {
+          console.error("[brain] reindex_file_symbols error:", err.message);
+          sendToMain({ type: "file_symbols_reindexed", requestId: data.requestId, skipped: true });
+        }
+        break;
+      }
+
+      case "synthesize": {
+        // Regenerate synthesis on demand
+        if (!db) { sendToMain({ type: "synthesis_result", requestId: data.requestId, synthesis: null }); break; }
+        const synthesis = updateSynthesis(db, data.projectId);
+        sendToMain({ type: "synthesis_result", requestId: data.requestId, synthesis });
         break;
       }
 

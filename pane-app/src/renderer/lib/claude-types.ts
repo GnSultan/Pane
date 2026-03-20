@@ -202,6 +202,83 @@ export interface ClaudeEventActiveTaskUpdated {
   };
 }
 
+// ── Orchestration Events (Control Inversion) ────────────────────────────
+
+export interface OrchestrationStartEvent {
+  event: "orchestration_start";
+  data: { prompt: string };
+}
+
+export interface OrchestrationPlanEvent {
+  event: "orchestration_plan";
+  data: {
+    summary: string;
+    steps: { index: number; action: string; type: string; files: string[] }[];
+    totalSteps: number;
+  };
+}
+
+export interface OrchestrationStepEvent {
+  event: "orchestration_step";
+  data: {
+    phase: string;
+    stepIndex?: number;
+    totalSteps?: number;
+    action?: string;
+    type?: string;
+    message: string;
+    reason?: string;
+  };
+}
+
+export interface OrchestrationStepCompleteEvent {
+  event: "orchestration_step_complete";
+  data: {
+    stepIndex: number;
+    totalSteps: number;
+    passed: boolean;
+    reason: string;
+    action: string;
+    scopeViolations?: string[];
+    changedFiles?: string[];
+    retry?: boolean;
+  };
+}
+
+export interface OrchestrationCompleteEvent {
+  event: "orchestration_complete";
+  data: {
+    summary: string;
+    totalSteps: number;
+    completedSteps: number;
+    allPassed: boolean;
+    typeCheckPassed: boolean;
+    typeCheckOutput: string | null;
+    touchedFiles: string[];
+    results: {
+      index: number;
+      action: string;
+      passed: boolean;
+      reason: string;
+      scopeViolations: string[];
+      changedFiles: string[];
+    }[];
+  };
+}
+
+export interface OrchestrationTypecheckEvent {
+  event: "orchestration_typecheck";
+  data: {
+    passed: boolean;
+    output: string;
+  };
+}
+
+export interface OrchestrationErrorEvent {
+  event: "orchestration_error";
+  data: { message: string };
+}
+
 export type ClaudeStreamEvent =
   | ClaudeEventMessage
   | ClaudeEventProcessStarted
@@ -211,13 +288,37 @@ export type ClaudeStreamEvent =
   | ClaudeEventCompactionStart
   | ClaudeEventCompactionComplete
   | ClaudeEventTodosUpdated
-  | ClaudeEventActiveTaskUpdated;
+  | ClaudeEventActiveTaskUpdated
+  | OrchestrationStartEvent
+  | OrchestrationPlanEvent
+  | OrchestrationStepEvent
+  | OrchestrationStepCompleteEvent
+  | OrchestrationCompleteEvent
+  | OrchestrationTypecheckEvent
+  | OrchestrationErrorEvent;
+
+// Plan message types — the blueprint Pane produces before execution
+
+export interface PlanStep {
+  index: number;
+  type: "read" | "write" | "verify" | "plan";
+  action: string;
+  files: string[];
+}
+
+export interface PlanData {
+  id: string;
+  task: string;
+  steps: PlanStep[];
+  planningModel?: string | null;
+  executionModel?: string | null;
+}
 
 // Parsed conversation message for the UI
 
 export interface ConversationMessage {
   id: string;
-  type: "user" | "assistant" | "system" | "result";
+  type: "user" | "assistant" | "system" | "result" | "plan";
   content: ContentBlock[];
   timestamp: number;
   isStreaming: boolean;
@@ -227,6 +328,8 @@ export interface ConversationMessage {
   outputTokens?: number;
   numTurns?: number;
   checkpointId?: string;
+  // Present when type === "plan"
+  planData?: PlanData;
 }
 
 // File checkpoint types
@@ -254,7 +357,7 @@ export interface ConversationState {
   serviceTier: string | null;
   isProcessing: boolean;
   isPlanning: boolean;
-  isReady: boolean;
+
   isRestored: boolean; // true once loaded from disk at startup
   error: string | null;
   todos: Todo[];
@@ -301,7 +404,6 @@ export function createEmptyConversation(): ConversationState {
     serviceTier: null,
     isProcessing: false,
     isPlanning: false,
-    isReady: false, // Will be set to true by warmup after initial message completes
     isRestored: false,
     error: null,
     todos: [],

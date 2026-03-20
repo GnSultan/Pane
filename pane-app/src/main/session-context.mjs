@@ -46,6 +46,9 @@ function defaultState() {
     // Last 8 actions (file edits, commands, errors, fixes)
     recentActions: [],      // [{ type, content, timestamp }]
 
+    // Method compliance notes from post-turn verification
+    methodNotes: [],        // [{ type: 'scope_violation'|'no_verification', content, timestamp }]
+
     // Git context
     gitStatus: null,        // { branch: string, summary: string }
 
@@ -220,6 +223,13 @@ export function mergeState(projectId, delta) {
     state.recentActions = [...delta.recentActions, ...state.recentActions].slice(0, 8);
   }
 
+  // Method notes: replace each turn (not cumulative — only latest turn's violations matter)
+  if (delta.methodNotes?.length) {
+    state.methodNotes = delta.methodNotes;
+  } else if (delta.methodNotes !== undefined) {
+    state.methodNotes = []; // Explicit clear — model complied this turn
+  }
+
   if (delta.todos)                   state.todos = delta.todos;
   if (delta.turnCount !== undefined) state.turnCount = delta.turnCount;
   if (delta.lastProvider)           state.lastProvider = delta.lastProvider;
@@ -245,48 +255,66 @@ export function mergeState(projectId, delta) {
  * Stable layer: identity, profile atoms, project brief, relevant files
  * Dynamic layer: session state, brain memories, session pins, intent directive
  */
-export function compileContext(projectId, intent = "other", historyLength = 0) {
+export function compileContext(projectId, intent = "other", historyLength = 0, backend = "gemini-cli") {
   const stableParts  = [];
   const dynamicParts = [];
 
   // ── CORE BEHAVIOR ────────────────────────────────────────────────────────
 
-  const coreInstructions = [
-    "You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks.",
+  const sharedInstructions = [
+    "You are an autonomous CLI agent specializing in software engineering tasks.",
     "Your primary goal is to help users safely and effectively.",
     "",
-    "# Core Mandates",
+    "# The Pane Method",
     "",
-    "## Security & System Integrity",
-    "- Credential Protection: Never log, print, or commit secrets, API keys, or sensitive credentials.",
-    "- Source Control: Do not stage or commit changes unless specifically requested by the user.",
+    "You operate inside Pane. Pane has already mapped the project, tracked decisions, and scoped your work. Follow this method on every task, in order. Do not skip steps.",
     "",
-    "## Context Efficiency",
-    "- Be strategic in your use of tools to minimize unnecessary context usage.",
-    "- Combine turns whenever possible. Prefer targeted, surgical edits (replace) over full file writes (write_file).",
-    "- Use grep_search and glob to identify points of interest before reading files.",
+    "## 1. ORIENT",
+    "Before acting, read what Pane knows. The current objective, task list, files in scope, locked decisions, and active commitments listed below are ground truth. Do not re-derive what Pane has already established. If Pane says a decision is locked, it is locked.",
     "",
-    "## Engineering Standards",
-    "- Contextual Precedence: Instructions in project memory (pane_recall) or session state are foundational.",
-    "- Conventions & Style: Rigorously adhere to existing workspace conventions, architectural patterns, and style.",
-    "- Technical Integrity: You are responsible for the entire lifecycle: implementation, testing, and validation.",
-    "- Testing: ALWAYS search for and update related tests after making a code change.",
-    "- Expertise & Intent Alignment: Distinguish between Directives (requests for action) and Inquiries (requests for analysis). Assume all requests are Inquiries unless they contain an explicit instruction.",
-    "- Proactiveness: Persist through errors. Backtrack and adjust your approach if needed. Validation is not merely running tests; it is the process of ensuring every aspect of your change is correct.",
+    "## 2. SCOPE",
+    "Identify exactly which files need to change. Start with the files in scope Pane has given you. Use search tools to find additional files only if needed. State your scope before touching anything. If you need to touch a file not in scope, explain why before proceeding — never silently expand scope.",
     "",
-    "## Git Repository",
-    "- NEVER stage or commit changes unless explicitly instructed.",
-    "- When asked to commit, propose a draft commit message focusing on 'why' rather than 'what'.",
+    "## 3. UNDERSTAND",
+    "Read every file you plan to modify. No exceptions. Search for existing patterns, conventions, and dependencies before introducing anything new. Understand why existing code is the way it is before changing it. Never edit a file you have not read in this session.",
     "",
-    "## Operational Guidelines",
-    "- Tone: Senior software engineer and collaborative peer programmer. Concise and direct.",
-    "- Tool Usage: Use run_shell_command for building, testing, and verifying your changes.",
-    "- Pane Tools: Use pane_* tools to orient yourself and recall project-specific knowledge.",
-    "- Research: Use google_web_search and web_fetch for research and information gathering.",
+    "## 4. PLAN",
+    "For any task touching more than two files: state numbered steps before executing. One step per file or concern. In EXECUTION mode, proceed immediately after stating. Otherwise, wait for confirmation before making changes.",
     "",
-    "## Visual & UX Standards",
-    "- When implementing UI, prioritize a modern, polished aesthetic with consistent spacing and platform-appropriate design.",
-    "- Prefer platform-native primitives and avoid heavy external dependencies unless already established in the project.",
+    "## 5. EXECUTE",
+    "One logical change at a time. Prefer targeted replacements (replace/edit) over full file rewrites (write_file). If a change is risky or irreversible, state that before proceeding — never after. Do not over-engineer: solve what was asked, nothing more.",
+    "",
+    "## 6. VERIFY",
+    "After every change: run tests, type-check, or build. If no verification is available, state that explicitly. Never declare a task complete without verification. If verification fails, fix the issue before moving on.",
+    "",
+    "## 7. RECORD",
+    "If you discovered something important — a pattern, a lesson, a gotcha, a decision — use pane_remember to store it. Knowledge that dies with the session is wasted. The next model to work here should benefit from what you learned.",
+    "",
+    "# Non-Negotiable Rules",
+    "",
+    "These are absolute. Not guidelines — hard constraints.",
+    "",
+    "- Never edit a file you have not read in this session.",
+    "- Never touch files outside scope without stating why first.",
+    "- Never contradict or undo a locked decision.",
+    "- Never stage, commit, or push unless the user explicitly instructs it.",
+    "- Never run destructive commands (rm -rf, force push, drop table, reset --hard) without explicit confirmation.",
+    "- Never log, print, or commit secrets, API keys, or credentials.",
+    "- If uncertain about a destructive or irreversible action — ask. Never guess.",
+    "- Follow existing patterns in the codebase. Do not invent abstractions for one-time operations.",
+    "- When asked to commit, propose a message that explains why, not what.",
+    "",
+    "# Operational Guidelines",
+    "",
+    "- Tone: Senior software engineer. Concise, direct, no filler.",
+    "- Distinguish between directives (requests for action) and inquiries (requests for analysis). Assume inquiry unless the message contains an explicit instruction.",
+    "- Pane Tools: Use pane_recall to orient yourself. Use pane_remember to preserve discoveries. Use pane_brief for project context.",
+    "- Testing: Always search for and update related tests after a code change.",
+    "- Persist through errors. Backtrack and adjust rather than abandoning an approach silently.",
+    "- When implementing UI, prioritize a modern, polished aesthetic with consistent spacing and platform-appropriate design. Prefer platform-native primitives.",
+  ];
+
+  const geminiOnlyInstructions = [
     "",
     "# Available Sub-Agents",
     "",
@@ -300,17 +328,18 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
     "    It returns a structured report with key file paths, symbols, and actionable architectural insights.</description>",
     "  </subagent>",
     "  <subagent>",
-    "    <name>cli_help</name>",
-    "    <description>Specialized in answering questions about how users use you, (Gemini CLI): features, documentation, and current runtime configuration.</description>",
-    "  </subagent>",
-    "  <subagent>",
     "    <name>generalist</name>",
     "    <description>A general-purpose AI agent with access to all tools. Highly recommended for tasks that are turn-intensive or involve processing large amounts of data. Use this to keep the main session history lean and efficient. Excellent for: batch refactoring/error fixing across multiple files, running commands with high-volume output, and speculative investigations.</description>",
     "  </subagent>",
     "</available_subagents>",
     "",
     "Remember that the closest relevant sub-agent should still be used even if its expertise is broader than the given task.",
-  ].join("\n");
+  ];
+
+  const isGemini = backend === "gemini-cli";
+  const coreInstructions = isGemini
+    ? [...sharedInstructions, ...geminiOnlyInstructions].join("\n")
+    : sharedInstructions.join("\n");
 
   stableParts.unshift(coreInstructions, "");
 
@@ -335,9 +364,9 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   } catch {}
 
   // Profile atoms: semantically closest principles to THIS request
-  const atoms = (brainCtx.profileAtoms || []).slice(0, 5);
+  const atoms = (brainCtx.profileAtoms || []).slice(0, 8);
   if (atoms.length > 0) {
-    stableParts.push("How they think — relevant to this request:");
+    stableParts.push("Operating constraints (apply without exception):");
     for (const atom of atoms) stableParts.push(`- ${atom.content}`);
     stableParts.push("");
   }
@@ -359,10 +388,42 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   }
 
   // Relevant files from brain index (LLM-described architecture map)
+  // When 3+ files are relevant, Pane structures them into a suggested approach order.
   const relevantFiles = (brainCtx.relevantFiles || []).slice(0, 5);
-  if (relevantFiles.length > 0) {
+  if (relevantFiles.length >= 3) {
+    // Heuristic ordering: config/types → core logic → API/handlers → UI → tests
+    const ordered = [...relevantFiles].sort((a, b) => {
+      const rank = (p) => {
+        const lp = (p || "").toLowerCase();
+        if (lp.includes("config") || lp.includes("types") || lp.includes("schema") || lp.includes("model")) return 0;
+        if (lp.includes("lib/") || lp.includes("util") || lp.includes("core") || lp.includes("engine")) return 1;
+        if (lp.includes("api") || lp.includes("handler") || lp.includes("route") || lp.includes("backend") || lp.includes("worker")) return 2;
+        if (lp.includes("hook") || lp.includes("store") || lp.includes("context")) return 3;
+        if (lp.includes("component") || lp.includes("page") || lp.includes("view") || lp.includes(".tsx") || lp.includes(".jsx")) return 4;
+        if (lp.includes("test") || lp.includes("spec")) return 5;
+        return 3;
+      };
+      return rank(a.path) - rank(b.path);
+    });
+
+    stableParts.push("Pane suggests this approach order for the relevant files:");
+    ordered.forEach((f, i) => {
+      stableParts.push(`${i + 1}. ${f.path} — ${f.description}`);
+    });
+    stableParts.push("");
+  } else if (relevantFiles.length > 0) {
     stableParts.push("Files relevant to this request:");
     for (const f of relevantFiles) stableParts.push(`- ${f.path} — ${f.description}`);
+    stableParts.push("");
+  }
+
+  // Layer 3: Project DNA — accumulated decisions, patterns, lessons synthesized into a narrative.
+  // Compact (<400 tokens). Changes rarely (only when new decisions/lessons reach confidence threshold).
+  // Lives in stable → safe for Anthropic prompt caching. Does NOT change per-query.
+  const synthesis = brainCtx.synthesis || "";
+  if (synthesis) {
+    stableParts.push("## Project DNA");
+    stableParts.push(synthesis);
     stableParts.push("");
   }
 
@@ -405,15 +466,15 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   const state = readState(projectId);
 
   if (state.activeTask) {
-    dynamicParts.push(`Active task: ${state.activeTask.description}`);
+    dynamicParts.push(`Current objective: ${state.activeTask.description}`);
     if (state.activeTask.goal) dynamicParts.push(`Goal: ${state.activeTask.goal}`);
     dynamicParts.push("");
   }
 
   if (state.todos?.length > 0) {
-    dynamicParts.push("Project TODOs:");
+    dynamicParts.push("Task list:");
     for (const t of state.todos) {
-      const mark = t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[/]" : "[ ]";
+      const mark = t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[→]" : "[ ]";
       dynamicParts.push(`${mark} ${t.content}`);
     }
     dynamicParts.push("");
@@ -426,23 +487,64 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   }
 
   if (state.workingSet.length > 0) {
-    dynamicParts.push("Files in play this session:");
+    dynamicParts.push("Files in scope — do not touch files outside this list unless explicitly asked:");
     for (const f of state.workingSet.slice(0, 6)) {
       dynamicParts.push(`- ${f.path}${f.purpose ? ` — ${f.purpose}` : ""}`);
     }
     dynamicParts.push("");
+
+    // Pre-read: include actual file content for top working set files.
+    // The model doesn't need to explore — Pane has already read these.
+    const PRE_READ_MAX_FILES = 3;
+    const PRE_READ_MAX_LINES = 80;
+    const PRE_READ_MAX_CHARS = 15000;
+    let preReadChars = 0;
+    const preReadParts = [];
+
+    for (const f of state.workingSet.slice(0, PRE_READ_MAX_FILES)) {
+      if (preReadChars >= PRE_READ_MAX_CHARS) break;
+      try {
+        const raw = fs.readFileSync(f.path, "utf-8");
+        const lines = raw.split("\n").slice(0, PRE_READ_MAX_LINES);
+        const content = lines.join("\n");
+        const remaining = PRE_READ_MAX_CHARS - preReadChars;
+        const truncated = content.length > remaining ? content.slice(0, remaining) + "\n[...truncated]" : content;
+        preReadParts.push(`### ${f.path}\n\`\`\`\n${truncated}\n\`\`\``);
+        preReadChars += truncated.length;
+      } catch {
+        // File doesn't exist or isn't readable — skip silently
+      }
+    }
+
+    if (preReadParts.length > 0) {
+      dynamicParts.push("Pre-read file contents (Pane has read these — do not re-read unless they have changed since):");
+      dynamicParts.push(preReadParts.join("\n\n"));
+      dynamicParts.push("");
+    }
   }
 
   if (state.decisions.length > 0) {
-    dynamicParts.push("Decisions locked in this session:");
+    dynamicParts.push("Locked decisions — do not contradict or undo these:");
     for (const d of state.decisions.slice(0, 6)) dynamicParts.push(`- ${d.content}`);
     dynamicParts.push("");
   }
 
   if (state.recentActions.length > 0) {
     const actions = state.recentActions.slice(0, 5);
-    dynamicParts.push("Recent actions:");
+    dynamicParts.push("What has been done:");
     for (const a of actions) dynamicParts.push(`- [${a.type}] ${a.content}`);
+    dynamicParts.push("");
+  }
+
+  // Layer 1: Symbol map — resolved from the codebase index against this specific query.
+  // Query-dependent → lives in dynamic (not cached). Models stop grepping for these.
+  const relevantSymbols = (brainCtx.relevantSymbols || []).slice(0, 8);
+  if (relevantSymbols.length > 0) {
+    dynamicParts.push("Symbol map (Pane resolved — no need to search for these):");
+    for (const s of relevantSymbols) {
+      const doc = s.doc ? ` — ${s.doc}` : "";
+      dynamicParts.push(`- \`${s.name}\` (${s.kind}) → ${s.file_path || s.file}:${s.line}${doc}`);
+    }
     dynamicParts.push("");
   }
 
@@ -451,6 +553,14 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   if (memories.length > 0) {
     dynamicParts.push("Relevant context from prior work:");
     for (const mem of memories) dynamicParts.push(`- ${mem.content}`);
+    dynamicParts.push("");
+  }
+
+  // Mind entries: active thoughts from the user's Mind
+  const mindEntries = (brainCtx.mindEntries || []);
+  if (mindEntries.length > 0) {
+    dynamicParts.push("Active thoughts from Mind (user-authored, treat as high-priority context):");
+    for (const m of mindEntries) dynamicParts.push(`- ${m.content}`);
     dynamicParts.push("");
   }
 
@@ -471,10 +581,18 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
     dynamicParts.push("");
   }
 
-  // Mid-session reinforcement: restate top pins near the intent directive
-  if (historyLength >= 8 && sessionPins.length > 0) {
-    const topPins = sessionPins.slice(0, 3).map(p => p.content).join("; ");
-    dynamicParts.push(`[Session is ${historyLength} turns deep. Key commitments still active: ${topPins}]`);
+  // Session orientation marker — fires from turn 4 onwards so the model always knows where it stands
+  if (historyLength >= 4) {
+    const orientationParts = [`[Turn ${historyLength}.`];
+    if (state.activeTask) orientationParts.push(`Working on: ${state.activeTask.description}.`);
+    const activeTodo = (state.todos || []).find(t => t.status === "in_progress");
+    if (activeTodo) orientationParts.push(`Current step: ${activeTodo.content}.`);
+    if (sessionPins.length > 0) {
+      const topPins = sessionPins.slice(0, 2).map(p => p.content).join("; ");
+      orientationParts.push(`Commitments still active: ${topPins}.`);
+    }
+    orientationParts.push("]");
+    dynamicParts.push(orientationParts.join(" "));
     dynamicParts.push("");
   }
 
@@ -487,6 +605,40 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
     dynamicParts.push("EXPLANATION mode. Clear, detailed, accurate explanations with code examples where appropriate.");
   } else {
     dynamicParts.push("For non-trivial tasks, present a brief plan and end with: \"Ready to proceed — send 'go' to start.\" Wait for confirmation before making changes. For simple tasks, just do them.");
+  }
+
+  // Behavioral fence — scope enforcement, fires whenever there's an active task or working set
+  if (state.activeTask || state.workingSet.length > 0) {
+    const fence = ["Behavioral constraints:"];
+
+    if (state.activeTask) {
+      fence.push(`- Objective: ${state.activeTask.description}`);
+    }
+
+    if (state.workingSet.length > 0) {
+      const inScope = state.workingSet.slice(0, 6).map(f => f.path).join(", ");
+      fence.push(`- In scope: ${inScope}`);
+      fence.push(`- Do not touch files outside this scope — if you must, state why before proceeding`);
+    }
+
+    if (state.decisions.length > 0) {
+      fence.push(`- Locked decisions must not be contradicted or undone`);
+    }
+
+    fence.push(`- Every action must trace back to the current objective`);
+    fence.push(`- If you find yourself acting outside scope, stop and explain before continuing`);
+
+    dynamicParts.push(fence.join("\n"));
+    dynamicParts.push("");
+  }
+
+  // Method compliance notes — corrections from Pane's post-turn verification
+  if (state.methodNotes?.length > 0) {
+    dynamicParts.push("⚠ Pane detected method violations on the previous turn. Correct these now:");
+    for (const note of state.methodNotes) {
+      dynamicParts.push(`- ${note.content}`);
+    }
+    dynamicParts.push("");
   }
 
   const stable  = stableParts.filter(Boolean).join("\n");

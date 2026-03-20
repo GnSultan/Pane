@@ -110,12 +110,19 @@ function ModelPicker({
 
   const filteredProviderModels = useMemo(() => {
     const isGeminiBackend = punkBackend === "gemini-cli";
+    const isClaudeBackend = punkBackend === "claude-cli";
     const providers = Object.fromEntries(
       Object.entries(PROVIDER_MODELS)
         .map(([provider, models]) => {
           // If we are on Gemini CLI, keep only the Gemini provider and keep auto models.
           if (isGeminiBackend) {
             if (provider !== "gemini") return [provider, []];
+            return [provider, models];
+          }
+
+          // If we are on Claude CLI, keep only the Anthropic provider (no API key needed).
+          if (isClaudeBackend) {
+            if (provider !== "anthropic") return [provider, []];
             return [provider, models];
           }
 
@@ -266,7 +273,13 @@ function ModelPicker({
           DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ??
             DEFAULT_BACKEND_ROUTING["http"]?.plan,
         ),
-    )!;
+    ) ?? {
+      label: activeRouting.plan?.model ?? "auto",
+      provider: activeRouting.plan?.provider ?? "",
+      model: activeRouting.plan?.model ?? "auto",
+      thinking: false,
+      requiresKey: "",
+    };
   const activeBuilding =
     BUILDING_ENGINES.find(
       (o) => keyFromRoute(o) === keyFromRoute(activeRouting.execute),
@@ -278,7 +291,13 @@ function ModelPicker({
           DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ??
             DEFAULT_BACKEND_ROUTING["http"]?.execute,
         ),
-    )!;
+    ) ?? {
+      label: activeRouting.execute?.model ?? "auto",
+      provider: activeRouting.execute?.provider ?? "",
+      model: activeRouting.execute?.model ?? "auto",
+      thinking: false,
+      requiresKey: "",
+    };
 
   const thinkingLabel = activeThinking.label.split(" — ")[0]!.toLowerCase();
   const buildingLabel = activeBuilding.label.split(" — ")[0]!.toLowerCase();
@@ -324,7 +343,9 @@ function ModelPicker({
     <div ref={ref} className="relative flex items-center">
       <button
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-1.5 text-pane-text-secondary btn-press select-none group"
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md
+          bg-pane-bg/70 backdrop-blur-sm ring-1 ring-pane-border/25
+          text-pane-text-secondary btn-press select-none"
         style={{ fontSize: "var(--pane-font-size-xs)" }}
       >
         <div
@@ -345,7 +366,7 @@ function ModelPicker({
       </button>
 
       {open && (
-        <div className="absolute bottom-full right-0 mb-2 w-64 bg-pane-bg border border-pane-border/40 rounded-xl shadow-2xl overflow-hidden z-50 animate-fadeSlideUp">
+        <div className="absolute bottom-full right-0 mb-2 w-64 bg-pane-bg ring-1 ring-pane-border/40 rounded-xl z-50 animate-fadeSlideUp">
           <div className="p-1.5 flex flex-col gap-0.5">
             {/* Smart Routing Toggle */}
             <button
@@ -353,10 +374,10 @@ function ModelPicker({
                 onToggleAutoRoute(!autoRoute);
                 setOpen(false);
               }}
-              className={`flex items-center justify-between w-full px-3 py-2 rounded-md text-left transition-colors ${
+              className={`flex items-center justify-between w-full px-3 py-2 rounded-lg text-left transition-colors ${
                 autoRoute
-                  ? "bg-pane-text/[0.08] text-pane-text"
-                  : "text-pane-text-secondary hover:bg-pane-text/[0.04] hover:text-pane-text"
+                  ? "text-pane-text ring-1 ring-pane-border/50"
+                  : "text-pane-text-secondary hover:text-pane-text hover:ring-1 hover:ring-pane-border/35"
               }`}
             >
               <div className="flex flex-col gap-0.5">
@@ -396,8 +417,8 @@ function ModelPicker({
                       }}
                       className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-mono text-left transition-colors ${
                         !autoRoute && model.value === value
-                          ? "bg-pane-text/10 text-pane-text"
-                          : "text-pane-text-secondary hover:bg-pane-text/[0.04] hover:text-pane-text"
+                          ? "text-pane-text ring-1 ring-pane-border/50"
+                          : "text-pane-text-secondary hover:text-pane-text hover:ring-1 hover:ring-pane-border/35"
                       }`}
                     >
                       <div className="flex flex-col">
@@ -523,19 +544,20 @@ export function InputBar({
     [setSelectedModel, setHttpProvider],
   );
 
-  // Handle graceful fadeout of processing indicator
-  // ... (rest of the component remains similar, but using the new ModelPicker)
-
-  // Handle graceful fadeout of processing indicator
+  // Handle graceful fadeout of processing indicator.
+  // Only fade out after real processing happened — not on initial mount.
+  const wasProcessingRef = useRef(false);
   useEffect(() => {
-    if (!isProcessing && !isFadingOut) {
+    if (isProcessing) {
+      wasProcessingRef.current = true;
+      setIsFadingOut(false);
+    } else if (wasProcessingRef.current) {
+      wasProcessingRef.current = false;
       setIsFadingOut(true);
       const timer = setTimeout(() => setIsFadingOut(false), 1500);
       return () => clearTimeout(timer);
-    } else if (isProcessing) {
-      setIsFadingOut(false);
     }
-  }, [isProcessing, isFadingOut]);
+  }, [isProcessing]);
 
   // Update static caret position
   const updateCaret = useCallback(() => {
@@ -736,46 +758,32 @@ export function InputBar({
         />
       )}
 
-      {/* The unified card — textarea body + toolbar strip */}
+      {/* One card. Textarea owns the whole surface. Buttons float inside it. */}
       {!pendingPlanApproval && (
-        <div className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative shadow-[0_0_12px_rgba(74,71,66,0.15)]">
-          {/* Writing area — relative container anchors the static caret overlay */}
-          <div
-            ref={caretContainerRef}
-            className="relative overflow-hidden"
-          >
+        <div className="bg-pane-bg/80 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 relative">
+          <div ref={caretContainerRef} className="relative overflow-hidden">
             <textarea
               ref={textareaRef}
               value={value}
               onChange={(e) => setValue(e.target.value)}
               onKeyDown={handleKeyDown}
-              onFocus={() => {
-                setTextareaFocused(true);
-                updateCaret();
-              }}
-              onBlur={() => {
-                setTextareaFocused(false);
-                setCaretPos(null);
-              }}
+              onFocus={() => { setTextareaFocused(true); updateCaret(); }}
+              onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
               placeholder={
-                isProcessing
-                  ? ""
-                  : planRejected
-                    ? "what should change..."
-                    : "let's build..."
+                isProcessing ? "" : planRejected ? "what should change..." : "let's build..."
               }
               className="w-full bg-transparent text-pane-text font-mono
                          resize-none outline-none placeholder:text-pane-text-secondary
-                         leading-[1.75] px-5 pt-4 pb-3 overflow-y-auto overflow-x-hidden"
+                         leading-[1.75] px-5 pt-4 overflow-y-auto overflow-x-hidden"
               style={{
                 fontSize: "var(--pane-font-size)",
                 caretColor: "transparent",
-                minHeight: "96px",
+                minHeight: "120px",
                 maxHeight: "40vh",
-                height: "96px",
+                height: "120px",
+                paddingBottom: "32px",
               }}
             />
-            {/* Static amber cursor — replaces the native blinking caret */}
             {textareaFocused && caretPos && (
               <div
                 aria-hidden
@@ -792,134 +800,88 @@ export function InputBar({
             )}
           </div>
 
-          {/* Send button - top right corner of card */}
+          {/* Send — top right */}
           {value.trim().length > 0 && !isProcessing && (
             <button
               onClick={() => {
                 const trimmed = value.trim();
-                if (trimmed) {
-                  onSend(trimmed);
-                  setValue("");
-                  setPlanRejected(false);
-                }
+                if (trimmed) { onSend(trimmed); setValue(""); setPlanRejected(false); }
               }}
-              className="absolute top-2 right-2 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
-              title="Send message (Enter)"
+              className="absolute top-2 right-2 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
+              title="Send (Enter)"
             >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="m5 9 7-7 7 7" />
-                <path d="M12 16V2" />
-                <circle cx="12" cy="21" r="1" />
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
               </svg>
             </button>
           )}
 
-          {/* Toolbar strip */}
+          {/* Buttons — absolute bottom, floating over the textarea, no background */}
           <div
-            className="h-9 flex items-center px-5 shrink-0 bg-transparent font-mono text-pane-text-secondary"
+            className="absolute bottom-0 left-0 right-0 flex items-center gap-2 pl-4 pr-2 pb-1.5 font-mono pointer-events-none"
             style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
-            {/* Add path button */}
             <button
               onClick={() => {
                 try {
-                  // Trigger file/folder picker
                   const input = document.createElement('input');
                   input.type = 'file';
                   input.multiple = true;
-                  // Try to enable directory selection (Electron/Tauri supports this)
                   input.webkitdirectory = true;
                   input.onchange = (e) => {
                     const files = (e.target as HTMLInputElement).files;
                     if (files && files.length > 0) {
-                      // When selecting a folder with webkitdirectory, files will contain
-                      // all files from that folder. We just want to show the folder name.
-                      
-                      // Extract unique top-level folder names from webkitRelativePath
                       const folderNames = new Set<string>();
-                      
                       Array.from(files).forEach(f => {
                         if (f.webkitRelativePath) {
-                          // webkitRelativePath is "folderName/file.txt" or "folderName/subfolder/file.txt"
-                          const relativePath = f.webkitRelativePath;
-                          const parts = relativePath.split('/');
-                          if (parts.length > 0 && parts[0]) {
-                            folderNames.add(parts[0]);
-                          }
+                          const parts = f.webkitRelativePath.split('/');
+                          if (parts.length > 0 && parts[0]) folderNames.add(parts[0]);
                         }
                       });
-                      
-                      // If we have folder names, use them with proper styling
                       if (folderNames.size > 0) {
-                        const pathsText = Array.from(folderNames).map(p => {
-                          // Prepend ./ so the path matches SPECIAL_REGEX and gets styled with text-pane-error
-                          return `\`./${p}\``;
-                        }).join('\n');
+                        const pathsText = Array.from(folderNames).map(p => `\`./${p}\``).join('\n');
                         setValue(prev => prev ? `${prev}\n${pathsText}` : pathsText);
                       } else {
-                        // Fallback for individual file selection
-                        const paths = Array.from(files).map(f => {
+                        const pathsText = Array.from(files).map(f => {
                           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                          const path = (f as any).path || f.name;
-                          return `\`${path}\``;
-                        });
-                        const pathsText = paths.join('\n');
+                          return `\`${(f as any).path || f.name}\``;
+                        }).join('\n');
                         setValue(prev => prev ? `${prev}\n${pathsText}` : pathsText);
                       }
                     }
                   };
-                  input.onerror = () => {
-                    // Fallback for browsers that don't support directory selection
-                    input.webkitdirectory = false;
-                    input.click();
-                  };
+                  input.onerror = () => { input.webkitdirectory = false; input.click(); };
                   input.click();
-                } catch (err) {
-                  console.error('Failed to open file picker:', err);
-                }
+                } catch (err) { console.error('Failed to open file picker:', err); }
               }}
-              className="flex items-center gap-1.5 px-2 py-1 rounded text-pane-text-secondary/50 hover:text-pane-text-secondary hover:bg-pane-text/[0.04] transition-colors btn-press shrink-0"
+              className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
+                bg-pane-bg/70 backdrop-blur-sm ring-1 ring-pane-border/25
+                text-pane-text-secondary/50 hover:text-pane-text-secondary btn-press transition-colors"
               title="Add file or folder path"
             >
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M12 5v14M5 12h14" />
               </svg>
               <span>add path</span>
             </button>
-            
+
             {contextPressure !== "none" && (
-              <span
-                className={`ml-4 mr-auto transition-colors ${contextPressure === "high" ? "text-pane-error" : "text-pane-text-secondary/60"}`}
-              >
+              <span className={`pointer-events-none transition-colors ${contextPressure === "high" ? "text-pane-error" : "text-pane-text-secondary/60"}`}>
                 context {contextPercent}%
               </span>
             )}
+
             <div className="flex-1" />
-            <ModelPicker
-              value={isProcessing && routedModel ? routedModel : selectedModel}
-              onChange={handleModelChange}
-              autoRoute={intentAutoRoute}
-              onToggleAutoRoute={setIntentAutoRoute}
-              isProcessing={isProcessing}
-            />
+
+            <div className="pointer-events-auto">
+              <ModelPicker
+                value={isProcessing && routedModel ? routedModel : selectedModel}
+                onChange={handleModelChange}
+                autoRoute={intentAutoRoute}
+                onToggleAutoRoute={setIntentAutoRoute}
+                isProcessing={isProcessing}
+              />
+            </div>
           </div>
         </div>
       )}

@@ -11,7 +11,7 @@ const { AbortController, fetch, TextDecoder, console } = globalThis;
 
 import { PunkBackend } from "./punk-backend.mjs";
 import { ToolExecutor } from "./tool-executor.mjs";
-import { compileContext, mergeState } from "./session-context.mjs";
+import { compileContext, mergeState, readState } from "./session-context.mjs";
 import contextManager from "./context-manager.mjs";
 
 // ============================================================================
@@ -607,6 +607,109 @@ const ANTHROPIC_TOOLS = TOOL_DEFINITIONS.map((td) => ({
   input_schema: td.function.parameters,
 }));
 
+// ---------------------------------------------------------------------------
+// Auto Todo Advancement — Pane drives status, model just sets content
+// ---------------------------------------------------------------------------
+
+const VERIFY_COMMANDS = /\b(jest|vitest|pytest|mocha|karma|test|tsc|build|lint|eslint|check|cargo\s+check|go\s+vet|go\s+build|make)\b/i;
+
+/**
+ * Advance todo statuses based on what Pane actually knows happened.
+ *
+ * Called after each significant tool result. Reads session state, mutates
+ * statuses, persists, and emits todos_updated — without the model needing
+ * to call TodoWrite.
+ *
+ * @param {string} projectId
+ * @param {'write'|'verify_pass'|'turn_end'} trigger
+ * @param {Function} onEvent  — backend event emitter
+ * @param {string} requestId
+ */
+function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
+  const state = readState(projectId);
+  const todos = state.todos;
+  if (!todos || todos.length === 0) return;
+
+  const hasPending    = todos.some(t => t.status === "pending");
+  const hasInProgress = todos.some(t => t.status === "in_progress");
+  const allDone       = todos.every(t => t.status === "completed");
+
+  if (allDone) return;
+
+  let updated = todos.map(t => ({ ...t })); // shallow clone
+  let changed = false;
+
+  switch (trigger) {
+    case "turn_start": {
+      // Turn is beginning. If nothing is in_progress, start the first pending.
+      // This gives immediate UI feedback that work is happening.
+      if (!hasInProgress) {
+        const firstPending = updated.findIndex(t => t.status === "pending");
+        if (firstPending !== -1) {
+          updated[firstPending] = { ...updated[firstPending], status: "in_progress" };
+          changed = true;
+        }
+      }
+      break;
+    }
+
+    case "write": {
+      // A real file change just happened.
+      // If nothing is in_progress, start the first pending.
+      // If something IS in_progress and a DIFFERENT file is being worked on,
+      // complete the current one and advance — heuristic: each write = one todo step.
+      if (!hasInProgress) {
+        const firstPending = updated.findIndex(t => t.status === "pending");
+        if (firstPending !== -1) {
+          updated[firstPending] = { ...updated[firstPending], status: "in_progress" };
+          changed = true;
+        }
+      }
+      break;
+    }
+
+    case "verify_pass": {
+      // A verification command (test/build/tsc) just succeeded.
+      // The current in_progress step is done — complete it and start the next.
+      const inProgressIdx = updated.findIndex(t => t.status === "in_progress");
+      if (inProgressIdx !== -1) {
+        updated[inProgressIdx] = { ...updated[inProgressIdx], status: "completed" };
+        changed = true;
+        // Advance to next pending
+        const nextPending = updated.findIndex(t => t.status === "pending");
+        if (nextPending !== -1) {
+          updated[nextPending] = { ...updated[nextPending], status: "in_progress" };
+        }
+      }
+      break;
+    }
+
+    case "turn_end": {
+      // Turn completed successfully. Mark all in_progress as completed —
+      // if the model finished the turn without errors, the work is done.
+      let anyCompleted = false;
+      updated = updated.map(t => {
+        if (t.status === "in_progress") {
+          anyCompleted = true;
+          return { ...t, status: "completed" };
+        }
+        return t;
+      });
+      changed = anyCompleted;
+      break;
+    }
+  }
+
+  if (!changed) return;
+
+  mergeState(projectId, { todos: updated });
+  onEvent(
+    projectId,
+    { event: "todos_updated", data: { todos: updated } },
+    requestId,
+  );
+}
+
 export class HttpBackend extends PunkBackend {
   constructor(onEvent) {
     super(onEvent);
@@ -856,6 +959,9 @@ export class HttpBackend extends PunkBackend {
       request.requestId,
     );
 
+    // Auto-start: mark first pending todo as in_progress when turn begins
+    autoAdvanceTodos(request.projectId, "turn_start", this.onEvent.bind(this), request.requestId);
+
     try {
       const apiConfig = await this.getApiConfig(request.provider || null);
       console.log(
@@ -884,7 +990,7 @@ export class HttpBackend extends PunkBackend {
         request.intent,
         historyLength,
       );
-      let systemPrompt = context.full;
+      let systemPrompt = request._systemOverride || context.full;
 
       // Emit synthetic init event after config is validated
       this.onEvent(
@@ -1277,6 +1383,20 @@ export class HttpBackend extends PunkBackend {
                 request.requestId,
               );
             }
+
+            // ── Auto-advance todos based on what actually happened ─────────
+            // write_file / replace: real work happened → advance first pending
+            if (!isError && (tool.name === "write_file" || tool.name === "replace")) {
+              autoAdvanceTodos(request.projectId, "write", this.onEvent.bind(this), request.requestId);
+            }
+
+            // run_shell_command: if it's a verify command and it passed → complete current step
+            if (!isError && tool.name === "run_shell_command") {
+              const cmd = (parsedInput.command || "").toLowerCase();
+              if (VERIFY_COMMANDS.test(cmd)) {
+                autoAdvanceTodos(request.projectId, "verify_pass", this.onEvent.bind(this), request.requestId);
+              }
+            }
           }
 
           // Emit tool_result as a "user" message to match CLI worker
@@ -1329,6 +1449,9 @@ export class HttpBackend extends PunkBackend {
           }
         }
       }
+
+      // Turn completed cleanly — mark all in_progress todos as done
+      autoAdvanceTodos(request.projectId, "turn_end", this.onEvent.bind(this), request.requestId);
 
       this.onEvent(
         request.projectId,
@@ -1533,7 +1656,7 @@ export class HttpBackend extends PunkBackend {
       case "kimi":
         return "moonshot-v1-128k";
       case "anthropic":
-        return "claude-3-5-sonnet-20241022";
+        return "claude-sonnet-4-6";
       case "openrouter":
         return "stepfun/step-3.5-flash:free";
       default:
@@ -1568,10 +1691,10 @@ export class HttpBackend extends PunkBackend {
 
     if (provider === "anthropic") {
       const map = {
-        opus: "claude-3-opus-20240229",
-        opusplan: "claude-3-opus-20240229",
-        sonnet: "claude-3-5-sonnet-20241022",
-        haiku: "claude-3-haiku-20240307",
+        opus: "claude-opus-4-6",
+        opusplan: "claude-opus-4-6",
+        sonnet: "claude-sonnet-4-6",
+        haiku: "claude-haiku-4-5-20251001",
       };
       return map[model.toLowerCase()] || this.getDefaultModel(provider);
     }
@@ -1959,6 +2082,107 @@ export class HttpBackend extends PunkBackend {
     } catch (err) {
       console.error("[http] Failed to fetch OpenRouter models:", err);
       return [];
+    }
+  }
+
+  // ==========================================================================
+  // Task Runner Support — Planning Call & Step Execution
+  // ==========================================================================
+
+  /**
+   * Make a lightweight API call with no tools — used for task decomposition.
+   * Returns the raw text response from the model.
+   */
+  async planningCall(systemPrompt, userPrompt, request) {
+    const apiConfig = await this.getApiConfig(request.provider || null);
+    this.validateApiConfig(apiConfig);
+
+    const model = this.mapModelName(apiConfig.provider, request.model);
+
+    const body = {
+      model,
+      messages: this.normalizeMessages([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ], apiConfig.provider),
+      stream: false,
+      max_tokens: 2048,
+      // No tools — pure text generation for planning
+    };
+
+    const { url, headers, finalBody } = this.prepareRequest(apiConfig, body, request);
+
+    // Strip tools from finalBody if prepareRequest added them
+    const cleanBody = { ...(finalBody || body) };
+    delete cleanBody.tools;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(cleanBody),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => response.statusText);
+      throw new Error(`Planning call failed: HTTP ${response.status}: ${errorText}`);
+    }
+
+    const json = await response.json();
+
+    // Extract text from response based on provider
+    if (apiConfig.provider === "anthropic") {
+      return json.content?.[0]?.text || "";
+    }
+    if (apiConfig.provider === "gemini") {
+      return json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    }
+    // OpenAI-compatible (DeepSeek, OpenRouter, Kimi)
+    return json.choices?.[0]?.message?.content || "";
+  }
+
+  /**
+   * Execute a single step — constrained spawn with a custom system prompt.
+   * Returns { messages } with the conversation from this step.
+   */
+  async spawnStep(projectId, prompt, systemOverride, request) {
+    const collectedMessages = [];
+    const stepRequestId = `step-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Wrap onEvent to collect messages for verification
+    const originalOnEvent = this.onEvent;
+    this.onEvent = (pid, event, rid) => {
+      if (pid === projectId && event.event === "message") {
+        const parsed = event.data?.parsed;
+        if (parsed?.type === "assistant" && parsed.message) {
+          collectedMessages.push({ role: "assistant", content: parsed.message.content });
+        }
+        if (parsed?.type === "user" && parsed.message) {
+          collectedMessages.push({ role: "user", content: parsed.message.content });
+        }
+      }
+      // Forward all events to renderer
+      originalOnEvent(pid, event, rid);
+    };
+
+    try {
+      // Create a modified request with the system override.
+      // history is always cleared here — execution model gets a narrow job card,
+      // not the full conversation. Context comes from the system prompt built by
+      // TaskRunner (which synthesizes handoff from Pane's change history).
+      const stepRequest = {
+        ...request,
+        projectId,
+        prompt,
+        requestId: stepRequestId,
+        _systemOverride: systemOverride,
+        history: [], // narrow job card: no prior conversation
+      };
+
+      await this.spawn(stepRequest);
+      return { messages: collectedMessages };
+    } finally {
+      // Restore original onEvent
+      this.onEvent = originalOnEvent;
     }
   }
 }

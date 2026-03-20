@@ -384,8 +384,9 @@ function EntryItem({
 type SaveStatus = "idle" | "saving" | "saved";
 
 export function Mind() {
-  const closeMind = useWorkspaceStore((s) => s.closeMind);
-  const mindOpen = useWorkspaceStore((s) => s.mindOpen);
+  const overlay = useWorkspaceStore((s) => s.overlay);
+  const mindOpen = overlay === "mind";
+  const closeMind = () => useWorkspaceStore.getState().setOverlay(null);
   const [entries, setEntries] = useState<MindEntry[]>([]);
   const [draft, setDraft] = useState("");
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");

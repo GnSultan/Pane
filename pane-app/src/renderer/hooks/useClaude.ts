@@ -45,6 +45,58 @@ import {
 } from "../lib/agent-routing";
 import { getContextLimit } from "../lib/models";
 
+// Active tool input animations keyed by `${projectId}:${toolId}`.
+// Used to cancel a previous animation if the same tool is re-animated.
+const activeToolAnimations = new Map<string, { cancelled: boolean }>();
+
+function streamToolInputAnimate(
+  projectId: string,
+  toolId: string,
+  completeInput: Record<string, unknown>,
+) {
+  const key = `${projectId}:${toolId}`;
+  const existing = activeToolAnimations.get(key);
+  if (existing) existing.cancelled = true;
+
+  const token = { cancelled: false };
+  activeToolAnimations.set(key, token);
+
+  const json = JSON.stringify(completeInput);
+  // Scale so animation takes ~0.4–1.5s regardless of content length
+  const targetMs = Math.min(Math.max(json.length * 0.8, 400), 1500);
+  const charsPerFrame = Math.max(
+    Math.ceil(json.length / (targetMs / (1000 / 60))),
+    1,
+  );
+
+  let pos = 0;
+  const tick = () => {
+    if (token.cancelled) {
+      activeToolAnimations.delete(key);
+      return;
+    }
+    pos = Math.min(pos + charsPerFrame, json.length);
+    const partial = fixPartialJson(json.slice(0, pos));
+    try {
+      const parsed = JSON.parse(partial) as Record<string, unknown>;
+      useProjectsStore.getState().updateToolUseInputById(projectId, toolId, parsed);
+    } catch {
+      /* partial JSON not yet parseable — skip frame */
+    }
+
+    if (pos < json.length) {
+      requestAnimationFrame(tick);
+    } else {
+      // Final frame: guarantee complete input
+      useProjectsStore
+        .getState()
+        .updateToolUseInputById(projectId, toolId, completeInput);
+      activeToolAnimations.delete(key);
+    }
+  };
+  requestAnimationFrame(tick);
+}
+
 let messageIdCounter = 0;
 function nextMessageId(): string {
   return `msg-${Date.now()}-${++messageIdCounter}`;
@@ -62,6 +114,9 @@ interface StreamingState {
   pendingToolJsonTruncated: boolean;
   pendingTodos: import("../lib/claude-types").Todo[] | null;
   todosFlushRaf: number;
+  // Per-tool streaming tracking
+  currentStreamingToolId: string | null;
+  currentToolDeltaCount: number; // how many partial_json_delta events for current tool
 }
 
 const streamingStates = new Map<string, StreamingState>();
@@ -81,6 +136,8 @@ function getStreamingState(projectId: string): StreamingState {
       pendingToolJsonTruncated: false,
       pendingTodos: null,
       todosFlushRaf: 0,
+      currentStreamingToolId: null,
+      currentToolDeltaCount: 0,
     };
     streamingStates.set(projectId, state);
   }
@@ -195,7 +252,6 @@ function resetStreamingState(projectId: string, flush = false) {
   if (flush) {
     if (state.pendingTextDelta) {
       cancelAnimationFrame(state.textFlushRaf);
-      // Final flush of remaining text
       useProjectsStore
         .getState()
         .appendToLastAssistantText(projectId, state.pendingTextDelta);
@@ -203,11 +259,22 @@ function resetStreamingState(projectId: string, flush = false) {
     }
     if (state.pendingThinkingDelta) {
       cancelAnimationFrame(state.thinkingFlushRaf);
-      // Final flush of remaining thinking
       useProjectsStore
         .getState()
         .appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
       state.pendingThinkingDelta = "";
+    }
+    // Flush any pending tool JSON that didn't make it through the rAF pipeline.
+    // This happens when resetStreamingState is called (e.g. on a tool_result message)
+    // before the toolJsonParseRaf fires — common with fast CLI tool sequences.
+    if (state.pendingToolJson && !state.pendingToolJsonTruncated) {
+      cancelAnimationFrame(state.toolJsonParseRaf);
+      state.toolJsonParseRaf = 0;
+      const fixed = fixPartialJson(state.pendingToolJson);
+      try {
+        state.pendingToolInput = JSON.parse(fixed) as Record<string, unknown>;
+      } catch { /* ignore */ }
+      state.pendingToolJson = "";
     }
     if (state.pendingToolInput) {
       cancelAnimationFrame(state.toolInputFlushRaf);
@@ -237,6 +304,14 @@ function resetStreamingState(projectId: string, flush = false) {
   state.toolInputFlushRaf = 0;
   state.toolJsonParseRaf = 0;
   state.todosFlushRaf = 0;
+  state.currentStreamingToolId = null;
+  state.currentToolDeltaCount = 0;
+
+  // Cancel any active CLI tool animations for this project
+  const prefix = `${projectId}:`;
+  for (const [key, token] of activeToolAnimations) {
+    if (key.startsWith(prefix)) token.cancelled = true;
+  }
 }
 
 function flushThinkingDelta(projectId: string) {
@@ -321,10 +396,17 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
 
         if (tool.name === "pane_remember") continue;
 
-        if (tool.name === "Edit" || tool.name === "Write") {
+        // CLI tools: Edit, Write | HTTP tools: write_file, replace
+        if (
+          tool.name === "Edit" ||
+          tool.name === "Write" ||
+          tool.name === "write_file" ||
+          tool.name === "replace"
+        ) {
           const filePath =
             (tool.input.file_path as string) ||
             (tool.input.path as string) ||
+            (tool.input.target_file as string) ||
             "unknown";
           events.push({
             type: "file_edit",
@@ -334,7 +416,8 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
             metadata: { file: filePath, tool: tool.name },
           });
         }
-        if (tool.name === "Bash") {
+        // CLI tools: Bash | HTTP tools: run_shell_command
+        if (tool.name === "Bash" || tool.name === "run_shell_command") {
           const cmd = (tool.input.command as string) || "";
           if (cmd) {
             events.push({
@@ -342,7 +425,7 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
               content: cmd.length > 200 ? cmd.slice(0, 200) + "..." : cmd,
               timestamp: now,
               source: "auto",
-              metadata: { tool: "Bash" },
+              metadata: { tool: tool.name },
             });
           }
         }
@@ -395,6 +478,14 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
     /(?:instead of|rather than|over)\s+(.{10,100})/gi,
   ];
 
+  const lessonPatterns = [
+    /(?:the (?:issue|problem|bug|root cause) (?:was|is)[:\s]+)(.{10,200})/gi,
+    /(?:the (?:key )?(?:insight|fix|solution|answer) (?:was|is)[:\s]+)(.{10,200})/gi,
+    /(?:(?:discovered|realized|found out|learned|turns out)[:\s]+)(.{10,200})/gi,
+    /(?:important(?:ly)?[:\s]+|note[:\s]+)(.{10,200})/gi,
+    /(?:the reason (?:is|was)[:\s]+)(.{10,200})/gi,
+  ];
+
   const lastAssistant = [...turnMessages]
     .reverse()
     .find((m) => m.type === "assistant");
@@ -406,6 +497,7 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
         .join("\n")
         .trim();
 
+      // Extract decisions (cap 5)
       const seenDecisions = new Set<string>();
       for (const pattern of decisionPatterns) {
         pattern.lastIndex = 0;
@@ -428,9 +520,37 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
               source: "auto",
             });
           }
-          if (seenDecisions.size >= 3) break;
+          if (seenDecisions.size >= 5) break;
         }
-        if (seenDecisions.size >= 3) break;
+        if (seenDecisions.size >= 5) break;
+      }
+
+      // Extract lessons (cap 3)
+      const seenLessons = new Set<string>();
+      for (const pattern of lessonPatterns) {
+        pattern.lastIndex = 0;
+        let match;
+        while ((match = pattern.exec(fullText)) !== null) {
+          const lesson = match[1]?.trim();
+          if (
+            lesson &&
+            lesson.length >= 10 &&
+            !seenLessons.has(lesson.slice(0, 40).toLowerCase())
+          ) {
+            seenLessons.add(lesson.slice(0, 40).toLowerCase());
+            events.push({
+              type: "lesson",
+              content:
+                lesson.length > 200
+                  ? lesson.slice(0, 200) + "..."
+                  : lesson,
+              timestamp: now,
+              source: "auto",
+            });
+          }
+          if (seenLessons.size >= 3) break;
+        }
+        if (seenLessons.size >= 3) break;
       }
 
       if (fullText.length > 20) {
@@ -471,10 +591,14 @@ function extractSessionDelta(
     for (const block of msg.content) {
       if (block.type === "tool_use") {
         const tool = block as ToolUseBlock;
+        // CLI tools: Edit, Write, Read | HTTP tools: write_file, replace, read_file
         if (
           tool.name === "Edit" ||
           tool.name === "Write" ||
-          tool.name === "Read"
+          tool.name === "Read" ||
+          tool.name === "write_file" ||
+          tool.name === "replace" ||
+          tool.name === "read_file"
         ) {
           const filePath =
             (tool.input.file_path as string) ||
@@ -490,7 +614,8 @@ function extractSessionDelta(
             });
           }
         }
-        if (tool.name === "Bash") {
+        // CLI tools: Bash | HTTP tools: run_shell_command
+        if (tool.name === "Bash" || tool.name === "run_shell_command") {
           const cmd = (tool.input.command as string) || "";
           if (cmd)
             recentActions.push({
@@ -512,8 +637,10 @@ function extractSessionDelta(
       .map((b) => (b as { type: "text"; text: string }).text)
       .join("\n");
 
+    // Decision extraction (cap 5)
     const decisionPatterns = [
       /(?:I'll|I will|We'll|Let's|Going to|chose|choosing|decided|using|switched to)\s+(.{15,120})/gi,
+      /(?:instead of|rather than|over)\s+(.{15,100})/gi,
     ];
     const seen = new Set<string>();
     for (const pattern of decisionPatterns) {
@@ -526,10 +653,34 @@ function extractSessionDelta(
           decisions.push({
             content: d.length > 120 ? d.slice(0, 120) + "..." : d,
           });
-          if (seen.size >= 3) break;
+          if (seen.size >= 5) break;
         }
       }
-      if (seen.size >= 3) break;
+      if (seen.size >= 5) break;
+    }
+
+    // Lesson extraction → pushed as decisions so they appear in session state immediately
+    const lessonPatterns = [
+      /(?:the (?:issue|problem|bug|root cause) (?:was|is)[:\s]+)(.{10,150})/gi,
+      /(?:the (?:key )?(?:insight|fix|solution) (?:was|is)[:\s]+)(.{10,150})/gi,
+      /(?:(?:discovered|realized|found out|learned|turns out)[:\s]+)(.{10,150})/gi,
+      /(?:the reason (?:is|was)[:\s]+)(.{10,150})/gi,
+    ];
+    const seenLessons = new Set<string>();
+    for (const pattern of lessonPatterns) {
+      pattern.lastIndex = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        const l = match[1]?.trim();
+        if (l && l.length >= 10 && !seenLessons.has(l.slice(0, 40).toLowerCase())) {
+          seenLessons.add(l.slice(0, 40).toLowerCase());
+          decisions.push({
+            content: l.length > 150 ? l.slice(0, 150) + "..." : l,
+          });
+          if (seenLessons.size >= 3) break;
+        }
+      }
+      if (seenLessons.size >= 3) break;
     }
   }
 
@@ -541,6 +692,81 @@ function extractSessionDelta(
   )
     return null;
   return { workingSet, decisions, recentActions, todos: todos || [] };
+}
+
+/**
+ * Post-turn method compliance check.
+ * Compares what the model did against what it was scoped to do.
+ */
+function extractMethodViolations(
+  messages: ConversationMessage[],
+): { type: string; content: string; timestamp: number }[] {
+  const violations: { type: string; content: string; timestamp: number }[] = [];
+  const now = Date.now();
+
+  // Find last turn
+  let turnStart = messages.length - 1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.type === "user") {
+      turnStart = i;
+      break;
+    }
+  }
+  const turnMessages = messages.slice(turnStart);
+
+  // Track what happened: edits and verification commands
+  let hasEdits = false;
+  let hasVerification = false;
+
+  for (const msg of turnMessages) {
+    for (const block of msg.content) {
+      if (block.type === "tool_use") {
+        const tool = block as ToolUseBlock;
+
+        // File edits (CLI + HTTP tool names)
+        if (
+          tool.name === "Edit" ||
+          tool.name === "Write" ||
+          tool.name === "write_file" ||
+          tool.name === "replace"
+        ) {
+          hasEdits = true;
+        }
+
+        // Verification commands
+        if (tool.name === "Bash" || tool.name === "run_shell_command") {
+          const cmd = ((tool.input.command as string) || "").toLowerCase();
+          if (
+            cmd.includes("test") ||
+            cmd.includes("tsc") ||
+            cmd.includes("typecheck") ||
+            cmd.includes("build") ||
+            cmd.includes("lint") ||
+            cmd.includes("check") ||
+            cmd.includes("jest") ||
+            cmd.includes("vitest") ||
+            cmd.includes("pytest") ||
+            cmd.includes("cargo check") ||
+            cmd.includes("go vet")
+          ) {
+            hasVerification = true;
+          }
+        }
+      }
+    }
+  }
+
+  // Edits happened but no verification — flag it
+  if (hasEdits && !hasVerification) {
+    violations.push({
+      type: "no_verification",
+      content:
+        "Code was changed but no verification (tests, type-check, build) was run. Follow the Pane Method step 6 — verify after every change.",
+      timestamp: now,
+    });
+  }
+
+  return violations;
 }
 
 export function usePunk(projectId: string) {
@@ -590,6 +816,7 @@ export function usePunk(projectId: string) {
       store.setConversationError(projectId, null);
 
       let assistantMessageAdded = false;
+      let resultReceived = false;
       const sessionId = project.conversation.sessionId;
       let resultSafetyTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -663,6 +890,7 @@ export function usePunk(projectId: string) {
                 assistantMessageAdded,
               );
 
+              if (msg.type === "result") resultReceived = true;
               if (msg.type === "result" && !resultSafetyTimer) {
                 resultSafetyTimer = setTimeout(() => {
                   console.warn(
@@ -678,6 +906,17 @@ export function usePunk(projectId: string) {
           }
 
           case "processEnded": {
+            // If the process died without ever sending a result event, surface an error
+            if (!resultReceived) {
+              const s = useProjectsStore.getState();
+              if (!s.projects.get(projectId)?.conversation.error) {
+                s.setConversationSessionId(projectId, null);
+                s.setConversationError(
+                  projectId,
+                  "Process exited without responding — session may be invalid. Try again.",
+                );
+              }
+            }
             finishProcessing();
 
             try {
@@ -704,8 +943,21 @@ export function usePunk(projectId: string) {
                   proj.conversation.messages,
                   proj.conversation.todos,
                 );
+
+                // Post-turn method compliance check
+                const methodViolations = extractMethodViolations(
+                  proj.conversation.messages,
+                );
+
                 if (sessionDelta) {
-                  sessionMergeState(projectId, sessionDelta).catch(() => {});
+                  sessionMergeState(projectId, {
+                    ...sessionDelta,
+                    methodNotes: methodViolations,
+                  }).catch(() => {});
+                } else if (methodViolations.length > 0) {
+                  sessionMergeState(projectId, {
+                    methodNotes: methodViolations,
+                  }).catch(() => {});
                 }
               }
             } catch {
@@ -776,6 +1028,151 @@ export function usePunk(projectId: string) {
             // Update the status message with the active task
             const s = useProjectsStore.getState();
             s.setConversationStatusMessage(projectId, activeTask.description);
+            break;
+          }
+
+          // ── Orchestration Events (Control Inversion) ──────────────────
+          case "orchestration_start": {
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(projectId, "Decomposing task...");
+            break;
+          }
+
+          case "orchestration_plan": {
+            const { summary, steps, totalSteps, planId, planningModel, executionModel } = event.data;
+            console.log(
+              `[orchestration] Plan: ${summary} (${totalSteps} steps)`,
+            );
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              `Orchestrating: ${totalSteps} steps`,
+            );
+
+            // Push the plan as a first-class message in the conversation.
+            // This is the readable blueprint — static after it lands.
+            // Todos near the input handle live step progress.
+            if (steps && planId) {
+              s.addConversationMessage(projectId, {
+                id: `plan-${planId}`,
+                type: "plan",
+                content: [],
+                timestamp: Date.now(),
+                isStreaming: false,
+                planData: {
+                  id: planId,
+                  task: summary,
+                  steps: steps.map((step: { index: number; action: string; type: string; files: string[] }) => ({
+                    index: step.index,
+                    type: step.type as "read" | "write" | "verify" | "plan",
+                    action: step.action,
+                    files: step.files || [],
+                  })),
+                  planningModel: planningModel || null,
+                  executionModel: executionModel || null,
+                },
+              });
+            }
+
+            // Update todos to reflect the plan for live progress near input
+            if (steps) {
+              s.setConversationTodos(
+                projectId,
+                steps.map((step: { index: number; action: string; type: string }) => ({
+                  content: step.action,
+                  status: "pending" as const,
+                  activeForm: step.action.split(" ").slice(0, 4).join(" ") + "...",
+                })),
+              );
+            }
+            break;
+          }
+
+          case "orchestration_step": {
+            const { phase, stepIndex, totalSteps, message } = event.data;
+            console.log(`[orchestration] ${phase}: ${message}`);
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              `Step ${stepIndex || "?"}/${totalSteps || "?"}: ${message}`,
+            );
+            break;
+          }
+
+          case "orchestration_step_complete": {
+            const { stepIndex, totalSteps, passed, action } = event.data;
+            console.log(
+              `[orchestration] Step ${stepIndex}/${totalSteps} ${passed ? "passed" : "failed"}: ${action}`,
+            );
+            // Update the specific todo
+            const s = useProjectsStore.getState();
+            const proj = s.projects.get(projectId);
+            if (proj?.conversation.todos) {
+              const updatedTodos = proj.conversation.todos.map(
+                (todo: Todo, idx: number) => ({
+                  ...todo,
+                  status:
+                    idx < stepIndex
+                      ? ("completed" as const)
+                      : idx === stepIndex - 1
+                        ? (passed ? "completed" as const : "in_progress" as const)
+                        : todo.status,
+                }),
+              );
+              s.setConversationTodos(projectId, updatedTodos);
+            }
+            break;
+          }
+
+          case "orchestration_complete": {
+            const {
+              summary,
+              completedSteps,
+              totalSteps: total,
+              allPassed,
+              typeCheckPassed,
+              touchedFiles,
+            } = event.data;
+            console.log(
+              `[orchestration] Complete: ${completedSteps}/${total} steps passed` +
+              ` | tsc: ${typeCheckPassed ? "✓" : "✗"}` +
+              ` | touched: ${touchedFiles?.length ?? 0} files (${summary})`,
+            );
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              allPassed && typeCheckPassed
+                ? `All ${total} steps completed`
+                : !typeCheckPassed
+                  ? `${completedSteps}/${total} steps — type check failed`
+                  : `${completedSteps}/${total} steps completed`,
+            );
+            resultReceived = true;
+            finishProcessing();
+            break;
+          }
+
+          case "orchestration_typecheck": {
+            const { passed, output } = event.data;
+            console.log(
+              `[orchestration] Type check: ${passed ? "passed ✓" : "failed ✗"}`,
+              passed ? "" : output,
+            );
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              passed
+                ? "Type check passed ✓"
+                : `Type check failed — ${output.slice(0, 80)}`,
+            );
+            break;
+          }
+
+          case "orchestration_error": {
+            console.error(`[orchestration] Error: ${event.data.message}`);
+            const s = useProjectsStore.getState();
+            s.setConversationError(projectId, event.data.message);
+            finishProcessing();
             break;
           }
         }
@@ -883,7 +1280,6 @@ function handleClaudeMessage(
         if (msg.model) {
           store.setConversationModel(projectId, msg.model);
         }
-        store.setConversationReady(projectId, true);
       }
       return assistantMessageExists;
     }
@@ -1046,6 +1442,9 @@ function handleClaudeMessage(
 
         console.warn("[pane] Claude non-success result:", msg.subtype, msg);
 
+        // Clear stale session ID so the next attempt starts a fresh session
+        store.setConversationSessionId(projectId, null);
+
         const existing = store.projects.get(projectId)?.conversation.error;
         if (!existing) {
           const detail = msg.error?.trim() || msg.result?.trim();
@@ -1204,6 +1603,18 @@ function handleClaudeMessage(
         evt.type === "content_block_start" &&
         evt.content_block?.type === "tool_use"
       ) {
+        // Flush any pending JSON from the previous tool before starting the new one.
+        // Without this, the previous tool's rAF gets cancelled and its input is lost.
+        if (state.pendingToolJson && !state.pendingToolJsonTruncated) {
+          cancelAnimationFrame(state.toolJsonParseRaf);
+          state.toolJsonParseRaf = 0;
+          const fixed = fixPartialJson(state.pendingToolJson);
+          try {
+            useProjectsStore
+              .getState()
+              .updateLastToolUseInput(projectId, JSON.parse(fixed) as Record<string, unknown>);
+          } catch { /* ignore */ }
+        }
         state.pendingToolJson = "";
         state.pendingToolJsonTruncated = false;
         if (state.toolJsonParseRaf) {
@@ -1211,6 +1622,8 @@ function handleClaudeMessage(
           state.toolJsonParseRaf = 0;
         }
         const toolBlock = evt.content_block as ToolUseBlock;
+        state.currentStreamingToolId = toolBlock.id;
+        state.currentToolDeltaCount = 0;
 
         let status = `using ${toolBlock.name.toLowerCase()}...`;
         if (toolBlock.name === "read_file" || toolBlock.name === "Read")
@@ -1273,7 +1686,26 @@ function handleClaudeMessage(
       ) {
         if (state.pendingToolJsonTruncated) return assistantMessageExists;
 
+        state.currentToolDeltaCount++;
         state.pendingToolJson += evt.delta.partial_json;
+
+        // Detect CLI: tool input arrives as one complete JSON in a single delta.
+        // HTTP always sends partial chunks, so the first delta won't parse cleanly.
+        // When detected, animate the reveal instead of using the rAF pipeline.
+        if (state.currentToolDeltaCount === 1 && state.currentStreamingToolId) {
+          try {
+            const complete = JSON.parse(state.pendingToolJson) as Record<string, unknown>;
+            if (Object.keys(complete).length > 0) {
+              // Single-shot complete JSON → CLI → animate char-by-char
+              streamToolInputAnimate(projectId, state.currentStreamingToolId, complete);
+              state.pendingToolJson = "";
+              return assistantMessageExists;
+            }
+          } catch {
+            // Partial JSON → HTTP streaming → fall through to scheduleToolJsonParse
+          }
+        }
+
         if (state.pendingToolJson.length > MAX_STREAMING_TOOL_JSON_CHARS) {
           state.pendingToolJsonTruncated = true;
           state.pendingToolJson = "";

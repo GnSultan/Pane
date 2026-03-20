@@ -1,10 +1,10 @@
 // CLI UtilityProcess worker.
 // Runs in a separate V8 isolate — no access to BrowserWindow, ipcMain, or webContents.
-// Handles spawn, readline, JSON.parse so the main process never touches CLI tool data.
+//
+// Claude backend: @anthropic-ai/claude-agent-sdk (clean async API, no JSONL parsing)
+// Gemini backend: spawn + readline (stream-json JSONL)
 
-// Debug: Log service data on startup
-console.log("[cli-worker] Starting with serviceData:", process.serviceData);
-
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import { spawn, exec } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -12,13 +12,34 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { compileContext, mergeState } from "./session-context.mjs";
+
+// Resolve the SDK's cli.js — works in both dev and production (asar).
+// In production, cli-worker.mjs is inside app.asar/out/main/, so node_modules
+// resolves to app.asar/node_modules/. We redirect to app.asar.unpacked/ where
+// electron-builder extracts asarUnpack entries so they can be spawned.
+function getClaudeCliPath() {
+  const workerDir = path.dirname(fileURLToPath(import.meta.url));
+  const appRoot = path.resolve(workerDir, "../..");
+  const cliPath = path.join(
+    appRoot,
+    "node_modules/@anthropic-ai/claude-agent-sdk/cli.js",
+  );
+  return cliPath.replace(/app\.asar([/\\])/g, "app.asar.unpacked$1");
+}
+
+const CLAUDE_CLI_PATH = getClaudeCliPath();
 
 const execAsync = promisify(exec);
 const __dirname = import.meta.dirname;
 
+// Claude: projectId -> AbortController (for graceful cancellation)
+const activeControllers = new Map();
+// Gemini: projectId -> child process
 const activeProcesses = new Map();
-const requestStates = new Map(); // requestId -> { lastText: "", lastThought: "" }
+// Per-request state (used by Gemini normalizer)
+const requestStates = new Map();
 
 async function getGitStatus(workingDir) {
   try {
@@ -39,7 +60,6 @@ async function getGitStatus(workingDir) {
 
 function getEnvWithPath() {
   const home = os.homedir();
-  // Add all nvm node version bin dirs
   const nvmVersionsDir = path.join(home, ".nvm", "versions", "node");
   const nvmBins = [];
   try {
@@ -69,14 +89,14 @@ function handleGeminiLine(projectId, line, requestId) {
   try {
     parsed = JSON.parse(line);
   } catch {
-    return; // ignore non-JSON (e.g. blank lines, debug output)
+    return;
   }
 
   if (!requestStates.has(requestId)) {
     requestStates.set(requestId, {
       lastText: "",
       lastThought: "",
-      toolResults: new Map(), // tool_id -> content
+      toolResults: new Map(),
     });
   }
   const state = requestStates.get(requestId);
@@ -105,27 +125,19 @@ function handleGeminiLine(projectId, line, requestId) {
     }
 
     case "message": {
-      if (parsed.role !== "assistant") break; // skip user echoes
+      if (parsed.role !== "assistant") break;
       const currentFullText =
         typeof parsed.content === "string" ? parsed.content : "";
 
       if (parsed.delta === true) {
-        // Smart Delta Logic: Gemini CLI might send cumulative OR incremental chunks
         let increment = "";
-
         if (currentFullText.startsWith(state.lastText)) {
-          // Cumulative chunk detected — slice off the part we already have
           increment = currentFullText.slice(state.lastText.length);
         } else {
-          // Non-cumulative chunk — treat the whole content as the delta
           increment = currentFullText;
         }
-
-        // Update tracking state regardless of which branch we took
-        // (If cumulative, lastText grows. If incremental, it's replaced by the latest chunk)
         state.lastText = currentFullText;
-
-        if (!increment) break; // skip empty or duplicate chunks
+        if (!increment) break;
 
         sendToMain({
           type: "event",
@@ -145,7 +157,6 @@ function handleGeminiLine(projectId, line, requestId) {
           },
         });
       } else {
-        // Final assistant message
         sendToMain({
           type: "event",
           projectId,
@@ -168,17 +179,13 @@ function handleGeminiLine(projectId, line, requestId) {
       const currentFullThinking =
         typeof parsed.content === "string" ? parsed.content : "";
       if (parsed.delta === true) {
-        // Smart Delta Logic for Thoughts
         let increment = "";
-
         if (currentFullThinking.startsWith(state.lastThought)) {
           increment = currentFullThinking.slice(state.lastThought.length);
         } else {
           increment = currentFullThinking;
         }
-
         state.lastThought = currentFullThinking;
-
         if (!increment) break;
 
         sendToMain({
@@ -199,7 +206,6 @@ function handleGeminiLine(projectId, line, requestId) {
           },
         });
       } else {
-        // Final thought block
         sendToMain({
           type: "event",
           projectId,
@@ -230,7 +236,6 @@ function handleGeminiLine(projectId, line, requestId) {
       const toolInput = parsed.parameters || {};
       const toolInputJson = JSON.stringify(toolInput);
 
-      // Start event with empty input
       sendToMain({
         type: "event",
         projectId,
@@ -254,7 +259,6 @@ function handleGeminiLine(projectId, line, requestId) {
         },
       });
 
-      // Follow-up delta with full input to trigger renderer-side incremental parsing/UI updates
       sendToMain({
         type: "event",
         projectId,
@@ -290,19 +294,14 @@ function handleGeminiLine(projectId, line, requestId) {
       if (parsed.delta === true) {
         const lastOutput = state.toolResults.get(toolId) || "";
         let increment = "";
-
         if (currentFullOutput.startsWith(lastOutput)) {
           increment = currentFullOutput.slice(lastOutput.length);
         } else {
           increment = currentFullOutput;
         }
-
         state.toolResults.set(toolId, currentFullOutput);
-
         if (!increment) break;
 
-        // Note: Renderer-side tool_result streaming is simplified — we send a single block
-        // that gets updated. This keeps the UI logic unified with Claude.
         sendToMain({
           type: "event",
           projectId,
@@ -327,7 +326,6 @@ function handleGeminiLine(projectId, line, requestId) {
           },
         });
       } else {
-        // Final tool result
         state.toolResults.set(toolId, currentFullOutput);
         sendToMain({
           type: "event",
@@ -400,15 +398,343 @@ function handleGeminiLine(projectId, line, requestId) {
   }
 }
 
+function sendToMain(message) {
+  process.parentPort.postMessage(message);
+}
+
+// ============================================================================
+// Claude backend via @anthropic-ai/claude-agent-sdk
+// ============================================================================
+
+// Message types the renderer knows how to handle
+const RENDERER_MSG_TYPES = new Set([
+  "system",
+  "stream_event",
+  "assistant",
+  "user",
+  "result",
+]);
+
+async function handleClaudeSpawn({
+  projectId,
+  requestId,
+  prompt,
+  workingDir,
+  sessionId,
+  model,
+  systemPrompt,
+  mcpServerDest,
+}) {
+  const ac = new AbortController();
+  // Kill any existing session for this project
+  const oldAc = activeControllers.get(projectId);
+  if (oldAc) oldAc.abort();
+  activeControllers.set(projectId, ac);
+
+  sendToMain({
+    type: "event",
+    projectId,
+    requestId,
+    event: { event: "processStarted", data: null },
+  });
+
+  try {
+    for await (const msg of query({
+      prompt,
+      options: {
+        cwd: workingDir,
+        model: model || undefined,
+        resume: sessionId || undefined,
+        appendSystemPrompt: systemPrompt || undefined,
+        pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
+        executable: process.execPath,
+        // ELECTRON_RUN_AS_NODE=1 makes Electron behave as plain Node.js when
+        // spawned as a subprocess — otherwise it boots as an Electron GUI app.
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+        permissionMode: "bypassPermissions",
+        dangerouslySkipPermissions: true,
+        maxTurns: 50,
+        mcpServers: {
+          pane: {
+            type: "stdio",
+            command: process.execPath,
+            args: [mcpServerDest],
+            env: {
+              ...process.env,
+              ELECTRON_RUN_AS_NODE: "1",
+              PANE_PROJECT_ID: projectId,
+              PANE_PROJECT_ROOT: workingDir,
+            },
+          },
+        },
+        abortController: ac,
+      },
+    })) {
+      if (RENDERER_MSG_TYPES.has(msg.type)) {
+        sendToMain({
+          type: "event",
+          projectId,
+          requestId,
+          event: { event: "message", data: { parsed: msg } },
+        });
+      }
+    }
+  } catch (err) {
+    if (!ac.signal.aborted) {
+      const msg = err?.message || String(err);
+      // Filter noise: stack traces, deprecation warnings
+      const useful = msg
+        .split("\n")
+        .filter(
+          (l) =>
+            !l.startsWith("    at ") &&
+            !l.includes("DeprecationWarning") &&
+            l.trim().length > 0,
+        )
+        .join("\n")
+        .slice(0, 600);
+      if (useful) {
+        sendToMain({
+          type: "event",
+          projectId,
+          requestId,
+          event: { event: "error", data: { message: useful } },
+        });
+      }
+    }
+  } finally {
+    if (activeControllers.get(projectId) === ac) {
+      activeControllers.delete(projectId);
+    }
+    sendToMain({
+      type: "event",
+      projectId,
+      requestId,
+      event: { event: "processEnded", data: { exit_code: 0 } },
+    });
+    requestStates.delete(requestId);
+  }
+}
+
+// ============================================================================
+// Gemini backend via spawn + readline
+// ============================================================================
+
 function shellEscape(s) {
   if (s.length === 0) return "''";
   if (/^[a-zA-Z0-9\-_./:]+$/.test(s)) return s;
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-function sendToMain(message) {
-  process.parentPort.postMessage(message);
+async function handleGeminiSpawn({
+  projectId,
+  requestId,
+  prompt,
+  workingDir,
+  model,
+  systemPrompt,
+  history,
+  mcpServerDest,
+}) {
+  const home = os.homedir();
+  const paneDir = path.join(home, ".pane");
+  const geminiConfigDir = path.join(workingDir, ".gemini");
+  const geminiSettingsPath = path.join(geminiConfigDir, "settings.json");
+
+  try {
+    await fsp.mkdir(geminiConfigDir, { recursive: true });
+    let existingSettings = {};
+    try {
+      const data = await fsp.readFile(geminiSettingsPath, "utf-8");
+      existingSettings = JSON.parse(data);
+    } catch {}
+    await fsp.writeFile(
+      geminiSettingsPath,
+      JSON.stringify(
+        {
+          ...existingSettings,
+          mcpServers: {
+            pane: {
+              command: "node",
+              args: [mcpServerDest],
+              env: {
+                PANE_PROJECT_ID: projectId,
+                PANE_PROJECT_ROOT: workingDir,
+              },
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+  } catch {}
+
+  let historyPreamble = "";
+  if (history && history.length > 0) {
+    const turns = history
+      .filter((m) => m.type === "user" || m.type === "assistant")
+      .slice(-20);
+    if (turns.length > 0) {
+      const lines = ["## Previous conversation\n"];
+      for (const msg of turns) {
+        const role = msg.type === "user" ? "User" : "Assistant";
+        const textBlocks = msg.content.filter((b) => b.type === "text");
+        const thinkingBlocks = msg.content.filter((b) => b.type === "thinking");
+        let messageParts = [];
+        if (textBlocks.length > 0) {
+          const fullText = textBlocks.map((b) => b.text).join("\n").trim();
+          if (fullText) messageParts.push(fullText);
+        }
+        if (thinkingBlocks.length > 0) {
+          const fullThinking = thinkingBlocks
+            .map((b) => b.thinking)
+            .join("\n")
+            .trim();
+          if (fullThinking)
+            messageParts.push(`⟨thinking⟩\n${fullThinking}\n⟨/thinking⟩`);
+        }
+        if (messageParts.length === 0) continue;
+        lines.push(`${role}: ${messageParts.join("\n\n")}`);
+      }
+      lines.push("\n---\n");
+      historyPreamble = lines.join("\n");
+    }
+  }
+
+  const fullPrompt = systemPrompt
+    ? `${systemPrompt}\n\n---\n\n${historyPreamble}${prompt}`
+    : `${historyPreamble}${prompt}`;
+
+  const cmdParts = ["gemini", "-p", fullPrompt, "--output-format", "stream-json", "--yolo"];
+  if (model && /gemini/i.test(model)) {
+    cmdParts.push("--model", model);
+  }
+
+  const shellCmd = cmdParts.map((arg) => shellEscape(arg)).join(" ");
+  const fullCmd = `eval $(/usr/libexec/path_helper -s 2>/dev/null); [ -f "${home}/.zshrc" ] && source "${home}/.zshrc" 2>/dev/null; ${shellCmd}`;
+
+  const child = spawn("/bin/zsh", ["-c", fullCmd], {
+    cwd: workingDir,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
+    env: { ...getEnvWithPath() },
+  });
+
+  const oldChild = activeProcesses.get(projectId);
+  if (oldChild && !oldChild.killed) {
+    try {
+      process.kill(-oldChild.pid, "SIGKILL");
+    } catch {}
+  }
+  activeProcesses.set(projectId, child);
+
+  sendToMain({
+    type: "event",
+    projectId,
+    requestId,
+    event: { event: "processStarted", data: null },
+  });
+
+  if (child.stdout) {
+    const rl = readline.createInterface({ input: child.stdout });
+    rl.on("line", (line) => {
+      if (line.trim().length === 0) return;
+      handleGeminiLine(projectId, line, requestId);
+    });
+  }
+
+  let stderrOutput = "";
+  if (child.stderr) {
+    child.stderr.on("data", (chunk) => {
+      stderrOutput += chunk.toString();
+    });
+  }
+
+  function filterStderr(output) {
+    const quotaRegex =
+      /(TerminalQuotaError: )?You have exhausted your capacity on this model\. Your quota will reset after \d+h\d+m\d+s\.?/i;
+    const match = output.match(quotaRegex);
+    if (match) return match[0].trim();
+    const lines = output.split("\n");
+    const quotaLines = lines.filter(
+      (line) =>
+        line.includes("exhausted your capacity") ||
+        line.includes("quota will reset"),
+    );
+    return quotaLines.join("\n").trim();
+  }
+
+  child.on("close", (code) => {
+    if (code !== 0) {
+      const filtered = filterStderr(stderrOutput);
+      if (filtered.length > 0) {
+        sendToMain({
+          type: "event",
+          projectId,
+          requestId,
+          event: { event: "error", data: { message: filtered } },
+        });
+      } else if (stderrOutput.trim()) {
+        const useful = stderrOutput
+          .trim()
+          .split("\n")
+          .filter(
+            (l) =>
+              !l.startsWith("    at ") &&
+              !l.includes("DeprecationWarning") &&
+              l.trim().length > 0,
+          )
+          .join("\n")
+          .slice(0, 600);
+        if (useful) {
+          sendToMain({
+            type: "event",
+            projectId,
+            requestId,
+            event: { event: "error", data: { message: useful } },
+          });
+        }
+      }
+    }
+    sendToMain({
+      type: "event",
+      projectId,
+      requestId,
+      event: { event: "processEnded", data: { exit_code: code } },
+    });
+    if (activeProcesses.get(projectId) === child) {
+      activeProcesses.delete(projectId);
+    }
+    requestStates.delete(requestId);
+  });
+
+  child.on("error", (err) => {
+    sendToMain({
+      type: "event",
+      projectId,
+      requestId,
+      event: {
+        event: "error",
+        data: { message: `Failed to spawn gemini: ${err.message}` },
+      },
+    });
+    sendToMain({
+      type: "event",
+      projectId,
+      requestId,
+      event: { event: "processEnded", data: { exit_code: null } },
+    });
+    if (activeProcesses.get(projectId) === child) {
+      activeProcesses.delete(projectId);
+    }
+    requestStates.delete(requestId);
+  });
 }
+
+// ============================================================================
+// Unified spawn dispatcher
+// ============================================================================
 
 async function handleSpawn({
   projectId,
@@ -432,7 +758,7 @@ async function handleSpawn({
       event: {
         event: "error",
         data: {
-          message: `No CLI command specified for backend. Service data: ${JSON.stringify(process.serviceData)}`,
+          message: `No CLI command specified. Service data: ${JSON.stringify(process.serviceData)}`,
         },
       },
     });
@@ -442,385 +768,108 @@ async function handleSpawn({
   const historyLength = history ? history.length : 0;
   const gitStatus = await getGitStatus(workingDir);
 
-  // Update session state before compileContext
-  const stateUpdate = {
+  mergeState(projectId, {
     lastProvider: command === "claude" ? "claude-cli" : "gemini-cli",
     lastIntent: intent,
     turnCount: historyLength / 2 + 1,
     gitStatus,
-  };
-  if (todos) {
-    stateUpdate.todos = todos;
-  }
-  mergeState(projectId, stateUpdate);
+    ...(todos ? { todos } : {}),
+  });
 
-  const context = compileContext(projectId, intent, historyLength);
+  const backend = command === "claude" ? "claude-cli" : "gemini-cli";
+  const context = compileContext(projectId, intent, historyLength, backend);
   const systemPrompt = context.full;
 
   const home = os.homedir();
   const paneDir = path.join(home, ".pane");
 
-  // Generate MCP config
-  const mcpServerPath = path.join(__dirname, "pane-mcp-server.mjs");
-  const mcpConfigPath = path.join(paneDir, `mcp-config-${projectId}.json`);
+  // Extract MCP server to ~/.pane/ so external node can access it outside .asar
+  const mcpServerSrc = path.join(__dirname, "pane-mcp-server.mjs");
+  const mcpServerDest = path.join(paneDir, "pane-mcp-server.mjs");
   try {
     await fsp.mkdir(paneDir, { recursive: true });
-    await fsp.writeFile(
-      mcpConfigPath,
-      JSON.stringify({
-        mcpServers: {
-          pane: {
-            command: "node",
-            args: [mcpServerPath],
-            env: {
-              PANE_PROJECT_ID: projectId,
-              PANE_PROJECT_ROOT: workingDir,
-            },
-          },
-        },
-      }),
-    );
-  } catch (err) {}
-
-  let cmdParts = [command];
+    const mcpServerContent = await fsp.readFile(mcpServerSrc, "utf-8");
+    await fsp.writeFile(mcpServerDest, mcpServerContent, "utf-8");
+  } catch (err) {
+    console.warn("[cli-worker] Failed to write MCP server:", err.message);
+  }
 
   if (command === "claude") {
-    cmdParts.push(
-      "-p",
+    await handleClaudeSpawn({
+      projectId,
+      requestId,
       prompt,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--include-partial-messages",
-      "--max-turns",
-      "50",
-      "--dangerously-skip-permissions",
-      "--mcp-config",
-      mcpConfigPath,
-      "--append-system-prompt",
+      workingDir,
+      sessionId,
+      model,
       systemPrompt,
-    );
-    if (model) {
-      const cliModel = model === "opusplan" ? "opus" : model;
-      cmdParts.push("--model", cliModel);
-    }
-    if (sessionId) {
-      cmdParts.push("--resume", sessionId);
-    }
-  } else if (command === "gemini") {
-    const geminiConfigDir = path.join(workingDir, ".gemini");
-    const geminiSettingsPath = path.join(geminiConfigDir, "settings.json");
-    try {
-      await fsp.mkdir(geminiConfigDir, { recursive: true });
-      let existingSettings = {};
-      try {
-        const data = await fsp.readFile(geminiSettingsPath, "utf-8");
-        existingSettings = JSON.parse(data);
-      } catch {}
-      await fsp.writeFile(
-        geminiSettingsPath,
-        JSON.stringify(
-          {
-            ...existingSettings,
-            mcpServers: {
-              pane: {
-                command: "node",
-                args: [mcpServerPath],
-                env: {
-                  PANE_PROJECT_ID: projectId,
-                  PANE_PROJECT_ROOT: workingDir,
-                },
-              },
-            },
-          },
-          null,
-          2,
-        ),
-      );
-    } catch (err) {}
-
-    let historyPreamble = "";
-    if (history && history.length > 0) {
-      // History is already sliced to 10 turns in renderer, but we'll double check
-      const turns = history
-        .filter((m) => m.type === "user" || m.type === "assistant")
-        .slice(-10);
-      if (turns.length > 0) {
-        const lines = ["## Previous conversation\n"];
-        for (const msg of turns) {
-          const role = msg.type === "user" ? "User" : "Assistant";
-
-          // Extract both text and thinking blocks, with appropriate truncation per type
-          const textBlocks = msg.content.filter((b) => b.type === "text");
-          const thinkingBlocks = msg.content.filter((b) => b.type === "thinking");
-
-          let messageParts: string[] = [];
-
-          // Add text blocks (truncated more aggressively)
-          if (textBlocks.length > 0) {
-            const fullText = textBlocks.map((b) => b.text).join("\n").trim();
-            if (fullText) {
-              const capped = fullText.length > 600 ? fullText.slice(0, 600) + "…" : fullText;
-              messageParts.push(capped);
-            }
-          }
-
-          // Add thinking blocks (also truncated, but slightly more generous)
-          if (thinkingBlocks.length > 0) {
-            const fullThinking = thinkingBlocks.map((b) => b.thinking).join("\n").trim();
-            if (fullThinking) {
-              const capped = fullThinking.length > 800 ? fullThinking.slice(0, 800) + "…" : fullThinking;
-              // Format thinking distinctly
-              messageParts.push(`⟨thinking⟩\n${capped}\n⟨/thinking⟩`);
-            }
-          }
-
-          if (messageParts.length === 0) continue;
-
-          lines.push(`${role}: ${messageParts.join("\n\n")}`);
-        }
-        lines.push("\n---\n");
-        historyPreamble = lines.join("\n");
-      }
-    }
-
-    const fullPrompt = systemPrompt
-      ? `${systemPrompt}\n\n---\n\n${historyPreamble}${prompt}`
-      : `${historyPreamble}${prompt}`;
-
-    cmdParts.push("-p", fullPrompt, "--output-format", "stream-json", "--yolo");
-    if (model && /gemini/i.test(model)) {
-      cmdParts.push("--model", model);
-    }
-  }
-
-  const shellCmd = cmdParts.map((arg) => shellEscape(arg)).join(" ");
-  const fullCmd = `eval $(/usr/libexec/path_helper -s 2>/dev/null); [ -f "${home}/.zshrc" ] && source "${home}/.zshrc" 2>/dev/null; ${shellCmd}`;
-
-  const child = spawn("/bin/zsh", ["-c", fullCmd], {
-    cwd: workingDir,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: true,
-    env: {
-      ...getEnvWithPath(),
-      ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-3-opus-latest",
-      ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-3-5-sonnet-latest",
-    },
-  });
-
-  // Ensure old process for this project is dead before tracking new one
-  const oldChild = activeProcesses.get(projectId);
-  if (oldChild && !oldChild.killed) {
-    try {
-      process.kill(-oldChild.pid, "SIGKILL");
-    } catch {}
-  }
-  activeProcesses.set(projectId, child);
-
-  sendToMain({
-    type: "event",
-    projectId,
-    requestId,
-    event: { event: "processStarted", data: null },
-  });
-
-  if (child.stdout) {
-    const rl = readline.createInterface({ input: child.stdout });
-    rl.on("line", (line) => {
-      if (line.trim().length === 0) return;
-      if (command === "gemini") {
-        handleGeminiLine(projectId, line, requestId);
-        return;
-      }
-      if (line.length > 20480) {
-        try {
-          const typeMatch = line.match(/^.{0,50}"type"\s*:\s*"(\w+)"/);
-          const msgType = typeMatch ? typeMatch[1] : null;
-          if (msgType === "assistant") {
-            sendToMain({
-              type: "event",
-              projectId,
-              requestId,
-              event: {
-                event: "message",
-                data: { parsed: { type: "assistant", skipped: true } },
-              },
-            });
-            return;
-          }
-          if (msgType === "user") {
-            const toolUseIds = [];
-            const idRegex = /"tool_use_id"\s*:\s*"([^"]+)"/g;
-            let match;
-            while ((match = idRegex.exec(line)) !== null) {
-              toolUseIds.push(match[1]);
-            }
-            sendToMain({
-              type: "event",
-              projectId,
-              requestId,
-              event: {
-                event: "message",
-                data: {
-                  parsed: {
-                    type: "user",
-                    message: {
-                      role: "user",
-                      content: toolUseIds.map((id) => ({
-                        type: "tool_result",
-                        tool_use_id: id,
-                        content: "(output too large to display)",
-                      })),
-                    },
-                  },
-                },
-              },
-            });
-            return;
-          }
-        } catch {}
-      }
-      try {
-        const parsed = JSON.parse(line);
-        sendToMain({
-          type: "event",
-          projectId,
-          requestId,
-          event: { event: "message", data: { parsed } },
-        });
-      } catch {
-        sendToMain({
-          type: "event",
-          projectId,
-          requestId,
-          event: { event: "message", data: { raw_json: line } },
-        });
-      }
+      mcpServerDest,
     });
-  }
-
-  let stderrOutput = "";
-  if (child.stderr) {
-    child.stderr.on("data", (chunk) => {
-      stderrOutput += chunk.toString();
-    });
-  }
-
-  function filterStderr(output) {
-    // Look for the quota exhaustion message and extract only that
-    const quotaRegex =
-      /(TerminalQuotaError: )?You have exhausted your capacity on this model\. Your quota will reset after \d+h\d+m\d+s\.?/i;
-    const match = output.match(quotaRegex);
-    if (match) {
-      return match[0].trim();
-    }
-    // Fallback to simple line filtering for other quota-related messages
-    const lines = output.split("\n");
-    const quotaLines = lines.filter(
-      (line) =>
-        line.includes("exhausted your capacity") ||
-        line.includes("quota will reset"),
-    );
-    return quotaLines.join("\n").trim();
-  }
-
-  child.on("close", (code) => {
-    if (code !== 0) {
-      const filtered = filterStderr(stderrOutput);
-      if (filtered.length > 0) {
-        sendToMain({
-          type: "event",
-          projectId,
-          requestId,
-          event: {
-            event: "error",
-            data: { message: filtered },
-          },
-        });
-      }
-    }
-    sendToMain({
-      type: "event",
+  } else {
+    await handleGeminiSpawn({
       projectId,
       requestId,
-      event: { event: "processEnded", data: { exit_code: code } },
+      prompt,
+      workingDir,
+      model,
+      systemPrompt,
+      history,
+      mcpServerDest,
     });
-    // Only delete if it's the SAME child we're tracking
-    if (activeProcesses.get(projectId) === child) {
-      activeProcesses.delete(projectId);
-    }
-    // Clean up state
-    requestStates.delete(requestId);
-  });
-
-  child.on("error", (err) => {
-    sendToMain({
-      type: "event",
-      projectId,
-      requestId,
-      event: {
-        event: "error",
-        data: {
-          message: `Failed to spawn ${command}: ${err.message}`,
-        },
-      },
-    });
-    sendToMain({
-      type: "event",
-      projectId,
-      requestId,
-      event: { event: "processEnded", data: { exit_code: null } },
-    });
-    if (activeProcesses.get(projectId) === child) {
-      activeProcesses.delete(projectId);
-    }
-    // Clean up state
-    requestStates.delete(requestId);
-  });
+  }
 }
 
 function handleAbort({ projectId }) {
+  // Claude: abort via AbortController
+  const ac = activeControllers.get(projectId);
+  if (ac) {
+    ac.abort();
+    activeControllers.delete(projectId);
+    return;
+  }
+  // Gemini: kill child process
   const child = activeProcesses.get(projectId);
   if (child?.pid) {
     try {
       process.kill(-child.pid, "SIGTERM");
     } catch (err) {
-      try {
-        child.kill("SIGTERM");
-      } catch {}
+      try { child.kill("SIGTERM"); } catch {}
     }
     setTimeout(() => {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch {
-        try {
-          child.kill("SIGKILL");
-        } catch {}
+      try { process.kill(-child.pid, "SIGKILL"); } catch {
+        try { child.kill("SIGKILL"); } catch {}
       }
     }, 2000);
     activeProcesses.delete(projectId);
   }
 }
+
 function handleTerminate({ projectId }) {
+  // Claude: abort via AbortController
+  const ac = activeControllers.get(projectId);
+  if (ac) {
+    ac.abort();
+    activeControllers.delete(projectId);
+    return;
+  }
+  // Gemini: kill child process
   const child = activeProcesses.get(projectId);
   if (child?.pid) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-    } catch (err) {}
+    try { process.kill(-child.pid, "SIGTERM"); } catch {}
     setTimeout(() => {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch {}
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
     }, 1500);
     activeProcesses.delete(projectId);
   }
 }
 
 function handleShutdown() {
+  for (const [, ac] of activeControllers) {
+    try { ac.abort(); } catch {}
+  }
+  activeControllers.clear();
   for (const [, child] of activeProcesses) {
-    try {
-      process.kill(child.pid, "SIGKILL");
-    } catch {}
+    try { process.kill(child.pid, "SIGKILL"); } catch {}
   }
   activeProcesses.clear();
   process.exit(0);

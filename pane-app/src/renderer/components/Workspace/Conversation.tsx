@@ -1,7 +1,7 @@
 import { useRef, useEffect, useCallback, useMemo, memo, useState } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { usePunk } from "../../hooks/useClaude";
-import { usePunkWarmup } from "../../hooks/useClaudeWarmup";
+import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
 import type {
@@ -66,17 +66,20 @@ export const Conversation = memo(function Conversation({
   const isThinking = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.statusMessage === "thinking...",
   );
-  const isReady = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.isReady ?? false,
-  );
   const error = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.error ?? null,
   );
 
   const { sendMessage, abortMessage } = usePunk(projectId);
-  usePunkWarmup(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
+
+  const { applyRestored } = useScrollPosition(projectId, scrollRef, followRef);
+
+  // Restore saved scroll position when messages first arrive from disk.
+  useEffect(() => {
+    if (messages.length > 0) applyRestored();
+  }, [messages.length]);
 
   const isActive = isProcessing || isThinking;
 
@@ -125,22 +128,8 @@ export const Conversation = memo(function Conversation({
     };
     container.addEventListener("wheel", handleWheel, { passive: true });
     return () => container.removeEventListener("wheel", handleWheel);
-  }, [isReady]);
+  }, []);
 
-  // Scroll listener: re-engage follow when user scrolls back to the bottom.
-  useEffect(() => {
-    const container = scrollRef.current;
-    if (!container) return;
-    const handleScroll = () => {
-      if (!followRef.current) {
-        const { scrollTop, scrollHeight, clientHeight } = container;
-        const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-        if (distanceFromBottom < 10) followRef.current = true;
-      }
-    };
-    container.addEventListener("scroll", handleScroll, { passive: true });
-    return () => container.removeEventListener("scroll", handleScroll);
-  }, [isReady]);
 
   // rAF loop: while active + following, continuously pin to bottom.
   const rafRef = useRef(0);
@@ -174,56 +163,24 @@ export const Conversation = memo(function Conversation({
     [sendMessage, scrollToBottom],
   );
 
-  // Scroll to bottom when this conversation becomes active
+  // Listen for send-message events from EmptyState (first message on thread creation)
   useEffect(() => {
     const handler = (e: Event) => {
-      const { projectId: activatedId } = (e as CustomEvent).detail;
-      if (activatedId === projectId && isReady && scrollRef.current) {
-        requestAnimationFrame(() => {
-          if (scrollRef.current) {
-            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-          }
-        });
+      const { projectId: targetId, message } = (e as CustomEvent).detail;
+      if (targetId === projectId && message) {
+        handleSend(message);
       }
     };
-    window.addEventListener("pane:conversation-activated", handler);
-    return () =>
-      window.removeEventListener("pane:conversation-activated", handler);
-  }, [projectId, isReady]);
-
-  // Show loading state when Claude is initializing
-  if (!isReady) {
-    return (
-      <div className="flex flex-col h-full w-full">
-        <div className="flex-1 flex items-center justify-center">
-          <svg
-            width="120"
-            height="120"
-            viewBox="0 0 120 120"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            className="text-pane-text-secondary"
-          >
-            <circle
-              cx="60"
-              cy="60"
-              r="40"
-              fill="none"
-              className="animate-circle-pulse"
-              style={{ strokeWidth: "var(--circle-stroke-width, 2)" }}
-            />
-          </svg>
-        </div>
-      </div>
-    );
-  }
+    window.addEventListener("pane:send-message", handler);
+    return () => window.removeEventListener("pane:send-message", handler);
+  }, [projectId, handleSend]);
 
   return (
     <div className="relative h-full w-full">
       <div
         ref={scrollRef}
         className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pb-48 pt-8 z-20"
+        data-conv-scroll
         data-no-drag
       >
         {messages.length === 0 && (

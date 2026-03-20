@@ -5,11 +5,11 @@ import {
   getCwd,
   detectProjectRoot,
   readFile,
-  writeFile,
   getHomeDir,
   listCheckpoints,
   brainGetProfile,
   brainGetAvatar,
+  saveConversationToMain,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/claude-types";
@@ -56,82 +56,9 @@ async function saveConversation(
   conversation: PersistedConversation,
 ): Promise<void> {
   if (!paneDir) return;
-  
-  const data: PersistedConversation = {
-    sessionId: conversation.sessionId,
-    model: conversation.model,
-    messages: conversation.messages,
-  };
-  
-  const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
-  const THRESHOLD_SIZE = 4 * 1024 * 1024; // 4MB (compact before hitting limit)
-  
-  // Function to calculate JSON size
-  const calculateSize = (obj: unknown) => new Blob([JSON.stringify(obj)]).size;
-  
-  let jsonSize = calculateSize(data);
-  
-  // Check if the conversation would exceed the threshold
-  if (jsonSize > THRESHOLD_SIZE) {
-    console.warn(`[persistence] Conversation size ${jsonSize} bytes exceeds threshold, compacting...`);
-    
-    const messages = data.messages;
-    const originalCount = messages.length;
-    let keepCount = Math.min(100, originalCount);
-    
-    // Aggressive compaction if still too large
-    if (jsonSize > MAX_FILE_SIZE) {
-      console.log(`[persistence] File exceeds maximum size, applying aggressive compaction`);
-      keepCount = Math.min(50, originalCount);
-    }
-    
-    // Keep only recent messages
-    data.messages = messages.slice(-keepCount);
-    
-    jsonSize = calculateSize(data);
-    const reduction = ((originalCount - keepCount) / originalCount * 100).toFixed(1);
-    console.log(`[persistence] Compacted: ${originalCount} → ${keepCount} messages (${reduction}% reduction)`);
-    console.log(`[persistence] New size: ${jsonSize} bytes`);
-    
-    // If still too large after basic compaction, apply aggressive truncation
-    if (jsonSize > MAX_FILE_SIZE) {
-      console.log(`[persistence] Still too large, truncating content fields...`);
-      
-      // Truncate large content fields in the remaining messages
-      data.messages = data.messages.map((msg) => {
-        if (msg.content && typeof msg.content === 'object') {
-          // Handle array content (typical for Claude/OpenAI format)
-          const content = Array.isArray(msg.content) ? msg.content : [msg.content];
-          const truncatedContent = content.map((item) => {
-            if (typeof item === 'object' && item !== null && 'text' in item && typeof item.text === 'string') {
-              // Truncate text fields to 2000 chars
-              const text = item.text;
-              if (text && text.length > 2000) {
-                return {
-                  ...item,
-                  text: text.substring(0, 1500) + '\n\n... [truncated] ...\n\n' + text.substring(text.length - 500)
-                };
-              }
-            }
-            return item;
-          });
-          return { ...msg, content: truncatedContent };
-        }
-        return msg;
-      });
-      
-      jsonSize = calculateSize(data);
-      console.log(`[persistence] After content truncation: ${jsonSize} bytes`);
-    }
-  }
-  
-  // Final safety check - if still too large, log an error
-  if (jsonSize > MAX_FILE_SIZE) {
-    console.error(`[persistence] ERROR: Unable to compact conversation to under 5MB (final size: ${jsonSize} bytes)`);
-    // Still save it, but the file may not be readable
-  }
-  
-  await writeFile(conversationPath(projectId), JSON.stringify(data));
+  // All JSON.stringify / compaction happens in the main process (Node.js),
+  // so the renderer main thread is never blocked.
+  await saveConversationToMain(conversationPath(projectId), conversation);
 }
 
 async function loadConversation(
@@ -397,7 +324,6 @@ export function useSettingsPersistence() {
               ps.restoreConversation(id, saved.messages, saved.sessionId);
               if (saved.model) {
                 ps.setConversationModel(id, saved.model);
-                ps.setConversationReady(id, true);
               }
               listCheckpoints(id)
                 .then((metas) => {
@@ -408,7 +334,7 @@ export function useSettingsPersistence() {
           }
           if (activeId) setActiveProject(activeId);
 
-          // Mark all as restored AFTER the loops so usePunkWarmup can start safely
+          // Mark all as restored AFTER the loops
           for (const id of projectIds) {
             useProjectsStore.getState().setConversationRestored(id, true);
           }

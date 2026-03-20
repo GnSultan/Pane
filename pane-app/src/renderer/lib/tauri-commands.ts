@@ -30,6 +30,23 @@ export async function writeFile(path: string, content: string): Promise<void> {
   return electronAPI.invoke("write_file", { path, content });
 }
 
+export async function loadScrollPositions(): Promise<Record<string, number | "bottom">> {
+  return electronAPI.invoke("load_scroll_positions");
+}
+
+export async function saveScrollPositions(
+  positions: Record<string, number | "bottom">,
+): Promise<void> {
+  return electronAPI.invoke("save_scroll_positions", { positions });
+}
+
+export async function saveConversationToMain(
+  filePath: string,
+  conversation: { sessionId: string | null; model?: string | null; messages: unknown[] },
+): Promise<void> {
+  return electronAPI.invoke("save_conversation", { filePath, conversation });
+}
+
 export async function getHomeDir(): Promise<string> {
   return electronAPI.invoke("get_home_dir");
 }
@@ -99,7 +116,8 @@ export async function searchInFiles(
 
 export interface GitCommit {
   hash: string;
-  message: string;
+  subject: string;  // first line of commit message
+  body: string;     // full message body (may repeat subject)
   author: string;
   date: string;
 }
@@ -191,8 +209,35 @@ export async function sendToPunk(
       draining = false;
       return;
     }
-    const event = queue.shift()!;
-    onEvent(event);
+
+    // Process events in a time-budgeted batch.
+    // Problem: setImmediate in main process can flood the renderer with hundreds
+    // of events during a compaction burst. With one-event-per-macrotask, hundreds
+    // of pending MessageChannel tasks pile up, each delaying user input by one task.
+    // Result: the app appears frozen (clicks fire 500+ tasks later).
+    //
+    // Fix: process events for up to BUDGET_MS per macrotask, then yield. This
+    // drains the backlog fast while still letting the browser handle repaints and
+    // user input between batches. If a single event is expensive (assembled
+    // assistant message with many blocks), we still yield after processing it.
+    const BUDGET_MS = 4; // ~1 frame at 240Hz — imperceptible yield gap
+    const deadline = performance.now() + BUDGET_MS;
+
+    while (queue.length > 0) {
+      const event = queue.shift()!;
+      onEvent(event);
+      // Terminal events: clean up after processing, don't schedule another drain.
+      if (event.event === "processEnded" || event.event === "error") {
+        draining = false;
+        port1.close();
+        port2.close();
+        setTimeout(() => cleanup?.(), 0);
+        return;
+      }
+      // Yield to the browser if we've used up our time budget.
+      if (performance.now() >= deadline) break;
+    }
+
     if (queue.length > 0) port1.postMessage(null);
     else draining = false;
   };
@@ -200,22 +245,10 @@ export async function sendToPunk(
   cleanup = electronAPI.on(
     `claude-stream:${projectId}`,
     (event: ClaudeStreamEvent) => {
-      // Ignore events for other requests on the same channel
-      // Note: ClaudeStreamEvent doesn't have requestId property, so we can't filter by it
-      // if (event.requestId && event.requestId !== requestId) return;
-
-      // Critical events bypass queue — must process immediately.
-      // Drain queued events FIRST so ordering is preserved (they happened before
-      // this terminal event). Then process the terminal event itself.
-      if (event.event === "processEnded" || event.event === "error") {
-        while (queue.length > 0) onEvent(queue.shift()!);
-        onEvent(event);
-        draining = false;
-        port1.close();
-        port2.close();
-        setTimeout(() => cleanup?.(), 0);
-        return;
-      }
+      // All events go through the MessageChannel queue so the browser can
+      // interleave paint/input between each one. The old pattern of
+      // synchronously dumping the queue on processEnded caused UI freezes
+      // with CLI backends that burst many events right before exit.
       queue.push(event);
       if (!draining) {
         draining = true;
@@ -528,6 +561,23 @@ export async function deleteChangeHistory(
   return electronAPI.invoke("delete_change_history", { projectId });
 }
 
+// --- Git Auto-Draft ---
+
+export async function draftCommitMessage(
+  projectId: string,
+  root: string,
+): Promise<{ draft: string; error?: string }> {
+  return electronAPI.invoke("draft_commit_message", { projectId, root });
+}
+
+export async function listBranches(path: string): Promise<{ branches: string[]; error?: string }> {
+  return electronAPI.invoke("git_list_branches", { path });
+}
+
+export async function checkoutBranch(path: string, branch: string): Promise<{ success: boolean; error?: string }> {
+  return electronAPI.invoke("git_checkout", { path, branch });
+}
+
 // --- Pane Intelligence Layer: State + Memory ---
 
 export interface EditorState {
@@ -809,6 +859,7 @@ export interface SessionDelta {
   workingSet?: { path: string; purpose?: string }[];
   decisions?: { content: string }[];
   recentActions?: { type: string; content: string; timestamp: number }[];
+  methodNotes?: { type: string; content: string; timestamp: number }[];
   turnCount?: number;
   lastProvider?: string;
   lastIntent?: string;

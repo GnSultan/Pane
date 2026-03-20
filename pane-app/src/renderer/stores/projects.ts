@@ -38,7 +38,7 @@ export interface Project {
   selectedPath: string | null;
   activeFilePath: string | null;
   activeFileContent: string | null;
-  mode: "conversation" | "viewer" | "terminal";
+  mode: "conversation" | "viewer" | "terminal" | "git";
   conversation: ConversationState;
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
@@ -129,7 +129,7 @@ interface ProjectsState {
   // Per-project mode
   setMode: (
     projectId: string,
-    mode: "conversation" | "viewer" | "terminal",
+    mode: "conversation" | "viewer" | "terminal" | "git",
   ) => void;
   toggleMode: (projectId: string) => void;
 
@@ -167,14 +167,13 @@ interface ProjectsState {
   appendToLastAssistantText: (projectId: string, text: string) => void;
   appendToLastAssistantThinking: (projectId: string, thinking: string) => void;
   setLastThinkingSignature: (projectId: string, signature: string) => void;
-  setConversationSessionId: (projectId: string, sessionId: string) => void;
+  setConversationSessionId: (projectId: string, sessionId: string | null) => void;
   setConversationModel: (projectId: string, model: string) => void;
   setConversationStatusMessage: (
     projectId: string,
     message: string | null,
   ) => void;
   setConversationRoutedModel: (projectId: string, model: string | null) => void;
-  setConversationReady: (projectId: string, isReady: boolean) => void;
   setConversationRestored: (projectId: string, isRestored: boolean) => void;
   setConversationProcessing: (projectId: string, isProcessing: boolean) => void;
   setConversationError: (projectId: string, error: string | null) => void;
@@ -202,6 +201,11 @@ interface ProjectsState {
   setIsPlanning: (projectId: string, isPlanning: boolean) => void;
   updateLastToolUseInput: (
     projectId: string,
+    input: Record<string, unknown>,
+  ) => void;
+  updateToolUseInputById: (
+    projectId: string,
+    toolId: string,
     input: Record<string, unknown>,
   ) => void;
   setContextPressure: (
@@ -401,11 +405,11 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => {
           // Toggle between Chat and Viewer (if a file is open), or Chat and Terminal (if no file)
-          let nextMode: "conversation" | "viewer" | "terminal";
+          let nextMode: "conversation" | "viewer" | "terminal" | "git";
           if (p.mode === "conversation") {
             nextMode = p.activeFilePath ? "viewer" : "terminal";
           } else {
-            // From either terminal or viewer, always go back to conversation (chat)
+            // From git, terminal, or viewer — always go back to conversation
             nextMode = "conversation";
           }
           return { mode: nextMode };
@@ -604,13 +608,6 @@ function createProjectsStore() {
         })),
       ),
 
-    setConversationReady: (projectId, isReady) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, isReady },
-        })),
-      ),
-
     setConversationRestored: (projectId, isRestored) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -726,6 +723,30 @@ function createProjectsStore() {
         }),
       ),
 
+    updateToolUseInputById: (projectId, toolId, input) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const msgs = [...p.conversation.messages];
+          for (let mi = msgs.length - 1; mi >= 0; mi--) {
+            const msg = msgs[mi]!;
+            if (msg.type === "assistant") {
+              const blocks = [...msg.content];
+              for (let i = 0; i < blocks.length; i++) {
+                if (
+                  blocks[i]!.type === "tool_use" &&
+                  (blocks[i] as ToolUseBlock).id === toolId
+                ) {
+                  blocks[i] = { ...blocks[i]!, input } as ToolUseBlock;
+                  msgs[mi] = { ...msg, content: blocks };
+                  return { conversation: { ...p.conversation, messages: msgs } };
+                }
+              }
+            }
+          }
+          return { conversation: p.conversation };
+        }),
+      ),
+
     setContextPressure: (projectId, tokens, pressure) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -768,7 +789,6 @@ function createProjectsStore() {
             serviceTier: null,
             isProcessing: false,
             isPlanning: false,
-            isReady: false,
             isRestored: true,
             error: null,
             todos: [],

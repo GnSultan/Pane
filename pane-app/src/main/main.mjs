@@ -341,6 +341,20 @@ function registerCommandHandlers() {
     // Using 'w' flag explicitly to ensure truncation, though writeFile default is 'w'
     await fs.promises.writeFile(args.path, args.content, { encoding: "utf-8", flag: "w" });
   });
+
+  const SCROLL_POSITIONS_PATH = path.join(os.homedir(), ".pane", "scroll-positions.json");
+  ipcMain.handle("load_scroll_positions", async () => {
+    try {
+      const content = await fs.promises.readFile(SCROLL_POSITIONS_PATH, "utf-8");
+      return JSON.parse(content);
+    } catch {
+      return {};
+    }
+  });
+  ipcMain.handle("save_scroll_positions", async (_event, args) => {
+    await fs.promises.mkdir(path.dirname(SCROLL_POSITIONS_PATH), { recursive: true });
+    await fs.promises.writeFile(SCROLL_POSITIONS_PATH, JSON.stringify(args.positions), "utf-8");
+  });
   ipcMain.handle("rename_file", async (_event, args) => {
     await fs.promises.rename(args.oldPath, args.newPath);
   });
@@ -532,20 +546,24 @@ function registerCommandHandlers() {
   ipcMain.handle("get_git_log", async (_event, args) => {
     const max = args.count ?? 50;
     try {
+      // \x00 = field sep, \x1E = commit record sep — both safe in git output
       const { stdout } = await execFileAsync(
         "git",
-        ["log", `-${max}`, "--pretty=format:%h%s%an%ar"],
+        ["log", `-${max}`, "--pretty=format:%h%x00%s%x00%B%x00%an%x00%ar%x1E"],
         { cwd: args.path },
       );
       const commits = [];
-      for (const line of stdout.split("\n")) {
-        const parts = line.split("");
-        if (parts.length >= 4) {
+      for (const block of stdout.split("\x1E")) {
+        const trimmed = block.trim();
+        if (!trimmed) continue;
+        const parts = trimmed.split("\x00");
+        if (parts.length >= 5) {
           commits.push({
-            hash: parts[0],
-            message: parts[1],
-            author: parts[2],
-            date: parts[3],
+            hash: (parts[0] ?? "").trim(),
+            subject: (parts[1] ?? "").trim(),
+            body: (parts[2] ?? "").trim(),
+            author: (parts[3] ?? "").trim(),
+            date: (parts[4] ?? "").trim(),
           });
         }
       }
@@ -582,6 +600,126 @@ function registerCommandHandlers() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: message };
+    }
+  });
+
+  ipcMain.handle("git_list_branches", async (_event, args) => {
+    try {
+      // Plain `git branch` output: "* main\n  feature\n  ..." — strip the * marker
+      const { stdout } = await execFileAsync("git", ["branch"], { cwd: args.path });
+      const branches = stdout
+        .split("\n")
+        .map((l) => l.replace(/^\*?\s*/, "").trim())
+        .filter(Boolean);
+      return { branches };
+    } catch (err) {
+      return { branches: [], error: String(err) };
+    }
+  });
+
+  ipcMain.handle("git_checkout", async (_event, args) => {
+    try {
+      await execFileAsync("git", ["checkout", args.branch], { cwd: args.path });
+      return { success: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { success: false, error: message };
+    }
+  });
+
+  ipcMain.handle("git_stash", async (_event, args) => {
+    try {
+      await execFileAsync("git", ["stash"], { cwd: args.path });
+      return { success: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { success: false, error: message };
+    }
+  });
+
+  // --- Auto-draft commit message via LLM ---
+  ipcMain.handle("draft_commit_message", async (_event, args) => {
+    const { projectId, root } = args;
+    try {
+      // 1. Staged diff (what's actually going to be committed)
+      let stagedDiff = "";
+      try {
+        const { stdout } = await execFileAsync("git", ["diff", "--cached"], { cwd: root });
+        stagedDiff = stdout.trim();
+      } catch {}
+
+      // 2. Unstaged diff (working tree changes not yet staged)
+      let unstagedDiff = "";
+      try {
+        const { stdout } = await execFileAsync("git", ["diff"], { cwd: root });
+        unstagedDiff = stdout.trim();
+      } catch {}
+
+      // 3. Full status — file-level summary with status codes
+      let statusSummary = "";
+      try {
+        const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-unormal"], { cwd: root });
+        statusSummary = stdout.trim();
+      } catch {}
+
+      // 4. Recent commits — understand the project's commit style and context
+      let recentCommits = "";
+      try {
+        const { stdout } = await execFileAsync(
+          "git",
+          ["log", "--oneline", "-8"],
+          { cwd: root },
+        );
+        recentCommits = stdout.trim();
+      } catch {}
+
+      // 5. Pane session change history — what the AI assistant actually did
+      let changeDescriptions = [];
+      try {
+        const historyFile = path.join(os.homedir(), ".pane", "change-history", projectId, "changes.json");
+        const changes = JSON.parse(await fs.promises.readFile(historyFile, "utf-8"));
+        for (const c of changes.slice(-40)) {
+          if (c.description) changeDescriptions.push(`- ${c.file}: ${c.description}`);
+          else if (c.file) changeDescriptions.push(`- modified ${c.file}`);
+        }
+      } catch {}
+
+      // Combine diffs — prefer staged, fall back to unstaged, cap total to avoid token blowout
+      const MAX_DIFF = 6000;
+      let diffSection = "";
+      if (stagedDiff) {
+        diffSection = stagedDiff.length > MAX_DIFF
+          ? stagedDiff.slice(0, MAX_DIFF) + "\n... (truncated)"
+          : stagedDiff;
+      } else if (unstagedDiff) {
+        diffSection = unstagedDiff.length > MAX_DIFF
+          ? unstagedDiff.slice(0, MAX_DIFF) + "\n... (truncated)"
+          : unstagedDiff;
+      }
+
+      const systemPrompt = `You are writing a git commit message for a developer. Study the actual diff carefully — understand what changed at the code level, not just which files.
+
+Rules:
+- First line: imperative mood, lowercase, max 72 chars — be specific ("add branch switching to git panel", not "update git UI")
+- If there are multiple distinct changes, add a blank line then a tight bullet list (2-5 items max)
+- Bullets: lowercase, no trailing punctuation, lead with the verb ("remove shadow from commit card", "fix branch list format flag")
+- No conventional commit prefixes (feat:, fix:, chore:)
+- No emoji, no filler phrases ("this commit", "various improvements")
+- Write only the commit message — no preamble, no explanation`;
+
+      const userPrompt = [
+        statusSummary ? `Changed files:\n${statusSummary}` : "",
+        diffSection   ? `Diff:\n${diffSection}` : "(no diff — all changes may be untracked)",
+        recentCommits ? `Recent commits (for style context):\n${recentCommits}` : "",
+        changeDescriptions.length > 0
+          ? `Session changes (what the AI assistant did):\n${changeDescriptions.join("\n")}`
+          : "",
+      ].filter(Boolean).join("\n\n");
+
+      const draft = await punkEngine.quickCall(systemPrompt, userPrompt);
+      return { draft: draft.trim() };
+    } catch (err) {
+      return { draft: "", error: err instanceof Error ? err.message : String(err) };
     }
   });
   ipcMain.handle("reveal_in_finder", (_event, args) => {
@@ -690,9 +828,8 @@ function registerSettingsHandlers() {
     const merged = { ...existing, ...args.settings };
     const json = JSON.stringify(merged, null, 2);
 
-    // Atomic write: write to a temp file then rename.
-    // A crash or HMR kill mid-write can never zero the real settings file.
-    const tmpPath = filePath + ".tmp";
+    // Unique tmp path per write — safe against concurrent saves.
+    const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
     await fs.promises.writeFile(tmpPath, json, "utf-8");
     await fs.promises.rename(tmpPath, filePath);
   });
@@ -1335,6 +1472,58 @@ function registerStateHandlers() {
 
   ipcMain.handle("write_project_state", async (_event, args) => {
     await writeStateFile(args.projectId, "project.json", args.data);
+  });
+
+  ipcMain.handle("save_conversation", async (_event, args) => {
+    const { filePath, conversation } = args;
+    const MAX_FILE_SIZE = 5 * 1024 * 1024;
+    const THRESHOLD_SIZE = 4 * 1024 * 1024;
+
+    const data = {
+      sessionId: conversation.sessionId,
+      model: conversation.model,
+      messages: conversation.messages,
+    };
+
+    // All JSON.stringify/size-checking happens in Node.js, never the renderer.
+    let json = JSON.stringify(data);
+
+    if (json.length > THRESHOLD_SIZE) {
+      const originalCount = data.messages.length;
+      let keepCount = json.length > MAX_FILE_SIZE
+        ? Math.min(50, originalCount)
+        : Math.min(100, originalCount);
+
+      data.messages = data.messages.slice(-keepCount);
+      json = JSON.stringify(data);
+
+      if (json.length > MAX_FILE_SIZE) {
+        data.messages = data.messages.map((msg) => {
+          if (msg.content && typeof msg.content === "object") {
+            const content = Array.isArray(msg.content) ? msg.content : [msg.content];
+            return {
+              ...msg,
+              content: content.map((item) => {
+                if (item && typeof item === "object" && typeof item.text === "string" && item.text.length > 2000) {
+                  return { ...item, text: item.text.substring(0, 1500) + "\n\n... [truncated] ...\n\n" + item.text.substring(item.text.length - 500) };
+                }
+                return item;
+              }),
+            };
+          }
+          return msg;
+        });
+        json = JSON.stringify(data);
+      }
+    }
+
+    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+    // Unique tmp path per write — concurrent saves each get their own tmp file,
+    // so writeFile calls never interleave on the same file descriptor.
+    // The rename is atomic: last writer wins with a complete snapshot.
+    const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
+    await fs.promises.writeFile(tmpPath, json, { encoding: "utf-8" });
+    await fs.promises.rename(tmpPath, filePath);
   });
 }
 

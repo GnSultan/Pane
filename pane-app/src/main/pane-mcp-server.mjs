@@ -247,6 +247,28 @@ const TOOLS = [
       required: ["philosophy"],
     },
   },
+  {
+    name: "pane_find_symbol",
+    description: "Find exported symbols (functions, classes, types, interfaces, constants) in the project by name. Returns exact file path and line number. Use this instead of grep when you know the name of what you're looking for.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Symbol name to search for (partial match supported)" },
+        kind: {
+          type: "string",
+          enum: ["function", "class", "const", "let", "var", "type", "interface", "enum", "default", "namespace", "reexport", "async_fn"],
+          description: "Filter by symbol kind (optional)",
+        },
+        file: { type: "string", description: "Filter by file path (partial match, optional)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "pane_synthesize",
+    description: "Get the project's synthesized DNA — a compact narrative of architectural decisions, established patterns, lessons learned, and known anti-patterns. This is the causal memory of the project: why things are the way they are.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ];
 
 // --- Tool implementations ---
@@ -442,8 +464,8 @@ async function handleToolCall(name, args) {
     }
 
     case "pane_search_changes": {
-      const query = params.query;
-      const filePath = params.file_path;
+      const query = args?.query;
+      const filePath = args?.file_path;
       const changeHistoryDir = path.join(PANE_DIR, "change-history", PROJECT_ID);
       const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
       let changes = [];
@@ -474,7 +496,7 @@ async function handleToolCall(name, args) {
     }
 
     case "pane_revert_change": {
-      const changeId = params.change_id;
+      const changeId = args?.change_id;
       const changeHistoryDir = path.join(PANE_DIR, "change-history", PROJECT_ID);
       const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
       let changes = [];
@@ -630,6 +652,95 @@ async function handleToolCall(name, args) {
       await fs.promises.writeFile(philPath, philosophy);
 
       return text("Design philosophy updated.");
+    }
+
+    case "pane_find_symbol": {
+      const query = (args?.query || "").trim();
+      if (!query) return text("Query is required.");
+
+      const symbolsPath = path.join(PANE_DIR, "brain", "symbols", `${PROJECT_ID}.json`);
+      const exported = await readJson(symbolsPath);
+      if (!exported?.symbols?.length) {
+        return text("Symbol index not available yet — it builds automatically when you open a project in Pane.");
+      }
+
+      const q = query.toLowerCase();
+      const kindFilter = args?.kind;
+      const fileFilter = args?.file?.toLowerCase();
+
+      // Fuzzy score: exact > prefix > contains > file/doc
+      const scored = exported.symbols
+        .filter(s => !kindFilter || s.kind === kindFilter)
+        .filter(s => !fileFilter || s.file.toLowerCase().includes(fileFilter))
+        .map(s => {
+          const n = s.name.toLowerCase();
+          let score = 0;
+          if (n === q)              score = 1.0;
+          else if (n.startsWith(q)) score = 0.8;
+          else if (n.includes(q))   score = 0.6;
+          else if (s.file.toLowerCase().includes(q)) score = 0.3;
+          else if (s.doc?.toLowerCase().includes(q)) score = 0.2;
+          return score > 0 ? { ...s, score } : null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 20);
+
+      if (scored.length === 0) {
+        return text(`No symbols matching "${query}" found.${kindFilter ? ` (kind: ${kindFilter})` : ""}`);
+      }
+
+      const out = scored.map(s => {
+        const doc = s.doc ? `\n    ${s.doc}` : "";
+        return `${s.name} (${s.kind}) → ${s.file}:${s.line}${doc}`;
+      }).join("\n");
+
+      return text(`${scored.length} symbol${scored.length > 1 ? "s" : ""} matching "${query}":\n\n${out}`);
+    }
+
+    case "pane_synthesize": {
+      // Read synthesis from contextual export (written by brain-engine)
+      const contextPath = path.join(PANE_DIR, "brain", "context", `${PROJECT_ID}.json`);
+      const ctx = await readJson(contextPath);
+
+      if (ctx?.synthesis) {
+        return text(`## Project DNA\n\n${ctx.synthesis}`);
+      }
+
+      // Fallback: check if brain export has enough nodes to build one
+      const exported = await readBrainExport(PROJECT_ID);
+      if (!exported || exported.length === 0) {
+        return text("Project DNA not available yet — it builds as decisions and lessons accumulate through your work.");
+      }
+
+      const decisions = exported.filter(n => n.type === "decision" && n.confidence >= 0.70).slice(0, 12);
+      const patterns  = exported.filter(n => n.type === "pattern"  && n.confidence >= 0.70).slice(0, 8);
+      const lessons   = exported.filter(n => n.type === "lesson"   && n.confidence >= 0.72).slice(0, 8);
+      const fixes     = exported.filter(n => n.type === "error_fix"&& n.confidence >= 0.70).slice(0, 6);
+
+      if (decisions.length + patterns.length + lessons.length + fixes.length === 0) {
+        return text("Project DNA not available yet — memory confidence is still building.");
+      }
+
+      const parts = ["## Project DNA\n"];
+      if (decisions.length > 0) {
+        parts.push("Architectural decisions:");
+        for (const d of decisions) parts.push(`- ${d.content}`);
+      }
+      if (patterns.length > 0) {
+        parts.push("\nEstablished patterns:");
+        for (const p of patterns) parts.push(`- ${p.content}`);
+      }
+      if (lessons.length > 0) {
+        parts.push("\nLessons learned:");
+        for (const l of lessons) parts.push(`- ${l.content}`);
+      }
+      if (fixes.length > 0) {
+        parts.push("\nKnown anti-patterns:");
+        for (const f of fixes) parts.push(`- ${f.content}`);
+      }
+
+      return text(parts.join("\n"));
     }
 
     default:

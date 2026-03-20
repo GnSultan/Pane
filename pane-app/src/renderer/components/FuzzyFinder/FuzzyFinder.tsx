@@ -92,7 +92,7 @@ export function FuzzyFinder() {
     const fileResults = fuse.search(query, { limit: 30 }).map((r) => ({
       type: "file" as const,
       path: r.item,
-      score: 100 - r.score, // Fuse.js scores are higher for worse matches
+      score: 100 - (r.score ?? 1), // Fuse.js scores are higher for worse matches
     }));
     
     const codeResultsMapped = codeResults.map((r) => ({
@@ -192,7 +192,7 @@ export function FuzzyFinder() {
           <div ref={listRef} className="flex-1 overflow-y-auto">
             {allResults.map((result, i) => (
               <button
-                key={`${result.path}-${result.line || ""}`}
+                key={`${result.path}-${result.type === "code" ? result.line : ""}`}
                 onClick={() => handleSelect(result)}
                 className={`w-full px-5 py-2.5 text-left font-mono flex items-center gap-3 ${
                   i === selectedIndex

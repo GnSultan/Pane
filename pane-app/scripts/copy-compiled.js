@@ -68,4 +68,16 @@ copyFileSync(
   `${projectRoot}/src/main/tool-executor.mjs`,
   `${projectRoot}/out/main/tool-executor.mjs`,
 );
+copyFileSync(
+  `${projectRoot}/src/main/task-runner.mjs`,
+  `${projectRoot}/out/main/task-runner.mjs`,
+);
+copyFileSync(
+  `${projectRoot}/src/main/symbol-index.mjs`,
+  `${projectRoot}/out/main/symbol-index.mjs`,
+);
+copyFileSync(
+  `${projectRoot}/src/main/plan-store.mjs`,
+  `${projectRoot}/out/main/plan-store.mjs`,
+);
 console.log("✓ Compiled scripts copied successfully");

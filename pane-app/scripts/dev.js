@@ -68,6 +68,18 @@ function copyCompiled() {
     `${projectRoot}/src/main/tool-executor.mjs`,
     `${projectRoot}/out/main/tool-executor.mjs`,
   );
+  copyFileSync(
+    `${projectRoot}/src/main/task-runner.mjs`,
+    `${projectRoot}/out/main/task-runner.mjs`,
+  );
+  copyFileSync(
+    `${projectRoot}/src/main/plan-store.mjs`,
+    `${projectRoot}/out/main/plan-store.mjs`,
+  );
+  copyFileSync(
+    `${projectRoot}/src/main/symbol-index.mjs`,
+    `${projectRoot}/out/main/symbol-index.mjs`,
+  );
   console.log("✓ Compiled scripts copied");
 }
 
@@ -251,6 +263,45 @@ watch(`${projectRoot}/src/main/tool-executor.mjs`, () => {
       `${projectRoot}/out/main/tool-executor.mjs`,
     );
     console.log("✓ tool-executor.mjs copied");
+  } catch (err) {
+    console.error("Copy failed:", err.message);
+  }
+});
+
+watch(`${projectRoot}/src/main/task-runner.mjs`, () => {
+  console.log("🔄 task-runner.mjs changed, copying...");
+  try {
+    copyFileSync(
+      `${projectRoot}/src/main/task-runner.mjs`,
+      `${projectRoot}/out/main/task-runner.mjs`,
+    );
+    console.log("✓ task-runner.mjs copied");
+  } catch (err) {
+    console.error("Copy failed:", err.message);
+  }
+});
+
+watch(`${projectRoot}/src/main/plan-store.mjs`, () => {
+  console.log("🔄 plan-store.mjs changed, copying...");
+  try {
+    copyFileSync(
+      `${projectRoot}/src/main/plan-store.mjs`,
+      `${projectRoot}/out/main/plan-store.mjs`,
+    );
+    console.log("✓ plan-store.mjs copied");
+  } catch (err) {
+    console.error("Copy failed:", err.message);
+  }
+});
+
+watch(`${projectRoot}/src/main/symbol-index.mjs`, () => {
+  console.log("🔄 symbol-index.mjs changed, copying...");
+  try {
+    copyFileSync(
+      `${projectRoot}/src/main/symbol-index.mjs`,
+      `${projectRoot}/out/main/symbol-index.mjs`,
+    );
+    console.log("✓ symbol-index.mjs copied");
   } catch (err) {
     console.error("Copy failed:", err.message);
   }

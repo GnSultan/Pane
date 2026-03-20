@@ -32,26 +32,26 @@ export const DEFAULT_HTTP_ROUTING: IntentRouting = {
   },
   execute: {
     provider: "openrouter",
-    model: "anthropic/claude-3.5-sonnet",
+    model: "anthropic/claude-sonnet-4-5",
     thinking: false,
   },
   explain: {
     provider: "openrouter",
-    model: "anthropic/claude-3.5-sonnet",
+    model: "anthropic/claude-sonnet-4-5",
     thinking: false,
   },
   other: {
     provider: "openrouter",
-    model: "anthropic/claude-3.5-sonnet",
+    model: "anthropic/claude-sonnet-4-5",
     thinking: false,
   },
 };
 
 export const DEFAULT_CLAUDE_CLI_ROUTING: IntentRouting = {
-  plan: { provider: "anthropic", model: "opus", thinking: false },
-  execute: { provider: "anthropic", model: "sonnet", thinking: false },
-  explain: { provider: "anthropic", model: "sonnet", thinking: false },
-  other: { provider: "anthropic", model: "sonnet", thinking: false },
+  plan: { provider: "anthropic", model: "claude-opus-4-6", thinking: false },
+  execute: { provider: "anthropic", model: "claude-sonnet-4-6", thinking: false },
+  explain: { provider: "anthropic", model: "claude-sonnet-4-6", thinking: false },
+  other: { provider: "anthropic", model: "claude-sonnet-4-6", thinking: false },
 };
 
 export const DEFAULT_BACKEND_ROUTING: BackendRouting = {
@@ -105,17 +105,17 @@ export const THINKING_ENGINES: EngineOption[] = [
     contextWindow: 128000,
   },
   {
-    label: "Claude 3.5 Opus",
+    label: "Claude Opus 4.6",
     provider: "anthropic",
-    model: "claude-3-opus-latest",
+    model: "claude-opus-4-6",
     thinking: false,
     requiresKey: "anthropic",
     contextWindow: 200000,
   },
   {
-    label: "Claude 3.5 Sonnet (OR)",
+    label: "Claude Sonnet 4.5 (OR)",
     provider: "openrouter",
-    model: "anthropic/claude-3.5-sonnet",
+    model: "anthropic/claude-sonnet-4-5",
     thinking: false,
     requiresKey: "openrouter",
     contextWindow: 200000,
@@ -244,17 +244,17 @@ export const BUILDING_ENGINES: EngineOption[] = [
     contextWindow: 1000000,
   },
   {
-    label: "Claude 3.5 Sonnet",
+    label: "Claude Sonnet 4.6",
     provider: "anthropic",
-    model: "claude-3-5-sonnet-latest",
+    model: "claude-sonnet-4-6",
     thinking: false,
     requiresKey: "anthropic",
     contextWindow: 200000,
   },
   {
-    label: "Claude 3.5 Sonnet (OR)",
+    label: "Claude Sonnet 4.5 (OR)",
     provider: "openrouter",
-    model: "anthropic/claude-3.5-sonnet",
+    model: "anthropic/claude-sonnet-4-5",
     thinking: false,
     requiresKey: "openrouter",
     contextWindow: 200000,
@@ -354,9 +354,9 @@ export const PROVIDER_MODELS: Record<
   Array<{ value: string; label: string }>
 > = {
   anthropic: [
-    { value: "opus", label: "Claude 3.5 Opus" },
-    { value: "sonnet", label: "Claude 3.5 Sonnet" },
-    { value: "haiku", label: "Claude 3.5 Haiku" },
+    { value: "claude-opus-4-6", label: "Claude Opus 4.6" },
+    { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
+    { value: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
   ],
   deepseek: [
     { value: "deepseek-chat", label: "DeepSeek Chat (V3.2)" },
@@ -378,7 +378,7 @@ export const PROVIDER_MODELS: Record<
     { value: "gemini-1.5-pro-latest", label: "Gemini 1.5 Pro" },
   ],
   openrouter: [
-    { value: "anthropic/claude-3.5-sonnet", label: "Claude 3.5 Sonnet (OR)" },
+    { value: "anthropic/claude-sonnet-4-5", label: "Claude Sonnet 4.5 (OR)" },
     { value: "google/gemini-2.0-flash-001", label: "Gemini 2.0 Flash (OR)" },
     { value: "deepseek/deepseek-chat", label: "DeepSeek V3 (OR)" },
     { value: "deepseek/deepseek-r1", label: "DeepSeek R1 (OR)" },

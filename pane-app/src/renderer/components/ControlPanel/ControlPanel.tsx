@@ -1,7 +1,5 @@
 import { useState, useCallback, useEffect, type ReactNode } from "react";
-import { FileTree } from "./FileTree";
 import { ProjectList } from "./ProjectList";
-import { GitStatus } from "./GitStatus";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 
@@ -189,17 +187,24 @@ export function ControlPanel() {
     return s.projects.get(s.activeProjectId)?.root;
   });
 
-  const profileOpen = useWorkspaceStore((s) => s.profileOpen);
-  const mindOpen = useWorkspaceStore((s) => s.mindOpen);
-  const [gitPanelActive, setGitPanelActive] = useState(false);
+  const overlay = useWorkspaceStore((s) => s.overlay);
 
-  // Auto-close git panel when project changes or isn't a git repo
+  // If we're somehow in git mode but the project isn't a git repo, go to conversation
   useEffect(() => {
-    setGitPanelActive(false);
-  }, [activeProjectId, isGitRepo]);
+    if (mode === "git" && !isGitRepo && activeProjectId) {
+      setMode(activeProjectId, "conversation");
+    }
+  }, [isGitRepo, mode, activeProjectId]);
 
-  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal") => {
-    if (!activeProjectId || mode === newMode) return;
+  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal" | "git") => {
+    if (!activeProjectId) return;
+    const ws = useWorkspaceStore.getState();
+    // Close any overlay first — clicking a space always navigates to it
+    if (ws.overlay !== null) {
+      ws.setOverlay(null);
+      if (mode === newMode) return; // overlay was covering this mode, just close it
+    }
+    if (mode === newMode) return;
     if (newMode === "viewer" && !activeFilePath) return;
     setMode(activeProjectId, newMode);
     if (newMode === "conversation") {
@@ -207,12 +212,7 @@ export function ControlPanel() {
     } else if (newMode === "viewer") {
       window.dispatchEvent(new CustomEvent("pane:focus-editor"));
     }
-    // Terminal handles its own focus
   }, [activeProjectId, mode, activeFilePath, setMode]);
-
-  const toggleGit = useCallback(() => {
-    setGitPanelActive((prev) => !prev);
-  }, []);
 
   return (
     <div
@@ -223,17 +223,10 @@ export function ControlPanel() {
       {/* Spacer for macOS traffic lights — enough room so they sit inside the panel */}
       <div className="h-12 shrink-0" />
 
-      {/* Project list */}
-      <div className="py-2">
+      {/* Thread list — fills available space between traffic lights and toolbar */}
+      <div className="flex-1 min-h-0 overflow-y-auto py-2">
         <ProjectList />
       </div>
-
-      {/* FileTree and GitStatus are mutually exclusive — git takes over the panel */}
-      {gitPanelActive && isGitRepo && root && activeProjectId ? (
-        <GitStatus root={root} />
-      ) : (
-        <FileTree />
-      )}
 
       {/* Toolbar */}
       <div className="h-9 flex items-center gap-1 px-2 shrink-0">
@@ -258,8 +251,8 @@ export function ControlPanel() {
         {isGitRepo && (
           <ToolbarButton
             icon={<GitIcon />}
-            active={gitPanelActive}
-            onClick={toggleGit}
+            active={mode === "git"}
+            onClick={() => handleSetMode(mode === "git" ? "conversation" : "git")}
             tooltip="Git"
           />
         )}
@@ -271,21 +264,21 @@ export function ControlPanel() {
         />
         <ToolbarButton
           icon={<ChangeHistoryIcon />}
-          active={useWorkspaceStore((s) => s.changeHistoryOpen)}
-          onClick={() => useWorkspaceStore.getState().toggleChangeHistory()}
+          active={overlay === "history"}
+          onClick={() => useWorkspaceStore.getState().setOverlay("history")}
           tooltip="History"
         />
         <div className="ml-auto flex items-center gap-0.5">
           <ToolbarButton
             icon={<MindIcon />}
-            active={mindOpen}
-            onClick={() => useWorkspaceStore.getState().toggleMind()}
+            active={overlay === "mind"}
+            onClick={() => useWorkspaceStore.getState().setOverlay("mind")}
             tooltip="Mind"
           />
           <ToolbarButton
             icon={<ProfileAvatar />}
-            active={profileOpen}
-            onClick={() => useWorkspaceStore.getState().toggleProfile()}
+            active={overlay === "profile"}
+            onClick={() => useWorkspaceStore.getState().setOverlay("profile")}
             tooltip="Profile"
           />
         </div>

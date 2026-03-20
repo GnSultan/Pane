@@ -8,11 +8,17 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { BrowserWindow, utilityProcess, ipcMain } from "electron";
+
+const execFileAsync = promisify(execFile);
 import { classifyIntent } from "./classify-intent.mjs";
 import { HttpBackend } from "./http-backend.mjs";
 import { PunkBackend } from "./punk-backend.mjs";
 import { modelManager } from "./model-manager.mjs";
+import { TaskRunner } from "./task-runner.mjs";
+import { readState } from "./session-context.mjs";
 
 // Node.js globals for utility process
 const { AbortController, fetch, TextDecoder, setImmediate, console } =
@@ -191,6 +197,77 @@ class CliBackend extends PunkBackend {
     }
     this.activeRequests.clear();
   }
+
+  /**
+   * Execute a single orchestration step through the CLI backend.
+   * The system override is folded into the user prompt since we can't
+   * inject an arbitrary system prompt into the Claude/Gemini CLI binary.
+   * A fresh sessionId ensures no prior conversation history bleeds in.
+   */
+  async spawnStep(projectId, prompt, systemOverride, request) {
+    const stepRequestId = `step-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Fold the system override into the user message as preamble context.
+    // The CLI binary controls its own system prompt, but the model will
+    // still follow grounded instructions prepended to the user turn.
+    const stepPrompt = systemOverride
+      ? `[Step context — follow these instructions precisely]\n${systemOverride}\n\n[Your task]\n${prompt}`
+      : prompt;
+
+    const stepRequest = {
+      ...request,
+      projectId,
+      prompt: stepPrompt,
+      requestId: stepRequestId,
+      sessionId: null, // fresh session — no conversation history
+      history: [],     // belt-and-suspenders: no history
+    };
+
+    await this.spawn(stepRequest);
+    // CLI backend is event-driven; messages are emitted via onEvent, not returned.
+    // Verification in TaskRunner falls back to change-history grounding (no message scan needed).
+    return { messages: [] };
+  }
+
+  /**
+   * Make a lightweight planning call using the CLI's --print / non-interactive mode.
+   * `claude --print` and `gemini --prompt` both return text and exit immediately —
+   * no session, no tools, no streaming. Perfect for task decomposition.
+   *
+   * Falls back to HTTP backend if the CLI call fails (e.g. binary not found).
+   */
+  async planningCall(systemPrompt, userPrompt, request) {
+    const combinedPrompt = `${systemPrompt}\n\n${userPrompt}`;
+
+    try {
+      if (this.command === "claude") {
+        // Claude Code: --print runs non-interactively and prints the response
+        const { stdout } = await execFileAsync(
+          "claude",
+          ["--print", combinedPrompt],
+          { timeout: 60_000, maxBuffer: 1024 * 1024 * 4 },
+        );
+        return stdout.trim();
+      }
+
+      if (this.command === "gemini") {
+        // Gemini CLI: --prompt flag for non-interactive mode
+        const { stdout } = await execFileAsync(
+          "gemini",
+          ["--prompt", combinedPrompt],
+          { timeout: 60_000, maxBuffer: 1024 * 1024 * 4 },
+        );
+        return stdout.trim();
+      }
+
+      throw new Error(`Unknown CLI command: ${this.command}`);
+    } catch (err) {
+      console.warn(`[punk] CliBackend.planningCall failed (${err.message}), falling back to HTTP`);
+      // If the CLI call fails for any reason, try HTTP as a last resort
+      const httpBackend = new HttpBackend(this.onEvent);
+      return httpBackend.planningCall(systemPrompt, userPrompt, request);
+    }
+  }
 }
 
 // ============================================================================
@@ -202,6 +279,7 @@ class PunkEngine {
     this.backend = null;
     this.relayQueue = [];
     this.relayDraining = false;
+    this.taskRunner = null;
   }
 
   async initialize(backendOverride) {
@@ -232,6 +310,21 @@ class PunkEngine {
       default:
         throw new Error(`Unknown backend type: ${backendType}`);
     }
+
+    // Initialize TaskRunner for ALL backends — orchestration is Pane's layer,
+    // not the backend's. Both planning and execution route through whatever
+    // backend is active (CLI or HTTP). CLI backends use --print mode for
+    // planning (non-interactive, text-only, no tools).
+    this.taskRunner = new TaskRunner(
+      // spawnStep: execute a single step through the active backend
+      (projectId, prompt, systemOverride, request) =>
+        this.backend.spawnStep(projectId, prompt, systemOverride, request),
+      // onEvent: relay events to renderer
+      onEvent,
+      // planCall: route through the active backend's planning method
+      (systemPrompt, userPrompt, request) =>
+        this.backend.planningCall(systemPrompt, userPrompt, request),
+    );
   }
 
   async reinitialize(backendOverride) {
@@ -295,12 +388,10 @@ class PunkEngine {
     // Attach requestId to the event so the renderer can filter it
     const enrichedEvent = { ...event, requestId };
 
-    if (event.event === "processEnded" || event.event === "error") {
-      this.flushRelayQueue();
-      this.sendToRenderer(channel, enrichedEvent);
-      return;
-    }
-
+    // Queue everything — including terminal events — and drain via setImmediate.
+    // The old pattern of flushing the entire queue synchronously on processEnded
+    // caused a burst of webContents.send calls that froze the renderer with CLI
+    // backends, which can produce many events locally before the process exits.
     this.relayQueue.push({ channel, event: enrichedEvent });
     this.drainRelayQueue();
   }
@@ -315,13 +406,25 @@ class PunkEngine {
     if (this.relayDraining) return;
     this.relayDraining = true;
 
+    // Process up to BATCH_SIZE events per setImmediate tick.
+    // One-per-tick was correct for preventing synchronous dumps, but during
+    // a burst (e.g. context compaction outputting hundreds of lines at once)
+    // it creates hundreds of pending setImmediate callbacks, each calling
+    // webContents.send() in isolation. Batching reduces the number of
+    // scheduled callbacks while still yielding to I/O between batches.
+    const BATCH_SIZE = 16;
+
     const drain = () => {
       if (this.relayQueue.length === 0) {
         this.relayDraining = false;
         return;
       }
-      const { channel, event } = this.relayQueue.shift();
-      this.sendToRenderer(channel, event);
+      let sent = 0;
+      while (this.relayQueue.length > 0 && sent < BATCH_SIZE) {
+        const { channel, event } = this.relayQueue.shift();
+        this.sendToRenderer(channel, event);
+        sent++;
+      }
       if (this.relayQueue.length > 0) setImmediate(drain);
       else this.relayDraining = false;
     };
@@ -414,6 +517,56 @@ class PunkEngine {
       );
     }
 
+    // ── CONTROL INVERSION CHECK ──────────────────────────────────────────
+    // If TaskRunner is available and the task qualifies for orchestration,
+    // route through the step-by-step executor instead of handing the model
+    // full autonomy.
+    if (this.taskRunner && !resolvedRequest._systemOverride) {
+      const sessionState = readState(resolvedRequest.projectId);
+      const shouldOrchestrate = this.taskRunner.shouldOrchestrate(
+        resolvedRequest.prompt,
+        sessionState,
+      );
+
+      // Check settings for orchestration toggle
+      let orchestrationEnabled = false;
+      try {
+        const settings = await this.loadSettings();
+        orchestrationEnabled = settings.orchestration_enabled ?? false;
+      } catch {}
+
+      if (shouldOrchestrate && orchestrationEnabled) {
+        // Build a separate planning request routed to the "plan" intent slot.
+        // This lets the reasoning model (e.g. claude-opus, deepseek-r1) do
+        // decomposition while the cheaper execution model runs each step.
+        const planRoute = routing["plan"] || routing["execute"];
+        const planningRequest = {
+          ...resolvedRequest,
+          provider: planRoute.provider,
+          model: planRoute.model,
+          thinking: planRoute.thinking ?? false,
+        };
+
+        console.log(
+          `[punk] 🎯 ORCHESTRATING: planning=${planningRequest.provider}/${planningRequest.model} execute=${resolvedRequest.provider}/${resolvedRequest.model}`,
+        );
+
+        try {
+          await this.taskRunner.run(
+            resolvedRequest.projectId,
+            resolvedRequest.prompt,
+            resolvedRequest,
+            planningRequest,
+          );
+        } catch (err) {
+          console.error(`[punk] TaskRunner failed, falling back to direct:`, err.message);
+          // Fall through to direct execution below
+          await this.backend.spawn(resolvedRequest);
+        }
+        return;
+      }
+    }
+
     try {
       console.log(
         `[punk] spawn attempt: ${resolvedRequest.provider}/${resolvedRequest.model} (thinking=${resolvedRequest.thinking})`,
@@ -426,6 +579,10 @@ class PunkEngine {
   }
 
   async abort(projectId) {
+    // Also abort TaskRunner if running
+    if (this.taskRunner?.isRunning(projectId)) {
+      this.taskRunner.abort(projectId);
+    }
     if (this.backend) await this.backend.abort(projectId);
   }
 
@@ -439,6 +596,25 @@ class PunkEngine {
 
   async getOpenRouterModels() {
     return await modelManager.refreshModels("openrouter").then(() => modelManager.models["openrouter"] || []);
+  }
+
+  /**
+   * Simple text generation call routed through the active backend.
+   * Uses whatever the user has configured — CLI, HTTP, anything.
+   * No tools, no history, no streaming. Just a prompt → text response.
+   *
+   * This is the single entry point for any Pane-internal generation
+   * (commit drafts, summaries, etc.) that should respect user's active config.
+   */
+  async quickCall(systemPrompt, userPrompt) {
+    await this.initialize();
+    const settings = await this.loadSettings();
+    // Build a minimal request matching what planningCall expects
+    const request = {
+      provider: settings.http_provider || null,
+      model: settings.http_model || null,
+    };
+    return this.backend.planningCall(systemPrompt, userPrompt, request);
   }
 }
 

@@ -56,7 +56,7 @@ function App() {
   const fuzzyFinderOpen = useWorkspaceStore((s) => s.fuzzyFinderOpen);
   const toggleFileSearch = useWorkspaceStore((s) => s.toggleFileSearch);
   const fileSearchOpen = useWorkspaceStore((s) => s.fileSearchOpen);
-  const toggleMind = useWorkspaceStore((s) => s.toggleMind);
+  const toggleMind = () => useWorkspaceStore.getState().toggleOverlay("mind");
 
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
 
@@ -184,7 +184,7 @@ function App() {
           break;
         }
         case "settings":
-          useWorkspaceStore.getState().toggleProfile();
+          useWorkspaceStore.getState().toggleOverlay("profile");
           break;
         case "cycle-theme":
           useWorkspaceStore.getState().toggleTheme();
