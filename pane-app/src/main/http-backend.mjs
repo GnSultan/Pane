@@ -710,6 +710,113 @@ function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
   );
 }
 
+// ============================================================================
+// OpenRouter model curation — Pane-aware filter + normalizer
+// ============================================================================
+//
+// Pane is a coding agent. We only want models that are:
+//   1. Tool-capable  — agentic tasks require function calling
+//   2. Context-adequate — < 16k tokens can't hold a meaningful codebase
+//   3. From a coding-capable family — known providers with strong code performance
+//   4. Not vision/multimodal-only — those families don't run code tools
+//
+// Everything else (story generators, image captioners, tiny chat models,
+// "free" models with no tool support) is noise for Pane's model picker.
+//
+
+// Families known to perform well at coding + agentic tasks.
+// Format: [id-prefix, display-provider-name, tier (1=frontier, 2=balanced, 3=fast)]
+const CODING_FAMILIES = [
+  // Tier 1 — frontier
+  ["anthropic/claude-opus",          "Anthropic",  1],
+  ["openai/o3",                       "OpenAI",     1],
+  ["openai/o4",                       "OpenAI",     1],
+  ["openai/gpt-4o",                   "OpenAI",     1],
+  ["google/gemini-2.5-pro",           "Google",     1],
+  ["google/gemini-2.0-pro",           "Google",     1],
+  ["deepseek/deepseek-r1",            "DeepSeek",   1],
+  ["x-ai/grok-3",                     "xAI",        1],
+  // Tier 2 — balanced
+  ["anthropic/claude-sonnet",         "Anthropic",  2],
+  ["openai/gpt-4",                    "OpenAI",     2],
+  ["openai/o3-mini",                  "OpenAI",     2],
+  ["openai/o1",                       "OpenAI",     2],
+  ["google/gemini-2.0-flash",         "Google",     2],
+  ["google/gemini-2.5-flash",         "Google",     2],
+  ["deepseek/deepseek-v3",            "DeepSeek",   2],
+  ["deepseek/deepseek-chat",          "DeepSeek",   2],
+  ["meta-llama/llama-4",              "Meta",       2],
+  ["meta-llama/llama-3.3",            "Meta",       2],
+  ["meta-llama/llama-3.1-405",        "Meta",       2],
+  ["qwen/qwen3",                      "Qwen",       2],
+  ["qwen/qwq",                        "Qwen",       2],
+  ["qwen/qwen2.5-coder",              "Qwen",       2],
+  ["mistralai/codestral",             "Mistral",    2],
+  ["mistralai/mistral-large",         "Mistral",    2],
+  ["mistralai/devstral",              "Mistral",    2],
+  ["x-ai/grok-2",                     "xAI",        2],
+  ["cohere/command-r-plus",           "Cohere",     2],
+  // Tier 3 — fast / cheap
+  ["anthropic/claude-haiku",          "Anthropic",  3],
+  ["openai/gpt-4o-mini",              "OpenAI",     3],
+  ["google/gemini-2.0-flash-lite",    "Google",     3],
+  ["google/gemini-flash",             "Google",     3],
+  ["meta-llama/llama-3.1-70",         "Meta",       3],
+  ["meta-llama/llama-3.2",            "Meta",       3],
+  ["qwen/qwen2.5-72",                 "Qwen",       3],
+  ["mistralai/mistral-small",         "Mistral",    3],
+  ["microsoft/phi-4",                 "Microsoft",  3],
+];
+
+function _familyFor(modelId) {
+  const lower = modelId.toLowerCase();
+  for (const [prefix, provider, tier] of CODING_FAMILIES) {
+    if (lower.startsWith(prefix)) return { provider, tier };
+  }
+  return null;
+}
+
+function _isPaneModel(m) {
+  const params = m.supported_parameters || [];
+  const hasTools = params.includes("tools") || params.includes("tool_choice");
+  if (!hasTools) return false;
+  if ((m.context_length ?? 0) < 16_384) return false;
+  return _familyFor(m.id) !== null;
+}
+
+function _normalizeModel(m) {
+  const family  = _familyFor(m.id);
+  // Strip OpenRouter noise from display names: "(self-moderated)", "(extended)",
+  // ":nitro", ":floor", ":free" suffixes, and trailing date stamps like " 2024-11"
+  const name = (m.name ?? m.id)
+    .replace(/\s*\(self-moderated\)/gi, "")
+    .replace(/\s*\(extended\)/gi, "")
+    .replace(/\s*\(preview\)/gi, " preview")
+    .replace(/:\w+$/,             "")   // :nitro, :free, :floor
+    .replace(/\s+\d{4}-\d{2}$/,  "")   // trailing " 2024-11" date stamps
+    .trim();
+
+  // Pricing in $/Mtok (OpenRouter uses per-token strings like "0.000003")
+  const inputMtok  = m.pricing?.prompt   ? parseFloat(m.pricing.prompt)  * 1_000_000 : null;
+  const outputMtok = m.pricing?.completion ? parseFloat(m.pricing.completion) * 1_000_000 : null;
+
+  return {
+    id:             m.id,
+    name,
+    context_length: m.context_length,
+    provider:       family.provider,
+    tier:           family.tier,
+    input_cost:     inputMtok  != null ? +inputMtok.toFixed(4)  : null,
+    output_cost:    outputMtok != null ? +outputMtok.toFixed(4) : null,
+  };
+}
+
+function _byRelevance(a, b) {
+  // Tier ascending (1 first), then context descending (larger wins ties)
+  if (a.tier !== b.tier) return a.tier - b.tier;
+  return (b.context_length ?? 0) - (a.context_length ?? 0);
+}
+
 export class HttpBackend extends PunkBackend {
   constructor(onEvent) {
     super(onEvent);
@@ -2055,45 +2162,30 @@ export class HttpBackend extends PunkBackend {
 
     try {
       const response = await fetch("https://openrouter.ai/api/v1/models", {
-        headers: {
-          Authorization: `Bearer ${apiConfig.apiKey}`,
-        },
+        headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
+        signal: AbortSignal.timeout(12_000),
       });
-
       if (!response.ok) return [];
 
       const json = await response.json();
       if (!json.data) return [];
 
-      return json.data
-        .filter((m) => {
-          const params = m.supported_parameters || [];
-          // Some models are free (pricing.prompt is "0" or 0)
-          const isFree = Number(m.pricing?.prompt) === 0;
-          const supportsTools =
-            params.includes("tools") || params.includes("tool_choice");
-          return isFree || supportsTools;
-        })
-        .map((m) => ({
-          id: m.id,
-          name: m.name,
-          context_length: m.context_length,
-        }));
+      return json.data.filter(_isPaneModel).map(_normalizeModel).sort(_byRelevance);
     } catch (err) {
       console.error("[http] Failed to fetch OpenRouter models:", err);
       return [];
     }
   }
 
-  // ==========================================================================
-  // Task Runner Support — Planning Call & Step Execution
-  // ==========================================================================
+// ==========================================================================
+// Task Runner Support — Planning Call & Step Execution (class methods)
+// ==========================================================================
 
   /**
    * Make a lightweight API call with no tools — used for task decomposition.
    * Returns the raw text response from the model.
    */
-  async planningCall(systemPrompt, userPrompt, request) {
+  async planningCall(systemPrompt, userPrompt, request, onChunk) {
     const apiConfig = await this.getApiConfig(request.provider || null);
     this.validateApiConfig(apiConfig);
 
@@ -2105,9 +2197,91 @@ export class HttpBackend extends PunkBackend {
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ], apiConfig.provider),
+      stream: true,
+      // No tools — pure text generation for planning
+    };
+
+    const { url, headers, finalBody } = this.prepareRequest(apiConfig, body, request);
+
+    const cleanBody = { ...(finalBody || body), stream: true };
+    delete cleanBody.tools;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(cleanBody),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => response.statusText);
+      throw new Error(`Planning call failed: HTTP ${response.status}: ${errorText}`);
+    }
+
+    // Stream the response — extract text deltas and call onChunk as they arrive
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = "";
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep incomplete last line
+
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+
+        let parsed;
+        try { parsed = JSON.parse(data); } catch { continue; }
+
+        let delta = "";
+        if (apiConfig.provider === "anthropic") {
+          // Anthropic: content_block_delta with text_delta
+          if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta") {
+            delta = parsed.delta.text || "";
+          }
+        } else {
+          // OpenAI-compatible (DeepSeek, OpenRouter, Kimi, etc.)
+          delta = parsed.choices?.[0]?.delta?.content || "";
+        }
+
+        if (delta) {
+          fullText += delta;
+          if (onChunk) onChunk(delta);
+        }
+      }
+    }
+
+    return fullText;
+  }
+
+  /**
+   * Multi-turn conversation call (no tools) — used for discovery phase.
+   * Takes a full messages array instead of a single user message.
+   * Returns the raw text response from the model.
+   */
+  async conversationCall(systemPrompt, messages, request) {
+    const apiConfig = await this.getApiConfig(request.provider || null);
+    this.validateApiConfig(apiConfig);
+
+    const model = this.mapModelName(apiConfig.provider, request.model);
+
+    const fullMessages = [
+      { role: "system", content: systemPrompt },
+      ...messages,
+    ];
+
+    const body = {
+      model,
+      messages: this.normalizeMessages(fullMessages, apiConfig.provider),
       stream: false,
       max_tokens: 2048,
-      // No tools — pure text generation for planning
+      // No tools — pure conversation for discovery
     };
 
     const { url, headers, finalBody } = this.prepareRequest(apiConfig, body, request);
@@ -2124,7 +2298,7 @@ export class HttpBackend extends PunkBackend {
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Planning call failed: HTTP ${response.status}: ${errorText}`);
+      throw new Error(`Conversation call failed: HTTP ${response.status}: ${errorText}`);
     }
 
     const json = await response.json();

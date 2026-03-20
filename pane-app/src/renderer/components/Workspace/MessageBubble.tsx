@@ -7,6 +7,7 @@ import type {
   ServerToolUseBlock,
   WebSearchToolResultBlock,
   JsonBlock,
+  StrategyBlock,
 } from "../../lib/claude-types";
 import { restoreCheckpoint, getCheckpointDiff } from "../../lib/tauri-commands";
 import type { CheckpointDiffFile } from "../../lib/tauri-commands";
@@ -16,6 +17,7 @@ import { ToolActivity, ServerToolActivity } from "./ToolActivity";
 import { MarkdownText } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
 import { PlanBlock } from "./PlanBlock";
+import { StrategyBlockDisplay } from "./StrategyBlock";
 
 // No CSS containment — content-visibility: auto causes visible pop-in stutter
 // when messages scroll into view, which is worse than the layout cost it saves.
@@ -359,11 +361,7 @@ export function MessageBubble({
 
   // Plan messages — the blueprint Pane produced before execution
   if (message.type === "plan" && message.planData) {
-    return (
-      <div className="px-4">
-        <PlanBlock planData={message.planData} />
-      </div>
-    );
+    return <PlanBlock planData={message.planData} />;
   }
 
   if (message.type === "assistant") {
@@ -383,13 +381,15 @@ export function MessageBubble({
     // Check if this is a DeepSeek R1 response with reasoning
     // const hasThinking = message.content.some((b) => b.type === "thinking");
 
-    // Group consecutive text/thinking blocks, but tools always get their own group
-    type GroupType = "text" | "tool" | "thinking" | "json";
+    // Group consecutive text/thinking blocks, but tools/strategy always get their own group
+    type GroupType = "text" | "tool" | "thinking" | "json" | "strategy";
     const groups: { type: GroupType; blocks: typeof message.content }[] = [];
     for (const block of filteredContent) {
       let groupType: GroupType;
       if (block.type === "thinking") {
         groupType = "thinking";
+      } else if (block.type === "strategy") {
+        groupType = "strategy";
       } else if (
         block.type === "tool_use" ||
         block.type === "server_tool_use" ||
@@ -403,12 +403,13 @@ export function MessageBubble({
       }
       const last = groups[groups.length - 1];
       // Only group consecutive text or thinking blocks together
-      // Tools and JSON always get their own group
+      // Tools, JSON, and strategy always get their own group
       if (
         last &&
         last.type === groupType &&
         groupType !== "tool" &&
-        groupType !== "json"
+        groupType !== "json" &&
+        groupType !== "strategy"
       ) {
         last.blocks.push(block);
       } else {
@@ -419,10 +420,12 @@ export function MessageBubble({
     const hasVisibleContent = message.content.some(
       (b) => b.type === "text" || b.type === "json",
     );
+    const isStrategyOnly = message.content.length > 0 &&
+      message.content.every(b => b.type === "strategy");
 
     return (
       <div
-        className={`group ${animClass} ${hasVisibleContent ? "mb-12" : "mb-4"} ${message.isStreaming ? "streaming-message" : ""}`}
+        className={`group ${animClass} ${hasVisibleContent ? "mb-12" : isStrategyOnly ? "mb-1" : "mb-4"} ${message.isStreaming ? "streaming-message" : ""}`}
       >
         {groups.map((group, gi) => {
           if (group.type === "thinking") {
@@ -439,6 +442,15 @@ export function MessageBubble({
             );
           }
 
+          if (group.type === "strategy") {
+            const block = group.blocks[0] as StrategyBlock;
+            return (
+              <div key={gi} className="my-0.5">
+                <StrategyBlockDisplay block={block} />
+              </div>
+            );
+          }
+
           if (group.type === "text") {
             return (
               <div
@@ -448,6 +460,7 @@ export function MessageBubble({
               >
                 {group.blocks.map((block, i) => {
                   const text = (block as { type: "text"; text: string }).text;
+                  if (text == null) return null;
                   return (
                     <div
                       key={i}

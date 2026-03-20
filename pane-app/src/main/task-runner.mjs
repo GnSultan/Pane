@@ -33,6 +33,64 @@ const execAsync = promisify(exec);
 const PANE_DIR = path.join(os.homedir(), ".pane");
 
 // ---------------------------------------------------------------------------
+// JSON extraction — models sometimes wrap JSON in markdown despite instructions
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the first complete JSON object from a string that may contain
+ * markdown code fences, prose preamble, or other non-JSON content.
+ * @param {string} raw
+ * @returns {string}
+ */
+function extractJson(raw) {
+  if (!raw) throw new Error("Empty response from planning call");
+  // Strip markdown code fences first (```json ... ``` or ``` ... ```)
+  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) return fenceMatch[1].trim();
+  // Find first { ... } block spanning the whole object
+  const start = raw.indexOf("{");
+  if (start === -1) throw new Error("No JSON object found in planning response");
+  // Walk to find matching closing brace
+  let depth = 0;
+  for (let i = start; i < raw.length; i++) {
+    if (raw[i] === "{") depth++;
+    else if (raw[i] === "}") { depth--; if (depth === 0) return raw.slice(start, i + 1); }
+  }
+  // No balanced close — return from start to end and let JSON.parse report the error
+  return raw.slice(start);
+}
+
+/**
+ * Distill the last few turns of conversation into plain text for the planning model.
+ * Keeps only text content — strips tool calls, tool results, thinking blocks.
+ * @param {Array<{type: string, content: any}>} history
+ * @returns {string}
+ */
+function buildConversationContext(history) {
+  if (!history || history.length === 0) return "";
+  // Take last 8 messages (≈4 turns) — enough context without noise
+  const recent = history.slice(-8);
+  const lines = [];
+  for (const msg of recent) {
+    const role = msg.type === "user" ? "User" : msg.type === "assistant" ? "Assistant" : null;
+    if (!role) continue;
+    // Content may be a string or an array of content blocks
+    let text = "";
+    if (typeof msg.content === "string") {
+      text = msg.content;
+    } else if (Array.isArray(msg.content)) {
+      text = msg.content
+        .filter(b => b.type === "text")
+        .map(b => b.text || "")
+        .join("\n");
+    }
+    text = text.trim();
+    if (text) lines.push(`${role}: ${text.length > 800 ? text.slice(0, 800) + "…" : text}`);
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Change History Primitives
 // ---------------------------------------------------------------------------
 
@@ -173,38 +231,85 @@ async function runTypeCheck(workingDir) {
 // Planning Prompt
 // ---------------------------------------------------------------------------
 
-const PLANNING_SYSTEM_PROMPT = `You are Pane's task decomposition engine. Your job is to break a software engineering task into precise, ordered steps that a model can execute one at a time.
+const PLANNING_SYSTEM_PROMPT = `You are writing an execution script for a coding model. This is not a plan or a guide — it is a precise, ordered sequence of instructions that a model will execute one at a time, with no human intervention between steps.
 
-Rules:
-- Each step must be independently executable by a model with tool access (read files, edit files, run commands).
-- Each step must have a clear verification condition.
-- Steps should follow this natural order: understand → plan → implement → verify.
-- Keep steps granular. "Add auth to the API" is too broad. "Read the existing route handler in routes/api.ts" is right.
-- Never combine reading and writing in one step. Read first, write second.
-- The last step should always be verification (run tests, type-check, or build).
-- Maximum 8 steps. If the task needs more, you're over-scoping.
+The model executing your script has read_file, write_file, and run_command tools. It has no memory of previous turns. Each step is a complete, self-contained job card.
+
+─── WRITE STEPS — the standard you must meet ───────────────────────────────
+Every write step must specify:
+  1. Exact file and location — which function, class, block, or line to modify
+  2. Exact change — what to insert, replace, or delete (include actual code, signatures, and logic)
+  3. Exact reason — one sentence on why, so the model doesn't second-guess the intent
+
+BAD (description):  "Add a find_files tool to TOOL_DEFINITIONS in http-backend.mjs"
+GOOD (execution):   "In http-backend.mjs, in the TOOL_DEFINITIONS array, add a new entry with name 'find_files', description 'Find files by name or glob pattern using the brain index', and parameters: pattern (string, required). Handler in tool-executor.mjs should call brainEngine.findFiles(pattern) and return { files: string[] }."
+
+If you have file contents in context — use them. Reference actual function names, actual variable names, actual line positions. Do not invent names you haven't seen.
+
+─── READ STEPS ──────────────────────────────────────────────────────────────
+A read step is only valid if its findings are required to write a later step precisely.
+State exactly what to extract: "Read X to find the signature of function Y and the shape of type Z — needed by step N."
+Never use read steps to 'understand' or 'explore' without a specific extraction goal.
+
+─── OTHER RULES ─────────────────────────────────────────────────────────────
+- Never combine read and write in one step.
+- The last step must verify: run tsc, run tests, or build — whichever applies.
+- Use as many steps as the task requires. Do not compress.
+- Steps execute sequentially. Later steps may reference what earlier steps produced.
 
 Step types:
-- "read": Model reads/explores files to understand something. No edits.
-- "write": Model makes a specific code change. Must name exact files.
-- "verify": Model runs a command to verify (test, build, type-check).
-- "plan": Model produces a plan or analysis (no file changes).
+- "read":   Read and extract specific information. No edits.
+- "write":  Make a specific, fully-specified code change.
+- "verify": Run a command to confirm correctness.
+- "plan":   Produce analysis or a decision. No file changes.
 
 Respond with ONLY a JSON object. No markdown, no explanation, no code fences.
 
-Schema:
 {
   "summary": "one-line task description",
   "steps": [
     {
       "index": 1,
-      "action": "imperative instruction for the model",
+      "action": "complete, precise instruction — for write steps this must include exact location and exact code/logic",
       "files": ["path/to/file.ts"],
-      "verification": "what success looks like",
+      "verification": "concrete check — what the model should confirm before marking this step done",
       "type": "read|write|verify|plan"
     }
   ]
 }`;
+
+// ---------------------------------------------------------------------------
+// Discovery Prompt — alignment conversation before planning
+// ---------------------------------------------------------------------------
+
+const DISCOVERY_SYSTEM_PROMPT = `You are a senior engineer on the user's team. The user is about to describe a task they want built. Your job is NOT to start coding — your job is to deeply understand what they want through genuine conversation.
+
+Rules:
+- Ask clarifying questions about anything ambiguous or underspecified.
+- Challenge assumptions. If their approach has a flaw, say so — respectfully, directly.
+- Surface edge cases, trade-offs, or constraints they may not have considered.
+- Propose your interpretation of what they want. "If I understand correctly, you want X that does Y because Z."
+- Keep it conversational. You're a teammate, not a requirements-gathering bot. Be concise.
+- If the task is already crystal clear (specific files, exact changes, no ambiguity), you can align in a single turn.
+- Do NOT write any code. Do NOT plan implementation steps. That comes later.
+
+Response format — you MUST respond with valid JSON every turn:
+
+When you have questions or want to discuss:
+{
+  "message": "Your conversational text here. Ask questions naturally, challenge ideas, propose alternatives.",
+  "aligned": false
+}
+
+When you and the user are fully aligned and you're ready to proceed:
+{
+  "message": "Brief confirmation of what was agreed.",
+  "aligned": true,
+  "summary": "A precise, actionable description of the task incorporating everything discussed. This replaces the user's original prompt — it must be complete enough for a planner to decompose into steps without any additional context.",
+  "decisions": ["key decision 1 made during discussion", "key decision 2"]
+}
+
+Only set aligned: true when the user has explicitly confirmed your understanding. Do not assume alignment.`;
 
 // ---------------------------------------------------------------------------
 // Step Execution Prompt
@@ -222,13 +327,15 @@ function buildStepPrompt(step, plan, projectContext, prevScopeViolations = []) {
     "",
   ];
 
-  // Scope enforcement
+  // Task-centric focus
   if (step.files.length > 0) {
-    parts.push(`## Files in scope for this step:`);
+    parts.push(`## Files for this step:`);
     for (const f of step.files) parts.push(`- ${f}`);
-    parts.push(`Do NOT touch files outside this list.`);
     parts.push("");
   }
+  parts.push(`## Focus:`);
+  parts.push(`Stay focused on this step's objective and nothing else. Do not work on other parts of the task, do not make improvements outside what this step requires, do not anticipate future steps.`);
+  parts.push("");
 
   // Type-specific constraints
   switch (step.type) {
@@ -255,7 +362,7 @@ function buildStepPrompt(step, plan, projectContext, prevScopeViolations = []) {
   }
 
   parts.push("");
-  parts.push(`## Verification: ${step.verification}`);
+  parts.push(`## Verification: ${step.verification || "Confirm the change is correct and complete"}`);
   parts.push("");
 
   // Show progress
@@ -324,12 +431,14 @@ function verifyStepResult(step, stepChanges, messages) {
   const scopeViolations = [];
 
   // ── READ / PLAN STEPS ─────────────────────────────────────────────────────
-  // No file changes expected. Just confirm the model responded.
+  // No file changes expected. Confirm the model responded.
+  // CLI backend is event-driven and returns messages: [] — treat empty as passed
+  // since the backend emits events rather than returning messages synchronously.
   if (step.type === "read" || step.type === "plan") {
-    const hasResponse = messages?.some(m => m.role === "assistant");
+    const hasResponse = !messages || messages.length === 0 || messages.some(m => m.role === "assistant");
     return {
       passed: hasResponse,
-      reason: hasResponse ? "Step completed" : "No model response",
+      reason: "Step completed",
       scopeViolations,
     };
   }
@@ -419,12 +528,167 @@ export class TaskRunner {
    *   Signature: (projectId, event, requestId) => void
    * @param {Function} planCall — Function that makes a planning API call (no tools).
    *   Signature: (systemPrompt, userPrompt, request) => Promise<string>
+   * @param {Function} conversationCall — Multi-turn capable call (no tools).
+   *   Signature: (systemPrompt, messages, request) => Promise<string>
    */
-  constructor(spawnStep, onEvent, planCall) {
+  constructor(spawnStep, onEvent, planCall, conversationCall) {
     this.spawnStep = spawnStep;
     this.onEvent = onEvent;
     this.planCall = planCall;
-    this.activeRuns = new Map(); // projectId -> { plan, currentStep, aborted }
+    this.conversationCall = conversationCall;
+    this.activeRuns = new Map();       // projectId -> { plan, currentStep, aborted }
+    this.discoveryResolvers = new Map(); // projectId -> resolve fn
+    this.planApprovalResolvers = new Map(); // projectId -> { resolve, reject }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Discovery Phase — conversational alignment before planning
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Run a multi-turn discovery conversation to align on the task before planning.
+   * The model asks questions, the user responds, until both sides agree on what
+   * to build. Returns the aligned summary that replaces the raw prompt for planning.
+   *
+   * @param {string} projectId
+   * @param {string} prompt — the user's original task description
+   * @param {object} request — the request object (model, provider, etc.)
+   * @returns {Promise<{ summary: string, decisions: string[] }>}
+   */
+  async discoveryPhase(projectId, prompt, request) {
+    const MAX_TURNS = 10;
+    const messages = [
+      { role: "user", content: prompt },
+    ];
+
+    this.onEvent(projectId, {
+      event: "orchestration_discovery_start",
+      data: { prompt },
+    }, request.requestId);
+
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      // Call the model with the full conversation so far
+      let rawResponse;
+      try {
+        rawResponse = await this.conversationCall(
+          DISCOVERY_SYSTEM_PROMPT,
+          messages,
+          request,
+        );
+      } catch (err) {
+        console.error("[task-runner] Discovery call failed:", err.message);
+        // Fall back to using the raw prompt
+        return { summary: prompt, decisions: [] };
+      }
+
+      // Parse the structured JSON response
+      let parsed;
+      try {
+        // Handle responses that might have markdown fencing
+        const cleaned = rawResponse
+          .replace(/^```json\s*/i, "")
+          .replace(/```\s*$/, "")
+          .trim();
+        parsed = JSON.parse(cleaned);
+      } catch {
+        // Model didn't produce valid JSON — treat as a question turn with raw text
+        parsed = { message: rawResponse, aligned: false };
+      }
+
+      // Check if the run was aborted
+      const runState = this.activeRuns.get(projectId);
+      if (runState?.aborted) {
+        return { summary: prompt, decisions: [] };
+      }
+
+      // ── ALIGNED: model and user agree, proceed to planning ──────────────
+      if (parsed.aligned && parsed.summary) {
+        // Emit the final alignment message to the conversation
+        this.onEvent(projectId, {
+          event: "orchestration_discovery_complete",
+          data: {
+            message: parsed.message,
+            summary: parsed.summary,
+            decisions: parsed.decisions || [],
+          },
+        }, request.requestId);
+
+        return {
+          summary: parsed.summary,
+          decisions: parsed.decisions || [],
+        };
+      }
+
+      // ── NOT ALIGNED: model has questions or wants to discuss ─────────────
+      messages.push({ role: "assistant", content: rawResponse });
+
+      // Emit the question to the frontend
+      this.onEvent(projectId, {
+        event: "orchestration_discovery",
+        data: {
+          message: parsed.message || rawResponse,
+          turn: turn + 1,
+          maxTurns: MAX_TURNS,
+        },
+      }, request.requestId);
+
+      // Wait for user response — this Promise resolves when respondToDiscovery() is called
+      const userResponse = await new Promise((resolve) => {
+        this.discoveryResolvers.set(projectId, resolve);
+      });
+      this.discoveryResolvers.delete(projectId);
+
+      // Check for skip signal
+      if (userResponse === "__SKIP_DISCOVERY__") {
+        this.onEvent(projectId, {
+          event: "orchestration_discovery_complete",
+          data: {
+            message: "Skipping alignment — proceeding with original task.",
+            summary: prompt,
+            decisions: [],
+          },
+        }, request.requestId);
+        return { summary: prompt, decisions: [] };
+      }
+
+      // Add user response to conversation and continue the loop
+      messages.push({ role: "user", content: userResponse });
+
+      // Emit the user response as a conversation message
+      this.onEvent(projectId, {
+        event: "orchestration_discovery_response",
+        data: { message: userResponse },
+      }, request.requestId);
+    }
+
+    // Max turns reached — use what we have
+    console.warn("[task-runner] Discovery hit max turns without alignment. Using raw prompt.");
+    return { summary: prompt, decisions: [] };
+  }
+
+  approvePlan(projectId) {
+    const resolver = this.planApprovalResolvers.get(projectId);
+    if (resolver) resolver.resolve();
+    else console.warn(`[task-runner] approvePlan: no pending resolver for ${projectId}`);
+  }
+
+  rejectPlan(projectId) {
+    const resolver = this.planApprovalResolvers.get(projectId);
+    if (resolver) resolver.reject(new Error("Plan rejected by user"));
+    else console.warn(`[task-runner] rejectPlan: no pending resolver for ${projectId}`);
+  }
+
+  /**
+   * Called by IPC when the user responds during discovery.
+   * Resolves the pending Promise in discoveryPhase().
+   */
+  respondToDiscovery(projectId, response) {
+    const resolver = this.discoveryResolvers.get(projectId);
+    if (resolver) {
+      resolver(response);
+    } else {
+      console.warn(`[task-runner] respondToDiscovery: no pending resolver for ${projectId}`);
+    }
   }
 
   /**
@@ -506,7 +770,7 @@ export class TaskRunner {
    * @param {object} request          — execution request (model used per step)
    * @param {object} [planningRequest] — separate request for the planning call (reasoning model)
    */
-  async run(projectId, prompt, request, planningRequest) {
+  async run(projectId, prompt, request, planningRequest, options = {}) {
     const runState = { plan: null, currentStep: 0, aborted: false };
     this.activeRuns.set(projectId, runState);
 
@@ -517,72 +781,89 @@ export class TaskRunner {
         data: { prompt },
       }, request.requestId);
 
-      // ── STEP 1: DECOMPOSE ──────────────────────────────────────────────
+      // ── PHASE 0: DISCOVERY ─────────────────────────────────────────────
+      // Conversational alignment before planning. The model asks questions,
+      // challenges assumptions, and proposes its understanding. Only proceeds
+      // to planning after the user explicitly confirms alignment.
+      const callRequest = planningRequest || request;
+      let taskPrompt = prompt;
+      let discoveryDecisions = [];
+
+      if (this.conversationCall && !options.skipDiscovery) {
+        const discovery = await this.discoveryPhase(projectId, prompt, callRequest);
+        taskPrompt = discovery.summary;
+        discoveryDecisions = discovery.decisions;
+
+        if (runState.aborted) return;
+      }
+
+      // ── PHASE 1: DECOMPOSE ─────────────────────────────────────────────
       const state = readState(projectId);
       const context = compileContext(projectId, "execute", 0);
 
-      // Build planning context
-      const planningContext = [
+      // Lock discovery decisions into session state
+      if (discoveryDecisions.length > 0) {
+        const existingDecisions = state.decisions || [];
+        mergeState(projectId, {
+          decisions: [
+            ...existingDecisions,
+            ...discoveryDecisions.map(d => ({ content: d, source: "discovery" })),
+          ],
+        });
+      }
+
+      // Build planning context from the full compiled context — same rich snapshot
+      // every execution model gets: brief, brain memories, pre-read files, symbol map,
+      // Project DNA, decisions, recent actions, etc.
+      const recentConversation = buildConversationContext(request.history || []);
+      const userPrompt = [
         `Project working directory: ${request.workingDir}`,
-      ];
-
-      if (state.workingSet?.length > 0) {
-        planningContext.push("Files currently in the working set:");
-        for (const f of state.workingSet.slice(0, 8)) {
-          planningContext.push(`  - ${f.path}${f.purpose ? ` (${f.purpose})` : ""}`);
-        }
-      }
-
-      if (state.decisions?.length > 0) {
-        planningContext.push("Locked decisions:");
-        for (const d of state.decisions) {
-          planningContext.push(`  - ${d.content}`);
-        }
-      }
-
-      const userPrompt = `${planningContext.join("\n")}\n\nTask:\n${prompt}`;
+        "",
+        context.full,      // everything: project brief, brain memories, pre-read files, decisions, DNA…
+        recentConversation ? `Recent conversation:\n${recentConversation}` : "",
+        `Task:\n${taskPrompt}`,
+      ].filter(Boolean).join("\n");
 
       this.onEvent(projectId, {
-        event: "orchestration_step",
-        data: { phase: "planning", message: "Decomposing task into steps..." },
+        event: "orchestration_planning_start",
+        data: {},
       }, request.requestId);
 
-      // Use the dedicated planning request (reasoning model) if provided,
-      // otherwise fall back to the execution request.
-      const callRequest = planningRequest || request;
+      // callRequest was already resolved in discovery phase above
       const planningModel = callRequest.model || null;
       const executionModel = request.model || null;
 
       let plan;
       try {
-        const planJson = await this.planCall(
+        const planRaw = await this.planCall(
           PLANNING_SYSTEM_PROMPT,
           userPrompt,
           callRequest,
+          (chunk) => {
+            this.onEvent(projectId, {
+              event: "orchestration_planning_chunk",
+              data: { chunk },
+            }, request.requestId);
+          },
         );
+        // Models sometimes wrap JSON in markdown code fences despite instructions.
+        // Extract the first {...} block from the response.
+        const planJson = extractJson(planRaw);
         plan = JSON.parse(planJson);
       } catch (err) {
         console.error("[task-runner] Planning call failed:", err.message);
-        // Fallback: single-step direct execution
-        plan = {
-          summary: prompt.slice(0, 100),
-          steps: [{
-            index: 1,
-            action: prompt,
-            files: (state.workingSet || []).map(f => f.path),
-            verification: "Verify the change is correct",
-            type: "write",
-          }],
-        };
+        // Surface the failure — emit an error event so the user sees it
+        this.onEvent(projectId, {
+          event: "orchestration_error",
+          data: { message: `Planning failed: ${err.message}` },
+        }, request.requestId);
+        return;
       }
 
       // Validate plan
       if (!plan.steps || plan.steps.length === 0) {
         throw new Error("Planning produced empty step list");
       }
-
-      // Cap at 8 steps
-      plan.steps = plan.steps.slice(0, 8);
 
       runState.plan = plan;
 
@@ -619,6 +900,17 @@ export class TaskRunner {
           activeForm: s.action.split(" ").slice(0, 4).join(" ") + "...",
         })),
       });
+
+      // ── PLAN APPROVAL GATE ─────────────────────────────────────────────
+      // Pause here and wait for the user to approve the plan.
+      // approvePlan() / rejectPlan() resolve or reject this promise.
+      try {
+        await new Promise((resolve, reject) => {
+          this.planApprovalResolvers.set(projectId, { resolve, reject });
+        });
+      } finally {
+        this.planApprovalResolvers.delete(projectId);
+      }
 
       // ── STEP 2: EXECUTE EACH STEP ──────────────────────────────────────
       const stepResults = [];
@@ -676,9 +968,14 @@ export class TaskRunner {
               (descs.length > 0 ? ` — ${descs.join("; ")}` : "")
             );
           } else if (prev.step.type === "read" || prev.step.type === "plan") {
+            // Inject the model's actual findings so subsequent steps have real context,
+            // not a placeholder. Cap at 1200 chars to avoid bloating the prompt.
+            const findings = prev.modelOutput
+              ? prev.modelOutput.slice(0, 1200) + (prev.modelOutput.length > 1200 ? "\n[...truncated]" : "")
+              : null;
             handoffLines.push(
-              `Step ${prev.step.index} (${prev.step.action.split(" ").slice(0, 5).join(" ")}...): ` +
-              `analysis complete`
+              `Step ${prev.step.index} (${prev.step.action.split(" ").slice(0, 5).join(" ")}...):\n` +
+              (findings ? findings : "analysis complete — no findings recorded")
             );
           }
         }
@@ -723,11 +1020,31 @@ export class TaskRunner {
         // ── Verify using change history, not message scanning ──────────────
         const verification = verifyStepResult(step, stepChanges, stepMessages);
 
+        // Extract final assistant text for read/plan steps — this becomes
+        // the handoff context for subsequent steps.
+        let modelOutput = null;
+        if (step.type === "read" || step.type === "plan") {
+          const assistantMessages = stepMessages.filter(m => m.role === "assistant");
+          const lastAssistant = assistantMessages[assistantMessages.length - 1];
+          if (lastAssistant) {
+            if (typeof lastAssistant.content === "string") {
+              modelOutput = lastAssistant.content;
+            } else if (Array.isArray(lastAssistant.content)) {
+              modelOutput = lastAssistant.content
+                .filter(b => b.type === "text")
+                .map(b => b.text)
+                .join("\n")
+                .trim();
+            }
+          }
+        }
+
         stepResults.push({
           step,
           verification,
           stepChanges,
           stepChangeIds,
+          modelOutput,
         });
 
         this.onEvent(projectId, {

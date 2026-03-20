@@ -29,7 +29,15 @@ const PROFILE_DIR = path.join(os.homedir(), ".pane", "profile");
 const EXPORTS_DIR = path.join(BRAIN_DIR, "exports");
 const MODEL_CACHE = path.join(BRAIN_DIR, "models");
 
-const SETTINGS_PATH = path.join(os.homedir(), ".pane", "settings.json");
+const SESSION_DIR = path.join(os.homedir(), ".pane", "session");
+/** Read session state for working set access. Returns null on any failure. */
+function _readSessionState(projectId) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(SESSION_DIR, projectId, "state.json"), "utf-8"));
+  } catch {
+    return null;
+  }
+}
 
 // --- State ---
 let db = null;
@@ -43,16 +51,6 @@ const indexedProjects = new Set();
 // Tracks files that failed summarization during this session.
 // Maps projectId -> Set of absolute file paths to retry on next call.
 const failedFiles = new Map();
-
-// --- Settings Reader ---
-
-function readSettings() {
-  try {
-    return JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
-  } catch {
-    return {};
-  }
-}
 
 // --- File Summarization via LLM ---
 
@@ -117,70 +115,54 @@ function walkProjectFiles(rootDir, maxFiles = 200) {
   return results;
 }
 
+// --- LLM Summarization via main process relay ---
+//
+// The brain is a UtilityProcess — it can't call the backend directly.
+// Instead it sends a "llm_call" message to main, which routes it through
+// punkEngine.quickCall() — the same path used for commit drafts, summaries,
+// and every other Pane-internal generation. Whatever backend + model the
+// user has selected, that's what gets used. No hardcoded providers, no
+// separate HTTP clients, no provider chains.
+
+let _llmCallId = 0;
+const _llmPending = new Map(); // callId → { resolve, reject }
+
 /**
- * Build an ordered list of providers to try for indexing/summarization.
- *
- * Priority: whatever the user is actively using comes first.
- * - If punk_backend is claude-cli or gemini-cli → CLI goes first
- * - If punk_backend is http → active HTTP provider goes first
- * Other configured providers follow as fallback.
+ * Ask the user's current backend to generate text. Returns the response
+ * string, or null on any failure. Timeout: 60s (CLI cold starts are slow).
  */
-function buildProviderChain(settings) {
-  const keys = settings.http_api_keys || {};
-  const chain = [];
-  const backend = settings.punk_backend || "http";
+function llmCall(systemPrompt, userPrompt) {
+  return new Promise((resolve) => {
+    const callId = `llm-${++_llmCallId}`;
+    const timeout = setTimeout(() => {
+      _llmPending.delete(callId);
+      console.warn(`[brain] LLM call timed out (${callId})`);
+      resolve(null);
+    }, 60000);
 
-  // CLI-first: user is running claude-cli or gemini-cli — use that directly.
-  // No HTTP overhead, no extra API key, same model they're already paying for.
-  if (backend === "claude-cli" || backend === "cli") {
-    chain.push({ type: "cli", command: "claude" });
-  } else if (backend === "gemini-cli") {
-    chain.push({ type: "cli", command: "gemini" });
-  }
+    _llmPending.set(callId, { resolve, timeout });
+    sendToMain({ type: "llm_call", callId, systemPrompt, userPrompt });
+  });
+}
 
-  // HTTP provider — either primary (if backend is http) or fallback (if backend is cli)
-  const activeProvider = settings.http_provider || "";
-  const activeKey = keys[activeProvider] || settings.http_api_key || "";
-
-  const cheapModels = {
-    openrouter: "google/gemini-2.0-flash-001",
-    deepseek: "deepseek-chat",
-    anthropic: "claude-haiku-4-5-20251001",
-    openai: "gpt-4o-mini",
-    gemini: "gemini-flash-latest",
-    kimi: "moonshot-v1-8k",
-  };
-
-  if (activeKey && activeProvider) {
-    chain.push({
-      type: "http",
-      provider: activeProvider,
-      apiKey: activeKey,
-      model: cheapModels[activeProvider] || "deepseek-chat",
-    });
-  }
-
-  // Other configured HTTP providers as further fallback
-  for (const [provider, model] of Object.entries(cheapModels)) {
-    if (provider === activeProvider) continue;
-    if (keys[provider]) {
-      chain.push({ type: "http", provider, apiKey: keys[provider], model });
-    }
-  }
-
-  return chain;
+/** Called by the message handler when main sends back an llm_call_result. */
+function _handleLlmCallResult(callId, result) {
+  const pending = _llmPending.get(callId);
+  if (!pending) return;
+  _llmPending.delete(callId);
+  clearTimeout(pending.timeout);
+  pending.resolve(result || null);
 }
 
 /**
  * Ask the LLM to describe a file in 2-3 sentences.
- * Tries each provider in the chain in order — moves to the next on any failure.
- * Returns the description string, or null if all providers fail.
+ * Routes through main → quickCall → user's active backend + model.
+ * Returns the description string, or null on failure.
  */
-async function summarizeFile(filePath, projectRoot, providerChain) {
+async function summarizeFile(filePath, projectRoot) {
   let fileContent;
   try {
     const raw = fs.readFileSync(filePath, "utf-8");
-    // Cap at ~400 lines — first 400 lines is enough semantic signal
     fileContent = raw.split("\n").slice(0, 400).join("\n");
   } catch {
     return null;
@@ -189,160 +171,26 @@ async function summarizeFile(filePath, projectRoot, providerChain) {
   if (fileContent.trim().length < 20) return null;
 
   const relativePath = path.relative(projectRoot, filePath);
-  const prompt = [
+  const systemPrompt = "You summarize code files. Provide clear, concise descriptions of the file's role and responsibilities. No preamble, just the description.";
+  const userPrompt = [
     `File: ${relativePath}`,
     ``,
     `\`\`\``,
-    fileContent.slice(0, 8000), // ~2000 tokens max
+    fileContent.slice(0, 8000),
     `\`\`\``,
     ``,
-    `Describe what this file does in 2-3 sentences. Be specific about its role in the codebase — mention key responsibilities, what it owns, and how it relates to other parts of the system. No preamble, just the description.`,
+    `Describe what this file does in 2-3 sentences. Be specific about its role in the codebase — mention key responsibilities, what it owns, and how it relates to other parts of the system.`,
   ].join("\n");
 
-  for (const provider of providerChain) {
-    try {
-      let result = null;
-      if (provider.type === "http") {
-        result = await summarizeViaHttp(prompt, provider);
-      } else if (provider.type === "cli") {
-        result = await summarizeViaCli(prompt, provider.command);
-      }
-      if (result && result.trim().length > 10) return result.trim();
-      // Result was empty — try next provider
-      console.warn(`[brain] ${provider.provider || provider.command} returned empty for ${relativePath}, trying next provider`);
-    } catch (err) {
-      console.warn(`[brain] ${provider.provider || provider.command} failed for ${relativePath}: ${err.message}, trying next provider`);
-    }
-  }
-
-  console.error(`[brain] All providers failed for ${relativePath}`);
-  return null;
-}
-
-async function summarizeViaHttp(prompt, { provider, apiKey, model }) {
-  const { default: https } = await import("node:https");
-
-  const makeRequest = (url, body, headers) => new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const data = JSON.stringify(body);
-    const req = https.request({
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data), ...headers },
-    }, (res) => {
-      let raw = "";
-      res.on("data", c => raw += c);
-      res.on("end", () => {
-        try { 
-          const parsed = JSON.parse(raw);
-          if (res.statusCode >= 400) {
-            console.error(`[brain] HTTP ${res.statusCode} from ${urlObj.hostname}:`, JSON.stringify(parsed));
-            reject(new Error(`HTTP ${res.statusCode}`));
-          } else {
-            resolve(parsed);
-          }
-        }
-        catch { 
-          console.error(`[brain] Failed to parse JSON from ${urlObj.hostname}:`, raw.slice(0, 500));
-          reject(new Error(`Bad JSON from ${urlObj.hostname}`)); 
-        }
-      });
-    });
-    req.on("error", reject);
-    req.write(data);
-    req.end();
-  });
-
-  if (provider === "gemini") {
-    const resp = await makeRequest(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-      { 
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        systemInstruction: {
-          parts: [{ text: "You are a helpful assistant that summarizes code files. Provide clear, concise descriptions of the file's role and responsibilities." }]
-        },
-        safetySettings: [
-          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-        ]
-      },
-      {},
-    );
-    return resp?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
-  }
-
-  if (provider === "anthropic") {
-    const resp = await makeRequest(
-      "https://api.anthropic.com/v1/messages",
-      { model, max_tokens: 256, messages: [{ role: "user", content: prompt }] },
-      { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-    );
-    return resp?.content?.[0]?.text?.trim() || null;
-  }
-
-  if (provider === "deepseek") {
-    const resp = await makeRequest(
-      "https://api.deepseek.com/v1/chat/completions",
-      { model, max_tokens: 256, messages: [{ role: "user", content: prompt }] },
-      { "Authorization": `Bearer ${apiKey}` },
-    );
-    return resp?.choices?.[0]?.message?.content?.trim() || null;
-  }
-
-  if (provider === "openrouter") {
-    console.log(`[brain] summarizing with ${model} via openrouter...`);
-    const resp = await makeRequest(
-      "https://openrouter.ai/api/v1/chat/completions",
-      { model, max_tokens: 256, messages: [{ role: "user", content: prompt }] },
-      { 
-        "Authorization": `Bearer ${apiKey}`,
-        "HTTP-Referer": "https://pane.app",
-        "X-Title": "Pane Brain"
-      },
-    );
-    return resp?.choices?.[0]?.message?.content?.trim() || null;
-  }
-
-  if (provider === "openai") {
-    const resp = await makeRequest(
-      "https://api.openai.com/v1/chat/completions",
-      { model, max_tokens: 256, messages: [{ role: "user", content: prompt }] },
-      { "Authorization": `Bearer ${apiKey}` },
-    );
-    return resp?.choices?.[0]?.message?.content?.trim() || null;
-  }
-
-  return null;
-}
-
-async function summarizeViaCli(prompt, command) {
-  const { spawn } = await import("node:child_process");
-  const home = os.homedir();
-  const nvmBins = [];
   try {
-    const versions = fs.readdirSync(path.join(home, ".nvm", "versions", "node"));
-    for (const v of versions) nvmBins.push(path.join(home, ".nvm", "versions", "node", v, "bin"));
-  } catch {}
-  const PATH = [...nvmBins, "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", process.env.PATH || ""].join(":");
-
-  return new Promise((resolve) => {
-    let args, output = "";
-    if (command === "claude") {
-      // Claude CLI: --output-format text gives plain stdout, --no-tools disables agentic tool use
-      args = ["-p", prompt, "--output-format", "text", "--no-tools"];
-    } else {
-      // Gemini CLI: plain -p gives plain text stdout. No --no-tools flag exists.
-      args = ["-p", prompt];
-    }
-
-    const child = spawn(command, args, { env: { ...process.env, PATH }, timeout: 30000 });
-    child.stdout.on("data", d => output += d.toString());
-    child.on("close", () => resolve(output.trim() || null));
-    child.on("error", () => resolve(null));
-  });
+    const result = await llmCall(systemPrompt, userPrompt);
+    if (result && result.trim().length > 10) return result.trim();
+    console.warn(`[brain] LLM returned empty for ${relativePath}`);
+    return null;
+  } catch (err) {
+    console.warn(`[brain] LLM call failed for ${relativePath}: ${err.message}`);
+    return null;
+  }
 }
 
 /**
@@ -351,13 +199,6 @@ async function summarizeViaCli(prompt, command) {
  */
 async function indexProjectFiles(projectId, projectRoot) {
   if (!db) return;
-
-  const settings = readSettings();
-  const providerChain = buildProviderChain(settings);
-  if (providerChain.length === 0) {
-    console.log(`[brain] No LLM provider available for file indexing of ${projectId}`);
-    return;
-  }
 
   // Determine which files to attempt this run:
   // - First call for this project this session: full walk minus already-indexed
@@ -406,7 +247,7 @@ async function indexProjectFiles(projectId, projectRoot) {
       console.log(`[brain] All ${files.length} files up to date for ${projectId}`);
       return;
     }
-    console.log(`[brain] Indexing ${toIndex.length} files for ${projectId} (${newCount} new, ${changedCount} changed) | chain: ${providerChain.map(p => p.provider || p.command).join(" → ")}`);
+    console.log(`[brain] Indexing ${toIndex.length} files for ${projectId} (${newCount} new, ${changedCount} changed) via quickCall relay`);
   } else if (pending && pending.size > 0) {
     // Retry pass — only files that failed last time
     toIndex = Array.from(pending);
@@ -417,17 +258,30 @@ async function indexProjectFiles(projectId, projectRoot) {
   }
 
   let indexed = 0;
+  let consecutiveFailures = 0;
   const nowFailed = failedFiles.get(projectId) || new Set();
   failedFiles.set(projectId, nowFailed);
 
   for (const filePath of toIndex) {
     const relativePath = path.relative(projectRoot, filePath);
-    const description = await summarizeFile(filePath, projectRoot, providerChain);
+    const description = await summarizeFile(filePath, projectRoot);
 
     if (!description) {
       nowFailed.add(filePath); // Remember for mid-session retry
+      consecutiveFailures++;
+      // If 5+ files fail in a row, the provider is likely down or rate-limited.
+      // Bail out early — remaining files will be retried on next request.
+      if (consecutiveFailures >= 5) {
+        console.warn(`[brain] ${consecutiveFailures} consecutive failures — aborting batch. ${toIndex.length - indexed - consecutiveFailures} files deferred.`);
+        for (const remaining of toIndex.slice(toIndex.indexOf(filePath) + 1)) {
+          nowFailed.add(remaining);
+        }
+        break;
+      }
       continue;
     }
+
+    consecutiveFailures = 0; // Reset on success
 
     const id = nodeId("file", relativePath);
     const embedding = await embed(description);
@@ -452,6 +306,9 @@ async function indexProjectFiles(projectId, projectRoot) {
       console.error(`[brain] Failed to store file node for ${relativePath}:`, err.message);
       nowFailed.add(filePath);
     }
+
+    // Small delay between requests to avoid rate-limiting
+    await new Promise(r => setTimeout(r, 150));
   }
 
   const stillFailing = nowFailed.size;
@@ -1303,15 +1160,38 @@ function writeSearchExport(projectId) {
 async function writeContextualExport(projectId, query, fileContext, intent, projectRoot) {
   const result = await contextualSearch(query || "", fileContext || "", projectId, intent || "other", projectRoot || null);
 
-  // Layer 1: Symbol map — resolve symbols mentioned in the query
-  if (db && query) {
+  // Layer 1: Symbol map — resolve symbols mentioned in the query + working set exports.
+  // The model sees key symbols pre-resolved so it doesn't grep for them.
+  result.relevantSymbols = [];
+  if (db) {
     try {
-      result.relevantSymbols = findRelevantSymbols(db, projectId, query);
-    } catch {
-      result.relevantSymbols = [];
+      // From query text: extract symbol names and resolve them
+      if (query) {
+        result.relevantSymbols = findRelevantSymbols(db, projectId, query);
+      }
+
+      // From working set: pull top exports from active files so the model
+      // knows the interfaces in play without searching for them.
+      const state = _readSessionState(projectId);
+      const wsFiles = (state?.workingSet || []).slice(0, 6);
+      if (wsFiles.length > 0) {
+        const queryNames = new Set(result.relevantSymbols.map(s => s.name));
+        for (const wsFile of wsFiles) {
+          const filePath = wsFile.path || wsFile;
+          const fileSyms = getFileSymbols(db, projectId, filePath);
+          // Add up to 3 key exports per file (functions, classes, types — not consts)
+          const meaningful = fileSyms
+            .filter(s => !queryNames.has(s.name) && ["function", "class", "interface", "type"].includes(s.kind))
+            .slice(0, 3);
+          for (const s of meaningful) {
+            queryNames.add(s.name);
+            result.relevantSymbols.push(s);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[brain] symbol resolution error (non-fatal):", err.message);
     }
-  } else {
-    result.relevantSymbols = [];
   }
 
   // Layer 3: Synthesis — cached project DNA narrative
@@ -1323,6 +1203,30 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
     }
   } else {
     result.synthesis = null;
+  }
+
+  // Full codebase map — every indexed file with a one-line description.
+  // The model sees the entire project structure, not just 5 "relevant" files.
+  // ~2-4k tokens for a 100-file project. Injected into the stable prompt.
+  if (db) {
+    try {
+      const fileNodes = db.prepare(
+        `SELECT name, content FROM nodes WHERE entity_type = 'file' AND project_id = ? ORDER BY name`
+      ).all(projectId);
+      result.codebaseMap = fileNodes.map(n => {
+        const text = JSON.parse(n.content || "{}").text || "";
+        // First sentence only — keep it compact
+        const firstSentence = text.split(/\.\s/)[0] || text;
+        return {
+          path: n.name,
+          desc: firstSentence.length > 120 ? firstSentence.slice(0, 117) + "..." : firstSentence + (firstSentence.endsWith(".") ? "" : "."),
+        };
+      });
+    } catch {
+      result.codebaseMap = [];
+    }
+  } else {
+    result.codebaseMap = [];
   }
 
   try {
@@ -1759,6 +1663,12 @@ function getProfile() {
 process.parentPort.on("message", async ({ data }) => {
   try {
     switch (data.type) {
+      case "llm_call_result": {
+        // Response from main for an llm_call request — route to pending promise
+        _handleLlmCallResult(data.callId, data.result);
+        break;
+      }
+
       case "index_events": {
         const result = await indexEvents(data.projectId, data.events);
         sendToMain({ type: "indexed", requestId: data.requestId, ...result });

@@ -320,8 +320,15 @@ export function useSettingsPersistence() {
 
             const ps = useProjectsStore.getState();
             if (saved && saved.messages.length > 0) {
-              console.log(`[persistence] restoring conversation for ${id} (saved messages: ${saved.messages.length})`);
-              ps.restoreConversation(id, saved.messages, saved.sessionId);
+              // Deduplicate by message ID (persisted data may have duplicates from prior bugs)
+              const seen = new Set<string>();
+              const dedupedMessages = saved.messages.filter((m: { id: string }) => {
+                if (seen.has(m.id)) return false;
+                seen.add(m.id);
+                return true;
+              });
+              console.log(`[persistence] restoring conversation for ${id} (saved messages: ${saved.messages.length}, deduped: ${dedupedMessages.length})`);
+              ps.restoreConversation(id, dedupedMessages, saved.sessionId);
               if (saved.model) {
                 ps.setConversationModel(id, saved.model);
               }

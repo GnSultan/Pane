@@ -58,6 +58,32 @@ export interface JsonBlock {
   raw?: string;
 }
 
+export interface StrategySignal {
+  dimension: string;
+  label: string;
+  direction: "+" | "-";
+}
+
+export interface StrategyBlock {
+  type: "strategy";
+  mode: "direct" | "orchestrate" | "discuss";
+  discovery: boolean;
+  reasoning: "shallow" | "deep";
+  verification: "none" | "diff" | "test";
+  confidence: number;
+  reason: string;
+  signals: StrategySignal[];
+  // routing fields (mirrored from strategy event for display)
+  intent: string;
+  provider: string;
+  model: string;
+  thinking: boolean;
+  // oracle fields
+  oracleUsed?: boolean;
+  oracleConfidence?: number | null;
+  oracleExploring?: boolean;
+}
+
 export type ContentBlock =
   | TextBlock
   | ToolUseBlock
@@ -65,7 +91,8 @@ export type ContentBlock =
   | ThinkingBlock
   | ServerToolUseBlock
   | WebSearchToolResultBlock
-  | JsonBlock;
+  | JsonBlock
+  | StrategyBlock;
 
 // Top-level message types from stream-json
 
@@ -165,6 +192,19 @@ export interface PunkEventRouting {
     provider: string;
     model: string;
     thinking: boolean;
+  };
+}
+
+export interface PunkEventStrategy {
+  event: "strategy";
+  data: Omit<StrategyBlock, "type"> & {
+    intent: string;
+    provider: string;
+    model: string;
+    thinking: boolean;
+    oracleUsed?: boolean;
+    oracleConfidence?: number | null;
+    oracleExploring?: boolean;
   };
 }
 
@@ -284,6 +324,7 @@ export type ClaudeStreamEvent =
   | ClaudeEventProcessStarted
   | ClaudeEventProcessEnded
   | PunkEventRouting
+  | PunkEventStrategy
   | ClaudeEventError
   | ClaudeEventCompactionStart
   | ClaudeEventCompactionComplete
@@ -362,6 +403,7 @@ export interface ConversationState {
   error: string | null;
   todos: Todo[];
   pendingPlanApproval: boolean;
+  discoveryActive: boolean; // True when orchestration is in discovery phase, waiting for user input
   // Session lifecycle
   isProcessActive: boolean; // Is the Claude CLI child process currently running?
   lastActivity: number; // Timestamp of last user interaction with this project
@@ -408,6 +450,7 @@ export function createEmptyConversation(): ConversationState {
     error: null,
     todos: [],
     pendingPlanApproval: false,
+    discoveryActive: false,
     isProcessActive: false,
     lastActivity: Date.now(),
     contextTokens: 0,

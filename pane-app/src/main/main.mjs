@@ -700,10 +700,12 @@ function registerCommandHandlers() {
       const systemPrompt = `You are writing a git commit message for a developer. Study the actual diff carefully — understand what changed at the code level, not just which files.
 
 Rules:
-- First line: imperative mood, lowercase, max 72 chars — be specific ("add branch switching to git panel", not "update git UI")
+- First line: conventional commit format — type(scope): description — all lowercase, max 72 chars
+- Types: feat, fix, refactor, style, chore, docs, test, perf — pick the most accurate one
+- Scope: optional, short noun describing what area changed (e.g. git-panel, input-bar, terminal)
+- Description: imperative mood, specific ("add branch auto-stash on checkout", not "update git UI")
 - If there are multiple distinct changes, add a blank line then a tight bullet list (2-5 items max)
-- Bullets: lowercase, no trailing punctuation, lead with the verb ("remove shadow from commit card", "fix branch list format flag")
-- No conventional commit prefixes (feat:, fix:, chore:)
+- Bullets: lowercase, no trailing punctuation, lead with the verb
 - No emoji, no filler phrases ("this commit", "various improvements")
 - Write only the commit message — no preamble, no explanation`;
 
@@ -1803,6 +1805,18 @@ function getBrainWorker() {
       const resolve = brainPendingRequests.get(message.requestId);
       brainPendingRequests.delete(message.requestId);
       resolve(message);
+    }
+    // LLM call relay: brain asks main to run a quickCall through the user's
+    // active backend + model — same path as commit drafts, summaries, etc.
+    if (message.type === "llm_call") {
+      punkEngine.quickCall(message.systemPrompt, message.userPrompt)
+        .then(result => {
+          brainWorker?.postMessage({ type: "llm_call_result", callId: message.callId, result });
+        })
+        .catch(err => {
+          console.warn(`[pane] Brain LLM relay failed: ${err.message}`);
+          brainWorker?.postMessage({ type: "llm_call_result", callId: message.callId, result: null });
+        });
     }
     // Forward tension alerts to renderer
     if (message.type === "tensions_detected") {

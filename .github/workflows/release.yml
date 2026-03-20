@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  release:
+    name: Version & Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # ── Determine bump type from conventional commits since last tag ───────────
+      - name: Determine version bump
+        id: bump
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          if [ -z "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"%s")
+          else
+            COMMITS=$(git log "${LAST_TAG}..HEAD" --pretty=format:"%s")
+          fi
+
+          if [ -z "$COMMITS" ]; then
+            echo "No commits since last tag, skipping release."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # feat: → minor bump, everything else → patch
+          if echo "$COMMITS" | grep -qE "^feat(\(.+\))?[!]?:"; then
+            BUMP="minor"
+          else
+            BUMP="patch"
+          fi
+
+          echo "bump=$BUMP" >> $GITHUB_OUTPUT
+          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      # ── Bump version in package.json ──────────────────────────────────────────
+      - name: Bump version
+        id: version
+        if: steps.bump.outputs.skip != 'true'
+        run: |
+          cd pane-app
+          npm version ${{ steps.bump.outputs.bump }} --no-git-tag-version
+          NEW=$(node -p "require('./package.json').version")
+          echo "new=$NEW" >> $GITHUB_OUTPUT
+
+      # ── Build changelog grouped by commit type ────────────────────────────────
+      - name: Build changelog
+        id: changelog
+        if: steps.bump.outputs.skip != 'true'
+        run: |
+          LAST_TAG="${{ steps.bump.outputs.last_tag }}"
+
+          if [ -z "$LAST_TAG" ]; then
+            RAW=$(git log --pretty=format:"%s" | head -40)
+          else
+            RAW=$(git log "${LAST_TAG}..HEAD" --pretty=format:"%s")
+          fi
+
+          FEATURES=""
+          FIXES=""
+          REFACTORS=""
+          OTHERS=""
+
+          while IFS= read -r line; do
+            if echo "$line" | grep -qE "^feat(\(.+\))?[!]?:"; then
+              FEATURES="$FEATURES\n- $line"
+            elif echo "$line" | grep -qE "^fix(\(.+\))?[!]?:"; then
+              FIXES="$FIXES\n- $line"
+            elif echo "$line" | grep -qE "^refactor(\(.+\))?[!]?:"; then
+              REFACTORS="$REFACTORS\n- $line"
+            elif echo "$line" | grep -qE "^(chore|style|docs|test|perf)(\(.+\))?[!]?:"; then
+              OTHERS="$OTHERS\n- $line"
+            fi
+          done <<< "$RAW"
+
+          BODY=""
+          [ -n "$FEATURES" ]  && BODY="$BODY\n### Features\n$FEATURES\n"
+          [ -n "$FIXES" ]     && BODY="$BODY\n### Fixes\n$FIXES\n"
+          [ -n "$REFACTORS" ] && BODY="$BODY\n### Refactors\n$REFACTORS\n"
+          [ -n "$OTHERS" ]    && BODY="$BODY\n### Chores\n$OTHERS\n"
+
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          printf "%b" "$BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # ── Commit bump, tag, push ────────────────────────────────────────────────
+      - name: Commit & tag
+        if: steps.bump.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pane-app/package.json
+          git commit -m "chore: release v${{ steps.version.outputs.new }}"
+          git tag "v${{ steps.version.outputs.new }}"
+          git push origin master --tags
+
+      # ── Create GitHub Release ─────────────────────────────────────────────────
+      - name: Create release
+        if: steps.bump.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.version.outputs.new }}"
+          name: "Pane v${{ steps.version.outputs.new }}"
+          body: ${{ steps.changelog.outputs.body }}
+          draft: false
+          prerelease: false

@@ -286,6 +286,18 @@ export async function abortPunk(projectId: string): Promise<void> {
   return electronAPI.invoke("abort_punk", { projectId });
 }
 
+export async function respondToDiscovery(projectId: string, response: string): Promise<void> {
+  return electronAPI.invoke("respond_to_discovery", { projectId, response });
+}
+
+export async function approvePlan(projectId: string): Promise<void> {
+  return electronAPI.invoke("approve_plan", { projectId });
+}
+
+export async function rejectPlan(projectId: string): Promise<void> {
+  return electronAPI.invoke("reject_plan", { projectId });
+}
+
 export async function terminateClaudeSession(projectId: string): Promise<void> {
   return electronAPI.invoke("terminate_punk_session", { projectId });
 }
@@ -294,20 +306,28 @@ export async function reinitializePunkBackend(backend?: string): Promise<void> {
   return electronAPI.invoke("reinitialize_punk_backend", { backend });
 }
 
-export async function getOpenRouterModels(): Promise<
-  Array<{ id: string; name: string; context_length: number }>
-> {
+export interface OpenRouterModel {
+  id: string;
+  name: string;
+  context_length: number;
+  provider: string;      // upstream provider display name, e.g. "Anthropic", "Google"
+  tier: 1 | 2 | 3;      // 1=frontier, 2=balanced, 3=fast/cheap
+  input_cost: number | null;   // $/Mtok
+  output_cost: number | null;  // $/Mtok
+}
+
+export async function getOpenRouterModels(): Promise<OpenRouterModel[]> {
   return electronAPI.invoke("get_openrouter_models");
 }
 
 export async function getAllModels(): Promise<
-  Record<string, Array<{ id: string; name: string; context_length: number }>>
+  Record<string, OpenRouterModel[]>
 > {
   return electronAPI.invoke("get_all_models");
 }
 
 export async function refreshAllModels(): Promise<
-  Record<string, Array<{ id: string; name: string; context_length: number }>>
+  Record<string, OpenRouterModel[]>
 > {
   return electronAPI.invoke("refresh_all_models");
 }

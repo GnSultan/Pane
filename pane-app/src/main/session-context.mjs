@@ -273,7 +273,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     "Before acting, read what Pane knows. The current objective, task list, files in scope, locked decisions, and active commitments listed below are ground truth. Do not re-derive what Pane has already established. If Pane says a decision is locked, it is locked.",
     "",
     "## 2. SCOPE",
-    "Identify exactly which files need to change. Start with the files in scope Pane has given you. Use search tools to find additional files only if needed. State your scope before touching anything. If you need to touch a file not in scope, explain why before proceeding — never silently expand scope.",
+    "Identify exactly which files need to change. Pane has given you a complete codebase map below — use it to locate files by purpose, not by grepping filenames. For symbol lookups, use pane_find_symbol — it returns exact file:line in <1ms. Only fall back to grep/glob if the map and symbol index both miss. State your scope before touching anything. If you need to touch a file not in scope, explain why before proceeding — never silently expand scope.",
     "",
     "## 3. UNDERSTAND",
     "Read every file you plan to modify. No exceptions. Search for existing patterns, conventions, and dependencies before introducing anything new. Understand why existing code is the way it is before changing it. Never edit a file you have not read in this session.",
@@ -308,7 +308,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     "",
     "- Tone: Senior software engineer. Concise, direct, no filler.",
     "- Distinguish between directives (requests for action) and inquiries (requests for analysis). Assume inquiry unless the message contains an explicit instruction.",
-    "- Pane Tools: Use pane_recall to orient yourself. Use pane_remember to preserve discoveries. Use pane_brief for project context.",
+    "- Pane Tools: The codebase map below is your primary navigation tool — read it before searching. Use pane_find_symbol for exact symbol→file:line lookups. Use pane_recall to orient yourself. Use pane_remember to preserve discoveries.",
     "- Testing: Always search for and update related tests after a code change.",
     "- Persist through errors. Backtrack and adjust rather than abandoning an approach silently.",
     "- When implementing UI, prioritize a modern, polished aesthetic with consistent spacing and platform-appropriate design. Prefer platform-native primitives.",
@@ -387,11 +387,26 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     stableParts.push("");
   }
 
-  // Relevant files from brain index (LLM-described architecture map)
-  // When 3+ files are relevant, Pane structures them into a suggested approach order.
+  // ── Codebase map: every indexed file with a one-line description ──────────
+  // This is the model's primary navigation tool. It sees the ENTIRE project
+  // structure, not a 5-file sample. ~2-4k tokens for a 100-file project.
+  // Lives in stable → cached across turns (files don't change that fast).
+  const codebaseMap = (brainCtx.codebaseMap || []);
+  if (codebaseMap.length > 0) {
+    stableParts.push("## Codebase map");
+    stableParts.push("Every file in this project and what it does. Use this to navigate — do not grep for files.");
+    stableParts.push("");
+    for (const f of codebaseMap) {
+      stableParts.push(`${f.path} — ${f.desc}`);
+    }
+    stableParts.push("");
+  }
+
+  // Relevant files from brain index — the top semantic matches for THIS query.
+  // These are the files most likely to need changes. Approach order is heuristic:
+  // config/types → core logic → API/handlers → hooks/stores → UI → tests
   const relevantFiles = (brainCtx.relevantFiles || []).slice(0, 5);
   if (relevantFiles.length >= 3) {
-    // Heuristic ordering: config/types → core logic → API/handlers → UI → tests
     const ordered = [...relevantFiles].sort((a, b) => {
       const rank = (p) => {
         const lp = (p || "").toLowerCase();
@@ -406,13 +421,13 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
       return rank(a.path) - rank(b.path);
     });
 
-    stableParts.push("Pane suggests this approach order for the relevant files:");
+    stableParts.push("Suggested approach order for this task:");
     ordered.forEach((f, i) => {
       stableParts.push(`${i + 1}. ${f.path} — ${f.description}`);
     });
     stableParts.push("");
   } else if (relevantFiles.length > 0) {
-    stableParts.push("Files relevant to this request:");
+    stableParts.push("Files most likely to need changes:");
     for (const f of relevantFiles) stableParts.push(`- ${f.path} — ${f.description}`);
     stableParts.push("");
   }
@@ -538,9 +553,11 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
 
   // Layer 1: Symbol map — resolved from the codebase index against this specific query.
   // Query-dependent → lives in dynamic (not cached). Models stop grepping for these.
-  const relevantSymbols = (brainCtx.relevantSymbols || []).slice(0, 8);
+  // Extended: up to 15 symbols — query matches + working set exports so the model
+  // already knows the key interfaces in scope without searching for them.
+  const relevantSymbols = (brainCtx.relevantSymbols || []).slice(0, 15);
   if (relevantSymbols.length > 0) {
-    dynamicParts.push("Symbol map (Pane resolved — no need to search for these):");
+    dynamicParts.push("Symbol map (Pane resolved — use directly, do not search for these):");
     for (const s of relevantSymbols) {
       const doc = s.doc ? ` — ${s.doc}` : "";
       dynamicParts.push(`- \`${s.name}\` (${s.kind}) → ${s.file_path || s.file}:${s.line}${doc}`);

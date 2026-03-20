@@ -198,6 +198,7 @@ interface ProjectsState {
     todos: import("../lib/claude-types").Todo[],
   ) => void;
   setPendingPlanApproval: (projectId: string, pending: boolean) => void;
+  setDiscoveryActive: (projectId: string, active: boolean) => void;
   setIsPlanning: (projectId: string, isPlanning: boolean) => void;
   updateLastToolUseInput: (
     projectId: string,
@@ -474,12 +475,15 @@ function createProjectsStore() {
     // Conversation
     addConversationMessage: (projectId, message) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: {
-            ...p.conversation,
-            messages: [...p.conversation.messages, message],
-          },
-        })),
+        updateProject(state, projectId, (p) => {
+          if (p.conversation.messages.some((m) => m.id === message.id)) return p;
+          return {
+            conversation: {
+              ...p.conversation,
+              messages: [...p.conversation.messages, message],
+            },
+          };
+        }),
       ),
 
     removeLastConversationMessage: (projectId) =>
@@ -697,6 +701,13 @@ function createProjectsStore() {
         })),
       ),
 
+    setDiscoveryActive: (projectId, active) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: { ...p.conversation, discoveryActive: active },
+        })),
+      ),
+
     setIsPlanning: (projectId, isPlanning) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -793,6 +804,7 @@ function createProjectsStore() {
             error: null,
             todos: [],
             pendingPlanApproval: false,
+            discoveryActive: false,
             isProcessActive: false,
             lastActivity: Date.now(),
             contextTokens: 0,

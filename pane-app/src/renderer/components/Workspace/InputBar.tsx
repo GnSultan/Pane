@@ -4,6 +4,7 @@ import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
 import type { Todo } from "../../lib/claude-types";
+import { respondToDiscovery, approvePlan, rejectPlan } from "../../lib/tauri-commands";
 import {
   PROVIDER_MODELS,
   THINKING_ENGINES,
@@ -129,15 +130,19 @@ function ModelPicker({
           // If we are NOT on Gemini CLI (e.g. HTTP), only show providers with keys.
           if (!httpApiKeys[provider]) return [provider, []];
 
-          // Special case for OpenRouter: merge hardcoded with dynamically fetched models
+          // Special case for OpenRouter: use enriched dynamic models with real provider grouping
           if (provider === "openrouter") {
             if (openRouterModels.length > 0) {
-              // Convert fetched models to the expected format, merging with hardcoded labels if they match
               const dynamicModels = openRouterModels.map((m) => {
                 const hardcoded = models.find((h) => h.value === m.id);
                 return {
                   value: m.id,
                   label: hardcoded ? hardcoded.label : m.name,
+                  // Pass through enriched metadata from the backend filter
+                  realProvider: m.provider,   // "Anthropic", "Google", etc. — used for grouping
+                  inputCost:    m.input_cost,
+                  outputCost:   m.output_cost,
+                  tier:         m.tier,
                 };
               });
               return [provider, dynamicModels];
@@ -159,23 +164,39 @@ function ModelPicker({
       label: string;
       provider: string;
       thinking?: boolean;
+      inputCost?: number | null;
+      outputCost?: number | null;
     }> = [];
-    Object.entries(filteredProviderModels).forEach(([provider, list]) => {
+    Object.entries(filteredProviderModels).forEach(([providerKey, list]) => {
       if (Array.isArray(list)) {
-        list.forEach((m: { value: string; label: string }) => {
-          // Find if this model exists in THINKING_ENGINES or BUILDING_ENGINES to get its thinking flag,
-          // otherwise use the helper to guess.
+        list.forEach((m: {
+          value: string;
+          label: string;
+          realProvider?: string;
+          inputCost?: number | null;
+          outputCost?: number | null;
+          tier?: number;
+        }) => {
+          // Use realProvider for grouping when available (OpenRouter models expose the upstream provider)
+          const displayProvider = m.realProvider || providerKey;
           const engineEntry =
             THINKING_ENGINES.find(
-              (e) => e.provider === provider && e.model === m.value,
+              (e) => e.provider === providerKey && e.model === m.value,
             ) ||
             BUILDING_ENGINES.find(
-              (e) => e.provider === provider && e.model === m.value,
+              (e) => e.provider === providerKey && e.model === m.value,
             );
           const isThinking = engineEntry
             ? engineEntry.thinking
             : isThinkingModel(m.value);
-          models.push({ ...m, provider, thinking: isThinking });
+          models.push({
+            value:      m.value,
+            label:      m.label,
+            provider:   displayProvider,
+            thinking:   isThinking,
+            inputCost:  m.inputCost,
+            outputCost: m.outputCost,
+          });
         });
       }
     });
@@ -333,11 +354,9 @@ function ModelPicker({
     activeBuilding.provider,
   ]);
 
+  // When smart routing is active and a specific model has been chosen for this turn, show it
   const showSpecificModel =
     autoRoute && isProcessing && current && !current.value.startsWith("auto-");
-  const labelToShow = showSpecificModel
-    ? current.label.toLowerCase()
-    : displayLabel;
 
   return (
     <div ref={ref} className="relative flex items-center">
@@ -353,12 +372,13 @@ function ModelPicker({
         />
         <span className="flex items-center gap-1.5 transition-colors group-hover:text-pane-text-secondary">
           {autoRoute ? (
-            <span className="flex items-center gap-1.5">
-              <span className="text-pane-text-secondary/60">auto</span>
+            showSpecificModel ? (
               <span className="hidden sm:inline-block transition-all duration-300">
-                {labelToShow}
+                {current!.label.toLowerCase()}
               </span>
-            </span>
+            ) : (
+              <span className="text-pane-text-secondary/60">smart routing</span>
+            )
           ) : (
             currentDisplay.label.toLowerCase()
           )}
@@ -425,11 +445,18 @@ function ModelPicker({
                         <span className="font-mono text-[12px]">
                           {model.label.toLowerCase()}
                         </span>
-                        {model.thinking && (
-                          <span className="text-[9px] text-pane-status-added/60 uppercase tracking-tighter">
-                            thinking mode
-                          </span>
-                        )}
+                        <div className="flex items-center gap-2">
+                          {model.thinking && (
+                            <span className="text-[9px] text-pane-status-added/60 uppercase tracking-tighter">
+                              thinking
+                            </span>
+                          )}
+                          {model.inputCost != null && (
+                            <span className="text-[9px] text-pane-terminal/50 font-mono tabular-nums">
+                              ${model.inputCost} · ${model.outputCost}/m
+                            </span>
+                          )}
+                        </div>
                       </div>
                       {!autoRoute && model.value === value && (
                         <div className="w-1.5 h-1.5 rounded-full bg-pane-text" />
@@ -510,6 +537,9 @@ export function InputBar({
   const pendingPlanApproval = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.pendingPlanApproval ?? false,
   );
+  const discoveryActive = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.discoveryActive ?? false,
+  );
   const selectedModel = useWorkspaceStore((s) => s.selectedModel);
   const setSelectedModel = useWorkspaceStore((s) => s.setSelectedModel);
   const setHttpProvider = useWorkspaceStore((s) => s.setHttpProvider);
@@ -548,7 +578,7 @@ export function InputBar({
   // Only fade out after real processing happened — not on initial mount.
   const wasProcessingRef = useRef(false);
   useEffect(() => {
-    if (isProcessing) {
+    if (isProcessing && !discoveryActive) {
       wasProcessingRef.current = true;
       setIsFadingOut(false);
     } else if (wasProcessingRef.current) {
@@ -557,7 +587,7 @@ export function InputBar({
       const timer = setTimeout(() => setIsFadingOut(false), 1500);
       return () => clearTimeout(timer);
     }
-  }, [isProcessing]);
+  }, [isProcessing, discoveryActive]);
 
   // Update static caret position
   const updateCaret = useCallback(() => {
@@ -586,10 +616,10 @@ export function InputBar({
 
   // Auto-focus when not processing
   useEffect(() => {
-    if (!isProcessing && textareaRef.current && isConversationVisible()) {
+    if ((!isProcessing || discoveryActive) && textareaRef.current && isConversationVisible()) {
       textareaRef.current.focus();
     }
-  }, [isProcessing]);
+  }, [isProcessing, discoveryActive]);
 
   // Cmd+K focus
   useEffect(() => {
@@ -625,6 +655,15 @@ export function InputBar({
     (e: React.KeyboardEvent) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
+        // During discovery, send response to the discovery channel instead
+        if (discoveryActive) {
+          const trimmed = value.trim();
+          if (trimmed) {
+            respondToDiscovery(projectId, trimmed);
+            setValue("");
+          }
+          return;
+        }
         if (isProcessing) return;
         const trimmed = value.trim();
         if (trimmed) {
@@ -638,25 +677,46 @@ export function InputBar({
         onAbort();
       }
     },
-    [value, isProcessing, onSend, onAbort],
+    [value, isProcessing, discoveryActive, projectId, onSend, onAbort],
   );
 
   const handleAcceptPlan = useCallback(() => {
     useProjectsStore.getState().setPendingPlanApproval(projectId, false);
-    onSend("good to go");
-  }, [projectId, onSend]);
+    approvePlan(projectId).catch(console.error);
+  }, [projectId]);
 
   const handleRejectPlan = useCallback(() => {
     useProjectsStore.getState().setPendingPlanApproval(projectId, false);
+    rejectPlan(projectId).catch(console.error);
     setPlanRejected(true);
     setTimeout(() => textareaRef.current?.focus(), 0);
   }, [projectId]);
 
   return (
     <div className="bg-transparent">
+      {/* Discovery mode indicator */}
+      {discoveryActive && (
+        <div className="flex items-center gap-3 px-1 pb-3 animate-fadeIn">
+          <span
+            className="text-pane-text-secondary font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            discussing...
+          </span>
+          <button
+            onClick={() => respondToDiscovery(projectId, "__SKIP_DISCOVERY__")}
+            className="text-pane-text-secondary font-mono hover:text-pane-text ml-auto btn-press"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            skip — just do it
+          </button>
+        </div>
+      )}
+
       {/* Processing indicator — only exists when active, no reserved space */}
       {(isProcessing || isFadingOut) &&
         !pendingPlanApproval &&
+        !discoveryActive &&
         !todoPanelOpen && (
           <div
             className={`flex items-center gap-3 px-1 pb-3 ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
@@ -770,7 +830,7 @@ export function InputBar({
               onFocus={() => { setTextareaFocused(true); updateCaret(); }}
               onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
               placeholder={
-                isProcessing ? "" : planRejected ? "what should change..." : "let's build..."
+                discoveryActive ? "reply..." : isProcessing ? "" : planRejected ? "what should change..." : "let's build..."
               }
               className="w-full bg-transparent text-pane-text font-mono
                          resize-none outline-none placeholder:text-pane-text-secondary
@@ -801,11 +861,17 @@ export function InputBar({
           </div>
 
           {/* Send — top right */}
-          {value.trim().length > 0 && !isProcessing && (
+          {value.trim().length > 0 && (!isProcessing || discoveryActive) && (
             <button
               onClick={() => {
                 const trimmed = value.trim();
-                if (trimmed) { onSend(trimmed); setValue(""); setPlanRejected(false); }
+                if (!trimmed) return;
+                if (discoveryActive) {
+                  respondToDiscovery(projectId, trimmed);
+                  setValue("");
+                  return;
+                }
+                onSend(trimmed); setValue(""); setPlanRejected(false);
               }}
               className="absolute top-2 right-2 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
               title="Send (Enter)"

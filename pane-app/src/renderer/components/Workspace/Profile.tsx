@@ -471,34 +471,28 @@ function AiEnginesSection({
   const openRouterModels = useWorkspaceStore((s) => s.openRouterModels);
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
 
-  const isGeminiBackend = punkBackend === "gemini-cli";
-  const isClaudeBackend = punkBackend === "claude-cli";
+  // The provider that the current CLI backend authenticates natively —
+  // no HTTP API key needed for these (the CLI handles auth itself).
+  const nativeProvider =
+    punkBackend === "claude-cli" ? "anthropic" :
+    punkBackend === "gemini-cli" ? "gemini" :
+    null;
 
-  const filteredThinking = useMemo(
-    () =>
-      THINKING_ENGINES.filter((o) => {
-        if (isGeminiBackend) return o.provider === "gemini";
-        if (isClaudeBackend) return o.provider === "anthropic";
-        // If not gemini-cli, hide models starting with "auto-"
-        if (o.model.startsWith("auto-")) return false;
-        // Require API key in HTTP mode (except for providers that support background fetching)
+  const filterEngines = useCallback(
+    (engines: EngineOption[]) =>
+      engines.filter((o) => {
+        // auto-* models are CLI-managed routing — only show for their native backend
+        if (o.model.startsWith("auto-")) return o.provider === nativeProvider;
+        // Native CLI provider: CLI handles auth, no HTTP key check needed
+        if (nativeProvider && o.provider === nativeProvider) return true;
+        // HTTP: show if the required API key is present
         return o.provider === "openrouter" || !!httpApiKeys?.[o.provider];
       }),
-    [isGeminiBackend, isClaudeBackend, httpApiKeys],
+    [nativeProvider, httpApiKeys],
   );
 
-  const filteredBuilding = useMemo(
-    () =>
-      BUILDING_ENGINES.filter((o) => {
-        if (isGeminiBackend) return o.provider === "gemini";
-        if (isClaudeBackend) return o.provider === "anthropic";
-        // If not gemini-cli, hide models starting with "auto-"
-        if (o.model.startsWith("auto-")) return false;
-        // Require API key in HTTP mode (except for providers that support background fetching)
-        return o.provider === "openrouter" || !!httpApiKeys?.[o.provider];
-      }),
-    [isGeminiBackend, isClaudeBackend, httpApiKeys],
-  );
+  const filteredThinking = useMemo(() => filterEngines(THINKING_ENGINES), [filterEngines]);
+  const filteredBuilding = useMemo(() => filterEngines(BUILDING_ENGINES), [filterEngines]);
 
   const autoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
   const setIntentRouting = useWorkspaceStore((s) => s.setIntentRouting);
@@ -686,11 +680,19 @@ function AiEnginesSection({
         >
           <button
             onClick={handleAutoRouteToggle}
-            className={`relative w-10 h-5 rounded-full transition-colors ${autoRoute ? "bg-pane-text/30" : "bg-pane-border/40"}`}
+            className={`flex items-center gap-1.5 font-mono transition-colors ${
+              autoRoute
+                ? "text-pane-terminal"
+                : "text-pane-text-secondary/50 hover:text-pane-text-secondary"
+            }`}
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
-            <span
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-pane-text transition-transform ${autoRoute ? "translate-x-5" : "translate-x-0.5"}`}
+            <div
+              className={`w-1.5 h-1.5 rounded-full transition-colors ${
+                autoRoute ? "bg-pane-terminal" : "bg-pane-text-secondary/30"
+              }`}
             />
+            {autoRoute ? "on" : "off"}
           </button>
         </SettingRow>
 
@@ -744,7 +746,7 @@ function AiEnginesSection({
                   )}
                 </div>
               </div>
-              {!isGeminiBackend && !isClaudeBackend && missingThinkingKey && (
+              {missingThinkingKey && thinkingEngine.provider !== nativeProvider && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
@@ -778,7 +780,7 @@ function AiEnginesSection({
                   onChange={handleBuildingChange}
                 />
               </div>
-              {!isGeminiBackend && !isClaudeBackend && missingBuildingKey && (
+              {missingBuildingKey && buildingEngine.provider !== nativeProvider && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
@@ -812,13 +814,12 @@ function AiEnginesSection({
                   onChange={handleExplainChange}
                 />
               </div>
-              {!isGeminiBackend && !isClaudeBackend && missingExplainingKey && (
+              {missingExplainingKey && explainingEngine.provider !== nativeProvider && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ no API key for {explainingEngine.requiresKey} — add it
-                  below
+                  ⚠ no API key for {explainingEngine.requiresKey} — add it below
                 </span>
               )}
             </div>
@@ -847,7 +848,7 @@ function AiEnginesSection({
                   onChange={handleOtherChange}
                 />
               </div>
-              {!isGeminiBackend && !isClaudeBackend && missingOtherKey && (
+              {missingOtherKey && otherEngine.provider !== nativeProvider && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
@@ -1491,16 +1492,14 @@ export function Profile() {
         </AccordionSection>
 
         {/* AI Engines Section */}
-        {(punkBackend === "http" || punkBackend === "gemini-cli") && (
-          <AccordionSection
-            title="ai engines"
-            icon={icons.aiEngines}
-            isExpanded={expandedSection === "aiEngines"}
-            onToggle={() => setExpandedSection(expandedSection === "aiEngines" ? null : "aiEngines")}
-          >
-            <AiEnginesSection httpApiKeys={httpApiKeys} />
-          </AccordionSection>
-        )}
+        <AccordionSection
+          title="ai engines"
+          icon={icons.aiEngines}
+          isExpanded={expandedSection === "aiEngines"}
+          onToggle={() => setExpandedSection(expandedSection === "aiEngines" ? null : "aiEngines")}
+        >
+          <AiEnginesSection httpApiKeys={httpApiKeys} />
+        </AccordionSection>
 
         {/* API Keys Section */}
         {punkBackend === "http" && (

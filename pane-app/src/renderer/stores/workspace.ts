@@ -5,6 +5,7 @@ import {
   type IntentRouting,
   type BackendRouting,
 } from "../lib/models";
+import type { OpenRouterModel } from "../lib/tauri-commands";
 
 const DEFAULT_FONT_SIZE = 15;
 const DEFAULT_PANEL_FONT_SIZE = 13;
@@ -44,8 +45,8 @@ interface WorkspaceState {
   httpBaseUrls: Record<string, string>;
   intentRouting: BackendRouting;
   intentAutoRoute: boolean;
-  openRouterModels: Array<{ id: string; name: string; context_length: number }>;
-  allModels: Record<string, Array<{ id: string; name: string; context_length: number }>>;
+  openRouterModels: OpenRouterModel[];
+  allModels: Record<string, OpenRouterModel[]>;
   fetchOpenRouterModels: () => Promise<void>;
   fetchAllModels: () => Promise<void>;
   refreshAllModels: () => Promise<void>;

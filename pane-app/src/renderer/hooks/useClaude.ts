@@ -819,6 +819,7 @@ export function usePunk(projectId: string) {
       let resultReceived = false;
       const sessionId = project.conversation.sessionId;
       let resultSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+      let orchestrationActive = false; // true while TaskRunner is running steps
 
       const finishProcessing = () => {
         if (resultSafetyTimer) {
@@ -872,11 +873,48 @@ export function usePunk(projectId: string) {
             break;
 
           case "routing": {
+            // Legacy routing event — still handled for backwards compat
             const { model, thinking, intent } = event.data;
             store.setConversationRoutedModel(projectId, model);
             if (thinking && intent === "plan") {
               store.setIsPlanning(projectId, true);
             }
+            break;
+          }
+
+          case "strategy": {
+            const d = event.data;
+            // Update routing display (same as routing event)
+            store.setConversationRoutedModel(projectId, d.model);
+            if (d.thinking && d.intent === "plan") {
+              store.setIsPlanning(projectId, true);
+            }
+            // Inject a synthetic assistant message containing the strategy block.
+            // Appears between the user message and the LLM's response —
+            // collapsed by default in the UI.
+            store.addConversationMessage(projectId, {
+              id: `strategy-${Date.now()}`,
+              type: "assistant",
+              content: [{
+                type: "strategy",
+                mode:             d.mode,
+                discovery:        d.discovery,
+                reasoning:        d.reasoning,
+                verification:     d.verification,
+                confidence:       d.confidence,
+                reason:           d.reason,
+                signals:          d.signals,
+                intent:           d.intent,
+                provider:         d.provider,
+                model:            d.model,
+                thinking:         d.thinking,
+                oracleUsed:       d.oracleUsed       ?? false,
+                oracleConfidence: d.oracleConfidence ?? null,
+                oracleExploring:  d.oracleExploring  ?? false,
+              }],
+              timestamp: Date.now(),
+              isStreaming: false,
+            });
             break;
           }
 
@@ -906,6 +944,11 @@ export function usePunk(projectId: string) {
           }
 
           case "processEnded": {
+            // During orchestration the TaskRunner spawns one process per step.
+            // Each step exit fires processEnded — ignore these mid-plan or we'd
+            // mark the conversation done and show spurious errors after step 1.
+            if (orchestrationActive) break;
+
             // If the process died without ever sending a result event, surface an error
             if (!resultReceived) {
               const s = useProjectsStore.getState();
@@ -1032,14 +1075,98 @@ export function usePunk(projectId: string) {
           }
 
           // ── Orchestration Events (Control Inversion) ──────────────────
-          case "orchestration_start": {
+          case "orchestration_discovery_start": {
             const s = useProjectsStore.getState();
-            s.setConversationStatusMessage(projectId, "Decomposing task...");
+            s.setConversationStatusMessage(projectId, "Understanding the task...");
+            break;
+          }
+
+          case "orchestration_discovery": {
+            // Model is asking questions during discovery — show as assistant message
+            // and enable input so the user can respond
+            const s = useProjectsStore.getState();
+            s.addConversationMessage(projectId, {
+              id: `discovery-${Date.now()}`,
+              type: "assistant",
+              content: [{ type: "text", text: event.data.message }],
+              timestamp: Date.now(),
+              isStreaming: false,
+            });
+            s.setConversationStatusMessage(projectId, "Discussing...");
+            s.setDiscoveryActive(projectId, true);
+            break;
+          }
+
+          case "orchestration_discovery_response": {
+            // User's response during discovery — add as user message
+            const s = useProjectsStore.getState();
+            s.addConversationMessage(projectId, {
+              id: `discovery-user-${Date.now()}`,
+              type: "user",
+              content: [{ type: "text", text: event.data.message }],
+              timestamp: Date.now(),
+              isStreaming: false,
+            });
+            s.setDiscoveryActive(projectId, false);
+            s.setConversationStatusMessage(projectId, "Understanding the task...");
+            break;
+          }
+
+          case "orchestration_discovery_complete": {
+            // Alignment reached — show confirmation and transition to planning
+            const s = useProjectsStore.getState();
+            if (event.data.message) {
+              s.addConversationMessage(projectId, {
+                id: `discovery-aligned-${Date.now()}`,
+                type: "assistant",
+                content: [{ type: "text", text: event.data.message }],
+                timestamp: Date.now(),
+                isStreaming: false,
+              });
+            }
+            s.setDiscoveryActive(projectId, false);
+            s.setConversationStatusMessage(projectId, "Aligned — decomposing task...");
+            break;
+          }
+
+          case "orchestration_start": {
+            orchestrationActive = true;
+            break;
+          }
+
+          case "orchestration_planning_start": {
+            // Add a streaming assistant message — the planning model's raw output
+            // appears here in real-time, then gets replaced by the plan block
+            const s = useProjectsStore.getState();
+            s.addConversationMessage(projectId, {
+              id: "planning-stream",
+              type: "assistant",
+              content: [{ type: "text", text: "" }],
+              timestamp: Date.now(),
+              isStreaming: true,
+            });
+            s.setConversationStatusMessage(projectId, "Planning...");
+            break;
+          }
+
+          case "orchestration_planning_chunk": {
+            const s = useProjectsStore.getState();
+            s.appendToLastAssistantText(projectId, event.data.chunk);
             break;
           }
 
           case "orchestration_plan": {
             const { summary, steps, totalSteps, planId, planningModel, executionModel } = event.data;
+            // Finalize the planning stream — keep it in history, just stop the cursor
+            const ps = useProjectsStore.getState();
+            const proj = ps.projects.get(projectId);
+            const streamMsg = proj?.conversation.messages.find((m) => m.id === "planning-stream");
+            if (streamMsg) {
+              ps.removeLastConversationMessage(projectId);
+              ps.addConversationMessage(projectId, { ...streamMsg, isStreaming: false });
+            }
+            // Show the approval gate — execution waits until user presses accept
+            ps.setPendingPlanApproval(projectId, true);
             console.log(
               `[orchestration] Plan: ${summary} (${totalSteps} steps)`,
             );
@@ -1125,6 +1252,7 @@ export function usePunk(projectId: string) {
           }
 
           case "orchestration_complete": {
+            orchestrationActive = false;
             const {
               summary,
               completedSteps,
@@ -1169,6 +1297,7 @@ export function usePunk(projectId: string) {
           }
 
           case "orchestration_error": {
+            orchestrationActive = false;
             console.error(`[orchestration] Error: ${event.data.message}`);
             const s = useProjectsStore.getState();
             s.setConversationError(projectId, event.data.message);

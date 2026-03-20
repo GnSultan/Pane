@@ -206,6 +206,8 @@ export const MarkdownText = memo(function MarkdownText({
   isStreaming,
   isThinking,
 }: MarkdownTextProps) {
+  if (!text) return null;
+
   // During streaming, we use incremental parsing to provide rich formatting
   // without the performance cost of full document parsing on every frame.
   // We parse inline formatting (bold, code, links) and detect simple block

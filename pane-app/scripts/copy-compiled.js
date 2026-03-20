@@ -1,83 +1,35 @@
 #!/usr/bin/env node
-import { copyFileSync, mkdirSync } from "fs";
-import { dirname } from "path";
+import { copyFileSync, mkdirSync, readdirSync } from "fs";
+import { basename, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = dirname(__dirname);
 
-// Ensure output directories exist
 mkdirSync(`${projectRoot}/out/main`, { recursive: true });
 mkdirSync(`${projectRoot}/out/preload`, { recursive: true });
 
-// Copy compiled main and preload scripts
 console.log("Copying pre-compiled main and preload scripts...");
+
+// main.mjs → index.js (entry point rename)
 copyFileSync(
   `${projectRoot}/src/main/main.mjs`,
   `${projectRoot}/out/main/index.js`,
 );
+
+// preload
 copyFileSync(
   `${projectRoot}/src/preload/preload.mjs`,
   `${projectRoot}/out/preload/preload.mjs`,
 );
-copyFileSync(
-  `${projectRoot}/src/main/cli-worker.mjs`,
-  `${projectRoot}/out/main/cli-worker.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/pty-worker.mjs`,
-  `${projectRoot}/out/main/pty-worker.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/brain-engine.mjs`,
-  `${projectRoot}/out/main/brain-engine.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/punk-engine.mjs`,
-  `${projectRoot}/out/main/punk-engine.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/http-backend.mjs`,
-  `${projectRoot}/out/main/http-backend.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/context-manager.mjs`,
-  `${projectRoot}/out/main/context-manager.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/model-manager.mjs`,
-  `${projectRoot}/out/main/model-manager.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/classify-intent.mjs`,
-  `${projectRoot}/out/main/classify-intent.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/punk-backend.mjs`,
-  `${projectRoot}/out/main/punk-backend.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/session-context.mjs`,
-  `${projectRoot}/out/main/session-context.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/pane-mcp-server.mjs`,
-  `${projectRoot}/out/main/pane-mcp-server.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/tool-executor.mjs`,
-  `${projectRoot}/out/main/tool-executor.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/task-runner.mjs`,
-  `${projectRoot}/out/main/task-runner.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/symbol-index.mjs`,
-  `${projectRoot}/out/main/symbol-index.mjs`,
-);
-copyFileSync(
-  `${projectRoot}/src/main/plan-store.mjs`,
-  `${projectRoot}/out/main/plan-store.mjs`,
-);
+
+// all .mjs files in src/main/ (except main.mjs which is handled above as index.js)
+for (const file of readdirSync(`${projectRoot}/src/main/`)) {
+  if (!file.endsWith(".mjs") || file === "main.mjs") continue;
+  copyFileSync(
+    `${projectRoot}/src/main/${file}`,
+    `${projectRoot}/out/main/${file}`,
+  );
+}
+
 console.log("✓ Compiled scripts copied successfully");

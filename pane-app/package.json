@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.2.448",
+  "version": "0.3.0",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -8,7 +8,7 @@
   "license": "MIT",
   "scripts": {
     "dev": "node scripts/dev.js",
-    "build": "npm version patch --no-git-tag-version && electron-vite build && node scripts/copy-compiled.js",
+    "build": "electron-vite build && node scripts/copy-compiled.js",
     "preview": "electron-vite preview",
     "build:mac": "npm run build && electron-builder --mac --arm64",
     "build:all": "npm run build && electron-builder --mac --arm64 --x64",
