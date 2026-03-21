@@ -15,6 +15,7 @@ export interface ToolUseBlock {
 export interface ToolResultBlock {
   type: "tool_result";
   tool_use_id: string;
+  name?: string;
   content: string;
   is_error?: boolean;
 }
@@ -51,13 +52,47 @@ export interface WebSearchToolResultBlock {
   content: WebSearchResult[] | WebSearchToolResultError;
 }
 
+export interface JsonBlock {
+  type: "json";
+  json: Record<string, unknown> | Array<unknown>;
+  raw?: string;
+}
+
+export interface StrategySignal {
+  dimension: string;
+  label: string;
+  direction: "+" | "-";
+}
+
+export interface StrategyBlock {
+  type: "strategy";
+  mode: "direct" | "orchestrate" | "discuss";
+  discovery: boolean;
+  reasoning: "shallow" | "deep";
+  verification: "none" | "diff" | "test";
+  confidence: number;
+  reason: string;
+  signals: StrategySignal[];
+  // routing fields (mirrored from strategy event for display)
+  intent: string;
+  provider: string;
+  model: string;
+  thinking: boolean;
+  // oracle fields
+  oracleUsed?: boolean;
+  oracleConfidence?: number | null;
+  oracleExploring?: boolean;
+}
+
 export type ContentBlock =
   | TextBlock
   | ToolUseBlock
   | ToolResultBlock
   | ThinkingBlock
   | ServerToolUseBlock
-  | WebSearchToolResultBlock;
+  | WebSearchToolResultBlock
+  | JsonBlock
+  | StrategyBlock;
 
 // Top-level message types from stream-json
 
@@ -114,7 +149,7 @@ export interface StreamEvent {
     type: string;
     index?: number;
     delta?: {
-      type: string;
+      type: "text_delta" | "thinking_delta" | "partial_json_delta";
       text?: string;
       thinking?: string;
       signature?: string;
@@ -148,8 +183,139 @@ export interface ClaudeEventProcessEnded {
   data: { exit_code: number | null };
 }
 
+export interface PunkEventRouting {
+  event: "routing";
+  data: {
+    intent: string;
+    confidence: number;
+    reason: string;
+    provider: string;
+    model: string;
+    thinking: boolean;
+  };
+}
+
+export interface PunkEventStrategy {
+  event: "strategy";
+  data: Omit<StrategyBlock, "type"> & {
+    intent: string;
+    provider: string;
+    model: string;
+    thinking: boolean;
+    oracleUsed?: boolean;
+    oracleConfidence?: number | null;
+    oracleExploring?: boolean;
+  };
+}
+
 export interface ClaudeEventError {
   event: "error";
+  data: { message: string };
+}
+
+export interface ClaudeEventCompactionStart {
+  event: "compaction_start";
+  data: { reason: string; strategy: string };
+}
+
+export interface ClaudeEventCompactionComplete {
+  event: "compaction_complete";
+  data: {
+    originalCount: number;
+    compactedCount: number;
+    tokensSaved: number;
+    totalCompactions: number;
+  };
+}
+
+export interface ClaudeEventTodosUpdated {
+  event: "todos_updated";
+  data: {
+    todos: Todo[];
+  };
+}
+
+export interface ClaudeEventActiveTaskUpdated {
+  event: "activeTask_updated";
+  data: {
+    activeTask: { description: string };
+  };
+}
+
+// ── Orchestration Events (Control Inversion) ────────────────────────────
+
+export interface OrchestrationStartEvent {
+  event: "orchestration_start";
+  data: { prompt: string };
+}
+
+export interface OrchestrationPlanEvent {
+  event: "orchestration_plan";
+  data: {
+    summary: string;
+    steps: { index: number; action: string; type: string; files: string[] }[];
+    totalSteps: number;
+  };
+}
+
+export interface OrchestrationStepEvent {
+  event: "orchestration_step";
+  data: {
+    phase: string;
+    stepIndex?: number;
+    totalSteps?: number;
+    action?: string;
+    type?: string;
+    message: string;
+    reason?: string;
+  };
+}
+
+export interface OrchestrationStepCompleteEvent {
+  event: "orchestration_step_complete";
+  data: {
+    stepIndex: number;
+    totalSteps: number;
+    passed: boolean;
+    reason: string;
+    action: string;
+    scopeViolations?: string[];
+    changedFiles?: string[];
+    retry?: boolean;
+  };
+}
+
+export interface OrchestrationCompleteEvent {
+  event: "orchestration_complete";
+  data: {
+    summary: string;
+    totalSteps: number;
+    completedSteps: number;
+    allPassed: boolean;
+    typeCheckPassed: boolean;
+    typeCheckOutput: string | null;
+    touchedFiles: string[];
+    results: {
+      index: number;
+      action: string;
+      passed: boolean;
+      reason: string;
+      scopeViolations: string[];
+      changedFiles: string[];
+    }[];
+  };
+}
+
+export interface OrchestrationTypecheckEvent {
+  event: "orchestration_typecheck";
+  data: {
+    passed: boolean;
+    output: string;
+  };
+}
+
+export interface OrchestrationErrorEvent {
+  event: "orchestration_error";
   data: { message: string };
 }
 
@@ -157,13 +323,43 @@ export type ClaudeStreamEvent =
   | ClaudeEventMessage
   | ClaudeEventProcessStarted
   | ClaudeEventProcessEnded
-  | ClaudeEventError;
+  | PunkEventRouting
+  | PunkEventStrategy
+  | ClaudeEventError
+  | ClaudeEventCompactionStart
+  | ClaudeEventCompactionComplete
+  | ClaudeEventTodosUpdated
+  | ClaudeEventActiveTaskUpdated
+  | OrchestrationStartEvent
+  | OrchestrationPlanEvent
+  | OrchestrationStepEvent
+  | OrchestrationStepCompleteEvent
+  | OrchestrationCompleteEvent
+  | OrchestrationTypecheckEvent
+  | OrchestrationErrorEvent;
+
+// Plan message types — the blueprint Pane produces before execution
+
+export interface PlanStep {
+  index: number;
+  type: "read" | "write" | "verify" | "plan";
+  action: string;
+  files: string[];
+}
+
+export interface PlanData {
+  id: string;
+  task: string;
+  steps: PlanStep[];
+  planningModel?: string | null;
+  executionModel?: string | null;
+}
 
 // Parsed conversation message for the UI
 
 export interface ConversationMessage {
   id: string;
-  type: "user" | "assistant" | "system" | "result";
+  type: "user" | "assistant" | "system" | "result" | "plan";
   content: ContentBlock[];
   timestamp: number;
   isStreaming: boolean;
@@ -173,6 +369,8 @@ export interface ConversationMessage {
   outputTokens?: number;
   numTurns?: number;
   checkpointId?: string;
+  // Present when type === "plan"
+  planData?: PlanData;
 }
 
 // File checkpoint types
@@ -196,26 +394,43 @@ export interface ConversationState {
   messages: ConversationMessage[];
   sessionId: string | null;
   model: string | null;
+  routedModel: string | null; // Model chosen by smart router for current request
   serviceTier: string | null;
   isProcessing: boolean;
   isPlanning: boolean;
-  isReady: boolean;
+
+  isRestored: boolean; // true once loaded from disk at startup
   error: string | null;
   todos: Todo[];
   pendingPlanApproval: boolean;
+  discoveryActive: boolean; // True when orchestration is in discovery phase, waiting for user input
   // Session lifecycle
-  isProcessActive: boolean;  // Is the Claude CLI child process currently running?
-  lastActivity: number;       // Timestamp of last user interaction with this project
+  isProcessActive: boolean; // Is the Claude CLI child process currently running?
+  lastActivity: number; // Timestamp of last user interaction with this project
   // Context pressure tracking
-  contextTokens: number;          // Latest input_tokens from usage
+  contextTokens: number; // Latest input_tokens from usage
   contextPressure: ContextPressure;
   // Cached brief from last generateBrief — used for enhanced continuation
   cachedBrief: string;
+  statusMessage: string | null;
+  // Context compaction status
+  isCompacting: boolean;
+  lastCompactionAt: number | null;
+  compactionCount: number;
+  tokensSaved: number;
 }
 
 // Memory event types for automatic extraction
 export interface MemoryEvent {
-  type: "file_edit" | "error" | "error_fix" | "decision" | "command" | "summary" | "lesson" | "pattern";
+  type:
+    | "file_edit"
+    | "error"
+    | "error_fix"
+    | "decision"
+    | "command"
+    | "summary"
+    | "lesson"
+    | "pattern";
   content: string;
   timestamp: number;
   source?: "auto" | "claude";
@@ -227,17 +442,24 @@ export function createEmptyConversation(): ConversationState {
     messages: [],
     sessionId: null,
     model: null,
+    routedModel: null,
     serviceTier: null,
     isProcessing: false,
     isPlanning: false,
-    isReady: false,  // Will be set to true by warmup after initial message completes
+    isRestored: false,
     error: null,
     todos: [],
     pendingPlanApproval: false,
+    discoveryActive: false,
     isProcessActive: false,
     lastActivity: Date.now(),
     contextTokens: 0,
     contextPressure: "none",
     cachedBrief: "",
+    statusMessage: null,
+    isCompacting: false,
+    lastCompactionAt: null,
+    compactionCount: 0,
+    tokensSaved: 0,
   };
 }

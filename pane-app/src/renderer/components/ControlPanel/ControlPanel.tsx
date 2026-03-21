@@ -1,9 +1,19 @@
 import { useState, useCallback, useEffect, type ReactNode } from "react";
-import { FileTree } from "./FileTree";
 import { ProjectList } from "./ProjectList";
-import { GitStatus } from "./GitStatus";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
+
+function MindIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      {/* Thought bubble body */}
+      <path d="M12.5 7c0-2.485-2.015-4.5-4.5-4.5S3.5 4.515 3.5 7c0 1.48.714 2.794 1.82 3.612C5.12 11.22 4.9 12 4.9 12s1.02-.38 1.7-.8A4.476 4.476 0 008 11.5c2.485 0 4.5-2.015 4.5-4.5z" />
+      {/* Trailing thought dots */}
+      <circle cx="4" cy="13" r="0.75" fill="currentColor" stroke="none" />
+      <circle cx="2.75" cy="14.25" r="0.5" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
 
 // --- Inline SVG icons (16x16, outlined, unified) ---
 // Pane design language: consistent 1.5px stroke, simple geometry, harmonious system
@@ -89,28 +99,68 @@ function TerminalIcon() {
   );
 }
 
+function ChangeHistoryIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="8" r="5" />
+      <path d="M8 5v2.5l1.5 1" />
+      <path d="M3 8h1.5" />
+      <path d="M11.5 8H13" />
+    </svg>
+  );
+}
+
 // --- Toolbar button ---
 
-function ToolbarButton({ icon, active, disabled, onClick }: {
+function ToolbarButton({ icon, active, disabled, onClick, tooltip }: {
   icon: ReactNode;
   active?: boolean;
   disabled?: boolean;
   onClick: () => void;
+  tooltip?: string;
 }) {
+  const [showTooltip, setShowTooltip] = useState(false);
+  const [tooltipTimer, setTooltipTimer] = useState<NodeJS.Timeout | null>(null);
+
+  const handleMouseEnter = () => {
+    if (tooltip) {
+      setShowTooltip(true);
+    }
+  };
+
+  const handleMouseLeave = () => {
+    if (tooltipTimer) {
+      clearTimeout(tooltipTimer);
+      setTooltipTimer(null);
+    }
+    setShowTooltip(false);
+  };
+
   return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`w-7 h-7 flex items-center justify-center rounded-xl
-        ${disabled
-          ? "text-pane-text-secondary opacity-30 cursor-default"
-          : active
-            ? "text-pane-text bg-pane-text/[0.08]"
-            : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04]"
-        }`}
+    <div 
+      className="relative flex items-center"
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
     >
-      {icon}
-    </button>
+      <button
+        onClick={onClick}
+        disabled={disabled}
+        className={`w-7 h-7 flex items-center justify-center rounded-xl
+          ${disabled
+            ? "text-pane-text-secondary opacity-30 cursor-default"
+            : active
+              ? "text-pane-text bg-pane-text/[0.08]"
+              : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04]"
+          }`}
+      >
+        {icon}
+      </button>
+      {showTooltip && tooltip && (
+        <div className="absolute left-full ml-2 px-2 py-1 bg-pane-bg border border-pane-border/40 rounded-lg text-pane-text-secondary text-[11px] whitespace-nowrap shadow-lg z-50">
+          {tooltip}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -124,10 +174,6 @@ export function ControlPanel() {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
   });
-  const activeFilePath = useProjectsStore((s) => {
-    if (!s.activeProjectId) return null;
-    return s.projects.get(s.activeProjectId)?.activeFilePath ?? null;
-  });
   const isGitRepo = useProjectsStore((s) => {
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.git.isGitRepo ?? false;
@@ -137,85 +183,97 @@ export function ControlPanel() {
     return s.projects.get(s.activeProjectId)?.root;
   });
 
-  const profileOpen = useWorkspaceStore((s) => s.profileOpen);
-  const [gitPanelActive, setGitPanelActive] = useState(false);
+  const overlay = useWorkspaceStore((s) => s.overlay);
 
-  // Auto-close git panel when project changes or isn't a git repo
+  // If we're somehow in git mode but the project isn't a git repo, go to conversation
   useEffect(() => {
-    setGitPanelActive(false);
-  }, [activeProjectId, isGitRepo]);
+    if (mode === "git" && !isGitRepo && activeProjectId) {
+      setMode(activeProjectId, "conversation");
+    }
+  }, [isGitRepo, mode, activeProjectId]);
 
-  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal") => {
-    if (!activeProjectId || mode === newMode) return;
-    if (newMode === "viewer" && !activeFilePath) return;
+  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal" | "git") => {
+    if (!activeProjectId) return;
+    const ws = useWorkspaceStore.getState();
+    // Close any overlay first — clicking a space always navigates to it
+    if (ws.overlay !== null) {
+      ws.setOverlay(null);
+      if (mode === newMode) return; // overlay was covering this mode, just close it
+    }
+    if (mode === newMode) return;
     setMode(activeProjectId, newMode);
     if (newMode === "conversation") {
       window.dispatchEvent(new CustomEvent("pane:focus-input"));
     } else if (newMode === "viewer") {
       window.dispatchEvent(new CustomEvent("pane:focus-editor"));
     }
-    // Terminal handles its own focus
-  }, [activeProjectId, mode, activeFilePath, setMode]);
-
-  const toggleGit = useCallback(() => {
-    setGitPanelActive((prev) => !prev);
-  }, []);
+  }, [activeProjectId, mode, setMode]);
 
   return (
     <div
-      className="no-select flex flex-col h-full bg-pane-bg rounded-2xl font-panel outline-none ring-1 ring-pane-border/40"
+      className="no-select flex flex-col h-full bg-pane-bg rounded-xl font-panel outline-none ring-1 ring-pane-border/40"
       data-panel="control"
       tabIndex={0}
     >
       {/* Spacer for macOS traffic lights — enough room so they sit inside the panel */}
       <div className="h-12 shrink-0" />
 
-      {/* Project list */}
-      <div className="border-b border-pane-border py-2">
+      {/* Thread list — fills available space between traffic lights and toolbar */}
+      <div className="flex-1 min-h-0 overflow-y-auto py-2">
         <ProjectList />
       </div>
 
-      {/* FileTree and GitStatus are mutually exclusive — git takes over the panel */}
-      {gitPanelActive && isGitRepo && root && activeProjectId ? (
-        <GitStatus root={root} />
-      ) : (
-        <FileTree />
-      )}
-
       {/* Toolbar */}
-      <div className="h-9 flex items-center gap-1 px-2 border-t border-pane-border shrink-0">
+      <div className="h-9 flex items-center gap-1 px-2 shrink-0">
         <ToolbarButton
           icon={<ConversationIcon />}
           active={mode === "conversation"}
           onClick={() => handleSetMode("conversation")}
+          tooltip="Conversation"
         />
         <ToolbarButton
           icon={<FileIcon />}
           active={mode === "viewer"}
-          disabled={!activeFilePath}
           onClick={() => handleSetMode("viewer")}
+          tooltip="Files"
         />
         <ToolbarButton
           icon={<SearchIcon />}
           onClick={() => useWorkspaceStore.getState().toggleFuzzyFinder()}
+          tooltip="Search"
         />
         {isGitRepo && (
           <ToolbarButton
             icon={<GitIcon />}
-            active={gitPanelActive}
-            onClick={toggleGit}
+            active={mode === "git"}
+            onClick={() => handleSetMode(mode === "git" ? "conversation" : "git")}
+            tooltip="Git"
           />
         )}
         <ToolbarButton
           icon={<TerminalIcon />}
           active={mode === "terminal"}
           onClick={() => handleSetMode("terminal")}
+          tooltip="Terminal"
         />
-        <div className="ml-auto">
+        <ToolbarButton
+          icon={<ChangeHistoryIcon />}
+          active={overlay === "history"}
+          onClick={() => useWorkspaceStore.getState().setOverlay("history")}
+          tooltip="History"
+        />
+        <div className="ml-auto flex items-center gap-0.5">
+          <ToolbarButton
+            icon={<MindIcon />}
+            active={overlay === "mind"}
+            onClick={() => useWorkspaceStore.getState().setOverlay("mind")}
+            tooltip="Mind"
+          />
           <ToolbarButton
             icon={<ProfileAvatar />}
-            active={profileOpen}
-            onClick={() => useWorkspaceStore.getState().toggleProfile()}
+            active={overlay === "profile"}
+            onClick={() => useWorkspaceStore.getState().setOverlay("profile")}
+            tooltip="Profile"
           />
         </div>
       </div>

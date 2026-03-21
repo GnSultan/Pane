@@ -17,7 +17,7 @@ export function TodoPanel({ projectId, onCollapse }: TodoPanelProps) {
   if (todos.length === 0) return null;
 
   return (
-    <div className="mb-2 bg-pane-bg rounded-2xl ring-1 ring-pane-border/40 overflow-hidden animate-fadeSlideUp">
+    <div className="mb-2 bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden animate-fadeSlideUp">
       <div className="px-5 pt-4 pb-2 space-y-2.5">
         {todos.map((todo, i) => (
           <div key={i} className="flex items-start gap-3">

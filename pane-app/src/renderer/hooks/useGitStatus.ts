@@ -3,7 +3,7 @@ import { useProjectsStore } from "../stores/projects";
 import { getGitStatus } from "../lib/tauri-commands";
 import { appReadyPromise } from "./useSettingsPersistence";
 
-const electronAPI = (window as any).electronAPI;
+const electronAPI = window.electronAPI;
 
 export function useGitStatus() {
   const projectOrder = useProjectsStore((s) => s.projectOrder);

@@ -1,5 +1,14 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { createPty, writePty, destroyPty, destroyAllPtysForProject, onPtyData, onPtyExit, getHomeDir, writeTerminalState } from "../../lib/tauri-commands";
+import {
+  createPty,
+  writePty,
+  destroyPty,
+  destroyAllPtysForProject,
+  onPtyData,
+  onPtyExit,
+  getHomeDir,
+  writeTerminalState,
+} from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";
 import type { TerminalTab } from "../../stores/projects";
 import stripAnsi from "strip-ansi";
@@ -17,6 +26,51 @@ interface TerminalLine {
 
 const CMD_END_MARKER = "___PANE_CMD_END___";
 const PWD_MARKER = "___PANE_PWD___";
+
+function measureCaretPos(
+  el: HTMLTextAreaElement,
+  container: HTMLElement,
+): { top: number; left: number; lineHeight: number } | null {
+  const sel = el.selectionStart;
+  if (sel === null) return null;
+
+  const computed = window.getComputedStyle(el);
+
+  const mirror = document.createElement("div");
+  mirror.setAttribute("aria-hidden", "true");
+  Object.assign(mirror.style, {
+    position: "absolute",
+    top: "0",
+    left: "0",
+    visibility: "hidden",
+    pointerEvents: "none",
+    width: el.clientWidth + "px",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    overflowWrap: "break-word",
+    padding: computed.padding,
+    font: computed.font,
+    letterSpacing: computed.letterSpacing,
+    lineHeight: computed.lineHeight,
+    boxSizing: computed.boxSizing,
+  });
+
+  mirror.appendChild(document.createTextNode(el.value.slice(0, sel)));
+  const marker = document.createElement("span");
+  marker.textContent = "\u200b"; // zero-width space
+  mirror.appendChild(marker);
+
+  container.appendChild(mirror);
+  const caretH = parseFloat(computed.fontSize) || 15;
+  const markerCenter = marker.offsetTop + marker.offsetHeight / 2;
+  const result = {
+    top: markerCenter - el.scrollTop - caretH / 2,
+    left: marker.offsetLeft,
+    lineHeight: caretH,
+  };
+  container.removeChild(mirror);
+  return result;
+}
 
 function shortenPath(fullPath: string, home: string): string {
   if (fullPath === home) return "~";
@@ -42,8 +96,13 @@ interface TabState {
   isRunning: boolean;
   initialized: boolean; // suppress initial shell prompt
   echoSkipped: boolean; // skip the echoed command line from PTY
-  lastCommand: string;  // last command sent (for MCP state sync)
-  recentCommands: Array<{ cmd: string; output: string; cwd: string; timestamp: number }>; // last 20 commands
+  lastCommand: string; // last command sent (for MCP state sync)
+  recentCommands: Array<{
+    cmd: string;
+    output: string;
+    cwd: string;
+    timestamp: number;
+  }>; // last 20 commands
 }
 
 const tabStates = new Map<string, TabState>();
@@ -85,7 +144,10 @@ function TerminalTabBar({
   if (tabs.length <= 1) return null;
 
   return (
-    <div className="shrink-0 flex items-center gap-1 px-10 pt-2 pb-1">
+    <div
+      className="shrink-0 flex items-center gap-1 px-10 pt-2 pb-1 relative z-20"
+      data-no-drag
+    >
       {tabs.map((tab) => (
         <button
           key={tab.id}
@@ -144,9 +206,16 @@ function TerminalTabContent({
   const [isRunning, setIsRunning] = useState(state.isRunning);
   const [cwd, setCwd] = useState(state.cwd);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const [caretPos, setCaretPos] = useState<{
+    top: number;
+    left: number;
+    lineHeight: number;
+  } | null>(null);
+  const [textareaFocused, setTextareaFocused] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const caretContainerRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef(state);
 
   // Keep tabState in sync
@@ -204,13 +273,18 @@ function TerminalTabContent({
       if (markerIdx !== -1) {
         // Extract output before the marker
         let output = ts.outputBuffer.slice(0, markerIdx);
-        const afterMarker = ts.outputBuffer.slice(markerIdx + CMD_END_MARKER.length);
+        const afterMarker = ts.outputBuffer.slice(
+          markerIdx + CMD_END_MARKER.length,
+        );
 
         // Parse exit code and pwd from: exitCode___PANE_PWD___/path/to/dir
         const pwdIdx = afterMarker.indexOf(PWD_MARKER);
         let newCwd = "";
         if (pwdIdx !== -1) {
-          const pwdStr = afterMarker.slice(pwdIdx + PWD_MARKER.length).split("\n")[0]?.trim();
+          const pwdStr = afterMarker
+            .slice(pwdIdx + PWD_MARKER.length)
+            .split("\n")[0]
+            ?.trim();
           if (pwdStr) {
             newCwd = pwdStr;
           }
@@ -244,7 +318,9 @@ function TerminalTabContent({
             timestamp: Date.now(),
           };
           ts.recentCommands = [...ts.recentCommands, entry].slice(-20);
-          writeTerminalState(projectId, { commands: ts.recentCommands }).catch(() => {});
+          writeTerminalState(projectId, { commands: ts.recentCommands }).catch(
+            () => {},
+          );
         }
       }
     });
@@ -263,6 +339,31 @@ function TerminalTabContent({
     };
   }, [tabId, projectId, workingDir]);
 
+  // Update static caret position
+  const updateCaret = useCallback(() => {
+    const el = inputRef.current;
+    const container = caretContainerRef.current;
+    if (!el || !container || document.activeElement !== el) {
+      setCaretPos(null);
+      return;
+    }
+    setCaretPos(measureCaretPos(el, container));
+  }, []);
+
+  // Reposition on every value change (covers typing)
+  useEffect(() => {
+    if (textareaFocused) updateCaret();
+  }, [command, textareaFocused, updateCaret]);
+
+  // Reposition on selection movement (arrows, mouse clicks, scroll)
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    const events = ["click", "keyup", "mouseup", "select", "scroll"];
+    events.forEach((e) => el.addEventListener(e, updateCaret));
+    return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
+  }, [updateCaret]);
+
   // Auto-scroll
   useEffect(() => {
     if (scrollRef.current) {
@@ -270,12 +371,17 @@ function TerminalTabContent({
     }
   }, [lines]);
 
-  // Focus input when tab becomes visible or command finishes
+  // Focus input when tab becomes visible or command finishes/starts
   useEffect(() => {
-    if (isVisible && !isRunning) {
+    if (isVisible) {
       inputRef.current?.focus();
     }
   }, [isVisible, isRunning]);
+
+  const clearTerminal = useCallback(() => {
+    setLines([]);
+    stateRef.current.lines = [];
+  }, []);
 
   const runCommand = useCallback(
     (cmd: string) => {
@@ -292,7 +398,11 @@ function TerminalTabContent({
       const displayPath = shortenPath(cwd, homeDir);
       setLines((prev) => [
         ...prev,
-        { type: "command", content: `${displayPath} $ ${trimmedCmd}`, timestamp: Date.now() },
+        {
+          type: "command",
+          content: `${displayPath} $ ${trimmedCmd}`,
+          timestamp: Date.now(),
+        },
       ]);
       setCommand("");
       setIsRunning(true);
@@ -309,29 +419,54 @@ function TerminalTabContent({
     [tabId, isRunning, cwd, homeDir],
   );
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "c" && e.ctrlKey && isRunning) {
-      e.preventDefault();
-      writePty(tabId, "\x03");
-      // The interrupted command won't produce our completion marker,
-      // so clear running state after a short delay
-      const ts = stateRef.current;
-      setTimeout(() => {
-        if (ts.isRunning) {
-          // Flush any accumulated output
-          const pending = ts.outputBuffer.replace(/\^C\n?/g, "").trim();
-          if (pending) {
-            setLines((prev) => [
-              ...prev,
-              { type: "output", content: pending, timestamp: Date.now() },
-            ]);
-          }
-          ts.outputBuffer = "";
-          ts.isRunning = false;
-          ts.echoSkipped = false;
-          setIsRunning(false);
+  const abortCommand = useCallback(() => {
+    if (!isRunning) return;
+    writePty(tabId, "\x03");
+    // The interrupted command won't produce our completion marker,
+    // so clear running state after a short delay
+    const ts = stateRef.current;
+    setTimeout(() => {
+      if (ts.isRunning) {
+        // Flush any accumulated output
+        const pending = ts.outputBuffer.replace(/\^C\n?/g, "").trim();
+        if (pending) {
+          setLines((prev) => [
+            ...prev,
+            { type: "output", content: pending, timestamp: Date.now() },
+          ]);
         }
-      }, 200);
+        ts.outputBuffer = "";
+        ts.isRunning = false;
+        ts.echoSkipped = false;
+        setIsRunning(false);
+      }
+    }, 200);
+  }, [tabId, isRunning]);
+
+  // Global escape/ctrl+c listener when visible
+  useEffect(() => {
+    if (!isVisible || !isRunning) return;
+    const handleWindowKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" || (e.key === "c" && e.ctrlKey)) {
+        // Only intercept if we aren't already in the textarea (which has its own handler)
+        // or if we want to ensure it works regardless of focus.
+        if (
+          document.activeElement?.tagName !== "TEXTAREA" &&
+          document.activeElement?.tagName !== "INPUT"
+        ) {
+          e.preventDefault();
+          abortCommand();
+        }
+      }
+    };
+    window.addEventListener("keydown", handleWindowKeyDown);
+    return () => window.removeEventListener("keydown", handleWindowKeyDown);
+  }, [isVisible, isRunning, abortCommand]);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if ((e.key === "Escape" || (e.key === "c" && e.ctrlKey)) && isRunning) {
+      e.preventDefault();
+      abortCommand();
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -339,13 +474,15 @@ function TerminalTabContent({
       runCommand(command);
     } else if (e.key === "l" && e.metaKey) {
       e.preventDefault();
-      setLines([]);
-      stateRef.current.lines = [];
+      clearTerminal();
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       const history = stateRef.current.history;
       if (history.length === 0) return;
-      const newIdx = historyIndex === -1 ? history.length - 1 : Math.max(0, historyIndex - 1);
+      const newIdx =
+        historyIndex === -1
+          ? history.length - 1
+          : Math.max(0, historyIndex - 1);
       setHistoryIndex(newIdx);
       setCommand(history[newIdx]!);
     } else if (e.key === "ArrowDown") {
@@ -366,48 +503,70 @@ function TerminalTabContent({
   const displayPath = shortenPath(cwd, homeDir);
 
   return (
-    <div className="flex flex-col h-full w-full" style={{ display: isVisible ? "flex" : "none" }}>
-      {/* Terminal output area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 px-10 py-8" style={{ willChange: "transform" }}>
-        {lines.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full select-none gap-6">
-            <span
-              className="text-pane-text-secondary/40 font-mono tracking-[0.25em] uppercase"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              terminal
-            </span>
-            <div className="flex items-center gap-6 text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-              <span>return run</span>
-              <span>up/down history</span>
-              <span>cmd+L clear</span>
-              <span>ctrl+C cancel</span>
-            </div>
-          </div>
-        )}
-
-        {lines.map((line, i) => (
-          <div
-            key={`${line.timestamp}-${i}`}
-            className={`font-mono whitespace-pre-wrap mb-1 ${
-              line.type === "command"
-                ? "text-pane-text"
-                : line.type === "error"
-                  ? "text-pane-error"
-                  : "text-pane-text-secondary"
-            }`}
-            style={{ fontSize: "var(--pane-font-size-base)" }}
+    <div
+      className="flex flex-col h-full w-full"
+      style={{ display: isVisible ? "flex" : "none" }}
+    >
+      <div className="flex-1 relative min-h-0" data-no-drag>
+        {lines.length > 0 && (
+          <button
+            onClick={clearTerminal}
+            className="absolute top-8 right-10 text-pane-text-secondary/30 hover:text-pane-text-secondary font-mono text-[10px] uppercase tracking-wider z-30 transition-colors"
+            title="Clear terminal (Cmd+L)"
           >
-            {line.content}
-          </div>
-        ))}
-
-        {isRunning && (
-          <div className="flex items-center gap-2 text-pane-text-secondary/50 font-mono mt-2">
-            <span className="inline-block w-1 h-3 bg-pane-text-secondary/50 animate-pulse" />
-            <span style={{ fontSize: "var(--pane-font-size-sm)" }}>running...</span>
-          </div>
+            clear
+          </button>
         )}
+        <div
+          ref={scrollRef}
+          className="h-full overflow-y-auto overflow-x-hidden px-10 py-8 relative z-20"
+          style={{ willChange: "transform" }}
+        >
+          {lines.length === 0 && (
+            <div className="flex flex-col items-center justify-center h-full select-none gap-6">
+              <span
+                className="text-pane-text-secondary/40 font-mono tracking-[0.25em] uppercase"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+              >
+                terminal
+              </span>
+              <div
+                className="flex items-center gap-6 text-pane-text-secondary/30 font-mono"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                <span>return run</span>
+                <span>up/down history</span>
+                <span>cmd+L clear</span>
+                <span>esc / ctrl+C cancel</span>
+              </div>
+            </div>
+          )}
+
+          {lines.map((line, i) => (
+            <div
+              key={`${line.timestamp}-${i}`}
+              className={`font-mono whitespace-pre-wrap break-words mb-1 ${
+                line.type === "command"
+                  ? "text-pane-text"
+                  : line.type === "error"
+                    ? "text-pane-error"
+                    : "text-pane-text-secondary"
+              }`}
+              style={{ fontSize: "var(--pane-font-size-base)" }}
+            >
+              {line.content}
+            </div>
+          ))}
+
+          {isRunning && (
+            <div className="flex items-center gap-2 text-pane-text-secondary/50 font-mono mt-2">
+              <span className="inline-block w-1 h-3 bg-pane-text-secondary/50 animate-pulse" />
+              <span style={{ fontSize: "var(--pane-font-size-sm)" }}>
+                running...
+              </span>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Command input with cwd prompt */}
@@ -418,21 +577,50 @@ function TerminalTabContent({
         >
           {displayPath} $
         </span>
-        <textarea
-          ref={inputRef}
-          value={command}
-          onChange={(e) => { setCommand(e.target.value); setHistoryIndex(-1); }}
-          onKeyDown={handleKeyDown}
-          disabled={isRunning}
-          placeholder=""
-          className="flex-1 bg-transparent border-none outline-none resize-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
-          style={{
-            fontSize: "var(--pane-font-size-base)",
-            minHeight: "2rem",
-            lineHeight: "2rem",
-          }}
-          rows={1}
-        />
+        <div ref={caretContainerRef} className="flex-1 relative">
+          <textarea
+            ref={inputRef}
+            value={command}
+            onChange={(e) => {
+              setCommand(e.target.value);
+              setHistoryIndex(-1);
+            }}
+            onKeyDown={handleKeyDown}
+            onFocus={() => {
+              setTextareaFocused(true);
+              updateCaret();
+            }}
+            onBlur={() => {
+              setTextareaFocused(false);
+              setCaretPos(null);
+            }}
+            readOnly={isRunning}
+            placeholder=""
+            className="w-full bg-transparent border-none outline-none resize-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
+            style={{
+              fontSize: "var(--pane-font-size-base)",
+              minHeight: "2rem",
+              lineHeight: "2rem",
+              caretColor: "transparent",
+            }}
+            rows={1}
+          />
+          {/* Static amber cursor */}
+          {textareaFocused && caretPos && (
+            <div
+              aria-hidden
+              style={{
+                position: "absolute",
+                top: caretPos.top,
+                left: caretPos.left,
+                width: 2,
+                height: caretPos.lineHeight,
+                background: "var(--pane-editor-cursor)",
+                pointerEvents: "none",
+              }}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
@@ -442,12 +630,18 @@ function TerminalTabContent({
 
 export function Terminal({ projectId, workingDir }: TerminalProps) {
   const [homeDir, setHomeDir] = useState("");
-  const tabs = useProjectsStore((s) => s.projects.get(projectId)?.terminalTabs ?? []);
-  const activeTabId = useProjectsStore((s) => s.projects.get(projectId)?.activeTerminalTabId ?? null);
+  const tabs = useProjectsStore(
+    (s) => s.projects.get(projectId)?.terminalTabs ?? [],
+  );
+  const activeTabId = useProjectsStore(
+    (s) => s.projects.get(projectId)?.activeTerminalTabId ?? null,
+  );
 
   // Get home dir on mount
   useEffect(() => {
-    getHomeDir().then(setHomeDir).catch(() => {});
+    getHomeDir()
+      .then(setHomeDir)
+      .catch(() => {});
   }, []);
 
   // Auto-create first tab on mount
@@ -456,7 +650,11 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
     const project = store.projects.get(projectId);
     if (project && project.terminalTabs.length === 0) {
       const id = nextTabId(projectId);
-      store.addTerminalTab(projectId, { id, title: tabTitle(0), isAlive: true });
+      store.addTerminalTab(projectId, {
+        id,
+        title: tabTitle(0),
+        isAlive: true,
+      });
     }
   }, [projectId]);
 
@@ -472,7 +670,11 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
     const project = store.projects.get(projectId);
     const index = project ? project.terminalTabs.length : 0;
     const id = nextTabId(projectId);
-    store.addTerminalTab(projectId, { id, title: tabTitle(index), isAlive: true });
+    store.addTerminalTab(projectId, {
+      id,
+      title: tabTitle(index),
+      isAlive: true,
+    });
   }, [projectId]);
 
   const handleCloseTab = useCallback(

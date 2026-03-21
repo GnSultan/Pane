@@ -42,7 +42,7 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
   return (
     <div
       ref={menuRef}
-      className="fixed z-50 bg-pane-bg ring-1 ring-pane-border/40 rounded-2xl overflow-hidden py-1 min-w-[160px]"
+      className="fixed z-50 bg-pane-bg ring-1 ring-pane-border/40 rounded-xl overflow-hidden py-1 min-w-[160px]"
       style={{ left: adjustedX, top: adjustedY }}
       onClick={(e) => e.stopPropagation()}
     >

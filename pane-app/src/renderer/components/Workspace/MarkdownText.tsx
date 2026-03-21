@@ -10,86 +10,342 @@ import type React from "react";
  * All sizes scale with --pane-font-size CSS variable (Cmd+/- adjustable).
  */
 
-// --- Emoji stripping ---
+// --- Syntax Highlighting ---
 
-// eslint-disable-next-line no-misleading-character-class -- intentional Unicode range for emoji stripping
-const emojiPattern = /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]+/gu;
-
-function stripEmojis(text: string): string {
-  return text.replace(emojiPattern, "").replace(/  +/g, " ").trim();
+interface SyntaxToken {
+  type: "keyword" | "string" | "number" | "comment" | "function" | "operator" | "punctuation" | "text";
+  content: string;
 }
 
-// --- Markdown marker stripping for streaming ---
+// Helper function to escape special regex characters
+function escapeRegExp(str: string): string {
+  const specialChars = "*+?^${}()|[]\\";
+  return str.split('').map(char => 
+    specialChars.includes(char) ? '\\' + char : char
+  ).join('');
+}
 
-function stripMarkdownMarkers(text: string): string {
-  return text
-    // Remove heading markers: ### Heading → Heading
-    .replace(/^#{1,6}\s+/gm, "")
-    // Remove list markers: - item or * item → item
-    .replace(/^[\s]*[-*]\s+/gm, "")
-    // Remove numbered list markers: 1. item → item
-    .replace(/^[\s]*\d+\.\s+/gm, "")
-    // Remove blockquote markers: > quote → quote
-    .replace(/^>\s?/gm, "")
-    // Remove horizontal rules: ---, ***, ___
-    .replace(/^[-*_]{3,}\s*$/gm, "")
-    // Remove code fence markers: ``` → (just remove the backticks, keep the code)
-    .replace(/^```\w*$/gm, "")
-    // Clean up extra whitespace
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+function highlightSyntax(code: string, language: string): SyntaxToken[] {
+  const tokens: SyntaxToken[] = [];
+  
+  // Build regex patterns with priorities
+  const patterns = [
+    // Comments (highest priority)
+    { pattern: /(\/\/.*$|\/\*[\s\S]*?\*\/|#.*$)/gm, type: "comment" as const },
+    // Strings (with escape handling)
+    { pattern: /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, type: "string" as const },
+    // Numbers
+    { pattern: /\b(\d+\.?\d*)\b/g, type: "number" as const },
+    // Keywords (language-specific)
+    { pattern: new RegExp(`\\b(${getKeywords(language).map(escapeRegExp).join('|')})\\b`, "g"), type: "keyword" as const },
+    // Function calls
+    { pattern: /\b([a-zA-Z_]\w*)\s*\(/g, type: "function" as const },
+    // Operators
+    { pattern: /[+\-*/%=<>!&|^~?:]+/g, type: "operator" as const },
+    // Punctuation
+    { pattern: /[{}[\]();,.]/g, type: "punctuation" as const },
+  ];
+
+  // Create a single regex that matches any of the patterns
+  const combinedPattern = new RegExp(
+    patterns.map(p => `(${p.pattern.source})`).join("|"),
+    "gm"
+  );
+
+  let lastIndex = 0;
+  let match;
+  
+  while ((match = combinedPattern.exec(code)) !== null) {
+    // Add any text before this match
+    if (match.index > lastIndex) {
+      tokens.push({ type: "text", content: code.slice(lastIndex, match.index) });
+    }
+    
+    // Determine which pattern matched
+    for (let j = 0; j < patterns.length; j++) {
+      const matchedContent = match[j + 1];
+      const pattern = patterns[j];
+      if (matchedContent !== undefined && pattern) {
+        tokens.push({ type: pattern.type, content: matchedContent });
+        break;
+      }
+    }
+    
+    lastIndex = match.index + match[0].length;
+  }
+  
+  // Add any remaining text
+  if (lastIndex < code.length) {
+    tokens.push({ type: "text", content: code.slice(lastIndex) });
+  }
+  
+  return tokens;
+}
+
+function getKeywords(language: string): string[] {
+  const baseKeywords = [
+    "const", "let", "var", "function", "return", "if", "else", "for", "while", 
+    "do", "switch", "case", "break", "continue", "try", "catch", "finally",
+    "throw", "new", "this", "class", "extends", "super", "import", "export",
+    "default", "from", "as", "async", "await", "yield", "of", "in", "instanceof",
+    "typeof", "void", "delete", "true", "false", "null", "undefined"
+  ];
+
+  const languageKeywords: Record<string, string[]> = {
+    javascript: baseKeywords,
+    typescript: [
+      ...baseKeywords,
+      "interface", "type", "enum", "implements", "public", "private", "protected",
+      "readonly", "abstract", "static", "namespace", "declare", "any", "unknown",
+      "never", "keyof", "infer", "satisfies"
+    ],
+    python: [
+      "def", "return", "if", "elif", "else", "for", "while", "break", "continue",
+      "pass", "try", "except", "finally", "raise", "class", "import", "from",
+      "as", "with", "lambda", "yield", "global", "nonlocal", "assert", "and",
+      "or", "not", "in", "is", "True", "False", "None", "async", "await"
+    ],
+    html: [
+      "html", "head", "body", "div", "span", "p", "a", "img", "script", "style",
+      "link", "meta", "title", "header", "footer", "nav", "section", "article",
+      "aside", "main", "form", "input", "button", "label", "select", "textarea"
+    ],
+    css: [
+      "color", "background", "margin", "padding", "border", "width", "height",
+      "font", "display", "position", "top", "right", "bottom", "left", "z-index",
+      "flex", "grid", "box-shadow", "text-align", "line-height", "opacity"
+    ],
+    json: ["true", "false", "null"],
+    markdown: ["#", "##", "###", "####", "#####", "######", "-", "*", "+", ">"],
+    mjs: baseKeywords,
+    cjs: baseKeywords,
+    jsx: baseKeywords,
+    tsx: [...baseKeywords, "interface", "type", "enum", "public", "private", "protected"],
+    yml: ["true", "false", "null", "yes", "no"],
+    yaml: ["true", "false", "null", "yes", "no"],
+    bash: ["if", "then", "else", "fi", "for", "do", "done", "while", "until", "case", "esac", "function"],
+    sh: ["if", "then", "else", "fi", "for", "do", "done", "while", "until", "case", "esac", "function"]
+  };
+  
+  const lang = language.toLowerCase().trim();
+  
+  // Handle common aliases
+  const aliases: Record<string, string> = {
+    "js": "javascript",
+    "ts": "typescript",
+    "py": "python",
+    "yml": "yaml",
+    "mjs": "mjs",
+    "cjs": "cjs",
+    "jsx": "jsx",
+    "tsx": "tsx"
+  };
+  
+  const normalizedLang = aliases[lang] || lang;
+  
+  return languageKeywords[normalizedLang] || baseKeywords;
+}
+
+function renderHighlightedCode(code: string, language: string): React.JSX.Element[] {
+  const tokens = highlightSyntax(code, language);
+  
+  return tokens.map((token, index) => {
+    let className = "";
+    
+    switch (token.type) {
+      case "keyword":
+        className = "text-pane-syn-keyword font-semibold";
+        break;
+      case "string":
+        className = "text-pane-syn-string";
+        break;
+      case "number":
+        className = "text-pane-syn-number";
+        break;
+      case "comment":
+        className = "text-pane-syn-comment italic";
+        break;
+      case "function":
+        className = "text-pane-syn-function";
+        break;
+      case "operator":
+        className = "text-pane-syn-operator";
+        break;
+      case "punctuation":
+        className = "text-pane-syn-property";
+        break;
+      default:
+        className = "text-pane-text/85";
+    }
+    
+    return (
+      <span key={index} className={className}>
+        {token.content}
+      </span>
+    );
+  });
+}
+
+// --- Emoji stripping ---
+
+const emojiPattern =
+  /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]/gu;
+
+function stripEmojis(text: string): string {
+  return text.replace(emojiPattern, "").replace(/  +/g, " ");
 }
 
 interface MarkdownTextProps {
   text: string;
   isStreaming?: boolean;
+  isThinking?: boolean;
 }
 
-export const MarkdownText = memo(function MarkdownText({ text, isStreaming }: MarkdownTextProps) {
-  // During streaming, skip markdown parsing entirely — parseBlocks runs O(n)
-  // regex passes over the full accumulated text on every frame. For long messages
-  // (summaries, plans), this exceeds 16ms and freezes the app.
-  // Raw text renders in O(1). Full markdown parses once when streaming ends.
-  //
-  // However, "once" can still be too expensive for very large final summaries.
-  // In that case we keep the cheap plain-text rendering to avoid UI stalls.
+export const MarkdownText = memo(function MarkdownText({
+  text,
+  isStreaming,
+  isThinking,
+}: MarkdownTextProps) {
+  if (!text) return null;
 
+  // During streaming, we use incremental parsing to provide rich formatting
+  // without the performance cost of full document parsing on every frame.
+  // We parse inline formatting (bold, code, links) and detect simple block
+  // boundaries for a better streaming experience.
   const shouldParseMarkdown = !isStreaming && text.length <= 30_000;
-
-  // Memoize cleaning during streaming — strip emojis AND markdown markers
-  // This prevents visible transformation when streaming ends (### → styled heading, etc.)
-  const displayText = useMemo(
-    () => {
-      if (isStreaming) {
-        const noEmojis = stripEmojis(text);
-        const noMarkdown = stripMarkdownMarkers(noEmojis);
-        return noMarkdown;
-      }
-      return text;
-    },
-    [text, isStreaming]
-  );
+  const shouldParseIncremental = isStreaming;
 
   const blocks = useMemo(
-    () => (shouldParseMarkdown ? parseBlocks(displayText) : null),
-    [displayText, shouldParseMarkdown],
+    () => (shouldParseMarkdown ? parseBlocks(text) : null),
+    [text, shouldParseMarkdown],
   );
+
+  const incrementalBlocks = useMemo(
+    () => (shouldParseIncremental ? parseIncremental(text) : null),
+    [text, shouldParseIncremental],
+  );
+
+  // Define types for grouped items
+  type GroupedCodeBlock = { type: "code_block"; lang: string; chunks: IncrementalBlock[] };
+  type GroupedInline = { type: "group"; blocks: IncrementalBlock[] };
+  type GroupedItem = IncrementalBlock | GroupedCodeBlock | GroupedInline;
+
+  if (incrementalBlocks) {
+    // Group consecutive chunks into stable containers to prevent "slipping"
+    const groups: GroupedItem[] = [];
+    let currentCodeBlock: GroupedCodeBlock | null = null;
+    
+    for (const b of incrementalBlocks) {
+      const last = groups[groups.length - 1];
+      
+      // Handle code block grouping
+      if (b.type === "code_start") {
+        currentCodeBlock = { type: "code_block", lang: b.lang, chunks: [] };
+        groups.push(currentCodeBlock);
+        continue;
+      } else if (b.type === "code_end") {
+        currentCodeBlock = null;
+        continue;
+      } else if (b.type === "code_chunk" && currentCodeBlock) {
+        currentCodeBlock.chunks.push(b);
+        continue;
+      }
+      
+      // Reset code block if we encounter a non-code block while in code block
+      if (currentCodeBlock && b.type !== "code_chunk") {
+        currentCodeBlock = null;
+      }
+      
+      // Types that should be grouped into a single paragraph
+      const isInline = b.type === "inline" || b.type === "paragraph_chunk" || b.type === "list_item";
+      
+      if (isInline && last && (last as GroupedInline).type === "group") {
+        (last as GroupedInline).blocks.push(b);
+      } else if (isInline) {
+        groups.push({ type: "group", blocks: [b] });
+      } else {
+        groups.push(b);
+      }
+    }
+
+    return (
+      <div className={isThinking ? "space-y-1" : "space-y-4"}>
+        {groups.map((item, i) => {
+          if (item.type === "group") {
+            const groupItem = item as GroupedInline;
+            const isListItem = groupItem.blocks[0]?.type === "list_item";
+            const Tag = isListItem ? "li" : "p";
+            return (
+              <Tag
+                key={i}
+                className={`${isThinking ? "whitespace-pre-wrap break-words" : "text-pane-text leading-[1.75] whitespace-pre-wrap break-words mb-5"}`}
+                style={{
+                  fontSize: isThinking ? "inherit" : "var(--pane-font-size)",
+                  maxWidth: "65ch",
+                }}
+              >
+                {groupItem.blocks.map((b, bi) => (
+                  <span key={bi}>
+                    {"content" in b && typeof b.content === "string" && renderInline(b.content, isThinking)}
+                  </span>
+                ))}
+              </Tag>
+            );
+          }
+          
+          // Handle code_block type
+          if (item.type === "code_block") {
+            const codeBlock = item as GroupedCodeBlock;
+            const codeContent = codeBlock.chunks
+              .map((c) => c.type === "code_chunk" ? c.content : "")
+              .join("\n");
+            
+            return (
+              <div key={i} className={isThinking ? "my-2" : "my-6"}>
+                {codeBlock.lang && (
+                  <div className="flex items-center gap-2 text-[10px] font-mono text-pane-text-secondary/60 mb-2 uppercase tracking-[0.1em]">
+                    <span className="w-2 h-2 rounded-full bg-pane-terminal/60"></span>
+                    {codeBlock.lang}
+                  </div>
+                )}
+                <div
+                  className="font-mono overflow-x-auto leading-[1.75] px-4 py-3 rounded-md"
+                  style={{ 
+                    fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)`
+                  }}
+                >
+                  <pre className="whitespace-pre-wrap break-words m-0">
+                    <code>
+                      {renderHighlightedCode(codeContent, codeBlock.lang)}
+                    </code>
+                  </pre>
+                </div>
+              </div>
+            );
+          }
+          
+          // For regular IncrementalBlock items
+          return renderIncrementalBlock(item as IncrementalBlock, i, isThinking);
+        })}
+      </div>
+    );
+  }
 
   if (!blocks) {
     return (
       <p
-        className="text-pane-text leading-[1.75] whitespace-pre-wrap mb-5"
+        className={`${isThinking ? "whitespace-pre-wrap" : "text-pane-text leading-[1.75] whitespace-pre-wrap mb-5"}`}
         style={{
-          fontSize: "var(--pane-font-size)",
+          fontSize: isThinking ? "inherit" : "var(--pane-font-size)",
           maxWidth: "65ch",
         }}
       >
-        {displayText}
+        {renderInline(text, isThinking)}
       </p>
     );
   }
 
-  return <>{blocks.map((block, i) => renderBlock(block, i))}</>;
+  return <>{blocks.map((block, i) => renderBlock(block, i, isThinking))}</>;
 });
 
 // --- Block-level parsing ---
@@ -102,6 +358,16 @@ type Block =
   | { type: "blockquote"; content: string }
   | { type: "table"; headers: string[]; rows: string[][] }
   | { type: "paragraph"; content: string };
+
+// Incremental block types for streaming
+type IncrementalBlock =
+  | { type: "code_start"; lang: string }
+  | { type: "code_chunk"; content: string }
+  | { type: "code_end" }
+  | { type: "heading"; level: number; content: string }
+  | { type: "paragraph_chunk"; content: string }
+  | { type: "list_item"; content: string; ordered: boolean }
+  | { type: "inline"; content: string };
 
 function parseBlocks(text: string): Block[] {
   const lines = text.split("\n");
@@ -151,11 +417,16 @@ function parseBlocks(text: string): Block[] {
       i + 1 < lines.length &&
       /^\|[-:\s|]+\|$/.test(lines[i + 1]!)
     ) {
-      const headerCells = line.split("|").slice(1, -1).map((c) => c.trim());
+      const headerCells = line
+        .split("|")
+        .slice(1, -1)
+        .map((c) => c.trim());
       i += 2; // skip header + separator
       const rows: string[][] = [];
       while (i < lines.length && lines[i]!.startsWith("|")) {
-        const cells = lines[i]!.split("|").slice(1, -1).map((c) => c.trim());
+        const cells = lines[i]!.split("|")
+          .slice(1, -1)
+          .map((c) => c.trim());
         rows.push(cells);
         i++;
       }
@@ -166,7 +437,10 @@ function parseBlocks(text: string): Block[] {
     // Blockquote
     if (line.startsWith("> ") || line === ">") {
       const quoteLines: string[] = [];
-      while (i < lines.length && (lines[i]!.startsWith("> ") || lines[i]! === ">")) {
+      while (
+        i < lines.length &&
+        (lines[i]!.startsWith("> ") || lines[i]! === ">")
+      ) {
         quoteLines.push(lines[i]!.replace(/^>\s?/, ""));
         i++;
       }
@@ -223,54 +497,68 @@ function parseBlocks(text: string): Block[] {
 
 // --- Block rendering ---
 
-function renderBlock(block: Block, key: number) {
+const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|codebase_investigator|cli_help|generalist|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
+const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|${TOOL_NAMES})(?::)?)`, "g");
+const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^(?:${TOOL_NAMES})(?::)?$`);
+
+function renderBlock(block: Block, key: number, isThinking?: boolean) {
   switch (block.type) {
-    case "code":
+    case "code": {
+      const trimmedContent = block.content.trim();
+      const isSingleLine = !trimmedContent.includes("\n");
+      const isSpecial = isSingleLine && SPECIAL_REGEX.test(trimmedContent);
+
       return (
-        <div key={key} className="my-6">
+        <div key={key} className={isThinking ? "my-2" : "my-6"}>
           {block.lang && (
-            <div className="text-[10px] font-mono text-pane-text-secondary/40 mb-2 uppercase tracking-[0.1em]">
+            <div className="flex items-center gap-2 text-[10px] font-mono text-pane-text-secondary/60 mb-2 uppercase tracking-[0.1em]">
+              <span className="w-2 h-2 rounded-full bg-pane-terminal/60"></span>
               {block.lang}
             </div>
           )}
-          <pre
-            className="font-mono text-pane-text/85 bg-pane-bg
-                        border border-pane-border/60 px-5 py-4
-                        overflow-x-auto leading-[1.75]"
-            style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
+          <div
+            className="font-mono overflow-x-auto leading-[1.75]"
+            style={{ 
+              fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)`
+            }}
           >
-            {block.content}
-          </pre>
+            <pre className="whitespace-pre-wrap break-words m-0">
+              <code className={isSpecial ? "text-pane-error" : undefined}>
+                {isSpecial ? block.content : renderHighlightedCode(block.content, block.lang)}
+              </code>
+            </pre>
+          </div>
         </div>
       );
+    }
 
     case "heading": {
       const styles: Record<number, { fontSize: string; className: string }> = {
         1: {
           fontSize: "calc(var(--pane-font-size) + 4px)",
-          className: "font-semibold mt-8 mb-4 tracking-[-0.02em]",
+          className: `font-semibold ${isThinking ? "mt-4 mb-2" : "mt-8 mb-4"} tracking-[-0.02em]`,
         },
         2: {
           fontSize: "calc(var(--pane-font-size) + 2px)",
-          className: "font-semibold mt-7 mb-3 tracking-[-0.02em]",
+          className: `font-semibold ${isThinking ? "mt-3 mb-1.5" : "mt-7 mb-3"} tracking-[-0.02em]`,
         },
         3: {
           fontSize: "calc(var(--pane-font-size) + 1px)",
-          className: "font-medium mt-6 mb-3 tracking-[-0.01em]",
+          className: `font-medium ${isThinking ? "mt-2 mb-1" : "mt-6 mb-3"} tracking-[-0.01em]`,
         },
         4: {
           fontSize: "var(--pane-font-size)",
-          className: "font-medium mt-5 mb-2 uppercase tracking-[0.05em]",
+          className: `font-medium ${isThinking ? "mt-1.5 mb-1" : "mt-5 mb-2"} uppercase tracking-[0.05em]`,
         },
       };
       const s = styles[block.level] ?? styles[3]!;
       return (
         <div
           key={key}
-          className={`text-pane-text ${s.className}`}
-          style={{ fontSize: s.fontSize }}
+          className={`${isThinking ? s.className : `text-pane-text ${s.className}`}`}
+          style={{ fontSize: isThinking ? "inherit" : s.fontSize }}
         >
-          {renderInline(block.content)}
+          {renderInline(block.content, isThinking)}
         </div>
       );
     }
@@ -279,7 +567,7 @@ function renderBlock(block: Block, key: number) {
       return (
         <hr
           key={key}
-          className="border-none border-t border-pane-border/30 my-8"
+          className={`border-none ${isThinking ? "my-4" : "my-8"}`}
         />
       );
 
@@ -287,23 +575,23 @@ function renderBlock(block: Block, key: number) {
       return (
         <div
           key={key}
-          className="my-4 pl-4 border-l-2 border-pane-text-secondary/20"
+          className={`${isThinking ? "my-2" : "my-4"} pl-4`}
         >
           <p
-            className="text-pane-text-secondary leading-[1.75] italic"
-            style={{ fontSize: "var(--pane-font-size)" }}
+            className={`text-pane-text-secondary leading-[1.75] ${isThinking ? "" : "italic"}`}
+            style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
           >
-            {renderInline(block.content)}
+            {renderInline(block.content, isThinking)}
           </p>
         </div>
       );
 
     case "table":
       return (
-        <div key={key} className="my-6 overflow-x-auto">
+        <div key={key} className={isThinking ? "my-2" : "my-6"} style={{ overflowX: "auto" }}>
           <table
             className="w-full font-mono border-collapse"
-            style={{ fontSize: "calc(var(--pane-font-size) - 1px)" }}
+            style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 1px)` }}
           >
             <thead>
               <tr>
@@ -311,9 +599,9 @@ function renderBlock(block: Block, key: number) {
                   <th
                     key={j}
                     className="text-left text-pane-text-secondary/70 font-medium
-                               px-3 py-1.5 border-b border-pane-border/40"
+                               px-3 py-1.5"
                   >
-                    {renderInline(h)}
+                    {renderInline(h, isThinking)}
                   </th>
                 ))}
               </tr>
@@ -324,10 +612,9 @@ function renderBlock(block: Block, key: number) {
                   {row.map((cell, ci) => (
                     <td
                       key={ci}
-                      className="text-pane-text/80 px-3 py-1.5
-                                 border-b border-pane-border/20"
+                      className="text-pane-text/80 px-3 py-1.5"
                     >
-                      {renderInline(cell)}
+                      {renderInline(cell, isThinking)}
                     </td>
                   ))}
                 </tr>
@@ -342,15 +629,15 @@ function renderBlock(block: Block, key: number) {
       return (
         <Tag
           key={key}
-          className={`my-4 space-y-2 ${block.ordered ? "list-decimal" : "list-disc"} list-inside`}
+          className={`${isThinking ? "my-2" : "my-4"} space-y-1 ${block.ordered ? "list-decimal" : "list-disc"} list-inside`}
         >
           {block.items.map((item, j) => (
             <li
               key={j}
-              className="text-pane-text leading-[1.7]"
-              style={{ fontSize: "var(--pane-font-size)" }}
+              className={`${isThinking ? "leading-[1.7]" : "text-pane-text leading-[1.7]"}`}
+              style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
             >
-              {renderInline(item)}
+              {renderInline(item, isThinking)}
             </li>
           ))}
         </Tag>
@@ -361,18 +648,188 @@ function renderBlock(block: Block, key: number) {
       return (
         <p
           key={key}
-          className="text-pane-text leading-[1.75] mb-5"
-          style={{ fontSize: "var(--pane-font-size)", maxWidth: "65ch" }}
+          className={`${isThinking ? "leading-[1.75] mb-2 break-words" : "text-pane-text leading-[1.75] mb-5 break-words"}`}
+          style={{ 
+            fontSize: isThinking ? "inherit" : "var(--pane-font-size)", 
+            maxWidth: "65ch" 
+          }}
         >
-          {renderInline(block.content)}
+          {renderInline(block.content, isThinking)}
         </p>
+      );
+  }
+}
+
+// --- Incremental parsing for streaming ---
+
+function parseIncremental(text: string): IncrementalBlock[] {
+  const lines = text.split("\n");
+  const blocks: IncrementalBlock[] = [];
+  let i = 0;
+  let inCodeBlock = false;
+  let currentCodeContent: string[] = [];
+
+  // Helper to flush code block if we're in one
+  const flushCodeBlock = () => {
+    if (inCodeBlock && currentCodeContent.length > 0) {
+      blocks.push({
+        type: "code_chunk",
+        content: currentCodeContent.join("\n"),
+      });
+      currentCodeContent = [];
+    }
+  };
+
+  while (i < lines.length) {
+    const line = lines[i]!;
+
+    // Code fence detection
+    const fenceMatch = line.match(/^```(\w*)/);
+    if (fenceMatch && !inCodeBlock) {
+      // Start of code block
+      flushCodeBlock();
+      inCodeBlock = true;
+      const currentCodeLang = fenceMatch[1] ?? "";
+      blocks.push({ type: "code_start", lang: currentCodeLang });
+      i++;
+      continue;
+    } else if (line.startsWith("```") && inCodeBlock) {
+      // End of code block
+      flushCodeBlock();
+      inCodeBlock = false;
+      blocks.push({ type: "code_end" });
+      i++;
+      continue;
+    }
+
+    if (inCodeBlock) {
+      // Inside code block - accumulate lines
+      currentCodeContent.push(line);
+      i++;
+      continue;
+    }
+
+    // Heading detection
+    const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
+    if (headingMatch) {
+      flushCodeBlock();
+      blocks.push({
+        type: "heading",
+        level: headingMatch[1]!.length,
+        content: headingMatch[2]!,
+      });
+      i++;
+      continue;
+    }
+
+    // List item detection
+    const listMatch = line.match(/^(\s*)([-*]|\d+\.)\s+(.+)/);
+    if (listMatch) {
+      flushCodeBlock();
+      const ordered = /^\d+\./.test(listMatch[2]!);
+      blocks.push({
+        type: "list_item",
+        content: listMatch[3]!,
+        ordered,
+      });
+      i++;
+      continue;
+    }
+
+    // Regular text - keep lines intact for stable rendering
+    flushCodeBlock();
+    if (line.trim() !== "") {
+      blocks.push({ type: "inline", content: line });
+    }
+    i++;
+  }
+
+  // Flush any remaining code content
+  flushCodeBlock();
+
+  return blocks;
+}
+
+// --- Incremental block rendering ---
+
+function renderIncrementalBlock(
+  block: IncrementalBlock,
+  key: number,
+  isThinking?: boolean,
+) {
+  switch (block.type) {
+    case "code_start": {
+      // For streaming, we need to collect code chunks and render them together
+      // This is handled by the group rendering logic above
+      return null;
+    }
+
+    case "code_chunk":
+      // Code chunks are handled by the group rendering logic
+      return null;
+
+    case "code_end":
+      return null;
+
+    case "heading": {
+      const styles: Record<number, { fontSize: string; className: string }> = {
+        1: {
+          fontSize: "calc(var(--pane-font-size) + 4px)",
+          className: `font-semibold ${isThinking ? "mt-4 mb-2" : "mt-8 mb-4"} tracking-[-0.02em]`,
+        },
+        2: {
+          fontSize: "calc(var(--pane-font-size) + 2px)",
+          className: `font-semibold ${isThinking ? "mt-3 mb-1.5" : "mt-7 mb-3"} tracking-[-0.02em]`,
+        },
+        3: {
+          fontSize: "calc(var(--pane-font-size) + 1px)",
+          className: `font-medium ${isThinking ? "mt-2 mb-1" : "mt-6 mb-3"} tracking-[-0.01em]`,
+        },
+        4: {
+          fontSize: "var(--pane-font-size)",
+          className: `font-medium ${isThinking ? "mt-1.5 mb-1" : "mt-5 mb-2"} uppercase tracking-[0.05em]`,
+        },
+      };
+      const s = styles[block.level] ?? styles[3]!;
+      return (
+        <div
+          key={key}
+          className={`${isThinking ? s.className : `text-pane-text ${s.className}`}`}
+          style={{ fontSize: isThinking ? "inherit" : s.fontSize }}
+        >
+          {renderInline(block.content, isThinking)}
+        </div>
+      );
+    }
+
+    case "list_item":
+      return (
+        <li
+          key={key}
+          className={`${isThinking ? "leading-[1.7] my-1" : "text-pane-text leading-[1.7] my-1"}`}
+          style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
+        >
+          {renderInline(block.content, isThinking)}
+        </li>
+      );
+
+    case "paragraph_chunk":
+    case "inline":
+      return (
+        <span
+          key={key}
+          className={`${isThinking ? "leading-[1.75] whitespace-pre-wrap break-words" : "text-pane-text leading-[1.75] whitespace-pre-wrap break-words"}`}
+          style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
+        >
+          {renderInline(block.content, isThinking)}
+        </span>
       );
   }
 }
 
 // --- Inline parsing ---
 
-function renderInline(text: string): (string | React.JSX.Element)[] {
+function renderInline(text: string, isThinking?: boolean): (string | React.JSX.Element)[] {
   const cleaned = stripEmojis(text);
   const parts: (string | React.JSX.Element)[] = [];
   // Match: [link](url), `code`, **bold**, *italic*
@@ -380,10 +837,43 @@ function renderInline(text: string): (string | React.JSX.Element)[] {
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
+  const renderTextWithPaths = (txt: string, startIndex: number) => {
+    let txtIdx = 0;
+    let pMatch: RegExpExecArray | null;
+    const result: (string | React.JSX.Element)[] = [];
+
+    // Reset regex state since it's global
+    PATH_REGEX.lastIndex = 0;
+
+    while ((pMatch = PATH_REGEX.exec(txt)) !== null) {
+      const matchFull = pMatch[0];
+      const matchPath = pMatch[1]!;
+      const matchStart = pMatch.index + (matchFull.indexOf(matchPath));
+
+      if (matchStart > txtIdx) {
+        result.push(txt.slice(txtIdx, matchStart));
+      }
+      result.push(
+        <code
+          key={`path-${startIndex}-${matchStart}`}
+          className="font-mono text-pane-error"
+          style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
+        >
+          {matchPath}
+        </code>
+      );
+      txtIdx = matchStart + matchPath.length;
+    }
+    if (txtIdx < txt.length) {
+      result.push(txt.slice(txtIdx));
+    }
+    return result;
+  };
+
   while ((match = regex.exec(cleaned)) !== null) {
-    // Push preceding text
+    // Push preceding text with path detection
     if (match.index > lastIndex) {
-      parts.push(cleaned.slice(lastIndex, match.index));
+      parts.push(...renderTextWithPaths(cleaned.slice(lastIndex, match.index), lastIndex));
     }
 
     const token = match[0];
@@ -407,25 +897,45 @@ function renderInline(text: string): (string | React.JSX.Element)[] {
         );
       }
     } else if (token.startsWith("`")) {
+      const codeContent = token.slice(1, -1);
+      const trimmed = codeContent.trim();
+      const isSpecial = SPECIAL_REGEX.test(trimmed);
+
+      if (isSpecial) {
+        parts.push(
+          <code
+            key={key}
+            className="font-mono text-pane-error"
+            style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
+          >
+            {codeContent}
+          </code>,
+        );
+      } else {
+        parts.push(
+          <code
+            key={key}
+            className={`font-mono px-1.5 py-0.5 ${isThinking ? "" : "text-pane-text/80"} rounded-sm`}
+            style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
+          >
+            {codeContent}
+          </code>,
+        );
+      }
+    }
+ else if (token.startsWith("**")) {
       parts.push(
-        <code
-          key={key}
-          className="font-mono bg-pane-bg border border-pane-border/60
-                     px-1.5 py-0.5 text-pane-text/80"
-          style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
-        >
-          {token.slice(1, -1)}
-        </code>,
-      );
-    } else if (token.startsWith("**")) {
-      parts.push(
-        <strong key={key} className="font-semibold text-pane-text">
+        <strong key={key} className={`font-semibold ${isThinking ? "" : "text-pane-text"}`}>
           {token.slice(2, -2)}
         </strong>,
       );
     } else if (token.startsWith("*")) {
       parts.push(
-        <em key={key} className="italic text-pane-text/80">
+        <em 
+          key={key} 
+          className={`${isThinking ? "" : "italic"} ${isThinking ? "" : "text-pane-text/80"}`}
+          style={{ fontStyle: isThinking ? "normal" : "italic" }}
+        >
           {token.slice(1, -1)}
         </em>,
       );
@@ -434,9 +944,9 @@ function renderInline(text: string): (string | React.JSX.Element)[] {
     lastIndex = match.index + token.length;
   }
 
-  // Remaining text
+  // Remaining text with path detection
   if (lastIndex < cleaned.length) {
-    parts.push(cleaned.slice(lastIndex));
+    parts.push(...renderTextWithPaths(cleaned.slice(lastIndex), lastIndex));
   }
 
   return parts;

@@ -5,33 +5,143 @@ import { useWorkspaceStore } from "../../stores/workspace";
 import { writeFile } from "../../lib/tauri-commands";
 import { markFileWritten } from "../../hooks/useFileWatcher";
 
-// Import ace modes and themes
+// Import ace modes
 import "ace-builds/src-noconflict/mode-javascript";
 import "ace-builds/src-noconflict/mode-typescript";
 import "ace-builds/src-noconflict/mode-json";
 import "ace-builds/src-noconflict/mode-html";
 import "ace-builds/src-noconflict/mode-css";
+import "ace-builds/src-noconflict/mode-scss";
+import "ace-builds/src-noconflict/mode-less";
 import "ace-builds/src-noconflict/mode-markdown";
 import "ace-builds/src-noconflict/mode-python";
 import "ace-builds/src-noconflict/mode-rust";
 import "ace-builds/src-noconflict/mode-jsx";
 import "ace-builds/src-noconflict/mode-tsx";
-// Pane theme is in globals.css - no need to import Ace themes
+import "ace-builds/src-noconflict/mode-golang";
+import "ace-builds/src-noconflict/mode-ruby";
+import "ace-builds/src-noconflict/mode-sh";
+import "ace-builds/src-noconflict/mode-yaml";
+import "ace-builds/src-noconflict/mode-toml";
+import "ace-builds/src-noconflict/mode-sql";
+import "ace-builds/src-noconflict/mode-c_cpp";
+import "ace-builds/src-noconflict/mode-java";
+import "ace-builds/src-noconflict/mode-swift";
+import "ace-builds/src-noconflict/mode-kotlin";
+import "ace-builds/src-noconflict/mode-php";
+import "ace-builds/src-noconflict/mode-lua";
+import "ace-builds/src-noconflict/mode-xml";
+import "ace-builds/src-noconflict/mode-svg";
+import "ace-builds/src-noconflict/mode-dockerfile";
+import "ace-builds/src-noconflict/mode-makefile";
+import "ace-builds/src-noconflict/mode-graphqlschema";
+import "ace-builds/src-noconflict/mode-elixir";
+import "ace-builds/src-noconflict/mode-haskell";
+import "ace-builds/src-noconflict/mode-ocaml";
+import "ace-builds/src-noconflict/mode-scala";
+import "ace-builds/src-noconflict/mode-dart";
+import "ace-builds/src-noconflict/mode-zig";
+import "ace-builds/src-noconflict/mode-diff";
+import "ace-builds/src-noconflict/mode-ini";
+import "ace-builds/src-noconflict/mode-text";
+import "ace-builds/src-noconflict/ext-language_tools";
+// Import the custom Pane theme
+import "../../lib/pane-ace-theme";
 
 // Map file extensions to Ace modes
 function getModeForFile(filePath: string): string {
   const ext = filePath.split('.').pop()?.toLowerCase();
+  const name = filePath.split('/').pop()?.toLowerCase() ?? '';
+
+  // Match by filename first (dotfiles, Makefile, Dockerfile, etc.)
+  const nameMap: Record<string, string> = {
+    'makefile': 'makefile',
+    'gnumakefile': 'makefile',
+    'dockerfile': 'dockerfile',
+    'gemfile': 'ruby',
+    'rakefile': 'ruby',
+    '.bashrc': 'sh',
+    '.zshrc': 'sh',
+    '.bash_profile': 'sh',
+    '.profile': 'sh',
+    '.gitignore': 'text',
+    '.env': 'ini',
+    '.editorconfig': 'ini',
+  };
+  if (nameMap[name]) return nameMap[name];
+
   const modeMap: Record<string, string> = {
+    // JavaScript / TypeScript
     'js': 'javascript',
+    'mjs': 'javascript',
+    'cjs': 'javascript',
     'jsx': 'jsx',
     'ts': 'typescript',
+    'mts': 'typescript',
+    'cts': 'typescript',
     'tsx': 'tsx',
-    'json': 'json',
+    // Web
     'html': 'html',
+    'htm': 'html',
     'css': 'css',
+    'scss': 'scss',
+    'less': 'less',
+    'svg': 'svg',
+    'xml': 'xml',
+    // Data / config
+    'json': 'json',
+    'jsonc': 'json',
+    'yaml': 'yaml',
+    'yml': 'yaml',
+    'toml': 'toml',
+    'ini': 'ini',
+    'cfg': 'ini',
+    'conf': 'ini',
+    // Markdown
     'md': 'markdown',
-    'py': 'python',
+    'mdx': 'markdown',
+    // Shell
+    'sh': 'sh',
+    'bash': 'sh',
+    'zsh': 'sh',
+    'fish': 'sh',
+    // Systems
     'rs': 'rust',
+    'go': 'golang',
+    'c': 'c_cpp',
+    'h': 'c_cpp',
+    'cpp': 'c_cpp',
+    'cc': 'c_cpp',
+    'cxx': 'c_cpp',
+    'hpp': 'c_cpp',
+    'zig': 'zig',
+    // JVM
+    'java': 'java',
+    'kt': 'kotlin',
+    'kts': 'kotlin',
+    'scala': 'scala',
+    // Apple
+    'swift': 'swift',
+    // Scripting
+    'py': 'python',
+    'rb': 'ruby',
+    'php': 'php',
+    'lua': 'lua',
+    'ex': 'elixir',
+    'exs': 'elixir',
+    'erl': 'elixir',
+    'dart': 'dart',
+    // Functional
+    'hs': 'haskell',
+    'ml': 'ocaml',
+    'mli': 'ocaml',
+    // Query / schema
+    'sql': 'sql',
+    'graphql': 'graphqlschema',
+    'gql': 'graphqlschema',
+    // Other
+    'diff': 'diff',
+    'patch': 'diff',
   };
   return modeMap[ext || ''] || 'text';
 }
@@ -46,16 +156,25 @@ export function FileViewer() {
     if (!s.activeProjectId) return null;
     return s.projects.get(s.activeProjectId)?.activeFileContent ?? null;
   });
+  const scrollPositions = useProjectsStore((s) => {
+    if (!s.activeProjectId) return null;
+    return s.projects.get(s.activeProjectId)?.scrollPositions ?? null;
+  });
   const mode = useProjectsStore((s) => {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
+  });
+  const isProcessing = useProjectsStore((s) => {
+    if (!s.activeProjectId) return false;
+    return s.projects.get(s.activeProjectId)?.conversation.isProcessing ?? false;
   });
   const editorFontSize = useWorkspaceStore((s) => s.editorFontSize);
 
   const editorRef = useRef<AceEditor>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const scrollPositions = useRef<Map<string, { scrollTop: number; cursor: { row: number; column: number } }>>(new Map());
   const prevFilePathRef = useRef<string | null>(null);
+  const followRef = useRef(true);
+  const rafRef = useRef(0);
 
   const handleChange = useCallback(
     (content: string) => {
@@ -71,6 +190,20 @@ export function FileViewer() {
           console.error("Auto-save failed:", err);
         }
       }, 800);
+      
+      // Scroll to bottom to show the last edit position
+      if (editorRef.current) {
+        const editor = editorRef.current.editor;
+        const session = editor.session;
+        const lineCount = session.getLength();
+        const lineHeight = editor.renderer.lineHeight;
+        const scrollerHeight = editor.renderer.scroller.clientHeight;
+        
+        // Calculate scroll position to show the bottom of the file
+        // Keep the last few lines visible
+        const targetScrollTop = (lineCount * lineHeight) - (scrollerHeight * 0.7);
+        editor.session.setScrollTop(Math.max(0, targetScrollTop));
+      }
     },
     [activeFilePath, activeProjectId],
   );
@@ -80,24 +213,47 @@ export function FileViewer() {
     if (editorRef.current && activeFileContent !== null) {
       const editor = editorRef.current.editor;
       const currentValue = editor.getValue();
-      if (currentValue !== activeFileContent) {
+      
+      // Only update if content is actually different to avoid jumps during typing.
+      // We also check if we're switching files.
+      const isNewFile = prevFilePathRef.current !== activeFilePath;
+      
+      if (isNewFile || currentValue !== activeFileContent) {
+        const pos = editor.getCursorPosition();
+        const scrollTop = editor.session.getScrollTop();
+
         // Save position for the file we're leaving
-        if (prevFilePathRef.current && prevFilePathRef.current !== activeFilePath) {
-          scrollPositions.current.set(prevFilePathRef.current, {
-            scrollTop: editor.session.getScrollTop(),
-            cursor: editor.getCursorPosition(),
+        if (isNewFile && prevFilePathRef.current && activeProjectId) {
+          useProjectsStore.getState().setScrollPosition(activeProjectId, prevFilePathRef.current, {
+            scrollTop,
+            cursor: pos,
           });
         }
 
-        editor.setValue(activeFileContent, -1);
+        // Only setValue if it's a new file or the content is fundamentally different.
+        // For same-file updates (external or auto-save sync), we only update if 
+        // the content doesn't match to avoid interrupting the user.
+        if (isNewFile || currentValue !== activeFileContent) {
+          editor.setValue(activeFileContent, -1);
 
-        // Restore position if we've visited this file before
-        const saved = activeFilePath ? scrollPositions.current.get(activeFilePath) : null;
-        if (saved) {
-          requestAnimationFrame(() => {
-            editor.session.setScrollTop(saved.scrollTop);
-            editor.moveCursorToPosition(saved.cursor);
-          });
+          // Restore position
+          if (!isNewFile) {
+            // Same file (external update) — restore immediate position
+            // But only if we're not processing (agent editing) to allow auto-scrolling
+            if (!isProcessing) {
+              editor.session.setScrollTop(scrollTop);
+              editor.moveCursorToPosition(pos);
+            }
+          } else {
+            // New file — restore its last known position
+            const saved = activeFilePath && scrollPositions ? scrollPositions.get(activeFilePath) : null;
+            if (saved) {
+              requestAnimationFrame(() => {
+                editor.session.setScrollTop(saved.scrollTop);
+                editor.moveCursorToPosition(saved.cursor);
+              });
+            }
+          }
         }
       }
       prevFilePathRef.current = activeFilePath;
@@ -105,7 +261,7 @@ export function FileViewer() {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
     }
-  }, [activeFilePath, activeFileContent]);
+  }, [activeFilePath, activeFileContent, activeProjectId, scrollPositions, isProcessing]);
 
   useEffect(() => {
     return () => {
@@ -115,10 +271,81 @@ export function FileViewer() {
     };
   }, []);
 
+  // Auto-scroll to follow agent edits during processing
+  useEffect(() => {
+    if (!isProcessing || !editorRef.current) return;
+    
+    const editor = editorRef.current.editor;
+    const tick = () => {
+      if (followRef.current && editorRef.current) {
+        // Get current cursor position
+        const cursor = editor.getCursorPosition();
+        // Get the line count and scroll to keep the cursor visible
+        const lineHeight = editor.renderer.lineHeight;
+        const scrollTop = editor.session.getScrollTop();
+        const scrollerHeight = editor.renderer.scroller.clientHeight;
+        
+        // Calculate target scroll position to keep cursor in view
+        const cursorY = cursor.row * lineHeight;
+        const targetScrollTop = cursorY - scrollerHeight * 0.3; // Keep cursor at ~30% from top
+        
+        // Smooth scroll if needed
+        if (Math.abs(targetScrollTop - scrollTop) > lineHeight) {
+          editor.session.setScrollTop(targetScrollTop);
+        }
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [isProcessing]);
+
+  // Wheel listener: disengage follow on upward scroll
+  useEffect(() => {
+    if (!editorRef.current) return;
+    const editor = editorRef.current.editor;
+    const container = editor.renderer.scroller;
+    
+    const handleWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) followRef.current = false;
+    };
+    
+    container.addEventListener("wheel", handleWheel, { passive: true });
+    return () => container.removeEventListener("wheel", handleWheel);
+  }, []);
+
+  // Scroll listener: re-engage follow when user scrolls back to cursor position
+  useEffect(() => {
+    if (!editorRef.current) return;
+    const editor = editorRef.current.editor;
+    const container = editor.renderer.scroller;
+    
+    const handleScroll = () => {
+      if (!followRef.current && editorRef.current) {
+        const cursor = editor.getCursorPosition();
+        const lineHeight = editor.renderer.lineHeight;
+        const scrollTop = editor.session.getScrollTop();
+        const cursorY = cursor.row * lineHeight;
+        const distanceFromCursor = Math.abs(cursorY - scrollTop);
+        
+        // Re-engage follow if user scrolls near the cursor position
+        if (distanceFromCursor < lineHeight * 3) {
+          followRef.current = true;
+        }
+      }
+    };
+    
+    container.addEventListener("scroll", handleScroll, { passive: true });
+    return () => container.removeEventListener("scroll", handleScroll);
+  }, []);
+
   // Auto-focus editor when switching to viewer mode
   useEffect(() => {
     if (mode === "viewer" && editorRef.current) {
-      editorRef.current.editor.focus();
+      const editor = editorRef.current.editor;
+      editor.focus();
+      editor.renderer.updateCursor();
     }
   }, [mode]);
 
@@ -129,6 +356,22 @@ export function FileViewer() {
     };
     window.addEventListener("pane:focus-editor", handler);
     return () => window.removeEventListener("pane:focus-editor", handler);
+  }, []);
+
+  // Listen for scroll-to-line event (from FuzzyFinder code search)
+  useEffect(() => {
+    const handler = (e: CustomEvent) => {
+      const { line } = e.detail;
+      if (line && editorRef.current) {
+        const editor = editorRef.current.editor;
+        // Scroll to the line (0-indexed, so subtract 1)
+        const row = Math.max(0, line - 1);
+        editor.scrollToRow(row);
+        editor.gotoLine(row, 0, true);
+      }
+    };
+    window.addEventListener("pane:scroll-to-line", handler as EventListener);
+    return () => window.removeEventListener("pane:scroll-to-line", handler as EventListener);
   }, []);
 
   // Set top scroll margin to ~45% of editor height so the first line sits
@@ -163,10 +406,11 @@ export function FileViewer() {
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="flex-1 min-h-0 w-full max-w-[780px] mx-auto">
+      <div className="flex-1 min-h-0 w-full relative z-20" data-no-drag>
       <AceEditor
         ref={editorRef}
         mode={getModeForFile(activeFilePath)}
+        theme="pane"
         defaultValue={activeFileContent}
         onChange={handleChange}
         name="pane-editor"
@@ -174,19 +418,20 @@ export function FileViewer() {
         height="100%"
         fontSize={editorFontSize}
         showPrintMargin={false}
-        showGutter={false}
+        showGutter={true}
         highlightActiveLine={false}
         enableBasicAutocompletion={true}
         enableLiveAutocompletion={false}
         enableSnippets={false}
         setOptions={{
-          showLineNumbers: false,
+          showLineNumbers: true,
           tabSize: 2,
           useWorker: false,
           wrap: true,
           indentedSoftWrap: false,
           scrollPastEnd: 0.8 as unknown as boolean,
           highlightSelectedWord: false,
+          cursorStyle: "ace",
         }}
         editorProps={{ $blockScrolling: true }}
       />

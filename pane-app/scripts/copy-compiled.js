@@ -1,35 +1,35 @@
 #!/usr/bin/env node
-import { copyFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { copyFileSync, mkdirSync, readdirSync } from "fs";
+import { basename, dirname } from "path";
+import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = dirname(__dirname);
 
-// Ensure output directories exist
 mkdirSync(`${projectRoot}/out/main`, { recursive: true });
 mkdirSync(`${projectRoot}/out/preload`, { recursive: true });
 
-// Copy compiled main and preload scripts
-console.log('Copying pre-compiled main and preload scripts...');
+console.log("Copying pre-compiled main and preload scripts...");
+
+// main.mjs → index.js (entry point rename)
 copyFileSync(
   `${projectRoot}/src/main/main.mjs`,
-  `${projectRoot}/out/main/index.js`
+  `${projectRoot}/out/main/index.js`,
 );
+
+// preload
 copyFileSync(
   `${projectRoot}/src/preload/preload.mjs`,
-  `${projectRoot}/out/preload/preload.mjs`
+  `${projectRoot}/out/preload/preload.mjs`,
 );
-copyFileSync(
-  `${projectRoot}/src/main/claude-worker.mjs`,
-  `${projectRoot}/out/main/claude-worker.mjs`
-);
-copyFileSync(
-  `${projectRoot}/src/main/pty-worker.mjs`,
-  `${projectRoot}/out/main/pty-worker.mjs`
-);
-copyFileSync(
-  `${projectRoot}/src/main/brain-engine.mjs`,
-  `${projectRoot}/out/main/brain-engine.mjs`
-);
-console.log('✓ Compiled scripts copied successfully');
+
+// all .mjs files in src/main/ (except main.mjs which is handled above as index.js)
+for (const file of readdirSync(`${projectRoot}/src/main/`)) {
+  if (!file.endsWith(".mjs") || file === "main.mjs") continue;
+  copyFileSync(
+    `${projectRoot}/src/main/${file}`,
+    `${projectRoot}/out/main/${file}`,
+  );
+}
+
+console.log("✓ Compiled scripts copied successfully");

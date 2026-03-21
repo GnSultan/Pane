@@ -2,7 +2,9 @@ import { useState, useCallback } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { detectProjectRoot } from "../../lib/tauri-commands";
 
-const electronAPI = (window as any).electronAPI;
+import type { ElectronAPI } from '../../lib/electron';
+
+const electronAPI = window.electronAPI as ElectronAPI;
 
 // Each row subscribes to its own primitive data — no inline objects in selectors
 function ProjectRow({
@@ -131,7 +133,7 @@ export function ProjectList() {
 
       <button
         onClick={handleAddProject}
-        className="w-full flex items-center h-8 px-2 btn-press text-pane-text-secondary hover:bg-pane-text/[0.08] hover:text-pane-text active:bg-pane-text/[0.12]"
+        className="w-full flex items-center h-8 px-2 rounded-xl btn-press text-pane-text-secondary hover:bg-pane-text/[0.08] hover:text-pane-text active:bg-pane-text/[0.12]"
         style={{ fontSize: "var(--pane-panel-font-size)" }}
       >
         + new thread

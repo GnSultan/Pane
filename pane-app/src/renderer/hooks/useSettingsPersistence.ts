@@ -5,30 +5,34 @@ import {
   getCwd,
   detectProjectRoot,
   readFile,
-  writeFile,
   getHomeDir,
   listCheckpoints,
-  writeEditorState,
-  writeProjectState,
   brainGetProfile,
   brainGetAvatar,
+  saveConversationToMain,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/claude-types";
-import { useWorkspaceStore } from "../stores/workspace";
+import { useWorkspaceStore, type Theme } from "../stores/workspace";
 import { useProjectsStore } from "../stores/projects";
-
-// Module-level flag: only save settings after they've been successfully loaded.
-// This prevents cleanup saves from overwriting the file with default store values
-// during app reload or HMR.
-let settingsLoaded = false;
-let paneDir = "";
+import type { ActionId, KeyBinding } from "../lib/keybindings";
+import {
+  DEFAULT_BACKEND_ROUTING,
+  type IntentRouting,
+  type BackendRouting,
+  PROVIDER_MODELS,
+} from "../lib/models";
 
 // App readiness gate — other hooks (git, watcher) wait for this before starting
 let resolveAppReady: () => void;
 export const appReadyPromise = new Promise<void>((resolve) => {
   resolveAppReady = resolve;
 });
+
+// Use a ref for settingsLoaded to avoid HMR resets if possible,
+// but for now let's just make sure it's reliable.
+let settingsLoadedGlobal = false;
+let paneDir = "";
 
 // --- Conversation persistence helpers ---
 
@@ -38,10 +42,6 @@ interface PersistedConversation {
   messages: ConversationMessage[];
 }
 
-// Mirror of createProject's ID logic — lets us pre-compute the ID from a root
-// path before calling addProject, so we can load conversation state first.
-// NOTE: if two projects collide on the base name, ensureUniqueId appends "-2",
-// which we can't predict here. Accepted edge case — rare in practice.
 function precomputeProjectId(root: string): string {
   const name = root.split("/").filter(Boolean).pop() || root;
   return name.toLowerCase().replace(/[^a-z0-9]/g, "-");
@@ -51,112 +51,301 @@ function conversationPath(projectId: string): string {
   return `${paneDir}/conversations/${projectId}.json`;
 }
 
-async function saveConversation(projectId: string, conversation: PersistedConversation): Promise<void> {
+async function saveConversation(
+  projectId: string,
+  conversation: PersistedConversation,
+): Promise<void> {
   if (!paneDir) return;
-  const data: PersistedConversation = {
-    sessionId: conversation.sessionId,
-    model: conversation.model,
-    messages: conversation.messages,
-  };
-  await writeFile(conversationPath(projectId), JSON.stringify(data));
+  // All JSON.stringify / compaction happens in the main process (Node.js),
+  // so the renderer main thread is never blocked.
+  await saveConversationToMain(conversationPath(projectId), conversation);
 }
 
-async function loadConversation(projectId: string): Promise<PersistedConversation | null> {
+async function loadConversation(
+  projectId: string,
+): Promise<PersistedConversation | null> {
   if (!paneDir) return null;
   try {
     const content = await readFile(conversationPath(projectId));
-    return JSON.parse(content) as PersistedConversation;
-  } catch {
+    
+    // Check file size before parsing
+    const fileSize = content.length;
+    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+    
+    if (fileSize > MAX_FILE_SIZE) {
+      console.warn(`[persistence] Conversation file is ${fileSize} bytes, exceeding 5MB limit`);
+      console.log(`[persistence] Attempting to compact before loading...`);
+      
+      // Try to parse and compact the conversation
+      try {
+        const parsed = JSON.parse(content.trim()) as PersistedConversation;
+        
+        if (parsed.messages && parsed.messages.length > 100) {
+          console.log(`[persistence] Compacting ${parsed.messages.length} messages to 100 most recent`);
+          parsed.messages = parsed.messages.slice(-100);
+          
+          // Save the compacted version
+          await saveConversation(projectId, parsed);
+          console.log(`[persistence] Compacted conversation saved`);
+          
+          return parsed;
+        }
+      } catch (parseErr) {
+        console.error(`[persistence] Failed to parse large conversation file:`, parseErr);
+        
+        // If we can't even parse it, try a more aggressive approach
+        console.log(`[persistence] Attempting emergency recovery by extracting messages...`);
+        
+        // Simple message extraction - find message objects in the file
+        const messageMatches = content.match(/\{"id":\s*"[^"]*"[^}]*"type":\s*"[^"]*"[^}]*"content":[^}]*\}/g);
+        if (messageMatches && messageMatches.length > 0) {
+          console.log(`[persistence] Found ${messageMatches.length} message objects`);
+          
+          // Try to parse and keep only the last 50
+          const messages: ConversationMessage[] = [];
+          const startIdx = Math.max(0, messageMatches.length - 50);
+          
+          for (let i = startIdx; i < messageMatches.length; i++) {
+            const match = messageMatches[i];
+            if (!match) continue; // Safety check
+            
+            try {
+              const msg = JSON.parse(match) as ConversationMessage;
+              messages.push(msg);
+            } catch {
+              // Skip invalid messages
+            }
+          }
+          
+          if (messages.length > 0) {
+            console.log(`[persistence] Recovered ${messages.length} messages`);
+            
+            // Try to extract model from the original content if possible
+            let model: string | null = null;
+            try {
+              const fullParse = JSON.parse(content.trim()) as { model?: string };
+              model = fullParse?.model || null;
+            } catch {
+              // Can't parse full content, model will be null
+            }
+            
+            const recovered: PersistedConversation = {
+              sessionId: null,
+              model: model,
+              messages: messages
+            };
+            
+            // Save the recovered version
+            await saveConversation(projectId, recovered);
+            console.log(`[persistence] Recovered conversation saved`);
+            
+            return recovered;
+          }
+        }
+        
+        return null;
+      }
+    }
+    
+    // File is within limits, parse normally
+    return JSON.parse(content.trim()) as PersistedConversation;
+  } catch (err) {
+    console.error(`[persistence] Failed to load conversation for ${projectId}:`, err);
     return null;
   }
 }
 
 export function useSettingsPersistence() {
   const loadedRef = useRef(false);
+  const savingDisabled = useRef(true);
 
   // Load on mount
   useEffect(() => {
+    savingDisabled.current = true;
     loadSettings()
       .then(async (settings) => {
-        if (!settings.control_panel_visible) {
-          useWorkspaceStore.getState().toggleControlPanel();
+        const ws = useWorkspaceStore.getState();
+
+        // 1. Core UI settings
+        if (
+          settings.control_panel_visible !== undefined &&
+          !settings.control_panel_visible
+        ) {
+          ws.toggleControlPanel();
         }
-        if (settings.font_size) {
-          useWorkspaceStore.getState().setFontSize(settings.font_size);
+        if (settings.font_size) ws.setFontSize(settings.font_size);
+        if (settings.panel_font_size)
+          ws.setPanelFontSize(settings.panel_font_size);
+        if (settings.editor_font_size)
+          ws.setEditorFontSize(settings.editor_font_size);
+        if (settings.font_weight) ws.setFontWeight(settings.font_weight);
+        if (settings.keybindings)
+          ws.setKeybindingsRaw(settings.keybindings as Partial<Record<ActionId, KeyBinding>>);
+        if (settings.theme) ws.setTheme(settings.theme as Theme);
+        if (settings.panel_width) ws.setControlPanelWidth(settings.panel_width);
+        if (settings.completion_sound)
+          ws.setCompletionSound(settings.completion_sound);
+
+        // 2. Provider & Model state
+        const backend =
+          (settings.punk_backend === "cli"
+            ? "gemini-cli"
+            : settings.punk_backend) || "http";
+        ws.setPunkBackend(backend);
+
+        if (settings.http_provider) ws.setHttpProvider(settings.http_provider);
+
+        // API keys & Base URLs
+        const apiKeys: Record<string, string> = settings.http_api_keys || {};
+        // Only use the legacy single key if the map doesn't already have one for that provider
+        const provider = settings.http_provider || "deepseek";
+        if (settings.http_api_key && !apiKeys[provider]) {
+          apiKeys[provider] = settings.http_api_key;
         }
-        if (settings.panel_font_size) {
-          useWorkspaceStore.getState().setPanelFontSize(settings.panel_font_size);
-        }
-        if (settings.editor_font_size) {
-          useWorkspaceStore.getState().setEditorFontSize(settings.editor_font_size);
-        }
-        if (settings.font_weight) {
-          useWorkspaceStore.getState().setFontWeight(settings.font_weight);
-        }
-        if (settings.keybindings) {
-          useWorkspaceStore.getState().setKeybindingsRaw(settings.keybindings as any);
-        }
-        if (settings.theme === "light" || settings.theme === "dark" || settings.theme === "pure" || settings.theme === "system") {
-          useWorkspaceStore.getState().setTheme(settings.theme);
-        }
-        if (settings.panel_width) {
-          useWorkspaceStore.getState().setControlPanelWidth(settings.panel_width);
-        }
-        if (settings.completion_sound) {
-          useWorkspaceStore.getState().setCompletionSound(settings.completion_sound);
-        }
+        ws.setHttpApiKeys(apiKeys);
+        ws.setHttpBaseUrls(settings.http_base_urls || {});
+
+        // Model restoration
         if (settings.selected_model) {
-          useWorkspaceStore.getState().setSelectedModel(settings.selected_model);
+          let model = settings.selected_model;
+          if (model === "gemini-2.5-pro" || model === "gemini-1.5-pro-latest")
+            model = "gemini-3.1-pro-preview";
+          if (
+            model === "gemini-2.5-flash" ||
+            model === "gemini-1.5-flash-latest"
+          )
+            model = "gemini-3-flash-preview";
+
+          // Determine correct provider for the model
+          let provider =
+            settings.selected_model_provider || ws.selectedModelProvider;
+
+          // Validate that provider matches model
+          // Check if model belongs to a different provider than what's saved
+          for (const [prov, models] of Object.entries(PROVIDER_MODELS)) {
+            if (models.some((m: { value: string; label: string }) => m.value === model)) {
+              // Found the correct provider for this model
+              if (provider !== prov) {
+                console.warn(
+                  `[settings] Correcting provider mismatch: model "${model}" belongs to provider "${prov}" but settings has "${provider}"`,
+                );
+                provider = prov;
+              }
+              break;
+            }
+          }
+
+          ws.setSelectedModel(model, false, provider);
         }
 
+        // 3. Routing Migration & Validation
+        const rawRouting = settings.intent_routing as unknown as BackendRouting | IntentRouting | null;
+        const healedRouting: BackendRouting = JSON.parse(
+          JSON.stringify(DEFAULT_BACKEND_ROUTING),
+        );
+
+        if (rawRouting) {
+          const isLegacyFlat =
+            'plan' in rawRouting &&
+            'execute' in rawRouting &&
+            !('http' in rawRouting) &&
+            !('gemini-cli' in rawRouting);
+
+          if (isLegacyFlat) {
+            // Assign legacy settings to the active backend
+            // rawRouting is IntentRouting here, not BackendRouting
+            healedRouting[backend] = { 
+              plan: (rawRouting as IntentRouting).plan,
+              execute: (rawRouting as IntentRouting).execute,
+              explain: (rawRouting as IntentRouting).explain,
+              other: (rawRouting as IntentRouting).other,
+            };
+          } else {
+            // Merge existing backend maps into our canonical defaults
+            const backendRouting = rawRouting as BackendRouting;
+            for (const key of Object.keys(backendRouting)) {
+              const normalizedKey = key === "cli" ? "gemini-cli" : key;
+              if (healedRouting[normalizedKey]) {
+                healedRouting[normalizedKey] = {
+                  ...healedRouting[normalizedKey],
+                  ...backendRouting[key],
+                };
+              }
+            }
+          }
+
+          // Strict Validation: Ensure gemini-cli only uses auto- models
+          ["plan", "execute", "explain", "other"].forEach((intent) => {
+            const r =
+              healedRouting["gemini-cli"]?.[intent as keyof IntentRouting];
+
+            if (r && r.provider === "gemini" && !r.model.startsWith("auto-")) {
+              if (r.model.includes("pro")) r.model = "auto-gemini-3";
+              else r.model = "auto-gemini-3";
+            }
+          });
+        }
+        useWorkspaceStore.setState({ intentRouting: healedRouting });
+
+        if (settings.intent_auto_route !== undefined) {
+          ws.setIntentAutoRoute(settings.intent_auto_route);
+        }
+
+        // 4. Project & Conversation restoration
         const { addProject, setActiveProject, toggleDir } =
           useProjectsStore.getState();
 
-        if (settings.project_roots.length > 0) {
-          // Phase 1: Pre-load all conversation files in parallel BEFORE adding projects.
-          // This is critical — addProject triggers Zustand updates → React renders →
-          // useClaudeWarmup fires. If conversations aren't loaded by then, warmup sees
-          // sessionId=null and starts a fresh Claude session, destroying continuity.
+        if (settings.project_roots?.length > 0) {
           paneDir = `${await getHomeDir()}/.pane`;
           const preloaded = await Promise.all(
-            settings.project_roots.map(async (root) => {
+            settings.project_roots.map(async (root: string) => {
               const tentativeId = precomputeProjectId(root);
-              const saved = await loadConversation(tentativeId).catch(() => null);
+              const saved = await loadConversation(tentativeId).catch(
+                () => null,
+              );
+              console.log(`[persistence] preloaded project ${tentativeId} from ${root}, hasSaved=${!!saved}, msgCount=${saved?.messages.length || 0}`);
               return { root, saved };
             }),
           );
 
-          // Phase 2: Add projects + immediately restore conversation state synchronously.
-          // React 18 batches all these Zustand updates into a single render, so warmup
-          // will see the restored sessionId/isReady on its first check.
           let activeId: string | null = null;
           const projectIds: string[] = [];
           for (const { root, saved } of preloaded) {
-            const id = addProject(root);
+            const tentativeId = precomputeProjectId(root);
+            const id = addProject(root); // Returns the actual ID used in the store
             projectIds.push(id);
             if (root === settings.active_project_root) activeId = id;
 
+            console.log(`[persistence] project ${root}: tentativeId=${tentativeId}, actualId=${id}, hasSaved=${!!saved}`);
+
+            const ps = useProjectsStore.getState();
             if (saved && saved.messages.length > 0) {
-              const s = useProjectsStore.getState();
-              s.restoreConversation(id, saved.messages, saved.sessionId);
+              // Deduplicate by message ID (persisted data may have duplicates from prior bugs)
+              const seen = new Set<string>();
+              const dedupedMessages = saved.messages.filter((m: { id: string }) => {
+                if (seen.has(m.id)) return false;
+                seen.add(m.id);
+                return true;
+              });
+              console.log(`[persistence] restoring conversation for ${id} (saved messages: ${saved.messages.length}, deduped: ${dedupedMessages.length})`);
+              ps.restoreConversation(id, dedupedMessages, saved.sessionId);
               if (saved.model) {
-                s.setConversationModel(id, saved.model);
-                // Model known — warmup skips, no loading indicator needed
-                s.setConversationReady(id, true);
+                ps.setConversationModel(id, saved.model);
               }
-              // No model → isReady stays false → warmup runs, shows pulsing circle,
-              // fetches model from Claude init, then marks ready
-              // Checkpoints can load in background — not needed before first render
-              listCheckpoints(id).then((metas) => {
-                if (metas.length > 0) useProjectsStore.getState().setCheckpoints(id, metas);
-              }).catch(() => {});
+              listCheckpoints(id)
+                .then((metas) => {
+                  if (metas.length > 0) ps.setCheckpoints(id, metas);
+                })
+                .catch(() => {});
             }
           }
-          if (activeId) {
-            setActiveProject(activeId);
+          if (activeId) setActiveProject(activeId);
+
+          // Mark all as restored AFTER the loops
+          for (const id of projectIds) {
+            useProjectsStore.getState().setConversationRestored(id, true);
           }
 
-          // Phase 3: Defer non-critical state (expanded dirs, active file) to idle time
           const restoreProjectState = (idx: number) => {
             if (idx >= projectIds.length) return;
             const id = projectIds[idx]!;
@@ -165,11 +354,7 @@ export function useSettingsPersistence() {
               settings.project_states?.[root];
 
             if (state) {
-              // Restore expanded dirs
-              for (const dir of state.expanded_dirs) {
-                toggleDir(id, dir);
-              }
-              // Restore recent files
+              for (const dir of state.expanded_dirs) toggleDir(id, dir);
               if (state.recent_files?.length) {
                 useProjectsStore.setState((s) => {
                   const proj = s.projects.get(id);
@@ -179,59 +364,72 @@ export function useSettingsPersistence() {
                   return { projects: next };
                 });
               }
-              // Restore active file (read content async)
+              if (state.scroll_positions) {
+                useProjectsStore.setState((s) => {
+                  const proj = s.projects.get(id);
+                  if (!proj) return s;
+                  const next = new Map(s.projects);
+                  next.set(id, {
+                    ...proj,
+                    scrollPositions: new Map(
+                      Object.entries(state.scroll_positions!),
+                    ),
+                  });
+                  return { projects: next };
+                });
+              }
               if (state.active_file_path) {
-                const filePath = state.active_file_path;
-                readFile(filePath)
+                readFile(state.active_file_path)
                   .then((content) => {
                     const store = useProjectsStore.getState();
-                    store.openFile(id, filePath, content);
+                    store.openFile(id, state.active_file_path!, content);
                     store.setMode(id, "conversation");
                   })
                   .catch(() => {});
               }
             }
-
-            // Stagger next project restoration to next idle period
             if (idx + 1 < projectIds.length) {
               requestIdleCallback(() => restoreProjectState(idx + 1));
             }
           };
-
-          // Start restoring non-critical state after first paint
           requestIdleCallback(() => restoreProjectState(0));
         } else {
-          // First launch — auto-detect from CWD
           const cwd = await getCwd();
           const root = await detectProjectRoot(cwd);
           addProject(root);
         }
 
-        // Mark settings as loaded — saves are now safe
-        settingsLoaded = true;
+        // 5. Cleanup and final signals
+        settingsLoadedGlobal = true;
         loadedRef.current = true;
-        // Signal other hooks that the app is ready
+        savingDisabled.current = false;
         resolveAppReady();
 
-        // Load profile identity + avatar (non-blocking, after app is ready)
-        brainGetProfile().then(({ profile }) => {
-          if (profile?.identity) {
-            const ws = useWorkspaceStore.getState();
-            if (profile.identity.name) ws.setProfileName(profile.identity.name);
-            if (profile.identity.bio) ws.setProfileBio(profile.identity.bio);
-            if (profile.identity.role) ws.setProfileRole(profile.identity.role);
-          }
-        }).catch(() => {});
+        brainGetProfile()
+          .then(({ profile }) => {
+            if (profile?.identity) {
+              const ws = useWorkspaceStore.getState();
+              if (profile.identity.name)
+                ws.setProfileName(profile.identity.name);
+              if (profile.identity.bio) ws.setProfileBio(profile.identity.bio);
+              if (profile.identity.role)
+                ws.setProfileRole(profile.identity.role);
+            }
+          })
+          .catch(() => {});
 
-        brainGetAvatar().then(({ base64, mime }) => {
-          if (base64 && mime) {
-            useWorkspaceStore.getState().setProfileAvatarDataUrl(`data:${mime};base64,${base64}`);
-          }
-        }).catch(() => {});
+        brainGetAvatar()
+          .then(({ base64, mime }) => {
+            if (base64 && mime) {
+              useWorkspaceStore
+                .getState()
+                .setProfileAvatarDataUrl(`data:${mime};base64,${base64}`);
+            }
+          })
+          .catch(() => {});
       })
       .catch((err) => {
-        console.error(err);
-        // Still resolve so hooks don't hang forever
+        console.error("[persistence] Load failed:", err);
         resolveAppReady();
       });
   }, []);
@@ -239,223 +437,152 @@ export function useSettingsPersistence() {
   // Save on changes
   useEffect(() => {
     const save = () => {
-      // Don't save until settings have been loaded into the stores.
-      // This prevents overwriting the settings file with defaults during
-      // app reload, HMR, or StrictMode double-mount cleanup.
-      if (!settingsLoaded) return;
+      if (!settingsLoadedGlobal || savingDisabled.current) return;
 
-      const { controlPanelVisible, controlPanelWidth, fontSize, panelFontSize, editorFontSize, fontWeight, keybindings, theme, completionSound, selectedModel } = useWorkspaceStore.getState();
-      const { projects, activeProjectId, projectOrder } =
-        useProjectsStore.getState();
-
-      // Don't save if stores appear empty during initial load
-      // settingsLoaded is only true after successful load, so empty projectOrder
-      // at this point means user removed all projects (legitimate state)
-      // No additional guard needed - settingsLoaded check at top is sufficient
-
-      const activeProject = activeProjectId
-        ? projects.get(activeProjectId)
+      const ws = useWorkspaceStore.getState();
+      const ps = useProjectsStore.getState();
+      const activeProject = ps.activeProjectId
+        ? ps.projects.get(ps.activeProjectId)
         : undefined;
 
-      // Build per-project state and ordered roots
       const project_roots: string[] = [];
       const project_states: Record<string, ProjectSessionState> = {};
 
-      for (const id of projectOrder) {
-        const p = projects.get(id);
+      for (const id of ps.projectOrder) {
+        const p = ps.projects.get(id);
         if (!p) continue;
         project_roots.push(p.root);
         project_states[p.root] = {
           expanded_dirs: Array.from(p.expandedDirs),
           active_file_path: p.activeFilePath,
           recent_files: p.recentFiles,
+          scroll_positions: Object.fromEntries(p.scrollPositions.entries()),
         };
       }
 
       saveSettings({
         project_roots,
         active_project_root: activeProject?.root ?? null,
-        control_panel_visible: controlPanelVisible,
+        control_panel_visible: ws.controlPanelVisible,
         project_states,
-        font_size: fontSize,
-        panel_font_size: panelFontSize,
-        editor_font_size: editorFontSize,
-        font_weight: fontWeight,
-        keybindings: keybindings ?? null,
-        theme,
-        panel_width: controlPanelWidth,
-        completion_sound: completionSound,
-        selected_model: selectedModel,
-      }).catch(console.error);
+        font_size: ws.fontSize,
+        panel_font_size: ws.panelFontSize,
+        editor_font_size: ws.editorFontSize,
+        font_weight: ws.fontWeight,
+        keybindings: ws.keybindings,
+        theme: ws.theme,
+        panel_width: ws.controlPanelWidth,
+        completion_sound: ws.completionSound,
+        selected_model: ws.selectedModel,
+        selected_model_provider: ws.selectedModelProvider,
+
+        punk_backend: ws.punkBackend,
+        http_provider: ws.httpProvider,
+        http_api_keys: ws.httpApiKeys,
+        http_base_urls: ws.httpBaseUrls,
+        intent_routing: ws.intentRouting as BackendRouting,
+        intent_auto_route: ws.intentAutoRoute,
+      }).catch((err) => console.error("[persistence] Save failed:", err));
     };
 
-    // Debounced save for rapid changes (font size, panel resize)
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
     const debouncedSave = () => {
       if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(save, 500);
+      debounceTimer = setTimeout(save, 1000); // 1s debounce for safer persistence
     };
 
-    // Save when workspace settings change (font size, theme, panel width)
-    const unsubWorkspace = useWorkspaceStore.subscribe(
-      (state, prev) => {
-        if (
-          state.fontSize !== prev.fontSize ||
-          state.panelFontSize !== prev.panelFontSize ||
-          state.editorFontSize !== prev.editorFontSize ||
-          state.fontWeight !== prev.fontWeight ||
-          state.keybindings !== prev.keybindings ||
-          state.theme !== prev.theme ||
-          state.controlPanelWidth !== prev.controlPanelWidth ||
-          state.controlPanelVisible !== prev.controlPanelVisible ||
-          state.completionSound !== prev.completionSound ||
-          state.selectedModel !== prev.selectedModel
-        ) {
-          debouncedSave();
-        }
-      },
-    );
+    const unsubWorkspace = useWorkspaceStore.subscribe((state, prev) => {
+      // Deep comparison for routing to avoid unnecessary saves but capture changes
+      const routingChanged =
+        JSON.stringify(state.intentRouting) !==
+        JSON.stringify(prev.intentRouting);
+      const keysChanged =
+        JSON.stringify(state.httpApiKeys) !== JSON.stringify(prev.httpApiKeys);
+      const urlsChanged =
+        JSON.stringify(state.httpBaseUrls) !==
+        JSON.stringify(prev.httpBaseUrls);
 
-    // Save when structural project state changes (not conversation streaming)
-    // Track a fingerprint of the structural fields to avoid iterating all projects
+      if (
+        state.fontSize !== prev.fontSize ||
+        state.panelFontSize !== prev.panelFontSize ||
+        state.editorFontSize !== prev.editorFontSize ||
+        state.fontWeight !== prev.fontWeight ||
+        state.keybindings !== prev.keybindings ||
+        state.theme !== prev.theme ||
+        state.controlPanelWidth !== prev.controlPanelWidth ||
+        state.controlPanelVisible !== prev.controlPanelVisible ||
+        state.completionSound !== prev.completionSound ||
+        state.selectedModel !== prev.selectedModel ||
+        state.selectedModelProvider !== prev.selectedModelProvider ||
+        state.punkBackend !== prev.punkBackend ||
+        state.httpProvider !== prev.httpProvider ||
+        routingChanged ||
+        keysChanged ||
+        urlsChanged ||
+        state.intentAutoRoute !== prev.intentAutoRoute
+      ) {
+        debouncedSave();
+      }
+    });
+
     let lastStructuralKey = "";
-    const computeStructuralKey = (state: ReturnType<typeof useProjectsStore.getState>) => {
-      const parts: string[] = [state.activeProjectId ?? "", state.projectOrder.join(",")];
+    const computeStructuralKey = (
+      state: ReturnType<typeof useProjectsStore.getState>,
+    ) => {
+      const parts = [state.activeProjectId ?? "", state.projectOrder.join(",")];
       for (const id of state.projectOrder) {
         const p = state.projects.get(id);
         if (!p) continue;
-        parts.push(`${id}:${p.expandedDirs.size}:${p.activeFilePath ?? ""}:${p.mode}`);
+        parts.push(
+          `${id}:${p.expandedDirs.size}:${p.activeFilePath ?? ""}:${p.mode}`,
+        );
       }
       return parts.join("|");
     };
     lastStructuralKey = computeStructuralKey(useProjectsStore.getState());
 
-    const unsubProjects = useProjectsStore.subscribe(
-      (state) => {
-        const key = computeStructuralKey(state);
-        if (key !== lastStructuralKey) {
-          lastStructuralKey = key;
-          debouncedSave();
+    const unsubProjects = useProjectsStore.subscribe((state) => {
+      const key = computeStructuralKey(state);
+      if (key !== lastStructuralKey) {
+        lastStructuralKey = key;
+        debouncedSave();
+      }
+    });
+
+    const unsubConversation = useProjectsStore.subscribe((state, prev) => {
+      if (!settingsLoadedGlobal) return;
+      for (const id of state.projectOrder) {
+        const p = state.projects.get(id);
+        const pp = prev.projects.get(id);
+        if (!p) continue;
+
+        // Save when message count changes or session finishes
+        const countChanged =
+          p.conversation.messages.length !== pp?.conversation.messages.length;
+        const finished =
+          !p.conversation.isProcessing && pp?.conversation.isProcessing;
+
+        if (countChanged || finished) {
+          saveConversation(id, {
+            sessionId: p.conversation.sessionId,
+            model: p.conversation.model,
+            messages: p.conversation.messages,
+          }).catch(() => {});
         }
-      },
-    );
+      }
+    });
 
-    // Save conversation history when messages change
-    // Track per-project fingerprint to avoid iterating all projects on every mutation
-    let convDebounce: ReturnType<typeof setTimeout> | null = null;
-    const lastConvKeys = new Map<string, string>();
-    const convKey = (p: ReturnType<typeof useProjectsStore.getState>["projects"] extends Map<string, infer V> ? V : never) =>
-      `${p.conversation.messages.length}:${p.conversation.sessionId ?? ""}:${p.conversation.model ?? ""}:${p.conversation.isProcessing}`;
-
-    // Initialize keys
-    for (const [id, p] of useProjectsStore.getState().projects) {
-      lastConvKeys.set(id, convKey(p));
-    }
-
-    const unsubConversation = useProjectsStore.subscribe(
-      (state) => {
-        if (!settingsLoaded) return;
-        let changed = false;
-        for (const id of state.projectOrder) {
-          const project = state.projects.get(id);
-          if (!project) continue;
-          const key = convKey(project);
-          if (key !== lastConvKeys.get(id)) {
-            lastConvKeys.set(id, key);
-            changed = true;
-          }
-        }
-        if (!changed) return;
-
-        if (convDebounce) clearTimeout(convDebounce);
-        convDebounce = setTimeout(() => {
-          const current = useProjectsStore.getState();
-          for (const [pid, p] of current.projects) {
-            if (p.conversation.messages.length > 0 && !p.conversation.isProcessing) {
-              saveConversation(pid, {
-                sessionId: p.conversation.sessionId,
-                model: p.conversation.model,
-                messages: p.conversation.messages,
-              }).catch(console.error);
-            }
-          }
-        }, 1000);
-      },
-    );
-
-    const handleBeforeUnload = () => {
-      save();
-    };
-
-    // --- Intelligence Layer: sync state to ~/.pane/state/ for MCP server ---
-    let editorSyncTimer: ReturnType<typeof setTimeout> | null = null;
-    const unsubEditorSync = useProjectsStore.subscribe(
-      (state, prev) => {
-        const activeId = state.activeProjectId;
-        if (!activeId || !settingsLoaded) return;
-        const project = state.projects.get(activeId);
-        const prevProject = prev.projects.get(activeId);
-        // Sync when active file changes or active project changes
-        if (
-          project?.activeFilePath !== prevProject?.activeFilePath ||
-          state.activeProjectId !== prev.activeProjectId
-        ) {
-          if (editorSyncTimer) clearTimeout(editorSyncTimer);
-          editorSyncTimer = setTimeout(() => {
-            if (!project) return;
-            writeEditorState(activeId, {
-              activeFile: project.activeFilePath,
-              content: project.activeFileContent,
-              recentFiles: project.recentFiles,
-            }).catch(() => {});
-          }, 300);
-        }
-      },
-    );
-
-    // Sync project state on git branch change
-    let projectSyncTimer: ReturnType<typeof setTimeout> | null = null;
-    const unsubProjectSync = useProjectsStore.subscribe(
-      (state, prev) => {
-        if (!settingsLoaded) return;
-        for (const [id, project] of state.projects) {
-          const prevProject = prev.projects.get(id);
-          if (project.git.branch !== prevProject?.git.branch || !prevProject) {
-            if (projectSyncTimer) clearTimeout(projectSyncTimer);
-            projectSyncTimer = setTimeout(() => {
-              writeProjectState(id, {
-                name: project.name,
-                root: project.root,
-                gitBranch: project.git.branch,
-                topLevelFiles: project.dirContents.get(project.root)?.map(e => e.name) ?? [],
-              }).catch(() => {});
-            }, 500);
-          }
-        }
-      },
-    );
-
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    const interval = setInterval(save, 30000);
+    window.addEventListener("beforeunload", save);
+    const interval = setInterval(save, 60000);
 
     return () => {
       unsubWorkspace();
       unsubProjects();
       unsubConversation();
-      unsubEditorSync();
-      unsubProjectSync();
-      if (editorSyncTimer) clearTimeout(editorSyncTimer);
-      if (projectSyncTimer) clearTimeout(projectSyncTimer);
-      if (convDebounce) clearTimeout(convDebounce);
-      window.removeEventListener("beforeunload", handleBeforeUnload);
+      window.removeEventListener("beforeunload", save);
       clearInterval(interval);
       if (debounceTimer) clearTimeout(debounceTimer);
-      // Only save on cleanup if this instance successfully loaded settings
-      if (loadedRef.current) {
-        save();
-      }
-      // Reset module-level flag so error boundary recovery doesn't save with empty stores
-      settingsLoaded = false;
+      if (loadedRef.current) save();
     };
   }, []);
 }

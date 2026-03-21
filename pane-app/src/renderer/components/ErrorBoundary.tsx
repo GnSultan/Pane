@@ -39,12 +39,12 @@ export class ErrorBoundary extends Component<Props, State> {
             >
               {this.state.error.message}
             </pre>
-            {(this.state as any).stack && (
+            {this.state.stack && (
               <pre
                 className="text-pane-text-secondary/60 font-mono whitespace-pre-wrap break-words border border-pane-border p-3 max-h-[300px] overflow-y-auto"
                 style={{ fontSize: "10px" }}
               >
-                {(this.state as any).stack}
+                {this.state.stack}
               </pre>
             )}
             <button

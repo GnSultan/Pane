@@ -4,7 +4,7 @@ import { readFile, readDirectory, watchDirectory, unwatchDirectory } from "../li
 import { getParentDir } from "../lib/file-utils";
 import { appReadyPromise } from "./useSettingsPersistence";
 
-const electronAPI = (window as any).electronAPI;
+const electronAPI = window.electronAPI;
 
 // Track files we recently wrote so the watcher doesn't clobber the editor
 const recentWrites = new Map<string, number>();

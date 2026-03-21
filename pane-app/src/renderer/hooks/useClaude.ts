@@ -1,134 +1,348 @@
 import { useCallback, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
-import { sendToClaude, abortClaude, createCheckpoint, deleteProjectCheckpoints, recordMemoryEvents, generateBrief, brainIndexEvents, brainContextualSearch } from "../lib/tauri-commands";
+import type { Todo } from "../lib/claude-types";
+
+// ============================================================================
+// Model Execution Timeout Configuration
+// ============================================================================
+// These timeouts determine when to consider a model "hung" and force termination.
+// Increased values to prevent premature killing of long-running operations.
+// ============================================================================
+const MODEL_SAFETY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for silent stream
+const RESULT_PROCESSING_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes after result message
+const CHECKPOINT_TIMEOUT_MS = 3 * 1000; // 3 seconds for checkpoint creation
+
+import {
+  sendToPunk,
+  abortPunk,
+  createCheckpoint,
+  deleteProjectCheckpoints,
+  recordMemoryEvents,
+  recordChange,
+  generateBrief,
+  brainIndexEvents,
+  brainContextualSearch,
+  brainClearSessionPins,
+  sessionMergeState,
+  sessionClearState,
+} from "../lib/tauri-commands";
 import type {
-  ClaudeStreamEvent,
-  ClaudeStreamMessage,
-  ConversationMessage,
+  PunkStreamEvent as ClaudeStreamEvent,
+  PunkStreamMessage as ClaudeStreamMessage,
+  PunkConversationMessage as ConversationMessage,
   ContentBlock,
   ToolUseBlock,
+  ToolResultBlock,
   ThinkingBlock,
   ServerToolUseBlock,
   WebSearchToolResultBlock,
   MemoryEvent,
-} from "../lib/claude-types";
+} from "../lib/punk-types";
+import {
+  inferAgentIntent,
+  chooseModelForIntent,
+  type AgentIntent,
+} from "../lib/agent-routing";
+import { getContextLimit } from "../lib/models";
+
+// Active tool input animations keyed by `${projectId}:${toolId}`.
+// Used to cancel a previous animation if the same tool is re-animated.
+const activeToolAnimations = new Map<string, { cancelled: boolean }>();
+
+function streamToolInputAnimate(
+  projectId: string,
+  toolId: string,
+  completeInput: Record<string, unknown>,
+) {
+  const key = `${projectId}:${toolId}`;
+  const existing = activeToolAnimations.get(key);
+  if (existing) existing.cancelled = true;
+
+  const token = { cancelled: false };
+  activeToolAnimations.set(key, token);
+
+  const json = JSON.stringify(completeInput);
+  // Scale so animation takes ~0.4–1.5s regardless of content length
+  const targetMs = Math.min(Math.max(json.length * 0.8, 400), 1500);
+  const charsPerFrame = Math.max(
+    Math.ceil(json.length / (targetMs / (1000 / 60))),
+    1,
+  );
+
+  let pos = 0;
+  const tick = () => {
+    if (token.cancelled) {
+      activeToolAnimations.delete(key);
+      return;
+    }
+    pos = Math.min(pos + charsPerFrame, json.length);
+    const partial = fixPartialJson(json.slice(0, pos));
+    try {
+      const parsed = JSON.parse(partial) as Record<string, unknown>;
+      useProjectsStore.getState().updateToolUseInputById(projectId, toolId, parsed);
+    } catch {
+      /* partial JSON not yet parseable — skip frame */
+    }
+
+    if (pos < json.length) {
+      requestAnimationFrame(tick);
+    } else {
+      // Final frame: guarantee complete input
+      useProjectsStore
+        .getState()
+        .updateToolUseInputById(projectId, toolId, completeInput);
+      activeToolAnimations.delete(key);
+    }
+  };
+  requestAnimationFrame(tick);
+}
 
 let messageIdCounter = 0;
 function nextMessageId(): string {
   return `msg-${Date.now()}-${++messageIdCounter}`;
 }
 
-// Accumulates partial JSON fragments for streaming tool inputs.
-// Safe as module-level: JS is single-threaded, tool blocks stream sequentially,
-// and isProcessing guard prevents concurrent streams per project.
-let pendingToolJson = "";
+interface StreamingState {
+  pendingTextDelta: string;
+  pendingThinkingDelta: string;
+  textFlushRaf: number;
+  thinkingFlushRaf: number;
+  pendingToolInput: Record<string, unknown> | null;
+  toolInputFlushRaf: number;
+  toolJsonParseRaf: number;
+  pendingToolJson: string;
+  pendingToolJsonTruncated: boolean;
+  pendingTodos: import("../lib/claude-types").Todo[] | null;
+  todosFlushRaf: number;
+  // Per-tool streaming tracking
+  currentStreamingToolId: string | null;
+  currentToolDeltaCount: number; // how many partial_json_delta events for current tool
+}
 
-// Throttle streaming text/thinking deltas to batch rapid updates into single renders.
-// Accumulates text and flushes via rAF so we get at most one store update per frame.
-let pendingTextDelta = "";
-let pendingThinkingDelta = "";
-let textFlushRaf = 0;
-let thinkingFlushRaf = 0;
+const streamingStates = new Map<string, StreamingState>();
 
-// rAF throttle for tool input mutations — same pattern as text/thinking.
-// Accumulates parsed tool input, flushes once per frame instead of on every delta.
-let pendingToolInput: Record<string, unknown> | null = null;
-let toolInputFlushRaf = 0;
+function getStreamingState(projectId: string): StreamingState {
+  let state = streamingStates.get(projectId);
+  if (!state) {
+    state = {
+      pendingTextDelta: "",
+      pendingThinkingDelta: "",
+      textFlushRaf: 0,
+      thinkingFlushRaf: 0,
+      pendingToolInput: null,
+      toolInputFlushRaf: 0,
+      toolJsonParseRaf: 0,
+      pendingToolJson: "",
+      pendingToolJsonTruncated: false,
+      pendingTodos: null,
+      todosFlushRaf: 0,
+      currentStreamingToolId: null,
+      currentToolDeltaCount: 0,
+    };
+    streamingStates.set(projectId, state);
+  }
+  return state;
+}
 
-// Tool JSON streaming guardrails:
-// - Parse at most once per frame (JSON.parse + fixPartialJson are expensive)
-// - Hard cap buffer growth to avoid runaway memory/CPU on huge tool inputs
 const MAX_STREAMING_TOOL_JSON_CHARS = 100_000;
-let toolJsonParseRaf = 0;
-let pendingToolJsonTruncated = false;
-
-// rAF throttle for TodoWrite updates — ensures todos update smoothly during streaming
-// instead of batching all updates until the end.
-let pendingTodos: import("../lib/claude-types").Todo[] | null = null;
-let todosFlushRaf = 0;
 
 function flushToolInput(projectId: string) {
-  if (pendingToolInput) {
-    useProjectsStore.getState().updateLastToolUseInput(projectId, pendingToolInput);
-    pendingToolInput = null;
+  const state = getStreamingState(projectId);
+  if (state.pendingToolInput) {
+    useProjectsStore
+      .getState()
+      .updateLastToolUseInput(projectId, state.pendingToolInput);
+    state.pendingToolInput = null;
   }
-  toolInputFlushRaf = 0;
+  state.toolInputFlushRaf = 0;
 }
 
 function scheduleToolJsonParse(projectId: string) {
-  if (toolJsonParseRaf) return;
-  toolJsonParseRaf = requestAnimationFrame(() => {
-    toolJsonParseRaf = 0;
+  const state = getStreamingState(projectId);
+  if (state.toolJsonParseRaf) return;
+  state.toolJsonParseRaf = requestAnimationFrame(() => {
+    state.toolJsonParseRaf = 0;
 
-    if (pendingToolJsonTruncated) return;
-    if (!pendingToolJson) return;
+    if (state.pendingToolJsonTruncated) return;
+    if (!state.pendingToolJson) return;
 
-    const fixed = fixPartialJson(pendingToolJson);
+    const fixed = fixPartialJson(state.pendingToolJson);
     try {
       const parsed = JSON.parse(fixed) as Record<string, unknown>;
 
-      // TodoWrite detection stays inline — it only fires when input
-      // is fully parseable and triggers a different store method.
       const store = useProjectsStore.getState();
       const project = store.projects.get(projectId);
       if (project) {
         const msgs = project.conversation.messages;
         const last = msgs[msgs.length - 1];
         if (last && last.type === "assistant") {
-          const lastTool = [...last.content]
-            .reverse()
-            .find((b) => b.type === "tool_use") as ToolUseBlock | undefined;
-          if (lastTool?.name === "TodoWrite" && (parsed as any).todos) {
-            // Throttle todo updates via rAF to prevent React 18 batching all updates
-            // Deep clone to ensure Zustand detects updates even within todo objects
-            pendingTodos = ((parsed as any).todos as import("../lib/claude-types").Todo[]).map((t) => ({ ...t }));
-            if (!todosFlushRaf) {
-              todosFlushRaf = requestAnimationFrame(() => flushTodos(projectId));
+          // Check all tools in the last message, not just the last tool
+          // This ensures we capture TodoWrite even if there are multiple tools
+          const toolUses = last.content.filter(
+            (b) => b.type === "tool_use"
+          ) as ToolUseBlock[];
+          
+          // Find the TodoWrite tool and extract todos from parsed input
+          const todoWriteTool = toolUses.find((t) => t.name === "TodoWrite");
+          if (todoWriteTool && Array.isArray(parsed.todos)) {
+            state.pendingTodos = (
+              parsed.todos as import("../lib/claude-types").Todo[]
+            ).map((t) => ({ ...t }));
+            if (!state.todosFlushRaf) {
+              state.todosFlushRaf = requestAnimationFrame(() =>
+                flushTodos(projectId),
+              );
             }
           }
         }
       }
 
-      // Throttle store update to once per animation frame
-      pendingToolInput = parsed;
-      if (!toolInputFlushRaf) {
-        toolInputFlushRaf = requestAnimationFrame(() => flushToolInput(projectId));
+      state.pendingToolInput = parsed;
+      if (!state.toolInputFlushRaf) {
+        state.toolInputFlushRaf = requestAnimationFrame(() =>
+          flushToolInput(projectId),
+        );
       }
     } catch {
-      // Still incomplete/unparseable — wait for more chunks
+      // Still incomplete
     }
   });
 }
 
 function flushTodos(projectId: string) {
-  if (pendingTodos) {
-    useProjectsStore.getState().setConversationTodos(projectId, pendingTodos);
-    pendingTodos = null;
+  const state = getStreamingState(projectId);
+  if (state.pendingTodos) {
+    useProjectsStore
+      .getState()
+      .setConversationTodos(projectId, state.pendingTodos);
+    state.pendingTodos = null;
   }
-  todosFlushRaf = 0;
+  state.todosFlushRaf = 0;
 }
 
 function flushTextDelta(projectId: string) {
-  if (pendingTextDelta) {
-    useProjectsStore.getState().appendToLastAssistantText(projectId, pendingTextDelta);
-    pendingTextDelta = "";
+  const state = getStreamingState(projectId);
+  if (state.pendingTextDelta) {
+    // Bleed logic: release a portion of the buffer to create a smooth typewriter effect.
+    // If the buffer is large, we speed up slightly, but we always keep it calm.
+    const buffer = state.pendingTextDelta;
+    const len = buffer.length;
+
+    // Release between 1 and 4 characters per frame depending on buffer size.
+    // Capping at 4 ensures it never feels like a sudden jump.
+    const charsToRelease = Math.min(
+      len,
+      Math.max(1, Math.min(4, Math.floor(len / 8))),
+    );
+    const toFlush = buffer.slice(0, charsToRelease);
+    state.pendingTextDelta = buffer.slice(charsToRelease);
+
+    useProjectsStore.getState().appendToLastAssistantText(projectId, toFlush);
   }
-  textFlushRaf = 0;
+
+  if (state.pendingTextDelta) {
+    state.textFlushRaf = requestAnimationFrame(() => flushTextDelta(projectId));
+  } else {
+    state.textFlushRaf = 0;
+  }
+}
+
+function resetStreamingState(projectId: string, flush = false) {
+  const state = getStreamingState(projectId);
+  if (flush) {
+    if (state.pendingTextDelta) {
+      cancelAnimationFrame(state.textFlushRaf);
+      useProjectsStore
+        .getState()
+        .appendToLastAssistantText(projectId, state.pendingTextDelta);
+      state.pendingTextDelta = "";
+    }
+    if (state.pendingThinkingDelta) {
+      cancelAnimationFrame(state.thinkingFlushRaf);
+      useProjectsStore
+        .getState()
+        .appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
+      state.pendingThinkingDelta = "";
+    }
+    // Flush any pending tool JSON that didn't make it through the rAF pipeline.
+    // This happens when resetStreamingState is called (e.g. on a tool_result message)
+    // before the toolJsonParseRaf fires — common with fast CLI tool sequences.
+    if (state.pendingToolJson && !state.pendingToolJsonTruncated) {
+      cancelAnimationFrame(state.toolJsonParseRaf);
+      state.toolJsonParseRaf = 0;
+      const fixed = fixPartialJson(state.pendingToolJson);
+      try {
+        state.pendingToolInput = JSON.parse(fixed) as Record<string, unknown>;
+      } catch { /* ignore */ }
+      state.pendingToolJson = "";
+    }
+    if (state.pendingToolInput) {
+      cancelAnimationFrame(state.toolInputFlushRaf);
+      flushToolInput(projectId);
+    }
+    if (state.pendingTodos) {
+      cancelAnimationFrame(state.todosFlushRaf);
+      flushTodos(projectId);
+    }
+  }
+
+  if (state.textFlushRaf) cancelAnimationFrame(state.textFlushRaf);
+  if (state.thinkingFlushRaf) cancelAnimationFrame(state.thinkingFlushRaf);
+  if (state.toolInputFlushRaf) cancelAnimationFrame(state.toolInputFlushRaf);
+  if (state.toolJsonParseRaf) cancelAnimationFrame(state.toolJsonParseRaf);
+  if (state.todosFlushRaf) cancelAnimationFrame(state.todosFlushRaf);
+
+  state.pendingTextDelta = "";
+  state.pendingThinkingDelta = "";
+  state.pendingToolInput = null;
+  state.pendingToolJson = "";
+  state.pendingToolJsonTruncated = false;
+  state.pendingTodos = null;
+
+  state.textFlushRaf = 0;
+  state.thinkingFlushRaf = 0;
+  state.toolInputFlushRaf = 0;
+  state.toolJsonParseRaf = 0;
+  state.todosFlushRaf = 0;
+  state.currentStreamingToolId = null;
+  state.currentToolDeltaCount = 0;
+
+  // Cancel any active CLI tool animations for this project
+  const prefix = `${projectId}:`;
+  for (const [key, token] of activeToolAnimations) {
+    if (key.startsWith(prefix)) token.cancelled = true;
+  }
 }
 
 function flushThinkingDelta(projectId: string) {
-  if (pendingThinkingDelta) {
-    useProjectsStore.getState().appendToLastAssistantThinking(projectId, pendingThinkingDelta);
-    pendingThinkingDelta = "";
+  const state = getStreamingState(projectId);
+  if (state.pendingThinkingDelta) {
+    const buffer = state.pendingThinkingDelta;
+    const len = buffer.length;
+
+    // Thinking can bleed a bit faster than text, but still capped for calmness.
+    const charsToRelease = Math.min(
+      len,
+      Math.max(1, Math.min(6, Math.floor(len / 6))),
+    );
+    const toFlush = buffer.slice(0, charsToRelease);
+    state.pendingThinkingDelta = buffer.slice(charsToRelease);
+
+    useProjectsStore
+      .getState()
+      .appendToLastAssistantThinking(projectId, toFlush);
   }
-  thinkingFlushRaf = 0;
+
+  if (state.pendingThinkingDelta) {
+    state.thinkingFlushRaf = requestAnimationFrame(() =>
+      flushThinkingDelta(projectId),
+    );
+  } else {
+    state.thinkingFlushRaf = 0;
+  }
 }
 
-/**
- * Close unclosed delimiters in partial JSON so incomplete streaming input
- * can be parsed and displayed progressively. Same approach as Zed's partial_json_fixer.
- */
 function fixPartialJson(s: string): string {
   let inString = false;
   let escape = false;
@@ -136,13 +350,22 @@ function fixPartialJson(s: string): string {
 
   for (let i = 0; i < s.length; i++) {
     const ch = s[i]!;
-    if (escape) { escape = false; continue; }
-    if (ch === '\\' && inString) { escape = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "" && inString) {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
     if (inString) continue;
-    if (ch === '{') stack.push('}');
-    else if (ch === '[') stack.push(']');
-    else if (ch === '}' || ch === ']') stack.pop();
+    if (ch === "{") stack.push("}");
+    else if (ch === "[") stack.push("]");
+    else if (ch === "}" || ch === "]") stack.pop();
   }
 
   let result = s;
@@ -151,104 +374,41 @@ function fixPartialJson(s: string): string {
   return result;
 }
 
-/**
- * Build a condensed briefing from accumulated project memory + last N messages.
- * Used to seed a fresh session when context window is hit.
- * Incorporates the cached brief (from generateBrief) so accumulated wisdom survives.
- */
-function buildContinuationBrief(projectId: string): string {
-  const project = useProjectsStore.getState().projects.get(projectId);
-  if (!project) return "Continue from where you left off.";
-
-  const { messages, todos, cachedBrief } = project.conversation;
-
-  const parts: string[] = [];
-
-  // Prepend accumulated project memory from brief.md
-  if (cachedBrief) {
-    parts.push(cachedBrief);
-    parts.push("");
-  }
-
-  parts.push("---");
-  parts.push("The previous session hit the context window limit. Continuing automatically.");
-  parts.push("");
-  parts.push("## Recent conversation");
-  parts.push("");
-
-  // Last ~6 user+assistant pairs
-  const convoMsgs = messages.filter((m) => m.type === "user" || m.type === "assistant");
-  const recent = convoMsgs.slice(-12);
-
-  for (const msg of recent) {
-    if (msg.type === "user") {
-      const text = msg.content
-        .filter((b): b is { type: "text"; text: string } => b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-        .trim();
-      if (text) parts.push(`**User:** ${text}`);
-    } else if (msg.type === "assistant") {
-      const text = msg.content
-        .filter((b): b is { type: "text"; text: string } => b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-        .trim();
-      if (text) {
-        const truncated = text.length > 600 ? text.slice(0, 600) + "…" : text;
-        parts.push(`**You (Claude):** ${truncated}`);
-      }
-    }
-  }
-
-  const activeTodos = todos.filter((t) => t.status === "in_progress" || t.status === "pending");
-  if (activeTodos.length > 0) {
-    parts.push("", "## Pending tasks");
-    for (const todo of activeTodos) {
-      const marker = todo.status === "in_progress" ? "→" : "·";
-      parts.push(`${marker} ${todo.content}`);
-    }
-  }
-
-  parts.push("", "Pick up exactly where you left off and continue the work.");
-  return parts.join("\n");
-}
-
-/**
- * Extract memory events from the latest turn's messages.
- * Scans from the last user message to end of conversation for:
- * - File edits (Edit/Write tool uses)
- * - Errors + error→fix pairs
- * - Commands (Bash tool uses, truncated not dropped)
- * - Decisions auto-detected from assistant text
- * - Session summary (last assistant text)
- */
 function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
   const events: MemoryEvent[] = [];
   const now = Date.now();
 
-  // Find the last user message — everything after is "this turn"
   let turnStart = messages.length - 1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]!.type === "user") { turnStart = i; break; }
+    if (messages[i]!.type === "user") {
+      turnStart = i;
+      break;
+    }
   }
   const turnMessages = messages.slice(turnStart);
 
-  // Track last error for error→fix pair detection
   let lastError: string | null = null;
   let lastErrorTool: string | null = null;
 
   for (const msg of turnMessages) {
     for (const block of msg.content) {
-      // File edits
       if (block.type === "tool_use") {
         const tool = block as ToolUseBlock;
 
-        // Skip pane_remember — MCP server already writes these to events.jsonl
         if (tool.name === "pane_remember") continue;
 
-        if (tool.name === "Edit" || tool.name === "Write") {
-          const filePath = (tool.input.file_path as string) || (tool.input.path as string) || "unknown";
+        // CLI tools: Edit, Write | HTTP tools: write_file, replace
+        if (
+          tool.name === "Edit" ||
+          tool.name === "Write" ||
+          tool.name === "write_file" ||
+          tool.name === "replace"
+        ) {
+          const filePath =
+            (tool.input.file_path as string) ||
+            (tool.input.path as string) ||
+            (tool.input.target_file as string) ||
+            "unknown";
           events.push({
             type: "file_edit",
             content: `${tool.name}: ${filePath}`,
@@ -257,8 +417,8 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
             metadata: { file: filePath, tool: tool.name },
           });
         }
-        // Commands — truncate instead of dropping long ones
-        if (tool.name === "Bash") {
+        // CLI tools: Bash | HTTP tools: run_shell_command
+        if (tool.name === "Bash" || tool.name === "run_shell_command") {
           const cmd = (tool.input.command as string) || "";
           if (cmd) {
             events.push({
@@ -266,13 +426,11 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
               content: cmd.length > 200 ? cmd.slice(0, 200) + "..." : cmd,
               timestamp: now,
               source: "auto",
-              metadata: { tool: "Bash" },
+              metadata: { tool: tool.name },
             });
           }
         }
 
-        // Error→fix detection: if we have a pending error and see a successful
-        // tool_use of the same tool, emit an error_fix pair
         if (lastError && lastErrorTool && tool.name === lastErrorTool) {
           events.push({
             type: "error_fix",
@@ -285,8 +443,10 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
           lastErrorTool = null;
         }
       }
-      // Errors from tool results
-      if (block.type === "tool_result" && (block as { is_error?: boolean }).is_error) {
+      if (
+        block.type === "tool_result" &&
+        (block as { is_error?: boolean }).is_error
+      ) {
         const content = (block as { content: string }).content || "";
         if (content.length < 500) {
           events.push({
@@ -295,14 +455,15 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
             timestamp: now,
             source: "auto",
           });
-          // Track for error→fix pairing
           lastError = content.slice(0, 300);
-          // Try to find which tool this result belongs to
           const toolUseId = (block as { tool_use_id?: string }).tool_use_id;
           if (toolUseId) {
             for (const m of turnMessages) {
               for (const b of m.content) {
-                if (b.type === "tool_use" && (b as ToolUseBlock).id === toolUseId) {
+                if (
+                  b.type === "tool_use" &&
+                  (b as ToolUseBlock).id === toolUseId
+                ) {
                   lastErrorTool = (b as ToolUseBlock).name;
                 }
               }
@@ -313,48 +474,91 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
     }
   }
 
-  // Decision detection from assistant text
   const decisionPatterns = [
     /(?:I'll|I will|Let's|Going to|chose|choosing|decided|using|switched to)\s+(.{10,150})/gi,
     /(?:instead of|rather than|over)\s+(.{10,100})/gi,
   ];
 
-  const lastAssistant = [...turnMessages].reverse().find(m => m.type === "assistant");
+  const lessonPatterns = [
+    /(?:the (?:issue|problem|bug|root cause) (?:was|is)[:\s]+)(.{10,200})/gi,
+    /(?:the (?:key )?(?:insight|fix|solution|answer) (?:was|is)[:\s]+)(.{10,200})/gi,
+    /(?:(?:discovered|realized|found out|learned|turns out)[:\s]+)(.{10,200})/gi,
+    /(?:important(?:ly)?[:\s]+|note[:\s]+)(.{10,200})/gi,
+    /(?:the reason (?:is|was)[:\s]+)(.{10,200})/gi,
+  ];
+
+  const lastAssistant = [...turnMessages]
+    .reverse()
+    .find((m) => m.type === "assistant");
   if (lastAssistant) {
-    const textBlocks = lastAssistant.content.filter(b => b.type === "text");
+    const textBlocks = lastAssistant.content.filter((b) => b.type === "text");
     if (textBlocks.length > 0) {
       const fullText = textBlocks
-        .map(b => (b as { type: "text"; text: string }).text)
+        .map((b) => (b as { type: "text"; text: string }).text)
         .join("\n")
         .trim();
 
-      // Extract decisions
+      // Extract decisions (cap 5)
       const seenDecisions = new Set<string>();
       for (const pattern of decisionPatterns) {
         pattern.lastIndex = 0;
         let match;
         while ((match = pattern.exec(fullText)) !== null) {
           const decision = match[1]?.trim();
-          if (decision && decision.length >= 10 && !seenDecisions.has(decision)) {
+          if (
+            decision &&
+            decision.length >= 10 &&
+            !seenDecisions.has(decision)
+          ) {
             seenDecisions.add(decision);
             events.push({
               type: "decision",
-              content: decision.length > 150 ? decision.slice(0, 150) + "..." : decision,
+              content:
+                decision.length > 150
+                  ? decision.slice(0, 150) + "..."
+                  : decision,
               timestamp: now,
               source: "auto",
             });
           }
-          // Cap at 3 decisions per turn to avoid noise
-          if (seenDecisions.size >= 3) break;
+          if (seenDecisions.size >= 5) break;
         }
-        if (seenDecisions.size >= 3) break;
+        if (seenDecisions.size >= 5) break;
       }
 
-      // Session summary
+      // Extract lessons (cap 3)
+      const seenLessons = new Set<string>();
+      for (const pattern of lessonPatterns) {
+        pattern.lastIndex = 0;
+        let match;
+        while ((match = pattern.exec(fullText)) !== null) {
+          const lesson = match[1]?.trim();
+          if (
+            lesson &&
+            lesson.length >= 10 &&
+            !seenLessons.has(lesson.slice(0, 40).toLowerCase())
+          ) {
+            seenLessons.add(lesson.slice(0, 40).toLowerCase());
+            events.push({
+              type: "lesson",
+              content:
+                lesson.length > 200
+                  ? lesson.slice(0, 200) + "..."
+                  : lesson,
+              timestamp: now,
+              source: "auto",
+            });
+          }
+          if (seenLessons.size >= 3) break;
+        }
+        if (seenLessons.size >= 3) break;
+      }
+
       if (fullText.length > 20) {
         events.push({
           type: "summary",
-          content: fullText.length > 500 ? fullText.slice(0, 500) + "..." : fullText,
+          content:
+            fullText.length > 500 ? fullText.slice(0, 500) + "..." : fullText,
           timestamp: now,
           source: "auto",
         });
@@ -365,27 +569,285 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
   return events;
 }
 
-// Context window sizes by model family (input tokens)
-const MODEL_CONTEXT_LIMITS: Record<string, number> = {
-  opus: 200000,
-  sonnet: 200000,
-  haiku: 200000,
-};
-
-function getContextLimit(model: string | null): number {
-  if (!model) return 200000;
-  const lower = model.toLowerCase();
-  for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
-    if (lower.includes(key)) return limit;
+/**
+ * Record file changes from tool_use blocks into the change history.
+ * Works for both CLI tools (Edit, Write) and HTTP tools (replace, write_file).
+ * Called after each conversation turn completes.
+ */
+function recordChangeHistory(
+  projectId: string,
+  messages: ConversationMessage[],
+) {
+  // Find the last user message to scope to this turn only
+  let turnStart = messages.length - 1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.type === "user") {
+      turnStart = i;
+      break;
+    }
   }
-  return 200000;
+  const turnMessages = messages.slice(turnStart);
+
+  // Build a set of tool_use IDs that errored, so we skip them
+  const erroredToolIds = new Set<string>();
+  for (const msg of turnMessages) {
+    for (const block of msg.content) {
+      if (
+        block.type === "tool_result" &&
+        (block as { is_error?: boolean }).is_error
+      ) {
+        const toolUseId = (block as { tool_use_id?: string }).tool_use_id;
+        if (toolUseId) erroredToolIds.add(toolUseId);
+      }
+    }
+  }
+
+  for (const msg of turnMessages) {
+    for (const block of msg.content) {
+      if (block.type !== "tool_use") continue;
+      const tool = block as ToolUseBlock;
+
+      // Skip tools that errored
+      if (erroredToolIds.has(tool.id)) continue;
+
+      const filePath =
+        (tool.input.file_path as string) ||
+        (tool.input.path as string) ||
+        (tool.input.target_file as string) ||
+        "";
+      if (!filePath) continue;
+
+      // replace / Edit — have old_string and new_string
+      if (
+        tool.name === "replace" ||
+        tool.name === "Edit"
+      ) {
+        const oldString = (tool.input.old_string as string) || "";
+        const newString = (tool.input.new_string as string) || "";
+        if (oldString || newString) {
+          recordChange(projectId, filePath, oldString, newString).catch(
+            () => {},
+          );
+        }
+      }
+
+      // write_file / Write — full file content
+      if (
+        tool.name === "write_file" ||
+        tool.name === "Write"
+      ) {
+        const content = (tool.input.content as string) || "";
+        if (content) {
+          recordChange(projectId, filePath, "", content).catch(() => {});
+        }
+      }
+    }
+  }
 }
 
-export function useClaude(projectId: string) {
+function extractSessionDelta(
+  messages: ConversationMessage[],
+  todos: Todo[],
+) {
+  const now = Date.now();
+  const workingSet: { path: string; purpose?: string }[] = [];
+  const decisions: { content: string }[] = [];
+  const recentActions: { type: string; content: string; timestamp: number }[] =
+    [];
+
+  let turnStart = messages.length - 1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.type === "user") {
+      turnStart = i;
+      break;
+    }
+  }
+  const turnMessages = messages.slice(turnStart);
+
+  for (const msg of turnMessages) {
+    for (const block of msg.content) {
+      if (block.type === "tool_use") {
+        const tool = block as ToolUseBlock;
+        // CLI tools: Edit, Write, Read | HTTP tools: write_file, replace, read_file
+        if (
+          tool.name === "Edit" ||
+          tool.name === "Write" ||
+          tool.name === "Read" ||
+          tool.name === "write_file" ||
+          tool.name === "replace" ||
+          tool.name === "read_file"
+        ) {
+          const filePath =
+            (tool.input.file_path as string) ||
+            (tool.input.path as string) ||
+            (tool.input.target_file as string) ||
+            "";
+          if (filePath) {
+            workingSet.push({ path: filePath });
+            recentActions.push({
+              type: tool.name.toLowerCase(),
+              content: filePath,
+              timestamp: now,
+            });
+          }
+        }
+        // CLI tools: Bash | HTTP tools: run_shell_command
+        if (tool.name === "Bash" || tool.name === "run_shell_command") {
+          const cmd = (tool.input.command as string) || "";
+          if (cmd)
+            recentActions.push({
+              type: "command",
+              content: cmd.slice(0, 120),
+              timestamp: now,
+            });
+        }
+      }
+    }
+  }
+
+  const lastAssistant = [...turnMessages]
+    .reverse()
+    .find((m) => m.type === "assistant");
+  if (lastAssistant) {
+    const text = lastAssistant.content
+      .filter((b) => b.type === "text")
+      .map((b) => (b as { type: "text"; text: string }).text)
+      .join("\n");
+
+    // Decision extraction (cap 5)
+    const decisionPatterns = [
+      /(?:I'll|I will|We'll|Let's|Going to|chose|choosing|decided|using|switched to)\s+(.{15,120})/gi,
+      /(?:instead of|rather than|over)\s+(.{15,100})/gi,
+    ];
+    const seen = new Set<string>();
+    for (const pattern of decisionPatterns) {
+      pattern.lastIndex = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        const d = match[1]?.trim();
+        if (d && d.length >= 15 && !seen.has(d.slice(0, 40).toLowerCase())) {
+          seen.add(d.slice(0, 40).toLowerCase());
+          decisions.push({
+            content: d.length > 120 ? d.slice(0, 120) + "..." : d,
+          });
+          if (seen.size >= 5) break;
+        }
+      }
+      if (seen.size >= 5) break;
+    }
+
+    // Lesson extraction → pushed as decisions so they appear in session state immediately
+    const lessonPatterns = [
+      /(?:the (?:issue|problem|bug|root cause) (?:was|is)[:\s]+)(.{10,150})/gi,
+      /(?:the (?:key )?(?:insight|fix|solution) (?:was|is)[:\s]+)(.{10,150})/gi,
+      /(?:(?:discovered|realized|found out|learned|turns out)[:\s]+)(.{10,150})/gi,
+      /(?:the reason (?:is|was)[:\s]+)(.{10,150})/gi,
+    ];
+    const seenLessons = new Set<string>();
+    for (const pattern of lessonPatterns) {
+      pattern.lastIndex = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        const l = match[1]?.trim();
+        if (l && l.length >= 10 && !seenLessons.has(l.slice(0, 40).toLowerCase())) {
+          seenLessons.add(l.slice(0, 40).toLowerCase());
+          decisions.push({
+            content: l.length > 150 ? l.slice(0, 150) + "..." : l,
+          });
+          if (seenLessons.size >= 3) break;
+        }
+      }
+      if (seenLessons.size >= 3) break;
+    }
+  }
+
+  if (
+    !workingSet.length &&
+    !decisions.length &&
+    !recentActions.length &&
+    !todos?.length
+  )
+    return null;
+  return { workingSet, decisions, recentActions, todos: todos || [] };
+}
+
+/**
+ * Post-turn method compliance check.
+ * Compares what the model did against what it was scoped to do.
+ */
+function extractMethodViolations(
+  messages: ConversationMessage[],
+): { type: string; content: string; timestamp: number }[] {
+  const violations: { type: string; content: string; timestamp: number }[] = [];
+  const now = Date.now();
+
+  // Find last turn
+  let turnStart = messages.length - 1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.type === "user") {
+      turnStart = i;
+      break;
+    }
+  }
+  const turnMessages = messages.slice(turnStart);
+
+  // Track what happened: edits and verification commands
+  let hasEdits = false;
+  let hasVerification = false;
+
+  for (const msg of turnMessages) {
+    for (const block of msg.content) {
+      if (block.type === "tool_use") {
+        const tool = block as ToolUseBlock;
+
+        // File edits (CLI + HTTP tool names)
+        if (
+          tool.name === "Edit" ||
+          tool.name === "Write" ||
+          tool.name === "write_file" ||
+          tool.name === "replace"
+        ) {
+          hasEdits = true;
+        }
+
+        // Verification commands
+        if (tool.name === "Bash" || tool.name === "run_shell_command") {
+          const cmd = ((tool.input.command as string) || "").toLowerCase();
+          if (
+            cmd.includes("test") ||
+            cmd.includes("tsc") ||
+            cmd.includes("typecheck") ||
+            cmd.includes("build") ||
+            cmd.includes("lint") ||
+            cmd.includes("check") ||
+            cmd.includes("jest") ||
+            cmd.includes("vitest") ||
+            cmd.includes("pytest") ||
+            cmd.includes("cargo check") ||
+            cmd.includes("go vet")
+          ) {
+            hasVerification = true;
+          }
+        }
+      }
+    }
+  }
+
+  // Edits happened but no verification — flag it
+  if (hasEdits && !hasVerification) {
+    violations.push({
+      type: "no_verification",
+      content:
+        "Code was changed but no verification (tests, type-check, build) was run. Follow the Pane Method step 6 — verify after every change.",
+      timestamp: now,
+    });
+  }
+
+  return violations;
+}
+
+export function usePunk(projectId: string) {
   const abortingRef = useRef(false);
-  const continuationRef = useRef<string | null>(null);
-  // Proactive continuation: set to true when context hits 85%, consumed on next processEnded
-  const proactiveContinuationRef = useRef(false);
 
   const sendMessage = useCallback(
     async (prompt: string) => {
@@ -394,7 +856,9 @@ export function useClaude(projectId: string) {
       if (!project) return;
       if (project.conversation.isProcessing) return;
 
-      // Build user message (ID generated early for checkpoint linking)
+      await abortPunk(projectId).catch(() => {});
+      resetStreamingState(projectId);
+
       const messageId = nextMessageId();
       const userMessage: ConversationMessage = {
         id: messageId,
@@ -404,12 +868,11 @@ export function useClaude(projectId: string) {
         isStreaming: false,
       };
 
-      // Snapshot files before Claude touches anything (3s timeout — never block the user)
       try {
         const cpResult = await Promise.race([
           createCheckpoint(projectId, project.root, messageId),
           new Promise<{ id: null; fileCount: 0 }>((resolve) =>
-            setTimeout(() => resolve({ id: null, fileCount: 0 }), 3000),
+            setTimeout(() => resolve({ id: null, fileCount: 0 }), CHECKPOINT_TIMEOUT_MS),
           ),
         ]);
         if (cpResult.id) {
@@ -421,33 +884,44 @@ export function useClaude(projectId: string) {
             fileCount: cpResult.fileCount,
           });
         }
-      } catch {}
+      } catch {
+        // ignore
+      }
 
       store.addConversationMessage(projectId, userMessage);
       store.setConversationProcessing(projectId, true);
       store.setConversationError(projectId, null);
 
       let assistantMessageAdded = false;
+      let resultReceived = false;
       const sessionId = project.conversation.sessionId;
       let resultSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+      let orchestrationActive = false; // true while TaskRunner is running steps
 
       const finishProcessing = () => {
         if (resultSafetyTimer) {
           clearTimeout(resultSafetyTimer);
           resultSafetyTimer = null;
         }
+        abortPunk(projectId).catch(() => {});
+
         const s = useProjectsStore.getState();
         s.setConversationProcessing(projectId, false);
+        s.setConversationRoutedModel(projectId, null);
         s.setLastMessageStreamingDone(projectId);
         s.setIsPlanning(projectId, false);
 
-        // Skip sound and notification if we're auto-continuing after context limit
-        if (continuationRef.current) return;
+        setTimeout(() => {
+          const current = useProjectsStore.getState().projects.get(projectId);
+          if (current && !current.conversation.isProcessing) {
+            useProjectsStore
+              .getState()
+              .setConversationStatusMessage(projectId, null);
+          }
+        }, 1500);
 
-        // Play completion sound when processing finishes
         useWorkspaceStore.getState().playCompletionSound();
 
-        // Show notification badge if this isn't the active project
         if (s.activeProjectId !== projectId) {
           const proj = s.projects.get(projectId);
           if (proj) {
@@ -461,13 +935,68 @@ export function useClaude(projectId: string) {
       };
 
       const handleEvent = (event: ClaudeStreamEvent) => {
+        if (resultSafetyTimer) {
+          clearTimeout(resultSafetyTimer);
+          resultSafetyTimer = setTimeout(() => {
+            console.warn(
+              `[pane] resultSafetyTimer triggered — model stream went silent for ${MODEL_SAFETY_TIMEOUT_MS / 1000} seconds`,
+            );
+            finishProcessing();
+          }, MODEL_SAFETY_TIMEOUT_MS);
+        }
+
         switch (event.event) {
           case "processStarted":
             break;
 
+          case "routing": {
+            // Legacy routing event — still handled for backwards compat
+            const { model, thinking, intent } = event.data;
+            store.setConversationRoutedModel(projectId, model);
+            if (thinking && intent === "plan") {
+              store.setIsPlanning(projectId, true);
+            }
+            break;
+          }
+
+          case "strategy": {
+            const d = event.data;
+            // Update routing display (same as routing event)
+            store.setConversationRoutedModel(projectId, d.model);
+            if (d.thinking && d.intent === "plan") {
+              store.setIsPlanning(projectId, true);
+            }
+            // Inject a synthetic assistant message containing the strategy block.
+            // Appears between the user message and the LLM's response —
+            // collapsed by default in the UI.
+            store.addConversationMessage(projectId, {
+              id: `strategy-${Date.now()}`,
+              type: "assistant",
+              content: [{
+                type: "strategy",
+                mode:             d.mode,
+                discovery:        d.discovery,
+                reasoning:        d.reasoning,
+                verification:     d.verification,
+                confidence:       d.confidence,
+                reason:           d.reason,
+                signals:          d.signals,
+                intent:           d.intent,
+                provider:         d.provider,
+                model:            d.model,
+                thinking:         d.thinking,
+                oracleUsed:       d.oracleUsed       ?? false,
+                oracleConfidence: d.oracleConfidence ?? null,
+                oracleExploring:  d.oracleExploring  ?? false,
+              }],
+              timestamp: Date.now(),
+              isStreaming: false,
+            });
+            break;
+          }
+
           case "message": {
             try {
-              // Main process pre-parses JSON; fall back to raw_json if needed
               const msg: ClaudeStreamMessage =
                 event.data.parsed ?? JSON.parse(event.data.raw_json!);
               assistantMessageAdded = handleClaudeMessage(
@@ -476,21 +1005,14 @@ export function useClaude(projectId: string) {
                 assistantMessageAdded,
               );
 
-              // Arm proactive continuation when context pressure hits high
-              if (msg.type === "result") {
-                const proj = useProjectsStore.getState().projects.get(projectId);
-                if (proj?.conversation.contextPressure === "high" && !proactiveContinuationRef.current) {
-                  proactiveContinuationRef.current = true;
-                }
-              }
-
-              // Safety: if Claude sent a final result but the process hangs,
-              // force-clear processing state after 5 seconds.
+              if (msg.type === "result") resultReceived = true;
               if (msg.type === "result" && !resultSafetyTimer) {
                 resultSafetyTimer = setTimeout(() => {
-                  console.warn("[pane] Process hung after result — force-clearing processing state");
+                  console.warn(
+                    `[pane] Process hung after result message for ${RESULT_PROCESSING_TIMEOUT_MS / 1000} seconds — force-clearing processing state`,
+                  );
                   finishProcessing();
-                }, 5000);
+                }, RESULT_PROCESSING_TIMEOUT_MS);
               }
             } catch (e) {
               console.error("Failed to parse claude message:", e);
@@ -499,93 +1021,418 @@ export function useClaude(projectId: string) {
           }
 
           case "processEnded": {
+            // During orchestration the TaskRunner spawns one process per step.
+            // Each step exit fires processEnded — ignore these mid-plan or we'd
+            // mark the conversation done and show spurious errors after step 1.
+            if (orchestrationActive) break;
+
+            // If the process died without ever sending a result event, surface an error
+            if (!resultReceived) {
+              const s = useProjectsStore.getState();
+              if (!s.projects.get(projectId)?.conversation.error) {
+                s.setConversationSessionId(projectId, null);
+                s.setConversationError(
+                  projectId,
+                  "Process exited without responding — session may be invalid. Try again.",
+                );
+              }
+            }
             finishProcessing();
 
-            // --- Intelligence Layer: extract memory + regenerate brief + index brain ---
             try {
               const proj = useProjectsStore.getState().projects.get(projectId);
               if (proj && proj.conversation.messages.length > 1) {
-                const memEvents = extractMemoryEvents(proj.conversation.messages);
+                // Record file changes to change history
+                recordChangeHistory(projectId, proj.conversation.messages);
+
+                const memEvents = extractMemoryEvents(
+                  proj.conversation.messages,
+                );
                 if (memEvents.length > 0) {
                   recordMemoryEvents(projectId, memEvents).catch(() => {});
-                  // Feed events into the brain knowledge graph
                   brainIndexEvents(projectId, memEvents).catch(() => {});
                 }
-                // Generate brief and cache it for enhanced continuation
-                generateBrief(projectId).then((brief) => {
-                  if (brief) {
-                    useProjectsStore.getState().setCachedBrief(projectId, brief);
-                  }
-                }).catch(() => {});
-              }
-            } catch {}
+                generateBrief(projectId)
+                  .then((brief) => {
+                    if (brief) {
+                      useProjectsStore
+                        .getState()
+                        .setCachedBrief(projectId, brief);
+                    }
+                  })
+                  .catch(() => {});
 
-            // --- Proactive continuation at 85% context pressure ---
-            if (proactiveContinuationRef.current && !continuationRef.current) {
-              proactiveContinuationRef.current = false;
-              const brief = buildContinuationBrief(projectId);
-              useProjectsStore.getState().clearConversation(projectId);
-              window.dispatchEvent(new CustomEvent("pane:context-refreshed", { detail: { projectId } }));
-              setTimeout(() => sendMessage(brief), 50);
-              return; // Skip normal flow — continuation takes over
+                const sessionDelta = extractSessionDelta(
+                  proj.conversation.messages,
+                  proj.conversation.todos,
+                );
+
+                // Post-turn method compliance check
+                const methodViolations = extractMethodViolations(
+                  proj.conversation.messages,
+                );
+
+                if (sessionDelta) {
+                  sessionMergeState(projectId, {
+                    ...sessionDelta,
+                    methodNotes: methodViolations,
+                  }).catch(() => {});
+                } else if (methodViolations.length > 0) {
+                  sessionMergeState(projectId, {
+                    methodNotes: methodViolations,
+                  }).catch(() => {});
+                }
+              }
+            } catch {
+              // ignore
             }
             break;
           }
 
           case "error": {
-            const isContextLimit = /context window|context length|maximum context/i.test(
-              event.data.message,
-            );
-            if (isContextLimit) {
-              // Build brief now while conversation state is still intact.
-              // Don't surface an error — auto-continuation takes over after processEnded.
-              continuationRef.current = buildContinuationBrief(projectId);
-            } else {
-              const s = useProjectsStore.getState();
-              s.setConversationError(projectId, event.data.message);
-              s.setConversationProcessing(projectId, false);
-              s.setIsPlanning(projectId, false);
+            const s = useProjectsStore.getState();
+            s.setConversationError(projectId, event.data.message);
+            s.setConversationProcessing(projectId, false);
+            s.setIsPlanning(projectId, false);
+
+            // RETRY LOGIC: Restore the failed prompt to the InputBar
+            // We use a custom event that InputBar listens to
+            const retryEvt = new CustomEvent("pane:retry-prompt", {
+              detail: { projectId, prompt },
+            });
+            window.dispatchEvent(retryEvt);
+
+            // Also remove the failed user message from the history so it's not doubled on retry
+            const project = s.projects.get(projectId);
+            if (project) {
+              const msgs = project.conversation.messages;
+              const lastMsg = msgs[msgs.length - 1];
+              if (msgs.length > 0 && lastMsg && lastMsg.type === "user") {
+                s.removeLastConversationMessage(projectId);
+              }
             }
+            break;
+          }
+
+          case "compaction_start": {
+            console.log(
+              `[frontend] Starting conversation compaction: ${event.data.reason}`,
+            );
+            // Optional: Show a brief indicator in the UI
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              `Compressing conversation...`,
+            );
+            break;
+          }
+
+          case "compaction_complete": {
+            const { originalCount, compactedCount, tokensSaved, totalCompactions } = event.data;
+            console.log(
+              `[frontend] Compaction complete: ${originalCount} → ${compactedCount} messages, ` +
+              `${tokensSaved} tokens saved, total compactions: ${totalCompactions}`,
+            );
+            // Clear the compaction status message
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(projectId, null);
+            break;
+          }
+
+          case "todos_updated": {
+            const { todos } = event.data;
+            const s = useProjectsStore.getState();
+            s.setConversationTodos(projectId, todos);
+            break;
+          }
+
+          case "activeTask_updated": {
+            const { activeTask } = event.data;
+            // Update the status message with the active task
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(projectId, activeTask.description);
+            break;
+          }
+
+          // ── Orchestration Events (Control Inversion) ──────────────────
+          case "orchestration_discovery_start": {
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(projectId, "Understanding the task...");
+            break;
+          }
+
+          case "orchestration_discovery": {
+            // Model is asking questions during discovery — show as assistant message
+            // and enable input so the user can respond
+            const s = useProjectsStore.getState();
+            s.addConversationMessage(projectId, {
+              id: `discovery-${Date.now()}`,
+              type: "assistant",
+              content: [{ type: "text", text: event.data.message }],
+              timestamp: Date.now(),
+              isStreaming: false,
+            });
+            s.setConversationStatusMessage(projectId, "Discussing...");
+            s.setDiscoveryActive(projectId, true);
+            break;
+          }
+
+          case "orchestration_discovery_response": {
+            // User's response during discovery — add as user message
+            const s = useProjectsStore.getState();
+            s.addConversationMessage(projectId, {
+              id: `discovery-user-${Date.now()}`,
+              type: "user",
+              content: [{ type: "text", text: event.data.message }],
+              timestamp: Date.now(),
+              isStreaming: false,
+            });
+            s.setDiscoveryActive(projectId, false);
+            s.setConversationStatusMessage(projectId, "Understanding the task...");
+            break;
+          }
+
+          case "orchestration_discovery_complete": {
+            // Alignment reached — show confirmation and transition to planning
+            const s = useProjectsStore.getState();
+            if (event.data.message) {
+              s.addConversationMessage(projectId, {
+                id: `discovery-aligned-${Date.now()}`,
+                type: "assistant",
+                content: [{ type: "text", text: event.data.message }],
+                timestamp: Date.now(),
+                isStreaming: false,
+              });
+            }
+            s.setDiscoveryActive(projectId, false);
+            s.setConversationStatusMessage(projectId, "Aligned — decomposing task...");
+            break;
+          }
+
+          case "orchestration_start": {
+            orchestrationActive = true;
+            break;
+          }
+
+          case "orchestration_planning_start": {
+            // Add a streaming assistant message — the planning model's raw output
+            // appears here in real-time, then gets replaced by the plan block
+            const s = useProjectsStore.getState();
+            s.addConversationMessage(projectId, {
+              id: "planning-stream",
+              type: "assistant",
+              content: [{ type: "text", text: "" }],
+              timestamp: Date.now(),
+              isStreaming: true,
+            });
+            s.setConversationStatusMessage(projectId, "Planning...");
+            break;
+          }
+
+          case "orchestration_planning_chunk": {
+            const s = useProjectsStore.getState();
+            s.appendToLastAssistantText(projectId, event.data.chunk);
+            break;
+          }
+
+          case "orchestration_plan": {
+            const { summary, steps, totalSteps, planId, planningModel, executionModel } = event.data;
+            // Finalize the planning stream — keep it in history, just stop the cursor
+            const ps = useProjectsStore.getState();
+            const proj = ps.projects.get(projectId);
+            const streamMsg = proj?.conversation.messages.find((m) => m.id === "planning-stream");
+            if (streamMsg) {
+              ps.removeLastConversationMessage(projectId);
+              ps.addConversationMessage(projectId, { ...streamMsg, isStreaming: false });
+            }
+            // Show the approval gate — execution waits until user presses accept
+            ps.setPendingPlanApproval(projectId, true);
+            console.log(
+              `[orchestration] Plan: ${summary} (${totalSteps} steps)`,
+            );
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              `Orchestrating: ${totalSteps} steps`,
+            );
+
+            // Push the plan as a first-class message in the conversation.
+            // This is the readable blueprint — static after it lands.
+            // Todos near the input handle live step progress.
+            if (steps && planId) {
+              s.addConversationMessage(projectId, {
+                id: `plan-${planId}`,
+                type: "plan",
+                content: [],
+                timestamp: Date.now(),
+                isStreaming: false,
+                planData: {
+                  id: planId,
+                  task: summary,
+                  steps: steps.map((step: { index: number; action: string; type: string; files: string[] }) => ({
+                    index: step.index,
+                    type: step.type as "read" | "write" | "verify" | "plan",
+                    action: step.action,
+                    files: step.files || [],
+                  })),
+                  planningModel: planningModel || null,
+                  executionModel: executionModel || null,
+                },
+              });
+            }
+
+            // Update todos to reflect the plan for live progress near input
+            if (steps) {
+              s.setConversationTodos(
+                projectId,
+                steps.map((step: { index: number; action: string; type: string }) => ({
+                  content: step.action,
+                  status: "pending" as const,
+                  activeForm: step.action.split(" ").slice(0, 4).join(" ") + "...",
+                })),
+              );
+            }
+            break;
+          }
+
+          case "orchestration_step": {
+            const { phase, stepIndex, totalSteps, message } = event.data;
+            console.log(`[orchestration] ${phase}: ${message}`);
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              `Step ${stepIndex || "?"}/${totalSteps || "?"}: ${message}`,
+            );
+            break;
+          }
+
+          case "orchestration_step_complete": {
+            const { stepIndex, totalSteps, passed, action } = event.data;
+            console.log(
+              `[orchestration] Step ${stepIndex}/${totalSteps} ${passed ? "passed" : "failed"}: ${action}`,
+            );
+            // Update the specific todo
+            const s = useProjectsStore.getState();
+            const proj = s.projects.get(projectId);
+            if (proj?.conversation.todos) {
+              const updatedTodos = proj.conversation.todos.map(
+                (todo: Todo, idx: number) => ({
+                  ...todo,
+                  status:
+                    idx < stepIndex
+                      ? ("completed" as const)
+                      : idx === stepIndex - 1
+                        ? (passed ? "completed" as const : "in_progress" as const)
+                        : todo.status,
+                }),
+              );
+              s.setConversationTodos(projectId, updatedTodos);
+            }
+            break;
+          }
+
+          case "orchestration_complete": {
+            orchestrationActive = false;
+            const {
+              summary,
+              completedSteps,
+              totalSteps: total,
+              allPassed,
+              typeCheckPassed,
+              touchedFiles,
+            } = event.data;
+            console.log(
+              `[orchestration] Complete: ${completedSteps}/${total} steps passed` +
+              ` | tsc: ${typeCheckPassed ? "✓" : "✗"}` +
+              ` | touched: ${touchedFiles?.length ?? 0} files (${summary})`,
+            );
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              allPassed && typeCheckPassed
+                ? `All ${total} steps completed`
+                : !typeCheckPassed
+                  ? `${completedSteps}/${total} steps — type check failed`
+                  : `${completedSteps}/${total} steps completed`,
+            );
+            resultReceived = true;
+            finishProcessing();
+            break;
+          }
+
+          case "orchestration_typecheck": {
+            const { passed, output } = event.data;
+            console.log(
+              `[orchestration] Type check: ${passed ? "passed ✓" : "failed ✗"}`,
+              passed ? "" : output,
+            );
+            const s = useProjectsStore.getState();
+            s.setConversationStatusMessage(
+              projectId,
+              passed
+                ? "Type check passed ✓"
+                : `Type check failed — ${output.slice(0, 80)}`,
+            );
+            break;
+          }
+
+          case "orchestration_error": {
+            orchestrationActive = false;
+            console.error(`[orchestration] Error: ${event.data.message}`);
+            const s = useProjectsStore.getState();
+            s.setConversationError(projectId, event.data.message);
+            finishProcessing();
             break;
           }
         }
       };
 
       try {
-        // Proactive injection: trigger brain contextual search before spawning Claude.
-        // Writes ~/.pane/brain/context/{projectId}.json which claude-worker reads.
-        // Fire-and-forget with short timeout — don't delay the user.
+        const conversation = project.conversation;
+        const intent: AgentIntent = inferAgentIntent({ prompt, conversation });
+
         const activeFile = project.activeFilePath || undefined;
         await Promise.race([
-          brainContextualSearch(projectId, prompt, activeFile).catch(() => {}),
-          new Promise(resolve => setTimeout(resolve, 500)),
+          brainContextualSearch(
+            projectId,
+            prompt,
+            activeFile,
+            intent,
+            project.root,
+          ).catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 1000)), // Increased from 500ms to 1 second
         ]);
-
         const selectedModel = useWorkspaceStore.getState().selectedModel;
-        await sendToClaude(
+        const selectedModelThinking =
+          useWorkspaceStore.getState().selectedModelThinking;
+        const selectedModelProvider =
+          useWorkspaceStore.getState().selectedModelProvider;
+        const routedModel = chooseModelForIntent(selectedModel, intent);
+
+        // Don't set an aggressive initial timeout - let models take the time they need
+        // The processStarted event will handle legitimate hangs
+
+        const truncatedHistory = conversation.messages.slice(-20);
+        const todos = conversation.todos;
+
+        await sendToPunk(
           projectId,
           prompt,
           project.root,
           sessionId,
-          selectedModel,
+          routedModel,
           handleEvent,
+          intent,
+          truncatedHistory,
+          selectedModelThinking,
+          selectedModelProvider,
+          todos,
         );
       } catch (err) {
         console.error("[pane] sendToClaude error:", err);
         const errMsg = err instanceof Error ? err.message : String(err);
         store.setConversationError(projectId, errMsg);
         store.setConversationProcessing(projectId, false);
-      }
-
-      // Auto-continuation after context window limit:
-      // Build brief was stored in continuationRef by the error handler.
-      // Clear the session and fire a fresh one with the condensed handoff.
-      if (continuationRef.current) {
-        const brief = continuationRef.current;
-        continuationRef.current = null;
-        useProjectsStore.getState().clearConversation(projectId);
-        // Let state settle before starting the new session
-        setTimeout(() => sendMessage(brief), 50);
       }
     },
     [projectId],
@@ -595,13 +1442,14 @@ export function useClaude(projectId: string) {
     if (abortingRef.current) return;
     abortingRef.current = true;
     try {
-      await abortClaude(projectId);
+      await abortPunk(projectId);
     } finally {
       abortingRef.current = false;
       const store = useProjectsStore.getState();
       store.setConversationProcessing(projectId, false);
       store.setLastMessageStreamingDone(projectId);
       store.setIsPlanning(projectId, false);
+      resetStreamingState(projectId);
     }
   }, [projectId]);
 
@@ -609,45 +1457,27 @@ export function useClaude(projectId: string) {
     useProjectsStore.getState().clearConversation(projectId);
     useProjectsStore.getState().clearCheckpoints(projectId);
     deleteProjectCheckpoints(projectId).catch(() => {});
+    brainClearSessionPins(projectId).catch(() => {});
+    sessionClearState(projectId).catch(() => {});
   }, [projectId]);
 
   return { sendMessage, abortMessage, clearConversation };
 }
 
-/**
- * Process a parsed stream-json message and update the store.
- * Returns whether an assistant message now exists in the conversation.
- */
+export const useClaude = usePunk;
+
 function handleClaudeMessage(
   msg: ClaudeStreamMessage,
   projectId: string,
   assistantMessageExists: boolean,
 ): boolean {
   const store = useProjectsStore.getState();
+  const state = getStreamingState(projectId);
 
-  // Flush any buffered streaming deltas before processing a new message type
-  // (assistant/user/result messages replace or finalize content)
   if (msg.type !== "stream_event") {
-    if (pendingTextDelta) {
-      cancelAnimationFrame(textFlushRaf);
-      flushTextDelta(projectId);
-    }
-    if (pendingThinkingDelta) {
-      cancelAnimationFrame(thinkingFlushRaf);
-      flushThinkingDelta(projectId);
-    }
-    if (pendingToolInput) {
-      cancelAnimationFrame(toolInputFlushRaf);
-      flushToolInput(projectId);
-    }
-    if (pendingTodos) {
-      cancelAnimationFrame(todosFlushRaf);
-      flushTodos(projectId);
-    }
+    resetStreamingState(projectId, true);
   }
 
-  // Large messages (>100KB) are skipped in the worker to avoid structured clone freeze.
-  // They send a stub with { type, skipped: true } — nothing to render.
   if ("skipped" in msg) {
     return assistantMessageExists;
   }
@@ -659,37 +1489,53 @@ function handleClaudeMessage(
         if (msg.model) {
           store.setConversationModel(projectId, msg.model);
         }
-        // Mark conversation as ready once we have the model
-        store.setConversationReady(projectId, true);
       }
       return assistantMessageExists;
     }
 
     case "assistant": {
-      const finalContent = msg.message.content as ContentBlock[];
+      const rawContent = msg.message.content as ContentBlock[];
+      const seenToolIds = new Set<string>();
+      const finalContent = rawContent.filter((block) => {
+        if (block.type === "tool_use") {
+          const id = (block as ToolUseBlock).id;
+          if (seenToolIds.has(id)) return false;
+          seenToolIds.add(id);
+        }
+        return true;
+      });
+
       if (assistantMessageExists) {
-        // Merge: preserve streamed blocks that aren't in the final content
         const project = store.projects.get(projectId);
         if (project) {
           const msgs = project.conversation.messages;
           const last = msgs[msgs.length - 1];
           if (last && last.type === "assistant") {
-            const streamedTextBlocks = last.content.filter((b) => b.type === "text");
-            const streamedThinkingBlocks = last.content.filter((b) => b.type === "thinking");
+            const streamedTextBlocks = last.content.filter(
+              (b) => b.type === "text",
+            );
+            const streamedThinkingBlocks = last.content.filter(
+              (b) => b.type === "thinking",
+            );
             const finalHasText = finalContent.some((b) => b.type === "text");
-            const finalHasThinking = finalContent.some((b) => b.type === "thinking");
+            const finalHasThinking = finalContent.some(
+              (b) => b.type === "thinking",
+            );
 
             let merged = finalContent;
-            // If we streamed thinking but final has none, prepend streamed thinking
             if (streamedThinkingBlocks.length > 0 && !finalHasThinking) {
               merged = [...streamedThinkingBlocks, ...merged];
             }
-            // If we streamed text but final has no text blocks, prepend streamed text
             if (streamedTextBlocks.length > 0 && !finalHasText) {
-              // Insert text blocks after any thinking blocks
-              const thinkingEnd = merged.findIndex((b) => b.type !== "thinking");
+              const thinkingEnd = merged.findIndex(
+                (b) => b.type !== "thinking",
+              );
               const insertAt = thinkingEnd === -1 ? merged.length : thinkingEnd;
-              merged = [...merged.slice(0, insertAt), ...streamedTextBlocks, ...merged.slice(insertAt)];
+              merged = [
+                ...merged.slice(0, insertAt),
+                ...streamedTextBlocks,
+                ...merged.slice(insertAt),
+              ];
             }
             store.updateLastAssistantContent(projectId, merged);
           } else {
@@ -700,10 +1546,12 @@ function handleClaudeMessage(
         }
         store.setLastMessageStreamingDone(projectId);
 
-        // Auto-clear todos if all completed
         if (project) {
           const todos = project.conversation.todos;
-          if (todos.length > 0 && todos.every((t) => t.status === "completed")) {
+          if (
+            todos.length > 0 &&
+            todos.every((t) => t.status === "completed")
+          ) {
             store.setConversationTodos(projectId, []);
           }
         }
@@ -721,16 +1569,42 @@ function handleClaudeMessage(
     }
 
     case "user": {
-      // Auto-generated tool results — add as system type for rendering
+      const project = store.projects.get(projectId);
+      const newContent = msg.message.content as ContentBlock[];
+      const newToolResult = newContent.find((b) => b.type === "tool_result") as
+        | ToolResultBlock
+        | undefined;
+
+      if (project && newToolResult) {
+        const msgs = project.conversation.messages;
+        // Search backwards for a matching system message with this tool_use_id
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i]!;
+          if (m.type === "system") {
+            const hasMatch = m.content.some(
+              (b) =>
+                b.type === "tool_result" &&
+                (b as ToolResultBlock).tool_use_id ===
+                  newToolResult.tool_use_id,
+            );
+            if (hasMatch) {
+              store.updateMessageContent(projectId, m.id, newContent);
+              return false;
+            }
+          }
+          // Optimization: don't look too far back
+          if (msgs.length - i > 15) break;
+        }
+      }
+
       const toolResultMsg: ConversationMessage = {
         id: nextMessageId(),
         type: "system",
-        content: msg.message.content as ContentBlock[],
+        content: newContent,
         timestamp: Date.now(),
         isStreaming: false,
       };
       store.addConversationMessage(projectId, toolResultMsg);
-      // Next assistant turn starts fresh
       return false;
     }
 
@@ -745,17 +1619,16 @@ function handleClaudeMessage(
           msg.num_turns,
         );
 
-        // Track context window usage for pressure indicator
         if (msg.usage?.input_tokens) {
-          const model = store.projects.get(projectId)?.conversation.model ?? null;
+          const model =
+            store.projects.get(projectId)?.conversation.model ?? null;
           const limit = getContextLimit(model);
           const ratio = msg.usage.input_tokens / limit;
-          const pressure = ratio >= 0.85 ? "high" : ratio >= 0.70 ? "building" : "none";
+          const pressure =
+            ratio >= 0.85 ? "high" : ratio >= 0.7 ? "building" : "none";
           store.setContextPressure(projectId, msg.usage.input_tokens, pressure);
         }
 
-        // Text-based plan detection: with --dangerously-skip-permissions,
-        // EnterPlanMode/ExitPlanMode tools won't fire. Detect plan from text.
         const project = store.projects.get(projectId);
         if (project) {
           const msgs = project.conversation.messages;
@@ -766,30 +1639,28 @@ function handleClaudeMessage(
               .map((b) => (b as { type: "text"; text: string }).text)
               .join("\n")
               .trim();
-            // Detect plan prompts like "Ready to proceed" / "send 'go'" etc.
             if (
-              /ready to proceed|send ['"]go['"]/i.test(
-                fullText.slice(-200),
-              )
+              /ready to proceed|send ['"]go['"]/i.test(fullText.slice(-200))
             ) {
               store.setPendingPlanApproval(projectId, true);
             }
           }
         }
       } else if (msg.subtype !== "success") {
-        // "interrupted" is expected — user abort or warmup silent abort. Not an error.
         if (msg.subtype === "interrupted") return assistantMessageExists;
 
         console.warn("[pane] Claude non-success result:", msg.subtype, msg);
 
-        // Don't overwrite a more specific error already set by the error event
-        // (stderr output arrives as an error event before the result message)
+        // Clear stale session ID so the next attempt starts a fresh session
+        store.setConversationSessionId(projectId, null);
+
         const existing = store.projects.get(projectId)?.conversation.error;
         if (!existing) {
           const detail = msg.error?.trim() || msg.result?.trim();
           store.setConversationError(
             projectId,
-            detail || `Claude exited unexpectedly (${msg.subtype ?? "unknown"})`,
+            detail ||
+              `Claude exited unexpectedly (${msg.subtype ?? "unknown"})`,
           );
         }
       }
@@ -799,33 +1670,32 @@ function handleClaudeMessage(
     case "stream_event": {
       const evt = msg.event;
 
-      // Flush pending deltas before any content_block_start
-      // (new blocks need the accumulated text written first)
       if (evt.type === "content_block_start") {
-        if (pendingTextDelta) {
-          cancelAnimationFrame(textFlushRaf);
+        if (state.pendingTextDelta) {
+          cancelAnimationFrame(state.textFlushRaf);
           flushTextDelta(projectId);
         }
-        if (pendingThinkingDelta) {
-          cancelAnimationFrame(thinkingFlushRaf);
+        if (state.pendingThinkingDelta) {
+          cancelAnimationFrame(state.thinkingFlushRaf);
           flushThinkingDelta(projectId);
         }
-        if (pendingToolInput) {
-          cancelAnimationFrame(toolInputFlushRaf);
+        if (state.pendingToolInput) {
+          cancelAnimationFrame(state.toolInputFlushRaf);
           flushToolInput(projectId);
         }
-        if (pendingTodos) {
-          cancelAnimationFrame(todosFlushRaf);
+        if (state.pendingTodos) {
+          cancelAnimationFrame(state.todosFlushRaf);
           flushTodos(projectId);
         }
       }
 
-      // Streaming text — throttled to one store update per animation frame
       if (
         evt.type === "content_block_delta" &&
         evt.delta?.type === "text_delta" &&
         evt.delta.text
       ) {
+        store.setConversationStatusMessage(projectId, null);
+
         if (!assistantMessageExists) {
           const placeholder: ConversationMessage = {
             id: nextMessageId(),
@@ -837,20 +1707,22 @@ function handleClaudeMessage(
           store.addConversationMessage(projectId, placeholder);
           return true;
         } else {
-          pendingTextDelta += evt.delta.text;
-          if (!textFlushRaf) {
-            textFlushRaf = requestAnimationFrame(() => flushTextDelta(projectId));
+          state.pendingTextDelta += evt.delta.text;
+          if (!state.textFlushRaf) {
+            state.textFlushRaf = requestAnimationFrame(() =>
+              flushTextDelta(projectId),
+            );
           }
           return true;
         }
       }
 
-      // Streaming thinking — throttled to one store update per animation frame
       if (
         evt.type === "content_block_delta" &&
         evt.delta?.type === "thinking_delta" &&
         evt.delta.thinking
       ) {
+        store.setConversationStatusMessage(projectId, "thinking...");
         if (!assistantMessageExists) {
           const placeholder: ConversationMessage = {
             id: nextMessageId(),
@@ -862,18 +1734,35 @@ function handleClaudeMessage(
           store.addConversationMessage(projectId, placeholder);
           return true;
         } else {
-          pendingThinkingDelta += evt.delta.thinking;
-          if (!thinkingFlushRaf) {
-            thinkingFlushRaf = requestAnimationFrame(() => flushThinkingDelta(projectId));
+          // Ensure there's a thinking block to append to
+          const project = store.projects.get(projectId);
+          if (project) {
+            const msgs = project.conversation.messages;
+            const last = msgs[msgs.length - 1];
+            if (last && last.type === "assistant") {
+              const blocks = [...last.content];
+              const lastBlock = blocks[blocks.length - 1];
+              if (!lastBlock || lastBlock.type !== "thinking") {
+                // Add a new thinking block if the last block isn't thinking
+                blocks.push({ type: "thinking", thinking: "" });
+                store.updateLastAssistantContent(projectId, blocks);
+              }
+            }
+          }
+          
+          state.pendingThinkingDelta += evt.delta.thinking;
+          if (!state.thinkingFlushRaf) {
+            state.thinkingFlushRaf = requestAnimationFrame(() =>
+              flushThinkingDelta(projectId),
+            );
           }
           return true;
         }
       }
 
-      // Thinking signature
       if (
         evt.type === "content_block_delta" &&
-        evt.delta?.type === "signature_delta" &&
+        evt.delta?.type === "text_delta" &&
         evt.delta.signature
       ) {
         if (assistantMessageExists) {
@@ -882,7 +1771,6 @@ function handleClaudeMessage(
         return assistantMessageExists;
       }
 
-      // Thinking block start
       if (
         evt.type === "content_block_start" &&
         evt.content_block?.type === "thinking"
@@ -903,30 +1791,63 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              const newContent = [...last.content, evt.content_block as ThinkingBlock];
-              store.updateLastAssistantContent(projectId, newContent);
+              const blocks = [...last.content];
+              // Check if the last block is already a thinking block
+              const lastBlock = blocks[blocks.length - 1];
+              if (lastBlock && lastBlock.type === "thinking") {
+                // If so, reuse it instead of creating a new one
+                // This prevents multiple thinking blocks from being created
+              } else {
+                // Only add a new thinking block if the last one isn't already thinking
+                blocks.push(evt.content_block as ThinkingBlock);
+                store.updateLastAssistantContent(projectId, blocks);
+              }
             }
           }
         }
         return assistantMessageExists;
       }
 
-      // Tool use block start
       if (
         evt.type === "content_block_start" &&
         evt.content_block?.type === "tool_use"
       ) {
-        pendingToolJson = "";
-        pendingToolJsonTruncated = false;
-        if (toolJsonParseRaf) {
-          cancelAnimationFrame(toolJsonParseRaf);
-          toolJsonParseRaf = 0;
+        // Flush any pending JSON from the previous tool before starting the new one.
+        // Without this, the previous tool's rAF gets cancelled and its input is lost.
+        if (state.pendingToolJson && !state.pendingToolJsonTruncated) {
+          cancelAnimationFrame(state.toolJsonParseRaf);
+          state.toolJsonParseRaf = 0;
+          const fixed = fixPartialJson(state.pendingToolJson);
+          try {
+            useProjectsStore
+              .getState()
+              .updateLastToolUseInput(projectId, JSON.parse(fixed) as Record<string, unknown>);
+          } catch { /* ignore */ }
+        }
+        state.pendingToolJson = "";
+        state.pendingToolJsonTruncated = false;
+        if (state.toolJsonParseRaf) {
+          cancelAnimationFrame(state.toolJsonParseRaf);
+          state.toolJsonParseRaf = 0;
         }
         const toolBlock = evt.content_block as ToolUseBlock;
+        state.currentStreamingToolId = toolBlock.id;
+        state.currentToolDeltaCount = 0;
+
+        let status = `using ${toolBlock.name.toLowerCase()}...`;
+        if (toolBlock.name === "read_file" || toolBlock.name === "Read")
+          status = "reading file...";
+        if (toolBlock.name === "replace" || toolBlock.name === "Edit")
+          status = "editing file...";
+        if (toolBlock.name === "write_file" || toolBlock.name === "Write")
+          status = "writing file...";
+        if (toolBlock.name === "grep_search" || toolBlock.name === "Grep")
+          status = "searching...";
+        if (toolBlock.name === "run_shell_command" || toolBlock.name === "Bash")
+          status = "running command...";
+        store.setConversationStatusMessage(projectId, status);
 
         if (!assistantMessageExists) {
-          // Claude started this turn directly with a tool call (no text/thinking first).
-          // Create a placeholder so TodoWrite detection and tool rendering work correctly.
           const placeholder: ConversationMessage = {
             id: nextMessageId(),
             type: "assistant",
@@ -941,10 +1862,17 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              store.updateLastAssistantContent(projectId, [
-                ...last.content,
-                toolBlock,
-              ]);
+              const alreadyExists = last.content.some(
+                (b) =>
+                  b.type === "tool_use" &&
+                  (b as ToolUseBlock).id === toolBlock.id,
+              );
+              if (!alreadyExists) {
+                store.updateLastAssistantContent(projectId, [
+                  ...last.content,
+                  toolBlock,
+                ]);
+              }
             }
           }
         }
@@ -956,43 +1884,57 @@ function handleClaudeMessage(
           store.setPendingPlanApproval(projectId, true);
           store.setIsPlanning(projectId, false);
         }
-        // With --dangerously-skip-permissions, plan tools won't fire.
-        // Plan detection via text pattern happens in the "result" handler.
 
         return true;
       }
 
-      // Streaming tool input (input_json_delta)
-      // Uses fixPartialJson to close unclosed delimiters so partial inputs
-      // are visible during streaming. Store updates are rAF-throttled.
       if (
         evt.type === "content_block_delta" &&
-        evt.delta?.type === "input_json_delta" &&
+        evt.delta?.type === "partial_json_delta" &&
         evt.delta.partial_json
       ) {
-        if (pendingToolJsonTruncated) return assistantMessageExists;
+        if (state.pendingToolJsonTruncated) return assistantMessageExists;
 
-        pendingToolJson += evt.delta.partial_json;
-        if (pendingToolJson.length > MAX_STREAMING_TOOL_JSON_CHARS) {
-          pendingToolJsonTruncated = true;
-          pendingToolJson = "";
-          pendingToolInput = {
+        state.currentToolDeltaCount++;
+        state.pendingToolJson += evt.delta.partial_json;
+
+        // Detect CLI: tool input arrives as one complete JSON in a single delta.
+        // HTTP always sends partial chunks, so the first delta won't parse cleanly.
+        // When detected, animate the reveal instead of using the rAF pipeline.
+        if (state.currentToolDeltaCount === 1 && state.currentStreamingToolId) {
+          try {
+            const complete = JSON.parse(state.pendingToolJson) as Record<string, unknown>;
+            if (Object.keys(complete).length > 0) {
+              // Single-shot complete JSON → CLI → animate char-by-char
+              streamToolInputAnimate(projectId, state.currentStreamingToolId, complete);
+              state.pendingToolJson = "";
+              return assistantMessageExists;
+            }
+          } catch {
+            // Partial JSON → HTTP streaming → fall through to scheduleToolJsonParse
+          }
+        }
+
+        if (state.pendingToolJson.length > MAX_STREAMING_TOOL_JSON_CHARS) {
+          state.pendingToolJsonTruncated = true;
+          state.pendingToolJson = "";
+          state.pendingToolInput = {
             __pane_truncated: true,
             __pane_note:
               "Tool input streaming truncated (too large). Full input may still be available in the final message.",
           };
-          if (!toolInputFlushRaf) {
-            toolInputFlushRaf = requestAnimationFrame(() => flushToolInput(projectId));
+          if (!state.toolInputFlushRaf) {
+            state.toolInputFlushRaf = requestAnimationFrame(() =>
+              flushToolInput(projectId),
+            );
           }
           return assistantMessageExists;
         }
 
-        // Parse at most once per frame to avoid repeated O(n) scans + JSON.parse per chunk.
         scheduleToolJsonParse(projectId);
         return assistantMessageExists;
       }
 
-      // Server tool use block start (web search, etc.)
       if (
         evt.type === "content_block_start" &&
         evt.content_block?.type === "server_tool_use"
@@ -1003,7 +1945,10 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              const newContent = [...last.content, evt.content_block as ServerToolUseBlock];
+              const newContent = [
+                ...last.content,
+                evt.content_block as ServerToolUseBlock,
+              ];
               store.updateLastAssistantContent(projectId, newContent);
             }
           }
@@ -1011,7 +1956,6 @@ function handleClaudeMessage(
         return assistantMessageExists;
       }
 
-      // Web search tool result
       if (
         evt.type === "content_block_start" &&
         evt.content_block?.type === "web_search_tool_result"
@@ -1022,8 +1966,30 @@ function handleClaudeMessage(
             const msgs = project.conversation.messages;
             const last = msgs[msgs.length - 1];
             if (last && last.type === "assistant") {
-              const newContent = [...last.content, evt.content_block as WebSearchToolResultBlock];
+              const newContent = [
+                ...last.content,
+                evt.content_block as WebSearchToolResultBlock,
+              ];
               store.updateLastAssistantContent(projectId, newContent);
+            }
+          }
+        }
+        return assistantMessageExists;
+      }
+
+      if (evt.type === "content_block_stop") {
+        const project = store.projects.get(projectId);
+        if (project) {
+          const msgs = project.conversation.messages;
+          const last = msgs[msgs.length - 1];
+          if (last && last.type === "assistant") {
+            const lastBlock = last.content[last.content.length - 1];
+            if (
+              lastBlock &&
+              (lastBlock.type === "tool_use" ||
+                lastBlock.type === "server_tool_use")
+            ) {
+              store.setConversationStatusMessage(projectId, "thinking...");
             }
           }
         }
