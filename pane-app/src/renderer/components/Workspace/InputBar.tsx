@@ -898,7 +898,7 @@ export function InputBar({
 
           {/* Buttons — absolute bottom, floating over the textarea, no background */}
           <div
-            className="absolute bottom-0 left-0 right-0 flex items-center gap-2 pl-4 pr-2 pb-1.5 font-mono pointer-events-none"
+            className="absolute bottom-0 left-0 right-0 flex items-center gap-2 p-1.5 font-mono pointer-events-none"
             style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
             <button

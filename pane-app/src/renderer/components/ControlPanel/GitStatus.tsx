@@ -527,10 +527,11 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
         {canCommit && (
           <button
             onClick={handleCommit}
-            className="absolute top-2 right-2 z-10 w-9 h-9 flex items-center justify-center
+            className="absolute top-1.5 right-1.5 z-10 h-9 px-3 flex items-center justify-center
                        rounded-lg text-pane-text-secondary hover:text-pane-text
                        hover:bg-pane-text/[0.06] btn-press ring-1 ring-pane-border/40
-                       transition-all duration-150"
+                       transition-all duration-150 font-mono"
+            style={{ fontSize: "var(--pane-panel-font-size-sm)" }}
             title="Commit (⌘↵)"
           >
             {committing ? (
@@ -538,9 +539,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
                 <circle cx="7" cy="7" r="5" className="animate-circle-pulse" />
               </svg>
             ) : (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="20 6 9 17 4 12" />
-              </svg>
+              "commit"
             )}
           </button>
         )}
@@ -592,7 +591,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
 
         {/* Buttons — absolute bottom, floating inside the card, no background */}
         <div
-          className="absolute bottom-0 left-0 right-0 flex items-center gap-2 px-5 pb-1.5 font-mono pointer-events-none"
+          className="absolute bottom-0 left-0 right-0 flex items-center gap-2 p-1.5 font-mono pointer-events-none"
           style={{ fontSize: "var(--pane-font-size-xs)" }}
         >
           <button
