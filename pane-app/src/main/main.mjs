@@ -603,6 +603,21 @@ function registerCommandHandlers() {
     }
   });
 
+  ipcMain.handle("git_ahead_behind", async (_event, args) => {
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["rev-list", "--count", "--left-right", "HEAD...@{upstream}"],
+        { cwd: args.path },
+      );
+      const [ahead, behind] = stdout.trim().split(/\s+/).map(Number);
+      return { ahead: ahead || 0, behind: behind || 0 };
+    } catch {
+      // No upstream or other error — return zeros
+      return { ahead: 0, behind: 0 };
+    }
+  });
+
   ipcMain.handle("git_list_branches", async (_event, args) => {
     try {
       // Plain `git branch` output: "* main\n  feature\n  ..." — strip the * marker

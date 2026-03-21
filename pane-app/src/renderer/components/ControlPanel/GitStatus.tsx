@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import {
   getGitLog,
   getGitStatus,
+  getAheadBehind,
   draftCommitMessage,
   listBranches,
   checkoutBranch,
@@ -243,6 +244,8 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [pushState, setPushState] = useState<"idle" | "busy" | "ok" | "err">("idle");
   const [pullState, setPullState] = useState<"idle" | "busy" | "ok" | "err">("idle");
+  const [ahead, setAhead] = useState(0);
+  const [behind, setBehind] = useState(0);
   const [switchStatus, setSwitchStatus] = useState<string | null>(null);
   const [focused, setFocused] = useState(false);
   const [caretPos, setCaretPos] = useState<{ top: number; left: number; lineHeight: number } | null>(null);
@@ -251,12 +254,15 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
 
   // ── Load ────────────────────────────────────────────────────────────────────
   const load = useCallback(async () => {
-    const [s, cs] = await Promise.all([
+    const [s, cs, ab] = await Promise.all([
       getGitStatus(root).catch(() => ({ branch: "", files: {} } as GitStatusInfo)),
       getGitLog(root, 30).catch(() => [] as GitCommit[]),
+      getAheadBehind(root).catch(() => ({ ahead: 0, behind: 0 })),
     ]);
     setStatus(s);
     setCommits(cs);
+    setAhead(ab.ahead);
+    setBehind(ab.behind);
     setLoading(false);
   }, [root]);
 
@@ -328,6 +334,9 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
     try {
       await electronAPI.invoke("git_push", { path: root });
       setPushState("ok");
+      const ab = await getAheadBehind(root).catch(() => ({ ahead: 0, behind: 0 }));
+      setAhead(ab.ahead);
+      setBehind(ab.behind);
     } catch { setPushState("err"); }
     setTimeout(() => setPushState("idle"), 2500);
   };
@@ -340,7 +349,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
       await load();
       setPullState("ok");
     } catch { setPullState("err"); }
-    setTimeout(() => setPullState("idle"), 2500);
+    setTimeout(() => { setPullState("idle"); }, 2500);
   };
 
   const handleBranchSwitch = async (branch: string) => {
@@ -406,10 +415,10 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
 
   const pushLabel =
     pushState === "busy" ? "pushing…" : pushState === "ok" ? "pushed" :
-    pushState === "err" ? "failed" : "push";
+    pushState === "err" ? "failed" : ahead > 0 ? `push ${ahead}` : "push";
   const pullLabel =
     pullState === "busy" ? "pulling…" : pullState === "ok" ? "pulled" :
-    pullState === "err" ? "failed" : "pull";
+    pullState === "err" ? "failed" : behind > 0 ? `pull ${behind}` : "pull";
 
   const canCommit = !!commitMessage.trim() && !committing && fileCount > 0;
 

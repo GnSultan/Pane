@@ -590,6 +590,10 @@ export async function draftCommitMessage(
   return electronAPI.invoke("draft_commit_message", { projectId, root });
 }
 
+export async function getAheadBehind(path: string): Promise<{ ahead: number; behind: number }> {
+  return electronAPI.invoke("git_ahead_behind", { path });
+}
+
 export async function listBranches(path: string): Promise<{ branches: string[]; error?: string }> {
   return electronAPI.invoke("git_list_branches", { path });
 }
