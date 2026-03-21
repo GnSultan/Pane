@@ -40,6 +40,7 @@
   --animate-fadeIn: fadeIn 2.5s ease-out;
   --animate-fadeOut: fadeOut 1.5s ease-out forwards;
   --animate-circle-pulse: circle-pulse 2.5s ease-in-out infinite;
+  --animate-gentle-spin: gentle-spin 3.5s linear infinite;
   --animate-dot-1: orbit-1 3s ease-in-out infinite;
   --animate-dot-2: orbit-2 3.2s ease-in-out 0.1s infinite;
   --animate-dot-3: orbit-3 2.8s ease-in-out 0.2s infinite;
@@ -142,6 +143,19 @@
     opacity: 1;
     --circle-stroke-width: 2;
   }
+}
+
+/* Gentle spin — slow constant rotation for processing indicator */
+@keyframes gentle-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* Staggered radiate — each stroke fades through a peak, wave travels clockwise */
+@keyframes radiate {
+  0%, 100% { opacity: 0.12; }
+  30%       { opacity: 1;    }
+  60%       { opacity: 0.12; }
 }
 
 @keyframes breathe {

@@ -721,24 +721,38 @@ export function InputBar({
           <div
             className={`flex items-center gap-3 px-1 pb-3 ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
           >
+            {/* Radiating strokes — gentle spin */}
             <svg
-              width="20"
-              height="20"
+              width="18"
+              height="18"
               viewBox="0 0 24 24"
               fill="none"
               stroke="currentColor"
-              strokeWidth="1.5"
-              className="text-pane-text-secondary shrink-0"
+              strokeWidth="2"
+              strokeLinecap="round"
+              className="text-pane-text-secondary/70 shrink-0 animate-gentle-spin"
             >
-              <circle
-                cx="12"
-                cy="12"
-                r="7"
-                fill="none"
-                className="animate-circle-pulse"
-                style={{ strokeWidth: "var(--circle-stroke-width, 1.5)" }}
-              />
+              <line x1="12" y1="2"     x2="12"    y2="6" />
+              <line x1="16.24" y1="7.76"  x2="19.07" y2="4.93" />
+              <line x1="18" y1="12"    x2="22"    y2="12" />
+              <line x1="16.24" y1="16.24" x2="19.07" y2="19.07" />
+              <line x1="12" y1="18"    x2="12"    y2="22" />
+              <line x1="7.76" y1="16.24"  x2="4.93"  y2="19.07" />
+              <line x1="6"  y1="12"    x2="2"     y2="12" />
+              <line x1="7.76" y1="7.76"   x2="4.93"  y2="4.93" />
             </svg>
+            {/* Previous indicators — swap above SVG for either if needed
+            — circle-pulse (breathing circle):
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" strokeWidth="1.5"
+                 className="text-pane-text-secondary shrink-0">
+              <circle cx="12" cy="12" r="7" fill="none"
+                      className="animate-circle-pulse"
+                      style={{ strokeWidth: "var(--circle-stroke-width, 1.5)" }} />
+            </svg>
+            — radiate (staggered opacity ripple):
+            use animate-radiate-N classes on each stroke
+            */}
             {todos.length > 0 && (
               <button
                 onClick={() => setTodoPanelOpen((v) => !v)}
