@@ -171,6 +171,8 @@ export class ToolExecutor {
    * Record a change in the change history
    */
   async recordChange(change) {
+    // Debug probe — log every recordChange call to disk
+    try { await fsPromises.appendFile(path.join(os.homedir(), ".pane", "record-change-debug.log"), `[${new Date().toISOString()}] recordChange called: projectId=${this.projectId} file=${change.filePath}\n`); } catch {}
     try {
       const paneDir = path.join(os.homedir(), ".pane");
       const changeHistoryDir = path.join(paneDir, "change-history", this.projectId);
@@ -484,6 +486,7 @@ export class ToolExecutor {
    * Write file contents
    */
   async executeWriteFile(toolId, filePath, content) {
+    try { await fsPromises.appendFile(path.join(os.homedir(), ".pane", "record-change-debug.log"), `[${new Date().toISOString()}] executeWriteFile called: file=${filePath}\n`); } catch {}
     try {
       // Resolve and validate path
       const resolvedPath = this.resolveProjectPath(filePath);
@@ -495,11 +498,32 @@ export class ToolExecutor {
         };
       }
 
+      // Read previous content before overwriting (for change history)
+      let previousContent = "";
+      try {
+        previousContent = await fsPromises.readFile(resolvedPath, DEFAULT_ENCODING);
+      } catch {
+        // File doesn't exist yet — new file creation, oldString stays ""
+      }
+
       // Ensure directory exists
       await fsPromises.mkdir(path.dirname(resolvedPath), { recursive: true });
 
       // Write file
       await fsPromises.writeFile(resolvedPath, content, DEFAULT_ENCODING);
+
+      // Record the change in change history
+      try {
+        const relativePath = path.relative(this.projectRoot, resolvedPath);
+        await this.recordChange({
+          filePath: relativePath,
+          oldString: previousContent,
+          newString: content,
+          timestamp: Date.now(),
+        });
+      } catch (recorderError) {
+        console.error("Failed to record change:", recorderError);
+      }
 
       // Get file stats
       const stats = await fsPromises.stat(resolvedPath);
@@ -526,6 +550,7 @@ export class ToolExecutor {
    * Surgical edit: replace old_string with new_string
    */
   async executeReplace(toolId, filePath, oldString, newString) {
+    try { await fsPromises.appendFile(path.join(os.homedir(), ".pane", "record-change-debug.log"), `[${new Date().toISOString()}] executeReplace called: file=${filePath}\n`); } catch {}
     try {
       // Resolve and validate path
       const resolvedPath = this.resolveProjectPath(filePath);

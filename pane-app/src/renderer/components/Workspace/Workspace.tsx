@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback, memo } from "react";
 import { Conversation } from "./Conversation";
-import { FileViewer } from "./FileViewer";
+import { FileExplorer } from "./FileExplorer";
 import { Terminal } from "./Terminal";
 import { Profile } from "./Profile";
 import { Mind } from "./Mind";
@@ -185,7 +185,7 @@ export function Workspace() {
       </div>
 
       <div className={`absolute inset-0 flex flex-col ${overlay !== null || activeMode !== "viewer" ? "hidden" : ""}`}>
-        <FileViewer />
+        <FileExplorer />
       </div>
 
       <div className={`absolute inset-0 flex ${overlay !== null || activeMode !== "terminal" ? "hidden" : ""}`}>

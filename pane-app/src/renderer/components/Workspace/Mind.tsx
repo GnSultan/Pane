@@ -347,7 +347,7 @@ function EntryItem({
             <div className="flex items-center gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
               <button
                 onClick={handleCopy}
-                className="font-mono transition-colors"
+                className="font-mono transition-colors hover:!opacity-100"
                 style={{
                   fontSize: "10px",
                   color: copied
@@ -360,7 +360,7 @@ function EntryItem({
               </button>
               <button
                 onClick={handleDeleteClick}
-                className="font-mono transition-colors"
+                className="font-mono transition-colors hover:!opacity-100"
                 style={{
                   fontSize: "10px",
                   color: confirmDelete

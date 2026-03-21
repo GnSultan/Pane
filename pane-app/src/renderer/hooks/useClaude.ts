@@ -19,6 +19,7 @@ import {
   createCheckpoint,
   deleteProjectCheckpoints,
   recordMemoryEvents,
+  recordChange,
   generateBrief,
   brainIndexEvents,
   brainContextualSearch,
@@ -568,6 +569,82 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
   return events;
 }
 
+/**
+ * Record file changes from tool_use blocks into the change history.
+ * Works for both CLI tools (Edit, Write) and HTTP tools (replace, write_file).
+ * Called after each conversation turn completes.
+ */
+function recordChangeHistory(
+  projectId: string,
+  messages: ConversationMessage[],
+) {
+  // Find the last user message to scope to this turn only
+  let turnStart = messages.length - 1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.type === "user") {
+      turnStart = i;
+      break;
+    }
+  }
+  const turnMessages = messages.slice(turnStart);
+
+  // Build a set of tool_use IDs that errored, so we skip them
+  const erroredToolIds = new Set<string>();
+  for (const msg of turnMessages) {
+    for (const block of msg.content) {
+      if (
+        block.type === "tool_result" &&
+        (block as { is_error?: boolean }).is_error
+      ) {
+        const toolUseId = (block as { tool_use_id?: string }).tool_use_id;
+        if (toolUseId) erroredToolIds.add(toolUseId);
+      }
+    }
+  }
+
+  for (const msg of turnMessages) {
+    for (const block of msg.content) {
+      if (block.type !== "tool_use") continue;
+      const tool = block as ToolUseBlock;
+
+      // Skip tools that errored
+      if (erroredToolIds.has(tool.id)) continue;
+
+      const filePath =
+        (tool.input.file_path as string) ||
+        (tool.input.path as string) ||
+        (tool.input.target_file as string) ||
+        "";
+      if (!filePath) continue;
+
+      // replace / Edit — have old_string and new_string
+      if (
+        tool.name === "replace" ||
+        tool.name === "Edit"
+      ) {
+        const oldString = (tool.input.old_string as string) || "";
+        const newString = (tool.input.new_string as string) || "";
+        if (oldString || newString) {
+          recordChange(projectId, filePath, oldString, newString).catch(
+            () => {},
+          );
+        }
+      }
+
+      // write_file / Write — full file content
+      if (
+        tool.name === "write_file" ||
+        tool.name === "Write"
+      ) {
+        const content = (tool.input.content as string) || "";
+        if (content) {
+          recordChange(projectId, filePath, "", content).catch(() => {});
+        }
+      }
+    }
+  }
+}
+
 function extractSessionDelta(
   messages: ConversationMessage[],
   todos: Todo[],
@@ -965,6 +1042,9 @@ export function usePunk(projectId: string) {
             try {
               const proj = useProjectsStore.getState().projects.get(projectId);
               if (proj && proj.conversation.messages.length > 1) {
+                // Record file changes to change history
+                recordChangeHistory(projectId, proj.conversation.messages);
+
                 const memEvents = extractMemoryEvents(
                   proj.conversation.messages,
                 );

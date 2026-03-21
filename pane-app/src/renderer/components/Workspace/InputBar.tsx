@@ -719,7 +719,7 @@ export function InputBar({
         !discoveryActive &&
         !todoPanelOpen && (
           <div
-            className={`flex items-center gap-3 px-1 pb-3 ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
+            className={`flex items-center gap-3 px-3 pb-3 ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
           >
             {/* Radiating strokes — gentle spin */}
             <svg
@@ -887,7 +887,7 @@ export function InputBar({
                 }
                 onSend(trimmed); setValue(""); setPlanRejected(false);
               }}
-              className="absolute top-2 right-2 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
+              className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
               title="Send (Enter)"
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

@@ -98,7 +98,7 @@ function getToolLabel(name: string): string {
   }
 }
 
-function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
+export function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
   const oldStr = (input.old_string as string) || "";
   const newStr = (input.new_string as string) || "";
   const containerRef = useRef<HTMLDivElement>(null);
@@ -143,7 +143,7 @@ function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
   );
 }
 
-function ExpandedWriteInput({ input }: { input: Record<string, unknown> }) {
+export function ExpandedWriteInput({ input }: { input: Record<string, unknown> }) {
   const content = (input.content as string) || "";
 
   return (
@@ -417,7 +417,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
 
   return (
     <div
-      className={`rounded-md border transition-all duration-200 ${expanded ? 'border-[var(--pane-border-soft)] bg-[var(--pane-bg)] mb-2' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-0.5'}`}
+      className={`rounded-md border transition-all duration-200 ${expanded ? 'border-[var(--pane-border-soft)] bg-pane-bg/60 backdrop-blur-sm mb-2' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-0.5'}`}
     >
       <button
         onClick={() => setUserToggle(expanded ? false : true)}
@@ -451,7 +451,6 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
       {expanded && (
         <div
           ref={contentRef}
-          className="border-t border-pane-text-secondary/10"
         >
           {renderExpandedInput(toolUse.name, toolUse.input, toolResult)}
 
@@ -512,7 +511,7 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
 
   return (
     <div
-      className={`rounded-md border transition-all duration-200 ${expanded ? 'border-[var(--pane-border-soft)] bg-[var(--pane-bg)] mb-2' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-0.5'}`}
+      className={`rounded-md border transition-all duration-200 ${expanded ? 'border-[var(--pane-border-soft)] bg-pane-bg/60 backdrop-blur-sm mb-2' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-0.5'}`}
     >
       <button
         onClick={() => setExpanded(!expanded)}

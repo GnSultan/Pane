@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react";
-import { getChangeHistory, type ChangeEntry } from "../../lib/tauri-commands";
-import { MarkdownText } from "./MarkdownText";
+import { getChangeHistory, revertChange, type ChangeEntry } from "../../lib/tauri-commands";
+import { useProjectsStore } from "../../stores/projects";
+import { MicroIndicator } from "../shared";
+import { ExpandedEditInput, ExpandedWriteInput } from "./ToolActivity";
 
 interface ChangeHistoryPanelProps {
   projectId: string;
@@ -13,8 +15,6 @@ export function ChangeHistoryPanel({ projectId, onCollapse }: ChangeHistoryPanel
 
   useEffect(() => {
     loadChanges();
-    
-    // Reload every 2 seconds to catch new changes
     const interval = setInterval(loadChanges, 2000);
     return () => clearInterval(interval);
   }, [projectId]);
@@ -23,8 +23,8 @@ export function ChangeHistoryPanel({ projectId, onCollapse }: ChangeHistoryPanel
     try {
       const result = await getChangeHistory(projectId);
       setChanges(result.changes || []);
-    } catch (error) {
-      console.error("Failed to load change history:", error);
+    } catch {
+      // ignore
     } finally {
       setIsLoading(false);
     }
@@ -33,37 +33,56 @@ export function ChangeHistoryPanel({ projectId, onCollapse }: ChangeHistoryPanel
   return (
     <div className="h-full flex flex-col bg-pane-bg relative z-20">
       {/* Header */}
-      <div className="flex-shrink-0 px-5 py-4 border-b border-pane-border/10 flex items-center justify-between">
+      <div className="flex-shrink-0 px-4 py-3 flex items-center justify-between border-b border-pane-border/10">
         <div className="flex items-center gap-3">
-          <span className="text-pane-text text-sm font-medium">Change History</span>
-          <span className="text-pane-text-secondary/50 text-xs font-mono">
-            {changes.length} changes
+          <span
+            className="font-mono text-pane-text-secondary/60"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            history
+          </span>
+          <span
+            className="font-mono text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {changes.length}
           </span>
         </div>
         <button
           onClick={onCollapse}
-          className="text-pane-text-secondary/50 hover:text-pane-text-secondary/80 transition-colors"
+          className="text-pane-text-secondary/30 hover:text-pane-text-secondary/70 transition-colors"
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
             <path d="M6 18L18 6M6 6l12 12" />
           </svg>
         </button>
       </div>
-      
+
       {/* Content */}
-      <div className="flex-1 overflow-y-auto bg-pane-bg">
+      <div className="flex-1 overflow-y-auto py-1 custom-scrollbar">
         {isLoading ? (
-          <div className="flex items-center justify-center h-full text-pane-text-secondary text-sm">
-            Loading change history...
+          <div
+            className="flex items-center justify-center h-full font-mono text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            ·
           </div>
         ) : changes.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-pane-text-secondary text-sm">
-            No changes recorded yet. Edits will appear here.
+          <div
+            className="flex items-center justify-center h-full font-mono text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            no changes yet
           </div>
         ) : (
-          <div className="space-y-0">
+          <div>
             {changes.map((change) => (
-              <ChangeItem key={change.id} change={change} />
+              <ChangeItem
+                key={change.id}
+                change={change}
+                projectId={projectId}
+                onReverted={loadChanges}
+              />
             ))}
           </div>
         )}
@@ -72,82 +91,83 @@ export function ChangeHistoryPanel({ projectId, onCollapse }: ChangeHistoryPanel
   );
 }
 
-function ChangeItem({ change }: { change: ChangeEntry }) {
-  const [isExpanded, setIsExpanded] = useState(false);
+interface ChangeItemProps {
+  change: ChangeEntry;
+  projectId: string;
+  onReverted: () => void;
+}
+
+function ChangeItem({ change, projectId, onReverted }: ChangeItemProps) {
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
+  const [reverting, setReverting] = useState(false);
 
-  const formatTime = (timestamp: number) => {
-    const date = new Date(timestamp);
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const isWrite = !change.oldString;
+  const label = isWrite ? "write" : "edit";
+
+  // Collapsed by default — user expands on demand
+  const expanded = userToggle !== null ? userToggle : false;
+
+  const formatTime = (ts: number) => {
+    const d = new Date(ts);
+    const date = d.toLocaleDateString([], { month: "short", day: "numeric" });
+    const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return `${date} · ${time}`;
   };
 
-  const formatDate = (timestamp: number) => {
-    const date = new Date(timestamp);
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
-  };
-
-  // Get a summary of the change
-  const getSummary = () => {
-    const oldStr = change.oldString || "";
-    const newStr = change.newString || "";
-    
-    // If old string is empty, it's a file creation
-    if (!oldStr) {
-      return `Created file: ${change.file}`;
+  const handleRevert = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const project = useProjectsStore.getState().projects.get(projectId);
+    if (!project) return;
+    setReverting(true);
+    try {
+      await revertChange(projectId, change.id, project.root);
+      onReverted();
+    } catch {
+      // ignore
+    } finally {
+      setReverting(false);
     }
-    
-    // If new string is empty, it's a file deletion
-    if (!newStr) {
-      return `Deleted from: ${change.file}`;
-    }
-    
-    // Otherwise, it's an edit - show a preview of the old string
-    const previewLength = 50;
-    const preview = oldStr.length > previewLength 
-      ? oldStr.slice(0, previewLength) + "..." 
-      : oldStr;
-    
-    return `Edit in ${change.file}: "${preview}"`;
   };
 
-  // Determine expansion state
-  const expanded = userToggle !== null ? userToggle : isExpanded;
+  // Build input object matching the shape ExpandedEditInput/ExpandedWriteInput expect
+  const input: Record<string, unknown> = isWrite
+    ? { content: change.newString, file_path: change.file }
+    : { old_string: change.oldString, new_string: change.newString, file_path: change.file };
 
   return (
-    <div 
-      className={`border-b border-pane-text-secondary/10 transition-all duration-200 ${expanded ? 'border-[var(--pane-border-soft)] bg-[var(--pane-bg)] mb-0' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-0'}`}
+    <div
+      className={`rounded-md border transition-all duration-200 mx-1 ${
+        expanded
+          ? "border-[var(--pane-border-soft)] bg-pane-bg/60 backdrop-blur-sm mb-2"
+          : "border-transparent hover:border-[var(--pane-border-soft)] mb-0.5"
+      }`}
     >
+      {/* Row — identical structure to ToolActivity */}
       <button
-        onClick={() => {
-          const newExpanded = !expanded;
-          setUserToggle(newExpanded);
-          setIsExpanded(newExpanded);
-        }}
+        onClick={() => setUserToggle(!expanded)}
         className="flex items-center gap-2.5 text-pane-text-secondary font-mono
                    hover:text-pane-text w-full text-left
-                   h-10 leading-none px-5 group"
-        style={{
-          fontSize: "var(--pane-font-size-sm)",
-          minHeight: '2.5rem'
-        }}
+                   h-10 leading-none px-4 group"
+        style={{ fontSize: "var(--pane-font-size-sm)", minHeight: "2.5rem" }}
       >
-        {/* Timestamp */}
-        <span className="shrink-0 opacity-50 text-[10px]">
-          {formatDate(change.timestamp)} · {formatTime(change.timestamp)}
+        <MicroIndicator
+          variant="subtle"
+          animate={false}
+          size={5}
+          ariaLabel="change recorded"
+        />
+        <span className="shrink-0 opacity-70" style={{ color: "var(--pane-terminal)" }}>
+          {label}
         </span>
-        
-        {/* File path */}
-        <span className="shrink-0 opacity-70 text-pane-text-secondary/70">
-          {change.file}
+        <span className="truncate">{change.file}</span>
+        <span
+          className="ml-auto shrink-0 font-mono text-pane-text-secondary/30"
+          style={{ fontSize: "10px" }}
+        >
+          {formatTime(change.timestamp)}
         </span>
-        
-        {/* Summary */}
-        <span className="truncate">
-          {getSummary()}
-        </span>
-        
-        <span 
-          className="ml-auto shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-pane-text-secondary/20 font-mono"
+        <span
+          className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-pane-text-secondary/20 font-mono"
           style={{ fontSize: "var(--pane-font-size-sm)" }}
         >
           {expanded ? "collapse" : "expand"}
@@ -155,29 +175,22 @@ function ChangeItem({ change }: { change: ChangeEntry }) {
       </button>
 
       {expanded && (
-        <div className="border-t border-pane-text-secondary/10">
-          <div className="font-mono overflow-x-auto max-h-[400px] overflow-y-auto
-                        leading-[1.6] space-y-0"
-               style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
-          >
-            {change.oldString && (
-              <div className="px-5 py-4">
-                <div className="text-[9px] uppercase tracking-wider mb-2 text-pane-text-secondary/40">
-                  Original
-                </div>
-                <div className="opacity-50">
-                  <MarkdownText text={`\`\`\`ts\n${change.oldString}\n\`\`\``} />
-                </div>
-              </div>
-            )}
-            {change.newString && (
-              <div className="px-5 py-4 border-t border-pane-text-secondary/10">
-                <div className="text-[9px] uppercase tracking-wider mb-2 text-pane-text-secondary/40">
-                  Replacement
-                </div>
-                <MarkdownText text={`\`\`\`ts\n${change.newString}\n\`\`\``} />
-              </div>
-            )}
+        <div>
+          {isWrite
+            ? <ExpandedWriteInput input={input} />
+            : <ExpandedEditInput input={input} />
+          }
+
+          {/* Revert action */}
+          <div className="px-4 py-2 border-t border-pane-text-secondary/10 flex justify-end">
+            <button
+              onClick={handleRevert}
+              disabled={reverting}
+              className="font-mono text-pane-text-secondary/30 hover:text-pane-error/70 transition-colors disabled:opacity-30"
+              style={{ fontSize: "10px" }}
+            >
+              {reverting ? "reverting..." : "revert"}
+            </button>
           </div>
         </div>
       )}

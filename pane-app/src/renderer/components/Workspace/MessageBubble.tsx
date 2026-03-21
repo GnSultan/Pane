@@ -318,27 +318,34 @@ export function MessageBubble({
     return (
       <div className={`mb-10 group flex flex-col items-end ${animClass}`}>
         <div
-          className="px-5 py-4 rounded-lg ring-1 ring-pane-border/40"
+          className="bg-pane-bg/80 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 relative"
           style={{ maxWidth: "65ch" }}
         >
           <p
             ref={textRef}
-            className="text-pane-text font-mono leading-[1.75] whitespace-pre-wrap"
-            style={{ 
+            className="text-pane-text font-mono leading-[1.75] whitespace-pre-wrap px-4 py-4"
+            style={{
               fontSize: "var(--pane-font-size)",
               maxHeight: isExpanded ? 'none' : 'calc(24px * 10)',
-              overflow: isExpanded ? 'visible' : 'hidden'
+              overflow: isExpanded ? 'visible' : 'hidden',
+              paddingBottom: showExpand ? '32px' : undefined,
             }}
           >
             {truncatedText}
           </p>
           {showExpand && (
-            <button
-              onClick={() => setIsExpanded(!isExpanded)}
-              className="mt-2 text-pane-text-secondary/60 hover:text-pane-text-secondary text-xs font-mono"
-            >
-              {isExpanded ? 'collapse' : 'expand'}
-            </button>
+            <div className="absolute bottom-0 left-0 right-0 p-1.5 pointer-events-none">
+              <button
+                onClick={() => setIsExpanded(!isExpanded)}
+                className="pointer-events-auto inline-flex items-center px-3 py-1.5 rounded-md
+                  bg-pane-bg/70 backdrop-blur-sm ring-1 ring-pane-border/25
+                  text-pane-text-secondary/50 hover:text-pane-text-secondary
+                  font-mono btn-press transition-colors"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                {isExpanded ? 'collapse' : 'expand'}
+              </button>
+            </div>
           )}
         </div>
         <div className="flex items-center justify-end gap-2 mt-1">

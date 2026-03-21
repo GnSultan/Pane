@@ -5,38 +5,143 @@ import { useWorkspaceStore } from "../../stores/workspace";
 import { writeFile } from "../../lib/tauri-commands";
 import { markFileWritten } from "../../hooks/useFileWatcher";
 
-// Import ace modes and themes
+// Import ace modes
 import "ace-builds/src-noconflict/mode-javascript";
 import "ace-builds/src-noconflict/mode-typescript";
 import "ace-builds/src-noconflict/mode-json";
 import "ace-builds/src-noconflict/mode-html";
 import "ace-builds/src-noconflict/mode-css";
+import "ace-builds/src-noconflict/mode-scss";
+import "ace-builds/src-noconflict/mode-less";
 import "ace-builds/src-noconflict/mode-markdown";
 import "ace-builds/src-noconflict/mode-python";
 import "ace-builds/src-noconflict/mode-rust";
 import "ace-builds/src-noconflict/mode-jsx";
 import "ace-builds/src-noconflict/mode-tsx";
+import "ace-builds/src-noconflict/mode-golang";
+import "ace-builds/src-noconflict/mode-ruby";
+import "ace-builds/src-noconflict/mode-sh";
+import "ace-builds/src-noconflict/mode-yaml";
+import "ace-builds/src-noconflict/mode-toml";
+import "ace-builds/src-noconflict/mode-sql";
+import "ace-builds/src-noconflict/mode-c_cpp";
+import "ace-builds/src-noconflict/mode-java";
+import "ace-builds/src-noconflict/mode-swift";
+import "ace-builds/src-noconflict/mode-kotlin";
+import "ace-builds/src-noconflict/mode-php";
+import "ace-builds/src-noconflict/mode-lua";
+import "ace-builds/src-noconflict/mode-xml";
+import "ace-builds/src-noconflict/mode-svg";
+import "ace-builds/src-noconflict/mode-dockerfile";
+import "ace-builds/src-noconflict/mode-makefile";
+import "ace-builds/src-noconflict/mode-graphqlschema";
+import "ace-builds/src-noconflict/mode-elixir";
+import "ace-builds/src-noconflict/mode-haskell";
+import "ace-builds/src-noconflict/mode-ocaml";
+import "ace-builds/src-noconflict/mode-scala";
+import "ace-builds/src-noconflict/mode-dart";
+import "ace-builds/src-noconflict/mode-zig";
+import "ace-builds/src-noconflict/mode-diff";
+import "ace-builds/src-noconflict/mode-ini";
+import "ace-builds/src-noconflict/mode-text";
 import "ace-builds/src-noconflict/ext-language_tools";
 // Import the custom Pane theme
 import "../../lib/pane-ace-theme";
 
-// Debug: Log when the theme is imported
-console.log('[FileViewer] Custom Pane theme imported');
-
 // Map file extensions to Ace modes
 function getModeForFile(filePath: string): string {
   const ext = filePath.split('.').pop()?.toLowerCase();
+  const name = filePath.split('/').pop()?.toLowerCase() ?? '';
+
+  // Match by filename first (dotfiles, Makefile, Dockerfile, etc.)
+  const nameMap: Record<string, string> = {
+    'makefile': 'makefile',
+    'gnumakefile': 'makefile',
+    'dockerfile': 'dockerfile',
+    'gemfile': 'ruby',
+    'rakefile': 'ruby',
+    '.bashrc': 'sh',
+    '.zshrc': 'sh',
+    '.bash_profile': 'sh',
+    '.profile': 'sh',
+    '.gitignore': 'text',
+    '.env': 'ini',
+    '.editorconfig': 'ini',
+  };
+  if (nameMap[name]) return nameMap[name];
+
   const modeMap: Record<string, string> = {
+    // JavaScript / TypeScript
     'js': 'javascript',
+    'mjs': 'javascript',
+    'cjs': 'javascript',
     'jsx': 'jsx',
     'ts': 'typescript',
+    'mts': 'typescript',
+    'cts': 'typescript',
     'tsx': 'tsx',
-    'json': 'json',
+    // Web
     'html': 'html',
+    'htm': 'html',
     'css': 'css',
+    'scss': 'scss',
+    'less': 'less',
+    'svg': 'svg',
+    'xml': 'xml',
+    // Data / config
+    'json': 'json',
+    'jsonc': 'json',
+    'yaml': 'yaml',
+    'yml': 'yaml',
+    'toml': 'toml',
+    'ini': 'ini',
+    'cfg': 'ini',
+    'conf': 'ini',
+    // Markdown
     'md': 'markdown',
-    'py': 'python',
+    'mdx': 'markdown',
+    // Shell
+    'sh': 'sh',
+    'bash': 'sh',
+    'zsh': 'sh',
+    'fish': 'sh',
+    // Systems
     'rs': 'rust',
+    'go': 'golang',
+    'c': 'c_cpp',
+    'h': 'c_cpp',
+    'cpp': 'c_cpp',
+    'cc': 'c_cpp',
+    'cxx': 'c_cpp',
+    'hpp': 'c_cpp',
+    'zig': 'zig',
+    // JVM
+    'java': 'java',
+    'kt': 'kotlin',
+    'kts': 'kotlin',
+    'scala': 'scala',
+    // Apple
+    'swift': 'swift',
+    // Scripting
+    'py': 'python',
+    'rb': 'ruby',
+    'php': 'php',
+    'lua': 'lua',
+    'ex': 'elixir',
+    'exs': 'elixir',
+    'erl': 'elixir',
+    'dart': 'dart',
+    // Functional
+    'hs': 'haskell',
+    'ml': 'ocaml',
+    'mli': 'ocaml',
+    // Query / schema
+    'sql': 'sql',
+    'graphql': 'graphqlschema',
+    'gql': 'graphqlschema',
+    // Other
+    'diff': 'diff',
+    'patch': 'diff',
   };
   return modeMap[ext || ''] || 'text';
 }
@@ -301,7 +406,7 @@ export function FileViewer() {
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="flex-1 min-h-0 w-full max-w-[780px] mx-auto relative z-20" data-no-drag>
+      <div className="flex-1 min-h-0 w-full relative z-20" data-no-drag>
       <AceEditor
         ref={editorRef}
         mode={getModeForFile(activeFilePath)}
@@ -313,13 +418,13 @@ export function FileViewer() {
         height="100%"
         fontSize={editorFontSize}
         showPrintMargin={false}
-        showGutter={false}
+        showGutter={true}
         highlightActiveLine={false}
         enableBasicAutocompletion={true}
         enableLiveAutocompletion={false}
         enableSnippets={false}
         setOptions={{
-          showLineNumbers: false,
+          showLineNumbers: true,
           tabSize: 2,
           useWorker: false,
           wrap: true,

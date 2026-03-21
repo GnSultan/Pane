@@ -291,14 +291,23 @@ function createProjectsStore() {
     setActiveProject: (id: string) => {
       set((state) => {
         const project = state.projects.get(id);
-        if (project && project.hasUnreadCompletion) {
-          // Clear the notification badge when viewing the project
-          const updatedProject = { ...project, hasUnreadCompletion: false };
-          const updatedProjects = new Map(state.projects);
-          updatedProjects.set(id, updatedProject);
-          return { activeProjectId: id, projects: updatedProjects };
-        }
-        return { activeProjectId: id };
+        if (!project) return { activeProjectId: id };
+
+        // Carry the current workspace mode to the target project so switching
+        // threads while in file explorer (or terminal, etc.) stays locked there.
+        const currentProject = state.activeProjectId
+          ? state.projects.get(state.activeProjectId)
+          : undefined;
+        const carryMode = currentProject?.mode;
+
+        const updatedProjects = new Map(state.projects);
+        const updatedProject = {
+          ...project,
+          hasUnreadCompletion: false,
+          ...(carryMode ? { mode: carryMode } : {}),
+        };
+        updatedProjects.set(id, updatedProject);
+        return { activeProjectId: id, projects: updatedProjects };
       });
     },
 
@@ -405,10 +414,10 @@ function createProjectsStore() {
     toggleMode: (projectId) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          // Toggle between Chat and Viewer (if a file is open), or Chat and Terminal (if no file)
+          // Toggle between Chat and Viewer (file explorer / directory browser)
           let nextMode: "conversation" | "viewer" | "terminal" | "git";
           if (p.mode === "conversation") {
-            nextMode = p.activeFilePath ? "viewer" : "terminal";
+            nextMode = "viewer";
           } else {
             // From git, terminal, or viewer — always go back to conversation
             nextMode = "conversation";

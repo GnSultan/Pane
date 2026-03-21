@@ -42,7 +42,7 @@ export function TaskNotification() {
   if (notifications.length === 0) return null;
 
   return (
-    <div className="fixed bottom-4 right-4 flex flex-col gap-2 z-50 pointer-events-none">
+    <div className="fixed top-3.5 right-3.5 flex flex-col gap-2 z-50 pointer-events-none">
       {notifications.map((notification) => (
         <div
           key={notification.id}

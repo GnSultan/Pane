@@ -174,10 +174,6 @@ export function ControlPanel() {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
   });
-  const activeFilePath = useProjectsStore((s) => {
-    if (!s.activeProjectId) return null;
-    return s.projects.get(s.activeProjectId)?.activeFilePath ?? null;
-  });
   const isGitRepo = useProjectsStore((s) => {
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.git.isGitRepo ?? false;
@@ -205,14 +201,13 @@ export function ControlPanel() {
       if (mode === newMode) return; // overlay was covering this mode, just close it
     }
     if (mode === newMode) return;
-    if (newMode === "viewer" && !activeFilePath) return;
     setMode(activeProjectId, newMode);
     if (newMode === "conversation") {
       window.dispatchEvent(new CustomEvent("pane:focus-input"));
     } else if (newMode === "viewer") {
       window.dispatchEvent(new CustomEvent("pane:focus-editor"));
     }
-  }, [activeProjectId, mode, activeFilePath, setMode]);
+  }, [activeProjectId, mode, setMode]);
 
   return (
     <div
@@ -239,9 +234,8 @@ export function ControlPanel() {
         <ToolbarButton
           icon={<FileIcon />}
           active={mode === "viewer"}
-          disabled={!activeFilePath}
           onClick={() => handleSetMode("viewer")}
-          tooltip="Editor"
+          tooltip="Files"
         />
         <ToolbarButton
           icon={<SearchIcon />}
