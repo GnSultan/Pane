@@ -114,7 +114,7 @@ class RoutingStore {
       data.domain              ?? null,
       data.model               ?? null,
       data.provider            ?? null,
-      data.heuristicConfidence ?? null,
+      data.routingConfidence ?? data.heuristicConfidence ?? null,
       data.oracleUsed          ? 1 : 0,
       data.oracleConfidence    ?? null,
       data.promptLength        ?? null,

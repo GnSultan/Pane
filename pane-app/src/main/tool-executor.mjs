@@ -143,6 +143,24 @@ function validateCommand(command, projectRoot) {
 }
 
 // ============================================================================
+// Change history write queue — shared across all ToolExecutor instances.
+// Serializes writes per project so concurrent tool calls never race on the file.
+// ============================================================================
+
+const changeHistoryQueues = new Map(); // projectId -> Promise tail
+
+function enqueueChangeWrite(projectId, fn) {
+  const prev = changeHistoryQueues.get(projectId) ?? Promise.resolve();
+  const next = prev.then(fn).catch(err =>
+    console.error("[tool-executor] change-history write failed:", err.message)
+  );
+  changeHistoryQueues.set(projectId, next.then(() => {
+    if (changeHistoryQueues.get(projectId) === next) changeHistoryQueues.delete(projectId);
+  }));
+  return next;
+}
+
+// ============================================================================
 // Tool Executor Class
 // ============================================================================
 
@@ -168,49 +186,39 @@ export class ToolExecutor {
   }
 
   /**
-   * Record a change in the change history
+   * Record a change in the change history.
+   * Writes are serialized per project via a queue and use atomic temp→rename.
    */
   async recordChange(change) {
-    // Debug probe — log every recordChange call to disk
-    try { await fsPromises.appendFile(path.join(os.homedir(), ".pane", "record-change-debug.log"), `[${new Date().toISOString()}] recordChange called: projectId=${this.projectId} file=${change.filePath}\n`); } catch {}
-    try {
-      const paneDir = path.join(os.homedir(), ".pane");
-      const changeHistoryDir = path.join(paneDir, "change-history", this.projectId);
-      const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
-      
-      // Read existing changes
+    const paneDir = path.join(os.homedir(), ".pane");
+    const histDir = path.join(paneDir, "change-history", this.projectId);
+    const histFile = path.join(histDir, "changes.json");
+
+    const newChange = {
+      id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: change.timestamp || Date.now(),
+      file: change.filePath,
+      oldString: change.oldString,
+      newString: change.newString,
+      description: change.description || "",
+    };
+
+    await enqueueChangeWrite(this.projectId, async () => {
       let changes = [];
       try {
-        const data = await fsPromises.readFile(changeHistoryFile, "utf-8");
-        changes = JSON.parse(data);
+        changes = JSON.parse(await fsPromises.readFile(histFile, "utf-8"));
       } catch {
-        // File doesn't exist or is corrupted, start with empty array
+        // Missing or corrupt — start fresh
       }
-      
-      // Add new change
-      const newChange = {
-        id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        timestamp: change.timestamp || Date.now(),
-        file: change.filePath,
-        oldString: change.oldString,
-        newString: change.newString,
-        description: change.description || "",
-      };
-      
-      changes.unshift(newChange); // Add to beginning (most recent first)
-      
-      // Keep only last 500 changes
-      const trimmed = changes.slice(0, 500);
-      
-      // Write back to file
-      await fsPromises.mkdir(changeHistoryDir, { recursive: true });
-      await fsPromises.writeFile(changeHistoryFile, JSON.stringify(trimmed, null, 2), "utf-8");
-      
-      return { id: newChange.id, success: true };
-    } catch (error) {
-      console.error("Failed to record change:", error);
-      return { success: false, error: error.message };
-    }
+      changes.unshift(newChange);
+      await fsPromises.mkdir(histDir, { recursive: true });
+      // Atomic: write to .tmp then rename — no partial-write corruption
+      const tmp = histFile + ".tmp";
+      await fsPromises.writeFile(tmp, JSON.stringify(changes.slice(0, 500), null, 2), "utf-8");
+      await fsPromises.rename(tmp, histFile);
+    });
+
+    return { id: newChange.id, success: true };
   }
 
   /**

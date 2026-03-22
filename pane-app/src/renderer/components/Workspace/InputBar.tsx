@@ -4,13 +4,11 @@ import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
 import type { Todo } from "../../lib/punk-types";
-import { respondToDiscovery, approvePlan, rejectPlan } from "../../lib/tauri-commands";
+import { approvePlan, rejectPlan } from "../../lib/tauri-commands";
 import {
   PROVIDER_MODELS,
   THINKING_ENGINES,
   BUILDING_ENGINES,
-  keyFromRoute,
-  DEFAULT_BACKEND_ROUTING,
   getContextLimit,
   isThinkingModel,
 } from "../../lib/models";
@@ -107,7 +105,6 @@ function ModelPicker({
   const punkBackend = useWorkspaceStore((s) => s.punkBackend);
   const httpApiKeys = useWorkspaceStore((s) => s.httpApiKeys);
   const openRouterModels = useWorkspaceStore((s) => s.openRouterModels);
-  const routing = useWorkspaceStore(useShallow((s) => s.getEffectiveRouting()));
 
   const filteredProviderModels = useMemo(() => {
     const isGeminiBackend = punkBackend === "gemini-cli";
@@ -279,80 +276,6 @@ function ModelPicker({
     return () => document.removeEventListener("mousedown", handler);
   }, [open]);
 
-  const activeRouting = (routing ||
-    DEFAULT_BACKEND_ROUTING[punkBackend] ||
-    DEFAULT_BACKEND_ROUTING["http"])!;
-
-  const activeThinking =
-    THINKING_ENGINES.find(
-      (o) => keyFromRoute(o) === keyFromRoute(activeRouting.plan),
-    ) ??
-    THINKING_ENGINES.find(
-      (o) =>
-        keyFromRoute(o) ===
-        keyFromRoute(
-          DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ??
-            DEFAULT_BACKEND_ROUTING["http"]?.plan,
-        ),
-    ) ?? {
-      label: activeRouting.plan?.model ?? "auto",
-      provider: activeRouting.plan?.provider ?? "",
-      model: activeRouting.plan?.model ?? "auto",
-      thinking: false,
-      requiresKey: "",
-    };
-  const activeBuilding =
-    BUILDING_ENGINES.find(
-      (o) => keyFromRoute(o) === keyFromRoute(activeRouting.execute),
-    ) ??
-    BUILDING_ENGINES.find(
-      (o) =>
-        keyFromRoute(o) ===
-        keyFromRoute(
-          DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ??
-            DEFAULT_BACKEND_ROUTING["http"]?.execute,
-        ),
-    ) ?? {
-      label: activeRouting.execute?.model ?? "auto",
-      provider: activeRouting.execute?.provider ?? "",
-      model: activeRouting.execute?.model ?? "auto",
-      thinking: false,
-      requiresKey: "",
-    };
-
-  const thinkingLabel = activeThinking.label.split(" — ")[0]!.toLowerCase();
-  const buildingLabel = activeBuilding.label.split(" — ")[0]!.toLowerCase();
-  const isRedundant = thinkingLabel === buildingLabel;
-
-  const displayLabel = useMemo(() => {
-    if (isRedundant) return thinkingLabel;
-    if (activeThinking.provider === activeBuilding.provider) {
-      // Common provider: "gemini 3.1 pro" + "gemini 3.1 flash" -> "gemini 3.1 pro + flash"
-      const tParts = thinkingLabel.split(" ");
-      const bParts = buildingLabel.split(" ");
-      let common = 0;
-      while (
-        common < tParts.length &&
-        common < bParts.length &&
-        tParts[common] === bParts[common]
-      ) {
-        common++;
-      }
-      if (common > 0) {
-        const prefix = tParts.slice(0, common).join(" ");
-        const tSuffix = tParts.slice(common).join(" ");
-        const bSuffix = bParts.slice(common).join(" ");
-        return `${prefix} ${tSuffix} + ${bSuffix}`;
-      }
-    }
-    return `${thinkingLabel} + ${buildingLabel}`;
-  }, [
-    isRedundant,
-    thinkingLabel,
-    buildingLabel,
-    activeThinking.provider,
-    activeBuilding.provider,
-  ]);
 
   // When smart routing is active and a specific model has been chosen for this turn, show it
   const showSpecificModel =
@@ -537,9 +460,6 @@ export function InputBar({
   const pendingPlanApproval = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.pendingPlanApproval ?? false,
   );
-  const discoveryActive = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.discoveryActive ?? false,
-  );
   const selectedModel = useWorkspaceStore((s) => s.selectedModel);
   const setSelectedModel = useWorkspaceStore((s) => s.setSelectedModel);
   const setHttpProvider = useWorkspaceStore((s) => s.setHttpProvider);
@@ -578,7 +498,7 @@ export function InputBar({
   // Only fade out after real processing happened — not on initial mount.
   const wasProcessingRef = useRef(false);
   useEffect(() => {
-    if (isProcessing && !discoveryActive) {
+    if (isProcessing) {
       wasProcessingRef.current = true;
       setIsFadingOut(false);
     } else if (wasProcessingRef.current) {
@@ -587,7 +507,7 @@ export function InputBar({
       const timer = setTimeout(() => setIsFadingOut(false), 1500);
       return () => clearTimeout(timer);
     }
-  }, [isProcessing, discoveryActive]);
+  }, [isProcessing]);
 
   // Update static caret position
   const updateCaret = useCallback(() => {
@@ -616,10 +536,10 @@ export function InputBar({
 
   // Auto-focus when not processing
   useEffect(() => {
-    if ((!isProcessing || discoveryActive) && textareaRef.current && isConversationVisible()) {
+    if (!isProcessing && textareaRef.current && isConversationVisible()) {
       textareaRef.current.focus();
     }
-  }, [isProcessing, discoveryActive]);
+  }, [isProcessing]);
 
   // Cmd+K focus
   useEffect(() => {
@@ -655,15 +575,6 @@ export function InputBar({
     (e: React.KeyboardEvent) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        // During discovery, send response to the discovery channel instead
-        if (discoveryActive) {
-          const trimmed = value.trim();
-          if (trimmed) {
-            respondToDiscovery(projectId, trimmed);
-            setValue("");
-          }
-          return;
-        }
         const trimmed = value.trim();
         if (trimmed) {
           onSend(trimmed);
@@ -676,7 +587,7 @@ export function InputBar({
         onAbort();
       }
     },
-    [value, isProcessing, discoveryActive, projectId, onSend, onAbort],
+    [value, isProcessing, projectId, onSend, onAbort],
   );
 
   const handleAcceptPlan = useCallback(() => {
@@ -693,29 +604,9 @@ export function InputBar({
 
   return (
     <div className="bg-transparent">
-      {/* Discovery mode indicator */}
-      {discoveryActive && (
-        <div className="flex items-center gap-3 px-1 pb-3 animate-fadeIn">
-          <span
-            className="text-pane-text-secondary font-mono"
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
-          >
-            discussing...
-          </span>
-          <button
-            onClick={() => respondToDiscovery(projectId, "__SKIP_DISCOVERY__")}
-            className="text-pane-text-secondary font-mono hover:text-pane-text ml-auto btn-press"
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
-          >
-            skip — just do it
-          </button>
-        </div>
-      )}
-
       {/* Processing indicator — only exists when active, no reserved space */}
       {(isProcessing || isFadingOut) &&
         !pendingPlanApproval &&
-        !discoveryActive &&
         !todoPanelOpen && (
           <div
             className={`flex items-center gap-3 px-3 pb-3 ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
@@ -843,7 +734,7 @@ export function InputBar({
               onFocus={() => { setTextareaFocused(true); updateCaret(); }}
               onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
               placeholder={
-                discoveryActive ? "reply..." : isProcessing ? "" : planRejected ? "what should change..." : "let's build..."
+                isProcessing ? "" : planRejected ? "what should change..." : "let's build..."
               }
               className="w-full bg-transparent text-pane-text font-mono
                          resize-none outline-none placeholder:text-pane-text-secondary
@@ -879,11 +770,6 @@ export function InputBar({
               onClick={() => {
                 const trimmed = value.trim();
                 if (!trimmed) return;
-                if (discoveryActive) {
-                  respondToDiscovery(projectId, trimmed);
-                  setValue("");
-                  return;
-                }
                 onSend(trimmed); setValue(""); setPlanRejected(false);
               }}
               className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"

@@ -361,8 +361,8 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
         const isDirty = raw.includes("overwritten") || raw.includes("uncommitted");
         if (isDirty) {
           setSwitchStatus("stashing…");
-          const stash = await electronAPI.invoke("git_stash", { path: root });
-          if (!stash.success) {
+          const stashResult = await electronAPI.invoke("git_stash", { path: root }) as { success: boolean; error?: string };
+          if (!stashResult.success) {
             setSwitchStatus("stash failed");
             setTimeout(() => setSwitchStatus(null), 3000);
             return;

@@ -57,6 +57,9 @@ function defaultState() {
     lastProvider: null,
     lastIntent: null,
     startedAt: Date.now(),
+
+    // Orchestration phase — tracks where in the pipeline this session is
+    phase: "idle",  // "idle" | "discovery" | "planning" | "execution"
   };
 }
 

@@ -849,6 +849,10 @@ function extractMethodViolations(
 
 export function usePunk(projectId: string) {
   const abortingRef = useRef(false);
+  // Set to true when sendMessage aborts an in-flight session to replace it with a new one.
+  // Prevents the old processEnded from calling finishProcessing (which would set isProcessing=false)
+  // and from nulling the session ID — the new message needs both intact.
+  const intentionalAbortRef = useRef(false);
 
   const sendMessage = useCallback(
     async (prompt: string) => {
@@ -856,10 +860,11 @@ export function usePunk(projectId: string) {
       const project = store.projects.get(projectId);
       if (!project) return;
 
-      // If already processing, abort the current generation first.
-      // Flush pending deltas so the partial assistant response is preserved
-      // in the conversation — the user's new message may reference it.
+      // If already processing, abort the current generation and immediately replace it.
+      // Mark intentionalAbort so the old processEnded skips finishProcessing/session-null.
+      // UI stays on isProcessing=true the whole time — user sees no interruption.
       if (project.conversation.isProcessing) {
+        intentionalAbortRef.current = true;
         await abortPunk(projectId).catch(() => {});
         resetStreamingState(projectId, true); // flush = true to capture partial response
         const s = useProjectsStore.getState();
@@ -1005,6 +1010,9 @@ export function usePunk(projectId: string) {
                 oracleUsed:       d.oracleUsed       ?? false,
                 oracleConfidence: d.oracleConfidence ?? null,
                 oracleExploring:  d.oracleExploring  ?? false,
+                localTaskType:    d.localTaskType    ?? null,
+                localComplexity:  d.localComplexity  ?? null,
+                localAtomHints:   d.localAtomHints   ?? [],
               }],
               timestamp: Date.now(),
               isStreaming: false,
@@ -1042,6 +1050,14 @@ export function usePunk(projectId: string) {
             // Each step exit fires processEnded — ignore these mid-plan or we'd
             // mark the conversation done and show spurious errors after step 1.
             if (orchestrationActive) break;
+
+            // This processEnded belongs to a session that was intentionally aborted
+            // to make way for a new message. Skip all cleanup — isProcessing stays
+            // true, session ID stays intact, new message is already in flight.
+            if (intentionalAbortRef.current) {
+              intentionalAbortRef.current = false;
+              break;
+            }
 
             // If the process died without ever sending a result event, surface an error
             if (!resultReceived) {
@@ -1199,57 +1215,15 @@ export function usePunk(projectId: string) {
           }
 
           // ── Orchestration Events (Control Inversion) ──────────────────
-          case "orchestration_discovery_start": {
+          case "orchestration_phase": {
+            const { phase, model, provider } = event.data;
             const s = useProjectsStore.getState();
-            s.setConversationStatusMessage(projectId, "Understanding the task...");
-            break;
-          }
-
-          case "orchestration_discovery": {
-            // Model is asking questions during discovery — show as assistant message
-            // and enable input so the user can respond
-            const s = useProjectsStore.getState();
-            s.addConversationMessage(projectId, {
-              id: `discovery-${Date.now()}`,
-              type: "assistant",
-              content: [{ type: "text", text: event.data.message }],
-              timestamp: Date.now(),
-              isStreaming: false,
-            });
-            s.setConversationStatusMessage(projectId, "Discussing...");
-            s.setDiscoveryActive(projectId, true);
-            break;
-          }
-
-          case "orchestration_discovery_response": {
-            // User's response during discovery — add as user message
-            const s = useProjectsStore.getState();
-            s.addConversationMessage(projectId, {
-              id: `discovery-user-${Date.now()}`,
-              type: "user",
-              content: [{ type: "text", text: event.data.message }],
-              timestamp: Date.now(),
-              isStreaming: false,
-            });
-            s.setDiscoveryActive(projectId, false);
-            s.setConversationStatusMessage(projectId, "Understanding the task...");
-            break;
-          }
-
-          case "orchestration_discovery_complete": {
-            // Alignment reached — show confirmation and transition to planning
-            const s = useProjectsStore.getState();
-            if (event.data.message) {
-              s.addConversationMessage(projectId, {
-                id: `discovery-aligned-${Date.now()}`,
-                type: "assistant",
-                content: [{ type: "text", text: event.data.message }],
-                timestamp: Date.now(),
-                isStreaming: false,
-              });
-            }
-            s.setDiscoveryActive(projectId, false);
-            s.setConversationStatusMessage(projectId, "Aligned — decomposing task...");
+            s.setConversationPhase(projectId, phase);
+            const label =
+              phase === "discovery" ? "Understanding the task..."
+              : phase === "planning" ? `Planning with ${model || provider || "model"}...`
+              : "Executing...";
+            s.setConversationStatusMessage(projectId, label);
             break;
           }
 
@@ -1377,6 +1351,7 @@ export function usePunk(projectId: string) {
 
           case "orchestration_complete": {
             orchestrationActive = false;
+            useProjectsStore.getState().setConversationPhase(projectId, "idle");
             const {
               summary,
               completedSteps,
@@ -1401,6 +1376,14 @@ export function usePunk(projectId: string) {
             );
             resultReceived = true;
             finishProcessing();
+
+            // Record file changes from orchestration steps
+            try {
+              const proj = useProjectsStore.getState().projects.get(projectId);
+              if (proj && proj.conversation.messages.length > 1) {
+                recordChangeHistory(projectId, proj.conversation.messages);
+              }
+            } catch {}
             break;
           }
 
@@ -1422,10 +1405,19 @@ export function usePunk(projectId: string) {
 
           case "orchestration_error": {
             orchestrationActive = false;
+            useProjectsStore.getState().setConversationPhase(projectId, "idle");
             console.error(`[orchestration] Error: ${event.data.message}`);
             const s = useProjectsStore.getState();
             s.setConversationError(projectId, event.data.message);
             finishProcessing();
+
+            // Record any changes made before the error
+            try {
+              const proj = useProjectsStore.getState().projects.get(projectId);
+              if (proj && proj.conversation.messages.length > 1) {
+                recordChangeHistory(projectId, proj.conversation.messages);
+              }
+            } catch {}
             break;
           }
         }

@@ -282,35 +282,6 @@ Respond with ONLY a JSON object. No markdown, no explanation, no code fences.
 // Discovery Prompt — alignment conversation before planning
 // ---------------------------------------------------------------------------
 
-const DISCOVERY_SYSTEM_PROMPT = `You are a senior engineer on the user's team. The user is about to describe a task they want built. Your job is NOT to start coding — your job is to deeply understand what they want through genuine conversation.
-
-Rules:
-- Ask clarifying questions about anything ambiguous or underspecified.
-- Challenge assumptions. If their approach has a flaw, say so — respectfully, directly.
-- Surface edge cases, trade-offs, or constraints they may not have considered.
-- Propose your interpretation of what they want. "If I understand correctly, you want X that does Y because Z."
-- Keep it conversational. You're a teammate, not a requirements-gathering bot. Be concise.
-- If the task is already crystal clear (specific files, exact changes, no ambiguity), you can align in a single turn.
-- Do NOT write any code. Do NOT plan implementation steps. That comes later.
-
-Response format — you MUST respond with valid JSON every turn:
-
-When you have questions or want to discuss:
-{
-  "message": "Your conversational text here. Ask questions naturally, challenge ideas, propose alternatives.",
-  "aligned": false
-}
-
-When you and the user are fully aligned and you're ready to proceed:
-{
-  "message": "Brief confirmation of what was agreed.",
-  "aligned": true,
-  "summary": "A precise, actionable description of the task incorporating everything discussed. This replaces the user's original prompt — it must be complete enough for a planner to decompose into steps without any additional context.",
-  "decisions": ["key decision 1 made during discussion", "key decision 2"]
-}
-
-Only set aligned: true when the user has explicitly confirmed your understanding. Do not assume alignment.`;
-
 // ---------------------------------------------------------------------------
 // Step Execution Prompt
 // ---------------------------------------------------------------------------
@@ -526,175 +497,13 @@ export class TaskRunner {
    *   Signature: (projectId, prompt, systemOverride, request) => Promise<{ messages: any[] }>
    * @param {Function} onEvent — Callback for progress events.
    *   Signature: (projectId, event, requestId) => void
-   * @param {Function} planCall — Function that makes a planning API call (no tools).
-   *   Signature: (systemPrompt, userPrompt, request) => Promise<string>
-   * @param {Function} conversationCall — Multi-turn capable call (no tools).
-   *   Signature: (systemPrompt, messages, request) => Promise<string>
    */
-  constructor(spawnStep, onEvent, planCall, conversationCall) {
+  constructor(spawnStep, onEvent) {
     this.spawnStep = spawnStep;
     this.onEvent = onEvent;
-    this.planCall = planCall;
-    this.conversationCall = conversationCall;
-    this.activeRuns = new Map();       // projectId -> { plan, currentStep, aborted }
-    this.discoveryResolvers = new Map(); // projectId -> resolve fn
-    this.planApprovalResolvers = new Map(); // projectId -> { resolve, reject }
+    this.activeRuns = new Map();         // projectId -> { plan, currentStep, aborted }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Discovery Phase — conversational alignment before planning
-  // ─────────────────────────────────────────────────────────────────────────
-
-  /**
-   * Run a multi-turn discovery conversation to align on the task before planning.
-   * The model asks questions, the user responds, until both sides agree on what
-   * to build. Returns the aligned summary that replaces the raw prompt for planning.
-   *
-   * @param {string} projectId
-   * @param {string} prompt — the user's original task description
-   * @param {object} request — the request object (model, provider, etc.)
-   * @returns {Promise<{ summary: string, decisions: string[] }>}
-   */
-  async discoveryPhase(projectId, prompt, request) {
-    const MAX_TURNS = 10;
-    const messages = [
-      { role: "user", content: prompt },
-    ];
-
-    this.onEvent(projectId, {
-      event: "orchestration_discovery_start",
-      data: { prompt },
-    }, request.requestId);
-
-    for (let turn = 0; turn < MAX_TURNS; turn++) {
-      // Call the model with the full conversation so far
-      let rawResponse;
-      try {
-        rawResponse = await this.conversationCall(
-          DISCOVERY_SYSTEM_PROMPT,
-          messages,
-          request,
-        );
-      } catch (err) {
-        console.error("[task-runner] Discovery call failed:", err.message);
-        // Fall back to using the raw prompt
-        return { summary: prompt, decisions: [] };
-      }
-
-      // Parse the structured JSON response
-      let parsed;
-      try {
-        // Handle responses that might have markdown fencing
-        const cleaned = rawResponse
-          .replace(/^```json\s*/i, "")
-          .replace(/```\s*$/, "")
-          .trim();
-        parsed = JSON.parse(cleaned);
-      } catch {
-        // Model didn't produce valid JSON — treat as a question turn with raw text
-        parsed = { message: rawResponse, aligned: false };
-      }
-
-      // Check if the run was aborted
-      const runState = this.activeRuns.get(projectId);
-      if (runState?.aborted) {
-        return { summary: prompt, decisions: [] };
-      }
-
-      // ── ALIGNED: model and user agree, proceed to planning ──────────────
-      if (parsed.aligned && parsed.summary) {
-        // Emit the final alignment message to the conversation
-        this.onEvent(projectId, {
-          event: "orchestration_discovery_complete",
-          data: {
-            message: parsed.message,
-            summary: parsed.summary,
-            decisions: parsed.decisions || [],
-          },
-        }, request.requestId);
-
-        return {
-          summary: parsed.summary,
-          decisions: parsed.decisions || [],
-        };
-      }
-
-      // ── NOT ALIGNED: model has questions or wants to discuss ─────────────
-      messages.push({ role: "assistant", content: rawResponse });
-
-      // Emit the question to the frontend
-      this.onEvent(projectId, {
-        event: "orchestration_discovery",
-        data: {
-          message: parsed.message || rawResponse,
-          turn: turn + 1,
-          maxTurns: MAX_TURNS,
-        },
-      }, request.requestId);
-
-      // Wait for user response — this Promise resolves when respondToDiscovery() is called
-      const userResponse = await new Promise((resolve) => {
-        this.discoveryResolvers.set(projectId, resolve);
-      });
-      this.discoveryResolvers.delete(projectId);
-
-      // Check for skip signal
-      if (userResponse === "__SKIP_DISCOVERY__") {
-        this.onEvent(projectId, {
-          event: "orchestration_discovery_complete",
-          data: {
-            message: "Skipping alignment — proceeding with original task.",
-            summary: prompt,
-            decisions: [],
-          },
-        }, request.requestId);
-        return { summary: prompt, decisions: [] };
-      }
-
-      // Add user response to conversation and continue the loop
-      messages.push({ role: "user", content: userResponse });
-
-      // Emit the user response as a conversation message
-      this.onEvent(projectId, {
-        event: "orchestration_discovery_response",
-        data: { message: userResponse },
-      }, request.requestId);
-    }
-
-    // Max turns reached — use what we have
-    console.warn("[task-runner] Discovery hit max turns without alignment. Using raw prompt.");
-    return { summary: prompt, decisions: [] };
-  }
-
-  approvePlan(projectId) {
-    const resolver = this.planApprovalResolvers.get(projectId);
-    if (resolver) resolver.resolve();
-    else console.warn(`[task-runner] approvePlan: no pending resolver for ${projectId}`);
-  }
-
-  rejectPlan(projectId) {
-    const resolver = this.planApprovalResolvers.get(projectId);
-    if (resolver) resolver.reject(new Error("Plan rejected by user"));
-    else console.warn(`[task-runner] rejectPlan: no pending resolver for ${projectId}`);
-  }
-
-  /**
-   * Called by IPC when the user responds during discovery.
-   * Resolves the pending Promise in discoveryPhase().
-   */
-  respondToDiscovery(projectId, response) {
-    const resolver = this.discoveryResolvers.get(projectId);
-    if (resolver) {
-      resolver(response);
-    } else {
-      console.warn(`[task-runner] respondToDiscovery: no pending resolver for ${projectId}`);
-    }
-  }
-
-  /**
-   * Determine if a task should use the TaskRunner (multi-step orchestration)
-   * vs going straight to the model (simple single-turn tasks).
-   */
   /**
    * Decide whether this task should go through the orchestration loop.
    *
@@ -764,155 +573,22 @@ export class TaskRunner {
   }
 
   /**
-   * Main entry point. Decomposes the task, executes steps, verifies results.
+   * Execute an approved plan step by step.
+   * Called by punk-engine._orchestrate() after plan approval.
+   *
    * @param {string} projectId
-   * @param {string} prompt
-   * @param {object} request          — execution request (model used per step)
-   * @param {object} [planningRequest] — separate request for the planning call (reasoning model)
+   * @param {{ summary: string, steps: object[] }} plan — the approved plan (from Plan tool input)
+   * @param {string} planId — persisted plan ID from plan-store
+   * @param {object} request — execution request (model, workingDir, etc.)
    */
-  async run(projectId, prompt, request, planningRequest, options = {}) {
-    const runState = { plan: null, currentStep: 0, aborted: false };
+  async executeSteps(projectId, plan, planId, request) {
+    const runState = { plan, currentStep: 0, aborted: false, planId };
     this.activeRuns.set(projectId, runState);
 
+    const context = compileContext(projectId, "execute", 0);
+
     try {
-      // Emit orchestration start
-      this.onEvent(projectId, {
-        event: "orchestration_start",
-        data: { prompt },
-      }, request.requestId);
-
-      // ── PHASE 0: DISCOVERY ─────────────────────────────────────────────
-      // Conversational alignment before planning. The model asks questions,
-      // challenges assumptions, and proposes its understanding. Only proceeds
-      // to planning after the user explicitly confirms alignment.
-      const callRequest = planningRequest || request;
-      let taskPrompt = prompt;
-      let discoveryDecisions = [];
-
-      if (this.conversationCall && !options.skipDiscovery) {
-        const discovery = await this.discoveryPhase(projectId, prompt, callRequest);
-        taskPrompt = discovery.summary;
-        discoveryDecisions = discovery.decisions;
-
-        if (runState.aborted) return;
-      }
-
-      // ── PHASE 1: DECOMPOSE ─────────────────────────────────────────────
-      const state = readState(projectId);
-      const context = compileContext(projectId, "execute", 0);
-
-      // Lock discovery decisions into session state
-      if (discoveryDecisions.length > 0) {
-        const existingDecisions = state.decisions || [];
-        mergeState(projectId, {
-          decisions: [
-            ...existingDecisions,
-            ...discoveryDecisions.map(d => ({ content: d, source: "discovery" })),
-          ],
-        });
-      }
-
-      // Build planning context from the full compiled context — same rich snapshot
-      // every execution model gets: brief, brain memories, pre-read files, symbol map,
-      // Project DNA, decisions, recent actions, etc.
-      const recentConversation = buildConversationContext(request.history || []);
-      const userPrompt = [
-        `Project working directory: ${request.workingDir}`,
-        "",
-        context.full,      // everything: project brief, brain memories, pre-read files, decisions, DNA…
-        recentConversation ? `Recent conversation:\n${recentConversation}` : "",
-        `Task:\n${taskPrompt}`,
-      ].filter(Boolean).join("\n");
-
-      this.onEvent(projectId, {
-        event: "orchestration_planning_start",
-        data: {},
-      }, request.requestId);
-
-      // callRequest was already resolved in discovery phase above
-      const planningModel = callRequest.model || null;
-      const executionModel = request.model || null;
-
-      let plan;
-      try {
-        const planRaw = await this.planCall(
-          PLANNING_SYSTEM_PROMPT,
-          userPrompt,
-          callRequest,
-          (chunk) => {
-            this.onEvent(projectId, {
-              event: "orchestration_planning_chunk",
-              data: { chunk },
-            }, request.requestId);
-          },
-        );
-        // Models sometimes wrap JSON in markdown code fences despite instructions.
-        // Extract the first {...} block from the response.
-        const planJson = extractJson(planRaw);
-        plan = JSON.parse(planJson);
-      } catch (err) {
-        console.error("[task-runner] Planning call failed:", err.message);
-        // Surface the failure — emit an error event so the user sees it
-        this.onEvent(projectId, {
-          event: "orchestration_error",
-          data: { message: `Planning failed: ${err.message}` },
-        }, request.requestId);
-        return;
-      }
-
-      // Validate plan
-      if (!plan.steps || plan.steps.length === 0) {
-        throw new Error("Planning produced empty step list");
-      }
-
-      runState.plan = plan;
-
-      // Persist plan as a durable artifact on disk
-      const { planId } = createPlan(projectId, plan.summary, plan.steps, {
-        planning: planningModel,
-        execution: executionModel,
-      });
-      runState.planId = planId;
-
-      this.onEvent(projectId, {
-        event: "orchestration_plan",
-        data: {
-          planId,
-          summary: plan.summary,
-          steps: plan.steps.map(s => ({
-            index: s.index,
-            action: s.action,
-            type: s.type,
-            files: s.files,
-          })),
-          totalSteps: plan.steps.length,
-          planningModel,
-          executionModel,
-        },
-      }, request.requestId);
-
-      // Update session state with task info
-      mergeState(projectId, {
-        activeTask: { description: plan.summary },
-        todos: plan.steps.map(s => ({
-          content: s.action,
-          status: "pending",
-          activeForm: s.action.split(" ").slice(0, 4).join(" ") + "...",
-        })),
-      });
-
-      // ── PLAN APPROVAL GATE ─────────────────────────────────────────────
-      // Pause here and wait for the user to approve the plan.
-      // approvePlan() / rejectPlan() resolve or reject this promise.
-      try {
-        await new Promise((resolve, reject) => {
-          this.planApprovalResolvers.set(projectId, { resolve, reject });
-        });
-      } finally {
-        this.planApprovalResolvers.delete(projectId);
-      }
-
-      // ── STEP 2: EXECUTE EACH STEP ──────────────────────────────────────
+      // ── EXECUTE EACH STEP ──────────────────────────────────────────────
       const stepResults = [];
       // Track all change IDs produced across all steps (for scope reporting)
       const allStepChangeIds = [];
@@ -1236,7 +912,7 @@ export class TaskRunner {
       }, request.requestId);
 
     } catch (err) {
-      console.error("[task-runner] Run failed:", err.message);
+      console.error("[task-runner] executeSteps failed:", err.message);
       this.onEvent(projectId, {
         event: "orchestration_error",
         data: { message: err.message },

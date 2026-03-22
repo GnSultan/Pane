@@ -287,10 +287,6 @@ export async function abortPunk(projectId: string): Promise<void> {
   return electronAPI.invoke("abort_punk", { projectId });
 }
 
-export async function respondToDiscovery(projectId: string, response: string): Promise<void> {
-  return electronAPI.invoke("respond_to_discovery", { projectId, response });
-}
-
 export async function approvePlan(projectId: string): Promise<void> {
   return electronAPI.invoke("approve_plan", { projectId });
 }

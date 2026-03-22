@@ -95,13 +95,11 @@ export async function load() {
 }
 
 /**
- * Classify a user message. Returns a LocalDecision or null (caller falls back
- * to deriveStrategy heuristics).
+ * Classify a user message. Returns a LocalDecision — sole classifier, no fallback.
  *
  * Deadline: 500ms. The first call per session takes ~300-500ms (WASM JIT
  * compilation on first inference). Subsequent calls are ~50-150ms, well under
- * the deadline. The caller (punk-engine) fires this in parallel with routing
- * config loads to overlap the wait.
+ * the deadline. The caller (punk-engine) awaits readiness before calling.
  */
 export async function classify(input) {
   if (!_ready || !_brainSend) return null;

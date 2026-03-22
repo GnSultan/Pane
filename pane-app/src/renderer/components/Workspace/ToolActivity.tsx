@@ -368,6 +368,26 @@ function formatToolOutput(content: unknown): string {
   return truncated;
 }
 
+/**
+ * Strip the noise from tool error content.
+ * Returns clean, minimal lines — no code fences, no stack traces, no generics soup.
+ * At most 3 lines: enough to know what went wrong, not enough to overwhelm.
+ */
+function formatErrorContent(content: unknown): string {
+  const raw = typeof content === "string" ? content : JSON.stringify(content);
+  const lines = raw
+    .split("\n")
+    .map(l => l.trim())
+    // Drop empty lines, stack frames, code fence markers, and ansi escape codes
+    .filter(l =>
+      l.length > 0 &&
+      !l.startsWith("at ") &&
+      !l.startsWith("```") &&
+      !l.match(/^\u001b/)
+    );
+  return lines.slice(0, 3).join("\n") || raw.trim().slice(0, 120);
+}
+
 export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -454,27 +474,20 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
         >
           {renderExpandedInput(toolUse.name, toolUse.input, toolResult)}
 
-          {/* Hide tool result for Edit/Write/Read - the input already shows what changed or was read.
-              Only show results for errors or tools where the output matters (Bash, Grep, etc.) */}
-          {toolResult && !["Edit", "Write", "Read", "replace", "write_file", "read_file"].includes(toolUse.name) && (
+          {/* Error output — clean, unified, no markdown noise */}
+          {toolResult?.is_error && (
             <div
-              className={`px-4 py-4 overflow-x-auto max-h-[250px] overflow-y-auto leading-[1.6]
-                          ${
-                            toolResult.is_error
-                              ? "text-pane-error"
-                              : "text-pane-text-secondary"
-                          }`}
+              className="px-4 pb-4 font-mono text-pane-error leading-[1.6] whitespace-pre-wrap"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
-              <MarkdownText text={formatToolOutput(toolResult.content)} />
+              {formatErrorContent(toolResult.content)}
             </div>
           )}
-          {/* Always show errors, even for Edit/Write/Read */}
-          {toolResult?.is_error && ["Edit", "Write", "Read", "replace", "write_file", "read_file"].includes(toolUse.name) && (
+
+          {/* Success output — hide for Edit/Write/Read (input already shows what changed) */}
+          {toolResult && !toolResult.is_error && !["Edit", "Write", "Read", "replace", "write_file", "read_file"].includes(toolUse.name) && (
             <div
-              className="px-4 py-4 overflow-x-auto max-h-[250px] overflow-y-auto
-                         text-pane-error
-                         leading-[1.6]"
+              className="px-4 pb-4 overflow-x-auto max-h-[250px] overflow-y-auto text-pane-text-secondary leading-[1.6]"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
               <MarkdownText text={formatToolOutput(toolResult.content)} />
@@ -548,7 +561,7 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
         >
           {isError ? (
             <div
-              className="text-pane-error/80"
+              className="font-mono text-pane-error leading-[1.6]"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
               {(searchResult.content as WebSearchToolResultError).error_code}

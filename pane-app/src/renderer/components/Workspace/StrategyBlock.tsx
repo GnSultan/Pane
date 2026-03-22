@@ -38,46 +38,27 @@ function humanSummary(block: StrategyBlock): string {
   const model = modelShortName(block.model);
   const lines: string[] = [];
 
-  // Local intelligence path — Qwen produced a real decision
-  if (block.localIntelUsed && block.localTaskType) {
-    const taskLabel = TASK_TYPE_LABEL[block.localTaskType] ?? block.localTaskType;
-    const complexityLabel = block.localComplexity ? COMPLEXITY_LABEL[block.localComplexity] ?? block.localComplexity : null;
+  const taskLabel = block.localTaskType ? (TASK_TYPE_LABEL[block.localTaskType] ?? block.localTaskType) : "general task";
+  const complexityLabel = block.localComplexity ? (COMPLEXITY_LABEL[block.localComplexity] ?? block.localComplexity) : null;
 
-    // Lead with what Qwen actually understood
-    const desc = complexityLabel ? `${complexityLabel} ${taskLabel}` : taskLabel;
+  const desc = complexityLabel ? `${complexityLabel} ${taskLabel}` : taskLabel;
 
-    if (block.mode === "orchestrate") {
-      lines.push(`${desc} — breaking into steps before executing with ${model}.`);
-      if (block.discovery) lines.push("Checking scope before committing — the task boundaries aren't fully clear yet.");
-    } else if (block.mode === "discuss") {
-      lines.push(`${desc} — treating as a conversation with ${model}.`);
-      if (block.discovery) lines.push("This could shift direction, keeping it open.");
-    } else {
-      lines.push(`${desc} — executing directly with ${model}.`);
-    }
-
-    // Surface atom hints: what the brain flagged as relevant context
-    if (block.localAtomHints && block.localAtomHints.length > 0) {
-      lines.push(`Context pulled: ${block.localAtomHints.join(", ")}.`);
-    }
-
-    // Reasoning depth
-    if (block.reasoning === "deep") {
-      lines.push("Thinking this through carefully before responding.");
-    }
+  if (block.mode === "orchestrate") {
+    lines.push(`${desc} — breaking into steps before executing with ${model}.`);
+    if (block.discovery) lines.push("Checking scope before committing — the task boundaries aren't fully clear yet.");
+  } else if (block.mode === "discuss") {
+    lines.push(`${desc} — treating as a conversation with ${model}.`);
+    if (block.discovery) lines.push("This could shift direction, keeping it open.");
   } else {
-    // Heuristic fallback path — no Qwen decision
-    if (block.mode === "orchestrate") {
-      lines.push(
-        `Breaking this into a plan first, then executing with ${model}.` +
-        (block.discovery ? " Checking alignment before starting." : "")
-      );
-    } else if (block.mode === "discuss") {
-      lines.push(`Conversation with ${model}.`);
-    } else {
-      lines.push(`Direct execution with ${model}.`);
-    }
-    if (block.reasoning === "deep") lines.push("Deep reasoning mode.");
+    lines.push(`${desc} — executing directly with ${model}.`);
+  }
+
+  if (block.localAtomHints && block.localAtomHints.length > 0) {
+    lines.push(`Context pulled: ${block.localAtomHints.join(", ")}.`);
+  }
+
+  if (block.reasoning === "deep") {
+    lines.push("Thinking this through carefully before responding.");
   }
 
   // Oracle override — always surface if it changed the model

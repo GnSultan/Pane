@@ -9,7 +9,7 @@ import {
   revealInFinder,
   type FileEntry,
 } from "../../lib/tauri-commands";
-import { getParentDir, getFileName } from "../../lib/file-utils";
+import { getParentDir } from "../../lib/file-utils";
 import { FileViewer } from "./FileViewer";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

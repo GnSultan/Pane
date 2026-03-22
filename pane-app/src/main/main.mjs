@@ -21,6 +21,7 @@ import {
   punkEngine,
 } from "./punk-engine.mjs";
 import { modelManager } from "./model-manager.mjs";
+import { startBackupSchedule } from "./backup-engine.mjs";
 import {
   load as loadLocalIntelligence,
   onProgress as onLocalIntelProgress,
@@ -1343,6 +1344,9 @@ function registerCheckpointHandlers() {
     return path.join(changeHistoryDir(projectId), "changes.json");
   }
 
+  // Per-project write queue — serializes concurrent writes so they never race.
+  const changeHistoryQueues = new Map(); // projectId -> Promise
+
   async function readChangeHistory(projectId) {
     try {
       const file = changeHistoryFile(projectId);
@@ -1357,30 +1361,50 @@ function registerCheckpointHandlers() {
     const dir = changeHistoryDir(projectId);
     await fs.promises.mkdir(dir, { recursive: true });
     const file = changeHistoryFile(projectId);
-    await fs.promises.writeFile(file, JSON.stringify(changes, null, 2), "utf-8");
+    // Atomic write: write to temp file then rename — prevents partial-write corruption
+    const tmp = file + ".tmp";
+    await fs.promises.writeFile(tmp, JSON.stringify(changes, null, 2), "utf-8");
+    await fs.promises.rename(tmp, file);
+  }
+
+  // Enqueue a change-history write for a project.
+  // All writes for the same project are chained — no two run concurrently.
+  function enqueueChangeWrite(projectId, fn) {
+    const prev = changeHistoryQueues.get(projectId) ?? Promise.resolve();
+    const next = prev.then(fn).catch(err =>
+      console.error("[change-history] write failed:", err.message)
+    );
+    // Keep only the tail — old resolved promises can be GC'd
+    changeHistoryQueues.set(projectId, next.then(() => {
+      if (changeHistoryQueues.get(projectId) === next) changeHistoryQueues.delete(projectId);
+    }));
+    return next;
   }
 
   ipcMain.handle("record_change", async (_event, args) => {
-    const { projectId, filePath, oldString, newString, description, timestamp } = args;
-    
-    const changes = await readChangeHistory(projectId);
-    
+    const { projectId, filePath, oldString, newString, description, timestamp, workingDir } = args;
+
+    // Normalize to relative path — Claude Code passes absolute paths
+    let relFile = filePath;
+    if (workingDir && path.isAbsolute(filePath) && filePath.startsWith(workingDir)) {
+      relFile = path.relative(workingDir, filePath);
+    }
+
     const change = {
       id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       timestamp: timestamp || Date.now(),
-      file: filePath,
+      file: relFile,
       oldString,
       newString,
       description: description || "",
     };
-    
-    changes.unshift(change); // Add to beginning (most recent first)
-    
-    // Keep only last 500 changes to prevent unbounded growth
-    const trimmed = changes.slice(0, 500);
-    
-    await writeChangeHistory(projectId, trimmed);
-    
+
+    await enqueueChangeWrite(projectId, async () => {
+      const changes = await readChangeHistory(projectId);
+      changes.unshift(change);
+      await writeChangeHistory(projectId, changes.slice(0, 500));
+    });
+
     return { id: change.id, success: true };
   });
 
@@ -2186,6 +2210,9 @@ app.whenReady().then(() => {
   } catch {
     // Settings read failed — local intelligence stays disabled
   }
+  // Daily backup at midnight — silent, automatic, 7-day rotation
+  startBackupSchedule();
+
   app.on("activate", () => {
     if (mainWindow) {
       mainWindow.show();

@@ -9,23 +9,27 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
 import { BrowserWindow, utilityProcess, ipcMain } from "electron";
 
 const execFileAsync = promisify(execFile);
 
-// Resolve bundled CLI paths — works in both dev and production (asar).
-// Same logic as cli-worker.mjs: redirect asar → asar.unpacked so the
-// binaries can actually be spawned.
-function getBundledCliPath(packageName, relPath) {
-  const workerDir = path.dirname(fileURLToPath(import.meta.url));
-  const appRoot = path.resolve(workerDir, "../..");
-  const p = path.join(appRoot, "node_modules", packageName, relPath);
-  return p.replace(/app\.asar([/\\])/g, "app.asar.unpacked$1");
+// Enrich PATH for spawned CLIs — mirrors main.mjs and cli-worker.mjs.
+// Packaged Electron apps have a minimal PATH; this adds nvm, homebrew, etc.
+function getEnvWithPath() {
+  const home = os.homedir();
+  const nvmBins = [];
+  try {
+    for (const v of readdirSync(path.join(home, ".nvm", "versions", "node"))) {
+      nvmBins.push(path.join(home, ".nvm", "versions", "node", v, "bin"));
+    }
+  } catch {}
+  const extra = [...nvmBins, "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"];
+  const existing = process.env.PATH || "";
+  const combined = [...extra, ...existing.split(":")].filter(Boolean).join(":");
+  return { ...process.env, PATH: combined };
 }
-
-const CLAUDE_CLI_PATH = getBundledCliPath("@anthropic-ai/claude-agent-sdk", "cli.js");
 
 const STALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes of silence = stalled
 
@@ -92,8 +96,42 @@ function spawnWithStallTimeout(command, args, options = {}) {
     });
   });
 }
-import { deriveStrategy } from "./derive-strategy.mjs";
 import { HttpBackend } from "./http-backend.mjs";
+
+// ── Planning phase system prompt ───────────────────────────────────────────
+// Injected for the planning spawn. The model's only job is to call Plan once.
+const DISCOVERY_AND_PLANNING_SYSTEM_PROMPT = `You are the thinking model for Pane's orchestration engine. The task boundaries aren't fully clear yet — your job is to explore, understand, and then plan.
+
+Phase 1 — Discovery:
+- Use read_file, list_directory, glob, and grep_search to explore the codebase
+- Understand the existing architecture, patterns, and conventions before deciding anything
+- If the user's request is ambiguous, ask clarifying questions — this is a conversation, not a one-shot
+- Surface trade-offs, edge cases, or constraints the user may not have considered
+- Do NOT start coding or writing files — discovery is read-only
+
+Phase 2 — Planning:
+- Once you understand the full scope, call the Plan tool EXACTLY ONCE
+- Each step must be fully specified: exact file, exact change, exact location
+- The final step must always be a verify step (tsc, tests, or build command)
+- Your plan should reflect everything you learned during discovery
+
+Rules:
+- Explore thoroughly before planning — do not guess at file names or structure
+- If something is unclear, ask. Better to clarify now than replan later.
+- After calling Plan, your turn is complete — do not continue`;
+
+const PLANNING_PHASE_SYSTEM_PROMPT = `You are the planning model for Pane's orchestration engine.
+
+Your ONLY job is:
+1. Use read_file, list_directory, glob, and grep_search to gather the context you need
+2. Call the Plan tool EXACTLY ONCE with a precise, structured implementation plan
+
+Rules:
+- Explore the codebase thoroughly before planning — do not guess at file names or structure
+- Each step must be fully specified: exact file, exact change, exact location
+- The final step must always be a verify step (tsc, tests, or build command)
+- Do NOT write any code — execution happens after the user approves the plan
+- After calling Plan, your turn is complete — do not continue`;
 import { PunkBackend } from "./punk-backend.mjs";
 import { modelManager } from "./model-manager.mjs";
 import { TaskRunner } from "./task-runner.mjs";
@@ -323,12 +361,12 @@ class CliBackend extends PunkBackend {
     const combinedPrompt = `${systemPrompt}\n\n${userPrompt}`;
 
     if (this.command === "claude") {
-      const args = [CLAUDE_CLI_PATH, "--print"];
+      const args = ["--print"];
       if (request.model) args.push("--model", request.model);
-      const stdout = await spawnWithStallTimeout(process.execPath, args, {
+      const stdout = await spawnWithStallTimeout("claude", args, {
         stdin: combinedPrompt,
         onChunk,
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+        env: getEnvWithPath(),
       });
       return stdout.trim();
     }
@@ -338,7 +376,7 @@ class CliBackend extends PunkBackend {
       if (request.model && /gemini/i.test(request.model)) {
         args.push("--model", request.model);
       }
-      const stdout = await spawnWithStallTimeout("gemini", args, { stdin: combinedPrompt, onChunk });
+      const stdout = await spawnWithStallTimeout("gemini", args, { stdin: combinedPrompt, onChunk, env: getEnvWithPath() });
       return stdout.trim();
     }
 
@@ -364,11 +402,11 @@ class CliBackend extends PunkBackend {
     const combinedPrompt = parts.join("\n");
 
     if (this.command === "claude") {
-      const args = [CLAUDE_CLI_PATH, "--print"];
+      const args = ["--print"];
       if (request.model) args.push("--model", request.model);
-      const stdout = await spawnWithStallTimeout(process.execPath, args, {
+      const stdout = await spawnWithStallTimeout("claude", args, {
         stdin: combinedPrompt,
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+        env: getEnvWithPath(),
       });
       return stdout.trim();
     }
@@ -378,7 +416,7 @@ class CliBackend extends PunkBackend {
       if (request.model && /gemini/i.test(request.model)) {
         args.push("--model", request.model);
       }
-      const stdout = await spawnWithStallTimeout("gemini", args, { stdin: combinedPrompt });
+      const stdout = await spawnWithStallTimeout("gemini", args, { stdin: combinedPrompt, env: getEnvWithPath() });
       return stdout.trim();
     }
 
@@ -402,6 +440,21 @@ class PunkEngine {
     // Per-project last completed outcome — used for retrospective scoring
     // when the next message reveals whether the previous response was good
     this._projectLastOutcome = new Map(); // projectId → { outcomeId, pendingTodoCount }
+    // Plan approval gate — resolvers keyed by projectId
+    // Shared with HttpBackend so the Plan tool intercept can block until the user approves
+    this.planApprovalResolvers = new Map();
+  }
+
+  approvePlan(projectId) {
+    const resolver = this.planApprovalResolvers.get(projectId);
+    if (resolver) resolver.resolve();
+    else console.warn(`[punk] approvePlan: no pending resolver for ${projectId}`);
+  }
+
+  rejectPlan(projectId) {
+    const resolver = this.planApprovalResolvers.get(projectId);
+    if (resolver) resolver.reject(new Error("Plan rejected by user"));
+    else console.warn(`[punk] rejectPlan: no pending resolver for ${projectId}`);
   }
 
   /**
@@ -436,6 +489,8 @@ class PunkEngine {
         break;
       case "http":
         this.backend = new HttpBackend(onEvent);
+        // Inject shared approval resolvers — Plan tool in http-backend blocks on these
+        this.backend.planApprovalResolvers = this.planApprovalResolvers;
         break;
       default:
         throw new Error(`Unknown backend type: ${backendType}`);
@@ -451,14 +506,6 @@ class PunkEngine {
         this.backend.spawnStep(projectId, prompt, systemOverride, request),
       // onEvent: relay events to renderer
       onEvent,
-      // planCall: route through the active backend's planning method
-      (systemPrompt, userPrompt, request) =>
-        this.backend.planningCall(systemPrompt, userPrompt, request),
-      // conversationCall: multi-turn call for discovery phase
-      this.backend.conversationCall
-        ? (systemPrompt, messages, request) =>
-            this.backend.conversationCall(systemPrompt, messages, request)
-        : null,
     );
 
     // Seed benchmark priors (no-op after first run, refreshes weekly)
@@ -672,83 +719,77 @@ class PunkEngine {
     );
 
     // ── INTELLIGENCE ──────────────────────────────────────────────────────
-    // Local model is the primary classifier — strategy + task type + context shape
-    // in a single ~50-100ms inference pass. Falls back to regex heuristics in
-    // deriveStrategy() only when the model isn't ready or fails.
+    // Qwen local model is the sole classifier — strategy + task type + context
+    // shape in a single ~50-100ms inference pass. No heuristic fallback.
     //
     // Explicit slash commands (/plan, /direct, /discuss, /exec, /orchestrate)
-    // bypass both the model and the heuristics — they're user overrides, not
-    // classification tasks. deriveStrategy handles these with confidence 1.0.
+    // bypass classification — they're user overrides, resolved inline.
     const sessionState = readState(resolvedRequest.projectId);
     const promptText = (resolvedRequest.prompt || "").trim().toLowerCase();
     const hasSlashOverride = /^\/(?:plan|direct|raw|discuss|chat|orchestrate|steps|exec)\b/.test(promptText);
 
     const pendingTodos = (resolvedRequest.todos || []).filter(t => t.status !== "completed").length;
 
-    // Fire classify early — runs in parallel with routing config loads below.
-    // This overlaps the model's inference time (especially the first-call WASM
-    // JIT) with disk I/O for settings, so the classify cost is partially hidden.
-    let classifyPromise = null;
-    if (!hasSlashOverride && localIntelReady()) {
-      classifyPromise = localClassify({
+    let localDecision = null;
+    let strategy;
+
+    if (hasSlashOverride) {
+      // ── Slash overrides — user knows what they want ──
+      const slashStrategies = {
+        direct:      { mode: "direct",      discovery: false, reasoning: "shallow", verification: "none" },
+        raw:         { mode: "direct",      discovery: false, reasoning: "shallow", verification: "none" },
+        exec:        { mode: "direct",      discovery: false, reasoning: "shallow", verification: "none" },
+        discuss:     { mode: "discuss",     discovery: false, reasoning: "deep",    verification: "none" },
+        chat:        { mode: "discuss",     discovery: false, reasoning: "deep",    verification: "none" },
+        orchestrate: { mode: "orchestrate", discovery: true,  reasoning: "deep",    verification: "diff" },
+        steps:       { mode: "orchestrate", discovery: true,  reasoning: "deep",    verification: "diff" },
+        plan:        { mode: "orchestrate", discovery: false, reasoning: "deep",    verification: "diff" },
+      };
+      const cmd = promptText.match(/^\/([\w]+)/)?.[1] || "direct";
+      const override = slashStrategies[cmd] || slashStrategies.direct;
+      strategy = { ...override, confidence: 1.0, reason: `/${cmd}`, signals: [] };
+      console.log(`[punk] slash override → ${strategy.mode} (/${cmd})`);
+    } else {
+      // ── Qwen classification — wait for readiness if needed ──
+      if (!localIntelReady()) {
+        console.log("[punk] waiting for local-intel to load...");
+        await localIntelLoad();
+      }
+
+      localDecision = await localClassify({
         message:        resolvedRequest.prompt?.slice(0, 300) ?? "",
         turnCount:      (resolvedRequest.history || []).length,
         hasActiveTask:  !!sessionState?.activeTask,
         workingSetSize: (sessionState?.workingSet || []).length,
         pendingTodos,
-      }).catch(err => {
-        console.warn("[punk] local-intel classify failed (non-fatal):", err.message);
-        return null;
       });
-    }
 
-    // ── SMART ROUTING ─────────────────────────────────────────────────────
-    // Load routing config in parallel with classify — these are independent
-    const [autoRoute, routing] = await Promise.all([
-      this.loadIntentAutoRoute(),
-      this.loadIntentRouting(),
-    ]);
-
-    // Collect classify result — by now it's had time to run
-    let localDecision = null;
-    if (classifyPromise) {
-      localDecision = await classifyPromise;
       if (localDecision) {
         console.log(
           `[punk] local-intel: mode=${localDecision.mode} type=${localDecision.taskType} ` +
           `complexity=${localDecision.complexity} frontier=${localDecision.preferFrontier} ` +
           `discovery=${localDecision.discovery} hints=[${localDecision.atomHints.join(",")}]`,
         );
+        strategy = {
+          mode:         localDecision.mode,
+          discovery:    localDecision.discovery,
+          reasoning:    localDecision.reasoning,
+          verification: localDecision.verification,
+          confidence:   0.90,
+          reason:       `local-intel: ${localDecision.taskType}/${localDecision.complexity}`,
+          signals:      [],
+        };
+      } else {
+        console.warn("[punk] local-intel returned null — model not ready, falling back to execute");
+        strategy = { mode: "direct", discovery: false, reasoning: "shallow", verification: "none", confidence: 0.5, reason: "local-intel unavailable", signals: [] };
       }
     }
 
-    // Build unified strategy — model-driven or heuristic fallback
-    let strategy;
-    if (localDecision) {
-      // Model produced a full decision — use it as the strategy
-      strategy = {
-        mode:         localDecision.mode,
-        discovery:    localDecision.discovery,
-        reasoning:    localDecision.reasoning,
-        verification: localDecision.verification,
-        confidence:   0.90,  // model-driven decisions get high base confidence
-        reason:       `local-intel: ${localDecision.taskType}/${localDecision.complexity}`,
-        signals:      [],
-      };
-    } else {
-      // Fallback: regex heuristics
-      // Fires when: slash override, model not ready, timed out, or returned garbage
-      strategy = deriveStrategy(resolvedRequest.prompt, {
-        history: resolvedRequest.history || [],
-        todos:   resolvedRequest.todos   || [],
-        sessionState,
-      });
-      if (hasSlashOverride) {
-        console.log(`[punk] slash override → heuristic (${strategy.reason})`);
-      } else {
-        console.log("[punk] using heuristic fallback (local-intel unavailable)");
-      }
-    }
+    // ── SMART ROUTING ─────────────────────────────────────────────────────
+    const [autoRoute, routing] = await Promise.all([
+      this.loadIntentAutoRoute(),
+      this.loadIntentRouting(),
+    ]);
 
     // Map strategy mode to routing intent slot.
     // Orchestrate mode uses "execute" for resolvedRequest — the execute-phase model.
@@ -758,6 +799,7 @@ class PunkEngine {
       strategy.mode === "discuss" ? "explain" : "execute";
 
     // When the model says this is high-complexity frontier-worthy, route to plan model
+    // Qwen complexity-based intent adjustment
     if (localDecision) {
       if (localDecision.complexity === "high" && localDecision.preferFrontier && intentSlot === "execute") {
         intentSlot = "plan";
@@ -793,9 +835,8 @@ class PunkEngine {
     // Only fires when smart routing is on and the request doesn't override.
     // Overrides the heuristic selection when oracle confidence is sufficient.
     //
-    // Domain classification: when local-intel provided a taskType, map it
-    // to an oracle domain directly — no regex guessing needed.
-    const domain = localDecision?.taskType
+    // Domain classification from Qwen's taskType (slash overrides fall back to prompt regex)
+    const domain = localDecision
       ? _taskTypeToDomain(localDecision.taskType)
       : classifyDomain(resolvedRequest.prompt ?? "");
     let oracleResult = null;
@@ -814,7 +855,7 @@ class PunkEngine {
       if (oracleResult) {
         resolvedRequest.provider = oracleResult.top.provider;
         resolvedRequest.model    = oracleResult.top.model;
-        // Keep thinking flag from heuristic route — oracle doesn't override reasoning mode
+        // Keep thinking flag from strategy — oracle doesn't override reasoning mode
         console.log(
           `[oracle] → ${oracleResult.top.provider}/${oracleResult.top.model} ` +
           `(score=${oracleResult.score?.toFixed(2)}, conf=${oracleResult.confidence.toFixed(2)}, ` +
@@ -847,7 +888,6 @@ class PunkEngine {
           oracleConfidence: oracleResult?.confidence ?? null,
           oracleExploring:  oracleResult?.exploring  ?? false,
           // local intelligence metadata
-          localIntelUsed:   !!localDecision,
           localTaskType:    localDecision?.taskType ?? null,
           localComplexity:  localDecision?.complexity ?? null,
           localAtomHints:   localDecision?.atomHints ?? [],
@@ -896,7 +936,7 @@ class PunkEngine {
           this._brainSearch({
             projectId:   resolvedRequest.projectId,
             query:       resolvedRequest.prompt?.slice(0, 1000) ?? "",
-            taskType:    localDecision?.taskType ?? strategy.mode ?? null,
+            taskType:    localDecision?.taskType ?? strategy.mode,
             atomHints:   localDecision?.atomHints ?? [],
             projectRoot: resolvedRequest.workingDir ?? null,
             intent:      resolvedRequest.intent ?? null,
@@ -920,7 +960,7 @@ class PunkEngine {
           domain,
           model:               resolvedRequest.model,
           provider:            resolvedRequest.provider,
-          heuristicConfidence: strategy.confidence,
+          routingConfidence: strategy.confidence,
           oracleUsed:          !!oracleResult,
           oracleConfidence:    oracleResult?.confidence ?? null,
           promptLength:        (resolvedRequest.prompt ?? "").length,
@@ -942,39 +982,23 @@ class PunkEngine {
     }
 
     // ── CONTROL INVERSION CHECK ───────────────────────────────────────────
-    // Strategy engine drives orchestration — no separate shouldOrchestrate() call.
+    // Strategy engine drives orchestration — Qwen's mode decision is the gate.
     if (this.taskRunner && !resolvedRequest._systemOverride) {
-      let orchestrationEnabled = false;
+      let orchestrationEnabled = true;
       try {
         const settings = await this.loadSettings();
-        orchestrationEnabled = settings.orchestration_enabled ?? false;
+        orchestrationEnabled = settings.orchestration_enabled ?? true;
       } catch {}
 
       if (strategy.mode === "orchestrate" && orchestrationEnabled) {
-        const planRoute = routing["plan"] || routing["execute"];
-        const planningRequest = {
-          ...resolvedRequest,
-          provider: planRoute.provider,
-          model:    planRoute.model,
-          thinking: planRoute.thinking ?? false,
-        };
-
         console.log(
-          `[punk] 🎯 ORCHESTRATING: planning=${planningRequest.provider}/${planningRequest.model}` +
-          ` execute=${resolvedRequest.provider}/${resolvedRequest.model}` +
-          (strategy.discovery ? " [discovery]" : ""),
+          `[punk] 🎯 ORCHESTRATING via Plan tool` +
+          (strategy.discovery ? " [discovery first]" : " [planning first]"),
         );
-
         try {
-          await this.taskRunner.run(
-            resolvedRequest.projectId,
-            resolvedRequest.prompt,
-            resolvedRequest,
-            planningRequest,
-            { skipDiscovery: !strategy.discovery },
-          );
+          await this._orchestrate(resolvedRequest, routing, strategy);
         } catch (err) {
-          console.error(`[punk] TaskRunner failed, falling back to direct:`, err.message);
+          console.error(`[punk] Orchestration failed, falling back to direct:`, err.message);
           await this.backend.spawn(resolvedRequest);
         }
         return;
@@ -990,6 +1014,95 @@ class PunkEngine {
       console.error(`[punk] spawn failed: ${err.message}`);
       throw err;
     }
+  }
+
+  /**
+   * Pane-controlled orchestration: thinking → execution.
+   *
+   * One thinking model does both discovery AND planning in a single spawn.
+   * It explores the codebase, discusses with the user if needed, and calls
+   * the Plan tool when it's ready. Same brain, continuous context.
+   *
+   * After the user approves the plan, a fast builder model executes step by step.
+   */
+  async _orchestrate(request, routing, strategy) {
+    const projectId = request.projectId;
+
+    this.handleBackendEvent(projectId, {
+      event: "orchestration_start",
+      data: { prompt: request.prompt },
+    }, request.requestId);
+
+    // ── THINKING PHASE: discovery + planning in one spawn ─────────────────
+    // The reasoning model explores, asks questions, and calls Plan when ready.
+    // If discovery is needed, the system prompt tells it to discuss first.
+    // Either way, it must call Plan before its turn ends.
+    const planRoute = routing["plan"] || routing["execute"];
+    const phase = strategy.discovery ? "discovery" : "planning";
+
+    this.handleBackendEvent(projectId, {
+      event: "orchestration_phase",
+      data: { phase, model: planRoute.model, provider: planRoute.provider },
+    }, request.requestId);
+
+    console.log(
+      `[punk] thinking phase → ${planRoute.provider}/${planRoute.model}` +
+      (strategy.discovery ? " [discovery first]" : " [planning directly]"),
+    );
+
+    // Pick the right system prompt based on whether discovery is needed
+    const systemPrompt = strategy.discovery
+      ? DISCOVERY_AND_PLANNING_SYSTEM_PROMPT
+      : PLANNING_PHASE_SYSTEM_PROMPT;
+
+    const planningRequest = {
+      ...request,
+      phase: "planning",  // tools: reads + Plan (discovery gets same tools)
+      provider: planRoute.provider,
+      model: planRoute.model,
+      thinking: planRoute.thinking ?? false,
+      _systemPrepend: systemPrompt,
+    };
+
+    // This spawn blocks until: Plan tool is called + user approves (or rejects)
+    await this.backend.spawn(planningRequest);
+
+    // Grab the approved plan from the request (set by _handlePlanTool)
+    const plan = planningRequest._pendingPlan;
+    if (!plan) {
+      console.warn("[punk] No plan captured after thinking phase — orchestration aborted.");
+      this.handleBackendEvent(projectId, {
+        event: "orchestration_error",
+        data: { message: "Planning completed without a plan. Try again." },
+      }, request.requestId);
+      return;
+    }
+
+    // Persist plan to disk and get its ID
+    const { createPlan } = await import("./plan-store.mjs");
+    const { planId } = createPlan(projectId, plan.summary, plan.steps, {
+      planning: planningRequest.model,
+      execution: request.model,
+    });
+
+    // ── EXECUTION PHASE ───────────────────────────────────────────────────
+    const execRoute = routing["execute"];
+    const executionRequest = {
+      ...request,
+      phase: "execution",
+      provider: execRoute?.provider || request.provider,
+      model: execRoute?.model || request.model,
+      thinking: execRoute?.thinking ?? request.thinking ?? false,
+    };
+
+    this.handleBackendEvent(projectId, {
+      event: "orchestration_phase",
+      data: { phase: "execution", model: executionRequest.model, provider: executionRequest.provider },
+    }, request.requestId);
+
+    console.log(`[punk] execution phase → ${executionRequest.provider}/${executionRequest.model}`);
+
+    await this.taskRunner.executeSteps(projectId, plan, planId, executionRequest);
   }
 
   async abort(projectId) {
@@ -1077,19 +1190,12 @@ export async function registerPunkHandlers() {
     await punkEngine.abort(args.projectId);
   });
 
-  ipcMain.handle("respond_to_discovery", async (_event, args) => {
-    const { projectId, response } = args;
-    if (punkEngine.taskRunner) {
-      punkEngine.taskRunner.respondToDiscovery(projectId, response);
-    }
-  });
-
   ipcMain.handle("approve_plan", async (_event, args) => {
-    if (punkEngine.taskRunner) punkEngine.taskRunner.approvePlan(args.projectId);
+    punkEngine.approvePlan(args.projectId);
   });
 
   ipcMain.handle("reject_plan", async (_event, args) => {
-    if (punkEngine.taskRunner) punkEngine.taskRunner.rejectPlan(args.projectId);
+    punkEngine.rejectPlan(args.projectId);
   });
 
   ipcMain.handle("terminate_punk_session", async (_event, args) => {

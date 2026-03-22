@@ -47,37 +47,13 @@ function SearchIcon() {
   );
 }
 
-function ProfileAvatar() {
-  const avatarDataUrl = useWorkspaceStore((s) => s.profileAvatarDataUrl);
-  const profileName = useWorkspaceStore((s) => s.profileName);
-
-  const initials = profileName
-    ? profileName.split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2)
-    : "";
-
-  if (avatarDataUrl) {
-    return (
-      <img
-        src={avatarDataUrl}
-        alt=""
-        className="w-5 h-5 rounded-full object-cover"
-      />
-    );
-  }
-
-  if (initials) {
-    return (
-      <div className="w-5 h-5 rounded-full bg-pane-text/[0.08] flex items-center justify-center">
-        <span className="font-mono text-pane-text" style={{ fontSize: "8px", lineHeight: 1 }}>{initials}</span>
-      </div>
-    );
-  }
-
-  // Default: square head + arc shoulders
+function ProfileIcon() {
+  // Person inside a pane — head + shoulders, same geometry as every other icon
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="5.5" y="1.5" width="5" height="5" rx="1.5" />
-      <path d="M2.5 15c0-3 2.5-5 5.5-5s5.5 2 5.5 5" />
+      <rect x="2" y="2" width="12" height="12" rx="2" />
+      <circle cx="8" cy="6.5" r="2" />
+      <path d="M4.5 13c0-2 1.5-3.5 3.5-3.5s3.5 1.5 3.5 3.5" />
     </svg>
   );
 }
@@ -183,11 +159,6 @@ export function ControlPanel() {
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.git.isGitRepo ?? false;
   });
-  const root = useProjectsStore((s) => {
-    if (!s.activeProjectId) return undefined;
-    return s.projects.get(s.activeProjectId)?.root;
-  });
-
   const overlay = useWorkspaceStore((s) => s.overlay);
 
   // If we're somehow in git mode but the project isn't a git repo, go to conversation
@@ -234,7 +205,7 @@ export function ControlPanel() {
           icon={<ConversationIcon />}
           active={mode === "conversation"}
           onClick={() => handleSetMode("conversation")}
-          tooltip="Conversation"
+          tooltip="Chat"
         />
         <ToolbarButton
           icon={<FileIcon />}
@@ -275,7 +246,7 @@ export function ControlPanel() {
             tooltip="Mind"
           />
           <ToolbarButton
-            icon={<ProfileAvatar />}
+            icon={<ProfileIcon />}
             active={overlay === "profile"}
             onClick={() => useWorkspaceStore.getState().setOverlay("profile")}
             tooltip="Profile"

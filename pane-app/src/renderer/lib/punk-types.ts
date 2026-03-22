@@ -82,11 +82,10 @@ export interface StrategyBlock {
   oracleUsed?: boolean;
   oracleConfidence?: number | null;
   oracleExploring?: boolean;
-  // local intelligence fields
-  localIntelUsed?: boolean;
-  localTaskType?: string | null;
-  localComplexity?: string | null;
-  localAtomHints?: string[];
+  // local intelligence fields (Qwen — sole classifier, null only on slash overrides)
+  localTaskType: string | null;
+  localComplexity: string | null;
+  localAtomHints: string[];
 }
 
 export type ContentBlock =
@@ -255,12 +254,25 @@ export interface OrchestrationStartEvent {
   data: { prompt: string };
 }
 
+export interface OrchestrationPlanningStartEvent {
+  event: "orchestration_planning_start";
+  data: Record<string, never>;
+}
+
+export interface OrchestrationPlanningChunkEvent {
+  event: "orchestration_planning_chunk";
+  data: { chunk: string };
+}
+
 export interface OrchestrationPlanEvent {
   event: "orchestration_plan";
   data: {
     summary: string;
     steps: { index: number; action: string; type: string; files: string[] }[];
     totalSteps: number;
+    planId?: string;
+    planningModel?: string;
+    executionModel?: string;
   };
 }
 
@@ -325,6 +337,15 @@ export interface OrchestrationErrorEvent {
   data: { message: string };
 }
 
+export interface OrchestrationPhaseEvent {
+  event: "orchestration_phase";
+  data: {
+    phase: "discovery" | "planning" | "execution";
+    model?: string;
+    provider?: string;
+  };
+}
+
 export interface SdkModel {
   id: string;
   name?: string;
@@ -356,12 +377,15 @@ export type PunkStreamEvent = (
   | PunkEventTodosUpdated
   | PunkEventActiveTaskUpdated
   | OrchestrationStartEvent
+  | OrchestrationPlanningStartEvent
+  | OrchestrationPlanningChunkEvent
   | OrchestrationPlanEvent
   | OrchestrationStepEvent
   | OrchestrationStepCompleteEvent
   | OrchestrationCompleteEvent
   | OrchestrationTypecheckEvent
   | OrchestrationErrorEvent
+  | OrchestrationPhaseEvent
   | PunkEventSdkInitInfo
 ) & { requestId?: string };
 
@@ -425,12 +449,12 @@ export interface ConversationState {
   serviceTier: string | null;
   isProcessing: boolean;
   isPlanning: boolean;
+  phase: "idle" | "discovery" | "planning" | "execution"; // Current orchestration phase
 
   isRestored: boolean; // true once loaded from disk at startup
   error: string | null;
   todos: Todo[];
   pendingPlanApproval: boolean;
-  discoveryActive: boolean; // True when orchestration is in discovery phase, waiting for user input
   // Session lifecycle
   isProcessActive: boolean; // Is the Claude CLI child process currently running?
   lastActivity: number; // Timestamp of last user interaction with this project
@@ -473,11 +497,11 @@ export function createEmptyConversation(): ConversationState {
     serviceTier: null,
     isProcessing: false,
     isPlanning: false,
+    phase: "idle",
     isRestored: false,
     error: null,
     todos: [],
     pendingPlanApproval: false,
-    discoveryActive: false,
     isProcessActive: false,
     lastActivity: Date.now(),
     contextTokens: 0,

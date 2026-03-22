@@ -198,8 +198,8 @@ interface ProjectsState {
     todos: import("../lib/punk-types").Todo[],
   ) => void;
   setPendingPlanApproval: (projectId: string, pending: boolean) => void;
-  setDiscoveryActive: (projectId: string, active: boolean) => void;
   setIsPlanning: (projectId: string, isPlanning: boolean) => void;
+  setConversationPhase: (projectId: string, phase: import("../lib/punk-types").ConversationState["phase"]) => void;
   updateLastToolUseInput: (
     projectId: string,
     input: Record<string, unknown>,
@@ -710,17 +710,17 @@ function createProjectsStore() {
         })),
       ),
 
-    setDiscoveryActive: (projectId, active) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, discoveryActive: active },
-        })),
-      ),
-
     setIsPlanning: (projectId, isPlanning) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
           conversation: { ...p.conversation, isPlanning },
+        })),
+      ),
+
+    setConversationPhase: (projectId, phase) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: { ...p.conversation, phase },
         })),
       ),
 
@@ -809,11 +809,11 @@ function createProjectsStore() {
             serviceTier: null,
             isProcessing: false,
             isPlanning: false,
+            phase: "idle",
             isRestored: true,
             error: null,
             todos: [],
             pendingPlanApproval: false,
-            discoveryActive: false,
             isProcessActive: false,
             lastActivity: Date.now(),
             contextTokens: 0,
