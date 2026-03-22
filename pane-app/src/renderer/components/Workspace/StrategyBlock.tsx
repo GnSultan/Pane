@@ -16,42 +16,78 @@ function modelShortName(model: string): string {
   return slug.split("-").slice(0, 2).join("-");
 }
 
+const TASK_TYPE_LABEL: Record<string, string> = {
+  debug:          "debugging",
+  implement:      "implementation",
+  explain:        "explanation",
+  architect:      "architecture",
+  refactor:       "refactoring",
+  review:         "code review",
+  conversation:   "conversation",
+  "quick-answer": "quick answer",
+  other:          "general task",
+};
+
+const COMPLEXITY_LABEL: Record<string, string> = {
+  low:    "straightforward",
+  medium: "moderate complexity",
+  high:   "high complexity",
+};
+
 function humanSummary(block: StrategyBlock): string {
   const model = modelShortName(block.model);
   const lines: string[] = [];
 
-  // What pane is doing and with which model
-  if (block.mode === "orchestrate") {
-    lines.push(
-      `Breaking this into a plan first, then executing with ${model}.` +
-      (block.discovery
-        ? " Checking alignment before starting — the direction needs a bit more clarity."
-        : " The scope is large enough to benefit from a structured approach.")
-    );
-  } else if (block.mode === "discuss") {
-    lines.push(
-      block.discovery
-        ? `Treating this as a conversation with ${model}, with the current task in mind — this looks like it could shift direction.`
-        : `Having a conversation with ${model}. No code changes expected right now.`
-    );
+  // Local intelligence path — Qwen produced a real decision
+  if (block.localIntelUsed && block.localTaskType) {
+    const taskLabel = TASK_TYPE_LABEL[block.localTaskType] ?? block.localTaskType;
+    const complexityLabel = block.localComplexity ? COMPLEXITY_LABEL[block.localComplexity] ?? block.localComplexity : null;
+
+    // Lead with what Qwen actually understood
+    const desc = complexityLabel ? `${complexityLabel} ${taskLabel}` : taskLabel;
+
+    if (block.mode === "orchestrate") {
+      lines.push(`${desc} — breaking into steps before executing with ${model}.`);
+      if (block.discovery) lines.push("Checking scope before committing — the task boundaries aren't fully clear yet.");
+    } else if (block.mode === "discuss") {
+      lines.push(`${desc} — treating as a conversation with ${model}.`);
+      if (block.discovery) lines.push("This could shift direction, keeping it open.");
+    } else {
+      lines.push(`${desc} — executing directly with ${model}.`);
+    }
+
+    // Surface atom hints: what the brain flagged as relevant context
+    if (block.localAtomHints && block.localAtomHints.length > 0) {
+      lines.push(`Context pulled: ${block.localAtomHints.join(", ")}.`);
+    }
+
+    // Reasoning depth
+    if (block.reasoning === "deep") {
+      lines.push("Thinking this through carefully before responding.");
+    }
   } else {
-    // direct
-    lines.push(`Answering directly with ${model}.`);
+    // Heuristic fallback path — no Qwen decision
+    if (block.mode === "orchestrate") {
+      lines.push(
+        `Breaking this into a plan first, then executing with ${model}.` +
+        (block.discovery ? " Checking alignment before starting." : "")
+      );
+    } else if (block.mode === "discuss") {
+      lines.push(`Conversation with ${model}.`);
+    } else {
+      lines.push(`Direct execution with ${model}.`);
+    }
+    if (block.reasoning === "deep") lines.push("Deep reasoning mode.");
   }
 
-  // Oracle insight — only if it actually overrode the heuristic
+  // Oracle override — always surface if it changed the model
   if (block.oracleUsed && block.oracleConfidence != null) {
     if (block.oracleExploring) {
-      lines.push(`Trying ${model} here — testing whether it handles this type of work well.`);
+      lines.push(`Trying ${model} on this type of task — gathering performance data.`);
     } else {
       const pct = Math.round(block.oracleConfidence * 100);
-      lines.push(`${model} was chosen based on past performance on similar tasks (${pct}% confidence).`);
+      lines.push(`${model} chosen from prior performance on similar tasks (${pct}% confidence).`);
     }
-  }
-
-  // Reasoning depth — only mention if it's notable
-  if (block.reasoning === "deep" && block.mode !== "discuss") {
-    lines.push("Taking time to think this through carefully.");
   }
 
   return lines.join(" ");

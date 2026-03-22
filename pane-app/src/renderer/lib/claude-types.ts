@@ -82,6 +82,11 @@ export interface StrategyBlock {
   oracleUsed?: boolean;
   oracleConfidence?: number | null;
   oracleExploring?: boolean;
+  // local intelligence fields
+  localIntelUsed?: boolean;
+  localTaskType?: string | null;
+  localComplexity?: string | null;
+  localAtomHints?: string[];
 }
 
 export type ContentBlock =
@@ -108,6 +113,7 @@ export interface AssistantMessage {
   type: "assistant";
   message: {
     content: ContentBlock[];
+    stop_reason?: "end_turn" | "tool_use" | "max_tokens" | null;
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
@@ -319,7 +325,26 @@ export interface OrchestrationErrorEvent {
   data: { message: string };
 }
 
-export type ClaudeStreamEvent =
+export interface SdkModel {
+  id: string;
+  name?: string;
+  [key: string]: unknown;
+}
+
+export interface SdkAccount {
+  email?: string;
+  organization?: string;
+  subscription?: string;
+  apiProvider?: string;
+  [key: string]: unknown;
+}
+
+export interface ClaudeEventSdkInitInfo {
+  event: "sdk_init_info";
+  data: { models: SdkModel[] | null; account: SdkAccount | null };
+}
+
+export type ClaudeStreamEvent = (
   | ClaudeEventMessage
   | ClaudeEventProcessStarted
   | ClaudeEventProcessEnded
@@ -336,7 +361,9 @@ export type ClaudeStreamEvent =
   | OrchestrationStepCompleteEvent
   | OrchestrationCompleteEvent
   | OrchestrationTypecheckEvent
-  | OrchestrationErrorEvent;
+  | OrchestrationErrorEvent
+  | ClaudeEventSdkInitInfo
+) & { requestId?: string };
 
 // Plan message types — the blueprint Pane produces before execution
 

@@ -54,6 +54,10 @@ interface WorkspaceState {
   overlay: "mind" | "profile" | "history" | null;
   setOverlay: (overlay: "mind" | "profile" | "history" | null) => void;
   toggleOverlay: (overlay: "mind" | "profile" | "history") => void;
+  // SDK metadata — populated after first claude-cli session init
+  sdkModels: import("../lib/claude-types").SdkModel[] | null;
+  sdkAccount: import("../lib/claude-types").SdkAccount | null;
+  setSdkInfo: (models: import("../lib/claude-types").SdkModel[] | null, account: import("../lib/claude-types").SdkAccount | null) => void;
   // Profile data
   profileName: string;
   profileBio: string;
@@ -225,6 +229,10 @@ function createWorkspaceStore() {
     overlay: null,
     setOverlay: (o) => set({ overlay: o }),
     toggleOverlay: (o) => set((state) => ({ overlay: state.overlay === o ? null : o })),
+    // SDK metadata
+    sdkModels: null,
+    sdkAccount: null,
+    setSdkInfo: (models, account) => set({ sdkModels: models, sdkAccount: account }),
     // Profile data
     profileName: "",
     profileBio: "",

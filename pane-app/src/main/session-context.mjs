@@ -18,6 +18,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -259,88 +260,38 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   const stableParts  = [];
   const dynamicParts = [];
 
+  // ── LOCAL INTELLIGENCE CONTEXT SHAPE ─────────────────────────────────────
+  // Read early — drives core instruction selection, atom weighting, brief
+  // inclusion, file depth, and directive building below.
+  let contextShape = null;
+  try {
+    contextShape = JSON.parse(fs.readFileSync(
+      path.join(BRAIN_DIR, "context", `${projectId}-shape.json`), "utf-8"
+    ));
+  } catch {}
+
+  // Brain contextual export — read early so unified atoms are available for
+  // both system prompt assembly and profile atom injection below.
+  let brainCtx = { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [] };
+  try {
+    brainCtx = JSON.parse(fs.readFileSync(
+      path.join(BRAIN_DIR, "context", `${projectId}.json`), "utf-8"
+    ));
+  } catch {}
+
   // ── CORE BEHAVIOR ────────────────────────────────────────────────────────
+  //
+  // Dynamic system prompt assembly. When the brain has run a contextual search
+  // its unified atom results (system + profile + learned, scored by cosine ×
+  // facetWeight × priority) are used directly. Falls back to ALL_SYSTEM_ATOMS
+  // when the brain hasn't produced results yet — zero regression.
 
-  const sharedInstructions = [
-    "You are an autonomous CLI agent specializing in software engineering tasks.",
-    "Your primary goal is to help users safely and effectively.",
-    "",
-    "# The Pane Method",
-    "",
-    "You operate inside Pane. Pane has already mapped the project, tracked decisions, and scoped your work. Follow this method on every task, in order. Do not skip steps.",
-    "",
-    "## 1. ORIENT",
-    "Before acting, read what Pane knows. The current objective, task list, files in scope, locked decisions, and active commitments listed below are ground truth. Do not re-derive what Pane has already established. If Pane says a decision is locked, it is locked.",
-    "",
-    "## 2. SCOPE",
-    "Identify exactly which files need to change. Pane has given you a complete codebase map below — use it to locate files by purpose, not by grepping filenames. For symbol lookups, use pane_find_symbol — it returns exact file:line in <1ms. Only fall back to grep/glob if the map and symbol index both miss. State your scope before touching anything. If you need to touch a file not in scope, explain why before proceeding — never silently expand scope.",
-    "",
-    "## 3. UNDERSTAND",
-    "Read every file you plan to modify. No exceptions. Search for existing patterns, conventions, and dependencies before introducing anything new. Understand why existing code is the way it is before changing it. Never edit a file you have not read in this session.",
-    "",
-    "## 4. PLAN",
-    "For any task touching more than two files: state numbered steps before executing. One step per file or concern. In EXECUTION mode, proceed immediately after stating. Otherwise, wait for confirmation before making changes.",
-    "",
-    "## 5. EXECUTE",
-    "One logical change at a time. Prefer targeted replacements (replace/edit) over full file rewrites (write_file). If a change is risky or irreversible, state that before proceeding — never after. Do not over-engineer: solve what was asked, nothing more.",
-    "",
-    "## 6. VERIFY",
-    "After every change: run tests, type-check, or build. If no verification is available, state that explicitly. Never declare a task complete without verification. If verification fails, fix the issue before moving on.",
-    "",
-    "## 7. RECORD",
-    "If you discovered something important — a pattern, a lesson, a gotcha, a decision — use pane_remember to store it. Knowledge that dies with the session is wasted. The next model to work here should benefit from what you learned.",
-    "",
-    "# Non-Negotiable Rules",
-    "",
-    "These are absolute. Not guidelines — hard constraints.",
-    "",
-    "- Never edit a file you have not read in this session.",
-    "- Never touch files outside scope without stating why first.",
-    "- Never contradict or undo a locked decision.",
-    "- Never stage, commit, or push unless the user explicitly instructs it.",
-    "- Never run destructive commands (rm -rf, force push, drop table, reset --hard) without explicit confirmation.",
-    "- Never log, print, or commit secrets, API keys, or credentials.",
-    "- If uncertain about a destructive or irreversible action — ask. Never guess.",
-    "- Follow existing patterns in the codebase. Do not invent abstractions for one-time operations.",
-    "- When asked to commit, propose a message that explains why, not what.",
-    "",
-    "# Operational Guidelines",
-    "",
-    "- Tone: Senior software engineer. Concise, direct, no filler.",
-    "- Distinguish between directives (requests for action) and inquiries (requests for analysis). Assume inquiry unless the message contains an explicit instruction.",
-    "- Pane Tools: The codebase map below is your primary navigation tool — read it before searching. Use pane_find_symbol for exact symbol→file:line lookups. Use pane_recall to orient yourself. Use pane_remember to preserve discoveries.",
-    "- Testing: Always search for and update related tests after a code change.",
-    "- Persist through errors. Backtrack and adjust rather than abandoning an approach silently.",
-    "- When implementing UI, prioritize a modern, polished aesthetic with consistent spacing and platform-appropriate design. Prefer platform-native primitives.",
-  ];
-
-  const geminiOnlyInstructions = [
-    "",
-    "# Available Sub-Agents",
-    "",
-    "Sub-agents are specialized expert agents. Each sub-agent is available as a tool of the same name. You MUST delegate tasks to the sub-agent with the most relevant expertise.",
-    "",
-    "<available_subagents>",
-    "  <subagent>",
-    "    <name>codebase_investigator</name>",
-    "    <description>The specialized tool for codebase analysis, architectural mapping, and understanding system-wide dependencies.",
-    "    Invoke this tool for tasks like vague requests, bug root-cause analysis, system refactoring, comprehensive feature implementation or to answer questions about the codebase that require investigation.",
-    "    It returns a structured report with key file paths, symbols, and actionable architectural insights.</description>",
-    "  </subagent>",
-    "  <subagent>",
-    "    <name>generalist</name>",
-    "    <description>A general-purpose AI agent with access to all tools. Highly recommended for tasks that are turn-intensive or involve processing large amounts of data. Use this to keep the main session history lean and efficient. Excellent for: batch refactoring/error fixing across multiple files, running commands with high-volume output, and speculative investigations.</description>",
-    "  </subagent>",
-    "</available_subagents>",
-    "",
-    "Remember that the closest relevant sub-agent should still be used even if its expertise is broader than the given task.",
-  ];
-
-  const isGemini = backend === "gemini-cli";
-  const coreInstructions = isGemini
-    ? [...sharedInstructions, ...geminiOnlyInstructions].join("\n")
-    : sharedInstructions.join("\n");
-
+  const coreInstructions = _buildSystemPromptFromAtoms(
+    brainCtx.atoms || null,
+    contextShape?.taskType || null,
+    contextShape?.complexity || null,
+    backend,
+  );
   stableParts.unshift(coreInstructions, "");
 
   // Identity
@@ -354,33 +305,52 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     stableParts.push("");
   }
 
-  // Brain contextual export — profile atoms + memories + relevant files
-  // Written by brain-engine.mjs after each brainContextualSearch call.
-  let brainCtx = { memories: [], tensions: [], profileAtoms: [], relevantFiles: [] };
-  try {
-    brainCtx = JSON.parse(fs.readFileSync(
-      path.join(BRAIN_DIR, "context", `${projectId}.json`), "utf-8"
-    ));
-  } catch {}
-
-  // Profile atoms: semantically closest principles to THIS request
-  const atoms = (brainCtx.profileAtoms || []).slice(0, 8);
-  if (atoms.length > 0) {
-    stableParts.push("Operating constraints (apply without exception):");
-    for (const atom of atoms) stableParts.push(`- ${atom.content}`);
+  // Explicit rules — ALWAYS injected, never filtered by semantic relevance.
+  // These are behavioral invariants that apply to every single response.
+  let rules = "";
+  try { rules = fs.readFileSync(path.join(PROFILE_DIR, "rules.md"), "utf-8").trim(); } catch {}
+  if (rules) {
+    stableParts.push("Rules (apply to every response, no exceptions):");
+    for (const line of rules.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed) stableParts.push(`- ${trimmed}`);
+    }
     stableParts.push("");
   }
 
-  // Project brief: accumulated cross-session wisdom
+  // Profile atoms: semantically relevant preferences, anti-patterns, and guidelines.
+  // Rules are already injected above unconditionally — filter them out so they
+  // don't appear twice. System atoms (method/rule/guideline) are already in
+  // coreInstructions — filter those too.
+  //
+  // When the brain has run a contextual search, brainCtx.atoms contains the
+  // unified atom pool already scored by cosine × FACET_WEIGHTS × priority +
+  // hint boost. We use that directly. Falls back to legacy profileAtoms.
+  const profileAtoms = (brainCtx.atoms || brainCtx.profileAtoms || [])
+    .filter(a => a.entityType !== "system_atom" && a.facet !== "rule");
+
+  if (profileAtoms.length > 0) {
+    stableParts.push("Relevant preferences:");
+    for (const atom of profileAtoms.slice(0, 8)) stableParts.push(`- ${atom.content}`);
+    stableParts.push("");
+  }
+
+  // Project brief: accumulated cross-session wisdom.
+  // Local intelligence can suppress the brief on very short, scoped requests
+  // (complexity=low) to save context tokens. Medium+ always includes it.
+  const shouldIncludeBrief = contextShape?.includeBrief !== false
+    || (contextShape?.complexity !== "low");
   let brief = "";
-  try {
-    brief = fs.readFileSync(path.join(MEMORY_DIR, projectId, "brief.md"), "utf-8").trim();
-    if (brief.length > 2500) {
-      const truncated = brief.slice(0, 2500);
-      const lastSection = truncated.lastIndexOf("\n###");
-      brief = lastSection > 500 ? truncated.slice(0, lastSection) : truncated;
-    }
-  } catch {}
+  if (shouldIncludeBrief) {
+    try {
+      brief = fs.readFileSync(path.join(MEMORY_DIR, projectId, "brief.md"), "utf-8").trim();
+      if (brief.length > 2500) {
+        const truncated = brief.slice(0, 2500);
+        const lastSection = truncated.lastIndexOf("\n###");
+        brief = lastSection > 500 ? truncated.slice(0, lastSection) : truncated;
+      }
+    } catch {}
+  }
 
   if (brief) {
     stableParts.push(brief);
@@ -510,31 +480,39 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
 
     // Pre-read: include actual file content for top working set files.
     // The model doesn't need to explore — Pane has already read these.
-    const PRE_READ_MAX_FILES = 3;
-    const PRE_READ_MAX_LINES = 80;
-    const PRE_READ_MAX_CHARS = 15000;
-    let preReadChars = 0;
-    const preReadParts = [];
+    // Local intelligence context shaping adjusts depth:
+    //   "none" → skip pre-read entirely, "names" → file list only (already done above),
+    //   "shallow" → default (3 files, 80 lines), "deep" → 5 files, 120 lines
+    const localFileDepth = contextShape?.fileDepth || "shallow";
+    const skipPreRead = localFileDepth === "none" || localFileDepth === "names";
 
-    for (const f of state.workingSet.slice(0, PRE_READ_MAX_FILES)) {
-      if (preReadChars >= PRE_READ_MAX_CHARS) break;
-      try {
-        const raw = fs.readFileSync(f.path, "utf-8");
-        const lines = raw.split("\n").slice(0, PRE_READ_MAX_LINES);
-        const content = lines.join("\n");
-        const remaining = PRE_READ_MAX_CHARS - preReadChars;
-        const truncated = content.length > remaining ? content.slice(0, remaining) + "\n[...truncated]" : content;
-        preReadParts.push(`### ${f.path}\n\`\`\`\n${truncated}\n\`\`\``);
-        preReadChars += truncated.length;
-      } catch {
-        // File doesn't exist or isn't readable — skip silently
+    if (!skipPreRead) {
+      const PRE_READ_MAX_FILES = localFileDepth === "deep" ? 5 : 3;
+      const PRE_READ_MAX_LINES = localFileDepth === "deep" ? 120 : 80;
+      const PRE_READ_MAX_CHARS = localFileDepth === "deep" ? 25000 : 15000;
+      let preReadChars = 0;
+      const preReadParts = [];
+
+      for (const f of state.workingSet.slice(0, PRE_READ_MAX_FILES)) {
+        if (preReadChars >= PRE_READ_MAX_CHARS) break;
+        try {
+          const raw = fs.readFileSync(f.path, "utf-8");
+          const lines = raw.split("\n").slice(0, PRE_READ_MAX_LINES);
+          const content = lines.join("\n");
+          const remaining = PRE_READ_MAX_CHARS - preReadChars;
+          const truncated = content.length > remaining ? content.slice(0, remaining) + "\n[...truncated]" : content;
+          preReadParts.push(`### ${f.path}\n\`\`\`\n${truncated}\n\`\`\``);
+          preReadChars += truncated.length;
+        } catch {
+          // File doesn't exist or isn't readable — skip silently
+        }
       }
-    }
 
-    if (preReadParts.length > 0) {
-      dynamicParts.push("Pre-read file contents (Pane has read these — do not re-read unless they have changed since):");
-      dynamicParts.push(preReadParts.join("\n\n"));
-      dynamicParts.push("");
+      if (preReadParts.length > 0) {
+        dynamicParts.push("Pre-read file contents (Pane has read these — do not re-read unless they have changed since):");
+        dynamicParts.push(preReadParts.join("\n\n"));
+        dynamicParts.push("");
+      }
     }
   }
 
@@ -613,8 +591,19 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     dynamicParts.push("");
   }
 
-  // Intent directive
-  if (intent === "execute") {
+  // Intent directive — shaped by local intelligence when available.
+  // The local model's taskType, complexity, reasoning, and verification signals
+  // produce a tailored behavioral directive. Falls back to generic mode strings.
+  const taskType    = contextShape?.taskType    || null;
+  const complexity  = contextShape?.complexity  || null;
+  const reasoning   = contextShape?.reasoning   || null;
+  const verification = contextShape?.verification || null;
+
+  if (contextShape && taskType) {
+    // Model-driven directive: specific to the actual task
+    const directive = _buildDirective(intent, taskType, complexity, reasoning, verification);
+    dynamicParts.push(directive);
+  } else if (intent === "execute") {
     dynamicParts.push("EXECUTION mode. Do what's asked directly and efficiently. Skip planning unless absolutely necessary.");
   } else if (intent === "plan") {
     dynamicParts.push("PLANNING mode. Think deeply, explore architecture space, consider tradeoffs, surface tensions with past decisions. End with a clear recommendation and wait for confirmation before making changes.");
@@ -667,4 +656,179 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     dynamic,
     full,
   };
+}
+
+
+// ---------------------------------------------------------------------------
+// Directive builder — translates local intelligence signals into a behavioral
+// instruction for the cloud model. The goal: the model knows what kind of task
+// it's doing, how deeply to reason, and how to verify — before reading the
+// user's message.
+// ---------------------------------------------------------------------------
+
+const TASK_DIRECTIVES = {
+  debug: {
+    focus:  "Root-cause analysis. Reproduce → isolate → fix → verify. Follow the data, not assumptions.",
+    deep:   "Trace the full execution path. Consider race conditions, state mutation, and edge cases. Check error boundaries and upstream callers.",
+    shallow: "Quick fix. Identify the immediate cause, patch it, verify it.",
+  },
+  implement: {
+    focus:  "Build it. Follow existing patterns. Minimal footprint — solve what's asked, nothing more.",
+    deep:   "Consider interfaces, error handling, edge cases, and how this interacts with the rest of the system. Plan before writing.",
+    shallow: "Straightforward implementation. Write the code, match the style, move on.",
+  },
+  explain: {
+    focus:  "Clear, accurate explanation. Code examples where they help. No hand-waving.",
+    deep:   "Walk through the architecture. Explain why, not just what. Surface non-obvious implications and tradeoffs.",
+    shallow: "Concise answer. Get to the point fast.",
+  },
+  architect: {
+    focus:  "System design. Consider constraints, tradeoffs, extensibility, and what will break.",
+    deep:   "Explore the solution space. Compare approaches. Surface tensions with existing decisions. End with a clear recommendation.",
+    shallow: "Quick architectural judgment. State the approach and rationale.",
+  },
+  refactor: {
+    focus:  "Improve structure without changing behavior. Every step must preserve semantics.",
+    deep:   "Map all callers and dependencies before moving anything. Run verification after each structural change.",
+    shallow: "Simple rename or extract. Make the change, verify it compiles.",
+  },
+  review: {
+    focus:  "Code review. Focus on correctness, edge cases, and maintainability. Skip style nits.",
+    deep:   "Check logic flow, error handling, security implications, and performance. Verify test coverage.",
+    shallow: "Quick scan for obvious issues.",
+  },
+  conversation: {
+    focus:  "Discussion. Think with the developer, not at them.",
+    deep:   "Engage deeply with the question. Surface assumptions, explore alternatives, provide reasoned opinions.",
+    shallow: "Brief, direct response.",
+  },
+  "quick-answer": {
+    focus:  "Fast, direct answer. No preamble, no caveats unless critical.",
+    deep:   "Fast, direct answer. No preamble, no caveats unless critical.",
+    shallow: "Fast, direct answer. No preamble, no caveats unless critical.",
+  },
+};
+
+const VERIFICATION_DIRECTIVES = {
+  none: "",
+  diff: "After changes: review the diff to confirm correctness before declaring done.",
+  test: "After changes: run tests. If no tests exist for the changed code, write them. Do not declare done without green tests.",
+};
+
+// ---------------------------------------------------------------------------
+// System prompt builder — assembles core instructions from the brain's
+// unified atom results when available. Falls back to system-atoms.mjs imports
+// when the brain hasn't produced results yet (cold start, no embedder).
+//
+// The brain scores atoms by cosine × FACET_WEIGHTS × priority + hintBoost,
+// so the ranking is already task-aware. We just need to assemble them.
+// ---------------------------------------------------------------------------
+
+const _GEMINI_SUBAGENTS = [
+  "",
+  "# Available Sub-Agents",
+  "",
+  "Sub-agents are specialized expert agents. Each sub-agent is available as a tool of the same name. Delegate to the sub-agent with the most relevant expertise.",
+  "",
+  "<available_subagents>",
+  "  <subagent>",
+  "    <name>codebase_investigator</name>",
+  "    <description>Specialized for codebase analysis, architectural mapping, and system-wide dependencies. Use for vague requests, bug root-cause analysis, refactoring, or comprehensive feature implementation.</description>",
+  "  </subagent>",
+  "  <subagent>",
+  "    <name>generalist</name>",
+  "    <description>General-purpose agent with all tools. Use for turn-intensive tasks, batch operations, high-volume output, and speculative investigations.</description>",
+  "  </subagent>",
+  "</available_subagents>",
+].join("\n");
+
+function _buildSystemPromptFromAtoms(unifiedAtoms, taskType, complexity, backend) {
+  const parts = [];
+
+  // Extract system atoms from brain's unified results when available.
+  // These are already scored/filtered by the brain for this specific query.
+  const systemAtoms = (unifiedAtoms || []).filter(a => a.entityType === "system_atom");
+
+  if (systemAtoms.length > 0) {
+    // Brain-powered path: atoms are pre-scored, just assemble by facet
+    const methodAtoms = systemAtoms
+      .filter(a => a.facet === "method")
+      .sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
+
+    const ruleAtoms = systemAtoms
+      .filter(a => a.facet === "rule")
+      .sort((a, b) => (b.score || 0) - (a.score || 0));
+
+    const guideAtoms = systemAtoms
+      .filter(a => a.facet === "guideline")
+      .sort((a, b) => (b.score || 0) - (a.score || 0));
+
+    if (methodAtoms.length > 0) {
+      parts.push(methodAtoms.map(a => a.content).join("\n\n"));
+    }
+
+    if (ruleAtoms.length > 0) {
+      parts.push("");
+      parts.push("Constraints:");
+      for (const r of ruleAtoms) parts.push(`- ${r.content}`);
+    }
+
+    if (guideAtoms.length > 0) {
+      parts.push("");
+      for (const g of guideAtoms) parts.push(`- ${g.content}`);
+    }
+  } else {
+    // Fallback: no brain results — inject all system atoms from source of truth.
+    // Identical to the old behavior when no local model was available.
+    const methodAtoms = [...METHOD_ATOMS].sort((a, b) => a.sortOrder - b.sortOrder);
+
+    if (methodAtoms.length > 0) {
+      parts.push(methodAtoms.map(a => a.text).join("\n\n"));
+    }
+
+    if (RULE_ATOMS.length > 0) {
+      parts.push("");
+      parts.push("Constraints:");
+      for (const r of RULE_ATOMS) parts.push(`- ${r.text}`);
+    }
+
+    if (GUIDELINE_ATOMS.length > 0) {
+      parts.push("");
+      for (const g of GUIDELINE_ATOMS) parts.push(`- ${g.text}`);
+    }
+  }
+
+  // Gemini sub-agents
+  if (backend === "gemini-cli") {
+    parts.push(_GEMINI_SUBAGENTS);
+  }
+
+  return parts.join("\n");
+}
+
+function _buildDirective(intent, taskType, complexity, reasoning, verification) {
+  const parts = [];
+
+  // Mode line
+  const modeLabel = intent === "plan" ? "PLANNING" : intent === "explain" ? "EXPLANATION" : "EXECUTION";
+  parts.push(`${modeLabel} mode.`);
+
+  // Task-specific focus
+  const task = TASK_DIRECTIVES[taskType] || TASK_DIRECTIVES["implement"];
+  parts.push(task.focus);
+
+  // Reasoning depth
+  const depth = reasoning || (complexity === "high" ? "deep" : "shallow");
+  parts.push(task[depth] || task.deep);
+
+  // Complexity signal — high complexity gets explicit guardrails
+  if (complexity === "high") {
+    parts.push("This is a complex task. Take your time, plan carefully, and verify each step.");
+  }
+
+  // Verification
+  const verif = VERIFICATION_DIRECTIVES[verification || "none"];
+  if (verif) parts.push(verif);
+
+  return parts.join(" ");
 }

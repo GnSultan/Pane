@@ -26,6 +26,7 @@ import {
   brainClearSessionPins,
   sessionMergeState,
   sessionClearState,
+  extractPreferencesFromTurn,
 } from "../lib/tauri-commands";
 import type {
   PunkStreamEvent as ClaudeStreamEvent,
@@ -949,6 +950,12 @@ export function usePunk(projectId: string) {
           case "processStarted":
             break;
 
+          case "sdk_init_info": {
+            const { models, account } = event.data;
+            useWorkspaceStore.getState().setSdkInfo(models, account);
+            break;
+          }
+
           case "routing": {
             // Legacy routing event — still handled for backwards compat
             const { model, thinking, intent } = event.data;
@@ -1044,6 +1051,33 @@ export function usePunk(projectId: string) {
               if (proj && proj.conversation.messages.length > 1) {
                 // Record file changes to change history
                 recordChangeHistory(projectId, proj.conversation.messages);
+
+                // LLM preference extraction — build a concise text of the last
+                // user message + assistant response for the model to analyse.
+                // Fire-and-forget: never blocks the UI.
+                try {
+                  const msgs = proj.conversation.messages;
+                  let turnStart = msgs.length - 1;
+                  for (let i = msgs.length - 1; i >= 0; i--) {
+                    if (msgs[i]!.type === "user") { turnStart = i; break; }
+                  }
+                  const turnMsgs = msgs.slice(turnStart, turnStart + 4); // user + up to 3 assistant blocks
+                  const turnLines: string[] = [];
+                  for (const m of turnMsgs) {
+                    const role = m.type === "user" ? "Developer" : "Assistant";
+                    for (const b of m.content) {
+                      if (b.type === "text") {
+                        turnLines.push(`${role}: ${(b as { text: string }).text.slice(0, 600)}`);
+                      }
+                    }
+                  }
+                  const turnText = turnLines.join("\n\n");
+                  if (turnText.length > 100) {
+                    extractPreferencesFromTurn(turnText).catch(() => {});
+                  }
+                } catch {
+                  // non-critical
+                }
 
                 const memEvents = extractMemoryEvents(
                   proj.conversation.messages,
@@ -1651,12 +1685,18 @@ function handleClaudeMessage(
 
         console.warn("[pane] Claude non-success result:", msg.subtype, msg);
 
-        // Clear stale session ID so the next attempt starts a fresh session
-        store.setConversationSessionId(projectId, null);
+        // error_max_turns: session is still valid — keep the session ID so the
+        // next message resumes the conversation rather than starting fresh.
+        if (msg.subtype !== "error_max_turns") {
+          store.setConversationSessionId(projectId, null);
+        }
 
         const existing = store.projects.get(projectId)?.conversation.error;
         if (!existing) {
-          const detail = msg.error?.trim() || msg.result?.trim();
+          const detail =
+            msg.subtype === "error_max_turns"
+              ? "Reached max turns — send a message to continue"
+              : msg.error?.trim() || msg.result?.trim();
           store.setConversationError(
             projectId,
             detail ||

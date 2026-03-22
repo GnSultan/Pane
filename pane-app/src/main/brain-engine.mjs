@@ -22,12 +22,13 @@ import {
   updateSynthesis,
   readSynthesis,
 } from "./symbol-index.mjs";
+import { resolveModelCache } from "./model-paths.mjs";
+import { ALL_SYSTEM_ATOMS, FACET_WEIGHTS } from "./system-atoms.mjs";
 
 const BRAIN_DIR = path.join(os.homedir(), ".pane", "brain");
 const MEMORY_DIR = path.join(os.homedir(), ".pane", "memory");
 const PROFILE_DIR = path.join(os.homedir(), ".pane", "profile");
 const EXPORTS_DIR = path.join(BRAIN_DIR, "exports");
-const MODEL_CACHE = path.join(BRAIN_DIR, "models");
 
 const SESSION_DIR = path.join(os.homedir(), ".pane", "session");
 /** Read session state for working set access. Returns null on any failure. */
@@ -44,6 +45,12 @@ let db = null;
 let embedder = null;
 let embedderLoading = false;
 let embedderReady = false;
+
+// Local Intelligence model (Qwen2.5-0.5B) — lives here so it runs in the
+// UtilityProcess rather than the main process (avoids V8/Chromium OOM crash).
+let intelGenerator = null;
+let intelLoading = false;
+let intelReady = false;
 
 // Tracks which projects have completed a full initial index this session.
 const indexedProjects = new Set();
@@ -395,7 +402,10 @@ function initDatabase() {
       version INTEGER DEFAULT 1,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now')),
-      access_count INTEGER DEFAULT 0
+      access_count INTEGER DEFAULT 0,
+      priority REAL DEFAULT 0.5,
+      sort_order INTEGER DEFAULT 0,
+      facet TEXT DEFAULT NULL
     );
 
     CREATE TABLE IF NOT EXISTS edges (
@@ -451,6 +461,21 @@ function initDatabase() {
   try {
     db.exec("ALTER TABLE mind_entries ADD COLUMN embedding BLOB");
   } catch (err) { /* ignore if exists */ }
+
+  // Migrations for unified atom pool — add priority, sort_order, facet to nodes
+  try {
+    db.exec("ALTER TABLE nodes ADD COLUMN priority REAL DEFAULT 0.5");
+  } catch { /* ignore if exists */ }
+  try {
+    db.exec("ALTER TABLE nodes ADD COLUMN sort_order INTEGER DEFAULT 0");
+  } catch { /* ignore if exists */ }
+  try {
+    db.exec("ALTER TABLE nodes ADD COLUMN facet TEXT DEFAULT NULL");
+  } catch { /* ignore if exists */ }
+  // facet index must come after the column migration — safe for both new and existing DBs
+  try {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_facet ON nodes(facet)");
+  } catch { /* ignore */ }
 
   // Prepare statements for hot paths
   db._stmts = {
@@ -530,7 +555,11 @@ async function loadEmbedder() {
     // Dynamic import — @huggingface/transformers is pure ESM
     const { pipeline, env } = await import("@huggingface/transformers");
 
-    env.cacheDir = MODEL_CACHE;
+    // Resolve model cache: bundled (prod/dev) or user cache (fallback)
+    const { cacheDir, bundled } = resolveModelCache();
+    env.cacheDir = cacheDir;
+    if (bundled) console.log(`[brain] Using bundled embedder from ${cacheDir}`);
+    else console.warn("[brain] Bundled embedder not found, will download on first use");
 
     // CRITICAL: prevent em-pthread thread accumulation.
     //
@@ -557,8 +586,11 @@ async function loadEmbedder() {
     embedderReady = true;
     sendToMain({ type: "embedder_ready" });
     console.log("[brain] Embedding model loaded");
-    // Index profile atoms now that embedder is ready
-    indexProfileAtoms().catch(err => console.error("[brain] Profile atom indexing failed:", err.message));
+    // Index all atoms now that embedder is ready — system atoms + profile atoms into unified pool
+    Promise.all([
+      indexSystemAtoms().catch(err => console.error("[brain] System atom indexing failed:", err.message)),
+      indexProfileAtoms().catch(err => console.error("[brain] Profile atom indexing failed:", err.message)),
+    ]);
   } catch (err) {
     console.error("[brain] Failed to load embedding model:", err.message);
     // Brain still works without embeddings — just no semantic search
@@ -581,6 +613,118 @@ function cosineSimilarity(a, b) {
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
   return dot; // Vectors are already normalized, so dot product = cosine similarity
+}
+
+// --- Local Intelligence (Qwen2.5-0.5B) ---
+// Runs in the UtilityProcess alongside the embedder — safe from main-process OOM.
+
+const _INTEL_VALID_MODES       = new Set(["direct", "orchestrate", "discuss"]);
+const _INTEL_VALID_REASONING   = new Set(["shallow", "deep"]);
+const _INTEL_VALID_VERIFY      = new Set(["none", "diff", "test"]);
+const _INTEL_VALID_TASK_TYPES  = new Set(["debug","implement","explain","architect","refactor","review","conversation","quick-answer","other"]);
+const _INTEL_VALID_COMPLEXITY  = new Set(["low", "medium", "high"]);
+const _INTEL_VALID_FILE_DEPTH  = new Set(["none", "names", "shallow", "deep"]);
+
+async function loadLocalIntel() {
+  if (intelReady || intelLoading) return;
+  intelLoading = true;
+
+  try {
+    const { pipeline, env } = await import("@huggingface/transformers");
+    const { cacheDir } = resolveModelCache();
+    // env is a module-level singleton — these may already be set by loadEmbedder,
+    // but setting them again is idempotent and ensures correctness.
+    env.cacheDir = cacheDir;
+    env.backends.onnx.wasm.proxy = false;
+    env.backends.onnx.wasm.numThreads = 1;
+
+    intelGenerator = await pipeline("text-generation", "onnx-community/Qwen2.5-0.5B-Instruct", {
+      dtype: "q8",
+      revision: "main",
+    });
+
+    intelReady = true;
+    intelLoading = false;
+    sendToMain({ type: "local_intel_ready" });
+    console.log("[brain] Local intelligence model loaded (first classify will JIT-compile WASM)");
+
+  } catch (err) {
+    console.error("[brain] Local intelligence load failed:", err.message);
+    intelLoading = false;
+    sendToMain({ type: "local_intel_error", error: err.message });
+  }
+}
+
+async function classifyWithIntel(input) {
+  if (!intelReady || !intelGenerator) return null;
+
+  const truncated = (input.message || "").slice(0, 300);
+  const turns      = input.turnCount      || 0;
+  const hasTask    = !!input.hasActiveTask;
+  const files      = input.workingSetSize || 0;
+  const pending    = input.pendingTodos   || 0;
+
+  const system = `You are the routing brain for a code editor. Given a developer's message and session context, decide the execution strategy and classify the task. Output valid JSON only. No explanation.
+
+Strategy modes:
+- "direct": surgical single-file changes, short confirmations (yes/go/do it), simple questions
+- "orchestrate": multi-step tasks, new features, refactors, migrations — anything that needs planning
+- "discuss": questions, explanations, opinions, conceptual conversations — no code changes
+
+Discovery (only when mode=orchestrate): true if the task is new/ambiguous and needs alignment before planning. false if continuing established work with pending todos.
+
+Reasoning: "deep" for architecture/debugging/complex tasks, "shallow" for simple changes/quick answers.
+Verification: "none" for discussion/trivial, "diff" for code changes, "test" for complex implementations.`;
+
+  const user = `Message: "${truncated}"
+Context: turns=${turns}, activeTask=${hasTask}, files=${files}, pendingTodos=${pending}
+
+{"mode":"<direct|orchestrate|discuss>","discovery":<true|false>,"reasoning":"<shallow|deep>","verification":"<none|diff|test>","taskType":"<debug|implement|explain|architect|refactor|review|conversation|quick-answer|other>","complexity":"<low|medium|high>","preferFrontier":<true|false>,"atomHints":["<kw>"],"historyDepth":<1-20>,"includeBrief":<true|false>,"fileDepth":"<none|names|shallow|deep>"}`;
+
+  try {
+    const messages = [{ role: "system", content: system }, { role: "user", content: user }];
+    // No timeout here — let the UtilityProcess run to completion.
+    // The caller (local-intelligence.mjs) owns the deadline.
+    const output = await intelGenerator(messages, { max_new_tokens: 80, temperature: 0, do_sample: false, return_full_text: false });
+
+    let raw = null;
+    if (Array.isArray(output) && output.length > 0) {
+      const gen = output[0]?.generated_text;
+      if (typeof gen === "string") raw = gen.trim();
+      else if (Array.isArray(gen)) raw = gen[gen.length - 1]?.content?.trim() ?? null;
+    }
+    if (!raw) return null;
+
+    // Extract JSON
+    let jsonStr = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+    const match = jsonStr.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+
+    let parsed;
+    try { parsed = JSON.parse(match[0]); } catch { return null; }
+
+    const clamp = (v, lo, hi, def) => (typeof v === "number" && !isNaN(v)) ? Math.max(lo, Math.min(hi, Math.round(v))) : def;
+
+    const decision = {
+      mode:          _INTEL_VALID_MODES.has(parsed.mode)         ? parsed.mode        : null,
+      discovery:     typeof parsed.discovery === "boolean"        ? parsed.discovery   : true,
+      reasoning:     _INTEL_VALID_REASONING.has(parsed.reasoning) ? parsed.reasoning   : "deep",
+      verification:  _INTEL_VALID_VERIFY.has(parsed.verification) ? parsed.verification: "none",
+      taskType:      _INTEL_VALID_TASK_TYPES.has(parsed.taskType) ? parsed.taskType    : "other",
+      complexity:    _INTEL_VALID_COMPLEXITY.has(parsed.complexity)? parsed.complexity  : "medium",
+      preferFrontier: typeof parsed.preferFrontier === "boolean"  ? parsed.preferFrontier : false,
+      atomHints:     (Array.isArray(parsed.atomHints) ? parsed.atomHints : [])
+                       .filter(h => typeof h === "string" && h.length > 0 && h.length < 50).slice(0, 5),
+      historyDepth:  clamp(parsed.historyDepth, 1, 20, 5),
+      includeBrief:  typeof parsed.includeBrief === "boolean"     ? parsed.includeBrief : true,
+      fileDepth:     _INTEL_VALID_FILE_DEPTH.has(parsed.fileDepth)? parsed.fileDepth   : "shallow",
+    };
+
+    return decision.mode ? decision : null;
+  } catch (err) {
+    console.warn("[brain] classifyWithIntel failed:", err.message);
+    return null;
+  }
 }
 
 function nodeId(type, content) {
@@ -999,23 +1143,29 @@ function decayStaleNodes(projectId) {
 
 // --- Contextual Search (for proactive injection) ---
 
-async function contextualSearch(query, fileContext, projectId, intent, projectRoot) {
-  if (!db) return { memories: [], tensions: [], profileAtoms: [], relevantFiles: [] };
+async function contextualSearch(query, fileContext, projectId, intent, projectRoot, taskType = null, atomHints = []) {
+  if (!db) return { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [] };
 
-  // Embed the query once — used for both project search and profile atom search
+  // Embed the query once — used for both project search and atom pool search
   const queryEmbedding = embedderReady ? await embed(query) : null;
 
-  // Profile atoms: always retrieve regardless of intent or directive nature.
-  // These are about HOW to work, not WHAT to do — relevant to every request.
-  const profileAtoms = queryEmbedding ? searchProfileAtoms(queryEmbedding, 4) : [];
+  // Unified atom pool search: system atoms + profile atoms + learned atoms,
+  // scored by cosine × facetWeight × priority + hintBoost.
+  // Falls back to legacy profileAtoms when atom pool is empty.
+  const atoms = queryEmbedding ? searchAtomPool(queryEmbedding, taskType, atomHints, 16) : [];
+  // Legacy compat: also populate profileAtoms from the unified results
+  const profileAtoms = atoms.filter(a => a.entityType === "profile_atom").slice(0, 4);
 
-  // Short imperative prompts don't need project brain context — user is directing
-  const trimmed = query.trim();
-  const isDirective = trimmed.length < 65 && /^(add|remove|fix|update|change|delete|create|make|move|rename|refactor|run|install|build|deploy|write|edit|show|get|find|check|use|switch|enable|disable|set|reset|clear|open|close)/i.test(trimmed);
   // Relevant files: always retrieve if we have indexed files for this project
   const relevantFiles = projectRoot ? await findRelevantFiles(query, projectId, 5) : [];
 
-  if (isDirective) return { memories: [], tensions: [], profileAtoms, relevantFiles };
+  // Short imperative prompts skip project memory (lessons/decisions/tensions)
+  // but ALWAYS include scored atoms — they drive system prompt assembly.
+  // Without atoms, session-context falls back to injecting ALL atoms unfiltered.
+  const trimmed = query.trim();
+  const isDirective = trimmed.length < 65 && /^(add|remove|fix|update|change|delete|create|make|move|rename|refactor|run|install|build|deploy|write|edit|show|get|find|check|use|switch|enable|disable|set|reset|clear|open|close)/i.test(trimmed);
+
+  if (isDirective) return { memories: [], tensions: [], atoms, profileAtoms, relevantFiles };
 
   // Combine query + active file path for richer semantic search
   const searchText = fileContext ? `${query} ${fileContext}` : query;
@@ -1102,7 +1252,7 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
     console.error("[brain] Mind entry query failed:", err.message);
   }
 
-  return { memories: valuable, tensions, profileAtoms, relevantFiles, mindEntries };
+  return { memories: valuable, tensions, atoms, profileAtoms, relevantFiles, mindEntries };
 }
 
 // --- Search Export (for MCP server) ---
@@ -1157,8 +1307,8 @@ function writeSearchExport(projectId) {
 
 // --- Contextual Export (for claude-worker brief injection) ---
 
-async function writeContextualExport(projectId, query, fileContext, intent, projectRoot) {
-  const result = await contextualSearch(query || "", fileContext || "", projectId, intent || "other", projectRoot || null);
+async function writeContextualExport(projectId, query, fileContext, intent, projectRoot, taskType = null, atomHints = []) {
+  const result = await contextualSearch(query || "", fileContext || "", projectId, intent || "other", projectRoot || null, taskType, atomHints);
 
   // Layer 1: Symbol map — resolve symbols mentioned in the query + working set exports.
   // The model sees key symbols pre-resolved so it doesn't grep for them.
@@ -1319,8 +1469,42 @@ async function indexProfileAtoms() {
     if (antiPatterns?.patterns) {
       for (const ap of antiPatterns.patterns) {
         if (ap.error && ap.fix) {
-          atoms.push({ text: `Avoid: ${ap.error} — Instead: ${ap.fix}`, facet: "anti_pattern" });
+          atoms.push({ text: `Avoid: ${ap.error} — Instead: ${ap.fix}`, facet: "anti_pattern", priority: 0.75 });
         }
+      }
+    }
+
+    // Preferences: coding patterns as atoms
+    const preferences = readProfileJson("preferences.json");
+    if (preferences?.coding) {
+      for (const [, info] of Object.entries(preferences.coding)) {
+        if (info.content && info.content.length > 10) {
+          atoms.push({ text: info.content, facet: "preference", priority: 0.6 });
+        }
+      }
+    }
+
+    // Preferences: tool preferences as atoms
+    if (preferences?.tools) {
+      for (const [tool, info] of Object.entries(preferences.tools)) {
+        const label = info.prefers === false ? `Avoid ${info.avoids || tool}` : `Prefers ${tool}`;
+        const text = `${label}: ${info.content || ""}`.trim();
+        if (text.length > 10) {
+          atoms.push({ text, facet: "preference", priority: 0.55 });
+        }
+      }
+    }
+
+    // Style: verbosity and work style as atoms
+    const style = readProfileJson("style.json");
+    if (style) {
+      if (style.verbosity && style.verbosity !== "adaptive") {
+        atoms.push({ text: `Communication style: ${style.verbosity} verbosity.`, facet: "style", priority: 0.5 });
+      }
+      if (style.planFirst === true) {
+        atoms.push({ text: "Work style: plan before executing — think through the approach first.", facet: "style", priority: 0.5 });
+      } else if (style.planFirst === false) {
+        atoms.push({ text: "Work style: execute directly — skip planning for straightforward tasks.", facet: "style", priority: 0.5 });
       }
     }
 
@@ -1330,10 +1514,15 @@ async function indexProfileAtoms() {
       const id = nodeId(PROFILE_ATOM_TYPE, atom.text);
       const embedding = await embed(atom.text);
       const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
-      db._stmts.insertNode.run(
-        id, atom.text.slice(0, 80), PROFILE_ATOM_TYPE, null,
+
+      db.prepare(`
+        INSERT INTO nodes (id, name, entity_type, project_id, content, embedding, confidence, version, priority, facet)
+        VALUES (?, ?, ?, NULL, ?, ?, 1.0, 1, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+      `).run(
+        id, atom.text.slice(0, 80), PROFILE_ATOM_TYPE,
         JSON.stringify({ text: atom.text, facet: atom.facet }),
-        embeddingBuffer, 1.0
+        embeddingBuffer, atom.priority || 0.7, atom.facet,
       );
       indexed++;
     }
@@ -1345,6 +1534,156 @@ async function indexProfileAtoms() {
 }
 
 /**
+ * Index all system atoms (method steps, rules, guidelines) from system-atoms.mjs.
+ * These are the Pane workflow instructions — previously hardcoded in session-context.mjs,
+ * now stored as embeddings in the unified atom pool alongside profile atoms.
+ *
+ * Uses entity_type = 'system_atom'. Deletes and rebuilds on each call (they're static).
+ */
+async function indexSystemAtoms() {
+  if (!db || !embedderReady) return;
+
+  try {
+    db.prepare(`DELETE FROM nodes WHERE entity_type = 'system_atom'`).run();
+
+    let indexed = 0;
+    for (const atom of ALL_SYSTEM_ATOMS) {
+      const id = `system_atom-${atom.id}`;
+      const embedding = await embed(atom.text);
+      const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
+
+      db.prepare(`
+        INSERT INTO nodes (id, name, entity_type, project_id, content, embedding, confidence, version, priority, sort_order, facet)
+        VALUES (?, ?, 'system_atom', NULL, ?, ?, 1.0, 1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          content = excluded.content,
+          embedding = excluded.embedding,
+          priority = excluded.priority,
+          sort_order = excluded.sort_order,
+          facet = excluded.facet,
+          updated_at = datetime('now')
+      `).run(
+        id,
+        atom.id,
+        JSON.stringify({ text: atom.text, facet: atom.facet }),
+        embeddingBuffer,
+        atom.priority,
+        atom.sortOrder,
+        atom.facet,
+      );
+      indexed++;
+    }
+
+    console.log(`[brain] Indexed ${indexed} system atoms`);
+  } catch (err) {
+    console.error("[brain] indexSystemAtoms error:", err.message);
+  }
+}
+
+/**
+ * Unified atom pool search — replaces searchProfileAtoms().
+ *
+ * Queries ALL atom types (system_atom, profile_atom, learned nodes above threshold),
+ * applies facet-weighted scoring based on task type, and returns a single ranked list.
+ *
+ * Scoring: finalScore = (cosineSimilarity × facetWeight × priority) + hintBoost
+ *
+ * @param {Float32Array} queryEmbedding — embedded query vector
+ * @param {string|null} taskType — from local-intel classification
+ * @param {string[]} atomHints — keyword hints from local-intel
+ * @param {number} limit — max atoms to return
+ * @returns {Array<{id, facet, content, score, priority, sortOrder}>}
+ */
+function searchAtomPool(queryEmbedding, taskType = null, atomHints = [], limit = 12) {
+  if (!db || !queryEmbedding) return [];
+
+  // Get facet weights for this task type
+  const weights = taskType ? (FACET_WEIGHTS[taskType] || FACET_WEIGHTS._default) : FACET_WEIGHTS._default;
+
+  // Build hint pattern for keyword boost
+  const hintPattern = atomHints.length > 0
+    ? new RegExp(atomHints.map(h => h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "i")
+    : null;
+
+  // Query all atom-type nodes with embeddings
+  const atoms = db.prepare(`
+    SELECT * FROM nodes
+    WHERE entity_type IN ('system_atom', 'profile_atom')
+      AND embedding IS NOT NULL
+  `).all();
+
+  // Also pull in high-confidence learned nodes (lessons, patterns, error_fix)
+  // that have crossed the promotion threshold — these become "learned atoms"
+  const learnedAtoms = db.prepare(`
+    SELECT * FROM nodes
+    WHERE entity_type IN ('lesson', 'pattern', 'error_fix')
+      AND confidence >= 0.78
+      AND embedding IS NOT NULL
+    ORDER BY confidence DESC
+    LIMIT 20
+  `).all();
+
+  const results = [];
+
+  for (const node of [...atoms, ...learnedAtoms]) {
+    const nodeEmbedding = new Float32Array(
+      node.embedding.buffer, node.embedding.byteOffset, node.embedding.byteLength / 4,
+    );
+    const cosine = cosineSimilarity(queryEmbedding, nodeEmbedding);
+    if (cosine < 0.20) continue; // below noise floor
+
+    const content = JSON.parse(node.content || "{}");
+    const text = content.text || node.name;
+    const facet = node.facet || content.facet || _inferFacet(node.entity_type);
+    const priority = node.priority || 0.5;
+    const sortOrder = node.sort_order || 0;
+
+    // Unified scoring: cosine × facetWeight × priority + hintBoost
+    const facetMul = weights[facet] || 1.0;
+    const hintBoost = hintPattern && hintPattern.test(text) ? 0.15 : 0;
+    const finalScore = (cosine * facetMul * priority) + hintBoost;
+
+    results.push({
+      id: node.id,
+      facet,
+      content: text,
+      score: finalScore,
+      cosine,
+      priority,
+      sortOrder,
+      entityType: node.entity_type,
+    });
+  }
+
+  // Sort: sequenced atoms (sortOrder > 0) by sortOrder, then by score descending
+  results.sort((a, b) => {
+    // Sequenced atoms (method steps) maintain their order when both are present
+    if (a.sortOrder > 0 && b.sortOrder > 0) return a.sortOrder - b.sortOrder;
+    // Sequenced atoms rank above unordered at equal score
+    if (a.sortOrder > 0 && b.sortOrder === 0 && a.score >= b.score * 0.8) return -1;
+    if (b.sortOrder > 0 && a.sortOrder === 0 && b.score >= a.score * 0.8) return 1;
+    // Default: score descending
+    return b.score - a.score;
+  });
+
+  return results.slice(0, limit);
+}
+
+/**
+ * Infer facet from entity_type for learned nodes that don't have an explicit facet.
+ */
+function _inferFacet(entityType) {
+  switch (entityType) {
+    case "lesson": return "learned";
+    case "pattern": return "learned";
+    case "error_fix": return "anti_pattern";
+    case "decision": return "learned";
+    default: return "learned";
+  }
+}
+
+/**
+ * @deprecated Use searchAtomPool() instead. Kept for backward compatibility.
  * Semantic search over profile atoms only.
  * Returns atoms sorted by cosine similarity to the query embedding.
  */
@@ -1448,43 +1787,139 @@ function extractPreferences() {
     const content = JSON.parse(node.content || "{}").text || node.name;
     const lower = content.toLowerCase();
 
-    // Tool preferences: library, framework, package mentions
-    const toolPatterns = /(?:use|using|prefer|chose|switched to|installed)\s+([\w@/-]+)/i;
-    const toolMatch = content.match(toolPatterns);
-    if (toolMatch) {
-      const tool = toolMatch[1];
-      if (!newTools[tool]) {
-        newTools[tool] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 150) };
-      }
-    }
-
-    // Coding style: naming, structure, patterns
-    if (lower.includes("naming") || lower.includes("convention") || lower.includes("style") ||
-        lower.includes("pattern") || lower.includes("structure") || lower.includes("architecture")) {
-      const key = content.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/\s+/g, "-").toLowerCase();
-      if (key.length > 5 && !newCoding[key]) {
-        newCoding[key] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 150) };
-      }
-    }
-
-    // Anti-patterns: things from error_fix or low-confidence-then-dropped decisions
+    // Skip error_fix nodes for tool/coding extraction — they only feed anti-patterns.
+    // Without this gate, tool error messages leak into coding patterns.
     if (node.entity_type === "error_fix") {
-      const original = JSON.parse(node.content || "{}").metadata?.original_error;
+      // Fall through to anti-pattern extraction below
+    } else {
+      // ── Tool preferences ─────────────────────────────────────────────────
+      // Positive: explicit and implicit tool choices
+      const positiveToolRe = /(?:use|using|prefer(?:ring)?|chose|choosing|switch(?:ed|ing)? to|install(?:ed|ing)|opted? for|going with|went with|stick(?:ing)? with|decided on|picked|selected|settled on|works? (?:well |better )?with|built? with|rely(?:ing)? on|depend(?:ing)? on)\s+([\w@/.-]{2,40})/gi;
+      for (const m of content.matchAll(positiveToolRe)) {
+        const tool = m[1].replace(/[.,;:!?]+$/, ""); // strip trailing punctuation
+        if (tool.length > 1 && !/^(the|a|an|it|to|on|in|for|of|be|is|was|are|this|that)$/i.test(tool)) {
+          if (!newTools[tool]) {
+            newTools[tool] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 150), prefers: true };
+          }
+        }
+      }
+
+      // Negative: things being avoided or replaced
+      const negativeToolRe = /(?:avoid(?:ing)?|not? (?:use|using)|stop(?:p(?:ed|ing))? using|drop(?:p(?:ed|ing))?|replac(?:ed|ing)|mov(?:ed|ing) away from|get rid of|removing|ditching)\s+([\w@/.-]{2,40})/gi;
+      for (const m of content.matchAll(negativeToolRe)) {
+        const tool = m[1].replace(/[.,;:!?]+$/, "");
+        if (tool.length > 1 && !/^(the|a|an|it|to|on|in|for|of|be|is|was|are|this|that)$/i.test(tool)) {
+          const key = `avoid:${tool}`;
+          if (!newTools[key]) {
+            newTools[key] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 150), prefers: false, avoids: tool };
+          }
+        }
+      }
+
+      // ── Coding patterns ───────────────────────────────────────────────────
+      // Broader keyword set — captures style, approach, and implicit preferences
+      const codingKeywords = [
+        "naming", "convention", "style", "pattern", "structure", "architecture",
+        "approach", "practice", "instead of", "rather than", "always ", "never ",
+        "consistent", "standard", "rule", "guideline", "principle", "prefer",
+        "should ", "must ", "avoid ", "don't ", "do not ", "keep ", "make sure",
+        "important", "critical", "key insight", "the reason", "because ",
+      ];
+      if (codingKeywords.some(kw => lower.includes(kw))) {
+        const key = content.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/\s+/g, "-").toLowerCase();
+        if (key.length > 5 && !newCoding[key]) {
+          newCoding[key] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 200) };
+        }
+      }
+
+      // ── Implicit corrections ──────────────────────────────────────────────
+      // "X, not Y" / "use X instead of Y" — strongest signal of preference
+      const correctionRe = /(?:use|with|prefer)\s+([\w@/.-]{2,30})\s+(?:instead of|not|over|rather than)\s+([\w@/.-]{2,30})/gi;
+      for (const m of content.matchAll(correctionRe)) {
+        const toward = m[1].replace(/[.,;:!?]+$/, "");
+        const away = m[2].replace(/[.,;:!?]+$/, "");
+        const key = `correction:${toward}-over-${away}`;
+        if (!newCoding[key]) {
+          newCoding[key] = { confidence: node.confidence, source: node.project_id, content: `Prefer ${toward} over ${away}: ${content.slice(0, 120)}` };
+        }
+      }
+    }
+
+    // Anti-patterns: things from error_fix — but only genuine behavioral patterns,
+    // NOT tool operational errors (file not found, string not matched, validation failures).
+    // Those are transient tool issues, not user anti-patterns worth remembering.
+    if (node.entity_type === "error_fix") {
+      const parsed = JSON.parse(node.content || "{}");
+      const original = parsed.metadata?.original_error;
       if (original && original.length > 10) {
-        const exists = antiPatterns.patterns.some(p => p.error === original.slice(0, 100));
-        if (!exists) {
-          newAntiPatterns.push({
-            error: original.slice(0, 100),
-            fix: content.slice(0, 150),
-            confidence: node.confidence,
-            source: node.project_id,
-          });
+        // Skip tool operational errors — these are not behavioral patterns
+        const isToolError =
+          /tool_use_error/i.test(original) ||
+          /could not find the specified string/i.test(original) ||
+          /file has not been read/i.test(original) ||
+          /file does not exist/i.test(original) ||
+          /failed to edit/i.test(original) ||
+          /command (?:validation )?failed/i.test(original) ||
+          /path does not exist/i.test(original) ||
+          /not writable/i.test(original) ||
+          /permission denied/i.test(original) ||
+          /no such file or directory/i.test(original) ||
+          /timed? ?out/i.test(original) ||
+          /ENOENT|EACCES|EPERM|EISDIR/i.test(original) ||
+          /found \d+ occurrences/i.test(original) ||
+          /dangerous pattern/i.test(original);
+
+        if (!isToolError) {
+          const exists = antiPatterns.patterns.some(p => p.error === original.slice(0, 100));
+          if (!exists) {
+            newAntiPatterns.push({
+              error: original.slice(0, 100),
+              fix: content.slice(0, 150),
+              confidence: node.confidence,
+              source: node.project_id,
+            });
+          }
         }
       }
     }
   }
 
-  // Merge into profile (don't overwrite existing)
+  // ── C1: Frequency-based tool promotion ─────────────────────────────────────
+  // Scan ALL high-confidence nodes (not just current batch) and count how many
+  // distinct node_ids mention each tool name. Tools appearing in 3+ separate
+  // nodes are genuine preferences — behavioural signal, not just one sentence.
+  const FREQUENCY_THRESHOLD = 3;
+  const allNodes = db.prepare(`
+    SELECT id, content FROM nodes
+    WHERE confidence >= ? AND entity_type IN ('decision', 'lesson', 'pattern')
+    ORDER BY updated_at DESC LIMIT 500
+  `).all(0.65); // lower threshold for frequency scan — recurrence is the signal
+
+  const toolFrequency = new Map(); // toolName → Set of node ids
+  const positiveFreqRe = /(?:use|using|prefer(?:ring)?|chose|choosing|switch(?:ed|ing)? to|going with|went with|stick(?:ing)? with|decided on|picked|settled on|built? with)\s+([\w@/.-]{2,40})/gi;
+
+  for (const node of allNodes) {
+    const text = JSON.parse(node.content || "{}").text || "";
+    for (const m of text.matchAll(positiveFreqRe)) {
+      const tool = m[1].replace(/[.,;:!?]+$/, "");
+      if (tool.length < 2 || /^(the|a|an|it|to|on|in|for|of|be|is|was|are|this|that)$/i.test(tool)) continue;
+      if (!toolFrequency.has(tool)) toolFrequency.set(tool, new Set());
+      toolFrequency.get(tool).add(node.id);
+    }
+  }
+
+  for (const [tool, nodeIds] of toolFrequency.entries()) {
+    if (nodeIds.size >= FREQUENCY_THRESHOLD && !newTools[tool] && !prefs.tools[tool]) {
+      newTools[tool] = {
+        confidence: 0.85,
+        source: "frequency",
+        content: `Appears in ${nodeIds.size} separate sessions — consistent usage pattern`,
+        frequency: nodeIds.size,
+      };
+    }
+  }
+
+  // ── Merge into profile (don't overwrite existing) ───────────────────────────
   let changed = false;
 
   for (const [key, val] of Object.entries(newTools)) {
@@ -1703,8 +2138,9 @@ process.parentPort.on("message", async ({ data }) => {
           if (decayed > 0) console.log(`[brain] Decayed ${decayed} stale nodes in ${data.projectId}`);
         }
 
-        // Phase 6: Profile extraction (run occasionally — every ~5th indexing call)
-        if (Math.random() < 0.2) {
+        // Phase 6: Profile extraction — run whenever meaningful events exist.
+        // Cheap (SQLite reads + JSON writes), no reason to skip.
+        if (hasMeaningfulEvents) {
           extractPreferences();
         }
 
@@ -1728,7 +2164,7 @@ process.parentPort.on("message", async ({ data }) => {
       }
 
       case "contextual_search": {
-        const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null);
+        const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null, data.taskType || null, data.atomHints || []);
         sendToMain({ type: "contextual_result", requestId: data.requestId, ...result });
         break;
       }
@@ -1872,6 +2308,74 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
+      case "update_preferences_from_llm": {
+        // Merge LLM-extracted preferences into profile files.
+        // Runs after each conversation turn — complements regex extraction.
+        const { extracted } = data;
+        if (!extracted) break;
+
+        const prefs = readProfileJson("preferences.json") || { coding: {}, communication: {}, tools: {}, _meta: {} };
+        const antiPatterns = readProfileJson("anti-patterns.json") || { patterns: [], _meta: {} };
+        let changed = false;
+
+        // Tools
+        for (const t of (extracted.tools || [])) {
+          if (!t.name || t.name.length < 2) continue;
+          const key = t.prefers === false ? `avoid:${t.name}` : t.name;
+          if (!prefs.tools[key]) {
+            prefs.tools[key] = {
+              confidence: 0.8,
+              source: "llm_extraction",
+              content: t.evidence?.slice(0, 150) || t.name,
+              prefers: t.prefers !== false,
+            };
+            changed = true;
+          }
+        }
+
+        // Patterns
+        for (const p of (extracted.patterns || [])) {
+          if (!p.pattern || p.pattern.length < 5) continue;
+          const key = p.pattern.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/\s+/g, "-").toLowerCase();
+          if (key.length > 4 && !prefs.coding[key]) {
+            prefs.coding[key] = {
+              confidence: 0.8,
+              source: "llm_extraction",
+              content: `${p.pattern}: ${p.evidence || ""}`.slice(0, 200),
+            };
+            changed = true;
+          }
+        }
+
+        // Corrections → anti-patterns
+        for (const c of (extracted.corrections || [])) {
+          if (!c.toward || !c.away_from) continue;
+          const error = `Using ${c.away_from} instead of ${c.toward}`.slice(0, 100);
+          const exists = antiPatterns.patterns.some(ap => ap.error === error);
+          if (!exists) {
+            antiPatterns.patterns.push({
+              error,
+              fix: `Prefer ${c.toward}. ${c.evidence || ""}`.slice(0, 150),
+              confidence: 0.8,
+              source: "llm_extraction",
+            });
+            changed = true;
+          }
+        }
+
+        if (changed) {
+          writeProfileJson("preferences.json", prefs);
+          writeProfileJson("anti-patterns.json", antiPatterns);
+          writeProfileExport();
+          // Re-index profile atoms so new preferences are semantically searchable
+          indexProfileAtoms().catch(() => {});
+          console.log(`[brain] LLM extraction merged: ${(extracted.tools||[]).length} tools, ${(extracted.patterns||[]).length} patterns, ${(extracted.corrections||[]).length} corrections`);
+        }
+
+        sendToMain({ type: "llm_preferences_updated", requestId: data.requestId, changed });
+        break;
+      }
+
       case "reindex_profile_atoms": {
         await indexProfileAtoms();
         sendToMain({ type: "profile_atoms_indexed", requestId: data.requestId });
@@ -1949,6 +2453,18 @@ process.parentPort.on("message", async ({ data }) => {
         if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
         db.prepare(`DELETE FROM mind_entries WHERE id = ?`).run(data.id);
         sendToMain({ type: "mind_deleted", requestId: data.requestId, id: data.id });
+        break;
+      }
+
+      case "local_intel_load": {
+        // Fire-and-forget — sends local_intel_ready or local_intel_error when done
+        loadLocalIntel();
+        break;
+      }
+
+      case "local_intel_classify": {
+        const result = await classifyWithIntel(data.input || {});
+        sendToMain({ type: "local_intel_result", requestId: data.requestId, result });
         break;
       }
 

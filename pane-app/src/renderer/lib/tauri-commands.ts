@@ -245,6 +245,10 @@ export async function sendToPunk(
   cleanup = electronAPI.on(
     `claude-stream:${projectId}`,
     (event: ClaudeStreamEvent) => {
+      // Ignore events tagged for a different request (e.g. a previous aborted
+      // session whose processEnded arrives after the new session has started).
+      if (event.requestId && event.requestId !== requestId) return;
+
       // All events go through the MessageChannel queue so the browser can
       // interleave paint/input between each one. The old pattern of
       // synchronously dumping the queue on processEnded caused UI freezes
@@ -324,6 +328,20 @@ export async function getAllModels(): Promise<
   Record<string, OpenRouterModel[]>
 > {
   return electronAPI.invoke("get_all_models");
+}
+
+// ── SDK session management ─────────────────────────────────────────────────
+
+export async function sdkListSessions(): Promise<unknown[]> {
+  return electronAPI.invoke("sdk_list_sessions");
+}
+
+export async function sdkGetSessionMessages(sessionId: string): Promise<unknown[]> {
+  return electronAPI.invoke("sdk_get_session_messages", { sessionId });
+}
+
+export async function sdkForkSession(sessionId: string): Promise<unknown> {
+  return electronAPI.invoke("sdk_fork_session", { sessionId });
 }
 
 export async function refreshAllModels(): Promise<
@@ -662,6 +680,12 @@ export async function generateBrief(projectId: string): Promise<string> {
 
 export async function readBrief(projectId: string): Promise<string> {
   return electronAPI.invoke("read_brief", { projectId });
+}
+
+export async function extractPreferencesFromTurn(
+  turnText: string,
+): Promise<void> {
+  return electronAPI.invoke("brain_extract_preferences_llm", { turnText });
 }
 
 // --- Pane Brain Engine ---

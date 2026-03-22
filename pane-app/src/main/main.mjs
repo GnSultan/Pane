@@ -21,6 +21,13 @@ import {
   punkEngine,
 } from "./punk-engine.mjs";
 import { modelManager } from "./model-manager.mjs";
+import {
+  load as loadLocalIntelligence,
+  onProgress as onLocalIntelProgress,
+  setBrainSender,
+  handleBrainMessage as handleIntelBrainMessage,
+  resetIntelReady,
+} from "./local-intelligence.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -1729,6 +1736,52 @@ function registerMemoryHandlers() {
       return "";
     }
   });
+
+  // LLM-based preference extraction — runs after each conversation turn.
+  // Takes the last user+assistant exchange and asks the model to extract
+  // structured preferences: tools, patterns, corrections. Much richer than regex.
+  ipcMain.handle("brain_extract_preferences_llm", async (_event, args) => {
+    const { turnText } = args;
+    if (!turnText || turnText.length < 100) return null;
+
+    const system = `You extract preferences and patterns from conversations between a developer and an AI assistant.
+Focus on what the DEVELOPER prefers, values, or corrects — not the AI's suggestions.
+Return ONLY valid JSON. No explanation, no markdown, just the JSON object.`;
+
+    const prompt = `CONVERSATION TURN:
+${turnText.slice(0, 3000)}
+
+Extract preferences the developer expressed. Look for:
+- Tools, libraries, frameworks they chose or avoided
+- Coding/design patterns they enforce
+- Things they corrected the AI toward
+- Ways of working they clearly prefer
+
+Return JSON:
+{
+  "tools": [{"name": "string", "prefers": true/false, "evidence": "short quote"}],
+  "patterns": [{"pattern": "string", "evidence": "short quote"}],
+  "corrections": [{"toward": "string", "away_from": "string", "evidence": "short quote"}]
+}
+
+Only include items with clear evidence. Empty arrays if nothing found.`;
+
+    try {
+      const raw = await punkEngine.quickCall(system, prompt);
+      // Strip any markdown fences the model might add
+      const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+      const extracted = JSON.parse(cleaned);
+
+      // Forward to brain-engine to persist into preferences.json
+      if (extracted && (extracted.tools?.length || extracted.patterns?.length || extracted.corrections?.length)) {
+        await brainRequest("update_preferences_from_llm", { extracted });
+      }
+      return extracted;
+    } catch {
+      // LLM extraction is non-critical — never surface failures
+      return null;
+    }
+  });
 }
 
 // --- Session Context (per-project active state for context compilation) ---
@@ -1841,6 +1894,12 @@ function getBrainWorker() {
         }
       }
     }
+    // Local intelligence results (classify responses + ready/error signals)
+    if (message.type === "local_intel_ready" ||
+        message.type === "local_intel_result" ||
+        message.type === "local_intel_error") {
+      handleIntelBrainMessage(message);
+    }
   });
 
   brainWorker.on("exit", (code) => {
@@ -1851,6 +1910,8 @@ function getBrainWorker() {
       resolve({ type: "error", error: "Brain worker exited" });
     }
     brainPendingRequests.clear();
+    // Reset intel ready state — brain process is gone, model needs to reload
+    resetIntelReady();
   });
 
   return brainWorker;
@@ -1883,13 +1944,13 @@ function registerBrainHandlers() {
   });
 
   ipcMain.handle("brain_contextual_search", async (_event, args) => {
-    const { projectId, query, fileContext, intent, projectRoot } = args;
+    const { projectId, query, fileContext, intent, projectRoot, taskType, atomHints } = args;
     // Auto-trigger file indexing fire-and-forget when projectRoot is known.
     // brain-engine deduplicates via indexedProjects Set — safe to call every time.
     if (projectRoot) {
       brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
     }
-    return brainRequest("contextual_search", { projectId, query, fileContext, intent, projectRoot: projectRoot || null });
+    return brainRequest("contextual_search", { projectId, query, fileContext, intent, projectRoot: projectRoot || null, taskType: taskType || null, atomHints: atomHints || [] });
   });
 
   ipcMain.handle("brain_session_pins_clear", async (_event, args) => {
@@ -1965,6 +2026,33 @@ function registerBrainHandlers() {
 
   ipcMain.handle("brain_mind_delete", async (_event, args) => {
     return brainRequest("mind_delete", { id: args.id });
+  });
+
+  // Local Intelligence IPC
+  ipcMain.handle("local_intel_status", async () => {
+    const { isReady, getLoadError } = await import("./local-intelligence.mjs");
+    return { ready: isReady(), error: getLoadError() };
+  });
+
+  ipcMain.handle("local_intel_enable", async () => {
+    const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
+    let settings = {};
+    try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")); } catch {}
+    settings.local_intelligence = true;
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
+    // Start loading immediately
+    const { load } = await import("./local-intelligence.mjs");
+    load().catch(err => console.error("[main] Local intel load failed:", err.message));
+    return { enabled: true };
+  });
+
+  ipcMain.handle("local_intel_disable", async () => {
+    const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
+    let settings = {};
+    try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")); } catch {}
+    settings.local_intelligence = false;
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
+    return { enabled: false };
   });
 }
 
@@ -2052,6 +2140,52 @@ app.whenReady().then(() => {
   preforkPunkWorker(); // Pre-fork to hide first-use latency
   getPtyWorker();
   getBrainWorker(); // Pre-fork: start loading SQLite + embedding model
+
+  // Wire local intelligence IPC — the model lives in the brain UtilityProcess.
+  // setBrainSender uses getBrainWorker() lazily so it survives worker restarts.
+  setBrainSender(msg => getBrainWorker()?.postMessage(msg));
+
+  // Wire brain contextual search into punk-engine so it fires every turn.
+  // This is the critical link: brain searches the knowledge graph for query-
+  // relevant context and writes it to disk BEFORE compileContext() reads it.
+  punkEngine.setBrainSearch(args => {
+    const { projectId, query, taskType, atomHints, projectRoot, intent } = args;
+    if (projectRoot) {
+      brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
+    }
+    return brainRequest("contextual_search", {
+      projectId,
+      query,
+      fileContext: null,
+      intent:      intent || null,
+      projectRoot: projectRoot || null,
+      taskType:    taskType || null,
+      atomHints:   atomHints || [],
+    });
+  });
+
+  // Local Intelligence — on-device classifier for routing + context shaping.
+  // Opt-in via settings.json: { "local_intelligence": true }
+  // Model loads in brain UtilityProcess — no main-process OOM risk.
+  try {
+    const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
+    const settings = fs.existsSync(settingsPath)
+      ? JSON.parse(fs.readFileSync(settingsPath, "utf-8"))
+      : {};
+    if (settings.local_intelligence) {
+      console.log("[main] Local intelligence enabled — loading model in brain worker...");
+      onLocalIntelProgress((event) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send("local-intel-progress", event);
+        }
+      });
+      loadLocalIntelligence().catch(err =>
+        console.error("[main] Local intelligence load failed (non-fatal):", err.message)
+      );
+    }
+  } catch {
+    // Settings read failed — local intelligence stays disabled
+  }
   app.on("activate", () => {
     if (mainWindow) {
       mainWindow.show();

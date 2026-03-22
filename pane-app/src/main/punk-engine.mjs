@@ -88,6 +88,7 @@ import { readState } from "./session-context.mjs";
 import { routingStore } from "./routing-store.mjs";
 import { consult as oracleConsult, classifyDomain } from "./routing-oracle.mjs";
 import { ensurePriors } from "./benchmark-scout.mjs";
+import { classify as localClassify, isReady as localIntelReady, load as localIntelLoad } from "./local-intelligence.mjs";
 
 // Node.js globals for utility process
 const { AbortController, fetch, TextDecoder, setImmediate, console } =
@@ -375,11 +376,20 @@ class PunkEngine {
     this.relayQueue = [];
     this.relayDraining = false;
     this.taskRunner = null;
+    this._brainSearch = null; // injected by main.mjs — calls brain_contextual_search
     // Outcome tracking: requestId → { outcomeId, startTime, taskType, domain, projectId, pendingTodoCount, responseLength, hadToolErrors }
     this._activeOutcomes = new Map();
     // Per-project last completed outcome — used for retrospective scoring
     // when the next message reveals whether the previous response was good
     this._projectLastOutcome = new Map(); // projectId → { outcomeId, pendingTodoCount }
+  }
+
+  /**
+   * Inject brain contextual search function from main.mjs.
+   * Signature: (args) => Promise<result> where args = { projectId, query, taskType, atomHints, projectRoot, intent }
+   */
+  setBrainSearch(fn) {
+    this._brainSearch = fn;
   }
 
   async initialize(backendOverride) {
@@ -641,26 +651,103 @@ class PunkEngine {
       resolvedRequest.todos,
     );
 
-    // ── STRATEGY ENGINE ───────────────────────────────────────────────────
-    // Derives the full pipeline strategy from the situation:
-    // prompt shape + conversation state + session state + todos.
+    // ── INTELLIGENCE ──────────────────────────────────────────────────────
+    // Local model is the primary classifier — strategy + task type + context shape
+    // in a single ~50-100ms inference pass. Falls back to regex heuristics in
+    // deriveStrategy() only when the model isn't ready or fails.
+    //
+    // Explicit slash commands (/plan, /direct, /discuss, /exec, /orchestrate)
+    // bypass both the model and the heuristics — they're user overrides, not
+    // classification tasks. deriveStrategy handles these with confidence 1.0.
     const sessionState = readState(resolvedRequest.projectId);
-    const strategy = deriveStrategy(resolvedRequest.prompt, {
-      history: resolvedRequest.history || [],
-      todos:   resolvedRequest.todos   || [],
-      sessionState,
-    });
+    const promptText = (resolvedRequest.prompt || "").trim().toLowerCase();
+    const hasSlashOverride = /^\/(?:plan|direct|raw|discuss|chat|orchestrate|steps|exec)\b/.test(promptText);
+
+    const pendingTodos = (resolvedRequest.todos || []).filter(t => t.status !== "completed").length;
+
+    // Fire classify early — runs in parallel with routing config loads below.
+    // This overlaps the model's inference time (especially the first-call WASM
+    // JIT) with disk I/O for settings, so the classify cost is partially hidden.
+    let classifyPromise = null;
+    if (!hasSlashOverride && localIntelReady()) {
+      classifyPromise = localClassify({
+        message:        resolvedRequest.prompt?.slice(0, 300) ?? "",
+        turnCount:      (resolvedRequest.history || []).length,
+        hasActiveTask:  !!sessionState?.activeTask,
+        workingSetSize: (sessionState?.workingSet || []).length,
+        pendingTodos,
+      }).catch(err => {
+        console.warn("[punk] local-intel classify failed (non-fatal):", err.message);
+        return null;
+      });
+    }
 
     // ── SMART ROUTING ─────────────────────────────────────────────────────
-    const autoRoute = await this.loadIntentAutoRoute();
-    const routing   = await this.loadIntentRouting();
+    // Load routing config in parallel with classify — these are independent
+    const [autoRoute, routing] = await Promise.all([
+      this.loadIntentAutoRoute(),
+      this.loadIntentRouting(),
+    ]);
+
+    // Collect classify result — by now it's had time to run
+    let localDecision = null;
+    if (classifyPromise) {
+      localDecision = await classifyPromise;
+      if (localDecision) {
+        console.log(
+          `[punk] local-intel: mode=${localDecision.mode} type=${localDecision.taskType} ` +
+          `complexity=${localDecision.complexity} frontier=${localDecision.preferFrontier} ` +
+          `discovery=${localDecision.discovery} hints=[${localDecision.atomHints.join(",")}]`,
+        );
+      }
+    }
+
+    // Build unified strategy — model-driven or heuristic fallback
+    let strategy;
+    if (localDecision) {
+      // Model produced a full decision — use it as the strategy
+      strategy = {
+        mode:         localDecision.mode,
+        discovery:    localDecision.discovery,
+        reasoning:    localDecision.reasoning,
+        verification: localDecision.verification,
+        confidence:   0.90,  // model-driven decisions get high base confidence
+        reason:       `local-intel: ${localDecision.taskType}/${localDecision.complexity}`,
+        signals:      [],
+      };
+    } else {
+      // Fallback: regex heuristics
+      // Fires when: slash override, model not ready, timed out, or returned garbage
+      strategy = deriveStrategy(resolvedRequest.prompt, {
+        history: resolvedRequest.history || [],
+        todos:   resolvedRequest.todos   || [],
+        sessionState,
+      });
+      if (hasSlashOverride) {
+        console.log(`[punk] slash override → heuristic (${strategy.reason})`);
+      } else {
+        console.log("[punk] using heuristic fallback (local-intel unavailable)");
+      }
+    }
 
     // Map strategy mode to routing intent slot.
     // Orchestrate mode uses "execute" for resolvedRequest — the execute-phase model.
     // planningRequest independently reads routing["plan"] for the planning model.
     // This ensures direct spawn (orchestration disabled or fallback) uses the execute model.
-    const intentSlot =
+    let intentSlot =
       strategy.mode === "discuss" ? "explain" : "execute";
+
+    // When the model says this is high-complexity frontier-worthy, route to plan model
+    if (localDecision) {
+      if (localDecision.complexity === "high" && localDecision.preferFrontier && intentSlot === "execute") {
+        intentSlot = "plan";
+        console.log("[punk] local-intel promoted intent: execute → plan (high complexity + frontier)");
+      }
+      if (localDecision.complexity === "low" && !localDecision.preferFrontier && intentSlot === "plan") {
+        intentSlot = "explain";
+        console.log("[punk] local-intel demoted intent: plan → explain (low complexity)");
+      }
+    }
 
     if (!resolvedRequest.intent) resolvedRequest.intent = intentSlot;
 
@@ -685,7 +772,12 @@ class PunkEngine {
     // Consult routing-store + benchmark priors for a data-driven model pick.
     // Only fires when smart routing is on and the request doesn't override.
     // Overrides the heuristic selection when oracle confidence is sufficient.
-    const domain = classifyDomain(resolvedRequest.prompt ?? "");
+    //
+    // Domain classification: when local-intel provided a taskType, map it
+    // to an oracle domain directly — no regex guessing needed.
+    const domain = localDecision?.taskType
+      ? _taskTypeToDomain(localDecision.taskType)
+      : classifyDomain(resolvedRequest.prompt ?? "");
     let oracleResult = null;
 
     if (autoRoute && !resolvedRequest._systemOverride) {
@@ -734,6 +826,11 @@ class PunkEngine {
           oracleUsed:       !!oracleResult,
           oracleConfidence: oracleResult?.confidence ?? null,
           oracleExploring:  oracleResult?.exploring  ?? false,
+          // local intelligence metadata
+          localIntelUsed:   !!localDecision,
+          localTaskType:    localDecision?.taskType ?? null,
+          localComplexity:  localDecision?.complexity ?? null,
+          localAtomHints:   localDecision?.atomHints ?? [],
         },
       },
       request.requestId,
@@ -743,6 +840,53 @@ class PunkEngine {
       `[punk] strategy=${strategy.mode} (${(strategy.confidence * 100).toFixed(0)}%) ` +
       `discovery=${strategy.discovery} → ${resolvedRequest.provider}/${resolvedRequest.model} | ${strategy.reason}`,
     );
+
+    // Write local decision to context dir so session-context.mjs can read it.
+    // Drives: system prompt directive, atom boosting, file pre-read depth,
+    // brief inclusion, and verification instructions.
+    if (localDecision && resolvedRequest.projectId) {
+      try {
+        const contextDir = path.join(os.homedir(), ".pane", "brain", "context");
+        await fs.mkdir(contextDir, { recursive: true }).catch(() => {});
+        await fs.writeFile(
+          path.join(contextDir, `${resolvedRequest.projectId}-shape.json`),
+          JSON.stringify(localDecision),
+          "utf-8",
+        );
+      } catch {
+        // Non-fatal — context shaping falls back to defaults
+      }
+    }
+
+    // ── BRAIN CONTEXTUAL SEARCH ───────────────────────────────────────────
+    // Query the brain's knowledge graph with the user's prompt + routing
+    // context. Brain writes scored atoms, relevant files, and synthesis to
+    // ~/.pane/brain/context/{projectId}.json — which compileContext() reads
+    // synchronously in the backend workers. Must complete BEFORE delegation.
+    //
+    // 3s timeout: brain search is fast (~100-500ms) but we can't let it
+    // block the response indefinitely. compileContext reads stale/empty
+    // context gracefully when this times out.
+    if (this._brainSearch && resolvedRequest.projectId) {
+      try {
+        const searchTimeout = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("brain search timeout")), 3000),
+        );
+        await Promise.race([
+          this._brainSearch({
+            projectId:   resolvedRequest.projectId,
+            query:       resolvedRequest.prompt?.slice(0, 1000) ?? "",
+            taskType:    localDecision?.taskType ?? strategy.mode ?? null,
+            atomHints:   localDecision?.atomHints ?? [],
+            projectRoot: resolvedRequest.workingDir ?? null,
+            intent:      resolvedRequest.intent ?? null,
+          }),
+          searchTimeout,
+        ]);
+      } catch (err) {
+        console.warn("[punk] brain contextual search failed (non-fatal):", err.message);
+      }
+    }
 
     // ── OUTCOME TRACKING ──────────────────────────────────────────────────
     // Record the routing decision before execution. Signals are filled in
@@ -943,6 +1087,41 @@ export async function registerPunkHandlers() {
   ipcMain.handle("get_all_models", async () => {
     return await modelManager.models;
   });
+
+  // ── SDK session management ────────────────────────────────────────────────
+  // These call into the claude-agent-sdk directly, operating on the session
+  // store on disk. No active subprocess needed.
+
+  ipcMain.handle("sdk_list_sessions", async () => {
+    const { listSessions } = await import("@anthropic-ai/claude-agent-sdk");
+    return listSessions();
+  });
+
+  ipcMain.handle("sdk_get_session_messages", async (_event, { sessionId }) => {
+    const { getSessionMessages } = await import("@anthropic-ai/claude-agent-sdk");
+    return getSessionMessages(sessionId);
+  });
+
+  ipcMain.handle("sdk_fork_session", async (_event, { sessionId }) => {
+    const { forkSession } = await import("@anthropic-ai/claude-agent-sdk");
+    return forkSession(sessionId);
+  });
+}
+
+// Maps local-intel taskType → oracle domain. Replaces regex classifyDomain()
+// when the Qwen model has already classified the task.
+function _taskTypeToDomain(taskType) {
+  switch (taskType) {
+    case "debug":        return "debugging";
+    case "implement":    return "implementation";
+    case "explain":
+    case "conversation":
+    case "quick-answer": return "explanation";
+    case "architect":    return "architecture";
+    case "refactor":     return "refactoring";
+    case "review":       return "general";
+    default:             return "general";
+  }
 }
 
 export async function preforkPunkWorker() {

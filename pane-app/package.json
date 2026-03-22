@@ -16,6 +16,7 @@
     "version:minor": "npm version minor --no-git-tag-version",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/renderer/",
+    "download-models": "node scripts/download-models.mjs",
     "postinstall": "electron-rebuild -f --only node-pty,better-sqlite3"
   },
   "build": {
@@ -32,10 +33,18 @@
         }
       ]
     },
+    "extraResources": [
+      {
+        "from": "models/",
+        "to": "models",
+        "filter": ["**/*"]
+      }
+    ],
     "files": [
       "out/**/*",
       "src/main/main.mjs",
       "src/main/model-manager.mjs",
+      "src/main/model-paths.mjs",
       "src/main/cli-worker.mjs",
       "src/main/pty-worker.mjs",
       "src/main/pane-mcp-server.mjs",
@@ -46,6 +55,7 @@
       "src/main/session-context.mjs",
       "src/main/tool-executor.mjs",
       "src/main/classify-intent.mjs",
+      "src/main/local-intelligence.mjs",
       "src/main/punk-backend.mjs",
       "src/main/task-runner.mjs",
       "src/preload/preload.mjs",
