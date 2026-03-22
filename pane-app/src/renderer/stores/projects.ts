@@ -6,8 +6,8 @@ import type {
   ContentBlock,
   ToolUseBlock,
   CheckpointMeta,
-} from "../lib/claude-types";
-import { createEmptyConversation } from "../lib/claude-types";
+} from "../lib/punk-types";
+import { createEmptyConversation } from "../lib/punk-types";
 
 export interface ProjectGit {
   branch: string | null;
@@ -195,7 +195,7 @@ interface ProjectsState {
   ) => void;
   setConversationTodos: (
     projectId: string,
-    todos: import("../lib/claude-types").Todo[],
+    todos: import("../lib/punk-types").Todo[],
   ) => void;
   setPendingPlanApproval: (projectId: string, pending: boolean) => void;
   setDiscoveryActive: (projectId: string, active: boolean) => void;
@@ -212,7 +212,7 @@ interface ProjectsState {
   setContextPressure: (
     projectId: string,
     tokens: number,
-    pressure: import("../lib/claude-types").ContextPressure,
+    pressure: import("../lib/punk-types").ContextPressure,
   ) => void;
   setCompactionStatus: (
     projectId: string,

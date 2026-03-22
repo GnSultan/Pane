@@ -8,7 +8,7 @@ import type {
   WebSearchToolResultBlock,
   JsonBlock,
   StrategyBlock,
-} from "../../lib/claude-types";
+} from "../../lib/punk-types";
 import { restoreCheckpoint, getCheckpointDiff } from "../../lib/tauri-commands";
 import type { CheckpointDiffFile } from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";

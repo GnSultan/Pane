@@ -503,7 +503,7 @@ class PunkEngine {
   }
 
   handleBackendEvent(projectId, event, requestId) {
-    const channel = `claude-stream:${projectId}`;
+    const channel = `punk-stream:${projectId}`;
 
     // Attach requestId to the event so the renderer can filter it
     const enrichedEvent = { ...event, requestId };

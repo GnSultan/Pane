@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { PlanData, PlanStep } from "../../lib/claude-types";
+import type { PlanData, PlanStep } from "../../lib/punk-types";
 import { MicroIndicator } from "../shared";
 
 const TYPE_STYLES: Record<PlanStep["type"], { label: string; className: string }> = {

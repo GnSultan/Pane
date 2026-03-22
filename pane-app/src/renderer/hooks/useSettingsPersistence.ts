@@ -12,7 +12,7 @@ import {
   saveConversationToMain,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
-import type { ConversationMessage } from "../lib/claude-types";
+import type { ConversationMessage } from "../lib/punk-types";
 import { useWorkspaceStore, type Theme } from "../stores/workspace";
 import { useProjectsStore } from "../stores/projects";
 import type { ActionId, KeyBinding } from "../lib/keybindings";

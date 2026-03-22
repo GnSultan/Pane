@@ -6,6 +6,15 @@ import {
   type BackendRouting,
 } from "../lib/models";
 import type { OpenRouterModel } from "../lib/tauri-commands";
+import {
+  getOpenRouterModels,
+  getAllModels,
+  refreshAllModels,
+  checkClaudeUpdate,
+  updateClaude,
+  checkGeminiUpdate,
+  updateGemini,
+} from "../lib/tauri-commands";
 
 const DEFAULT_FONT_SIZE = 15;
 const DEFAULT_PANEL_FONT_SIZE = 13;
@@ -54,10 +63,10 @@ interface WorkspaceState {
   overlay: "mind" | "profile" | "history" | null;
   setOverlay: (overlay: "mind" | "profile" | "history" | null) => void;
   toggleOverlay: (overlay: "mind" | "profile" | "history") => void;
-  // SDK metadata — populated after first claude-cli session init
-  sdkModels: import("../lib/claude-types").SdkModel[] | null;
-  sdkAccount: import("../lib/claude-types").SdkAccount | null;
-  setSdkInfo: (models: import("../lib/claude-types").SdkModel[] | null, account: import("../lib/claude-types").SdkAccount | null) => void;
+  // SDK metadata — populated after first backend session init
+  sdkModels: import("../lib/punk-types").SdkModel[] | null;
+  sdkAccount: import("../lib/punk-types").SdkAccount | null;
+  setSdkInfo: (models: import("../lib/punk-types").SdkModel[] | null, account: import("../lib/punk-types").SdkAccount | null) => void;
   // Profile data
   profileName: string;
   profileBio: string;
@@ -190,7 +199,6 @@ function createWorkspaceStore() {
     openRouterModels: [],
     allModels: {},
     fetchOpenRouterModels: async () => {
-      const { getOpenRouterModels } = await import("../lib/tauri-commands");
       try {
         const models = await getOpenRouterModels();
         set({ 
@@ -202,7 +210,6 @@ function createWorkspaceStore() {
       }
     },
     fetchAllModels: async () => {
-      const { getAllModels } = await import("../lib/tauri-commands");
       try {
         const models = await getAllModels();
         set({ 
@@ -214,7 +221,6 @@ function createWorkspaceStore() {
       }
     },
     refreshAllModels: async () => {
-      const { refreshAllModels } = await import("../lib/tauri-commands");
       try {
         const models = await refreshAllModels();
         set({ 
@@ -253,7 +259,6 @@ function createWorkspaceStore() {
     setProfileAvatarDataUrl: (url: string | null) =>
       set({ profileAvatarDataUrl: url }),
     checkForClaudeUpdate: async () => {
-      const { checkClaudeUpdate } = await import("../lib/tauri-commands");
       const result = await checkClaudeUpdate();
       if (!result.error && result.updateAvailable) {
         set({
@@ -273,7 +278,6 @@ function createWorkspaceStore() {
     },
     triggerClaudeUpdate: async () => {
       set({ claudeUpdateState: "updating" });
-      const { updateClaude } = await import("../lib/tauri-commands");
       const result = await updateClaude();
       if (result.success) {
         set({ claudeUpdateState: "updated" });
@@ -286,7 +290,6 @@ function createWorkspaceStore() {
       }
     },
     checkForGeminiUpdate: async () => {
-      const { checkGeminiUpdate } = await import("../lib/tauri-commands");
       const result = await checkGeminiUpdate();
       if (!result.error && result.updateAvailable) {
         set({
@@ -306,7 +309,6 @@ function createWorkspaceStore() {
     },
     triggerGeminiUpdate: async () => {
       set({ geminiUpdateState: "updating" });
-      const { updateGemini } = await import("../lib/tauri-commands");
       const result = await updateGemini();
       if (result.success) {
         set({ geminiUpdateState: "updated" });

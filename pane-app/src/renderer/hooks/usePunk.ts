@@ -1,7 +1,7 @@
 import { useCallback, useRef } from "react";
 import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
-import type { Todo } from "../lib/claude-types";
+import type { Todo } from "../lib/punk-types";
 
 // ============================================================================
 // Model Execution Timeout Configuration
@@ -29,9 +29,9 @@ import {
   extractPreferencesFromTurn,
 } from "../lib/tauri-commands";
 import type {
-  PunkStreamEvent as ClaudeStreamEvent,
-  PunkStreamMessage as ClaudeStreamMessage,
-  PunkConversationMessage as ConversationMessage,
+  PunkStreamEvent,
+  PunkStreamMessage,
+  ConversationMessage,
   ContentBlock,
   ToolUseBlock,
   ToolResultBlock,
@@ -114,7 +114,7 @@ interface StreamingState {
   toolJsonParseRaf: number;
   pendingToolJson: string;
   pendingToolJsonTruncated: boolean;
-  pendingTodos: import("../lib/claude-types").Todo[] | null;
+  pendingTodos: import("../lib/punk-types").Todo[] | null;
   todosFlushRaf: number;
   // Per-tool streaming tracking
   currentStreamingToolId: string | null;
@@ -188,7 +188,7 @@ function scheduleToolJsonParse(projectId: string) {
           const todoWriteTool = toolUses.find((t) => t.name === "TodoWrite");
           if (todoWriteTool && Array.isArray(parsed.todos)) {
             state.pendingTodos = (
-              parsed.todos as import("../lib/claude-types").Todo[]
+              parsed.todos as import("../lib/punk-types").Todo[]
             ).map((t) => ({ ...t }));
             if (!state.todosFlushRaf) {
               state.todosFlushRaf = requestAnimationFrame(() =>
@@ -855,10 +855,20 @@ export function usePunk(projectId: string) {
       const store = useProjectsStore.getState();
       const project = store.projects.get(projectId);
       if (!project) return;
-      if (project.conversation.isProcessing) return;
 
-      await abortPunk(projectId).catch(() => {});
-      resetStreamingState(projectId);
+      // If already processing, abort the current generation first.
+      // Flush pending deltas so the partial assistant response is preserved
+      // in the conversation — the user's new message may reference it.
+      if (project.conversation.isProcessing) {
+        await abortPunk(projectId).catch(() => {});
+        resetStreamingState(projectId, true); // flush = true to capture partial response
+        const s = useProjectsStore.getState();
+        s.setLastMessageStreamingDone(projectId);
+        s.setIsPlanning(projectId, false);
+      } else {
+        await abortPunk(projectId).catch(() => {});
+        resetStreamingState(projectId);
+      }
 
       const messageId = nextMessageId();
       const userMessage: ConversationMessage = {
@@ -935,7 +945,7 @@ export function usePunk(projectId: string) {
         }
       };
 
-      const handleEvent = (event: ClaudeStreamEvent) => {
+      const handleEvent = (event: PunkStreamEvent) => {
         if (resultSafetyTimer) {
           clearTimeout(resultSafetyTimer);
           resultSafetyTimer = setTimeout(() => {
@@ -1004,9 +1014,9 @@ export function usePunk(projectId: string) {
 
           case "message": {
             try {
-              const msg: ClaudeStreamMessage =
+              const msg: PunkStreamMessage =
                 event.data.parsed ?? JSON.parse(event.data.raw_json!);
-              assistantMessageAdded = handleClaudeMessage(
+              assistantMessageAdded = handlePunkMessage(
                 msg,
                 projectId,
                 assistantMessageAdded,
@@ -1463,7 +1473,7 @@ export function usePunk(projectId: string) {
           todos,
         );
       } catch (err) {
-        console.error("[pane] sendToClaude error:", err);
+        console.error("[pane] sendToPunk error:", err);
         const errMsg = err instanceof Error ? err.message : String(err);
         store.setConversationError(projectId, errMsg);
         store.setConversationProcessing(projectId, false);
@@ -1498,10 +1508,8 @@ export function usePunk(projectId: string) {
   return { sendMessage, abortMessage, clearConversation };
 }
 
-export const useClaude = usePunk;
-
-function handleClaudeMessage(
-  msg: ClaudeStreamMessage,
+function handlePunkMessage(
+  msg: PunkStreamMessage,
   projectId: string,
   assistantMessageExists: boolean,
 ): boolean {

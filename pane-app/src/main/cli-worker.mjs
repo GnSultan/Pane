@@ -41,75 +41,6 @@ const activeProcesses = new Map();
 // Per-request state (used by Gemini normalizer)
 const requestStates = new Map();
 
-// ============================================================================
-// Streaming input queue — one persistent SDK session per project.
-// New user messages are injected into the running session rather than
-// spawning a new subprocess + resuming, eliminating that round-trip overhead.
-// ============================================================================
-
-class AsyncMessageQueue {
-  constructor() {
-    this._queue = [];
-    this._waiter = null;
-    this._closed = false;
-  }
-
-  /** Append a user message. Returns false if the session is already closed. */
-  push(text) {
-    if (this._closed) return false;
-    const item = { role: "user", content: [{ type: "text", text }] };
-    if (this._waiter) {
-      const resolve = this._waiter;
-      this._waiter = null;
-      resolve({ done: false, value: item });
-    } else {
-      this._queue.push(item);
-    }
-    return true;
-  }
-
-  /** Prepend a message (used to inject "continue" after error_max_turns). */
-  pushFront(text) {
-    if (this._closed) return false;
-    const item = { role: "user", content: [{ type: "text", text }] };
-    if (this._waiter) {
-      const resolve = this._waiter;
-      this._waiter = null;
-      resolve({ done: false, value: item });
-    } else {
-      this._queue.unshift(item);
-    }
-    return true;
-  }
-
-  close() {
-    this._closed = true;
-    if (this._waiter) {
-      this._waiter({ done: true, value: undefined });
-      this._waiter = null;
-    }
-  }
-
-  get closed() { return this._closed; }
-
-  [Symbol.asyncIterator]() {
-    const self = this;
-    return {
-      next() {
-        if (self._queue.length > 0) {
-          return Promise.resolve({ done: false, value: self._queue.shift() });
-        }
-        if (self._closed) {
-          return Promise.resolve({ done: true, value: undefined });
-        }
-        return new Promise(resolve => { self._waiter = resolve; });
-      },
-    };
-  }
-}
-
-// projectId -> { queue, currentRequestId, ac, sdkQuery }
-const activeStreamingSessions = new Map();
 
 async function getGitStatus(workingDir) {
   try {
@@ -500,20 +431,6 @@ async function handleClaudeSpawn({
   if (oldAc) oldAc.abort();
   activeControllers.set(projectId, ac);
 
-  // Streaming input: one persistent session per project.
-  // New user messages are injected via the queue rather than spawning a new
-  // subprocess. The session stays alive between turns.
-  const queue = new AsyncMessageQueue();
-  queue.push(prompt);
-
-  const sessionState = {
-    queue,
-    currentRequestId: requestId,
-    ac,
-    sdkQuery: null, // set once query() is called so callers can applyFlagSettings
-  };
-  activeStreamingSessions.set(projectId, sessionState);
-
   sendToMain({
     type: "event",
     projectId,
@@ -521,14 +438,13 @@ async function handleClaudeSpawn({
     event: { event: "processStarted", data: null },
   });
 
-  const baseOptions = {
+  const options = {
     cwd: workingDir,
     model: model || undefined,
+    resume: sessionId || undefined,
     appendSystemPrompt: systemPrompt || undefined,
     pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
     executable: process.execPath,
-    // ELECTRON_RUN_AS_NODE=1 makes Electron behave as plain Node.js when
-    // spawned as a subprocess — otherwise it boots as an Electron GUI app.
     env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
     permissionMode: "bypassPermissions",
     dangerouslySkipPermissions: true,
@@ -550,6 +466,9 @@ async function handleClaudeSpawn({
     abortController: ac,
   };
 
+  // Auto-resume across error_max_turns: if the model hits its turn limit mid-task,
+  // silently continue rather than surfacing an error. Capped at MAX_AUTO_RESUMES
+  // to prevent infinite loops on genuinely stuck sessions.
   const MAX_AUTO_RESUMES = 10;
   let resumeSessionId = sessionId;
   let autoResumes = 0;
@@ -561,86 +480,43 @@ async function handleClaudeSpawn({
       let maxTurnsSessionId = null;
 
       const q = query({
-        prompt: queue,
-        options: { ...baseOptions, resume: resumeSessionId || undefined },
+        prompt: autoResumes > 0 ? "continue" : prompt,
+        options: { ...options, resume: resumeSessionId || undefined },
       });
-      sessionState.sdkQuery = q;
 
       for await (const msg of q) {
-        const currentRequestId = sessionState.currentRequestId;
-
-        // After session init, query SDK metadata once (models + account info).
-        // Fire-and-forget — never blocks the event stream.
+        // Capture session_id from init so we can resume on max_turns
         if (!sdkInfoEmitted && msg.type === "system" && msg.subtype === "init") {
           sdkInfoEmitted = true;
           if (msg.session_id) resumeSessionId = msg.session_id;
+          // Fire-and-forget: fetch SDK metadata (models + account) once per session
           Promise.all([
-            q.supportedModels().catch(() => null),
-            q.accountInfo().catch(() => null),
+            q.supportedModels?.().catch(() => null),
+            q.accountInfo?.().catch(() => null),
           ]).then(([models, account]) => {
             if (models || account) {
               sendToMain({
                 type: "event",
                 projectId,
-                requestId: currentRequestId,
+                requestId,
                 event: { event: "sdk_init_info", data: { models, account } },
               });
             }
           });
         }
 
-        // Auto-resume: swallow error_max_turns, continue transparently.
+        // Transparent max_turns resume — swallow the error, loop back with "continue"
         if (msg.type === "result" && msg.subtype === "error_max_turns") {
           hitMaxTurns = true;
           maxTurnsSessionId = msg.session_id || resumeSessionId;
           break;
         }
 
-        // Turn-complete detection: assistant with stop_reason=end_turn means
-        // the model has finished this turn and is waiting for the next message.
-        // Emit synthetic result:success + processEnded so the renderer closes
-        // the current request cleanly, then keep the session alive for the next.
-        if (msg.type === "assistant" && msg.message?.stop_reason === "end_turn") {
-          sendToMain({
-            type: "event",
-            projectId,
-            requestId: currentRequestId,
-            event: { event: "message", data: { parsed: msg } },
-          });
-          sendToMain({
-            type: "event",
-            projectId,
-            requestId: currentRequestId,
-            event: {
-              event: "message",
-              data: {
-                parsed: {
-                  type: "result",
-                  subtype: "success",
-                  session_id: resumeSessionId || "",
-                  result: "",
-                  total_cost_usd: 0,
-                  duration_ms: 0,
-                  num_turns: 1,
-                  usage: msg.message?.usage,
-                },
-              },
-            },
-          });
-          sendToMain({
-            type: "event",
-            projectId,
-            requestId: currentRequestId,
-            event: { event: "processEnded", data: { exit_code: 0 } },
-          });
-          continue; // keep the streaming session alive
-        }
-
         if (RENDERER_MSG_TYPES.has(msg.type)) {
           sendToMain({
             type: "event",
             projectId,
-            requestId: currentRequestId,
+            requestId,
             event: { event: "message", data: { parsed: msg } },
           });
         }
@@ -650,10 +526,11 @@ async function handleClaudeSpawn({
 
       autoResumes++;
       if (autoResumes > MAX_AUTO_RESUMES) {
+        // Surfaced as a soft message so the UI can show "send a message to continue"
         sendToMain({
           type: "event",
           projectId,
-          requestId: sessionState.currentRequestId,
+          requestId,
           event: {
             event: "message",
             data: {
@@ -675,9 +552,6 @@ async function handleClaudeSpawn({
 
       resumeSessionId = maxTurnsSessionId;
       await new Promise((r) => setTimeout(r, 100));
-      // Inject "continue" at the front so the model resumes before any pending
-      // user messages that arrived while max_turns was being hit.
-      queue.pushFront("continue");
     }
   } catch (err) {
     if (!ac.signal.aborted) {
@@ -696,20 +570,19 @@ async function handleClaudeSpawn({
         sendToMain({
           type: "event",
           projectId,
-          requestId: sessionState.currentRequestId,
+          requestId,
           event: { event: "error", data: { message: useful } },
         });
       }
     }
   } finally {
-    activeStreamingSessions.delete(projectId);
     if (activeControllers.get(projectId) === ac) {
       activeControllers.delete(projectId);
     }
     sendToMain({
       type: "event",
       projectId,
-      requestId: sessionState.currentRequestId,
+      requestId,
       event: { event: "processEnded", data: { exit_code: 0 } },
     });
     requestStates.delete(requestId);
@@ -995,27 +868,6 @@ async function handleSpawn({
   }
 
   if (command === "claude") {
-    // If a streaming session is already alive for this project, inject the new
-    // message rather than spawning a fresh subprocess. This preserves all
-    // in-memory session state and eliminates the resume round-trip.
-    const existing = activeStreamingSessions.get(projectId);
-    if (existing && !existing.queue.closed) {
-      existing.currentRequestId = requestId;
-      // Update the system prompt so the model has fresh context (todos, git, etc.)
-      if (existing.sdkQuery?.applyFlagSettings) {
-        existing.sdkQuery.applyFlagSettings({
-          appendSystemPrompt: systemPrompt || undefined,
-        });
-      }
-      existing.queue.push(prompt);
-      sendToMain({
-        type: "event",
-        projectId,
-        requestId,
-        event: { event: "processStarted", data: null },
-      });
-      return;
-    }
     await handleClaudeSpawn({
       projectId,
       requestId,
@@ -1041,13 +893,6 @@ async function handleSpawn({
 }
 
 function handleAbort({ projectId }) {
-  // Close the streaming session queue so no new messages are accepted,
-  // then abort the controller to stop the running SDK subprocess.
-  const session = activeStreamingSessions.get(projectId);
-  if (session) {
-    session.queue.close();
-    activeStreamingSessions.delete(projectId);
-  }
   // Claude: abort via AbortController
   const ac = activeControllers.get(projectId);
   if (ac) {

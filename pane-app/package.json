@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -10,7 +10,7 @@
     "dev": "node scripts/dev.js",
     "build": "electron-vite build && node scripts/copy-compiled.js",
     "preview": "electron-vite preview",
-    "build:mac": "npm run build && electron-builder --mac --arm64",
+    "build:mac": "npm run build && electron-builder --mac --arm64 && npm run version:patch",
     "build:all": "npm run build && electron-builder --mac --arm64 --x64",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",
@@ -37,7 +37,9 @@
       {
         "from": "models/",
         "to": "models",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "files": [
@@ -92,6 +94,9 @@
     "strip-ansi": "^7.1.2",
     "zustand": "^5.0.0"
   },
+  "overrides": {
+    "isbinaryfile": "^6.0.0"
+  },
   "devDependencies": {
     "@electron/rebuild": "^4.0.3",
     "@eslint/eslintrc": "^3.3.5",
@@ -105,7 +110,7 @@
     "electron": "^40.6.0",
     "electron-builder": "^26.8.1",
     "electron-vite": "^2.3.0",
-    "eslint": "^9.39.4",
+    "eslint": "^10.0.0",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.2.0",
     "typescript": "^5.7.3",

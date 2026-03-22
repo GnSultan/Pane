@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { StrategyBlock } from "../../lib/claude-types";
+import type { StrategyBlock } from "../../lib/punk-types";
 
 function modelShortName(model: string): string {
   const lower = model.toLowerCase();

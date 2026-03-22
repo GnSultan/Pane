@@ -1,6 +1,6 @@
 import { useRef, useEffect, useCallback, useMemo, memo, useState } from "react";
 import { useProjectsStore } from "../../stores/projects";
-import { usePunk } from "../../hooks/useClaude";
+import { usePunk } from "../../hooks/usePunk";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
@@ -8,7 +8,7 @@ import type {
   ConversationMessage,
   ToolResultBlock,
   ToolUseBlock,
-} from "../../lib/claude-types";
+} from "../../lib/punk-types";
 
 const EMPTY_MESSAGES: ConversationMessage[] = [];
 
@@ -73,15 +73,17 @@ export const Conversation = memo(function Conversation({
   const { sendMessage, abortMessage } = usePunk(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
+  const streamingRef = useRef(false);
 
-  const { applyRestored } = useScrollPosition(projectId, scrollRef, followRef);
+  const isActive = isProcessing || isThinking;
+  streamingRef.current = isActive;
+
+  const { applyRestored } = useScrollPosition(projectId, scrollRef, followRef, streamingRef);
 
   // Restore saved scroll position when messages first arrive from disk.
   useEffect(() => {
     if (messages.length > 0) applyRestored();
   }, [messages.length]);
-
-  const isActive = isProcessing || isThinking;
 
   // Context refresh toast — shows briefly when proactive continuation fires
   const [showRefreshToast, setShowRefreshToast] = useState(false);
@@ -119,12 +121,20 @@ export const Conversation = memo(function Conversation({
     return map;
   }, [systemMessageCount]);
 
-  // Wheel listener: synchronously disengage follow on upward scroll.
+  // Wheel listener: disengage follow on scroll up, re-engage on scroll down to bottom.
   useEffect(() => {
     const container = scrollRef.current;
     if (!container) return;
     const handleWheel = (e: WheelEvent) => {
-      if (e.deltaY < 0) followRef.current = false;
+      if (e.deltaY < 0) {
+        followRef.current = false;
+      } else if (e.deltaY > 0 && streamingRef.current) {
+        // Re-engage follow if user scrolls down near the bottom during streaming.
+        const { scrollTop, scrollHeight, clientHeight } = container;
+        if (scrollHeight - scrollTop - clientHeight < 40) {
+          followRef.current = true;
+        }
+      }
     };
     container.addEventListener("wheel", handleWheel, { passive: true });
     return () => container.removeEventListener("wheel", handleWheel);

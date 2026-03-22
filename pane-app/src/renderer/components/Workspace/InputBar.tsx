@@ -3,7 +3,7 @@ import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
-import type { Todo } from "../../lib/claude-types";
+import type { Todo } from "../../lib/punk-types";
 import { respondToDiscovery, approvePlan, rejectPlan } from "../../lib/tauri-commands";
 import {
   PROVIDER_MODELS,
@@ -664,7 +664,6 @@ export function InputBar({
           }
           return;
         }
-        if (isProcessing) return;
         const trimmed = value.trim();
         if (trimmed) {
           onSend(trimmed);
@@ -875,7 +874,7 @@ export function InputBar({
           </div>
 
           {/* Send — top right */}
-          {value.trim().length > 0 && (!isProcessing || discoveryActive) && (
+          {value.trim().length > 0 && (
             <button
               onClick={() => {
                 const trimmed = value.trim();

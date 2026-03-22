@@ -1,4 +1,4 @@
-import type { ClaudeStreamEvent, ConversationMessage, Todo } from "./claude-types";
+import type { PunkStreamEvent, ConversationMessage, Todo } from "./punk-types";
 
 // Electron IPC bridge
 const electronAPI = (window as any).electronAPI;
@@ -177,7 +177,7 @@ export async function saveSettings(settings: UserSettings): Promise<void> {
   return electronAPI.invoke("save_settings", { settings });
 }
 
-// Claude process management
+// Punk engine process management
 
 export async function sendToPunk(
   projectId: string,
@@ -185,7 +185,7 @@ export async function sendToPunk(
   workingDir: string,
   sessionId: string | null,
   model: string | null,
-  onEvent: (event: ClaudeStreamEvent) => void,
+  onEvent: (event: PunkStreamEvent) => void,
   intent?: string,
   history?: ConversationMessage[],
   thinking?: boolean,
@@ -200,7 +200,7 @@ export async function sendToPunk(
   // Instead of processing all IPC events synchronously (starving clicks/inputs),
   // we queue events and drain one-per-task via MessageChannel.postMessage
   // which yields to the browser between each event (zero-delay, no setTimeout 4ms minimum).
-  const queue: ClaudeStreamEvent[] = [];
+  const queue: PunkStreamEvent[] = [];
   let draining = false;
   const { port1, port2 } = new MessageChannel();
 
@@ -243,8 +243,8 @@ export async function sendToPunk(
   };
 
   cleanup = electronAPI.on(
-    `claude-stream:${projectId}`,
-    (event: ClaudeStreamEvent) => {
+    `punk-stream:${projectId}`,
+    (event: PunkStreamEvent) => {
       // Ignore events tagged for a different request (e.g. a previous aborted
       // session whose processEnded arrives after the new session has started).
       if (event.requestId && event.requestId !== requestId) return;
@@ -283,9 +283,6 @@ export async function sendToPunk(
   }
 }
 
-// Backwards-compatible alias while we transition naming in the app.
-export const sendToClaude = sendToPunk;
-
 export async function abortPunk(projectId: string): Promise<void> {
   return electronAPI.invoke("abort_punk", { projectId });
 }
@@ -302,7 +299,7 @@ export async function rejectPlan(projectId: string): Promise<void> {
   return electronAPI.invoke("reject_plan", { projectId });
 }
 
-export async function terminateClaudeSession(projectId: string): Promise<void> {
+export async function terminatePunkSession(projectId: string): Promise<void> {
   return electronAPI.invoke("terminate_punk_session", { projectId });
 }
 
@@ -392,7 +389,7 @@ export function onPtyExit(
   return electronAPI.on(`pty-exit:${ptyId}`, cb);
 }
 
-export async function getClaudePlanInfo(): Promise<string | null> {
+export async function getPunkPlanInfo(): Promise<string | null> {
   return electronAPI.invoke("get_claude_plan_info");
 }
 
@@ -508,7 +505,7 @@ export async function restoreCheckpoint(
 
 export async function listCheckpoints(
   projectId: string,
-): Promise<import("./claude-types").CheckpointMeta[]> {
+): Promise<import("./punk-types").CheckpointMeta[]> {
   return electronAPI.invoke("list_checkpoints", { projectId });
 }
 
@@ -669,7 +666,7 @@ export async function writeProjectState(
 
 export async function recordMemoryEvents(
   projectId: string,
-  events: import("./claude-types").MemoryEvent[],
+  events: import("./punk-types").MemoryEvent[],
 ): Promise<void> {
   return electronAPI.invoke("record_memory_events", { projectId, events });
 }
@@ -702,7 +699,7 @@ export interface BrainSearchResult {
 
 export async function brainIndexEvents(
   projectId: string,
-  events: import("./claude-types").MemoryEvent[],
+  events: import("./punk-types").MemoryEvent[],
 ): Promise<{ indexed: number; deduplicated: number }> {
   return electronAPI.invoke("brain_index_events", { projectId, events });
 }

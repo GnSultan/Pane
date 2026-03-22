@@ -6,7 +6,7 @@ import type {
   WebSearchToolResultBlock,
   WebSearchResult,
   WebSearchToolResultError,
-} from "../../lib/claude-types";
+} from "../../lib/punk-types";
 import { MarkdownText } from "./MarkdownText";
 import { MicroIndicator } from "../shared";
 

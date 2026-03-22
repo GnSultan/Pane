@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState } from "react";
-import type { ThinkingBlock } from "../../lib/claude-types";
+import type { ThinkingBlock } from "../../lib/punk-types";
 import { MarkdownText } from "./MarkdownText";
 import { MicroIndicator } from "../shared";
 
