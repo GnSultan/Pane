@@ -10,9 +10,22 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { BrowserWindow, utilityProcess, ipcMain } from "electron";
 
 const execFileAsync = promisify(execFile);
+
+// Resolve bundled CLI paths — works in both dev and production (asar).
+// Same logic as cli-worker.mjs: redirect asar → asar.unpacked so the
+// binaries can actually be spawned.
+function getBundledCliPath(packageName, relPath) {
+  const workerDir = path.dirname(fileURLToPath(import.meta.url));
+  const appRoot = path.resolve(workerDir, "../..");
+  const p = path.join(appRoot, "node_modules", packageName, relPath);
+  return p.replace(/app\.asar([/\\])/g, "app.asar.unpacked$1");
+}
+
+const CLAUDE_CLI_PATH = getBundledCliPath("@anthropic-ai/claude-agent-sdk", "cli.js");
 
 const STALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes of silence = stalled
 
@@ -310,9 +323,13 @@ class CliBackend extends PunkBackend {
     const combinedPrompt = `${systemPrompt}\n\n${userPrompt}`;
 
     if (this.command === "claude") {
-      const args = ["--print"];
+      const args = [CLAUDE_CLI_PATH, "--print"];
       if (request.model) args.push("--model", request.model);
-      const stdout = await spawnWithStallTimeout("claude", args, { stdin: combinedPrompt, onChunk });
+      const stdout = await spawnWithStallTimeout(process.execPath, args, {
+        stdin: combinedPrompt,
+        onChunk,
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      });
       return stdout.trim();
     }
 
@@ -347,9 +364,12 @@ class CliBackend extends PunkBackend {
     const combinedPrompt = parts.join("\n");
 
     if (this.command === "claude") {
-      const args = ["--print"];
+      const args = [CLAUDE_CLI_PATH, "--print"];
       if (request.model) args.push("--model", request.model);
-      const stdout = await spawnWithStallTimeout("claude", args, { stdin: combinedPrompt });
+      const stdout = await spawnWithStallTimeout(process.execPath, args, {
+        stdin: combinedPrompt,
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      });
       return stdout.trim();
     }
 

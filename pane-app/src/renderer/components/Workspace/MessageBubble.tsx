@@ -113,8 +113,8 @@ function CopyButton({
           strokeLinecap="round"
           strokeLinejoin="round"
         >
-          <rect x="5.5" y="5.5" width="8" height="8" rx="1" />
-          <path d="M10.5 5.5V3.5a1 1 0 00-1-1h-6a1 1 0 00-1 1v6a1 1 0 001 1h2" />
+          <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+          <path d="M10.5 5.5V3.5h-7v7h2" />
         </svg>
       )}
     </button>

@@ -613,7 +613,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
                 pushState === "err" ? "text-pane-error" :
                 "text-pane-text-secondary/50 hover:text-pane-text-secondary"}`}
           >
-            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="M6 9V2M3 5l3-3 3 3" />
             </svg>
             <span>{pushLabel}</span>
@@ -629,7 +629,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
                 pullState === "err" ? "text-pane-error" :
                 "text-pane-text-secondary/50 hover:text-pane-text-secondary"}`}
           >
-            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="M6 2v7M3 6l3 3 3-3" />
             </svg>
             <span>{pullLabel}</span>

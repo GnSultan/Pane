@@ -3,43 +3,46 @@ import { ProjectList } from "./ProjectList";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 
+// --- Inline SVG icons (16x16, outlined) ---
+// Pane design language: panel forms, 1.5px stroke, rx="2" matches button radius
+
 function MindIcon() {
+  // A pane divided into three compartments — structured intelligence
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      {/* Thought bubble body */}
-      <path d="M12.5 7c0-2.485-2.015-4.5-4.5-4.5S3.5 4.515 3.5 7c0 1.48.714 2.794 1.82 3.612C5.12 11.22 4.9 12 4.9 12s1.02-.38 1.7-.8A4.476 4.476 0 008 11.5c2.485 0 4.5-2.015 4.5-4.5z" />
-      {/* Trailing thought dots */}
-      <circle cx="4" cy="13" r="0.75" fill="currentColor" stroke="none" />
-      <circle cx="2.75" cy="14.25" r="0.5" fill="currentColor" stroke="none" />
+      <rect x="2" y="2" width="12" height="12" rx="2" />
+      <path d="M2 8h12" />
+      <path d="M8 8v6" />
     </svg>
   );
 }
 
-// --- Inline SVG icons (16x16, outlined, unified) ---
-// Pane design language: consistent 1.5px stroke, simple geometry, harmonious system
-
 function ConversationIcon() {
+  // Rectangular speech pane with a right-angle tail
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="8" cy="8" r="5" />
+      <rect x="2" y="2" width="12" height="8" rx="2" />
+      <path d="M4 10v4h4" />
     </svg>
   );
 }
 
 function FileIcon() {
+  // Document pane — content lines
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="4" y="2.5" width="8" height="11" rx="0.5" />
-      <path d="M6.5 6h3M6.5 9h3" />
+      <rect x="2" y="2" width="12" height="12" rx="2" />
+      <path d="M5 6h6M5 9h4" />
     </svg>
   );
 }
 
 function SearchIcon() {
+  // Rectangular search frame with diagonal handle
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="7" cy="7" r="4" />
-      <path d="M10 10l3.5 3.5" />
+      <rect x="2" y="2" width="10" height="10" rx="2" />
+      <path d="M12 12l2.5 2.5" />
     </svg>
   );
 }
@@ -70,42 +73,44 @@ function ProfileAvatar() {
     );
   }
 
-  // Default: person silhouette
+  // Default: square head + arc shoulders
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="8" cy="6" r="2.5" />
-      <path d="M3.5 14c0-2.485 2.015-4.5 4.5-4.5s4.5 2.015 4.5 4.5" />
+      <rect x="5.5" y="1.5" width="5" height="5" rx="1.5" />
+      <path d="M2.5 15c0-3 2.5-5 5.5-5s5.5 2 5.5 5" />
     </svg>
   );
 }
 
 function GitIcon() {
+  // Three square nodes connected — a DAG in pane geometry
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="4" cy="4" r="1.5" />
-      <circle cx="4" cy="12" r="1.5" />
-      <circle cx="12" cy="8" r="1.5" />
-      <path d="M4 5.5v5M5.5 8H12" />
+      <rect x="2" y="2" width="4" height="4" rx="1.5" />
+      <rect x="2" y="10" width="4" height="4" rx="1.5" />
+      <rect x="10" y="6" width="4" height="4" rx="1.5" />
+      <path d="M4 6v4M6 8H10" />
     </svg>
   );
 }
 
 function TerminalIcon() {
+  // Terminal window pane with sharp prompt caret and cursor
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M3 5.5l3 2.5-3 2.5" />
-      <path d="M8 10.5h5" />
+      <rect x="2" y="2" width="12" height="12" rx="2" />
+      <path d="M4.5 7l2.5 1.5-2.5 1.5" />
+      <path d="M9.5 9.5h3.5" />
     </svg>
   );
 }
 
 function ChangeHistoryIcon() {
+  // Rectangular clock face — time in a pane
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="8" cy="8" r="5" />
-      <path d="M8 5v2.5l1.5 1" />
-      <path d="M3 8h1.5" />
-      <path d="M11.5 8H13" />
+      <rect x="2" y="2" width="12" height="12" rx="2" />
+      <path d="M8 5v3.5l2.5 1.5" />
     </svg>
   );
 }
@@ -156,7 +161,7 @@ function ToolbarButton({ icon, active, disabled, onClick, tooltip }: {
         {icon}
       </button>
       {showTooltip && tooltip && (
-        <div className="absolute left-full ml-2 px-2 py-1 bg-pane-bg border border-pane-border/40 rounded-lg text-pane-text-secondary text-[11px] whitespace-nowrap shadow-lg z-50">
+        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-pane-bg border border-pane-border/40 rounded-lg text-pane-text-secondary text-[11px] whitespace-nowrap shadow-lg z-50">
           {tooltip}
         </div>
       )}
