@@ -46,11 +46,6 @@ let embedder = null;
 let embedderLoading = false;
 let embedderReady = false;
 
-// Local Intelligence model (Qwen2.5-0.5B) — lives here so it runs in the
-// UtilityProcess rather than the main process (avoids V8/Chromium OOM crash).
-let intelGenerator = null;
-let intelLoading = false;
-let intelReady = false;
 
 // Tracks which projects have completed a full initial index this session.
 const indexedProjects = new Set();
@@ -461,6 +456,29 @@ function initDatabase() {
   try {
     db.exec("ALTER TABLE mind_entries ADD COLUMN embedding BLOB");
   } catch (err) { /* ignore if exists */ }
+  try {
+    db.exec("ALTER TABLE mind_entries ADD COLUMN project_id TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_mind_project ON mind_entries(project_id)");
+  } catch (err) { /* ignore if exists */ }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS mind_threads (
+      id TEXT PRIMARY KEY,
+      entry_id TEXT NOT NULL,
+      session_id TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_mind_threads_entry ON mind_threads(entry_id);
+    CREATE TABLE IF NOT EXISTS mind_turns (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content_json TEXT NOT NULL,
+      timestamp TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_mind_turns_thread ON mind_turns(thread_id);
+  `);
 
   // Migrations for unified atom pool — add priority, sort_order, facet to nodes
   try {
@@ -615,118 +633,6 @@ function cosineSimilarity(a, b) {
   return dot; // Vectors are already normalized, so dot product = cosine similarity
 }
 
-// --- Local Intelligence (Qwen2.5-0.5B) ---
-// Runs in the UtilityProcess alongside the embedder — safe from main-process OOM.
-
-const _INTEL_VALID_MODES       = new Set(["direct", "orchestrate", "discuss"]);
-const _INTEL_VALID_REASONING   = new Set(["shallow", "deep"]);
-const _INTEL_VALID_VERIFY      = new Set(["none", "diff", "test"]);
-const _INTEL_VALID_TASK_TYPES  = new Set(["debug","implement","explain","architect","refactor","review","conversation","quick-answer","other"]);
-const _INTEL_VALID_COMPLEXITY  = new Set(["low", "medium", "high"]);
-const _INTEL_VALID_FILE_DEPTH  = new Set(["none", "names", "shallow", "deep"]);
-
-async function loadLocalIntel() {
-  if (intelReady || intelLoading) return;
-  intelLoading = true;
-
-  try {
-    const { pipeline, env } = await import("@huggingface/transformers");
-    const { cacheDir } = resolveModelCache();
-    // env is a module-level singleton — these may already be set by loadEmbedder,
-    // but setting them again is idempotent and ensures correctness.
-    env.cacheDir = cacheDir;
-    env.backends.onnx.wasm.proxy = false;
-    env.backends.onnx.wasm.numThreads = 1;
-
-    intelGenerator = await pipeline("text-generation", "onnx-community/Qwen2.5-0.5B-Instruct", {
-      dtype: "q8",
-      revision: "main",
-    });
-
-    intelReady = true;
-    intelLoading = false;
-    sendToMain({ type: "local_intel_ready" });
-    console.log("[brain] Local intelligence model loaded (first classify will JIT-compile WASM)");
-
-  } catch (err) {
-    console.error("[brain] Local intelligence load failed:", err.message);
-    intelLoading = false;
-    sendToMain({ type: "local_intel_error", error: err.message });
-  }
-}
-
-async function classifyWithIntel(input) {
-  if (!intelReady || !intelGenerator) return null;
-
-  const truncated = (input.message || "").slice(0, 300);
-  const turns      = input.turnCount      || 0;
-  const hasTask    = !!input.hasActiveTask;
-  const files      = input.workingSetSize || 0;
-  const pending    = input.pendingTodos   || 0;
-
-  const system = `You are the routing brain for a code editor. Given a developer's message and session context, decide the execution strategy and classify the task. Output valid JSON only. No explanation.
-
-Strategy modes:
-- "direct": surgical single-file changes, short confirmations (yes/go/do it), simple questions
-- "orchestrate": multi-step tasks, new features, refactors, migrations — anything that needs planning
-- "discuss": questions, explanations, opinions, conceptual conversations — no code changes
-
-Discovery (only when mode=orchestrate): true if the task is new/ambiguous and needs alignment before planning. false if continuing established work with pending todos.
-
-Reasoning: "deep" for architecture/debugging/complex tasks, "shallow" for simple changes/quick answers.
-Verification: "none" for discussion/trivial, "diff" for code changes, "test" for complex implementations.`;
-
-  const user = `Message: "${truncated}"
-Context: turns=${turns}, activeTask=${hasTask}, files=${files}, pendingTodos=${pending}
-
-{"mode":"<direct|orchestrate|discuss>","discovery":<true|false>,"reasoning":"<shallow|deep>","verification":"<none|diff|test>","taskType":"<debug|implement|explain|architect|refactor|review|conversation|quick-answer|other>","complexity":"<low|medium|high>","preferFrontier":<true|false>,"atomHints":["<kw>"],"historyDepth":<1-20>,"includeBrief":<true|false>,"fileDepth":"<none|names|shallow|deep>"}`;
-
-  try {
-    const messages = [{ role: "system", content: system }, { role: "user", content: user }];
-    // No timeout here — let the UtilityProcess run to completion.
-    // The caller (local-intelligence.mjs) owns the deadline.
-    const output = await intelGenerator(messages, { max_new_tokens: 80, temperature: 0, do_sample: false, return_full_text: false });
-
-    let raw = null;
-    if (Array.isArray(output) && output.length > 0) {
-      const gen = output[0]?.generated_text;
-      if (typeof gen === "string") raw = gen.trim();
-      else if (Array.isArray(gen)) raw = gen[gen.length - 1]?.content?.trim() ?? null;
-    }
-    if (!raw) return null;
-
-    // Extract JSON
-    let jsonStr = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-    const match = jsonStr.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-
-    let parsed;
-    try { parsed = JSON.parse(match[0]); } catch { return null; }
-
-    const clamp = (v, lo, hi, def) => (typeof v === "number" && !isNaN(v)) ? Math.max(lo, Math.min(hi, Math.round(v))) : def;
-
-    const decision = {
-      mode:          _INTEL_VALID_MODES.has(parsed.mode)         ? parsed.mode        : null,
-      discovery:     typeof parsed.discovery === "boolean"        ? parsed.discovery   : true,
-      reasoning:     _INTEL_VALID_REASONING.has(parsed.reasoning) ? parsed.reasoning   : "deep",
-      verification:  _INTEL_VALID_VERIFY.has(parsed.verification) ? parsed.verification: "none",
-      taskType:      _INTEL_VALID_TASK_TYPES.has(parsed.taskType) ? parsed.taskType    : "other",
-      complexity:    _INTEL_VALID_COMPLEXITY.has(parsed.complexity)? parsed.complexity  : "medium",
-      preferFrontier: typeof parsed.preferFrontier === "boolean"  ? parsed.preferFrontier : false,
-      atomHints:     (Array.isArray(parsed.atomHints) ? parsed.atomHints : [])
-                       .filter(h => typeof h === "string" && h.length > 0 && h.length < 50).slice(0, 5),
-      historyDepth:  clamp(parsed.historyDepth, 1, 20, 5),
-      includeBrief:  typeof parsed.includeBrief === "boolean"     ? parsed.includeBrief : true,
-      fileDepth:     _INTEL_VALID_FILE_DEPTH.has(parsed.fileDepth)? parsed.fileDepth   : "shallow",
-    };
-
-    return decision.mode ? decision : null;
-  } catch (err) {
-    console.warn("[brain] classifyWithIntel failed:", err.message);
-    return null;
-  }
-}
-
 function nodeId(type, content) {
   const hash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 12);
   return `${type}-${hash}`;
@@ -793,15 +699,18 @@ async function indexEvents(projectId, events) {
         if (isDuplicate) continue;
 
         // New node with embedding
+        const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
         const embeddingBuffer = Buffer.from(embedding.buffer);
-        db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), embeddingBuffer, 0.5);
+        db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), embeddingBuffer, seedConfidence);
       } else {
         // Embedding failed — insert without
-        db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, 0.5);
+        const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+        db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, seedConfidence);
       }
     } else {
       // Embedder not ready — insert without embedding
-      db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, 0.5);
+      const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+      db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, seedConfidence);
     }
 
     // Create applies-to edge to project
@@ -813,6 +722,16 @@ async function indexEvents(projectId, events) {
       const errorId = nodeId("error", event.metadata.original_error);
       const fixEdgeId = `${errorId}-resolved-by-${id}`;
       db._stmts.insertEdge.run(fixEdgeId, errorId, id, "resolved-by", 1.0, "{}");
+    }
+
+    // Fix→decision causal edges ("this fix led to this architectural decision")
+    if (event.type === "decision" && event.metadata?.preceded_by_fix) {
+      const fixId = nodeId("error_fix", event.metadata.preceded_by_fix);
+      const fixNode = db._stmts.getNode.get(fixId);
+      if (fixNode) {
+        const causalEdgeId = `${fixId}-led-to-${id}`;
+        db._stmts.insertEdge.run(causalEdgeId, fixId, id, "led-to", 1.0, "{}");
+      }
     }
 
     indexed++;
@@ -842,14 +761,38 @@ function sessionPinsPath(projectId) {
 function updateSessionPins(projectId) {
   if (!db) return;
   try {
-    const rows = db.prepare(`
+    // Pass 1: top decisions and lessons (confidence >= 0.65, up to 6)
+    const decisionRows = db.prepare(`
       SELECT id, name, entity_type, content, confidence, access_count
       FROM nodes
-      WHERE project_id = ? AND entity_type IN ('decision', 'lesson', 'error_fix')
-        AND confidence >= 0.78
+      WHERE project_id = ? AND entity_type IN ('decision', 'lesson')
+        AND confidence >= 0.65
       ORDER BY confidence DESC, access_count DESC
-      LIMIT 12
+      LIMIT 6
     `).all(projectId);
+
+    // Pass 2: fill remaining slots with high-confidence error fixes (confidence >= 0.78)
+    const remaining = 12 - decisionRows.length;
+    const fixRows = remaining > 0
+      ? db.prepare(`
+          SELECT id, name, entity_type, content, confidence, access_count
+          FROM nodes
+          WHERE project_id = ? AND entity_type = 'error_fix'
+            AND confidence >= 0.78
+          ORDER BY confidence DESC, access_count DESC
+          LIMIT ?
+        `).all(projectId, remaining)
+      : [];
+
+    // Combine and deduplicate by id
+    const seenIds = new Set();
+    const rows = [];
+    for (const r of [...decisionRows, ...fixRows]) {
+      if (!seenIds.has(r.id)) {
+        seenIds.add(r.id);
+        rows.push(r);
+      }
+    }
 
     if (rows.length === 0) return;
 
@@ -1143,11 +1086,14 @@ function decayStaleNodes(projectId) {
 
 // --- Contextual Search (for proactive injection) ---
 
-async function contextualSearch(query, fileContext, projectId, intent, projectRoot, taskType = null, atomHints = []) {
-  if (!db) return { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [] };
+async function contextualSearch(query, fileContext, projectId, intent, projectRoot, taskType = null, atomHints = [], projectWhy = "") {
+  if (!db) return { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [], principles: [] };
 
-  // Embed the query once — used for both project search and atom pool search
-  const queryEmbedding = embedderReady ? await embed(query) : null;
+  // Embed a why-augmented query — biases retrieval toward the project's purpose.
+  // The "why" is typically 2-4 sentences. Prepending it shifts the embedding vector
+  // so that memories/files relevant to the project's core purpose rank higher.
+  const embeddingQuery = projectWhy ? `${projectWhy}\n\n${query}` : query;
+  const queryEmbedding = embedderReady ? await embed(embeddingQuery) : null;
 
   // Unified atom pool search: system atoms + profile atoms + learned atoms,
   // scored by cosine × facetWeight × priority + hintBoost.
@@ -1165,10 +1111,10 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
   const trimmed = query.trim();
   const isDirective = trimmed.length < 65 && /^(add|remove|fix|update|change|delete|create|make|move|rename|refactor|run|install|build|deploy|write|edit|show|get|find|check|use|switch|enable|disable|set|reset|clear|open|close)/i.test(trimmed);
 
-  if (isDirective) return { memories: [], tensions: [], atoms, profileAtoms, relevantFiles };
+  if (isDirective) return { memories: [], tensions: [], atoms, profileAtoms, relevantFiles, principles: [] };
 
-  // Combine query + active file path for richer semantic search
-  const searchText = fileContext ? `${query} ${fileContext}` : query;
+  // Combine query + active file + project why for richer semantic + keyword search
+  const searchText = [projectWhy, fileContext, query].filter(Boolean).join(" ");
   const candidates = await search(searchText, projectId, 8);
 
   // Intent-aware type and confidence filters
@@ -1252,7 +1198,49 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
     console.error("[brain] Mind entry query failed:", err.message);
   }
 
-  return { memories: valuable, tensions, atoms, profileAtoms, relevantFiles, mindEntries };
+  // ── Principles: standing project standards, surfaced separately ──────────
+  // Principles are intentionally excluded from `allowedTypes` above so they
+  // don't compete with general memories. They get their own retrieval path
+  // and their own section in the system prompt.
+  let principles = [];
+  try {
+    const principleNodes = db._stmts.getNodesByType.all("principle", projectId);
+    if (principleNodes.length > 0 && queryEmbedding) {
+      const scored = [];
+      for (const n of principleNodes) {
+        const content = JSON.parse(n.content || "{}").text || n.name;
+        if (n.embedding) {
+          const nEmb = new Float32Array(n.embedding.buffer, n.embedding.byteOffset, n.embedding.byteLength / 4);
+          const sim = cosineSimilarity(queryEmbedding, nEmb);
+          // Lower threshold than general memories — principles are standing criteria
+          if (sim > 0.30 || (n.confidence || 0) >= 0.80) {
+            scored.push({ content, score: sim, confidence: n.confidence || 0 });
+          }
+        } else {
+          // No embedding — include high-confidence principles unconditionally
+          if ((n.confidence || 0) >= 0.80) {
+            scored.push({ content, score: 0.5, confidence: n.confidence || 0 });
+          }
+        }
+      }
+      scored.sort((a, b) => b.score - a.score);
+      principles = scored.slice(0, 6);
+    } else if (principleNodes.length > 0) {
+      // No embedder — include all high-confidence principles
+      principles = principleNodes
+        .filter(n => (n.confidence || 0) >= 0.80)
+        .slice(0, 6)
+        .map(n => ({
+          content: JSON.parse(n.content || "{}").text || n.name,
+          score: 0.5,
+          confidence: n.confidence || 0,
+        }));
+    }
+  } catch (err) {
+    console.error("[brain] Principle query failed:", err.message);
+  }
+
+  return { memories: valuable, tensions, atoms, profileAtoms, relevantFiles, mindEntries, principles };
 }
 
 // --- Search Export (for MCP server) ---
@@ -1307,8 +1295,8 @@ function writeSearchExport(projectId) {
 
 // --- Contextual Export (for claude-worker brief injection) ---
 
-async function writeContextualExport(projectId, query, fileContext, intent, projectRoot, taskType = null, atomHints = []) {
-  const result = await contextualSearch(query || "", fileContext || "", projectId, intent || "other", projectRoot || null, taskType, atomHints);
+async function writeContextualExport(projectId, query, fileContext, intent, projectRoot, taskType = null, atomHints = [], projectWhy = "") {
+  const result = await contextualSearch(query || "", fileContext || "", projectId, intent || "other", projectRoot || null, taskType, atomHints, projectWhy);
 
   // Layer 1: Symbol map — resolve symbols mentioned in the query + working set exports.
   // The model sees key symbols pre-resolved so it doesn't grep for them.
@@ -2138,6 +2126,10 @@ process.parentPort.on("message", async ({ data }) => {
           if (decayed > 0) console.log(`[brain] Decayed ${decayed} stale nodes in ${data.projectId}`);
         }
 
+        const hasMeaningfulEvents = data.events.some(e =>
+          ["decision", "lesson", "pattern", "error_fix"].includes(e.type)
+        );
+
         // Phase 6: Profile extraction — run whenever meaningful events exist.
         // Cheap (SQLite reads + JSON writes), no reason to skip.
         if (hasMeaningfulEvents) {
@@ -2147,9 +2139,6 @@ process.parentPort.on("message", async ({ data }) => {
         // Layer 3: Synthesis — regenerate when significant events indexed.
         // updateSynthesis() is fast (4 SQL reads + hash check) so always run.
         // The internal hash check makes it idempotent — no DB write if unchanged.
-        const hasMeaningfulEvents = data.events.some(e =>
-          ["decision", "lesson", "pattern", "error_fix"].includes(e.type)
-        );
         if (hasMeaningfulEvents) {
           updateSynthesis(db, data.projectId);
         }
@@ -2164,7 +2153,7 @@ process.parentPort.on("message", async ({ data }) => {
       }
 
       case "contextual_search": {
-        const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null, data.taskType || null, data.atomHints || []);
+        const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null, data.taskType || null, data.atomHints || [], data.projectWhy || "");
         sendToMain({ type: "contextual_result", requestId: data.requestId, ...result });
         break;
       }
@@ -2416,7 +2405,8 @@ process.parentPort.on("message", async ({ data }) => {
         const id = `mind-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
         const embedding = await embed(data.content);
         const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
-        db.prepare(`INSERT INTO mind_entries (id, content, embedding) VALUES (?, ?, ?)`).run(id, data.content, embeddingBuffer);
+        const projectId = data.projectId || null;
+        db.prepare(`INSERT INTO mind_entries (id, content, embedding, project_id) VALUES (?, ?, ?, ?)`).run(id, data.content, embeddingBuffer, projectId);
         const entry = db.prepare(`SELECT * FROM mind_entries WHERE id = ?`).get(id);
         sendToMain({ type: "mind_entry", requestId: data.requestId, entry });
         break;
@@ -2456,15 +2446,55 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
-      case "local_intel_load": {
-        // Fire-and-forget — sends local_intel_ready or local_intel_error when done
-        loadLocalIntel();
+      case "mind_thread_create": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const threadId = `mt-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+        db.prepare(`INSERT INTO mind_threads (id, entry_id) VALUES (?, ?)`).run(threadId, data.entry_id);
+        const thread = db.prepare(`SELECT * FROM mind_threads WHERE id = ?`).get(threadId);
+        sendToMain({ type: "mind_thread", requestId: data.requestId, thread });
         break;
       }
 
-      case "local_intel_classify": {
-        const result = await classifyWithIntel(data.input || {});
-        sendToMain({ type: "local_intel_result", requestId: data.requestId, result });
+      case "mind_thread_get": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const thread = db.prepare(`SELECT * FROM mind_threads WHERE entry_id = ? ORDER BY updated_at DESC LIMIT 1`).get(data.entry_id);
+        let turns = [];
+        if (thread) {
+          turns = db.prepare(`SELECT * FROM mind_turns WHERE thread_id = ? ORDER BY timestamp ASC`).all(thread.id);
+        }
+        sendToMain({ type: "mind_thread_data", requestId: data.requestId, thread: thread || null, turns: turns || [] });
+        break;
+      }
+
+      case "mind_thread_list_entry_ids": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const rows = db.prepare(`SELECT DISTINCT entry_id FROM mind_threads`).all();
+        sendToMain({ type: "mind_thread_entry_ids", requestId: data.requestId, entryIds: rows.map(r => r.entry_id) });
+        break;
+      }
+
+      case "mind_thread_add_turn": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const turnId = `mtu-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+        db.prepare(`INSERT INTO mind_turns (id, thread_id, role, content_json) VALUES (?, ?, ?, ?)`).run(turnId, data.thread_id, data.role, data.content_json);
+        db.prepare(`UPDATE mind_threads SET updated_at = datetime('now') WHERE id = ?`).run(data.thread_id);
+        const turn = db.prepare(`SELECT * FROM mind_turns WHERE id = ?`).get(turnId);
+        sendToMain({ type: "mind_turn", requestId: data.requestId, turn });
+        break;
+      }
+
+      case "mind_thread_set_session": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        db.prepare(`UPDATE mind_threads SET session_id = ?, updated_at = datetime('now') WHERE id = ?`).run(data.session_id, data.thread_id);
+        sendToMain({ type: "mind_thread_session_set", requestId: data.requestId });
+        break;
+      }
+
+      case "mind_thread_delete": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        db.prepare(`DELETE FROM mind_turns WHERE thread_id = ?`).run(data.id);
+        db.prepare(`DELETE FROM mind_threads WHERE id = ?`).run(data.id);
+        sendToMain({ type: "mind_thread_deleted", requestId: data.requestId, id: data.id });
         break;
       }
 

@@ -22,21 +22,18 @@ import {
 } from "./punk-engine.mjs";
 import { modelManager } from "./model-manager.mjs";
 import { startBackupSchedule } from "./backup-engine.mjs";
-import {
-  load as loadLocalIntelligence,
-  onProgress as onLocalIntelProgress,
-  setBrainSender,
-  handleBrainMessage as handleIntelBrainMessage,
-  resetIntelReady,
-} from "./local-intelligence.mjs";
+import { initCloudAuth } from "./cloud-auth.mjs";
+import { registerCloudSyncHandlers } from "./cloud-sync.mjs";
+import { MindWorkers } from "./mind-workers.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
+let mindWorkers = null;
 // Punk engine runs in a UtilityProcess to keep the main thread free.
 // Main process is a thin relay — never touches JSON.parse or model output.
-function registerClaudeHandlers() {
+async function registerClaudeHandlers() {
   // Punk is the default engine; keep these names for backwards compatibility.
-  registerPunkHandlers();
+  await registerPunkHandlers();
   ipcMain.handle("send_to_claude", async (_event, args) => {
     const { projectId, prompt, workingDir, sessionId, model, intent } = args;
     await punkEngine.spawn({
@@ -67,78 +64,6 @@ function registerClaudeHandlers() {
       return { current: null, error: error.message };
     }
   });
-  ipcMain.handle("check_claude_update", async () => {
-    try {
-      // Get current version from claude --version
-      const { stdout: versionOut } = await execFileAsync(
-        "claude",
-        ["--version"],
-        { env: getEnvWithPath() },
-      );
-      const currentMatch = versionOut.trim().match(/^([\d.]+)/);
-      const current = currentMatch?.[1] ?? null;
-
-      // Get latest version from npm registry (no install, just metadata)
-      const { stdout: npmOut } = await execFileAsync(
-        "npm",
-        ["show", "@anthropic-ai/claude-code", "version"],
-        { timeout: 15000, env: getEnvWithPath() },
-      );
-      const latest = npmOut.trim() || null;
-
-      if (!current || !latest) {
-        return {
-          updateAvailable: false,
-          currentVersion: current,
-          newVersion: null,
-          error: null,
-        };
-      }
-
-      const updateAvailable = latest !== current;
-      return {
-        updateAvailable,
-        currentVersion: current,
-        newVersion: updateAvailable ? latest : null,
-        error: null,
-      };
-    } catch (error) {
-      return {
-        updateAvailable: false,
-        currentVersion: null,
-        newVersion: null,
-        error: error.message,
-      };
-    }
-  });
-  ipcMain.handle("update_claude", async () => {
-    try {
-      const env = getEnvWithPath();
-
-      // Find where claude is globally installed
-      const { stdout: prefixOut } = await execFileAsync("npm", ["root", "-g"], {
-        env,
-        timeout: 10000,
-      });
-      const globalRoot = prefixOut.trim(); // e.g. /Users/x/.nvm/.../lib/node_modules
-      const pkgDir = path.join(globalRoot, "@anthropic-ai", "claude-code");
-
-      // Remove existing install directory — npm ENOTEMPTY prevents in-place upgrade
-      await fs.promises.rm(pkgDir, { recursive: true, force: true });
-
-      // Fresh install
-      const { stdout, stderr } = await execFileAsync(
-        "npm",
-        ["install", "-g", "@anthropic-ai/claude-code@latest"],
-        { timeout: 120000, env },
-      );
-      return { success: true, output: stdout + stderr, error: null };
-    } catch (error) {
-      const output = (error.stdout || "") + (error.stderr || "");
-      return { success: false, output, error: error.message };
-    }
-  });
-
   ipcMain.handle("check_gemini_version", async () => {
     try {
       const { stdout } = await execFileAsync("gemini", ["-v"], {
@@ -720,17 +645,37 @@ function registerCommandHandlers() {
           : unstagedDiff;
       }
 
-      const systemPrompt = `You are writing a git commit message for a developer. Study the actual diff carefully — understand what changed at the code level, not just which files.
+      const systemPrompt = `Output only the raw git commit message text. No preamble, no explanation, no "Here is the commit message:", no markdown fences. Your entire response IS the commit message — nothing before it, nothing after it.
 
-Rules:
-- First line: conventional commit format — type(scope): description — all lowercase, max 72 chars
+Study the actual diff carefully — understand what changed at the code level, not just which files.
+
+Subject line rules:
+- Conventional commit format: type(scope): description — all lowercase, max 72 chars
 - Types: feat, fix, refactor, style, chore, docs, test, perf — pick the most accurate one
 - Scope: optional, short noun describing what area changed (e.g. git-panel, input-bar, terminal)
-- Description: imperative mood, specific ("add branch auto-stash on checkout", not "update git UI")
-- If there are multiple distinct changes, add a blank line then a tight bullet list (2-5 items max)
-- Bullets: lowercase, no trailing punctuation, lead with the verb
+- Description: outcome phrase, imperative mood ("add branch auto-stash on checkout", not "update git UI")
+
+Body rules (only include sections that apply — omit empty sections entirely):
+- After the subject line, add a blank line then organize changes into labeled sections
+- Use exactly these section headers (no bold, no markdown): "New features", "Bug fixes", "Improvements"
+- Under each section, write a tight bullet list (- item)
+- Each bullet: describes behavior/capability — what it IS and DOES, not which files changed
+- Lead with a verb: "add", "fix", "remove", "prevent", "expose", "allow"
+- Lowercase, no trailing punctuation
 - No emoji, no filler phrases ("this commit", "various improvements")
-- Write only the commit message — no preamble, no explanation`;
+
+Example format:
+feat(terminal): add persistent shell sessions with multi-tab support
+
+New features
+- add PTY-backed shell sessions that preserve env, cwd, and aliases across commands
+- add multi-tab support with Cmd+Shift+N/W/]/[ shortcuts
+
+Bug fixes
+- fix echo suppression so the first echoed line is not shown as output
+
+Improvements
+- strip ANSI codes for clean readable output without color artifacts`;
 
       const userPrompt = [
         statusSummary ? `Changed files:\n${statusSummary}` : "",
@@ -772,6 +717,13 @@ Rules:
     });
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
+  });
+  ipcMain.handle("create-directory", async (_event, dirPath) => {
+    const resolved = dirPath.startsWith("~/")
+      ? path.join(os.homedir(), dirPath.slice(2))
+      : dirPath;
+    await fs.promises.mkdir(resolved, { recursive: true });
+    return resolved;
   });
   ipcMain.handle("get_claude_plan_info", async () => {
     try {
@@ -819,7 +771,7 @@ const defaultSettings = {
   keybindings: null,
   theme: null,
   panel_width: null,
-  punk_backend: "http",
+  punk_backend: "api",
   http_provider: "deepseek",
   http_api_key: "",
   http_base_url: "",
@@ -977,7 +929,9 @@ function registerWatcherHandlers() {
     let debounceTimer = null;
     const flush = () => {
       if (pendingPaths.size > 0) {
-        sendToRenderer("pane://file-changed", Array.from(pendingPaths));
+        const paths = Array.from(pendingPaths);
+        sendToRenderer("pane://file-changed", paths);
+        if (mindWorkers) mindWorkers.onFilesChanged(paths);
         pendingPaths = /* @__PURE__ */ new Set();
       }
       debounceTimer = null;
@@ -1586,27 +1540,39 @@ function registerMemoryHandlers() {
     const { projectId, events } = args;
     const dir = memoryDir(projectId);
     await fs.promises.mkdir(dir, { recursive: true });
-    const lines = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+
+    // Deduplicate against last 20 lines in the existing events file
+    const eventsFilePath = path.join(dir, "events.jsonl");
+    const recentKeys = new Set();
+    try {
+      const existing = await fs.promises.readFile(eventsFilePath, "utf-8");
+      const allLines = existing.trim().split("\n").filter(Boolean);
+      const last20 = allLines.slice(-20);
+      for (const line of last20) {
+        try {
+          const e = JSON.parse(line);
+          recentKeys.add(`${e.type}:${e.content}`);
+        } catch {}
+      }
+    } catch {}
+
+    const dedupedEvents = events.filter((e) => !recentKeys.has(`${e.type}:${e.content}`));
+    if (dedupedEvents.length === 0) return;
+
+    const lines = dedupedEvents.map((e) => JSON.stringify(e)).join("\n") + "\n";
     await fs.promises.appendFile(
-      path.join(dir, "events.jsonl"),
+      eventsFilePath,
       lines,
       "utf-8",
     );
 
     // Prune to last N events
     try {
-      const content = await fs.promises.readFile(
-        path.join(dir, "events.jsonl"),
-        "utf-8",
-      );
+      const content = await fs.promises.readFile(eventsFilePath, "utf-8");
       const allLines = content.trim().split("\n").filter(Boolean);
       if (allLines.length > MEMORY_MAX_EVENTS) {
         const pruned = allLines.slice(-MEMORY_MAX_EVENTS).join("\n") + "\n";
-        await fs.promises.writeFile(
-          path.join(dir, "events.jsonl"),
-          pruned,
-          "utf-8",
-        );
+        await fs.promises.writeFile(eventsFilePath, pruned, "utf-8");
       }
     } catch {}
   });
@@ -1723,7 +1689,7 @@ function registerMemoryHandlers() {
           const summary = recentSummaries[i].content;
           // Truncate each to ~200 chars to leave room
           parts.push(
-            `**${label}:** ${summary.length > 200 ? summary.slice(0, 200) + "..." : summary}`,
+            `**${label}:** ${summary.length > 400 ? summary.slice(0, 400) + "..." : summary}`,
           );
         }
       }
@@ -1731,9 +1697,9 @@ function registerMemoryHandlers() {
 
     let brief = parts.join("\n");
 
-    // Section-aware truncation: cap at 3500 chars, break at last ### boundary
-    if (brief.length > 3500) {
-      const truncated = brief.slice(0, 3500);
+    // Section-aware truncation: cap at 6000 chars, break at last ### boundary
+    if (brief.length > 6000) {
+      const truncated = brief.slice(0, 6000);
       const lastSection = truncated.lastIndexOf("\n###");
       if (lastSection > 500) {
         brief = truncated.slice(0, lastSection);
@@ -1758,6 +1724,19 @@ function registerMemoryHandlers() {
       );
     } catch {
       return "";
+    }
+  });
+
+  ipcMain.handle("get_project_why", async (_event, args) => {
+    const { projectId } = args;
+    try {
+      const content = await fs.promises.readFile(
+        path.join(memoryDir(projectId), "why.md"),
+        "utf-8",
+      );
+      return content.trim() || null;
+    } catch {
+      return null;
     }
   });
 
@@ -1885,11 +1864,39 @@ function registerSessionHandlers() {
 let brainWorker = null;
 const brainPendingRequests = new Map();
 let brainRequestCounter = 0;
+let brainWorkerExitCount = 0;
+let brainWorkerLastExitTime = 0;
+let brainWorkerDisabled = false;
+const BRAIN_BACKOFF_WINDOW_MS = 30_000; // 30s
+const BRAIN_BACKOFF_THRESHOLD = 3;     // disable after 3 crashes in window
+const BRAIN_SURVIVE_RESET_MS  = 60_000; // reset counter if worker lives 60s
 
 function getBrainWorker() {
   if (brainWorker && !brainWorker.killed) return brainWorker;
+
+  // Backoff: if the worker has crashed repeatedly in a short window, stop
+  // re-forking — a rapid crash loop leaks memory and consumes CPU.
+  if (brainWorkerDisabled) {
+    const timeSince = Date.now() - brainWorkerLastExitTime;
+    if (timeSince < BRAIN_BACKOFF_WINDOW_MS) return null;
+    // Enough time has passed — try once more
+    console.log("[pane] Brain worker backoff elapsed, retrying...");
+    brainWorkerDisabled = false;
+    brainWorkerExitCount = 0;
+  }
+
   const workerPath = path.join(__dirname, "brain-engine.mjs");
   brainWorker = utilityProcess.fork(workerPath);
+
+  // Track whether this instance survives long enough to reset the crash counter
+  const spawnTime = Date.now();
+  const surviveTimer = setTimeout(() => {
+    if (brainWorker && !brainWorker.killed) {
+      brainWorkerExitCount = 0;
+      brainWorkerDisabled = false;
+    }
+  }, BRAIN_SURVIVE_RESET_MS);
+  if (surviveTimer.unref) surviveTimer.unref();
 
   brainWorker.on("message", (message) => {
     // Route responses back to pending IPC requests
@@ -1918,24 +1925,22 @@ function getBrainWorker() {
         }
       }
     }
-    // Local intelligence results (classify responses + ready/error signals)
-    if (message.type === "local_intel_ready" ||
-        message.type === "local_intel_result" ||
-        message.type === "local_intel_error") {
-      handleIntelBrainMessage(message);
-    }
   });
 
   brainWorker.on("exit", (code) => {
     console.warn(`[pane] Brain worker exited with code ${code}`);
     brainWorker = null;
+    brainWorkerLastExitTime = Date.now();
+    brainWorkerExitCount++;
+    if (brainWorkerExitCount >= BRAIN_BACKOFF_THRESHOLD) {
+      brainWorkerDisabled = true;
+      console.warn(`[pane] Brain worker disabled after ${brainWorkerExitCount} crashes — will retry in ${BRAIN_BACKOFF_WINDOW_MS / 1000}s`);
+    }
     // Reject pending requests
     for (const [id, resolve] of brainPendingRequests) {
       resolve({ type: "error", error: "Brain worker exited" });
     }
     brainPendingRequests.clear();
-    // Reset intel ready state — brain process is gone, model needs to reload
-    resetIntelReady();
   });
 
   return brainWorker;
@@ -1943,10 +1948,16 @@ function getBrainWorker() {
 
 function brainRequest(type, data, timeout = 30000) {
   return new Promise((resolve) => {
+    const worker = getBrainWorker();
+    if (!worker) {
+      // Worker is in backoff — resolve immediately so callers don't hang
+      resolve({ type: "error", error: "Brain worker temporarily disabled (crash backoff)" });
+      return;
+    }
     const requestId = `brain-${++brainRequestCounter}`;
     brainPendingRequests.set(requestId, resolve);
-    getBrainWorker().postMessage({ type, requestId, ...data });
-    // Timeout to prevent hanging
+    worker.postMessage({ type, requestId, ...data });
+    // Timeout to prevent hanging if worker dies without clearing pending map
     setTimeout(() => {
       if (brainPendingRequests.has(requestId)) {
         brainPendingRequests.delete(requestId);
@@ -1968,13 +1979,13 @@ function registerBrainHandlers() {
   });
 
   ipcMain.handle("brain_contextual_search", async (_event, args) => {
-    const { projectId, query, fileContext, intent, projectRoot, taskType, atomHints } = args;
+    const { projectId, query, fileContext, intent, projectRoot, taskType, atomHints, projectWhy } = args;
     // Auto-trigger file indexing fire-and-forget when projectRoot is known.
     // brain-engine deduplicates via indexedProjects Set — safe to call every time.
     if (projectRoot) {
       brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
     }
-    return brainRequest("contextual_search", { projectId, query, fileContext, intent, projectRoot: projectRoot || null, taskType: taskType || null, atomHints: atomHints || [] });
+    return brainRequest("contextual_search", { projectId, query, fileContext, intent, projectRoot: projectRoot || null, taskType: taskType || null, atomHints: atomHints || [], projectWhy: projectWhy || "" });
   });
 
   ipcMain.handle("brain_session_pins_clear", async (_event, args) => {
@@ -2037,7 +2048,12 @@ function registerBrainHandlers() {
   });
 
   ipcMain.handle("brain_mind_add", async (_event, args) => {
-    return brainRequest("mind_add", { content: args.content });
+    const result = await brainRequest("mind_add", { content: args.content, projectId: args.projectId || null });
+    // Fire-and-forget: workers analyze new entries asynchronously
+    if (result?.entry && mindWorkers) {
+      setTimeout(() => mindWorkers.onMindEntryAdded(result.entry, args.projectId).catch(() => {}), 2000);
+    }
+    return result;
   });
 
   ipcMain.handle("brain_mind_get_all", async () => {
@@ -2052,38 +2068,19 @@ function registerBrainHandlers() {
     return brainRequest("mind_delete", { id: args.id });
   });
 
-  // Local Intelligence IPC
-  ipcMain.handle("local_intel_status", async () => {
-    const { isReady, getLoadError } = await import("./local-intelligence.mjs");
-    return { ready: isReady(), error: getLoadError() };
-  });
+  ipcMain.handle('brain_mind_thread_create', async (_event, args) => brainRequest('mind_thread_create', {entry_id: args.entryId}));
+  ipcMain.handle('brain_mind_thread_get', async (_event, args) => brainRequest('mind_thread_get', {entry_id: args.entryId}));
+  ipcMain.handle('brain_mind_thread_list_entry_ids', async () => brainRequest('mind_thread_list_entry_ids', {}));
+  ipcMain.handle('brain_mind_thread_add_turn', async (_event, args) => brainRequest('mind_thread_add_turn', {thread_id: args.threadId, role: args.role, content_json: args.contentJson}));
+  ipcMain.handle('brain_mind_thread_set_session', async (_event, args) => brainRequest('mind_thread_set_session', {thread_id: args.threadId, session_id: args.sessionId}));
+  ipcMain.handle('brain_mind_thread_delete', async (_event, args) => brainRequest('mind_thread_delete', {id: args.id}));
 
-  ipcMain.handle("local_intel_enable", async () => {
-    const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
-    let settings = {};
-    try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")); } catch {}
-    settings.local_intelligence = true;
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
-    // Start loading immediately
-    const { load } = await import("./local-intelligence.mjs");
-    load().catch(err => console.error("[main] Local intel load failed:", err.message));
-    return { enabled: true };
-  });
-
-  ipcMain.handle("local_intel_disable", async () => {
-    const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
-    let settings = {};
-    try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")); } catch {}
-    settings.local_intelligence = false;
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
-    return { enabled: false };
-  });
 }
 
-function registerIpcHandlers() {
+async function registerIpcHandlers() {
   registerCommandHandlers();
   registerSettingsHandlers();
-  registerClaudeHandlers();
+  await registerClaudeHandlers();
   registerWatcherHandlers();
   registerPtyHandlers();
   registerCheckpointHandlers();
@@ -2120,7 +2117,7 @@ function createWindow() {
     icon: iconPath,
     show: false,
     webPreferences: {
-      preload: path.join(__dirname, "../preload/preload.mjs"),
+      preload: path.join(__dirname, "../preload/preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -2136,7 +2133,6 @@ function createWindow() {
   });
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
-    mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
     mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   }
@@ -2157,23 +2153,36 @@ function createWindow() {
     }
   });
 }
-app.whenReady().then(() => {
-  registerIpcHandlers();
+// Single-instance lock — required for Windows deep link (second-instance event).
+// Skip in dev: the production app may already hold the lock, which would
+// cause the dev build to quit immediately with no visible error.
+if (!isDev) {
+  if (!app.requestSingleInstanceLock()) {
+    app.quit();
+  }
+}
+
+// GPU rasterization — hardware-accelerates tile rasterization so scroll stays
+// smooth even in content-heavy views (long conversation lists, code blocks).
+// Without this, Chromium falls back to CPU rasterization which can stall for
+// 1-2s per tile on complex DOM. Must be called before app.whenReady().
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
+app.commandLine.appendSwitch('num-raster-threads', '4');
+
+app.whenReady().then(async () => {
+  await registerIpcHandlers();
   modelManager.initialize();
   createWindow();
   preforkPunkWorker(); // Pre-fork to hide first-use latency
   getPtyWorker();
   getBrainWorker(); // Pre-fork: start loading SQLite + embedding model
 
-  // Wire local intelligence IPC — the model lives in the brain UtilityProcess.
-  // setBrainSender uses getBrainWorker() lazily so it survives worker restarts.
-  setBrainSender(msg => getBrainWorker()?.postMessage(msg));
-
   // Wire brain contextual search into punk-engine so it fires every turn.
   // This is the critical link: brain searches the knowledge graph for query-
   // relevant context and writes it to disk BEFORE compileContext() reads it.
   punkEngine.setBrainSearch(args => {
-    const { projectId, query, taskType, atomHints, projectRoot, intent } = args;
+    const { projectId, query, taskType, atomHints, projectRoot, intent, projectWhy } = args;
     if (projectRoot) {
       brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
     }
@@ -2185,33 +2194,31 @@ app.whenReady().then(() => {
       projectRoot: projectRoot || null,
       taskType:    taskType || null,
       atomHints:   atomHints || [],
+      projectWhy:  projectWhy || "",
     });
   });
 
-  // Local Intelligence — on-device classifier for routing + context shaping.
-  // Opt-in via settings.json: { "local_intelligence": true }
-  // Model loads in brain UtilityProcess — no main-process OOM risk.
-  try {
-    const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
-    const settings = fs.existsSync(settingsPath)
-      ? JSON.parse(fs.readFileSync(settingsPath, "utf-8"))
-      : {};
-    if (settings.local_intelligence) {
-      console.log("[main] Local intelligence enabled — loading model in brain worker...");
-      onLocalIntelProgress((event) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send("local-intel-progress", event);
-        }
-      });
-      loadLocalIntelligence().catch(err =>
-        console.error("[main] Local intelligence load failed (non-fatal):", err.message)
-      );
-    }
-  } catch {
-    // Settings read failed — local intelligence stays disabled
-  }
-  // Daily backup at midnight — silent, automatic, 7-day rotation
+  punkEngine.setBrainIndexer((projectId, events) =>
+    brainRequest("index_events", { projectId, events })
+  );
+
+  // Mind workers: background intelligence that acts on thoughts
+  // Variable is used by brain_mind_add handler declared earlier in this scope,
+  // but only called at runtime after this initialization completes.
+  /* eslint-disable-next-line no-use-before-define -- runtime order is safe */
+  mindWorkers = new MindWorkers({
+    brainRequest,
+    quickCall: (sys, usr) => punkEngine.quickCall(sys, usr),
+    sendToRenderer,
+  });
+  mindWorkers.start();
+
+  // Daily backup at midnight — silent, automatic, 7-day rotation + cloud push
   startBackupSchedule();
+
+  // Pane Cloud — GitHub OAuth, encrypted backups, cross-device sync
+  initCloudAuth(mainWindow);
+  registerCloudSyncHandlers();
 
   app.on("activate", () => {
     if (mainWindow) {

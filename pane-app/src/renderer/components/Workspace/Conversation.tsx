@@ -16,6 +16,16 @@ interface ConversationProps {
   projectId: string;
 }
 
+// MemoizedMessage uses a custom comparator to prevent re-renders of unchanged
+// messages. The store only ever creates a new object for the LAST message on
+// each text delta (spread of the last element), so older messages keep the same
+// reference — the comparator short-circuits immediately for all but the
+// actively-streaming message. O(n) total reconciliation cost per update.
+//
+// Per-message store subscriptions (MessageItem pattern) look appealing but are
+// O(n²): each of n items runs an O(n) .find() selector on every store update.
+// With 100 messages × 100 streaming updates/s that's ~1M comparisons/s —
+// enough to fully saturate the main thread and block painting.
 const MemoizedMessage = memo(
   function MemoizedMessage({
     message,
@@ -27,7 +37,7 @@ const MemoizedMessage = memo(
     projectId: string;
   }) {
     return (
-      <div>
+      <div style={{ contain: "content" }}>
         <MessageBubble
           message={message}
           toolResults={toolResults}
@@ -64,11 +74,36 @@ export const Conversation = memo(function Conversation({
     (s) => s.projects.get(projectId)?.conversation.isProcessing ?? false,
   );
   const isThinking = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.statusMessage === "thinking...",
+    (s) =>
+      s.projects.get(projectId)?.conversation.statusMessage === "thinking...",
   );
   const error = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.error ?? null,
   );
+
+  // toolResultMap: only recompute when the count of system messages changes,
+  // not on every text delta. Text deltas only touch the last assistant message.
+  const systemMessageCount = useMemo(
+    () => messages.filter((m) => m.type === "system").length,
+    [messages],
+  );
+  const toolResultMap = useMemo(() => {
+    const map = new Map<string, ToolResultBlock>();
+    for (const msg of messages) {
+      if (msg.type === "system") {
+        for (const block of msg.content) {
+          if (block.type === "tool_result") {
+            map.set(
+              (block as ToolResultBlock).tool_use_id,
+              block as ToolResultBlock,
+            );
+          }
+        }
+      }
+    }
+    return map;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [systemMessageCount]);
 
   const { sendMessage, abortMessage } = usePunk(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -99,27 +134,11 @@ export const Conversation = memo(function Conversation({
     return () => window.removeEventListener("pane:context-refreshed", handler);
   }, [projectId]);
 
-  // Count only system messages (tool results) — text streaming doesn't change this
-  const systemMessageCount = useMemo(
-    () => messages.filter((m) => m.type === "system").length,
-    [messages],
-  );
-  const toolResultMap = useMemo(() => {
-    const map = new Map<string, ToolResultBlock>();
-    for (const msg of messages) {
-      if (msg.type === "system") {
-        for (const block of msg.content) {
-          if (block.type === "tool_result") {
-            map.set(
-              (block as ToolResultBlock).tool_use_id,
-              block as ToolResultBlock,
-            );
-          }
-        }
-      }
-    }
-    return map;
-  }, [systemMessageCount]);
+  // Error toast — persists until dismissed or cleared
+  const [visibleError, setVisibleError] = useState<string | null>(null);
+  useEffect(() => {
+    if (error) setVisibleError(error);
+  }, [error]);
 
   // Wheel listener: disengage follow on scroll up, re-engage on scroll down to bottom.
   useEffect(() => {
@@ -139,7 +158,6 @@ export const Conversation = memo(function Conversation({
     container.addEventListener("wheel", handleWheel, { passive: true });
     return () => container.removeEventListener("wheel", handleWheel);
   }, []);
-
 
   // rAF loop: while active + following, continuously pin to bottom.
   const rafRef = useRef(0);
@@ -189,7 +207,7 @@ export const Conversation = memo(function Conversation({
     <div className="relative h-full w-full">
       <div
         ref={scrollRef}
-        className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pb-48 pt-8 z-20"
+        className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pb-48 pt-8 z-20 [overflow-anchor:none] bg-pane-bg will-change-transform [contain:layout_paint]"
         data-conv-scroll
         data-no-drag
       >
@@ -204,28 +222,35 @@ export const Conversation = memo(function Conversation({
           </div>
         )}
 
-        {messages.map((msg) => (
+        {messages.map((message) => (
           <MemoizedMessage
-            key={msg.id}
-            message={msg}
+            key={message.id}
+            message={message}
             toolResults={toolResultMap}
             projectId={projectId}
           />
         ))}
 
-        {error && (
-          <div className="mt-4">
-            <p className="text-pane-error text-xs font-mono bg-[var(--pane-error-bg)] border border-[var(--pane-error-border)] px-4 py-3 leading-[1.7] break-words">
-              {error}
-            </p>
-          </div>
-        )}
       </div>
 
       {showRefreshToast && (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
           <div className="font-mono text-[10px] text-[var(--pane-terminal)] bg-pane-surface px-3 py-1.5 rounded-sm animate-fade-in">
             context refreshed — conversation continues with full memory
+          </div>
+        </div>
+      )}
+
+      {visibleError && (
+        <div className="absolute bottom-32 left-1/2 -translate-x-1/2 z-40 w-[min(480px,80%)]">
+          <div className="flex items-start gap-3 font-mono text-[10px] text-pane-error bg-pane-surface px-3 py-2 rounded-sm animate-fade-in leading-[1.6]">
+            <span className="break-words flex-1">{visibleError}</span>
+            <button
+              onClick={() => setVisibleError(null)}
+              className="shrink-0 text-pane-text-secondary/40 hover:text-pane-text-secondary transition-colors mt-px"
+            >
+              ×
+            </button>
           </div>
         </div>
       )}

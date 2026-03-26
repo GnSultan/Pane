@@ -280,6 +280,23 @@ function handleGeminiLine(projectId, line, requestId) {
           },
         },
       });
+      // content_block_stop: signals the tool_use block is complete.
+      // Without this, usePunk.ts never transitions the status from
+      // "using X..." to "thinking..." between tool call and result.
+      sendToMain({
+        type: "event",
+        projectId,
+        requestId,
+        event: {
+          event: "message",
+          data: {
+            parsed: {
+              type: "stream_event",
+              event: { type: "content_block_stop" },
+            },
+          },
+        },
+      });
       break;
     }
 
@@ -366,9 +383,11 @@ function handleGeminiLine(projectId, line, requestId) {
       }
       let inputTokens = 0;
       let outputTokens = 0;
+      let cachedTokens = 0;
       if (parsed.stats) {
         inputTokens = parsed.stats.input_tokens || 0;
         outputTokens = parsed.stats.output_tokens || 0;
+        cachedTokens = parsed.stats.cached || 0;
       }
       sendToMain({
         type: "event",
@@ -380,17 +399,39 @@ function handleGeminiLine(projectId, line, requestId) {
             parsed: {
               type: "result",
               subtype: isSuccess ? "success" : "error",
-              session_id: "",
+              // Forward the real session_id so the renderer can resume the session
+              session_id: parsed.session_id || "",
               result: "",
               error: errorMsg,
               total_cost_usd: 0,
               duration_ms: parsed.stats?.duration_ms || 0,
-              usage: { input_tokens: inputTokens, output_tokens: outputTokens },
-              num_turns: 1,
+              usage: {
+                input_tokens: inputTokens,
+                output_tokens: outputTokens,
+                cache_read_input_tokens: cachedTokens,
+              },
+              num_turns: parsed.stats?.tool_calls || 1,
             },
           },
         },
       });
+      break;
+    }
+
+    case "error": {
+      // Gemini CLI emits this for loop detection, max turns exceeded, etc.
+      // Forward as an error event so the renderer can surface it.
+      const severity = parsed.severity || "error";
+      const msg = parsed.message || "Gemini encountered an error";
+      if (severity === "error") {
+        sendToMain({
+          type: "event",
+          projectId,
+          requestId,
+          event: { event: "error", data: { message: msg } },
+        });
+      }
+      // warnings are informational — they don't stop execution, skip forwarding
       break;
     }
 
@@ -425,6 +466,8 @@ async function handleClaudeSpawn({
   model,
   systemPrompt,
   mcpServerDest,
+  tools,
+  maxTurns,
 }) {
   const ac = new AbortController();
   const oldAc = activeControllers.get(projectId);
@@ -448,7 +491,8 @@ async function handleClaudeSpawn({
     env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
     permissionMode: "bypassPermissions",
     dangerouslySkipPermissions: true,
-    maxTurns: 50,
+    maxTurns: maxTurns || 50,
+    tools: tools || undefined,
     betas: ["context-1m-2025-08-07"],
     mcpServers: {
       pane: {
@@ -604,6 +648,7 @@ async function handleGeminiSpawn({
   requestId,
   prompt,
   workingDir,
+  sessionId,
   model,
   systemPrompt,
   history,
@@ -643,8 +688,15 @@ async function handleGeminiSpawn({
     );
   } catch {}
 
+  // If the renderer passed back a real Gemini session ID (from a previous init event),
+  // use --resume so Gemini loads its own conversation history natively.
+  // Our fake placeholder IDs start with "gemini-" — those are not real sessions.
+  const isResumingSession = sessionId && !sessionId.startsWith("gemini-");
+
   let historyPreamble = "";
-  if (history && history.length > 0) {
+  if (!isResumingSession && history && history.length > 0) {
+    // History preamble is only needed on first-turn or when session cannot be resumed.
+    // When resuming, Gemini loads full history from its session file — no limit, no preamble.
     const turns = history
       .filter((m) => m.type === "user" || m.type === "assistant")
       .slice(-20);
@@ -675,24 +727,34 @@ async function handleGeminiSpawn({
     }
   }
 
+  // Build full prompt: system context + history (if any) + user message.
+  // When resuming a session the history preamble is empty — Gemini handles it natively.
   const fullPrompt = systemPrompt
     ? `${systemPrompt}\n\n---\n\n${historyPreamble}${prompt}`
     : `${historyPreamble}${prompt}`;
 
-  const cmdParts = ["gemini", "-p", fullPrompt, "--output-format", "stream-json", "--yolo"];
-  if (model && /gemini/i.test(model)) {
-    cmdParts.push("--model", model);
-  }
+  // Prompt is passed via stdin (not -p flag) to avoid shell arg length limits and
+  // quoting fragility with large prompts containing code, JSON, or special characters.
+  const cmdParts = ["gemini", "--output-format", "stream-json", "--yolo"];
+  if (isResumingSession) cmdParts.push("--resume", sessionId);
+  if (model && /gemini/i.test(model)) cmdParts.push("--model", model);
 
   const shellCmd = cmdParts.map((arg) => shellEscape(arg)).join(" ");
   const fullCmd = `eval $(/usr/libexec/path_helper -s 2>/dev/null); [ -f "${home}/.zshrc" ] && source "${home}/.zshrc" 2>/dev/null; ${shellCmd}`;
 
   const child = spawn("/bin/zsh", ["-c", fullCmd], {
     cwd: workingDir,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"], // stdin is piped so we can write the prompt
     detached: true,
     env: { ...getEnvWithPath() },
   });
+
+  // Write prompt via stdin and close — gemini reads it as the user message.
+  // Avoids shell-quoting the entire prompt as a CLI argument.
+  if (child.stdin) {
+    child.stdin.write(fullPrompt, "utf8");
+    child.stdin.end();
+  }
 
   const oldChild = activeProcesses.get(projectId);
   if (oldChild && !oldChild.killed) {
@@ -820,6 +882,10 @@ async function handleSpawn({
   command: messageCommand,
   requestId,
   todos,
+  tools,
+  maxTurns,
+  systemPromptOverride,
+  escalationHint,
 }) {
   const command =
     messageCommand || (process.serviceData && process.serviceData.command);
@@ -851,7 +917,8 @@ async function handleSpawn({
 
   const backend = command === "claude" ? "claude-cli" : "gemini-cli";
   const context = compileContext(projectId, intent, historyLength, backend);
-  const systemPrompt = context.full;
+  const basePrompt = systemPromptOverride || context.full;
+  const systemPrompt = escalationHint ? `${basePrompt}\n\n${escalationHint}` : basePrompt;
 
   const home = os.homedir();
   const paneDir = path.join(home, ".pane");
@@ -877,6 +944,8 @@ async function handleSpawn({
       model,
       systemPrompt,
       mcpServerDest,
+      tools,
+      maxTurns,
     });
   } else {
     await handleGeminiSpawn({
@@ -884,6 +953,7 @@ async function handleSpawn({
       requestId,
       prompt,
       workingDir,
+      sessionId,
       model,
       systemPrompt,
       history,

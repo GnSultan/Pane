@@ -56,16 +56,12 @@ function App() {
   const fuzzyFinderOpen = useWorkspaceStore((s) => s.fuzzyFinderOpen);
   const toggleFileSearch = useWorkspaceStore((s) => s.toggleFileSearch);
   const fileSearchOpen = useWorkspaceStore((s) => s.fileSearchOpen);
-  const toggleMind = () => useWorkspaceStore.getState().toggleOverlay("mind");
+  const toggleMind = () => {
+    const { activeProjectId, setMode } = useProjectsStore.getState();
+    if (activeProjectId) setMode(activeProjectId, "mind");
+  };
 
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
-
-  const claudeUpdateState = useWorkspaceStore((s) => s.claudeUpdateState);
-  const triggerClaudeUpdate = useWorkspaceStore((s) => s.triggerClaudeUpdate);
-  const geminiUpdateState = useWorkspaceStore((s) => s.geminiUpdateState);
-  const triggerGeminiUpdate = useWorkspaceStore((s) => s.triggerGeminiUpdate);
-
-  const showUpdate = !!claudeUpdateState || !!geminiUpdateState;
 
   useFileWatcher();
   useGitStatus();
@@ -73,7 +69,6 @@ function App() {
 
   // Check for updates and fetch models on app launch
   useEffect(() => {
-    useWorkspaceStore.getState().checkForClaudeUpdate();
     useWorkspaceStore.getState().checkForGeminiUpdate();
     
     // Initial fetch of models (cached or background)
@@ -183,9 +178,11 @@ function App() {
           }
           break;
         }
-        case "settings":
-          useWorkspaceStore.getState().toggleOverlay("profile");
+        case "settings": {
+          const { activeProjectId, setMode } = useProjectsStore.getState();
+          if (activeProjectId) setMode(activeProjectId, "profile");
           break;
+        }
         case "cycle-theme":
           useWorkspaceStore.getState().toggleTheme();
           break;
@@ -329,84 +326,6 @@ function App() {
           </>
         )}
         <div className="flex-1 min-w-0 pr-2 h-full relative">
-          {/* Update notification bar — positioned absolutely within workspace area */}
-          {showUpdate && (
-            <div className="absolute top-0 left-0 right-0 h-9 flex items-center justify-end px-4 z-40 pointer-events-none gap-2">
-              {/* Claude Update Pill */}
-              {claudeUpdateState && (
-                <div
-                  data-no-drag
-                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown"
-                >
-                  {claudeUpdateState === "available" && (
-                    <button
-                      onClick={() => triggerClaudeUpdate()}
-                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
-                      claude update available
-                    </button>
-                  )}
-                  {claudeUpdateState === "updating" && (
-                    <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
-                      installing claude...
-                    </span>
-                  )}
-                  {claudeUpdateState === "updated" && (
-                    <span className="text-[11px] font-mono text-pane-status-added">
-                      claude complete
-                    </span>
-                  )}
-                  {claudeUpdateState === "restart" && (
-                    <button
-                      onClick={() => window.location.reload()}
-                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
-                      restart claude
-                    </button>
-                  )}
-                </div>
-              )}
-
-              {/* Gemini Update Pill */}
-              {geminiUpdateState && (
-                <div
-                  data-no-drag
-                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown"
-                >
-                  {geminiUpdateState === "available" && (
-                    <button
-                      onClick={() => triggerGeminiUpdate()}
-                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
-                      gemini update available
-                    </button>
-                  )}
-                  {geminiUpdateState === "updating" && (
-                    <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
-                      installing gemini...
-                    </span>
-                  )}
-                  {geminiUpdateState === "updated" && (
-                    <span className="text-[11px] font-mono text-pane-status-added">
-                      gemini complete
-                    </span>
-                  )}
-                  {geminiUpdateState === "restart" && (
-                    <button
-                      onClick={() => window.location.reload()}
-                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
-                      restart gemini
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
           <Workspace />
         </div>
       </div>

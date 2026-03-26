@@ -87,7 +87,7 @@ function includesKeyword(prompt: string, keywords: string[]): boolean {
 }
 
 export function inferAgentIntent(ctx: RoutingContext): AgentIntent {
-  const { prompt, conversation } = ctx;
+  const { prompt } = ctx;
   const trimmed = prompt.trim();
 
   // 1. Explicit overrides
@@ -100,12 +100,7 @@ export function inferAgentIntent(ctx: RoutingContext): AgentIntent {
     return "execute";
   }
 
-  // 3. State-aware inference: if we are waiting for plan approval, short prompts are likely "execute"
-  if (conversation.pendingPlanApproval && trimmed.length < 20) {
-    return "execute";
-  }
-
-  // 4. Keyword matching
+  // 3. Keyword matching
   if (includesKeyword(prompt, EXPLAIN_KEYWORDS)) return "explain";
   if (includesKeyword(prompt, PLAN_KEYWORDS)) return "plan";
   if (includesKeyword(prompt, EXECUTE_KEYWORDS)) return "execute";

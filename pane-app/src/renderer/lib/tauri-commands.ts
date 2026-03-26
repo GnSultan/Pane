@@ -137,6 +137,7 @@ export interface ProjectSessionState {
     string,
     { scrollTop: number; cursor: { row: number; column: number } }
   >;
+  name?: string;
 }
 
 import type { BackendRouting } from "./models";
@@ -179,6 +180,20 @@ export async function saveSettings(settings: UserSettings): Promise<void> {
 
 // Punk engine process management
 
+export interface SendToPunkOptions {
+  intent?: string;
+  history?: ConversationMessage[];
+  thinking?: boolean;
+  provider?: string;
+  todos?: Todo[];
+  autoRoute?: boolean;
+  // Mind chat overrides — when projectId starts with "mind:", these control behavior
+  systemPromptOverride?: string;
+  _systemOverride?: boolean;
+  tools?: string[];
+  maxTurns?: number;
+}
+
 export async function sendToPunk(
   projectId: string,
   prompt: string,
@@ -186,15 +201,43 @@ export async function sendToPunk(
   sessionId: string | null,
   model: string | null,
   onEvent: (event: PunkStreamEvent) => void,
-  intent?: string,
+  intentOrOptions?: string | SendToPunkOptions,
   history?: ConversationMessage[],
   thinking?: boolean,
   provider?: string,
   todos?: Todo[],
+  autoRoute?: boolean,
 ): Promise<void> {
+  // Support both old positional args and new options object
+  let opts: SendToPunkOptions;
+  if (typeof intentOrOptions === 'object' && intentOrOptions !== null && !Array.isArray(intentOrOptions)) {
+    opts = intentOrOptions;
+  } else {
+    opts = {
+      intent: intentOrOptions as string | undefined,
+      history,
+      thinking,
+      provider,
+      todos,
+      autoRoute,
+    };
+  }
+
   const requestId = Math.random().toString(36).slice(2, 11);
-  // Self-cleaning listener — stays active until processEnded or error
+  // Self-cleaning listener — stays active until processEnded/error (or
+  // orchestration_complete/orchestration_error when orchestration is active).
   let cleanup: (() => void) | null = null;
+  // During orchestration, processEnded fires after each internal spawn
+  // (planning, each execution step). We must NOT close the listener on those
+  // mid-orchestration processEnded events — only on the final terminal event.
+  let orchestrationActive = false;
+
+  const closeListener = () => {
+    draining = false;
+    port1.close();
+    port2.close();
+    setTimeout(() => cleanup?.(), 0);
+  };
 
   // MessageChannel-based event yielding — same technique React's scheduler uses.
   // Instead of processing all IPC events synchronously (starving clicks/inputs),
@@ -226,14 +269,27 @@ export async function sendToPunk(
     while (queue.length > 0) {
       const event = queue.shift()!;
       onEvent(event);
+
+      // Track orchestration lifecycle so we know which processEnded is truly terminal.
+      if (event.event === "orchestration_start") orchestrationActive = true;
+      if (event.event === "orchestration_complete" || event.event === "orchestration_error") {
+        orchestrationActive = false;
+      }
+
       // Terminal events: clean up after processing, don't schedule another drain.
-      if (event.event === "processEnded" || event.event === "error") {
-        draining = false;
-        port1.close();
-        port2.close();
-        setTimeout(() => cleanup?.(), 0);
+      // During orchestration, processEnded fires after each internal spawn — ignore those.
+      // Only close when orchestration itself ends, or on a top-level processEnded/error.
+      const isTerminal =
+        event.event === "error" ||
+        event.event === "orchestration_complete" ||
+        event.event === "orchestration_error" ||
+        (event.event === "processEnded" && !orchestrationActive);
+
+      if (isTerminal) {
+        closeListener();
         return;
       }
+
       // Yield to the browser if we've used up our time budget.
       if (performance.now() >= deadline) break;
     }
@@ -268,12 +324,18 @@ export async function sendToPunk(
       workingDir,
       sessionId,
       model,
-      intent,
-      history,
+      intent: opts.intent,
+      history: opts.history,
       requestId,
-      thinking,
-      provider,
-      todos,
+      thinking: opts.thinking,
+      provider: opts.provider,
+      todos: opts.todos,
+      autoRoute: opts.autoRoute,
+      // Mind chat overrides — forwarded when present
+      ...(opts.systemPromptOverride ? { systemPromptOverride: opts.systemPromptOverride } : {}),
+      ...(opts._systemOverride ? { _systemOverride: opts._systemOverride } : {}),
+      ...(opts.tools ? { tools: opts.tools } : {}),
+      ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
     });
   } catch (err) {
     port1.close();
@@ -285,14 +347,6 @@ export async function sendToPunk(
 
 export async function abortPunk(projectId: string): Promise<void> {
   return electronAPI.invoke("abort_punk", { projectId });
-}
-
-export async function approvePlan(projectId: string): Promise<void> {
-  return electronAPI.invoke("approve_plan", { projectId });
-}
-
-export async function rejectPlan(projectId: string): Promise<void> {
-  return electronAPI.invoke("reject_plan", { projectId });
 }
 
 export async function terminatePunkSession(projectId: string): Promise<void> {
@@ -394,29 +448,8 @@ export interface ClaudeVersionInfo {
   error: string | null;
 }
 
-export interface ClaudeUpdateInfo {
-  updateAvailable: boolean;
-  currentVersion: string | null;
-  newVersion: string | null;
-  error: string | null;
-}
-
-export interface ClaudeUpdateResult {
-  success: boolean;
-  output: string;
-  error: string | null;
-}
-
 export async function checkClaudeVersion(): Promise<ClaudeVersionInfo> {
   return electronAPI.invoke("check_claude_version");
-}
-
-export async function checkClaudeUpdate(): Promise<ClaudeUpdateInfo> {
-  return electronAPI.invoke("check_claude_update");
-}
-
-export async function updateClaude(): Promise<ClaudeUpdateResult> {
-  return electronAPI.invoke("update_claude");
 }
 
 // Gemini process management
@@ -675,6 +708,10 @@ export async function readBrief(projectId: string): Promise<string> {
   return electronAPI.invoke("read_brief", { projectId });
 }
 
+export async function getProjectWhy(projectId: string): Promise<string | null> {
+  return electronAPI.invoke("get_project_why", { projectId });
+}
+
 export async function extractPreferencesFromTurn(
   turnText: string,
 ): Promise<void> {
@@ -861,8 +898,9 @@ export interface MindEntry {
 
 export async function brainMindAdd(
   content: string,
+  projectId?: string,
 ): Promise<{ entry: MindEntry }> {
-  return electronAPI.invoke("brain_mind_add", { content });
+  return electronAPI.invoke("brain_mind_add", { content, projectId });
 }
 
 export async function brainMindGetAll(): Promise<{ entries: MindEntry[] }> {
@@ -879,6 +917,145 @@ export async function brainMindUpdate(
 
 export async function brainMindDelete(id: string): Promise<{ id: string }> {
   return electronAPI.invoke("brain_mind_delete", { id });
+}
+
+// --- Mind Threads ---
+
+export interface MindThread {
+  id: string;
+  entry_id: string;
+  session_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MindTurn {
+  id: string;
+  thread_id: string;
+  role: string;
+  content_json: string;
+  timestamp: string;
+}
+
+export async function mindThreadCreate(
+  entryId: string,
+): Promise<{ thread: MindThread }> {
+  return electronAPI.invoke("brain_mind_thread_create", { entryId });
+}
+
+export async function mindThreadGet(
+  entryId: string,
+): Promise<{ thread: MindThread | null; turns: MindTurn[] }> {
+  return electronAPI.invoke("brain_mind_thread_get", { entryId });
+}
+
+export async function mindThreadListEntryIds(): Promise<{ entryIds: string[] }> {
+  return electronAPI.invoke("brain_mind_thread_list_entry_ids");
+}
+
+export async function mindThreadAddTurn(
+  threadId: string,
+  role: string,
+  contentJson: string,
+): Promise<{ turn: MindTurn }> {
+  return electronAPI.invoke("brain_mind_thread_add_turn", {
+    threadId,
+    role,
+    contentJson,
+  });
+}
+
+export async function mindThreadSetSession(threadId: string, sessionId: string): Promise<void> {
+  return electronAPI.invoke("brain_mind_thread_set_session", { threadId, sessionId });
+}
+
+export async function mindThreadDelete(id: string): Promise<{ id: string }> {
+  return electronAPI.invoke("brain_mind_thread_delete", { id });
+}
+
+export async function sendToMind(
+  threadId: string,
+  prompt: string,
+  workingDir: string,
+  sessionId: string | null,
+  model: string | null,
+  entryContent: string,
+  onEvent: (event: PunkStreamEvent) => void,
+): Promise<void> {
+  const requestId = Math.random().toString(36).slice(2, 11);
+  let cleanup: (() => void) | null = null;
+
+  const closeListener = () => {
+    draining = false;
+    port1.close();
+    port2.close();
+    setTimeout(() => cleanup?.(), 0);
+  };
+
+  const queue: PunkStreamEvent[] = [];
+  let draining = false;
+  const { port1, port2 } = new MessageChannel();
+
+  port2.onmessage = () => {
+    if (queue.length === 0) {
+      draining = false;
+      return;
+    }
+
+    const BUDGET_MS = 4;
+    const deadline = performance.now() + BUDGET_MS;
+
+    while (queue.length > 0) {
+      const event = queue.shift()!;
+      onEvent(event);
+
+      const isTerminal =
+        event.event === "error" || event.event === "processEnded";
+
+      if (isTerminal) {
+        closeListener();
+        return;
+      }
+
+      if (performance.now() >= deadline) break;
+    }
+
+    if (queue.length > 0) port1.postMessage(null);
+    else draining = false;
+  };
+
+  cleanup = electronAPI.on(
+    `punk-stream:mind:${threadId}`,
+    (event: PunkStreamEvent) => {
+      if (event.requestId && event.requestId !== requestId) return;
+      queue.push(event);
+      if (!draining) {
+        draining = true;
+        port1.postMessage(null);
+      }
+    },
+  );
+
+  try {
+    await electronAPI.invoke("send_to_mind", {
+      threadId,
+      prompt,
+      workingDir,
+      sessionId,
+      model,
+      requestId,
+      entryContent,
+    });
+  } catch (err) {
+    port1.close();
+    port2.close();
+    cleanup?.();
+    throw err;
+  }
+}
+
+export async function abortMind(threadId: string): Promise<void> {
+  return electronAPI.invoke("abort_mind", { threadId });
 }
 
 // --- Session Context ---
@@ -924,4 +1101,59 @@ export async function sessionReadState(
   projectId: string,
 ): Promise<SessionState | null> {
   return electronAPI.invoke("session_read_state", { projectId });
+}
+
+// ---------------------------------------------------------------------------
+// Pane Cloud
+// ---------------------------------------------------------------------------
+
+export interface CloudUser {
+  github_login: string;
+  github_id: number;
+  avatar_url: string | null;
+  logged_in: boolean;
+}
+
+export interface CloudStatus {
+  last_backup: string | null;
+  storage_bytes: number;
+  storage_mb: number;
+  backup_count: number;
+}
+
+export interface CloudBackupEntry {
+  id: string;
+  size_bytes: number;
+  checksum: string;
+  device_name: string | null;
+  app_version: string | null;
+  created_at: string;
+}
+
+export async function cloudLogin(): Promise<CloudUser | null> {
+  return electronAPI.invoke("cloud_login");
+}
+
+export async function cloudLogout(): Promise<void> {
+  return electronAPI.invoke("cloud_logout");
+}
+
+export async function cloudGetUser(): Promise<CloudUser | null> {
+  return electronAPI.invoke("cloud_get_user");
+}
+
+export async function cloudGetStatus(): Promise<CloudStatus | null> {
+  return electronAPI.invoke("cloud_get_status");
+}
+
+export async function cloudTriggerBackup(): Promise<{ backup_id: string; size_bytes: number }> {
+  return electronAPI.invoke("cloud_trigger_backup");
+}
+
+export async function cloudRestore(): Promise<{ backup_id: string; created_at: string }> {
+  return electronAPI.invoke("cloud_restore");
+}
+
+export async function cloudListBackups(): Promise<{ backups: CloudBackupEntry[] }> {
+  return electronAPI.invoke("cloud_list_backups");
 }

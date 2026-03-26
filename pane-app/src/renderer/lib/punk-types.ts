@@ -71,21 +71,24 @@ export interface StrategyBlock {
   reasoning: "shallow" | "deep";
   verification: "none" | "diff" | "test";
   confidence: number;
-  reason: string;
+  reason: string | null;
   signals: StrategySignal[];
   // routing fields (mirrored from strategy event for display)
   intent: string;
   provider: string;
   model: string;
   thinking: boolean;
-  // oracle fields
-  oracleUsed?: boolean;
-  oracleConfidence?: number | null;
-  oracleExploring?: boolean;
-  // local intelligence fields (Qwen — sole classifier, null only on slash overrides)
+  // classifier routing fields
+  classifierRouted?: boolean;
+  classifierConfidence?: number | null;
+  classifierExploring?: boolean;
+  // classifier fields (null only on slash overrides or no API key)
   localTaskType: string | null;
   localComplexity: string | null;
   localAtomHints: string[];
+  // escalation fields (present when struggle detected)
+  escalationLevel?: number;
+  struggleCount?: number;
 }
 
 export type ContentBlock =
@@ -207,9 +210,9 @@ export interface PunkEventStrategy {
     provider: string;
     model: string;
     thinking: boolean;
-    oracleUsed?: boolean;
-    oracleConfidence?: number | null;
-    oracleExploring?: boolean;
+    classifierRouted?: boolean;
+    classifierConfidence?: number | null;
+    classifierExploring?: boolean;
   };
 }
 
@@ -268,6 +271,8 @@ export interface OrchestrationPlanEvent {
   event: "orchestration_plan";
   data: {
     summary: string;
+    humanBrief?: string;
+    humanTasks?: string[];
     steps: { index: number; action: string; type: string; files: string[] }[];
     totalSteps: number;
     planId?: string;
@@ -340,7 +345,7 @@ export interface OrchestrationErrorEvent {
 export interface OrchestrationPhaseEvent {
   event: "orchestration_phase";
   data: {
-    phase: "discovery" | "planning" | "execution";
+    phase: "discovery" | "planning" | "executing" | "validating" | "replanning" | "execution";
     model?: string;
     provider?: string;
   };
@@ -398,9 +403,18 @@ export interface PlanStep {
   files: string[];
 }
 
+export interface PlanBrief {
+  what: string;                 // what's being built and why — full context, 2-3 sentences
+  architecture: string;         // how the pieces connect, key design decisions, data flow
+  created: { file: string; purpose: string }[];   // new files with what each one does
+  modified: { file: string; change: string }[];   // existing files with specific change
+  result: string;               // what the user experiences when done
+}
+
 export interface PlanData {
   id: string;
   task: string;
+  brief?: PlanBrief | string | null;
   steps: PlanStep[];
   planningModel?: string | null;
   executionModel?: string | null;
@@ -422,6 +436,8 @@ export interface ConversationMessage {
   checkpointId?: string;
   // Present when type === "plan"
   planData?: PlanData;
+  // Present on worker-generated turns (bug, reflection, sentinel)
+  workerType?: string;
 }
 
 // File checkpoint types
@@ -449,12 +465,11 @@ export interface ConversationState {
   serviceTier: string | null;
   isProcessing: boolean;
   isPlanning: boolean;
-  phase: "idle" | "discovery" | "planning" | "execution"; // Current orchestration phase
+  phase: "idle" | "discovery" | "planning" | "executing" | "validating" | "replanning" | "execution"; // Current orchestration phase
 
   isRestored: boolean; // true once loaded from disk at startup
   error: string | null;
   todos: Todo[];
-  pendingPlanApproval: boolean;
   // Session lifecycle
   isProcessActive: boolean; // Is the Claude CLI child process currently running?
   lastActivity: number; // Timestamp of last user interaction with this project
@@ -501,7 +516,6 @@ export function createEmptyConversation(): ConversationState {
     isRestored: false,
     error: null,
     todos: [],
-    pendingPlanApproval: false,
     isProcessActive: false,
     lastActivity: Date.now(),
     contextTokens: 0,

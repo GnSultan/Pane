@@ -394,6 +394,33 @@
   --pane-border-soft: rgba(192, 192, 192, 0.5);  /* In pure theme, this is 50% of the pure border */
 }
 
+/* Workspace page routing — single data-mode attribute drives all page visibility.
+   One DOM write → one style recalc → one composite → one paint frame. 120Hz clean.
+   ALL pages use pure z-index stacking — no visibility:hidden, ever.
+   visibility:hidden evicts layers from the GPU compositor; making them visible again
+   forces a rasterize-from-scratch, causing the faint "shift before it moves" artifact.
+   With z-index-only stacking every page stays warm in the compositor at all times.
+   content-visibility:hidden skips rasterization on inactive pages without evicting from
+   the compositor — no tile memory consumed, instant re-activation, 120Hz clean.
+   Conversation layers: z-index 0 (inactive) / 1 (active).
+   Non-conversation pages: z-index 0 (inactive) / 20 (active) — above conversations AND
+   the h-[50px] z-10 drag overlay so buttons/inputs aren't eaten by the drag region. */
+[data-page] {
+  pointer-events: none;
+  z-index: 0;
+  content-visibility: hidden;
+}
+[data-mode="viewer"] > [data-page="viewer"],
+[data-mode="terminal"] > [data-page="terminal"],
+[data-mode="git"] > [data-page="git"],
+[data-mode="mind"] > [data-page="mind"],
+[data-mode="profile"] > [data-page="profile"],
+[data-mode="history"] > [data-page="history"] {
+  pointer-events: auto;
+  z-index: 20;
+  content-visibility: visible;
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;

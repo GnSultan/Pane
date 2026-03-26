@@ -347,8 +347,8 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   if (shouldIncludeBrief) {
     try {
       brief = fs.readFileSync(path.join(MEMORY_DIR, projectId, "brief.md"), "utf-8").trim();
-      if (brief.length > 2500) {
-        const truncated = brief.slice(0, 2500);
+      if (brief.length > 4500) {
+        const truncated = brief.slice(0, 4500);
         const lastSection = truncated.lastIndexOf("\n###");
         brief = lastSection > 500 ? truncated.slice(0, lastSection) : truncated;
       }
@@ -358,6 +358,50 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   if (brief) {
     stableParts.push(brief);
     stableParts.push("");
+  }
+
+  // ── Project purpose (the "why") ───────────────────────────────────────────
+  // Per-project foundational context: what this project is trying to be, who
+  // it serves, what problem it solves. Captured once through exploration and
+  // stored at ~/.pane/memory/{projectId}/why.md.
+  //
+  // If present → stable layer, always injected. Gives every suggestion
+  // criteria to reason against.
+  //
+  // If absent and first turn → exploration directive in dynamic layer.
+  // Model asks conversational questions, calls pane_set_why when it has enough,
+  // then answers the original message with that context applied.
+  //
+  // Skip for mind: threads — those are thought journals, not code projects.
+  if (!projectId.startsWith("mind:")) {
+    let projectWhy = "";
+    try {
+      projectWhy = fs.readFileSync(path.join(MEMORY_DIR, projectId, "why.md"), "utf-8").trim();
+    } catch {}
+
+    if (projectWhy) {
+      stableParts.push("## Project Purpose");
+      stableParts.push(projectWhy);
+      stableParts.push("Treat this as active criteria, not background. When suggesting approaches or evaluating trade-offs, reason against this purpose — name tensions when something conflicts, and use it as a tie-breaker when alternatives are close. If a request would move the project away from this purpose, say so.");
+      stableParts.push("");
+    } else if (historyLength < 4) {
+      // No why yet and conversation is still early — enter exploration mode.
+      // This fires on any project without a why.md, not just brand-new ones.
+      dynamicParts.push([
+        "This project has no recorded purpose. Before answering, understand what it is trying to be.",
+        "",
+        "Ask one question at a time — start with: what is this project, and what problem does it solve? Follow the thread naturally: who is it for, where is it headed, what it deliberately isn't. Three solid answers is enough.",
+        "",
+        "Once you have a clear picture, call pane_set_why with a concise synthesis (2-4 sentences), then answer the original message with that context.",
+        "",
+        "If the first message is urgent (crash, broken build, critical bug), answer it first — explore purpose on the next turn.",
+      ].join("\n"));
+      dynamicParts.push("");
+    } else {
+      // Deeper into a conversation with no why — don't interrupt, just remind.
+      dynamicParts.push("Note: This project has no recorded purpose yet. If a natural opening arises, ask about the project's goals and call pane_set_why to record them.");
+      dynamicParts.push("");
+    }
   }
 
   // ── Codebase map: every indexed file with a one-line description ──────────
@@ -551,6 +595,15 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   if (memories.length > 0) {
     dynamicParts.push("Relevant context from prior work:");
     for (const mem of memories) dynamicParts.push(`- ${mem.content}`);
+    dynamicParts.push("");
+  }
+
+  // Extracted principles: standing project standards identified from past exchanges.
+  // Separate from general memories — these are active criteria, not historical observations.
+  const principles = (brainCtx.principles || []);
+  if (principles.length > 0) {
+    dynamicParts.push("Active project standards (extracted from how you work on this project — apply when relevant):");
+    for (const p of principles) dynamicParts.push(`- ${p.content}`);
     dynamicParts.push("");
   }
 

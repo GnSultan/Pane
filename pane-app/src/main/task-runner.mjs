@@ -42,7 +42,7 @@ const PANE_DIR = path.join(os.homedir(), ".pane");
  * @param {string} raw
  * @returns {string}
  */
-function extractJson(raw) {
+export function extractJson(raw) {
   if (!raw) throw new Error("Empty response from planning call");
   // Strip markdown code fences first (```json ... ``` or ``` ... ```)
   const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -50,11 +50,18 @@ function extractJson(raw) {
   // Find first { ... } block spanning the whole object
   const start = raw.indexOf("{");
   if (start === -1) throw new Error("No JSON object found in planning response");
-  // Walk to find matching closing brace
+  // Walk to find matching closing brace — track strings to ignore braces inside them
   let depth = 0;
+  let inString = false;
+  let escape = false;
   for (let i = start; i < raw.length; i++) {
-    if (raw[i] === "{") depth++;
-    else if (raw[i] === "}") { depth--; if (depth === 0) return raw.slice(start, i + 1); }
+    const ch = raw[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === "\"") { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}") { depth--; if (depth === 0) return raw.slice(start, i + 1); }
   }
   // No balanced close — return from start to end and let JSON.parse report the error
   return raw.slice(start);
@@ -231,7 +238,7 @@ async function runTypeCheck(workingDir) {
 // Planning Prompt
 // ---------------------------------------------------------------------------
 
-const PLANNING_SYSTEM_PROMPT = `You are writing an execution script for a coding model. This is not a plan or a guide — it is a precise, ordered sequence of instructions that a model will execute one at a time, with no human intervention between steps.
+export const PLANNING_SYSTEM_PROMPT = `You are writing an execution script for a coding model. This is not a plan or a guide — it is a precise, ordered sequence of instructions that a model will execute one at a time, with no human intervention between steps.
 
 The model executing your script has read_file, write_file, and run_command tools. It has no memory of previous turns. Each step is a complete, self-contained job card.
 
@@ -689,7 +696,7 @@ export class TaskRunner {
         }
 
         // ── Read changes that occurred DURING this step ────────────────────
-        const stepChanges = await getChangesSince(projectId, changeCursor);
+        let stepChanges = await getChangesSince(projectId, changeCursor);
         const stepChangeIds = stepChanges.map(c => c.id);
         allStepChangeIds.push(...stepChangeIds);
 
@@ -786,7 +793,7 @@ export class TaskRunner {
               request,
             );
 
-            const retryChanges = await getChangesSince(projectId, retryCursor);
+            let retryChanges = await getChangesSince(projectId, retryCursor);
             const retryVerification = verifyStepResult(step, retryChanges, retryResult.messages || []);
             const retryChangeIds = retryChanges.map(c => c.id);
             allStepChangeIds.push(...retryChangeIds);

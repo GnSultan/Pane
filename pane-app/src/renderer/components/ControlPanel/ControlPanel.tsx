@@ -1,7 +1,8 @@
-import { useState, useCallback, useEffect, type ReactNode } from "react";
+import { useState, useCallback, useEffect, useMemo, type ReactNode } from "react";
 import { ProjectList } from "./ProjectList";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
+import { useMindStore } from "../../stores/mind";
 
 // --- Inline SVG icons (16x16, outlined) ---
 // Pane design language: panel forms, 1.5px stroke, rx="2" matches button radius
@@ -145,6 +146,51 @@ function ToolbarButton({ icon, active, disabled, onClick, tooltip }: {
   );
 }
 
+// --- Thought Conversations (replaces thread list when in mind chat) ---
+
+function ThoughtConversations() {
+  const chatEntryId = useMindStore((s) => s.chatEntryId);
+  const entries = useMindStore((s) => s.entries);
+  const threadEntryIds = useMindStore((s) => s.threadEntryIds);
+  const setChatEntryId = useMindStore((s) => s.setChatEntryId);
+
+  // Stable sort by date — entries never jump positions when switching
+  const thoughtEntries = useMemo(() => {
+    return entries
+      .filter((e) => threadEntryIds.has(e.id) || e.id === chatEntryId)
+      .sort(
+        (a, b) =>
+          new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+      );
+  }, [entries, chatEntryId, threadEntryIds]);
+
+  const label = (content: string) =>
+    (content.split("\n")[0] ?? "").slice(0, 48) || "untitled thought";
+
+  return (
+    <div>
+      {thoughtEntries.map((entry) => {
+        const isActive = entry.id === chatEntryId;
+        return (
+          <button
+            key={entry.id}
+            onClick={() => setChatEntryId(isActive ? null : entry.id)}
+            title={entry.content}
+            className={`w-full flex items-center gap-1.5 h-8 px-2 truncate btn-press ${
+              isActive
+                ? "bg-pane-text/[0.08] rounded-xl text-pane-text"
+                : "text-pane-text-secondary hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40 hover:rounded-xl hover:text-pane-text"
+            }`}
+            style={{ fontSize: "var(--pane-panel-font-size)" }}
+          >
+            <span className="truncate flex-1 text-left">{label(entry.content)}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // --- ControlPanel ---
 
 export function ControlPanel() {
@@ -155,12 +201,11 @@ export function ControlPanel() {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
   });
+  const mindChatActive = useMindStore((s) => s.chatEntryId !== null);
   const isGitRepo = useProjectsStore((s) => {
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.git.isGitRepo ?? false;
   });
-  const overlay = useWorkspaceStore((s) => s.overlay);
-
   // If we're somehow in git mode but the project isn't a git repo, go to conversation
   useEffect(() => {
     if (mode === "git" && !isGitRepo && activeProjectId) {
@@ -168,21 +213,15 @@ export function ControlPanel() {
     }
   }, [isGitRepo, mode, activeProjectId]);
 
-  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal" | "git") => {
+  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history") => {
     if (!activeProjectId) return;
-    const ws = useWorkspaceStore.getState();
-    // Close any overlay first — clicking a space always navigates to it
-    if (ws.overlay !== null) {
-      ws.setOverlay(null);
-      if (mode === newMode) return; // overlay was covering this mode, just close it
-    }
     if (mode === newMode) return;
     setMode(activeProjectId, newMode);
-    if (newMode === "conversation") {
-      window.dispatchEvent(new CustomEvent("pane:focus-input"));
-    } else if (newMode === "viewer") {
-      window.dispatchEvent(new CustomEvent("pane:focus-editor"));
-    }
+    // Defer focus until after React has committed the DOM change and removed
+    // display:none from the target panel. Focusing inside display:none is a
+    // no-op in Chromium — the rAF fires after the browser's layout pass.
+    if (newMode === "conversation") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-input")));
+    else if (newMode === "viewer") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-editor")));
   }, [activeProjectId, mode, setMode]);
 
   return (
@@ -194,9 +233,13 @@ export function ControlPanel() {
       {/* Spacer for macOS traffic lights — enough room so they sit inside the panel */}
       <div className="h-12 shrink-0" />
 
-      {/* Thread list — fills available space between traffic lights and toolbar */}
+      {/* Thread list / thought conversations — fills available space between traffic lights and toolbar */}
       <div className="flex-1 min-h-0 overflow-y-auto py-2">
-        <ProjectList />
+        {mode === "mind" && mindChatActive ? (
+          <ThoughtConversations />
+        ) : (
+          <ProjectList />
+        )}
       </div>
 
       {/* Toolbar */}
@@ -222,7 +265,7 @@ export function ControlPanel() {
           <ToolbarButton
             icon={<GitIcon />}
             active={mode === "git"}
-            onClick={() => handleSetMode(mode === "git" ? "conversation" : "git")}
+            onClick={() => handleSetMode("git")}
             tooltip="Git"
           />
         )}
@@ -234,21 +277,21 @@ export function ControlPanel() {
         />
         <ToolbarButton
           icon={<ChangeHistoryIcon />}
-          active={overlay === "history"}
-          onClick={() => useWorkspaceStore.getState().setOverlay("history")}
+          active={mode === "history"}
+          onClick={() => handleSetMode("history")}
           tooltip="History"
         />
         <div className="ml-auto flex items-center gap-0.5">
           <ToolbarButton
             icon={<MindIcon />}
-            active={overlay === "mind"}
-            onClick={() => useWorkspaceStore.getState().setOverlay("mind")}
+            active={mode === "mind"}
+            onClick={() => handleSetMode("mind")}
             tooltip="Mind"
           />
           <ToolbarButton
             icon={<ProfileIcon />}
-            active={overlay === "profile"}
-            onClick={() => useWorkspaceStore.getState().setOverlay("profile")}
+            active={mode === "profile"}
+            onClick={() => handleSetMode("profile")}
             tooltip="Profile"
           />
         </div>

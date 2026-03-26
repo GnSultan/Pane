@@ -176,6 +176,17 @@ async function runBackup() {
 
   // Rotate after successful backup
   await rotate();
+
+  // Push to Pane Cloud if logged in
+  try {
+    const { isLoggedIn } = await import("./cloud-auth.mjs");
+    if (isLoggedIn()) {
+      const { uploadBackup } = await import("./cloud-sync.mjs");
+      await uploadBackup(dest);
+    }
+  } catch (err) {
+    console.warn("[backup] cloud upload failed (non-fatal):", err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------

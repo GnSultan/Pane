@@ -55,9 +55,13 @@ export const DEFAULT_CLAUDE_CLI_ROUTING: IntentRouting = {
 };
 
 export const DEFAULT_BACKEND_ROUTING: BackendRouting = {
+  api: DEFAULT_HTTP_ROUTING,
+  "claude-code": DEFAULT_CLAUDE_CLI_ROUTING,
+  "gemini": DEFAULT_GEMINI_CLI_ROUTING,
+  // Legacy keys — backward compat for stored settings
   http: DEFAULT_HTTP_ROUTING,
-  "gemini-cli": DEFAULT_GEMINI_CLI_ROUTING,
   "claude-cli": DEFAULT_CLAUDE_CLI_ROUTING,
+  "gemini-cli": DEFAULT_GEMINI_CLI_ROUTING,
 };
 
 // Deprecated — use DEFAULT_BACKEND_ROUTING instead

@@ -1,14 +1,13 @@
 {
   "name": "pane",
-  "version": "0.4.3",
-  "type": "module",
+  "version": "0.4.5",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
   "author": "Aslam Abdul",
   "license": "MIT",
   "scripts": {
-    "dev": "node scripts/dev.js",
-    "build": "electron-vite build && node scripts/copy-compiled.js",
+    "dev": "node scripts/dev.mjs",
+    "build": "electron-vite build && node scripts/copy-compiled.mjs",
     "preview": "electron-vite preview",
     "build:mac": "npm run build && electron-builder --mac --arm64 && npm run version:patch",
     "build:all": "npm run build && electron-builder --mac --arm64 --x64",
@@ -29,6 +28,14 @@
           "target": "dmg",
           "arch": [
             "arm64"
+          ]
+        }
+      ],
+      "protocols": [
+        {
+          "name": "Pane",
+          "schemes": [
+            "pane"
           ]
         }
       ]
@@ -57,9 +64,14 @@
       "src/main/session-context.mjs",
       "src/main/tool-executor.mjs",
       "src/main/classify-intent.mjs",
-      "src/main/local-intelligence.mjs",
+      "src/main/intent-classifier.mjs",
+      "src/main/planning-agent.mjs",
       "src/main/punk-backend.mjs",
       "src/main/task-runner.mjs",
+      "src/main/backup-engine.mjs",
+      "src/main/cloud-auth.mjs",
+      "src/main/cloud-crypto.mjs",
+      "src/main/cloud-sync.mjs",
       "src/preload/preload.mjs",
       "package.json"
     ],

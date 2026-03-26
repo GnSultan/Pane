@@ -24,8 +24,9 @@ export interface ProjectFileIndex {
 
 export interface TerminalTab {
   id: string; // doubles as ptyId
-  title: string; // "zsh", "zsh (2)", etc.
+  title: string; // display label (path)
   isAlive: boolean; // false after PTY exit
+  cwd?: string; // current working directory, updated as user navigates
 }
 
 export interface Project {
@@ -38,7 +39,7 @@ export interface Project {
   selectedPath: string | null;
   activeFilePath: string | null;
   activeFileContent: string | null;
-  mode: "conversation" | "viewer" | "terminal" | "git";
+  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history";
   conversation: ConversationState;
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
@@ -97,6 +98,7 @@ interface ProjectsState {
   // Project lifecycle
   addProject: (root: string) => string; // returns project ID
   removeProject: (id: string) => void;
+  renameProject: (id: string, name: string) => void;
   setActiveProject: (id: string) => void;
 
   // Active project helpers
@@ -129,7 +131,7 @@ interface ProjectsState {
   // Per-project mode
   setMode: (
     projectId: string,
-    mode: "conversation" | "viewer" | "terminal" | "git",
+    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history",
   ) => void;
   toggleMode: (projectId: string) => void;
 
@@ -155,6 +157,7 @@ interface ProjectsState {
     message: ConversationMessage,
   ) => void;
   removeLastConversationMessage: (projectId: string) => void;
+  removeConversationMessageById: (projectId: string, messageId: string) => void;
   updateMessageContent: (
     projectId: string,
     messageId: string,
@@ -197,7 +200,6 @@ interface ProjectsState {
     projectId: string,
     todos: import("../lib/punk-types").Todo[],
   ) => void;
-  setPendingPlanApproval: (projectId: string, pending: boolean) => void;
   setIsPlanning: (projectId: string, isPlanning: boolean) => void;
   setConversationPhase: (projectId: string, phase: import("../lib/punk-types").ConversationState["phase"]) => void;
   updateLastToolUseInput: (
@@ -225,6 +227,7 @@ interface ProjectsState {
   removeTerminalTab: (projectId: string, tabId: string) => void;
   setActiveTerminalTab: (projectId: string, tabId: string) => void;
   markTerminalTabDead: (projectId: string, tabId: string) => void;
+  updateTerminalTabCwd: (projectId: string, tabId: string, cwd: string) => void;
 
   // Checkpoints
   addCheckpoint: (projectId: string, meta: CheckpointMeta) => void;
@@ -272,6 +275,10 @@ function createProjectsStore() {
       return project.id;
     },
 
+    renameProject: (id: string, name: string) => {
+      set((state) => updateProject(state, id, () => ({ name: name.trim() || state.projects.get(id)?.name || "" })));
+    },
+
     removeProject: (id: string) => {
       const state = get();
       const next = new Map(state.projects);
@@ -299,12 +306,13 @@ function createProjectsStore() {
           ? state.projects.get(state.activeProjectId)
           : undefined;
         const carryMode = currentProject?.mode;
+        const isTransientMode = carryMode === "mind" || carryMode === "profile" || carryMode === "history";
 
         const updatedProjects = new Map(state.projects);
         const updatedProject = {
           ...project,
           hasUnreadCompletion: false,
-          ...(carryMode ? { mode: carryMode } : {}),
+          ...(carryMode && !isTransientMode ? { mode: carryMode } : {}),
         };
         updatedProjects.set(id, updatedProject);
         return { activeProjectId: id, projects: updatedProjects };
@@ -415,11 +423,11 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => {
           // Toggle between Chat and Viewer (file explorer / directory browser)
-          let nextMode: "conversation" | "viewer" | "terminal" | "git";
+          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history";
           if (p.mode === "conversation") {
             nextMode = "viewer";
           } else {
-            // From git, terminal, or viewer — always go back to conversation
+            // From git, terminal, viewer, mind, profile, or history — always go back to conversation
             nextMode = "conversation";
           }
           return { mode: nextMode };
@@ -501,6 +509,16 @@ function createProjectsStore() {
           conversation: {
             ...p.conversation,
             messages: p.conversation.messages.slice(0, -1),
+          },
+        })),
+      ),
+
+    removeConversationMessageById: (projectId, messageId) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: {
+            ...p.conversation,
+            messages: p.conversation.messages.filter((m) => m.id !== messageId),
           },
         })),
       ),
@@ -703,13 +721,6 @@ function createProjectsStore() {
         })),
       ),
 
-    setPendingPlanApproval: (projectId, pending) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, pendingPlanApproval: pending },
-        })),
-      ),
-
     setIsPlanning: (projectId, isPlanning) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -813,7 +824,6 @@ function createProjectsStore() {
             isRestored: true,
             error: null,
             todos: [],
-            pendingPlanApproval: false,
             isProcessActive: false,
             lastActivity: Date.now(),
             contextTokens: 0,
@@ -861,6 +871,15 @@ function createProjectsStore() {
         updateProject(state, projectId, (p) => ({
           terminalTabs: p.terminalTabs.map((t) =>
             t.id === tabId ? { ...t, isAlive: false } : t,
+          ),
+        })),
+      ),
+
+    updateTerminalTabCwd: (projectId, tabId, cwd) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          terminalTabs: p.terminalTabs.map((t) =>
+            t.id === tabId ? { ...t, cwd } : t,
           ),
         })),
       ),

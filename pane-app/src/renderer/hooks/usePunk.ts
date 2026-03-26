@@ -26,6 +26,7 @@ import {
   brainClearSessionPins,
   sessionMergeState,
   sessionClearState,
+  sessionReadState,
   extractPreferencesFromTurn,
 } from "../lib/tauri-commands";
 import type {
@@ -225,28 +226,14 @@ function flushTodos(projectId: string) {
 function flushTextDelta(projectId: string) {
   const state = getStreamingState(projectId);
   if (state.pendingTextDelta) {
-    // Bleed logic: release a portion of the buffer to create a smooth typewriter effect.
-    // If the buffer is large, we speed up slightly, but we always keep it calm.
-    const buffer = state.pendingTextDelta;
-    const len = buffer.length;
-
-    // Release between 1 and 4 characters per frame depending on buffer size.
-    // Capping at 4 ensures it never feels like a sudden jump.
-    const charsToRelease = Math.min(
-      len,
-      Math.max(1, Math.min(4, Math.floor(len / 8))),
-    );
-    const toFlush = buffer.slice(0, charsToRelease);
-    state.pendingTextDelta = buffer.slice(charsToRelease);
-
-    useProjectsStore.getState().appendToLastAssistantText(projectId, toFlush);
+    // Flush the full buffer in one shot per frame — no character-drip throttle.
+    // The typewriter bleed (1-4 chars/frame) caused visible lag: fast scrolls
+    // landed on empty space while the buffer slowly caught up (~1s delay in dev).
+    // Natural streaming cadence from the backend already produces smooth output.
+    useProjectsStore.getState().appendToLastAssistantText(projectId, state.pendingTextDelta);
+    state.pendingTextDelta = "";
   }
-
-  if (state.pendingTextDelta) {
-    state.textFlushRaf = requestAnimationFrame(() => flushTextDelta(projectId));
-  } else {
-    state.textFlushRaf = 0;
-  }
+  state.textFlushRaf = 0;
 }
 
 function resetStreamingState(projectId: string, flush = false) {
@@ -319,29 +306,12 @@ function resetStreamingState(projectId: string, flush = false) {
 function flushThinkingDelta(projectId: string) {
   const state = getStreamingState(projectId);
   if (state.pendingThinkingDelta) {
-    const buffer = state.pendingThinkingDelta;
-    const len = buffer.length;
-
-    // Thinking can bleed a bit faster than text, but still capped for calmness.
-    const charsToRelease = Math.min(
-      len,
-      Math.max(1, Math.min(6, Math.floor(len / 6))),
-    );
-    const toFlush = buffer.slice(0, charsToRelease);
-    state.pendingThinkingDelta = buffer.slice(charsToRelease);
-
     useProjectsStore
       .getState()
-      .appendToLastAssistantThinking(projectId, toFlush);
+      .appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
+    state.pendingThinkingDelta = "";
   }
-
-  if (state.pendingThinkingDelta) {
-    state.thinkingFlushRaf = requestAnimationFrame(() =>
-      flushThinkingDelta(projectId),
-    );
-  } else {
-    state.thinkingFlushRaf = 0;
-  }
+  state.thinkingFlushRaf = 0;
 }
 
 function fixPartialJson(s: string): string {
@@ -390,6 +360,7 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
 
   let lastError: string | null = null;
   let lastErrorTool: string | null = null;
+  let lastFix: string | null = null; // tracks most recent error_fix for causal linking
 
   for (const msg of turnMessages) {
     for (const block of msg.content) {
@@ -433,13 +404,15 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
         }
 
         if (lastError && lastErrorTool && tool.name === lastErrorTool) {
+          const fixContent = `Fixed: ${lastError.slice(0, 150)}`;
           events.push({
             type: "error_fix",
-            content: `Fixed: ${lastError.slice(0, 150)}`,
+            content: fixContent,
             timestamp: now,
             source: "auto",
             metadata: { original_error: lastError.slice(0, 200) },
           });
+          lastFix = fixContent; // track for causal linking to subsequent decisions
           lastError = null;
           lastErrorTool = null;
         }
@@ -520,7 +493,11 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
                   : decision,
               timestamp: now,
               source: "auto",
+              // Causal link: if a fix preceded this decision, tag it so the
+              // brain can create a "led-to" edge from the fix node → this node
+              ...(lastFix ? { metadata: { preceded_by_fix: lastFix.slice(0, 120) } } : {}),
             });
+            lastFix = null; // one fix → one decision; consume it
           }
           if (seenDecisions.size >= 5) break;
         }
@@ -567,7 +544,16 @@ function extractMemoryEvents(messages: ConversationMessage[]): MemoryEvent[] {
     }
   }
 
-  return events;
+  // Deduplicate events by type:content key (keep first occurrence)
+  const seenKeys = new Set<string>();
+  const deduped = events.filter((event) => {
+    const key = `${event.type}:${event.content}`;
+    if (seenKeys.has(key)) return false;
+    seenKeys.add(key);
+    return true;
+  });
+
+  return deduped;
 }
 
 /**
@@ -1007,12 +993,14 @@ export function usePunk(projectId: string) {
                 provider:         d.provider,
                 model:            d.model,
                 thinking:         d.thinking,
-                oracleUsed:       d.oracleUsed       ?? false,
-                oracleConfidence: d.oracleConfidence ?? null,
-                oracleExploring:  d.oracleExploring  ?? false,
+                classifierRouted:     d.classifierRouted     ?? false,
+                classifierConfidence: d.classifierConfidence ?? null,
+                classifierExploring:  d.classifierExploring  ?? false,
                 localTaskType:    d.localTaskType    ?? null,
                 localComplexity:  d.localComplexity  ?? null,
                 localAtomHints:   d.localAtomHints   ?? [],
+                escalationLevel:  d.escalationLevel  ?? 0,
+                struggleCount:    d.struggleCount    ?? 0,
               }],
               timestamp: Date.now(),
               isStreaming: false,
@@ -1222,8 +1210,13 @@ export function usePunk(projectId: string) {
             const label =
               phase === "discovery" ? "Understanding the task..."
               : phase === "planning" ? `Planning with ${model || provider || "model"}...`
+              : phase === "executing" ? `Executing with ${model || provider || "model"}...`
+              : phase === "validating" ? "Verifying plan..."
+              : phase === "replanning" ? "Revising plan..."
               : "Executing...";
             s.setConversationStatusMessage(projectId, label);
+            // Execution phase: the execution model's processEnded is the real terminal event.
+            if (phase === "executing") orchestrationActive = false;
             break;
           }
 
@@ -1233,83 +1226,9 @@ export function usePunk(projectId: string) {
           }
 
           case "orchestration_planning_start": {
-            // Add a streaming assistant message — the planning model's raw output
-            // appears here in real-time, then gets replaced by the plan block
-            const s = useProjectsStore.getState();
-            s.addConversationMessage(projectId, {
-              id: "planning-stream",
-              type: "assistant",
-              content: [{ type: "text", text: "" }],
-              timestamp: Date.now(),
-              isStreaming: true,
-            });
-            s.setConversationStatusMessage(projectId, "Planning...");
-            break;
-          }
-
-          case "orchestration_planning_chunk": {
-            const s = useProjectsStore.getState();
-            s.appendToLastAssistantText(projectId, event.data.chunk);
-            break;
-          }
-
-          case "orchestration_plan": {
-            const { summary, steps, totalSteps, planId, planningModel, executionModel } = event.data;
-            // Finalize the planning stream — keep it in history, just stop the cursor
-            const ps = useProjectsStore.getState();
-            const proj = ps.projects.get(projectId);
-            const streamMsg = proj?.conversation.messages.find((m) => m.id === "planning-stream");
-            if (streamMsg) {
-              ps.removeLastConversationMessage(projectId);
-              ps.addConversationMessage(projectId, { ...streamMsg, isStreaming: false });
-            }
-            // Show the approval gate — execution waits until user presses accept
-            ps.setPendingPlanApproval(projectId, true);
-            console.log(
-              `[orchestration] Plan: ${summary} (${totalSteps} steps)`,
-            );
-            const s = useProjectsStore.getState();
-            s.setConversationStatusMessage(
-              projectId,
-              `Orchestrating: ${totalSteps} steps`,
-            );
-
-            // Push the plan as a first-class message in the conversation.
-            // This is the readable blueprint — static after it lands.
-            // Todos near the input handle live step progress.
-            if (steps && planId) {
-              s.addConversationMessage(projectId, {
-                id: `plan-${planId}`,
-                type: "plan",
-                content: [],
-                timestamp: Date.now(),
-                isStreaming: false,
-                planData: {
-                  id: planId,
-                  task: summary,
-                  steps: steps.map((step: { index: number; action: string; type: string; files: string[] }) => ({
-                    index: step.index,
-                    type: step.type as "read" | "write" | "verify" | "plan",
-                    action: step.action,
-                    files: step.files || [],
-                  })),
-                  planningModel: planningModel || null,
-                  executionModel: executionModel || null,
-                },
-              });
-            }
-
-            // Update todos to reflect the plan for live progress near input
-            if (steps) {
-              s.setConversationTodos(
-                projectId,
-                steps.map((step: { index: number; action: string; type: string }) => ({
-                  content: step.action,
-                  status: "pending" as const,
-                  activeForm: step.action.split(" ").slice(0, 4).join(" ") + "...",
-                })),
-              );
-            }
+            // Planning model's messages stream through as regular conversation events.
+            // No placeholder needed — user sees tool calls and text directly.
+            useProjectsStore.getState().setConversationStatusMessage(projectId, "Planning...");
             break;
           }
 
@@ -1321,6 +1240,25 @@ export function usePunk(projectId: string) {
               projectId,
               `Step ${stepIndex || "?"}/${totalSteps || "?"}: ${message}`,
             );
+            // Mark the proportional task as in_progress when a step starts executing.
+            // Tasks are fewer than steps — map by ratio so the active indicator tracks correctly.
+            if (phase === "executing" && stepIndex && totalSteps) {
+              const proj = s.projects.get(projectId);
+              if (proj?.conversation.todos?.length) {
+                const numTasks = proj.conversation.todos.length;
+                const activeTask = Math.floor((stepIndex - 1) / totalSteps * numTasks);
+                s.setConversationTodos(projectId, proj.conversation.todos.map(
+                  (todo: Todo, idx: number) => ({
+                    ...todo,
+                    status: idx < activeTask
+                      ? "completed" as const
+                      : idx === activeTask
+                        ? "in_progress" as const
+                        : "pending" as const,
+                  })
+                ));
+              }
+            }
             break;
           }
 
@@ -1329,19 +1267,20 @@ export function usePunk(projectId: string) {
             console.log(
               `[orchestration] Step ${stepIndex}/${totalSteps} ${passed ? "passed" : "failed"}: ${action}`,
             );
-            // Update the specific todo
+            // Update todos using proportional mapping — tasks are fewer than steps.
             const s = useProjectsStore.getState();
             const proj = s.projects.get(projectId);
             if (proj?.conversation.todos) {
+              const numTasks = proj.conversation.todos.length;
+              const completedTasks = Math.floor(stepIndex / totalSteps * numTasks);
               const updatedTodos = proj.conversation.todos.map(
                 (todo: Todo, idx: number) => ({
                   ...todo,
-                  status:
-                    idx < stepIndex
-                      ? ("completed" as const)
-                      : idx === stepIndex - 1
-                        ? (passed ? "completed" as const : "in_progress" as const)
-                        : todo.status,
+                  status: idx < completedTasks
+                    ? "completed" as const
+                    : idx === completedTasks
+                      ? "in_progress" as const
+                      : "pending" as const,
                 }),
               );
               s.setConversationTodos(projectId, updatedTodos);
@@ -1408,6 +1347,10 @@ export function usePunk(projectId: string) {
             useProjectsStore.getState().setConversationPhase(projectId, "idle");
             console.error(`[orchestration] Error: ${event.data.message}`);
             const s = useProjectsStore.getState();
+            // Clean up planning-stream if it's still present (e.g. CLI plan parse failure)
+            const errProj = s.projects.get(projectId);
+            const planStream = errProj?.conversation.messages.find((m) => m.id === "planning-stream");
+            if (planStream) s.removeConversationMessageById(projectId, "planning-stream");
             s.setConversationError(projectId, event.data.message);
             finishProcessing();
 
@@ -1438,15 +1381,12 @@ export function usePunk(projectId: string) {
           ).catch(() => {}),
           new Promise((resolve) => setTimeout(resolve, 1000)), // Increased from 500ms to 1 second
         ]);
-        const selectedModel = useWorkspaceStore.getState().selectedModel;
-        const selectedModelThinking =
-          useWorkspaceStore.getState().selectedModelThinking;
-        const selectedModelProvider =
-          useWorkspaceStore.getState().selectedModelProvider;
+        const ws = useWorkspaceStore.getState();
+        const selectedModel = ws.selectedModel;
+        const selectedModelThinking = ws.selectedModelThinking;
+        const selectedModelProvider = ws.selectedModelProvider;
+        const intentAutoRoute = ws.intentAutoRoute;
         const routedModel = chooseModelForIntent(selectedModel, intent);
-
-        // Don't set an aggressive initial timeout - let models take the time they need
-        // The processStarted event will handle legitimate hangs
 
         const truncatedHistory = conversation.messages.slice(-20);
         const todos = conversation.todos;
@@ -1463,6 +1403,7 @@ export function usePunk(projectId: string) {
           selectedModelThinking,
           selectedModelProvider,
           todos,
+          intentAutoRoute,
         );
       } catch (err) {
         console.error("[pane] sendToPunk error:", err);
@@ -1490,11 +1431,59 @@ export function usePunk(projectId: string) {
   }, [projectId]);
 
   const clearConversation = useCallback(() => {
+    // Promote session state to long-term memory before wiping it.
+    // Decisions, method violations, and high-touch file patterns die on clear
+    // otherwise — this bridges the session layer → brain layer.
+    sessionReadState(projectId)
+      .then((state) => {
+        if (!state) return;
+        const now = Date.now();
+        const events: MemoryEvent[] = [];
+
+        // Decisions accumulated this session
+        for (const d of state.decisions || []) {
+          if (d.content && d.content.length >= 10) {
+            events.push({
+              type: "decision",
+              content: d.content.slice(0, 200),
+              timestamp: (d as { content: string; timestamp?: number }).timestamp ?? now,
+              source: "auto",
+            });
+          }
+        }
+
+        // Top-touch working set files → pattern node
+        const topFiles = (state.workingSet || [])
+          .filter((f) => (f.touches ?? 0) >= 2)
+          .sort((a, b) => (b.touches ?? 0) - (a.touches ?? 0))
+          .slice(0, 3)
+          .map((f) => f.path);
+        if (topFiles.length > 0) {
+          events.push({
+            type: "pattern",
+            content: `Frequently edited together: ${topFiles.join(", ")}`,
+            timestamp: now,
+            source: "auto",
+            metadata: { files: topFiles.join(",") },
+          });
+        }
+
+        if (events.length > 0) {
+          recordMemoryEvents(projectId, events).catch(() => {});
+          brainIndexEvents(projectId, events).catch(() => {});
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        // Clear regardless of promotion success
+        sessionClearState(projectId).catch(() => {});
+      });
+
     useProjectsStore.getState().clearConversation(projectId);
     useProjectsStore.getState().clearCheckpoints(projectId);
     deleteProjectCheckpoints(projectId).catch(() => {});
     brainClearSessionPins(projectId).catch(() => {});
-    sessionClearState(projectId).catch(() => {});
+    // sessionClearState is now called inside the finally above
   }, [projectId]);
 
   return { sendMessage, abortMessage, clearConversation };
@@ -1663,23 +1652,6 @@ function handlePunkMessage(
           store.setContextPressure(projectId, msg.usage.input_tokens, pressure);
         }
 
-        const project = store.projects.get(projectId);
-        if (project) {
-          const msgs = project.conversation.messages;
-          const last = msgs[msgs.length - 1];
-          if (last && last.type === "assistant") {
-            const fullText = last.content
-              .filter((b) => b.type === "text")
-              .map((b) => (b as { type: "text"; text: string }).text)
-              .join("\n")
-              .trim();
-            if (
-              /ready to proceed|send ['"]go['"]/i.test(fullText.slice(-200))
-            ) {
-              store.setPendingPlanApproval(projectId, true);
-            }
-          }
-        }
       } else if (msg.subtype !== "success") {
         if (msg.subtype === "interrupted") return assistantMessageExists;
 
@@ -1921,7 +1893,6 @@ function handlePunkMessage(
           store.setIsPlanning(projectId, true);
         }
         if (toolBlock.name === "ExitPlanMode") {
-          store.setPendingPlanApproval(projectId, true);
           store.setIsPlanning(projectId, false);
         }
 

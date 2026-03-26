@@ -4,7 +4,6 @@ import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
 import type { Todo } from "../../lib/punk-types";
-import { approvePlan, rejectPlan } from "../../lib/tauri-commands";
 import {
   PROVIDER_MODELS,
   THINKING_ENGINES,
@@ -88,12 +87,14 @@ function isConversationVisible(): boolean {
 
 function ModelPicker({
   value,
+  routedModel,
   onChange,
   autoRoute,
   onToggleAutoRoute,
   isProcessing,
 }: {
   value: string;
+  routedModel?: string | null;
   onChange: (v: string, thinking?: boolean) => void;
   autoRoute: boolean;
   onToggleAutoRoute: (v: boolean) => void;
@@ -107,24 +108,24 @@ function ModelPicker({
   const openRouterModels = useWorkspaceStore((s) => s.openRouterModels);
 
   const filteredProviderModels = useMemo(() => {
-    const isGeminiBackend = punkBackend === "gemini-cli";
-    const isClaudeBackend = punkBackend === "claude-cli";
+    const isGeminiBackend = punkBackend === "gemini";
+    const isClaudeBackend = punkBackend === "claude-code";
     const providers = Object.fromEntries(
       Object.entries(PROVIDER_MODELS)
         .map(([provider, models]) => {
-          // If we are on Gemini CLI, keep only the Gemini provider and keep auto models.
+          // If we are on Gemini, keep only the Gemini provider and keep auto models.
           if (isGeminiBackend) {
             if (provider !== "gemini") return [provider, []];
             return [provider, models];
           }
 
-          // If we are on Claude CLI, keep only the Anthropic provider (no API key needed).
+          // If we are on Claude Code, keep only the Anthropic provider (no API key needed).
           if (isClaudeBackend) {
             if (provider !== "anthropic") return [provider, []];
             return [provider, models];
           }
 
-          // If we are NOT on Gemini CLI (e.g. HTTP), only show providers with keys.
+          // If we are NOT on Gemini (e.g. API), only show providers with keys.
           if (!httpApiKeys[provider]) return [provider, []];
 
           // Special case for OpenRouter: use enriched dynamic models with real provider grouping
@@ -277,16 +278,17 @@ function ModelPicker({
   }, [open]);
 
 
-  // When smart routing is active and a specific model has been chosen for this turn, show it
+  // When smart routing is active and the router has chosen a model for this turn, show it.
+  // Requires routedModel to be explicitly set — don't show selectedModel as a pre-routing guess.
   const showSpecificModel =
-    autoRoute && isProcessing && current && !current.value.startsWith("auto-");
+    autoRoute && isProcessing && !!routedModel && current && !current.value.startsWith("auto-");
 
   return (
     <div ref={ref} className="relative flex items-center">
       <button
         onClick={() => setOpen(!open)}
         className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md
-          bg-pane-bg/70 backdrop-blur-sm ring-1 ring-pane-border/25
+          bg-pane-bg ring-1 ring-pane-border/25
           text-pane-text-secondary btn-press select-none"
         style={{ fontSize: "var(--pane-font-size-xs)" }}
       >
@@ -355,6 +357,7 @@ function ModelPicker({
                     <button
                       key={model.value}
                       onClick={() => {
+                        if (autoRoute) onToggleAutoRoute(false);
                         onChange(model.value, model.thinking);
                         setOpen(false);
                       }}
@@ -457,9 +460,6 @@ export function InputBar({
       (s) => s.projects.get(projectId)?.conversation.todos ?? EMPTY_TODOS,
     ),
   );
-  const pendingPlanApproval = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.pendingPlanApproval ?? false,
-  );
   const selectedModel = useWorkspaceStore((s) => s.selectedModel);
   const setSelectedModel = useWorkspaceStore((s) => s.setSelectedModel);
   const setHttpProvider = useWorkspaceStore((s) => s.setHttpProvider);
@@ -482,8 +482,6 @@ export function InputBar({
   const routedModel = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.routedModel ?? null,
   );
-
-  const [planRejected, setPlanRejected] = useState(false);
 
   // Handle model change and sync provider
   const handleModelChange = useCallback(
@@ -564,7 +562,15 @@ export function InputBar({
     // Don't collapse below minH — set to 1px only to measure scrollHeight,
     // then immediately restore to the correct height in the same frame.
     el.style.height = "1px";
+    const overflowing = el.scrollHeight > maxH;
     el.style.height = Math.min(Math.max(el.scrollHeight, minH), maxH) + "px";
+    // When overflowing, the browser's native caret scroll only guarantees the
+    // caret lands within [scrollTop, scrollTop + clientHeight] — it doesn't
+    // account for the 44px button overlay. Force-scroll to absolute bottom when
+    // typing at the end so paddingBottom actually shows below the last line.
+    if (overflowing && el.selectionEnd >= el.value.length - 1) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, []);
 
   useEffect(() => {
@@ -579,7 +585,6 @@ export function InputBar({
         if (trimmed) {
           onSend(trimmed);
           setValue("");
-          setPlanRejected(false);
         }
       }
       if (e.key === "Escape" && isProcessing) {
@@ -590,24 +595,10 @@ export function InputBar({
     [value, isProcessing, projectId, onSend, onAbort],
   );
 
-  const handleAcceptPlan = useCallback(() => {
-    useProjectsStore.getState().setPendingPlanApproval(projectId, false);
-    approvePlan(projectId).catch(console.error);
-  }, [projectId]);
-
-  const handleRejectPlan = useCallback(() => {
-    useProjectsStore.getState().setPendingPlanApproval(projectId, false);
-    rejectPlan(projectId).catch(console.error);
-    setPlanRejected(true);
-    setTimeout(() => textareaRef.current?.focus(), 0);
-  }, [projectId]);
-
   return (
     <div className="bg-transparent">
       {/* Processing indicator — only exists when active, no reserved space */}
-      {(isProcessing || isFadingOut) &&
-        !pendingPlanApproval &&
-        !todoPanelOpen && (
+      {(isProcessing || isFadingOut) && !todoPanelOpen && (
           <div
             className={`flex items-center gap-3 px-3 pb-3 ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
           >
@@ -678,43 +669,6 @@ export function InputBar({
           </div>
         )}
 
-      {/* Plan approval */}
-      {pendingPlanApproval && (
-        <div className="px-1 pb-3 animate-fadeSlideUp">
-          <div className="flex items-center gap-3">
-            <span
-              className="text-pane-text font-mono"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              plan above — proceed?
-            </span>
-            <button
-              onClick={handleAcceptPlan}
-              className="px-3 py-1 rounded font-mono text-pane-status-added
-                         hover:bg-pane-status-added/10 btn-press"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              good to go
-            </button>
-            <button
-              onClick={handleRejectPlan}
-              className="px-3 py-1 rounded font-mono text-pane-text-secondary
-                         hover:text-pane-text hover:bg-pane-text/[0.06] btn-press"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              revise
-            </button>
-            <button
-              onClick={onAbort}
-              className="text-pane-text-secondary font-mono hover:text-pane-text ml-auto btn-press"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              esc
-            </button>
-          </div>
-        </div>
-      )}
-
       {todoPanelOpen && todos.length > 0 && (
         <TodoPanel
           projectId={projectId}
@@ -723,8 +677,7 @@ export function InputBar({
       )}
 
       {/* One card. Textarea owns the whole surface. Buttons float inside it. */}
-      {!pendingPlanApproval && (
-        <div className="bg-pane-bg/80 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 relative">
+      <div className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative">
           <div ref={caretContainerRef} className="relative overflow-hidden">
             <textarea
               ref={textareaRef}
@@ -733,9 +686,7 @@ export function InputBar({
               onKeyDown={handleKeyDown}
               onFocus={() => { setTextareaFocused(true); updateCaret(); }}
               onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
-              placeholder={
-                isProcessing ? "" : planRejected ? "what should change..." : "let's build..."
-              }
+              placeholder={isProcessing ? "" : "let's build..."}
               className="w-full bg-transparent text-pane-text font-mono
                          resize-none outline-none placeholder:text-pane-text-secondary
                          leading-[1.75] px-5 pt-4 overflow-y-auto overflow-x-hidden"
@@ -745,7 +696,7 @@ export function InputBar({
                 minHeight: "120px",
                 maxHeight: "40vh",
                 height: "120px",
-                paddingBottom: "32px",
+                paddingBottom: "44px",
               }}
             />
             {textareaFocused && caretPos && (
@@ -770,7 +721,7 @@ export function InputBar({
               onClick={() => {
                 const trimmed = value.trim();
                 if (!trimmed) return;
-                onSend(trimmed); setValue(""); setPlanRejected(false);
+                onSend(trimmed); setValue("");
               }}
               className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
               title="Send (Enter)"
@@ -820,7 +771,7 @@ export function InputBar({
                 } catch (err) { console.error('Failed to open file picker:', err); }
               }}
               className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
-                bg-pane-bg/70 backdrop-blur-sm ring-1 ring-pane-border/25
+                bg-pane-bg ring-1 ring-pane-border/25
                 text-pane-text-secondary/50 hover:text-pane-text-secondary btn-press transition-colors"
               title="Add file or folder path"
             >
@@ -840,7 +791,8 @@ export function InputBar({
 
             <div className="pointer-events-auto">
               <ModelPicker
-                value={isProcessing && routedModel ? routedModel : selectedModel}
+                value={selectedModel}
+                routedModel={routedModel}
                 onChange={handleModelChange}
                 autoRoute={intentAutoRoute}
                 onToggleAutoRoute={setIntentAutoRoute}
@@ -849,7 +801,6 @@ export function InputBar({
             </div>
           </div>
         </div>
-      )}
     </div>
   );
 }

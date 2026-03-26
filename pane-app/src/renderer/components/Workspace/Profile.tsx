@@ -19,6 +19,16 @@ import {
   brainUpdateRules,
   brainUpdatePhilosophy,
   reinitializePunkBackend,
+  checkClaudeVersion,
+  checkGeminiVersion,
+  cloudLogin,
+  cloudLogout,
+  cloudGetUser,
+  cloudGetStatus,
+  cloudTriggerBackup,
+  cloudRestore,
+  type CloudUser,
+  type CloudStatus,
 } from "../../lib/tauri-commands";
 import {
   ACTION_DEFINITIONS,
@@ -382,8 +392,8 @@ function EngineSelect({
       // Check if provider has a key.
       // Special-case: gemini provider is only shown if there's a key in httpApiKeys
       // OR if we're in gemini-cli mode (where keys are managed by the CLI environment).
-      const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini-cli";
-      const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-cli";
+      const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini";
+      const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-code";
       if (!httpApiKeys?.[opt.provider] && !(isGeminiBackend && opt.provider === "gemini") && !(isClaudeBackend && opt.provider === "anthropic")) return;
 
       if (!groups[opt.provider]) groups[opt.provider] = [];
@@ -474,8 +484,8 @@ function AiEnginesSection({
   // The provider that the current CLI backend authenticates natively —
   // no HTTP API key needed for these (the CLI handles auth itself).
   const nativeProvider =
-    punkBackend === "claude-cli" ? "anthropic" :
-    punkBackend === "gemini-cli" ? "gemini" :
+    punkBackend === "claude-code" ? "anthropic" :
+    punkBackend === "gemini" ? "gemini" :
     null;
 
   const filterEngines = useCallback(
@@ -513,15 +523,15 @@ function AiEnginesSection({
       execute:
         routing?.execute ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
-        DEFAULT_BACKEND_ROUTING["http"]!.execute,
+        DEFAULT_BACKEND_ROUTING["api"]!.execute,
       explain:
         routing?.explain ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
-        DEFAULT_BACKEND_ROUTING["http"]!.explain,
+        DEFAULT_BACKEND_ROUTING["api"]!.explain,
       other:
         routing?.other ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
-        DEFAULT_BACKEND_ROUTING["http"]!.other,
+        DEFAULT_BACKEND_ROUTING["api"]!.other,
     };
     setIntentRouting(next);
     reinitializePunkBackend(punkBackend).catch(() => {});
@@ -532,7 +542,7 @@ function AiEnginesSection({
       plan:
         routing?.plan ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
-        DEFAULT_BACKEND_ROUTING["http"]!.plan,
+        DEFAULT_BACKEND_ROUTING["api"]!.plan,
       execute: {
         provider: opt.provider,
         model: opt.model,
@@ -541,11 +551,11 @@ function AiEnginesSection({
       explain:
         routing?.explain ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
-        DEFAULT_BACKEND_ROUTING["http"]!.explain,
+        DEFAULT_BACKEND_ROUTING["api"]!.explain,
       other:
         routing?.other ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
-        DEFAULT_BACKEND_ROUTING["http"]!.other,
+        DEFAULT_BACKEND_ROUTING["api"]!.other,
     };
     setIntentRouting(next);
     reinitializePunkBackend(punkBackend).catch(() => {});
@@ -556,11 +566,11 @@ function AiEnginesSection({
       plan:
         routing?.plan ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
-        DEFAULT_BACKEND_ROUTING["http"]!.plan,
+        DEFAULT_BACKEND_ROUTING["api"]!.plan,
       execute:
         routing?.execute ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
-        DEFAULT_BACKEND_ROUTING["http"]!.execute,
+        DEFAULT_BACKEND_ROUTING["api"]!.execute,
       explain: {
         provider: opt.provider,
         model: opt.model,
@@ -569,7 +579,7 @@ function AiEnginesSection({
       other:
         routing?.other ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
-        DEFAULT_BACKEND_ROUTING["http"]!.other,
+        DEFAULT_BACKEND_ROUTING["api"]!.other,
     };
     setIntentRouting(next);
     reinitializePunkBackend(punkBackend).catch(() => {});
@@ -580,15 +590,15 @@ function AiEnginesSection({
       plan:
         routing?.plan ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
-        DEFAULT_BACKEND_ROUTING["http"]!.plan,
+        DEFAULT_BACKEND_ROUTING["api"]!.plan,
       execute:
         routing?.execute ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
-        DEFAULT_BACKEND_ROUTING["http"]!.execute,
+        DEFAULT_BACKEND_ROUTING["api"]!.execute,
       explain:
         routing?.explain ||
         DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
-        DEFAULT_BACKEND_ROUTING["http"]!.explain,
+        DEFAULT_BACKEND_ROUTING["api"]!.explain,
       other: {
         provider: opt.provider,
         model: opt.model,
@@ -610,7 +620,7 @@ function AiEnginesSection({
     baseOptions: EngineOption[],
   ) => {
     const routingDefault =
-      DEFAULT_BACKEND_ROUTING[punkBackend] || DEFAULT_BACKEND_ROUTING["http"];
+      DEFAULT_BACKEND_ROUTING[punkBackend] || DEFAULT_BACKEND_ROUTING["api"];
     const target = current || routingDefault?.plan || baseOptions[0]!;
 
     // 1. Try to find in hardcoded options first
@@ -1016,6 +1026,264 @@ function ApiKeysSection({
   );
 }
 
+// ─── Cloud Section ────────────────────────────────────────────────────────────
+
+const electronAPI = (window as any).electronAPI;
+
+type SyncPhase = "idle" | "compressing" | "encrypting" | "uploading" | "complete" |
+  "finding" | "downloading" | "decrypting" | "restoring";
+
+function CloudSection() {
+  const [user, setUser] = useState<CloudUser | null>(null);
+  const [status, setStatus] = useState<CloudStatus | null>(null);
+  const [loggingIn, setLoggingIn] = useState(false);
+  const [syncPhase, setSyncPhase] = useState<SyncPhase>("idle");
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState(false);
+
+  // Load initial state
+  useEffect(() => {
+    cloudGetUser().then(setUser).catch(() => {});
+    cloudGetStatus().then(setStatus).catch(() => {});
+  }, []);
+
+  // Listen for auth changes from main process
+  useEffect(() => {
+    const unlisten = electronAPI.on("cloud-auth-changed", (u: CloudUser | null) => {
+      setUser(u);
+      if (u) {
+        cloudGetStatus().then(setStatus).catch(() => {});
+      } else {
+        setStatus(null);
+      }
+    });
+    return () => { if (typeof unlisten === "function") unlisten(); };
+  }, []);
+
+  // Listen for sync progress
+  useEffect(() => {
+    const unlisten = electronAPI.on("cloud-sync-progress", (data: { phase: SyncPhase }) => {
+      setSyncPhase(data.phase);
+      if (data.phase === "complete") {
+        // Refresh status after successful sync
+        cloudGetStatus().then(setStatus).catch(() => {});
+        setTimeout(() => setSyncPhase("idle"), 2000);
+      }
+    });
+    return () => { if (typeof unlisten === "function") unlisten(); };
+  }, []);
+
+  const handleLogin = async () => {
+    setLoggingIn(true);
+    setSyncError(null);
+    try {
+      const u = await cloudLogin();
+      setUser(u);
+      if (u) cloudGetStatus().then(setStatus).catch(() => {});
+    } catch (err: any) {
+      setSyncError(err?.message || "Login failed");
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await cloudLogout().catch(() => {});
+    setUser(null);
+    setStatus(null);
+    setSyncPhase("idle");
+    setSyncError(null);
+  };
+
+  const handleBackupNow = async () => {
+    setSyncError(null);
+    setSyncPhase("compressing");
+    try {
+      await cloudTriggerBackup();
+    } catch (err: any) {
+      setSyncError(err?.message || "Backup failed");
+      setSyncPhase("idle");
+    }
+  };
+
+  const handleRestore = async () => {
+    if (!confirm("Restore from cloud? This will overwrite your local data.")) return;
+    setSyncError(null);
+    setRestoring(true);
+    setSyncPhase("finding");
+    try {
+      await cloudRestore();
+    } catch (err: any) {
+      setSyncError(err?.message || "Restore failed");
+      setSyncPhase("idle");
+    } finally {
+      setRestoring(false);
+    }
+  };
+
+  const formatDate = (iso: string | null) => {
+    if (!iso) return "never";
+    const d = new Date(iso);
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  };
+
+  const phaseLabel: Record<SyncPhase, string> = {
+    idle: "",
+    compressing: "compressing…",
+    encrypting: "encrypting…",
+    uploading: "uploading…",
+    complete: "done",
+    finding: "finding backup…",
+    downloading: "downloading…",
+    decrypting: "decrypting…",
+    restoring: "restoring…",
+  };
+
+  const isSyncing = syncPhase !== "idle" && syncPhase !== "complete";
+
+  if (!user) {
+    // Logged-out state
+    return (
+      <div className="flex flex-col gap-4">
+        <p
+          className="text-pane-text-secondary/60 font-mono leading-relaxed"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          back up your session, memory, and brain to pane cloud. encrypted before it leaves your machine.
+        </p>
+        <button
+          onClick={handleLogin}
+          disabled={loggingIn}
+          className="flex items-center gap-2.5 self-start px-4 py-2 rounded-lg bg-pane-text/[0.06] hover:bg-pane-text/[0.10] active:bg-pane-text/[0.13] text-pane-text font-mono disabled:opacity-40 disabled:cursor-default transition-colors"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          {loggingIn ? (
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="animate-spin opacity-60">
+              <path d="M7 1.5A5.5 5.5 0 0112.5 7" />
+            </svg>
+          ) : (
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
+            </svg>
+          )}
+          {loggingIn ? "opening browser…" : "sign in with github"}
+        </button>
+        {syncError && (
+          <span
+            className="text-pane-error font-mono"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {syncError}
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  // Logged-in state
+  return (
+    <div className="flex flex-col gap-4">
+      {/* User row */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2.5">
+          {user.avatar_url ? (
+            <img
+              src={user.avatar_url}
+              alt=""
+              className="w-6 h-6 rounded-full ring-1 ring-pane-border/30"
+            />
+          ) : (
+            <div className="w-6 h-6 rounded-full bg-pane-text/[0.08] flex items-center justify-center">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="7" r="4" />
+                <path d="M5.5 21a7.5 7.5 0 0115 0" />
+              </svg>
+            </div>
+          )}
+          <span
+            className="text-pane-text font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {user.github_login}
+          </span>
+        </div>
+        <button
+          onClick={handleLogout}
+          className="text-pane-text-secondary/40 hover:text-pane-text-secondary font-mono transition-colors"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          sign out
+        </button>
+      </div>
+
+      {/* Status rows */}
+      <div className="flex flex-col gap-1 py-2 border-t border-b border-pane-border/20">
+        <SettingRow label="last backup">
+          <span
+            className="text-pane-text-secondary/60 font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {formatDate(status?.last_backup ?? null)}
+          </span>
+        </SettingRow>
+        <SettingRow label="storage used">
+          <span
+            className="text-pane-text-secondary/60 font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {status ? `${status.storage_mb} MB` : "—"}
+          </span>
+        </SettingRow>
+        <SettingRow label="backups stored">
+          <span
+            className="text-pane-text-secondary/60 font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {status?.backup_count ?? "—"}
+          </span>
+        </SettingRow>
+      </div>
+
+      {/* Actions */}
+      <div className="flex items-center gap-3">
+        <button
+          onClick={handleBackupNow}
+          disabled={isSyncing || restoring}
+          className="px-3 py-1.5 rounded-lg font-mono text-pane-text bg-pane-text/[0.06] hover:bg-pane-text/[0.10] active:bg-pane-text/[0.13] disabled:opacity-40 disabled:cursor-default transition-colors"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          back up now
+        </button>
+        <button
+          onClick={handleRestore}
+          disabled={isSyncing || restoring}
+          className="px-3 py-1.5 rounded-lg font-mono text-pane-text-secondary/60 hover:text-pane-text hover:bg-pane-text/[0.06] disabled:opacity-40 disabled:cursor-default transition-colors"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          restore
+        </button>
+        {(isSyncing || syncPhase === "complete") && (
+          <span
+            className="text-pane-terminal font-mono"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {phaseLabel[syncPhase]}
+          </span>
+        )}
+      </div>
+
+      {syncError && (
+        <span
+          className="text-pane-error font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          {syncError}
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Profile View ────────────────────────────────────────────────────────
 
 // Accordion Section Component
@@ -1108,6 +1376,19 @@ export function Profile() {
   // Accordion state - only one section expanded at a time
   const [expandedSection, setExpandedSection] = useState<string | null>("identity");
 
+  // Detect which CLI backends are available in PATH
+  const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
+  const [geminiAvailable, setGeminiAvailable] = useState(false);
+
+  useEffect(() => {
+    checkClaudeVersion()
+      .then((info) => setClaudeCodeAvailable(!!info.current))
+      .catch(() => setClaudeCodeAvailable(false));
+    checkGeminiVersion()
+      .then((info) => setGeminiAvailable(!!info.current))
+      .catch(() => setGeminiAvailable(false));
+  }, []);
+
   useEffect(() => {
     brainGetProfile()
       .then(({ profile }) => {
@@ -1125,16 +1406,16 @@ export function Profile() {
     setPunkBackend(backend);
 
     // Sync provider and model for Gemini CLI to ensure UI reflects the switch
-    if (backend === "gemini-cli") {
+    if (backend === "gemini") {
       useWorkspaceStore
         .getState()
         .setSelectedModel("auto-gemini-3", false, "gemini");
-    } else if (backend === "claude-cli") {
+    } else if (backend === "claude-code") {
       useWorkspaceStore
         .getState()
         .setSelectedModel("sonnet", false, "anthropic");
-    } else if (backend === "http") {
-      // Default to DeepSeek for HTTP if no prior selection
+    } else if (backend === "api") {
+      // Default to DeepSeek for API if no prior selection
       useWorkspaceStore
         .getState()
         .setSelectedModel("deepseek-chat", false, "deepseek");
@@ -1148,17 +1429,6 @@ export function Profile() {
   const handleApiKeyChange = (provider: string, key: string) => {
     setHttpApiKeys({ ...httpApiKeys, [provider]: key });
   };
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        useWorkspaceStore.getState().setOverlay(null);
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, []);
 
   const saveIdentity = useCallback((field: string, value: string) => {
     if (identitySaveRef.current) clearTimeout(identitySaveRef.current);
@@ -1271,33 +1541,18 @@ export function Profile() {
         <path d="M19.07 4.93l-1.41 1.41" />
       </svg>
     ),
+    cloud: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z" />
+      </svg>
+    ),
   };
 
   return (
     <div
-      className="h-full overflow-y-auto overflow-x-hidden px-12 pt-8 pb-48 relative z-20"
+      className="h-full overflow-y-auto overflow-x-hidden px-12 pt-8 pb-48 relative"
       data-no-drag
     >
-      {/* Close button — fixed top-right, always accessible while scrolling */}
-      <button
-        onClick={() => useWorkspaceStore.getState().setOverlay(null)}
-        data-no-drag
-        className="fixed top-8 right-12 w-7 h-7 flex items-center justify-center rounded text-pane-text-secondary/25 hover:text-pane-text hover:bg-pane-text/[0.06] transition-colors z-50"
-        title="Close (Esc)"
-      >
-        <svg
-          width="12"
-          height="12"
-          viewBox="0 0 12 12"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        >
-          <path d="M2 2l8 8M10 2l-8 8" />
-        </svg>
-      </button>
-
       <div className="max-w-xl mx-auto flex flex-col gap-y-8">
         {/* Identity Section */}
         <AccordionSection
@@ -1454,14 +1709,16 @@ export function Profile() {
                 active mode
               </span>
               <div className="flex gap-1">
-                {(["http", "claude-cli", "gemini-cli"] as const).map((backend) => (
+                {(["api", "claude-code", "gemini"] as const)
+                  .filter((b) => b === "api" || (b === "claude-code" && claudeCodeAvailable) || (b === "gemini" && geminiAvailable))
+                  .map((backend) => (
                   <button
                     key={backend}
                     onClick={() => handleBackendChange(backend)}
                     className={`px-3 py-1.5 rounded-lg font-mono transition-all ${punkBackend === backend ? "bg-pane-text/[0.12] text-pane-text ring-1 ring-pane-text/20" : "text-pane-text-secondary/40 hover:text-pane-text-secondary hover:bg-pane-text/[0.04]"}`}
                     style={{ fontSize: "var(--pane-font-size-sm)" }}
                   >
-                    {backend === "claude-cli" ? "Claude CLI" : backend === "gemini-cli" ? "Gemini CLI" : "HTTP"}
+                    {backend === "claude-code" ? "Claude Code" : backend === "gemini" ? "Gemini" : "API"}
                   </button>
                 ))}
               </div>
@@ -1469,11 +1726,11 @@ export function Profile() {
 
             {/* Backend info cards */}
             <div className="mt-2 p-3 bg-pane-surface/50 rounded-lg">
-              {(punkBackend === "claude-cli" || punkBackend === "gemini-cli") ? (
+              {(punkBackend === "claude-code" || punkBackend === "gemini") ? (
                 <div className="flex items-center gap-2 text-pane-text-secondary">
                   <div className="w-2 h-2 rounded-full bg-pane-status-added animate-pulse" />
                   <span className="font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    {punkBackend === "claude-cli" ? "Claude CLI" : "Gemini CLI"} — local command authentication ready
+                    {punkBackend === "claude-code" ? "Claude Code" : "Gemini"} — local command authentication ready
                   </span>
                 </div>
               ) : (
@@ -1483,7 +1740,7 @@ export function Profile() {
                     <path d="M12 16v-4M12 8h.01" />
                   </svg>
                   <span className="font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    HTTP mode — configure keys and model routing
+                    API mode — configure keys and model routing
                   </span>
                 </div>
               )}
@@ -1502,7 +1759,7 @@ export function Profile() {
         </AccordionSection>
 
         {/* API Keys Section */}
-        {punkBackend === "http" && (
+        {punkBackend === "api" && (
           <AccordionSection
             title="api keys"
             icon={icons.apiKeys}
@@ -1639,6 +1896,16 @@ export function Profile() {
           onToggle={() => setExpandedSection(expandedSection === "shortcuts" ? null : "shortcuts")}
         >
           <KeybindingsSection />
+        </AccordionSection>
+
+        {/* Cloud Section */}
+        <AccordionSection
+          title="pane cloud"
+          icon={icons.cloud}
+          isExpanded={expandedSection === "cloud"}
+          onToggle={() => setExpandedSection(expandedSection === "cloud" ? null : "cloud")}
+        >
+          <CloudSection />
         </AccordionSection>
       </div>
     </div>

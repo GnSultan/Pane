@@ -186,11 +186,14 @@ export function useSettingsPersistence() {
         if (settings.completion_sound)
           ws.setCompletionSound(settings.completion_sound);
 
-        // 2. Provider & Model state
+        // 2. Provider & Model state — normalize legacy backend names
+        const rawBackend = settings.punk_backend || "api";
         const backend =
-          (settings.punk_backend === "cli"
-            ? "gemini-cli"
-            : settings.punk_backend) || "http";
+          rawBackend === "cli" ? "gemini" :
+          rawBackend === "claude-cli" ? "claude-code" :
+          rawBackend === "gemini-cli" ? "gemini" :
+          rawBackend === "http" ? "api" :
+          rawBackend;
         ws.setPunkBackend(backend);
 
         if (settings.http_provider) ws.setHttpProvider(settings.http_provider);
@@ -264,7 +267,13 @@ export function useSettingsPersistence() {
             // Merge existing backend maps into our canonical defaults
             const backendRouting = rawRouting as BackendRouting;
             for (const key of Object.keys(backendRouting)) {
-              const normalizedKey = key === "cli" ? "gemini-cli" : key;
+              // Normalize legacy backend keys to current names
+              const normalizedKey =
+                key === "cli" ? "gemini" :
+                key === "claude-cli" ? "claude-code" :
+                key === "gemini-cli" ? "gemini" :
+                key === "http" ? "api" :
+                key;
               if (healedRouting[normalizedKey]) {
                 healedRouting[normalizedKey] = {
                   ...healedRouting[normalizedKey],
@@ -274,10 +283,10 @@ export function useSettingsPersistence() {
             }
           }
 
-          // Strict Validation: Ensure gemini-cli only uses auto- models
+          // Strict Validation: Ensure gemini backend only uses auto- models
           ["plan", "execute", "explain", "other"].forEach((intent) => {
             const r =
-              healedRouting["gemini-cli"]?.[intent as keyof IntentRouting];
+              healedRouting["gemini"]?.[intent as keyof IntentRouting];
 
             if (r && r.provider === "gemini" && !r.model.startsWith("auto-")) {
               if (r.model.includes("pro")) r.model = "auto-gemini-3";
@@ -354,6 +363,7 @@ export function useSettingsPersistence() {
               settings.project_states?.[root];
 
             if (state) {
+              if (state.name) useProjectsStore.getState().renameProject(id, state.name);
               for (const dir of state.expanded_dirs) toggleDir(id, dir);
               if (state.recent_files?.length) {
                 useProjectsStore.setState((s) => {
@@ -453,6 +463,7 @@ export function useSettingsPersistence() {
         if (!p) continue;
         project_roots.push(p.root);
         project_states[p.root] = {
+          name: p.name,
           expanded_dirs: Array.from(p.expandedDirs),
           active_file_path: p.activeFilePath,
           recent_files: p.recentFiles,
@@ -534,7 +545,7 @@ export function useSettingsPersistence() {
         const p = state.projects.get(id);
         if (!p) continue;
         parts.push(
-          `${id}:${p.expandedDirs.size}:${p.activeFilePath ?? ""}:${p.mode}`,
+          `${id}:${p.name}:${p.expandedDirs.size}:${p.activeFilePath ?? ""}:${p.mode}`,
         );
       }
       return parts.join("|");

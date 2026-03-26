@@ -16,7 +16,6 @@ import { setRestoreInProgress } from "../../hooks/useFileWatcher";
 import { ToolActivity, ServerToolActivity } from "./ToolActivity";
 import { MarkdownText } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
-import { PlanBlock } from "./PlanBlock";
 import { StrategyBlockDisplay } from "./StrategyBlock";
 
 // No CSS containment — content-visibility: auto causes visible pop-in stutter
@@ -36,17 +35,8 @@ style.textContent = `
     to { opacity: 1; transform: translateY(0); }
   }
 
-  @keyframes fadeIn {
-    from { opacity: 0; filter: blur(1.5px); transform: translateY(1px); }
-    to { opacity: 1; filter: blur(0); transform: translateY(0); }
-  }
-
   .streaming-message {
     animation: slideIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1);
-  }
-
-  .streaming-text {
-    animation: fadeIn 2.5s cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   .thinking-pulse {
@@ -265,12 +255,6 @@ export function MessageBubble({
   projectId,
 }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
-  // Only animate on first mount — not when scrolling through old messages
-  const isNewRef = useRef(true);
-  useEffect(() => {
-    isNewRef.current = false;
-  }, []);
-  const animClass = isNewRef.current ? "animate-fadeSlideUp" : "";
 
   // Graceful completion: track when streaming just ended to add settle animation
   const wasStreamingRef = useRef(message.isStreaming);
@@ -316,9 +300,9 @@ export function MessageBubble({
     const truncatedText = isExpanded || !showExpand ? text : text.split('\n').slice(0, 10).join('\n');
 
     return (
-      <div className={`mb-10 group flex flex-col items-end ${animClass}`}>
+      <div className="mb-10 group flex flex-col items-end">
         <div
-          className="bg-pane-bg/80 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 relative"
+          className="rounded-xl ring-1 ring-pane-border/40 relative"
           style={{ maxWidth: "65ch" }}
         >
           <p
@@ -364,11 +348,6 @@ export function MessageBubble({
   // System messages (tool results) are hidden — matched to their parent tool_use
   if (message.type === "system") {
     return null;
-  }
-
-  // Plan messages — the blueprint Pane produced before execution
-  if (message.type === "plan" && message.planData) {
-    return <PlanBlock planData={message.planData} />;
   }
 
   if (message.type === "assistant") {
@@ -432,7 +411,7 @@ export function MessageBubble({
 
     return (
       <div
-        className={`group ${animClass} ${hasVisibleContent ? "mb-12" : isStrategyOnly ? "mb-1" : "mb-4"} ${message.isStreaming ? "streaming-message" : ""}`}
+        className={`group ${hasVisibleContent ? "mb-12" : isStrategyOnly ? "mb-1" : "mb-4"} ${message.isStreaming ? "streaming-message" : ""}`}
       >
         {groups.map((group, gi) => {
           if (group.type === "thinking") {
@@ -469,10 +448,7 @@ export function MessageBubble({
                   const text = (block as { type: "text"; text: string }).text;
                   if (text == null) return null;
                   return (
-                    <div
-                      key={i}
-                      className={message.isStreaming ? "streaming-text" : ""}
-                    >
+                    <div key={i}>
                       <MarkdownText
                         text={text}
                         isStreaming={message.isStreaming}

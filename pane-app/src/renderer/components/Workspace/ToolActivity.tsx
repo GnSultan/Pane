@@ -21,7 +21,9 @@ function parseMcpName(name: string): { server: string; tool: string } | null {
   const parts = name.slice(5).split("__");
   if (parts.length < 2) return null;
   const server = parts[0]!.replace(/-/g, " ");
-  const tool = parts.slice(1).join(" ").replace(/_/g, " ");
+  let tool = parts.slice(1).join(" ").replace(/_/g, " ");
+  // Strip redundant server prefix: "pane pane recall" → "pane recall"
+  if (tool.startsWith(server + " ")) tool = tool.slice(server.length + 1);
   return { server, tool };
 }
 
@@ -55,10 +57,18 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       if (includePattern) summary += ` (${includePattern})`;
       return summary;
     }
+    case "Plan": {
+      const summary = (input.summary as string) || "";
+      const steps = (input.steps as Array<{ action: string }>) || [];
+      return summary || `${steps.length} steps`;
+    }
     case "TodoWrite":
       return "todos";
+    case "pane_plan":
+      return "plan";
     case "Task":
-      return (input.description as string) || "subagent";
+    case "agent":
+      return (input.description as string) || (input.prompt as string) || "subagent";
     case "WebSearch":
     case "google_web_search":
       return (input.query as string) || "";
@@ -88,7 +98,10 @@ function getToolLabel(name: string): string {
     case "write_file": return "write";
     case "Bash":
     case "run_shell_command": return "bash";
-    case "Task": return "task";
+    case "Task":
+    case "agent": return "agent";
+    case "pane_plan": return "pane";
+    case "Plan": return "plan";
     case "TodoWrite": return "todo";
     case "WebSearch":
     case "google_web_search": return "search";
@@ -153,8 +166,8 @@ export function ExpandedWriteInput({ input }: { input: Record<string, unknown> }
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
     >
       <div className="px-4 py-4">
-        <MarkdownText 
-          text={`\`\`\`ts\n${content.length > 5000 ? content.slice(0, 5000) + "\n... (truncated)" : content}\n\`\`\``} 
+        <MarkdownText
+          text={`\`\`\`ts\n${content}\n\`\`\``}
         />
       </div>
     </div>
@@ -221,8 +234,8 @@ function ExpandedReadInput({ result }: { result?: ToolResultBlock }) {
     >
       {hasContent && (
         <div className="px-4 py-4">
-          <MarkdownText 
-            text={`\`\`\`ts\n${content.length > 5000 ? content.slice(0, 5000) + "\n... (truncated)" : content}\n\`\`\``} 
+          <MarkdownText
+            text={`\`\`\`ts\n${content}\n\`\`\``}
           />
         </div>
       )}
@@ -288,6 +301,62 @@ function ExpandedMcpInput({ input, toolName }: { input: Record<string, unknown>;
   );
 }
 
+function ExpandedPlanInput({ input }: { input: Record<string, unknown> }) {
+  const summary = (input.summary as string) || "";
+  const steps = (input.steps as Array<{ index: number; action: string; type: string; files?: string[] }>) || [];
+
+  const typeColor = (type: string) => {
+    switch (type) {
+      case "read": return "var(--pane-terminal)";
+      case "write": return "var(--pane-status-modified)";
+      case "verify": return "var(--pane-status-added)";
+      default: return "var(--pane-text-secondary)";
+    }
+  };
+
+  return (
+    <div
+      className="font-mono leading-[1.6]"
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    >
+      {summary && (
+        <div className="px-4 py-3 text-pane-text/80 border-b border-pane-text-secondary/10">
+          {summary}
+        </div>
+      )}
+      {steps.map((step) => (
+        <div
+          key={step.index}
+          className="px-4 py-2.5 border-b border-pane-border/5 last:border-b-0"
+        >
+          <div className="flex items-start gap-2">
+            <span
+              className="shrink-0 font-mono opacity-60"
+              style={{ fontSize: "10px", color: typeColor(step.type) }}
+            >
+              {step.index}. {step.type}
+            </span>
+            <span className="text-pane-text-secondary/70">{step.action}</span>
+          </div>
+          {step.files && step.files.length > 0 && (
+            <div className="mt-1 ml-6 flex flex-wrap gap-2">
+              {step.files.map((f, i) => (
+                <span
+                  key={i}
+                  className="text-pane-text-secondary/40"
+                  style={{ fontSize: "10px" }}
+                >
+                  {f.split("/").pop()}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function renderExpandedInput(name: string, input: Record<string, unknown>, result?: ToolResultBlock) {
   if (parseMcpName(name)) {
     return <ExpandedMcpInput input={input} toolName={name} />;
@@ -299,6 +368,8 @@ function renderExpandedInput(name: string, input: Record<string, unknown>, resul
     case "Write":
     case "write_file":
       return <ExpandedWriteInput input={input} />;
+    case "Plan":
+      return <ExpandedPlanInput input={input} />;
     case "TodoWrite":
       return <ExpandedTodoInput input={input} />;
     case "Read":
@@ -354,18 +425,10 @@ function formatToolOutput(content: unknown): string {
       lang = "css";
     }
     
-    const truncated = content.length > 5000
-      ? content.slice(0, 5000) + "\n... (truncated)"
-      : content;
-    
-    return `\`\`\`${lang}\n${truncated}\n\`\`\``;
+    return `\`\`\`${lang}\n${content}\n\`\`\``;
   }
 
-  const truncated = content.length > 5000
-    ? content.slice(0, 5000) + "\n... (truncated)"
-    : content;
-
-  return truncated;
+  return content;
 }
 
 /**
@@ -416,7 +479,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
   // 5. Everything else → collapsed by default
 
   const alwaysExpanded = ["Edit", "Write", "replace", "write_file"];
-  const alwaysCollapsed = ["Read", "Bash", "Grep", "Glob", "WebSearch", "Task", "read_file", "run_shell_command", "grep_search", "glob", "google_web_search"];
+  const alwaysCollapsed = ["Read", "Bash", "Grep", "Glob", "WebSearch", "Task", "Plan", "read_file", "run_shell_command", "grep_search", "glob", "google_web_search"];
 
   // Determine base tool name (expand MCP tools to the actual tool name)
   const baseToolName = (() => {
@@ -437,7 +500,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
 
   return (
     <div
-      className={`rounded-md border transition-all duration-200 ${expanded ? 'border-[var(--pane-border-soft)] bg-pane-bg/60 backdrop-blur-sm mb-2' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-0.5'}`}
+      className={`rounded-md border transition-all duration-200 ${expanded ? 'border-[var(--pane-border-soft)] bg-pane-bg/60 mb-2' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-0.5'}`}
     >
       <button
         onClick={() => setUserToggle(expanded ? false : true)}
@@ -524,7 +587,7 @@ export function ServerToolActivity({ block, searchResult }: ServerToolActivityPr
 
   return (
     <div
-      className={`rounded-md border transition-all duration-200 ${expanded ? 'border-[var(--pane-border-soft)] bg-pane-bg/60 backdrop-blur-sm mb-2' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-0.5'}`}
+      className={`rounded-md border transition-all duration-200 ${expanded ? 'border-[var(--pane-border-soft)] bg-pane-bg/60 mb-2' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-0.5'}`}
     >
       <button
         onClick={() => setExpanded(!expanded)}

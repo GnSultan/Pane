@@ -456,6 +456,23 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "pane_set_why",
+      description: "Set this project's foundational purpose — what it is trying to be, who it serves, what problem it solves, and where it is headed. Per-project. Call this once you have understood the project's core purpose through conversation.",
+      parameters: {
+        type: "object",
+        properties: {
+          why: {
+            type: "string",
+            description: "The project's foundational purpose — a concise narrative covering what it is, who it's for, what problem it solves, and its direction",
+          },
+        },
+        required: ["why"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "TodoWrite",
       description:
         "Update the project's TODO list. Use this to track progress and plan future steps.",
@@ -601,71 +618,22 @@ const TOOL_DEFINITIONS = [
   },
 ];
 
-// ── Plan tool — the gate between planning and execution ────────────────────
-// The model calls this once when it's ready to commit to an implementation plan.
-// Pane intercepts it, shows it to the user for approval, and then triggers
-// the execution phase with the right model. No code is written until approved.
-const PLAN_TOOL = {
-  type: "function",
-  function: {
-    name: "Plan",
-    description:
-      "Submit a structured implementation plan for user approval. Call this ONCE after " +
-      "you have gathered enough context to decompose the task precisely. Execution begins " +
-      "only after the user approves. Do NOT write any code before calling this tool.",
-    parameters: {
-      type: "object",
-      properties: {
-        summary: {
-          type: "string",
-          description: "One-line description of the full task to be implemented.",
-        },
-        steps: {
-          type: "array",
-          description: "Ordered execution steps. Be precise — each step is a job card for a builder model.",
-          items: {
-            type: "object",
-            properties: {
-              index:  { type: "number", description: "1-based step number." },
-              type:   { type: "string", enum: ["read", "write", "verify"], description: "Step archetype." },
-              action: { type: "string", description: "Fully-specified instruction for this step." },
-              files:  { type: "array", items: { type: "string" }, description: "Files in scope." },
-            },
-            required: ["index", "type", "action", "files"],
-          },
-        },
-      },
-      required: ["summary", "steps"],
-    },
-  },
-};
-
 // ── Phase-based tool lists ─────────────────────────────────────────────────
-// discovery  — reads + exploration: model digs into the codebase to ask informed questions
-// planning   — same reads + Plan tool: model explores then commits to a plan
-// execution  — all tools: model implements the approved plan
-//
-// Write tools are stripped in discovery/planning — the model physically cannot
-// modify files until the plan is approved and execution begins.
+// planning  — reads + exploration only: model cannot modify files during planning
+// execution — all tools: model implements the plan
 const WRITE_TOOL_NAMES = new Set([
   "run_shell_command", "write_file", "replace",
-  "pane_revert_change", "pane_remember", "pane_set_rule", "pane_set_philosophy",
+  "pane_revert_change", "pane_remember", "pane_set_rule", "pane_set_philosophy", "pane_set_why",
   "TodoWrite", "Task", "activate_skill", "codebase_investigator", "generalist",
   "cli_help", "save_memory",
 ]);
 
 function getToolsForPhase(phase) {
-  if (phase === "discovery") {
-    // Everything except writes — model can read, search, explore freely
+  if (phase === "planning") {
+    // Read/explore only — model cannot modify files during planning
     return TOOL_DEFINITIONS.filter(t => !WRITE_TOOL_NAMES.has(t.function.name));
   }
-  if (phase === "planning") {
-    // Same as discovery + Plan tool
-    const tools = TOOL_DEFINITIONS.filter(t => !WRITE_TOOL_NAMES.has(t.function.name));
-    tools.push(PLAN_TOOL);
-    return tools;
-  }
-  // execution — all tools (PLAN_TOOL excluded — no planning during execution)
+  // execution — all tools
   return TOOL_DEFINITIONS;
 }
 
@@ -893,77 +861,17 @@ function _byRelevance(a, b) {
   return (b.context_length ?? 0) - (a.context_length ?? 0);
 }
 
-export class HttpBackend extends PunkBackend {
+export { ApiBackend as HttpBackend }; // backward compat alias
+
+export class ApiBackend extends PunkBackend {
+  get supportsToolCalling() { return true; }
+
   constructor(onEvent) {
     super(onEvent);
     this.activeRequests = new Map(); // projectId -> AbortController
     this.requestStates = new Map(); // projectId -> { accumulated: string, toolUses: Map }
     this.paneDir = path.join(os.homedir(), ".pane");
     this.toolExecutors = new Map(); // projectId -> ToolExecutor
-    // Injected by PunkEngine — resolvers for plan approval gate
-    this.planApprovalResolvers = null; // Map<projectId, { resolve, reject }>
-  }
-
-  /**
-   * Intercept the Plan tool call — emit the plan to the frontend, block until
-   * the user approves or rejects, then signal to the turn loop to exit.
-   */
-  async _handlePlanTool(projectId, input, requestId) {
-    if (!input.summary || !Array.isArray(input.steps) || input.steps.length === 0) {
-      return { success: false, error: "Plan must have a summary and at least one step." };
-    }
-
-    // Persist plan to disk
-    const { createPlan } = await import("./plan-store.mjs");
-    const { planId } = createPlan(projectId, input.summary, input.steps, {});
-
-    // Update session state with plan todos
-    const { mergeState } = await import("./session-context.mjs");
-    mergeState(projectId, {
-      phase: "planning",
-      activeTask: { description: input.summary },
-      todos: input.steps.map(s => ({
-        content: s.action,
-        status: "pending",
-        activeForm: s.action.split(" ").slice(0, 4).join(" ") + "...",
-      })),
-    });
-
-    // Emit plan to frontend — triggers approval UI
-    this.onEvent(projectId, {
-      event: "orchestration_plan",
-      data: {
-        planId,
-        summary: input.summary,
-        steps: input.steps.map(s => ({
-          index: s.index,
-          action: s.action,
-          type: s.type,
-          files: s.files,
-        })),
-        totalSteps: input.steps.length,
-      },
-    }, requestId);
-
-    // Block until user approves or rejects
-    if (!this.planApprovalResolvers) {
-      return { success: false, error: "Plan approval system not initialized." };
-    }
-
-    try {
-      await new Promise((resolve, reject) => {
-        this.planApprovalResolvers.set(projectId, { resolve, reject });
-      });
-    } catch {
-      this.planApprovalResolvers.delete(projectId);
-      return { success: false, error: "Plan rejected by user." };
-    }
-
-    this.planApprovalResolvers.delete(projectId);
-    return {
-      success: true,
-      output: "Plan approved. Pane will now execute the plan step by step. Your planning turn is complete — do not continue.",
-    };
   }
 
   getToolExecutor(projectId, projectRoot) {
@@ -1237,8 +1145,9 @@ export class HttpBackend extends PunkBackend {
         request.intent,
         historyLength,
       );
-      let systemPrompt = request._systemOverride
+      let systemPrompt = request.systemPromptOverride
         || (request._systemPrepend ? request._systemPrepend + "\n\n" + context.full : context.full);
+      if (request.escalationHint) systemPrompt += `\n\n${request.escalationHint}`;
 
       // Emit synthetic init event after config is validated
       this.onEvent(
@@ -1549,19 +1458,7 @@ export class HttpBackend extends PunkBackend {
           }
 
           let result;
-          if (tool.name === "Plan") {
-            // Intercept before executor — Plan is a Pane gate, not a file operation
-            result = await this._handlePlanTool(
-              request.projectId,
-              parsedInput,
-              request.requestId,
-            );
-            if (result.success) {
-              // Signal to the turn loop to end this spawn — execution starts fresh
-              request._planApproved = true;
-              request._pendingPlan = parsedInput;
-            }
-          } else if (tool.name === "evaluate_js") {
+          if (tool.name === "evaluate_js") {
             try {
               const { getContextLimit } = await import("./session-context.mjs");
               const fn = new Function(
@@ -1694,16 +1591,6 @@ export class HttpBackend extends PunkBackend {
             content,
             is_error: isError,
           });
-        }
-
-        // Plan approved — end this planning spawn so punk-engine can start execution phase
-        if (request._planApproved) {
-          this.onEvent(
-            request.projectId,
-            { event: "processEnded", data: { exit_code: 0 } },
-            request.requestId,
-          );
-          return;
         }
 
         if (needsStateRefresh) {

@@ -10,8 +10,6 @@ import {
   getOpenRouterModels,
   getAllModels,
   refreshAllModels,
-  checkClaudeUpdate,
-  updateClaude,
   checkGeminiUpdate,
   updateGemini,
 } from "../lib/tauri-commands";
@@ -48,7 +46,7 @@ interface WorkspaceState {
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
   selectedModelProvider: string; // The provider for the current model
   selectedModelThinking: boolean;
-  punkBackend: string; // "http" | "gemini-cli" | "claude-cli"
+  punkBackend: string; // "api" | "claude-code" | "gemini"
   httpProvider: string; // "deepseek" | "kimi" | "anthropic" | etc.
   httpApiKeys: Record<string, string>;
   httpBaseUrls: Record<string, string>;
@@ -59,10 +57,6 @@ interface WorkspaceState {
   fetchOpenRouterModels: () => Promise<void>;
   fetchAllModels: () => Promise<void>;
   refreshAllModels: () => Promise<void>;
-  // Overlay — mutually exclusive workspace-level spaces (mind, profile, history)
-  overlay: "mind" | "profile" | "history" | null;
-  setOverlay: (overlay: "mind" | "profile" | "history" | null) => void;
-  toggleOverlay: (overlay: "mind" | "profile" | "history") => void;
   // SDK metadata — populated after first backend session init
   sdkModels: import("../lib/punk-types").SdkModel[] | null;
   sdkAccount: import("../lib/punk-types").SdkAccount | null;
@@ -72,13 +66,6 @@ interface WorkspaceState {
   profileBio: string;
   profileRole: string;
   profileAvatarDataUrl: string | null; // data:image/... URL for display
-  // Claude updates
-  claudeUpdateAvailable: boolean;
-  claudeUpdateState: "available" | "updating" | "updated" | "restart" | null;
-  claudeCurrentVersion: string | null;
-  claudeNewVersion: string | null;
-  checkForClaudeUpdate: () => Promise<void>;
-  triggerClaudeUpdate: () => Promise<void>;
   // Gemini updates
   geminiUpdateAvailable: boolean;
   geminiUpdateState: "available" | "updating" | "updated" | "restart" | null;
@@ -190,7 +177,7 @@ function createWorkspaceStore() {
     selectedModel: "stepfun/step-3.5-flash:free",
     selectedModelProvider: "openrouter",
     selectedModelThinking: true,
-    punkBackend: "http",
+    punkBackend: "api",
     httpProvider: "openrouter",
     httpApiKeys: {},
     httpBaseUrls: {},
@@ -231,10 +218,6 @@ function createWorkspaceStore() {
         console.error("Failed to refresh all models:", err);
       }
     },
-    // Overlay
-    overlay: null,
-    setOverlay: (o) => set({ overlay: o }),
-    toggleOverlay: (o) => set((state) => ({ overlay: state.overlay === o ? null : o })),
     // SDK metadata
     sdkModels: null,
     sdkAccount: null,
@@ -244,11 +227,6 @@ function createWorkspaceStore() {
     profileBio: "",
     profileRole: "",
     profileAvatarDataUrl: null,
-    // Claude updates
-    claudeUpdateAvailable: false,
-    claudeUpdateState: null,
-    claudeCurrentVersion: null,
-    claudeNewVersion: null,
     geminiUpdateAvailable: false,
     geminiUpdateState: null,
     geminiCurrentVersion: null,
@@ -258,37 +236,6 @@ function createWorkspaceStore() {
     setProfileRole: (role: string) => set({ profileRole: role }),
     setProfileAvatarDataUrl: (url: string | null) =>
       set({ profileAvatarDataUrl: url }),
-    checkForClaudeUpdate: async () => {
-      const result = await checkClaudeUpdate();
-      if (!result.error && result.updateAvailable) {
-        set({
-          claudeUpdateAvailable: true,
-          claudeUpdateState: "available",
-          claudeCurrentVersion: result.currentVersion,
-          claudeNewVersion: result.newVersion,
-        });
-      } else {
-        set({
-          claudeUpdateAvailable: false,
-          claudeUpdateState: null,
-          claudeCurrentVersion: result.currentVersion,
-          claudeNewVersion: null,
-        });
-      }
-    },
-    triggerClaudeUpdate: async () => {
-      set({ claudeUpdateState: "updating" });
-      const result = await updateClaude();
-      if (result.success) {
-        set({ claudeUpdateState: "updated" });
-        setTimeout(() => {
-          set({ claudeUpdateState: "restart", claudeUpdateAvailable: false });
-        }, 2000);
-      } else {
-        // keep showing available so user can retry, but don't silently swallow the error
-        set({ claudeUpdateState: "available" });
-      }
-    },
     checkForGeminiUpdate: async () => {
       const result = await checkGeminiUpdate();
       if (!result.error && result.updateAvailable) {
@@ -470,14 +417,14 @@ function createWorkspaceStore() {
       return (
         intentRouting[punkBackend] ||
         DEFAULT_BACKEND_ROUTING[punkBackend] ||
-        DEFAULT_BACKEND_ROUTING["http"]
+        DEFAULT_BACKEND_ROUTING["api"]
       );
     },
     setIntentRouting: (routing) => {
       if (!routing) return;
       const { punkBackend, intentRouting } = get();
       const defaultForBackend =
-        DEFAULT_BACKEND_ROUTING[punkBackend] || DEFAULT_BACKEND_ROUTING["http"];
+        DEFAULT_BACKEND_ROUTING[punkBackend] || DEFAULT_BACKEND_ROUTING["api"];
 
       set({
         intentRouting: {

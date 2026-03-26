@@ -248,6 +248,17 @@ const TOOLS = [
     },
   },
   {
+    name: "pane_set_why",
+    description: "Set this project's foundational purpose — what it is trying to be, who it serves, what problem it solves, and where it is headed. This is per-project (not global) and gives every future suggestion context and criteria to reason against. Call this once you have understood the project's core purpose through conversation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        why: { type: "string", description: "The project's foundational purpose — a concise narrative covering what it is, who it's for, what problem it solves, and its direction" },
+      },
+      required: ["why"],
+    },
+  },
+  {
     name: "pane_find_symbol",
     description: "Find exported symbols (functions, classes, types, interfaces, constants) in the project by name. Returns exact file path and line number. Use this instead of grep when you know the name of what you're looking for.",
     inputSchema: {
@@ -428,9 +439,17 @@ async function handleToolCall(name, args) {
     }
 
     case "pane_brief": {
+      const parts = [];
+      const why = await readText(path.join(memoryDir, "why.md"));
+      if (why) {
+        parts.push("## Project Purpose");
+        parts.push(why.trim());
+        parts.push("");
+      }
       const brief = await readText(path.join(memoryDir, "brief.md"));
-      if (!brief) return text("No project brief yet — memory will accumulate as you work.");
-      return text(brief);
+      if (brief) parts.push(brief);
+      if (!parts.length) return text("No project brief yet — memory will accumulate as you work.");
+      return text(parts.join("\n"));
     }
 
     case "pane_checkpoints": {
@@ -652,6 +671,17 @@ async function handleToolCall(name, args) {
       await fs.promises.writeFile(philPath, philosophy);
 
       return text("Design philosophy updated.");
+    }
+
+    case "pane_set_why": {
+      const why = (args?.why || "").trim();
+      if (!why) return text("Why text is required.");
+
+      const whyDir = path.join(PANE_DIR, "memory", PROJECT_ID);
+      await fs.promises.mkdir(whyDir, { recursive: true });
+      await fs.promises.writeFile(path.join(whyDir, "why.md"), why);
+
+      return text("Project purpose recorded. Every future session on this project will carry this context.");
     }
 
     case "pane_find_symbol": {

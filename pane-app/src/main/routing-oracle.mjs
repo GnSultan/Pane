@@ -30,6 +30,7 @@ export function classifyDomain(prompt) {
   if (/\b(refactor|migrate|overhaul|rewrite|cleanup|clean up|restructure)\b/.test(t)) return "refactoring";
   if (/^(what|why|how|explain|tell me|can you|do you|could you)\b/.test(t)) return "explanation";
   if (/\b(implement|add feature|create|build|write|generate|integrate)\b/.test(t)) return "implementation";
+  if (/\b(security|auth|authentication|authorization|oauth|jwt|csrf|xss|injection|vulnerability|exploit|penetration|encrypt|decrypt|hash|certificate|ssl|tls)\b/.test(t)) return "security";
   return "general";
 }
 
@@ -54,11 +55,11 @@ function explorationRate(totalSamples) {
 // @param {Array}   candidates [{ model, provider }] — user-configured options
 // @returns {{ top: {model,provider}, score, confidence, exploring } | null}
 
-export function consult(taskType, domain, candidates) {
+export function consult(taskType, domain, candidates, projectId = '') {
   if (!candidates || candidates.length <= 1) return null;
 
   const scored = candidates.map(({ model, provider }) => {
-    const profile = routingStore.getProfile(model, provider, domain, taskType);
+    const profile = routingStore.getProfile(model, provider, domain, taskType, projectId);
     const prior   = routingStore.getPrior(model, provider);
 
     let score      = null;
@@ -135,6 +136,9 @@ function _priorScore(prior, domain, taskType) {
       break;
     case "devops":
       score = (prior.coding_score ?? 0.5) * 0.6 + (prior.reasoning_score ?? 0.5) * 0.4;
+      break;
+    case "security":
+      score = ((prior.coding_score ?? 0.5) + (prior.reasoning_score ?? 0.5)) / 2;
       break;
     default:
       score = prior.general_score ?? prior.reasoning_score ?? prior.coding_score ?? 0.5;

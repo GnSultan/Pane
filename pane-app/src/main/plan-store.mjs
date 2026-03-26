@@ -97,3 +97,31 @@ export function readPlan(projectId, planId) {
     return null;
   }
 }
+
+/**
+ * Return the most recent "executing" plan for this project created within
+ * the last `maxAgeMs` milliseconds. Used to resume rather than re-plan when
+ * the user sends "continue" after a planning failure.
+ *
+ * Returns the plan object or null.
+ */
+export function getLatestExecutingPlan(projectId, maxAgeMs = 30 * 60 * 1000) {
+  try {
+    const dir = planDir(projectId);
+    if (!fs.existsSync(dir)) return null;
+    const files = fs.readdirSync(dir)
+      .filter(f => f.endsWith(".json"))
+      .sort()
+      .reverse(); // newest first (filenames start with plan-{timestamp})
+    const cutoff = Date.now() - maxAgeMs;
+    for (const file of files) {
+      try {
+        const plan = JSON.parse(fs.readFileSync(path.join(dir, file), "utf-8"));
+        if (plan.status === "executing" && plan.created >= cutoff) return plan;
+      } catch { /* skip corrupt files */ }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}

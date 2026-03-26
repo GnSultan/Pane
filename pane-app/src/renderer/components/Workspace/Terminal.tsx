@@ -26,6 +26,82 @@ interface TerminalLine {
 
 const CMD_END_MARKER = "___PANE_CMD_END___";
 const PWD_MARKER = "___PANE_PWD___";
+const LIVE_OUTPUT_MAX_LINES = 200;
+const OUTPUT_BUFFER_MAX = 500_000; // ~500KB, prevents unbounded memory growth
+
+// Process \r semantically: overwrite current line rather than delete it.
+// This collapses progress bars (npm, pip, cargo) into a single updating line
+// instead of accumulating hundreds of identical lines.
+function processCarriageReturns(text: string): string {
+  const lines = text.split("\n");
+  return lines.map((line) => {
+    if (!line.includes("\r")) return line;
+    const parts = line.split("\r");
+    return parts[parts.length - 1] ?? "";
+  }).join("\n");
+}
+
+// Return only the last N lines of text — tail -f style display.
+function tailLines(text: string, max: number): string {
+  const lines = text.split("\n");
+  if (lines.length <= max) return text;
+  return lines.slice(-max).join("\n");
+}
+
+// Detect progress bar lines and extract fill level.
+// pct is null when fill chars exist but no numeric progress is found (indeterminate).
+function parseProgress(line: string): { pct: number | null; label: string | null } | null {
+  // Must have 4+ consecutive fill characters — the core signal
+  if (!/[#=█░▓▒▪■~\-]{4,}/.test(line)) return null;
+
+  // Percentage format: 47%
+  const pctMatch = line.match(/(\d{1,3})%/);
+  if (pctMatch) {
+    const pct = parseInt(pctMatch[1]!, 10);
+    if (pct >= 0 && pct <= 100) return { pct, label: `${pct}%` };
+  }
+
+  // Fraction format: 47/52
+  const fracMatch = line.match(/\b(\d+)\/(\d+)\b/);
+  if (fracMatch) {
+    const n = parseInt(fracMatch[1]!, 10);
+    const total = parseInt(fracMatch[2]!, 10);
+    if (total > 0 && n >= 0 && n <= total) {
+      return { pct: Math.round((n / total) * 100), label: `${n}/${total}` };
+    }
+  }
+
+  // Fill chars with no numeric info — indeterminate
+  return { pct: null, label: null };
+}
+
+function ProgressBar({ pct, label }: { pct: number | null; label: string | null }) {
+  return (
+    <div className="flex items-center gap-3 mt-2 mb-1">
+      <div className="flex-1 h-[2px] bg-pane-border/40 rounded-full overflow-hidden">
+        {pct !== null ? (
+          <div
+            className="h-full rounded-full transition-all duration-150"
+            style={{ width: `${pct}%`, background: "var(--pane-terminal)" }}
+          />
+        ) : (
+          <div
+            className="h-full w-1/3 rounded-full animate-pulse"
+            style={{ background: "var(--pane-terminal)" }}
+          />
+        )}
+      </div>
+      {label && (
+        <span
+          className="shrink-0 tabular-nums"
+          style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)" }}
+        >
+          {label}
+        </span>
+      )}
+    </div>
+  );
+}
 
 function measureCaretPos(
   el: HTMLTextAreaElement,
@@ -83,10 +159,6 @@ function nextTabId(projectId: string): string {
   return `pty-${projectId}-${Date.now()}-${++tabCounter}`;
 }
 
-function tabTitle(index: number): string {
-  return index === 0 ? "zsh" : `zsh (${index + 1})`;
-}
-
 // State per terminal tab — kept outside React to survive tab switches
 interface TabState {
   lines: TerminalLine[];
@@ -131,51 +203,54 @@ function getTabState(tabId: string, initialCwd: string): TabState {
 function TerminalTabBar({
   tabs,
   activeTabId,
+  homeDir,
   onSelect,
   onClose,
   onNew,
 }: {
   tabs: TerminalTab[];
   activeTabId: string | null;
+  homeDir: string;
   onSelect: (id: string) => void;
   onClose: (id: string) => void;
   onNew: () => void;
 }) {
-  if (tabs.length <= 1) return null;
-
   return (
     <div
-      className="shrink-0 flex items-center gap-1 px-10 pt-2 pb-1 relative z-20"
+      className="shrink-0 flex items-center px-4 pt-2 pb-1 gap-1 relative z-20"
       data-no-drag
     >
-      {tabs.map((tab) => (
-        <button
-          key={tab.id}
-          onClick={() => onSelect(tab.id)}
-          className={`font-mono px-2 py-0.5 rounded flex items-center gap-1.5 btn-press ${
-            tab.id === activeTabId
-              ? "text-pane-text"
-              : tab.isAlive
-                ? "text-pane-text-secondary/50 hover:text-pane-text-secondary"
-                : "text-pane-text-secondary/30"
-          }`}
-          style={{ fontSize: "var(--pane-font-size-xs)" }}
-        >
-          <span>{tab.title}</span>
-          <span
-            onClick={(e) => {
-              e.stopPropagation();
-              onClose(tab.id);
-            }}
-            className="hover:text-pane-text cursor-pointer"
+      {tabs.map((tab) => {
+        const label = tab.cwd ? shortenPath(tab.cwd, homeDir) : "~";
+        const isActive = tab.id === activeTabId;
+        return (
+          <button
+            key={tab.id}
+            onClick={() => onSelect(tab.id)}
+            className={`flex-1 min-w-0 font-mono px-3 py-1 rounded-md flex items-center justify-between gap-2 btn-press transition-colors ${
+              isActive
+                ? "bg-pane-text/[0.06] text-pane-text"
+                : tab.isAlive
+                  ? "text-pane-text-secondary/50 hover:text-pane-text-secondary hover:bg-pane-text/[0.03]"
+                  : "text-pane-text-secondary/30"
+            }`}
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
-            x
-          </span>
-        </button>
-      ))}
+            <span className="truncate min-w-0">{label}</span>
+            {tabs.length > 1 && (
+              <span
+                onClick={(e) => { e.stopPropagation(); onClose(tab.id); }}
+                className="shrink-0 opacity-40 hover:opacity-100 cursor-pointer"
+              >
+                ×
+              </span>
+            )}
+          </button>
+        );
+      })}
       <button
         onClick={onNew}
-        className="font-mono text-pane-text-secondary/40 hover:text-pane-text-secondary px-1.5 py-0.5 btn-press"
+        className="shrink-0 font-mono text-pane-text-secondary/40 hover:text-pane-text-secondary w-7 h-7 flex items-center justify-center rounded-md hover:bg-pane-text/[0.04] btn-press"
         style={{ fontSize: "var(--pane-font-size-xs)" }}
       >
         +
@@ -202,6 +277,7 @@ function TerminalTabContent({
   const state = getTabState(tabId, workingDir);
 
   const [lines, setLines] = useState<TerminalLine[]>(state.lines);
+  const [liveOutput, setLiveOutput] = useState("");
   const [command, setCommand] = useState("");
   const [isRunning, setIsRunning] = useState(state.isRunning);
   const [cwd, setCwd] = useState(state.cwd);
@@ -217,6 +293,8 @@ function TerminalTabContent({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef(state);
+  const liveOutputRaf = useRef(0);  // rAF handle for throttled live output updates
+  const scrollRaf = useRef(0);       // rAF handle for throttled auto-scroll
 
   // Keep tabState in sync
   useEffect(() => {
@@ -243,8 +321,9 @@ function TerminalTabContent({
     ts.outputBuffer = "";
 
     const cleanupData = onPtyData(tabId, (rawData: string) => {
-      // Strip ANSI escape codes and carriage returns (PTY sends \r\n)
-      const data = stripAnsi(rawData).replace(/\r/g, "");
+      // Strip ANSI codes, then process \r semantically (overwrite line, not delete)
+      // so progress bars collapse to a single updating line instead of inflating output.
+      const data = processCarriageReturns(stripAnsi(rawData));
 
       // Suppress initial shell prompt output (before first command)
       if (!ts.initialized) {
@@ -268,9 +347,26 @@ function TerminalTabContent({
         ts.outputBuffer += data;
       }
 
+      // Cap buffer to prevent unbounded memory growth on very long commands.
+      // Keeps the tail so completion marker is never lost.
+      if (ts.outputBuffer.length > OUTPUT_BUFFER_MAX) {
+        const trimAt = ts.outputBuffer.indexOf("\n", ts.outputBuffer.length - OUTPUT_BUFFER_MAX);
+        ts.outputBuffer = trimAt !== -1 ? ts.outputBuffer.slice(trimAt + 1) : ts.outputBuffer.slice(-OUTPUT_BUFFER_MAX);
+      }
+
+      // Throttle live output updates to one per animation frame.
+      // Prevents hundreds of React re-renders per second on fast-streaming commands.
+      cancelAnimationFrame(liveOutputRaf.current);
+      liveOutputRaf.current = requestAnimationFrame(() => {
+        if (!stateRef.current.isRunning) return;
+        setLiveOutput(tailLines(stateRef.current.outputBuffer, LIVE_OUTPUT_MAX_LINES));
+      });
+
       // Check for command completion marker
       const markerIdx = ts.outputBuffer.indexOf(CMD_END_MARKER);
       if (markerIdx !== -1) {
+        cancelAnimationFrame(liveOutputRaf.current);
+        setLiveOutput("");
         // Extract output before the marker
         let output = ts.outputBuffer.slice(0, markerIdx);
         const afterMarker = ts.outputBuffer.slice(
@@ -302,6 +398,7 @@ function TerminalTabContent({
 
         if (newCwd) {
           setCwd(newCwd);
+          useProjectsStore.getState().updateTerminalTabCwd(projectId, tabId, newCwd);
         }
 
         ts.outputBuffer = "";
@@ -364,12 +461,16 @@ function TerminalTabContent({
     return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
   }, [updateCaret]);
 
-  // Auto-scroll
+  // Auto-scroll — fires on both completed lines and live streaming output.
+  // rAF-throttled so rapid liveOutput updates don't cause scroll jank.
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [lines]);
+    cancelAnimationFrame(scrollRaf.current);
+    scrollRaf.current = requestAnimationFrame(() => {
+      if (scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      }
+    });
+  }, [lines, liveOutput]);
 
   // Focus input when tab becomes visible or command finishes/starts
   useEffect(() => {
@@ -405,6 +506,8 @@ function TerminalTabContent({
         },
       ]);
       setCommand("");
+      cancelAnimationFrame(liveOutputRaf.current);
+      setLiveOutput("");
       setIsRunning(true);
       ts.isRunning = true;
       ts.initialized = true;
@@ -427,6 +530,7 @@ function TerminalTabContent({
     const ts = stateRef.current;
     setTimeout(() => {
       if (ts.isRunning) {
+        cancelAnimationFrame(liveOutputRaf.current);
         // Flush any accumulated output
         const pending = ts.outputBuffer.replace(/\^C\n?/g, "").trim();
         if (pending) {
@@ -435,6 +539,7 @@ function TerminalTabContent({
             { type: "output", content: pending, timestamp: Date.now() },
           ]);
         }
+        setLiveOutput("");
         ts.outputBuffer = "";
         ts.isRunning = false;
         ts.echoSkipped = false;
@@ -443,7 +548,7 @@ function TerminalTabContent({
     }, 200);
   }, [tabId, isRunning]);
 
-  // Global escape/ctrl+c listener when visible
+  // Global escape/ctrl+c listener when visible and running
   useEffect(() => {
     if (!isVisible || !isRunning) return;
     const handleWindowKeyDown = (e: KeyboardEvent) => {
@@ -504,7 +609,7 @@ function TerminalTabContent({
 
   return (
     <div
-      className="flex flex-col h-full w-full"
+      className="flex flex-col flex-1 min-h-0 w-full"
       style={{ display: isVisible ? "flex" : "none" }}
     >
       <div className="flex-1 relative min-h-0" data-no-drag>
@@ -519,7 +624,7 @@ function TerminalTabContent({
         )}
         <div
           ref={scrollRef}
-          className="h-full overflow-y-auto overflow-x-hidden px-10 py-8 relative z-20"
+          className="h-full overflow-y-auto overflow-x-hidden px-10 pt-8 pb-4 relative z-20"
           style={{ willChange: "transform" }}
         >
           {lines.length === 0 && (
@@ -558,68 +663,90 @@ function TerminalTabContent({
             </div>
           ))}
 
-          {isRunning && (
-            <div className="flex items-center gap-2 text-pane-text-secondary/50 font-mono mt-2">
-              <span className="inline-block w-1 h-3 bg-pane-text-secondary/50 animate-pulse" />
-              <span style={{ fontSize: "var(--pane-font-size-sm)" }}>
-                running...
-              </span>
+          {isRunning && (() => {
+            const outputLines = liveOutput ? liveOutput.split("\n") : [];
+            const lastLine = outputLines[outputLines.length - 1] ?? "";
+            const progress = parseProgress(lastLine);
+            const bodyText = progress !== null && outputLines.length > 1
+              ? outputLines.slice(0, -1).join("\n")
+              : progress !== null ? "" : liveOutput;
+            return (
+            <div className="font-mono">
+              {bodyText && (
+                <div
+                  className="whitespace-pre-wrap break-words text-pane-text-secondary"
+                  style={{ fontSize: "var(--pane-font-size-base)" }}
+                >
+                  {bodyText}
+                </div>
+              )}
+              {progress !== null && (
+                <ProgressBar pct={progress.pct} label={progress.label} />
+              )}
+              <div className="flex items-center gap-2 text-pane-text-secondary/50 mt-2">
+                <span className="inline-block w-1 h-3 bg-pane-text-secondary/50 animate-pulse" />
+                <span style={{ fontSize: "var(--pane-font-size-sm)" }}>running...</span>
+              </div>
             </div>
-          )}
+            );
+          })()}
         </div>
       </div>
 
-      {/* Command input with cwd prompt */}
-      <div className="shrink-0 px-10 py-6 flex items-start gap-2">
-        <span
-          className="text-pane-text-secondary/60 font-mono select-none shrink-0"
-          style={{ lineHeight: "2rem", fontSize: "var(--pane-font-size-base)" }}
-        >
-          {displayPath} $
-        </span>
-        <div ref={caretContainerRef} className="flex-1 relative">
-          <textarea
-            ref={inputRef}
-            value={command}
-            onChange={(e) => {
-              setCommand(e.target.value);
-              setHistoryIndex(-1);
-            }}
-            onKeyDown={handleKeyDown}
-            onFocus={() => {
-              setTextareaFocused(true);
-              updateCaret();
-            }}
-            onBlur={() => {
-              setTextareaFocused(false);
-              setCaretPos(null);
-            }}
-            readOnly={isRunning}
-            placeholder=""
-            className="w-full bg-transparent border-none outline-none resize-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
-            style={{
-              fontSize: "var(--pane-font-size-base)",
-              minHeight: "2rem",
-              lineHeight: "2rem",
-              caretColor: "transparent",
-            }}
-            rows={1}
-          />
-          {/* Static amber cursor */}
-          {textareaFocused && caretPos && (
-            <div
-              aria-hidden
-              style={{
-                position: "absolute",
-                top: caretPos.top,
-                left: caretPos.left,
-                width: 2,
-                height: caretPos.lineHeight,
-                background: "var(--pane-editor-cursor)",
-                pointerEvents: "none",
+      {/* Command input card */}
+      <div className="shrink-0 mx-6 mb-4">
+        <div className={`bg-pane-bg rounded-xl ring-1 transition-colors ${isRunning ? "ring-pane-terminal/40" : "ring-pane-border/40"}`}>
+          <div
+            className="px-5 pt-3 pb-1 font-mono select-none"
+            style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)" }}
+          >
+            {displayPath} $
+          </div>
+          <div ref={caretContainerRef} className="relative">
+            <textarea
+              ref={inputRef}
+              value={command}
+              onChange={(e) => {
+                setCommand(e.target.value);
+                setHistoryIndex(-1);
               }}
+              onKeyDown={handleKeyDown}
+              onFocus={() => {
+                setTextareaFocused(true);
+                updateCaret();
+              }}
+              onBlur={() => {
+                setTextareaFocused(false);
+                setCaretPos(null);
+              }}
+              readOnly={isRunning}
+              placeholder={isRunning ? "" : "command"}
+              className="w-full bg-transparent border-none outline-none resize-none text-pane-text font-mono placeholder:text-pane-text-secondary/20"
+              style={{
+                fontSize: "var(--pane-font-size-base)",
+                minHeight: "2.5rem",
+                lineHeight: "1.75",
+                caretColor: "transparent",
+                padding: "0 1.25rem 0.75rem",
+              }}
+              rows={1}
             />
-          )}
+            {/* Static amber cursor */}
+            {textareaFocused && caretPos && (
+              <div
+                aria-hidden
+                style={{
+                  position: "absolute",
+                  top: caretPos.top,
+                  left: caretPos.left,
+                  width: 2,
+                  height: caretPos.lineHeight,
+                  background: "var(--pane-editor-cursor)",
+                  pointerEvents: "none",
+                }}
+              />
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -652,11 +779,12 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
       const id = nextTabId(projectId);
       store.addTerminalTab(projectId, {
         id,
-        title: tabTitle(0),
+        title: workingDir,
         isAlive: true,
+        cwd: workingDir,
       });
     }
-  }, [projectId]);
+  }, [projectId, workingDir]);
 
   // Cleanup all PTYs on unmount
   useEffect(() => {
@@ -667,15 +795,14 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
 
   const handleNewTab = useCallback(() => {
     const store = useProjectsStore.getState();
-    const project = store.projects.get(projectId);
-    const index = project ? project.terminalTabs.length : 0;
     const id = nextTabId(projectId);
     store.addTerminalTab(projectId, {
       id,
-      title: tabTitle(index),
+      title: workingDir,
       isAlive: true,
+      cwd: workingDir,
     });
-  }, [projectId]);
+  }, [projectId, workingDir]);
 
   const handleCloseTab = useCallback(
     (tabId: string) => {
@@ -698,6 +825,7 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
       <TerminalTabBar
         tabs={tabs}
         activeTabId={activeTabId}
+        homeDir={homeDir}
         onSelect={handleSelectTab}
         onClose={handleCloseTab}
         onNew={handleNewTab}

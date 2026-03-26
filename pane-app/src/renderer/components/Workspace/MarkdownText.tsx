@@ -216,7 +216,7 @@ export const MarkdownText = memo(function MarkdownText({
   const shouldParseIncremental = isStreaming;
 
   const blocks = useMemo(
-    () => (shouldParseMarkdown ? parseBlocks(text) : null),
+    () => (shouldParseMarkdown ? parseBlocks(wrapBareJson(text)) : null),
     [text, shouldParseMarkdown],
   );
 
@@ -368,6 +368,25 @@ type IncrementalBlock =
   | { type: "paragraph_chunk"; content: string }
   | { type: "list_item"; content: string; ordered: boolean }
   | { type: "inline"; content: string };
+
+/**
+ * If the text contains bare JSON objects/arrays (not wrapped in code fences),
+ * wrap them so they render as formatted code blocks instead of raw text.
+ */
+function wrapBareJson(text: string): string {
+  return text.replace(
+    /(^|\n)([ \t]*\{[\s\S]*?\}[ \t]*|\[[\s\S]*?\][ \t]*)(?=\n|$)/g,
+    (match, prefix, json) => {
+      const trimmed = json.trim();
+      try {
+        JSON.parse(trimmed);
+        return `${prefix}\`\`\`json\n${trimmed}\n\`\`\``;
+      } catch {
+        return match; // not valid JSON — leave as-is
+      }
+    }
+  );
+}
 
 function parseBlocks(text: string): Block[] {
   const lines = text.split("\n");

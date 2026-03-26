@@ -14,61 +14,46 @@ import type { ElectronAPI } from '../../lib/electron';
 
 const electronAPI = window.electronAPI as ElectronAPI;
 
-// Per-project scroll cache — measured while visible, restored before reveal.
-// Sentinel 1e9 means "pin to bottom": browser clamps to max scrollable.
-const scrollCache = new Map<string, number>();
-
-// Visibility is toggled via direct DOM manipulation — bypasses React entirely.
-// The Conversation inside is memo'd + never subscribes to activeProjectId,
-// so switching projects triggers zero re-renders in the conversation subtree.
+// z-index stacking for thread switching — zero-cost compositor operation.
+// All ConversationLayers are always visible and GPU-composited. Switching threads
+// just changes z-index (active=1, inactive=0) + pointer-events. No visibility toggle,
+// no layout read, no reflow, no layer teardown. The compositor reorders existing layers
+// without repainting — sub-millisecond at any refresh rate.
 const ConversationLayer = memo(function ConversationLayer({ projectId }: { projectId: string }) {
   const ref = useRef<HTMLDivElement>(null);
-  const initiallyActive = useProjectsStore.getState().activeProjectId === projectId;
+  const store = useProjectsStore.getState();
+  const initiallyActive =
+    store.activeProjectId === projectId &&
+    (store.projects.get(projectId)?.mode ?? "conversation") === "conversation";
 
   useEffect(() => {
-    let rafId = 0;
-
-    const hide = () => {
+    const apply = (state: ReturnType<typeof useProjectsStore.getState>) => {
       if (!ref.current) return;
-      const scrollEl = ref.current.querySelector<HTMLDivElement>("[data-conv-scroll]");
-      if (scrollEl) {
-        const { scrollTop, scrollHeight, clientHeight } = scrollEl;
-        scrollCache.set(projectId, scrollHeight - scrollTop - clientHeight < 10 ? 1e9 : scrollTop);
-      }
-      // opacity bypasses paint — goes straight to compositor, disappears this frame.
-      // visibility:hidden queues a repaint, leaving the old layer visible for 1-2 extra frames.
-      ref.current.style.opacity = "0";
-      ref.current.style.pointerEvents = "none";
+      const isActive = state.activeProjectId === projectId;
+      const mode = state.projects.get(projectId)?.mode ?? "conversation";
+      const shouldShow = isActive && mode === "conversation";
+      ref.current.style.zIndex = shouldShow ? "1" : "0";
+      ref.current.style.pointerEvents = shouldShow ? "auto" : "none";
     };
 
-    const show = () => {
-      if (!ref.current) return;
-      const scrollEl = ref.current.querySelector<HTMLDivElement>("[data-conv-scroll]");
-      if (scrollEl) scrollEl.scrollTop = scrollCache.get(projectId) ?? 1e9;
-      ref.current.style.opacity = "1";
-      ref.current.style.pointerEvents = "";
-    };
-
-    const apply = (activeId: string | null, instant: boolean) => {
-      cancelAnimationFrame(rafId);
-      if (activeId === projectId) {
-        if (instant) { show(); return; }
-        // Deliberate 1-frame blank: old layer hid this frame, new appears next frame.
-        // The brief workspace background visible between them reads as navigation, not replacement.
-        rafId = requestAnimationFrame(show);
-      } else {
-        hide();
-      }
-    };
-
-    apply(useProjectsStore.getState().activeProjectId, true);
+    apply(useProjectsStore.getState());
     return useProjectsStore.subscribe((state, prev) => {
-      if (state.activeProjectId !== prev.activeProjectId) apply(state.activeProjectId, false);
+      const activeChanged = state.activeProjectId !== prev.activeProjectId;
+      const modeChanged =
+        state.projects.get(projectId)?.mode !== prev.projects.get(projectId)?.mode;
+      if (activeChanged || modeChanged) apply(state);
     });
   }, [projectId]);
 
   return (
-    <div ref={ref} className="absolute inset-0 flex" style={{ opacity: initiallyActive ? 1 : 0, pointerEvents: initiallyActive ? "auto" : "none" }}>
+    <div
+      ref={ref}
+      className="absolute inset-0 flex bg-pane-bg"
+      style={{
+        zIndex: initiallyActive ? 1 : 0,
+        pointerEvents: initiallyActive ? "auto" : "none",
+      }}
+    >
       <Conversation projectId={projectId} />
     </div>
   );
@@ -80,18 +65,6 @@ function ProjectTerminal({ projectId }: { projectId: string }) {
   return <Terminal projectId={projectId} workingDir={root} />;
 }
 
-// Lazy keep-alive: mounts on first open, stays mounted (hidden) after.
-// Avoids paying mount cost on every open, but doesn't burn hooks when never used.
-function LazyKeepAlive({ open, children }: { open: boolean; children: React.ReactNode }) {
-  const [everOpened, setEverOpened] = useState(false);
-  if (open && !everOpened) setEverOpened(true);
-  if (!everOpened) return null;
-  return (
-    <div className={`absolute inset-0 ${!open ? "hidden" : ""}`}>
-      {children}
-    </div>
-  );
-}
 
 // Empty state — shown when no threads exist.
 // Centered input: type what you're working on → directory picker → thread created → message sent.
@@ -165,30 +138,48 @@ function GitView({ projectId }: { projectId: string }) {
 export function Workspace() {
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const projectOrder = useProjectsStore((s) => s.projectOrder);
-  const overlay = useWorkspaceStore((s) => s.overlay);
-  const activeMode = useProjectsStore((s) => {
-    if (!s.activeProjectId) return "conversation" as const;
-    return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
-  });
+  const geminiUpdateState = useWorkspaceStore((s) => s.geminiUpdateState);
+  const triggerGeminiUpdate = useWorkspaceStore((s) => s.triggerGeminiUpdate);
+  const showUpdate = !!geminiUpdateState;
+  const wsRef = useRef<HTMLDivElement>(null);
+
+  // Single store subscription → single data-mode DOM write → CSS handles all page visibility.
+  // No React re-render on mode switch. All pages transition in one style recalc, one paint frame.
+  useEffect(() => {
+    const applyMode = (state: ReturnType<typeof useProjectsStore.getState>) => {
+      if (!wsRef.current) return;
+      const id = state.activeProjectId;
+      const mode = id ? state.projects.get(id)?.mode ?? "conversation" : "conversation";
+      wsRef.current.dataset.mode = mode;
+    };
+    applyMode(useProjectsStore.getState());
+    return useProjectsStore.subscribe((state, prev) => {
+      const activeChanged = state.activeProjectId !== prev.activeProjectId;
+      const modeChanged = state.activeProjectId
+        ? state.projects.get(state.activeProjectId)?.mode !==
+          prev.projects.get(state.activeProjectId ?? "")?.mode
+        : false;
+      if (activeChanged || modeChanged) applyMode(state);
+    });
+  }, []);
 
   return (
-    <div className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
+    <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
       {/* Empty state — no threads yet */}
-      {projectOrder.length === 0 && overlay === null && (
+      {projectOrder.length === 0 && (
         <EmptyState />
       )}
 
-      <div className={`absolute inset-0 ${overlay !== null || activeMode !== "conversation" ? "hidden" : ""}`}>
-        {projectOrder.map((id) => (
-          <ConversationLayer key={id} projectId={id} />
-        ))}
-      </div>
+      {/* Conversation layers — self-managing visibility via store subscription */}
+      {projectOrder.map((id) => (
+        <ConversationLayer key={id} projectId={id} />
+      ))}
 
-      <div className={`absolute inset-0 flex flex-col ${overlay !== null || activeMode !== "viewer" ? "hidden" : ""}`}>
+      <div data-page="viewer" className="absolute inset-0 flex flex-col bg-pane-bg">
         <FileExplorer />
       </div>
 
-      <div className={`absolute inset-0 flex ${overlay !== null || activeMode !== "terminal" ? "hidden" : ""}`}>
+      <div data-page="terminal" className="absolute inset-0 flex bg-pane-bg">
         {projectOrder.map((id) => (
           <div
             key={id}
@@ -200,8 +191,7 @@ export function Workspace() {
         ))}
       </div>
 
-      {/* Git — a proper workspace mode, not an overlay */}
-      <div className={`absolute inset-0 flex flex-col ${overlay !== null || activeMode !== "git" ? "hidden" : ""}`}>
+      <div data-page="git" className="absolute inset-0 flex flex-col bg-pane-bg">
         {projectOrder.map((id) => (
           <div
             key={id}
@@ -213,23 +203,61 @@ export function Workspace() {
         ))}
       </div>
 
-      <LazyKeepAlive open={overlay === "mind"}>
+      <div data-page="mind" className="absolute inset-0 bg-pane-bg">
         <Mind />
-      </LazyKeepAlive>
+      </div>
 
-      <LazyKeepAlive open={overlay === "profile"}>
+      <div data-page="profile" className="absolute inset-0 bg-pane-bg">
         <Profile />
-      </LazyKeepAlive>
+      </div>
 
       {activeProjectId && (
-        <div className={`absolute inset-0 bg-pane-bg z-10 ${overlay !== "history" ? "hidden" : ""}`}>
-          <ChangeHistoryPanel
-            projectId={activeProjectId}
-            onCollapse={() => useWorkspaceStore.getState().setOverlay(null)}
-          />
+        <div data-page="history" className="absolute inset-0 bg-pane-bg">
+          <ChangeHistoryPanel projectId={activeProjectId} />
         </div>
       )}
 
+      {/* Update notification pills — inside the workspace border, top-right corner */}
+      {showUpdate && (
+        <div className="absolute top-1.5 right-1.5 flex items-center gap-2 z-40 pointer-events-none">
+
+          {geminiUpdateState && (
+            <div
+              data-no-drag
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 pointer-events-auto animate-fadeSlideDown"
+            >
+              {geminiUpdateState === "available" && (
+                <button
+                  onClick={() => triggerGeminiUpdate()}
+                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
+                  gemini update available
+                </button>
+              )}
+              {geminiUpdateState === "updating" && (
+                <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
+                  installing gemini...
+                </span>
+              )}
+              {geminiUpdateState === "updated" && (
+                <span className="text-[11px] font-mono text-pane-status-added">
+                  gemini complete
+                </span>
+              )}
+              {geminiUpdateState === "restart" && (
+                <button
+                  onClick={() => window.location.reload()}
+                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
+                  restart gemini
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
     </div>
   );
