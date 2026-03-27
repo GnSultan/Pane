@@ -19,6 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
+import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -259,7 +260,37 @@ export function mergeState(projectId, delta) {
  * Stable layer: identity, profile atoms, project brief, relevant files
  * Dynamic layer: session state, brain memories, session pins, intent directive
  */
-export function compileContext(projectId, intent = "other", historyLength = 0, backend = "gemini-cli") {
+
+// ---------------------------------------------------------------------------
+// ScoredItem helpers — backward-compatible normalisation for handoff items.
+// Pre-L3 handoffs store plain strings; L3+ stores { text, confidence, source }.
+// All consumers go through normalizeHandoffItem() to handle both shapes.
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalise a handoff item to { text, confidence, source }.
+ * Returns null for invalid/empty items.
+ */
+function normalizeHandoffItem(item) {
+  if (!item) return null;
+  if (typeof item === "string") {
+    const t = item.trim();
+    // Legacy strings get 0.65 — above the 0.60 injection threshold so they're
+    // shown, but below 0.80 so they get the "(uncertain)" label. This ensures
+    // handoffs written before Layer 3 aren't silently dropped on first upgrade.
+    return t ? { text: t, confidence: 0.65, source: "legacy" } : null;
+  }
+  if (typeof item === "object" && item.text) {
+    return {
+      text:       String(item.text).trim(),
+      confidence: typeof item.confidence === "number" ? item.confidence : 0.65,
+      source:     typeof item.source     === "string"  ? item.source     : "legacy",
+    };
+  }
+  return null;
+}
+
+export function compileContext(projectId, intent = "other", historyLength = 0, backend = "claude-code") {
   const stableParts  = [];
   const dynamicParts = [];
 
@@ -296,6 +327,95 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     backend,
   );
   stableParts.unshift(coreInstructions, "");
+
+  // ── PANE INTELLIGENCE GUIDE ──────────────────────────────────────────────
+  // This is the canonical operating model for working in Pane.
+  // It encodes context-first thinking, task playbooks, and the closed loop.
+  stableParts.push(
+    "## Working in Pane",
+    "",
+    "Pane pre-compiles everything relevant before you see the user's message. Your system prompt already contains: project purpose, architectural DNA, codebase map (every file described), relevant symbols, working set file contents, high-confidence memories, active principles, session state, recent actions, and the project brief.",
+    "",
+    "Start from what you already have. Tools extend context — they are not how you bootstrap.",
+    "",
+    "---",
+    "",
+    "**What is already in your context (do not call tools to fetch these)**",
+    "- Project purpose and DNA synthesis: the why and the architectural narrative",
+    "- Codebase map: one-line description of every file in the project",
+    "- Working set: content of the most-touched files, pre-read",
+    "- Symbol map: symbols most relevant to this query, already resolved",
+    "- Memories: high-confidence (≥0.75) past decisions, lessons, and error fixes",
+    "- Active principles: standing standards that must not be violated",
+    "- Session state: current task, locked decisions, recent actions, git status",
+    "- User profile: explicit rules and preferences, always applied",
+    "",
+    "**When to reach for tools (going beyond what is loaded)**",
+    "→ pane_find_symbol — a specific symbol not in the pre-queried symbol map",
+    "→ pane_recall — deeper history on a topic than the injected memories show",
+    "→ pane_knowledge_graph — structural connections between decisions: what depends on what",
+    "→ pane_cross_project — has this exact problem been solved in another project?",
+    "→ pane_open_files — full content of the file currently open (not just the working set preview)",
+    "→ pane_recent_terminal — full terminal history beyond the recentActions already in context",
+    "→ pane_synthesize — deeper architectural narrative than the DNA section already injected",
+    "→ pane_run_in_terminal — execute: builds, tests, git, verification",
+    "→ pane_remember / pane_set_rule / pane_set_why — persist discoveries (mandatory, not optional)",
+    "",
+    "---",
+    "",
+    "**Task playbooks**",
+    "",
+    "Bug investigation:",
+    "1. Check injected memories and working set — has this been seen before?",
+    "2. pane_recall if not in context — prior encounters, known fixes",
+    "3. pane_find_symbol — locate the exact function or component, do not grep by name",
+    "4. Read — only the specific section, not the whole file",
+    "5. pane_run_in_terminal — reproduce it; confirm the fix",
+    "6. pane_remember(error_fix) — root cause and fix; future sessions must not re-investigate",
+    "",
+    "Feature work:",
+    "1. Read injected DNA and principles — understand constraints before designing",
+    "2. pane_recall — prior art, constraints, or abandoned attempts in this area",
+    "3. pane_cross_project — has this been built elsewhere? Use proven patterns.",
+    "4. pane_knowledge_graph — which existing decisions and patterns apply",
+    "5. pane_find_symbol — locate integration points",
+    "6. Build → pane_run_in_terminal — verify",
+    "7. pane_remember(decision) — what was built and why; anchors future sessions",
+    "",
+    "Refactor or architectural change:",
+    "1. pane_knowledge_graph — blast radius: what connects to what you are changing",
+    "2. pane_recall — why was this built this way? were there constraints that shaped it?",
+    "3. pane_synthesize — if the DNA in context is insufficient for the scope of the change",
+    "4. pane_find_symbol — all instances that need to change",
+    "5. Change → pane_run_in_terminal — verify nothing broke",
+    "6. pane_remember(pattern) — the new pattern and why it replaces the old one",
+    "",
+    "Understanding the codebase:",
+    "1. Read the DNA synthesis and brief already in context — they are the answer",
+    "2. pane_knowledge_graph — see how the decisions connect structurally",
+    "3. pane_find_symbol — drill into any specific area",
+    "4. pane_cross_project — how does this compare to patterns across projects?",
+    "",
+    "---",
+    "",
+    "**The closed loop — mandatory**",
+    "Pane's brain improves only when you write back to it. After every session with significant findings:",
+    "→ pane_remember — any root cause, constraint, pattern, or decision that took investigation to find",
+    "→ pane_set_rule — immediately when the user states a firm preference; do not wait",
+    "→ pane_set_why — once you understand the project's purpose deeply enough to articulate it",
+    "",
+    "A session that discovers and does not record forces the next session to re-discover. Record as you go.",
+    "",
+    "---",
+    "",
+    "**Hard rules**",
+    "- Never use Grep to find a named symbol. pane_find_symbol is instant from the index.",
+    "- Never use Glob to explore file structure. The codebase map is already in your context.",
+    "- Never read a file from the working set — it is already pre-loaded.",
+    "- Never speculate about whether a build or test passes. Run it.",
+    "- Never end a session where root causes, decisions, or new patterns were found without persisting them.",
+    "",
+  );
 
   // Identity
   let identity = null;
@@ -632,6 +752,80 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     dynamicParts.push("");
   }
 
+  // Previous session handoff — inject at session start only (historyLength < 2).
+  // Uses rolling history (last 3 sessions): most recent shown in full, older shown
+  // as one-line summaries to give trajectory without bloating context.
+  // Stale handoffs (>24h) are dropped — they're noise, not signal.
+  //
+  // Confidence filtering (Layer 3):
+  //   ≥ 0.80 — shown as-is (high confidence)
+  //   0.60–0.79 — shown with "(uncertain)" suffix, model should verify first
+  //   < 0.60 — omitted (too noisy)
+  // Trajectory summaries only include items with confidence ≥ 0.75.
+  if (historyLength < 2) {
+    const history = readHandoffHistory(projectId) || [];
+    if (history.length > 0) {
+      const now = Date.now();
+
+      // Most recent — full detail if fresh enough
+      const recent = history[0];
+      const recentAgeHours = (now - (recent.timestamp || 0)) / (1000 * 60 * 60);
+
+      // Filter items above the injection threshold, label uncertain ones
+      const visibleItems = (arr) => (arr || []).reduce((out, raw) => {
+        const item = normalizeHandoffItem(raw);
+        if (!item || item.confidence < 0.60) return out;
+        const label = item.confidence < 0.80 ? ` (uncertain)` : "";
+        out.push({ text: item.text, label });
+        return out;
+      }, []);
+
+      const recentAccomplishments = visibleItems(recent.accomplishment);
+
+      if (recentAgeHours < 24 && recentAccomplishments.length > 0) {
+        const ageLabel = recentAgeHours >= 6 ? ` (~${Math.round(recentAgeHours)}h ago)` : "";
+        dynamicParts.push(`Previous session outcome${ageLabel} (correct anything wrong before proceeding):`);
+        for (const { text, label } of recentAccomplishments) dynamicParts.push(`✓ ${text}${label}`);
+        if (recent.currentObjective) dynamicParts.push(`Still working on: ${recent.currentObjective}`);
+
+        const recentBlockers = visibleItems(recent.blockers);
+        if (recentBlockers.length > 0) {
+          dynamicParts.push("Unresolved blockers:");
+          for (const { text, label } of recentBlockers) dynamicParts.push(`⚠ ${text}${label}`);
+        }
+
+        const recentNextSteps = visibleItems(recent.nextSteps);
+        if (recentNextSteps.length > 0) {
+          dynamicParts.push("Suggested next steps:");
+          for (const { text, label } of recentNextSteps) dynamicParts.push(`→ ${text}${label}`);
+        }
+
+        const recentFindings = visibleItems(recent.findings);
+        if (recentFindings.length > 0) {
+          dynamicParts.push("Discoveries from last session:");
+          for (const { text, label } of recentFindings) dynamicParts.push(`- ${text}${label}`);
+        }
+
+        dynamicParts.push("");
+
+        // Older sessions — one-line trajectory summaries, high-confidence only (≥ 0.75)
+        for (const older of history.slice(1)) {
+          const ageHrs = (now - (older.timestamp || 0)) / (1000 * 60 * 60);
+          if (ageHrs >= 24) continue; // drop stale
+          if (!older.accomplishment?.length) continue;
+          const highItems = (older.accomplishment || [])
+            .map(normalizeHandoffItem)
+            .filter(item => item && item.confidence >= 0.75)
+            .slice(0, 2);
+          if (!highItems.length) continue;
+          const summary = highItems.map(i => i.text).join(", ");
+          dynamicParts.push(`Earlier (~${Math.round(ageHrs)}h ago): ✓ ${summary}`);
+        }
+        if (history.length > 1) dynamicParts.push("");
+      }
+    }
+  }
+
   // Session orientation marker — fires from turn 4 onwards so the model always knows where it stands
   if (historyLength >= 4) {
     const orientationParts = [`[Turn ${historyLength}.`];
@@ -855,7 +1049,7 @@ function _buildSystemPromptFromAtoms(unifiedAtoms, taskType, complexity, backend
   }
 
   // Gemini sub-agents
-  if (backend === "gemini-cli") {
+  if (backend === "gemini") {
     parts.push(_GEMINI_SUBAGENTS);
   }
 
@@ -887,4 +1081,399 @@ function _buildDirective(intent, taskType, complexity, reasoning, verification) 
   if (verif) parts.push(verif);
 
   return parts.join(" ");
+}
+
+// ---------------------------------------------------------------------------
+// Handoff Document — captures session/turn outcome for continuity and model swaps
+// ---------------------------------------------------------------------------
+//
+// The handoff document is the bridge between sessions and model swaps. It captures:
+// - What was accomplished (facts extracted from session state)
+// - Current objective and progress (for the next model to pick up immediately)
+// - Decisions made (immutable once locked)
+// - Key findings (discoveries worth remembering)
+// - Next steps (what should happen next)
+//
+// Lives at: ~/.pane/session/{projectId}/handoff.json
+//
+// Schema:
+// {
+//   timestamp: number,
+//   turn: number,
+//   model: string,
+//   accomplishment: string[],      // What was accomplished this turn
+//   currentObjective: string,       // What is being worked on
+//   progress: string,               // How far along
+//   decisionsLocked: string[],      // Immutable decisions from this turn
+//   findings: string[],             // Discoveries, patterns, fixes
+//   nextSteps: string[],            // What should happen next
+//   blockers: string[],             // Unresolved issues
+//   workingSet: { path, purpose }[], // Files most likely to need changes
+// }
+
+export function generateHandoff(projectId, { writeFile = true } = {}) {
+  const state = readState(projectId);
+  const handoff = {
+    timestamp: Date.now(),
+    turn: state.turnCount,
+    model: state.lastProvider,
+    accomplishment: [],
+    currentObjective: state.activeTask?.description || "",
+    progress: "",
+    decisionsLocked: state.decisions.map(d => d.content),
+    findings: [],
+    nextSteps: [],
+    blockers: [],
+    workingSet: state.workingSet.slice(0, 5),
+  };
+
+  // Extract accomplishment from recent actions — tagged with source + confidence (Layer 3)
+  const completedActions = state.recentActions.filter(a =>
+    a.type === "file_edit" || a.type === "command" || a.type === "decision"
+  );
+  if (completedActions.length > 0) {
+    handoff.accomplishment = completedActions.slice(0, 3).map(a => ({
+      text:       a.content,
+      confidence: a.type === "decision" ? BASE_CONFIDENCE.state_decision
+                : a.type === "file_edit" ? BASE_CONFIDENCE.state_action
+                :                          BASE_CONFIDENCE.state_command,
+      source:     a.type === "decision" ? "state_decision"
+                : a.type === "file_edit" ? "state_action"
+                :                          "state_command",
+    }));
+  }
+
+  // Progress from active todo
+  const activeTodo = (state.todos || []).find(t => t.status === "in_progress");
+  if (activeTodo) {
+    handoff.progress = `Working on: ${activeTodo.content}`;
+  } else {
+    const completed = (state.todos || []).filter(t => t.status === "completed").length;
+    const total = (state.todos || []).length;
+    if (total > 0) {
+      handoff.progress = `${completed}/${total} tasks completed`;
+    }
+  }
+
+  // Next steps from pending todos — tagged as state_todo (Layer 3)
+  const pending = (state.todos || []).filter(t => t.status === "pending").slice(0, 2);
+  if (pending.length > 0) {
+    handoff.nextSteps = pending.map(t => ({
+      text:       t.content,
+      confidence: BASE_CONFIDENCE.state_todo,
+      source:     "state_todo",
+    }));
+  }
+
+  if (writeFile) {
+    writeHandoffWithHistory(projectId, handoff);
+  }
+
+  return handoff;
+}
+
+/**
+ * Write handoff and maintain a rolling history of the last 3 sessions.
+ *
+ * Writes two files:
+ *   handoff.json         — current handoff (for quick reads by compileContext)
+ *   handoff-history.json — array of last 3 handoffs (for trajectory display)
+ */
+export function writeHandoffWithHistory(projectId, handoff) {
+  try {
+    const projectSessionDir = path.join(SESSION_DIR, projectId);
+    fs.mkdirSync(projectSessionDir, { recursive: true });
+
+    // Read existing history
+    let history = [];
+    try {
+      history = JSON.parse(
+        fs.readFileSync(path.join(projectSessionDir, "handoff-history.json"), "utf-8")
+      );
+    } catch {}
+
+    // Prepend new handoff, keep last 3
+    history = [handoff, ...history].slice(0, 3);
+
+    // Write both files
+    fs.writeFileSync(path.join(projectSessionDir, "handoff.json"), JSON.stringify(handoff, null, 2), "utf-8");
+    fs.writeFileSync(path.join(projectSessionDir, "handoff-history.json"), JSON.stringify(history, null, 2), "utf-8");
+  } catch (err) {
+    console.warn(`[context] Failed to write handoff: ${err.message}`);
+  }
+}
+
+/**
+ * Update the most recent handoff entry in-place (same session, enriched version).
+ *
+ * Used by the LLM fallback path: the initial handoff is already written via
+ * writeHandoffWithHistory(); when the async LLM enrichment completes, we
+ * REPLACE history[0] rather than prepending — otherwise the same session
+ * would appear twice, ejecting an older legitimate session from the rolling 3.
+ *
+ * Match criterion: history[0].timestamp within 2 minutes of the new handoff.
+ * If no match (edge case — shouldn't happen in normal flow), falls back to
+ * a normal prepend so data is never lost.
+ */
+export function updateLatestHandoff(projectId, handoff) {
+  try {
+    const projectSessionDir = path.join(SESSION_DIR, projectId);
+    fs.mkdirSync(projectSessionDir, { recursive: true });
+
+    let history = [];
+    try {
+      history = JSON.parse(
+        fs.readFileSync(path.join(projectSessionDir, "handoff-history.json"), "utf-8")
+      );
+    } catch {}
+
+    const TWO_MINUTES = 2 * 60 * 1000;
+    if (
+      history.length > 0 &&
+      Math.abs((history[0].timestamp || 0) - (handoff.timestamp || 0)) < TWO_MINUTES
+    ) {
+      // Same session — replace in-place, no new entry
+      history[0] = handoff;
+    } else {
+      // Unexpected: different session timestamp, fall back to normal prepend
+      history = [handoff, ...history].slice(0, 3);
+    }
+
+    fs.writeFileSync(path.join(projectSessionDir, "handoff.json"), JSON.stringify(handoff, null, 2), "utf-8");
+    fs.writeFileSync(path.join(projectSessionDir, "handoff-history.json"), JSON.stringify(history, null, 2), "utf-8");
+  } catch (err) {
+    console.warn(`[context] Failed to update handoff: ${err.message}`);
+  }
+}
+
+export function readHandoff(projectId) {
+  try {
+    return JSON.parse(
+      fs.readFileSync(
+        path.join(SESSION_DIR, projectId, "handoff.json"),
+        "utf-8"
+      )
+    );
+  } catch {
+    return null;
+  }
+}
+
+function readHandoffHistory(projectId) {
+  try {
+    return JSON.parse(
+      fs.readFileSync(
+        path.join(SESSION_DIR, projectId, "handoff-history.json"),
+        "utf-8"
+      )
+    );
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pattern-based extraction (Layer 2b + 3) — extract structured information
+// from model output using per-pattern regex, each with a confidence score.
+//
+// Each pattern family is split into individual patterns so confidence can be
+// assigned per-signal-strength. Stronger markers (✓, ⚠) score higher than
+// softer prose markers (coming up:, following steps:).
+//
+// With Layer 5 active, getEffectiveConfidence() adjusts each score downward
+// when a source has been historically over-corrected by subsequent sessions.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a single regex against text and collect unique matches as ScoredItems.
+ *
+ * @param {RegExp} pattern — must have global + multiline flags, one capture group
+ * @param {string} text
+ * @param {string} source — key into BASE_CONFIDENCE
+ * @param {number} baseConf — nominal confidence for this pattern
+ * @param {string|null} projectId — if provided, effective confidence is used
+ * @param {Set} seen — deduplication set shared across passes for the same field
+ * @returns {Array<{text,confidence,source}>}
+ */
+function runPattern(pattern, text, source, baseConf, projectId, seen) {
+  const items = [];
+  const conf = projectId ? getEffectiveConfidence(projectId, source) : baseConf;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    const raw = match[1]?.trim().slice(0, 100);
+    if (!raw) continue;
+    const key = raw.toLowerCase().slice(0, 60);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({ text: raw, confidence: conf, source });
+  }
+  return items;
+}
+
+/**
+ * Extract structured items from model output text.
+ * Returns ScoredItem arrays — each item has { text, confidence, source }.
+ *
+ * Includes correction patterns (Layer 5) to capture when the model disagrees
+ * with a previously injected handoff claim.
+ *
+ * @param {string} text — accumulated model output
+ * @param {string|null} projectId — when provided, effective confidence is used
+ * @returns {{ accomplishments, blockers, nextSteps, discoveries, corrections }}
+ */
+export function extractFromModelOutput(text, projectId = null) {
+  if (!text || typeof text !== "string") return {
+    accomplishments: [], blockers: [], nextSteps: [], discoveries: [], corrections: [],
+  };
+
+  const BULLET = /(?:^|\n)[-*•]?\s*/;
+
+  // ── Accomplishments ──────────────────────────────────────────────────────
+  const accSeen = new Set();
+  const accomplishments = [
+    // ✓ at line start — strongest possible signal
+    ...runPattern(
+      new RegExp(`${BULLET.source}✓\\s*([^\\n]+)`, "gim"),
+      text, "marker_checkmark", BASE_CONFIDENCE.marker_checkmark, projectId, accSeen,
+    ),
+    // fixed: / solved: — explicit outcome verb
+    ...runPattern(
+      new RegExp(`${BULLET.source}(?:fixed:|solved:)\\s*([^\\n]+)`, "gim"),
+      text, "marker_outcome", BASE_CONFIDENCE.marker_outcome, projectId, accSeen,
+    ),
+    // completed: / implemented: — could describe others' work, slightly lower
+    ...runPattern(
+      new RegExp(`${BULLET.source}(?:completed:|implemented:)\\s*([^\\n]+)`, "gim"),
+      text, "marker_completion", BASE_CONFIDENCE.marker_completion, projectId, accSeen,
+    ),
+  ].slice(0, 5);
+
+  // ── Blockers ─────────────────────────────────────────────────────────────
+  const blkSeen = new Set();
+  const blockers = [
+    // ⚠ at line start — strongest blocker signal
+    ...runPattern(
+      new RegExp(`${BULLET.source}⚠\\s*([^\\n]+)`, "gim"),
+      text, "marker_warning", BASE_CONFIDENCE.marker_warning, projectId, blkSeen,
+    ),
+    // blocker: / blocked on:
+    ...runPattern(
+      new RegExp(`${BULLET.source}(?:blocker:|blocked on:)\\s*([^\\n]+)`, "gim"),
+      text, "marker_blocker", BASE_CONFIDENCE.marker_blocker, projectId, blkSeen,
+    ),
+    // failed to:
+    ...runPattern(
+      new RegExp(`${BULLET.source}failed to:\\s*([^\\n]+)`, "gim"),
+      text, "marker_failure", BASE_CONFIDENCE.marker_failure, projectId, blkSeen,
+    ),
+  ].slice(0, 3);
+
+  // ── Next steps ───────────────────────────────────────────────────────────
+  const nxtSeen = new Set();
+  const nextSteps = [
+    // next: — clearest intent signal
+    ...runPattern(
+      new RegExp(`${BULLET.source}next:\\s*([^\\n]+)`, "gim"),
+      text, "marker_next", BASE_CONFIDENCE.marker_next, projectId, nxtSeen,
+    ),
+    // → at line start — directional arrow
+    ...runPattern(
+      new RegExp(`${BULLET.source}→\\s*([^\\n]+)`, "gim"),
+      text, "symbol_arrow", BASE_CONFIDENCE.symbol_arrow, projectId, nxtSeen,
+    ),
+    // will proceed: / coming up: / following steps:
+    ...runPattern(
+      new RegExp(`${BULLET.source}(?:will proceed:|coming up:|following steps?:)\\s*([^\\n]+)`, "gim"),
+      text, "marker_proceed", BASE_CONFIDENCE.marker_proceed, projectId, nxtSeen,
+    ),
+  ].slice(0, 3);
+
+  // ── Discoveries ──────────────────────────────────────────────────────────
+  const dscSeen = new Set();
+  const discoveries = [
+    // discovered: / realized: — most explicit discovery signal
+    ...runPattern(
+      new RegExp(`${BULLET.source}(?:discovered:|realized:)\\s*([^\\n]+)`, "gim"),
+      text, "marker_discovery", BASE_CONFIDENCE.marker_discovery, projectId, dscSeen,
+    ),
+    // learned:
+    ...runPattern(
+      new RegExp(`${BULLET.source}learned:\\s*([^\\n]+)`, "gim"),
+      text, "marker_learned", BASE_CONFIDENCE.marker_learned, projectId, dscSeen,
+    ),
+    // insight:
+    ...runPattern(
+      new RegExp(`${BULLET.source}insight:\\s*([^\\n]+)`, "gim"),
+      text, "marker_insight", BASE_CONFIDENCE.marker_insight, projectId, dscSeen,
+    ),
+  ].slice(0, 5);
+
+  // ── Corrections (Layer 5) ────────────────────────────────────────────────
+  // Capture when the model explicitly disagrees with a previously injected
+  // handoff claim. These are fed into recordCorrections() at session end to
+  // update per-source accuracy scores — they do NOT go into the handoff itself.
+  const corSeen = new Set();
+  const corrections = [
+    // actually: / correction: — explicit disagreement
+    ...runPattern(
+      new RegExp(`${BULLET.source}(?:actually:|correction:)\\s*([^\\n]+)`, "gim"),
+      text, "correction_explicit", BASE_CONFIDENCE.correction_explicit, projectId, corSeen,
+    ),
+    // already resolved: / not accurate:
+    ...runPattern(
+      new RegExp(`${BULLET.source}(?:already resolved:|not accurate:)\\s*([^\\n]+)`, "gim"),
+      text, "correction_resolved", BASE_CONFIDENCE.correction_resolved, projectId, corSeen,
+    ),
+  ].slice(0, 5);
+
+  return { accomplishments, blockers, nextSteps, discoveries, corrections };
+}
+
+/**
+ * Merge two arrays of handoff items (string | ScoredItem), deduplicating by
+ * text, keeping the highest confidence on collision, and sorting by confidence
+ * descending before applying the cap.
+ */
+function mergeItemArrays(existing, incoming, cap) {
+  const map = new Map();
+  const add = (raw) => {
+    const item = normalizeHandoffItem(raw);
+    if (!item) return;
+    const key = item.text.toLowerCase().slice(0, 60);
+    const prev = map.get(key);
+    if (!prev || prev.confidence < item.confidence) map.set(key, item);
+  };
+  for (const item of (existing || [])) add(item);
+  for (const item of (incoming || [])) add(item);
+  return [...map.values()]
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, cap);
+}
+
+/**
+ * Merge pattern-extracted items into an existing handoff object.
+ * Handles both old-format (string[]) and new-format (ScoredItem[]) fields.
+ * corrections field is intentionally excluded — it's handled separately by
+ * recordCorrections() and must not pollute the handoff's claims.
+ */
+export function mergeExtractedIntoHandoff(handoff, extracted) {
+  if (!handoff || !extracted) return handoff;
+
+  if (extracted.accomplishments?.length > 0) {
+    handoff.accomplishment = mergeItemArrays(handoff.accomplishment, extracted.accomplishments, 5);
+  }
+
+  if (extracted.blockers?.length > 0) {
+    handoff.blockers = mergeItemArrays(handoff.blockers, extracted.blockers, 3);
+  }
+
+  if (extracted.nextSteps?.length > 0) {
+    handoff.nextSteps = mergeItemArrays(handoff.nextSteps, extracted.nextSteps, 3);
+  }
+
+  if (extracted.discoveries?.length > 0) {
+    handoff.findings = mergeItemArrays(handoff.findings, extracted.discoveries, 5);
+  }
+
+  return handoff;
 }

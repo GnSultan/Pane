@@ -33,6 +33,8 @@ import { existsSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import os from "node:os";
+import { isLoggedIn } from "./cloud-auth.mjs";
+import { uploadBackup } from "./cloud-sync.mjs";
 
 const require2 = createRequire(import.meta.url);
 
@@ -179,9 +181,7 @@ async function runBackup() {
 
   // Push to Pane Cloud if logged in
   try {
-    const { isLoggedIn } = await import("./cloud-auth.mjs");
     if (isLoggedIn()) {
-      const { uploadBackup } = await import("./cloud-sync.mjs");
       await uploadBackup(dest);
     }
   } catch (err) {

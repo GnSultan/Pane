@@ -8,6 +8,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
+import crypto from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { promisify } from "node:util";
@@ -299,6 +300,8 @@ class CliBackend extends PunkBackend {
       maxTurns: request.maxTurns,
       systemPromptOverride: request.systemPromptOverride,
       escalationHint: request.escalationHint,
+      // Mind sessions block shell execution — MCP context tools remain available
+      noExec: typeof request.projectId === "string" && request.projectId.startsWith("mind:"),
     });
   }
 
@@ -531,6 +534,10 @@ class PunkEngine {
     // processEnded instead.
     this._projectLastOutcome = new Map(); // projectId → { outcomeId, pendingTodoCount, userPrompt, timestamp }
 
+    // Worker agent listeners: requestId → { onText, resolve, reject, streamedText }
+    // Used by agentCall() — events are consumed internally, never forwarded to renderer.
+    this._workerAgentListeners = new Map();
+
     // Safety sweep: evict any _activeOutcomes entries older than 10 minutes
     // (covers crashes/hangs where neither processEnded nor error fires) and
     // _projectLastOutcome entries older than 30 minutes.
@@ -572,28 +579,18 @@ class PunkEngine {
   async initialize(backendOverride) {
     if (this.backend) return;
 
-    let backendType;
-    if (backendOverride) {
-      backendType = backendOverride;
-    } else {
-      const settings = await this.loadSettings();
-      backendType = this._normalizeBackendName(settings.punk_backend || "api");
-    }
+    const backendType = backendOverride || (await this.loadSettings()).punk_backend || "api";
 
     const onEvent = (projectId, event, requestId) =>
       this.handleBackendEvent(projectId, event, requestId);
 
     switch (backendType) {
-      case "cli":        // legacy
-      case "claude-cli": // legacy
       case "claude-code":
         this.backend = new CliBackend(onEvent, "claude");
         break;
-      case "gemini-cli": // legacy
       case "gemini":
         this.backend = new CliBackend(onEvent, "gemini");
         break;
-      case "http": // legacy
       case "api":
         this.backend = new ApiBackend(onEvent);
         break;
@@ -627,17 +624,6 @@ class PunkEngine {
     }
   }
 
-  /** Normalize legacy backend names to current values. */
-  _normalizeBackendName(raw) {
-    switch (raw) {
-      case "cli":        // legacy
-      case "claude-cli": return "claude-code";
-      case "gemini-cli": return "gemini";
-      case "http":       return "api";
-      default:           return raw;
-    }
-  }
-
   async loadIntentRouting() {
     try {
       const content = await fs.readFile(
@@ -645,17 +631,13 @@ class PunkEngine {
         "utf-8",
       );
       const settings = JSON.parse(content);
-      const backend = this._normalizeBackendName(settings.punk_backend || "api");
-
-      // Check both old and new key names in intent_routing
-      const routing = settings.intent_routing?.[backend]
-        || settings.intent_routing?.[settings.punk_backend];
+      const backend = settings.punk_backend || "api";
+      const routing = settings.intent_routing?.[backend];
       if (routing) return routing;
     } catch {}
 
-    // Last-resort fallback to default mapping for the active backend
     const settings = await this.loadSettings();
-    const backend = this._normalizeBackendName(settings.punk_backend || "api");
+    const backend = settings.punk_backend || "api";
     return DEFAULT_INTENT_ROUTING[backend] || DEFAULT_INTENT_ROUTING["api"];
   }
 
@@ -674,6 +656,42 @@ class PunkEngine {
   }
 
   handleBackendEvent(projectId, event, requestId) {
+    // ── Worker agent events — collected internally, never sent to renderer ────
+    if (requestId && this._workerAgentListeners.has(requestId)) {
+      const listener = this._workerAgentListeners.get(requestId);
+
+      if (event.event === 'message') {
+        const parsed = event.data?.parsed;
+        // Streaming text deltas (same path as outcome tracker)
+        if (parsed?.type === 'stream_event') {
+          const delta = parsed.data?.delta;
+          if (delta?.type === 'text_delta' && delta.text) {
+            listener.streamedText += delta.text;
+          }
+        }
+        // Assembled assistant message — authoritative final content
+        if (parsed?.type === 'assistant') {
+          const content = parsed.message?.content || parsed.content || [];
+          const text = content.filter(b => b.type === 'text').map(b => b.text).join('');
+          if (text) listener.assembledText = (listener.assembledText || '') + text;
+        }
+      }
+
+      if (event.event === 'processEnded') {
+        // Prefer assembled (authoritative) over streamed; fall back to streamed
+        const result = (listener.assembledText || listener.streamedText || '').trim();
+        listener.resolve(result);
+        this._workerAgentListeners.delete(requestId);
+      }
+
+      if (event.event === 'error') {
+        listener.reject(new Error(event.data?.message || 'Worker agent error'));
+        this._workerAgentListeners.delete(requestId);
+      }
+
+      return; // do not relay to renderer
+    }
+
     const channel = `punk-stream:${projectId}`;
 
     // Attach requestId to the event so the renderer can filter it
@@ -974,7 +992,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       let catalogData = null;
       try {
         catalogData = {
-          backend:  this._normalizeBackendName(settings.punk_backend || "api"),
+          backend:  settings.punk_backend || "api",
           apiKeys:  settings.http_api_keys || {},
           priors:   routingStore.getAllPriors(),
           profiles: routingStore.getAllProfiles(),
@@ -1039,29 +1057,42 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         console.warn("[punk] struggle detection failed (non-fatal):", err.message);
       }
 
-      localDecision = await localClassify({
-        message:        resolvedRequest.prompt ?? "",
-        turnCount:      history.length,
-        hasActiveTask:  !!sessionState?.activeTask,
-        activeTask:     sessionState?.activeTask?.description || null,
-        workingSetSize: workingSet.length,
-        workingSet:     workingSetSummary,
-        pendingTodos,
-        todoSummary:    (resolvedRequest.todos || [])
-          .filter(t => t.status !== "completed")
-          .slice(0, 5)
-          .map(t => t.content),
-        recentTurns,
-        recentActions,
-        decisions,
-        gitBranch:      sessionState?.gitStatus?.branch || null,
-        gitSummary:     sessionState?.gitStatus?.summary?.slice(0, 150) || null,
-        codebaseSize:   brainSummary.codebaseSize || 0,
-        relevantFiles:  brainSummary.relevantFiles || [],
-        projectDNA:     brainSummary.synthesis || null,
-        phase:          sessionState?.phase || "idle",
-        struggleCount,
-      }, (sys, usr) => this.quickCall(sys, usr), catalogData);
+      // ── Fast-path: deterministic bypass for trivially obvious intents ──
+      // Fires before the LLM call to avoid wasting tokens on confirmations
+      // and short questions. Falls through to the LLM for everything else.
+      const fastPath = _fastPathClassify(
+        resolvedRequest.prompt ?? "",
+        catalogData?.backend ?? "",
+      );
+
+      if (fastPath) {
+        localDecision = fastPath;
+        console.log(`[punk] fast-path → mode=${fastPath.mode} exec=${fastPath.executionModel?.model}`);
+      } else {
+        localDecision = await localClassify({
+          message:        resolvedRequest.prompt ?? "",
+          turnCount:      history.length,
+          hasActiveTask:  !!sessionState?.activeTask,
+          activeTask:     sessionState?.activeTask?.description || null,
+          workingSetSize: workingSet.length,
+          workingSet:     workingSetSummary,
+          pendingTodos,
+          todoSummary:    (resolvedRequest.todos || [])
+            .filter(t => t.status !== "completed")
+            .slice(0, 5)
+            .map(t => t.content),
+          recentTurns,
+          recentActions,
+          decisions,
+          gitBranch:      sessionState?.gitStatus?.branch || null,
+          gitSummary:     sessionState?.gitStatus?.summary?.slice(0, 150) || null,
+          codebaseSize:   brainSummary.codebaseSize || 0,
+          relevantFiles:  brainSummary.relevantFiles || [],
+          projectDNA:     brainSummary.synthesis || null,
+          phase:          sessionState?.phase || "idle",
+          struggleCount,
+        }, (sys, usr) => this.quickCall(sys, usr), catalogData);
+      }
 
       if (localDecision) {
         strategy = {
@@ -1069,7 +1100,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
           discovery:    localDecision.discovery,
           reasoning:    localDecision.reasoning,
           verification: localDecision.verification,
-          confidence:   0.90,
+          confidence:   fastPath ? 1.0 : 0.90,
           reason:       localDecision.reason || null,
           signals:      [],
         };
@@ -1109,7 +1140,23 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       resolvedRequest.provider = classifierRoute.provider;
       resolvedRequest.model    = classifierRoute.model;
       resolvedRequest.thinking = strategy.reasoning === "deep";
-      console.log(`[punk] classifier routed → ${classifierRoute.provider}/${classifierRoute.model}`);
+
+      // preferFrontier=false is a hard ceiling: even if the classifier's execution
+      // model is frontier-tier, downgrade it to the mid-tier model. This enforces
+      // the routing guidelines mechanically so the LLM can't quietly ignore them.
+      if (localDecision?.preferFrontier === false) {
+        const m = resolvedRequest.model ?? "";
+        const isFrontier = m === "opus" || m.includes("opus");
+        if (isFrontier) {
+          const mid = resolvedRequest.provider === "anthropic" ? "sonnet"
+                    : resolvedRequest.provider === "gemini"    ? "auto-gemini-3"
+                    : resolvedRequest.model; // unknown provider — leave as-is
+          console.log(`[punk] preferFrontier=false ceiling: ${resolvedRequest.model} → ${mid}`);
+          resolvedRequest.model = mid;
+        }
+      }
+
+      console.log(`[punk] classifier routed → ${resolvedRequest.provider}/${resolvedRequest.model}`);
     } else {
       // Fallback to static routing table.
       resolvedRequest.provider = intentRoute.provider;
@@ -1462,6 +1509,62 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     };
     return this.backend.planningCall(systemPrompt, userPrompt, request);
   }
+
+  /**
+   * Full agentic call for background workers — like spawn() but resolves with
+   * the aggregated text response instead of streaming to the renderer.
+   *
+   * Workers get: Read, Glob, Grep (built-in) + full MCP toolkit including
+   * pane_run_in_terminal. They can run tests, check builds, trace call paths.
+   * Events are collected internally and never forwarded to the renderer.
+   *
+   * Returns the accumulated assistant text, or throws on timeout/error.
+   */
+  async agentCall(systemPrompt, prompt, workingDir) {
+    await this.initialize();
+
+    const requestId = `worker-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+    const projectId = `worker-agent:${crypto.randomUUID().slice(0, 8)}`;
+
+    let resolveCall, rejectCall;
+    const callDone = new Promise((res, rej) => { resolveCall = res; rejectCall = rej; });
+
+    this._workerAgentListeners.set(requestId, {
+      streamedText: '',
+      assembledText: '',
+      resolve: resolveCall,
+      reject: rejectCall,
+    });
+
+    await this.spawn({
+      projectId,
+      prompt,
+      workingDir,
+      sessionId: null,
+      model: null,
+      intent: 'other',
+      history: [],
+      requestId,
+      todos: null,
+      tools: ['Read', 'Glob', 'Grep'],  // built-in tools: read-only analysis
+      maxTurns: 25,                      // enough for real multi-step investigation
+      systemPromptOverride: systemPrompt,
+      _systemOverride: true,
+      noExec: false,                     // MCP pane_run_in_terminal available — workers can run tests
+    });
+
+    // 8-minute ceiling — deep analysis should finish well within this
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('agentCall timeout')), 8 * 60 * 1000)
+    );
+
+    try {
+      return await Promise.race([callDone, timeout]);
+    } catch (err) {
+      this._workerAgentListeners.delete(requestId);
+      throw err;
+    }
+  }
 }
 
 // ============================================================================
@@ -1575,6 +1678,65 @@ export async function registerPunkHandlers() {
     const { forkSession } = await import("@anthropic-ai/claude-agent-sdk");
     return forkSession(sessionId);
   });
+}
+
+/**
+ * Deterministic fast-path classifier for trivially obvious intents.
+ * Only fires on inputs so clear that calling the LLM is pure waste.
+ * Returns a full decision object (same shape as parseDecision output)
+ * or null to fall through to the LLM classifier.
+ *
+ * @param {string} message   — raw user message
+ * @param {string} backend   — normalised backend ("claude-code" | "gemini" | "api")
+ * @returns {object|null}
+ */
+function _fastPathClassify(message, backend) {
+  const trimmed = message.trim();
+  if (!trimmed) return null;
+
+  const lower  = trimmed.toLowerCase();
+  const isGemini   = backend === "gemini";
+  const provider   = isGemini ? "gemini"     : "anthropic";
+  const cheapModel = isGemini ? "auto-gemini-3" : "haiku";
+  const midModel   = isGemini ? "auto-gemini-3" : "sonnet";
+
+  // ── Pattern 1: Pure confirmations ────────────────────────────────────────
+  // Single-intent words / phrases that just mean "yes, do it".
+  // Routed to sonnet (not haiku) because confirmations trigger real execution.
+  const CONFIRMATIONS = new Set([
+    "yes", "y", "ok", "okay", "sure", "do it", "go ahead", "go",
+    "yep", "yup", "yeah", "sounds good", "let's go", "lets go",
+    "proceed", "continue", "looks good", "ship it", "lgtm",
+    "perfect", "great", "done", "alright", "cool", "nice",
+  ]);
+  if (CONFIRMATIONS.has(lower)) {
+    return {
+      mode: "direct", reason: "Continuing — going directly.",
+      discovery: false, reasoning: "shallow", verification: "diff",
+      taskType: "other", complexity: "low", preferFrontier: false,
+      atomHints: [], historyDepth: 3, includeBrief: false, fileDepth: "none",
+      planningModel: null,
+      executionModel: { model: midModel, provider },
+    };
+  }
+
+  // ── Pattern 2: Short pure questions (≤ 15 words, ends with ?, no code) ───
+  // "what does X do?", "why is Y failing?", "how does Z work?"
+  // Routed to haiku — just answering, no file changes.
+  const wordCount    = trimmed.split(/\s+/).filter(Boolean).length;
+  const hasCodeBlock = trimmed.includes("```");
+  if (trimmed.endsWith("?") && wordCount <= 15 && !hasCodeBlock) {
+    return {
+      mode: "discuss", reason: "Quick question — answering directly.",
+      discovery: false, reasoning: "shallow", verification: "none",
+      taskType: "quick-answer", complexity: "low", preferFrontier: false,
+      atomHints: [], historyDepth: 3, includeBrief: false, fileDepth: "none",
+      planningModel: null,
+      executionModel: { model: cheapModel, provider },
+    };
+  }
+
+  return null; // no fast-path match — fall through to LLM classifier
 }
 
 // Maps local-intel taskType → oracle domain. Replaces regex classifyDomain()

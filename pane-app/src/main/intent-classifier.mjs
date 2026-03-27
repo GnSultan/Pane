@@ -28,19 +28,25 @@ const VALID_FILE_DEPTH  = new Set(["none", "names", "shallow", "deep"]);
  * Includes benchmark scores, costs, arena rank, and real outcome data.
  *
  * @param {object} options
- * @param {string} options.backend — "http" | "claude-cli" | "gemini-cli"
+ * @param {string} options.backend — "claude-code" | "gemini" | "api" (already normalised)
  * @param {object} options.apiKeys — { deepseek: "sk-...", anthropic: "sk-...", ... }
  * @param {Array}  options.priors  — from routingStore.getAllPriors()
  * @param {Array}  options.profiles — from routingStore.getAllProfiles()
  * @returns {string} — human-readable model catalog for the prompt
  */
+// SDK_ALIASES: short model names that the agent SDK and gemini CLI resolve automatically.
+// For these backends we show ONLY aliases — 3 clean tiers, no versioned noise.
+const SDK_ALIASES    = new Set(["opus", "sonnet", "haiku"]);
+const GEMINI_ALIASES = new Set(["auto-gemini-3"]);
+
 function buildModelCatalog({ backend, apiKeys, priors, profiles }) {
-  // Determine which providers are available
+  // Determine which providers are available.
+  // NOTE: backend arrives already normalised ("claude-code" | "gemini" | "api").
   const availableProviders = new Set();
 
-  if (backend === "claude-cli") {
+  if (backend === "claude-code") {
     availableProviders.add("anthropic");
-  } else if (backend === "gemini-cli") {
+  } else if (backend === "gemini") {
     availableProviders.add("gemini");
     availableProviders.add("google");
   } else {
@@ -60,11 +66,15 @@ function buildModelCatalog({ backend, apiKeys, priors, profiles }) {
     perfIndex.get(key).push(p);
   }
 
-  // Filter priors to available providers, skip CLI alias duplicates
-  const cliAliases = new Set(["opus", "sonnet", "haiku", "auto-gemini-3"]);
+  // For agent SDK backend: keep ONLY aliases (opus/sonnet/haiku) — 3 clear tiers.
+  // For gemini backend: keep ONLY the gemini alias.
+  // For HTTP API backends: keep full versioned names, strip aliases (need exact IDs).
   const availableModels = (priors || []).filter(p => {
     if (!availableProviders.has(p.provider)) return false;
-    if (cliAliases.has(p.model)) return false;
+    if (backend === "claude-code") return SDK_ALIASES.has(p.model);
+    if (backend === "gemini")      return GEMINI_ALIASES.has(p.model);
+    // HTTP: strip aliases, keep versioned names
+    if (SDK_ALIASES.has(p.model) || GEMINI_ALIASES.has(p.model)) return false;
     return true;
   });
 
@@ -134,14 +144,18 @@ Key signals for "direct":
 - "fix this", "update that", "change X to Y"
 - Working set has 1-2 files
 
-Routing guidelines:
-- For "orchestrate": pick the best reasoning model for planning, and a cost-efficient capable model for execution. They can be different.
-- For "direct": pick one model that balances capability and cost for the task complexity.
-- For "discuss": pick the cheapest model that can explain well.
-- Prefer models with strong real performance data over benchmark-only models.
-- If only one provider is available, pick models from that provider. Don't hallucinate models.
-- When struggle_count >= 2: the current model is failing — escalate to the highest-capability available model.
+Routing guidelines — follow these tiers strictly, do NOT default to the highest-capability model:
+- "discuss" / "quick-answer" / "conversation": always pick the cheapest capable model (haiku tier or equivalent).
+- "direct" + complexity=low: cheapest capable model.
+- "direct" + complexity=medium: mid-tier model (sonnet tier or equivalent). Do NOT use the frontier model.
+- "direct" + complexity=high: mid-tier model is still preferred unless the task clearly requires frontier reasoning (e.g. deep algorithmic debugging, novel architecture). Frontier model is the exception, not the default.
+- "orchestrate" + complexity=low/medium: sonnet tier for both planning and execution.
+- "orchestrate" + complexity=high: frontier model for planning only, sonnet tier for execution. Do NOT use frontier for both.
+- Only use frontier model for execution when: complexity=high AND mode=orchestrate AND the task is genuinely novel/architectural. Never for routine implement/refactor/debug.
+- When struggle_count >= 2: escalate planning model one tier up.
 - When struggle_count >= 3: require reasoning="deep" and pick the frontier model unconditionally.
+- Prefer models with real performance data over benchmark-only models when available.
+- If only one provider is available, pick models from that provider. Don't hallucinate models.
 
 Discovery: true if the task scope is unclear and needs codebase exploration before planning. false if recent conversation already established the scope or there are pending todos to continue.
 Reasoning: "deep" for architecture/debugging/complex tasks, "shallow" for simple changes/quick answers.
@@ -259,26 +273,60 @@ function parseDecision(raw, availableProviders) {
 
   const decision = {
     // ── Classification fields ──
-    mode:           VALID_MODES.has(parsed.mode)          ? parsed.mode         : null,
-    reason:         typeof parsed.reason === "string"      ? parsed.reason.trim().slice(0, 300) : null,
-    discovery:      typeof parsed.discovery === "boolean"  ? parsed.discovery    : true,
-    reasoning:      VALID_REASONING.has(parsed.reasoning)  ? parsed.reasoning    : "deep",
-    verification:   VALID_VERIFY.has(parsed.verification)  ? parsed.verification : "none",
-    taskType:       VALID_TASK_TYPES.has(parsed.taskType)  ? parsed.taskType     : "other",
-    complexity:     VALID_COMPLEXITY.has(parsed.complexity) ? parsed.complexity   : "medium",
+    mode:           VALID_MODES.has(parsed.mode)           ? parsed.mode          : null,
+    reason:         typeof parsed.reason === "string"       ? parsed.reason.trim().slice(0, 300) : null,
+    // Defaults lean cheap: discovery=false, reasoning=shallow.
+    // The LLM opts IN to expensive behaviour; we don't fall into it.
+    discovery:      typeof parsed.discovery === "boolean"   ? parsed.discovery     : false,
+    reasoning:      VALID_REASONING.has(parsed.reasoning)   ? parsed.reasoning     : "shallow",
+    verification:   VALID_VERIFY.has(parsed.verification)   ? parsed.verification  : "none",
+    taskType:       VALID_TASK_TYPES.has(parsed.taskType)   ? parsed.taskType      : "other",
+    complexity:     VALID_COMPLEXITY.has(parsed.complexity)  ? parsed.complexity    : "medium",
     preferFrontier: typeof parsed.preferFrontier === "boolean" ? parsed.preferFrontier : false,
     atomHints:      (Array.isArray(parsed.atomHints) ? parsed.atomHints : [])
                       .filter(h => typeof h === "string" && h.length > 0 && h.length < 50).slice(0, 5),
     historyDepth:   clamp(parsed.historyDepth, 1, 20, 5),
-    includeBrief:   typeof parsed.includeBrief === "boolean" ? parsed.includeBrief : true,
-    fileDepth:      VALID_FILE_DEPTH.has(parsed.fileDepth) ? parsed.fileDepth    : "shallow",
+    includeBrief:   typeof parsed.includeBrief === "boolean" ? parsed.includeBrief  : true,
+    fileDepth:      VALID_FILE_DEPTH.has(parsed.fileDepth)  ? parsed.fileDepth     : "shallow",
 
     // ── Routing fields ──
     planningModel:  parseModelRef(parsed.planningModel, availableProviders),
     executionModel: parseModelRef(parsed.executionModel, availableProviders),
   };
 
-  return decision.mode ? decision : null;
+  if (!decision.mode) return null;
+
+  // ── Cross-validation: hard constraints the LLM cannot override ────────────
+  // These catch inconsistencies (e.g. "deep" reasoning on a quick-answer) and
+  // ensure cheap defaults propagate correctly across dependent fields.
+
+  // discuss / conversational tasks never need discovery or deep reasoning
+  if (decision.mode === "discuss") {
+    decision.discovery    = false;
+    decision.reasoning    = "shallow";
+    decision.verification = "none";
+  }
+
+  // quick-answer and conversation are always cheap
+  if (decision.taskType === "quick-answer" || decision.taskType === "conversation") {
+    decision.discovery    = false;
+    decision.reasoning    = "shallow";
+    decision.verification = "none";
+    decision.preferFrontier = false;
+  }
+
+  // low complexity → never deep reasoning, never frontier
+  if (decision.complexity === "low") {
+    decision.reasoning      = "shallow";
+    decision.preferFrontier = false;
+  }
+
+  // direct + not high complexity → no frontier
+  if (decision.mode === "direct" && decision.complexity !== "high") {
+    decision.preferFrontier = false;
+  }
+
+  return decision;
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -299,11 +347,12 @@ export async function classify(input, quickCall, catalog) {
 
   const catalogText = catalog ? buildModelCatalog(catalog) : "";
 
-  // Track which providers are available for validation
+  // Track which providers are available for model-ref validation.
+  // backend is already normalised ("claude-code" | "gemini" | "api").
   const availableProviders = new Set();
-  if (catalog?.backend === "claude-cli") {
+  if (catalog?.backend === "claude-code") {
     availableProviders.add("anthropic");
-  } else if (catalog?.backend === "gemini-cli") {
+  } else if (catalog?.backend === "gemini") {
     availableProviders.add("gemini");
     availableProviders.add("google");
   } else if (catalog?.apiKeys) {

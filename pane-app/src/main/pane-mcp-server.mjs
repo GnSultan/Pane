@@ -7,6 +7,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+
+const execAsync = promisify(exec);
 
 const PANE_DIR = process.env.PANE_DATA_DIR || path.join(os.homedir(), ".pane");
 const PROJECT_ID = process.env.PANE_PROJECT_ID || "";
@@ -36,6 +40,35 @@ async function readText(filePath) {
 
 function text(s) {
   return { content: [{ type: "text", text: s }] };
+}
+
+// --- Shell execution helpers ---
+
+function getEnvWithPath() {
+  const home = os.homedir();
+  const nvmVersionsDir = path.join(home, ".nvm", "versions", "node");
+  const nvmBins = [];
+  try {
+    const versions = fs.readdirSync(nvmVersionsDir);
+    for (const v of versions) nvmBins.push(path.join(nvmVersionsDir, v, "bin"));
+  } catch {}
+  const extra = [...nvmBins, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+  const existing = process.env.PATH || "";
+  const combined = [...extra, ...existing.split(":")].filter(Boolean).join(":");
+  return { ...process.env, PATH: combined };
+}
+
+async function appendTerminalHistory(stateDir, cmd, output) {
+  const filePath = path.join(stateDir, "terminal.json");
+  let data = null;
+  try { data = JSON.parse(await fs.promises.readFile(filePath, "utf-8")); } catch {}
+  const commands = Array.isArray(data?.commands) ? data.commands : [];
+  commands.push({ cmd, output, timestamp: Date.now(), source: "claude" });
+  const trimmed = commands.slice(-20);
+  try {
+    await fs.promises.mkdir(stateDir, { recursive: true });
+    await fs.promises.writeFile(filePath, JSON.stringify({ commands: trimmed }));
+  } catch {}
 }
 
 // --- Search helpers ---
@@ -117,32 +150,44 @@ async function semanticSearch(query, projectId, limit = 20) {
 const TOOLS = [
   {
     name: "pane_project_context",
-    description: "Get project name, root path, git branch, and top-level file list. Use this to orient yourself in the project.",
+    description: "Get project name, root path, git branch, and top-level file list. Use when you need the physical layout or git state. For deeper orientation, prefer pane_synthesize or pane_brief first.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "pane_open_files",
-    description: "Get the file currently open in Pane's editor, including its full content and recent file history.",
+    description: "Get the file the user currently has open in Pane's editor, including its full content and recent file history. Call this when the user's message is about 'this file', 'here', or 'what I'm looking at' — it gives you their exact context without asking.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "pane_recent_terminal",
-    description: "Get recent terminal commands and their outputs from Pane's terminal.",
+    description: "Get recent terminal commands and their outputs from Pane's terminal. Call this when the user references a command they ran, an error they saw, or 'what I just did'. Combine with pane_open_files to get the full picture of their current work context.",
     inputSchema: { type: "object", properties: {} },
   },
   {
-    name: "pane_recall",
-    description: "Search project memory for past decisions, lessons, patterns, errors, and file edits from previous sessions. Uses fuzzy multi-word matching — 'auth bug' will match 'authentication error'.",
+    name: "pane_run_in_terminal",
+    description: "Run a shell command and return its output. Use for builds, tests, git operations, installs, or any verification step. Commands run in the project root with the user's full environment (nvm, homebrew, local tools). Prefer this over speculating about whether something works — just run it.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Search terms to filter memories. Leave empty for recent history." },
+        command: { type: "string", description: "The shell command to execute." },
+        timeout: { type: "number", description: "Timeout in seconds (default 30, max 120)." },
+      },
+      required: ["command"],
+    },
+  },
+  {
+    name: "pane_recall",
+    description: "Search this project's memory for past decisions, lessons, patterns, and error fixes from previous sessions. Call this BEFORE searching files when you're trying to understand why something is the way it is, or when you suspect the answer was already worked out. Uses fuzzy matching — 'auth bug' matches 'authentication error'. Combine with pane_find_symbol to go from memory to code.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search terms. Leave empty to surface recent history." },
       },
     },
   },
   {
     name: "pane_recall_all",
-    description: "Search memory across ALL projects — find patterns, decisions, and lessons from other projects that may be relevant here.",
+    description: "Search memory across ALL projects. Use when solving a problem that other projects may have already solved, or when looking for patterns that transcend this project. More targeted than pane_cross_project — use when you have a specific query.",
     inputSchema: {
       type: "object",
       properties: {
@@ -153,7 +198,7 @@ const TOOLS = [
   },
   {
     name: "pane_remember",
-    description: "Save something to project memory for future sessions — a decision, lesson, pattern, or important observation.",
+    description: "Save a decision, lesson, pattern, or error fix to project memory for future sessions. Call this when you discover something worth preserving — a root cause, a constraint, a design decision, a fix that wasn't obvious. Good memory saves future sessions from re-discovering the same things.",
     inputSchema: {
       type: "object",
       properties: {
@@ -169,49 +214,49 @@ const TOOLS = [
   },
   {
     name: "pane_brief",
-    description: "Read the project's accumulated memory brief — decisions, lessons, frequently modified files, and last session summary.",
+    description: "Read the project's accumulated memory brief — top decisions, lessons, frequently modified files, and the last session summary. Good starting point when resuming work or when you need a quick read on project history without the full architecture narrative. For deeper causal understanding, use pane_synthesize.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "pane_checkpoints",
-    description: "List available file checkpoints for this project. Each checkpoint is a snapshot of file state before a Claude edit.",
+    description: "List available file snapshots captured before edits. Use when the user wants to review or roll back a specific file to an earlier state. Pair with pane_revert_change when a specific change needs to be undone.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "pane_change_history",
-    description: "List the history of file changes made during this session. Shows the file, old content, new content, and timestamp for each change.",
+    description: "List all file changes made during this session — file, old content, new content, timestamp. Use when the user asks what was changed, wants to audit edits, or needs to undo something. Pair with pane_search_changes to narrow by file or content.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "pane_search_changes",
-    description: "Search for specific changes in the change history. Find changes by file path, content, or description.",
+    description: "Search change history by file path or content. Use instead of pane_change_history when you're looking for a specific edit rather than reviewing the full list.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Search query to find changes (matches file, content, or description)" },
-        file_path: { type: "string", description: "Filter changes to a specific file path" },
+        query: { type: "string", description: "Search query (matches file, content, or description)" },
+        file_path: { type: "string", description: "Filter to a specific file path" },
       },
     },
   },
   {
     name: "pane_revert_change",
-    description: "Revert a specific change from the change history. This will restore the old content and remove the change from history.",
+    description: "Revert a specific change by ID, restoring the file to its previous state. Get the change ID from pane_change_history or pane_search_changes first. Use when the user wants to undo a specific edit rather than a full rollback.",
     inputSchema: {
       type: "object",
       properties: {
-        change_id: { type: "string", description: "The ID of the change to revert (use pane_change_history to find IDs)" },
+        change_id: { type: "string", description: "The ID of the change to revert" },
       },
       required: ["change_id"],
     },
   },
   {
     name: "pane_knowledge_graph",
-    description: "View the project's knowledge graph — nodes (decisions, patterns, lessons, errors) and their connections, including cross-project pattern links. Shows the accumulated intelligence Pane has built from observing your work.",
+    description: "View the project's knowledge graph — how decisions, patterns, lessons, and errors connect to each other, including cross-project links. Use when you need to understand the relationships between architectural choices, or when pane_synthesize gives you the narrative but you want to see the structure. Complements pane_synthesize: synthesize for the story, graph for the connections.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "pane_cross_project",
-    description: "Find patterns, decisions, and lessons from OTHER projects that are relevant to the current work. Useful when solving a problem that another project may have already solved.",
+    description: "Find patterns, decisions, and lessons from OTHER projects relevant to current work. Use when facing a problem that other projects may have already solved — architecture patterns, recurring bugs, integration approaches. More contextual than pane_recall_all — it finds connections, not just keyword matches.",
     inputSchema: {
       type: "object",
       properties: {
@@ -222,62 +267,62 @@ const TOOLS = [
   },
   {
     name: "pane_profile",
-    description: "View the user's profile — learned preferences, explicit rules, design philosophy, and known anti-patterns. Pane builds this automatically by observing your work patterns. Use this to understand the user's coding style and preferences.",
+    description: "View the user's profile — explicit rules, learned preferences, design philosophy, and known anti-patterns. Call this when you need to understand how the user likes to work before proposing an approach, or when their preferences are directly relevant to the task. Rules in this profile are binding.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "pane_set_rule",
-    description: "Add an explicit rule to the user's profile. Rules override observed preferences. Use when the user says things like 'always use X', 'never do Y', or states a firm preference.",
+    description: "Add a firm behavioral rule to the user's profile. Call this immediately when the user says 'always X', 'never Y', or states a hard preference. Rules override everything else and apply across all future sessions. Do not wait — capture it when it's stated.",
     inputSchema: {
       type: "object",
       properties: {
-        rule: { type: "string", description: "The rule to add, e.g. 'always use bun instead of npm' or 'never auto-commit'" },
+        rule: { type: "string", description: "The rule, e.g. 'always use bun instead of npm'" },
       },
       required: ["rule"],
     },
   },
   {
     name: "pane_set_philosophy",
-    description: "Update the user's design philosophy. Use when the user describes their design principles or aesthetic preferences that should apply across all projects.",
+    description: "Update the user's design philosophy — aesthetic principles and values that apply across all projects. Call when the user articulates how they think about design, architecture, or code quality at a general level. Replaces the existing philosophy, so include everything.",
     inputSchema: {
       type: "object",
       properties: {
-        philosophy: { type: "string", description: "The full design philosophy text (replaces existing)" },
+        philosophy: { type: "string", description: "The full design philosophy (replaces existing)" },
       },
       required: ["philosophy"],
     },
   },
   {
     name: "pane_set_why",
-    description: "Set this project's foundational purpose — what it is trying to be, who it serves, what problem it solves, and where it is headed. This is per-project (not global) and gives every future suggestion context and criteria to reason against. Call this once you have understood the project's core purpose through conversation.",
+    description: "Set this project's foundational purpose — what it is, who it serves, what problem it solves, where it is headed. Call this once you have understood the project deeply enough to articulate it clearly. This grounds every future suggestion in the project's actual purpose. Per-project, not global.",
     inputSchema: {
       type: "object",
       properties: {
-        why: { type: "string", description: "The project's foundational purpose — a concise narrative covering what it is, who it's for, what problem it solves, and its direction" },
+        why: { type: "string", description: "The project's foundational purpose — concise narrative covering what it is, who it's for, the problem it solves, and its direction" },
       },
       required: ["why"],
     },
   },
   {
     name: "pane_find_symbol",
-    description: "Find exported symbols (functions, classes, types, interfaces, constants) in the project by name. Returns exact file path and line number. Use this instead of grep when you know the name of what you're looking for.",
+    description: "Find any exported symbol — function, class, type, interface, constant — by name. Returns exact file and line number instantly from the index. Always call this FIRST when you know the name of something you're looking for. Do not use Grep to find a symbol by name when this tool exists.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Symbol name to search for (partial match supported)" },
+        query: { type: "string", description: "Symbol name to find (partial match supported)" },
         kind: {
           type: "string",
           enum: ["function", "class", "const", "let", "var", "type", "interface", "enum", "default", "namespace", "reexport", "async_fn"],
-          description: "Filter by symbol kind (optional)",
+          description: "Narrow by symbol kind (optional)",
         },
-        file: { type: "string", description: "Filter by file path (partial match, optional)" },
+        file: { type: "string", description: "Narrow by file path (partial match, optional)" },
       },
       required: ["query"],
     },
   },
   {
     name: "pane_synthesize",
-    description: "Get the project's synthesized DNA — a compact narrative of architectural decisions, established patterns, lessons learned, and known anti-patterns. This is the causal memory of the project: why things are the way they are.",
+    description: "Get the project's architectural DNA — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -328,6 +373,33 @@ async function handleToolCall(name, args) {
         return `$ ${c.cmd}\n${output}`;
       }).join("\n\n");
       return text(out);
+    }
+
+    case "pane_run_in_terminal": {
+      const command = (args?.command || "").trim();
+      if (!command) return text("Error: no command provided.");
+      const timeoutSecs = Math.min(Math.max(Number(args?.timeout) || 30, 1), 120);
+      const cwd = PROJECT_ROOT || process.cwd();
+      let output = "";
+      let exitCode = 0;
+      try {
+        const { stdout, stderr } = await execAsync(command, {
+          cwd,
+          env: getEnvWithPath(),
+          timeout: timeoutSecs * 1000,
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        output = [stdout, stderr].filter(Boolean).join("\n").trimEnd();
+      } catch (err) {
+        exitCode = err.code ?? 1;
+        const partial = [err.stdout, err.stderr].filter(Boolean).join("\n").trimEnd();
+        output = partial
+          ? `Exit ${exitCode}\n${partial}`
+          : (err.killed ? `Error: command timed out after ${timeoutSecs}s` : `Error: ${err.message}`);
+      }
+      await appendTerminalHistory(stateDir, command, output);
+      const result = output || "(no output)";
+      return text(exitCode === 0 ? result : `Exit ${exitCode}\n${result}`);
     }
 
     case "pane_recall": {
@@ -811,9 +883,13 @@ rl.on("line", async (line) => {
       respond(req.id, {});
       break;
 
-    case "tools/list":
-      respond(req.id, { tools: TOOLS });
+    case "tools/list": {
+      const visibleTools = process.env.PANE_NO_EXEC === "1"
+        ? TOOLS.filter((t) => t.name !== "pane_run_in_terminal")
+        : TOOLS;
+      respond(req.id, { tools: visibleTools });
       break;
+    }
 
     case "tools/call":
       try {

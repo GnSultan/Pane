@@ -18,9 +18,7 @@ import { useProjectsStore } from "../stores/projects";
 import type { ActionId, KeyBinding } from "../lib/keybindings";
 import {
   DEFAULT_BACKEND_ROUTING,
-  type IntentRouting,
   type BackendRouting,
-  PROVIDER_MODELS,
 } from "../lib/models";
 
 // App readiness gate — other hooks (git, watcher) wait for this before starting
@@ -186,115 +184,29 @@ export function useSettingsPersistence() {
         if (settings.completion_sound)
           ws.setCompletionSound(settings.completion_sound);
 
-        // 2. Provider & Model state — normalize legacy backend names
-        const rawBackend = settings.punk_backend || "api";
-        const backend =
-          rawBackend === "cli" ? "gemini" :
-          rawBackend === "claude-cli" ? "claude-code" :
-          rawBackend === "gemini-cli" ? "gemini" :
-          rawBackend === "http" ? "api" :
-          rawBackend;
+        // 2. Provider & Model state
+        const backend = settings.punk_backend || "api";
         ws.setPunkBackend(backend);
 
         if (settings.http_provider) ws.setHttpProvider(settings.http_provider);
 
         // API keys & Base URLs
         const apiKeys: Record<string, string> = settings.http_api_keys || {};
-        // Only use the legacy single key if the map doesn't already have one for that provider
-        const provider = settings.http_provider || "deepseek";
-        if (settings.http_api_key && !apiKeys[provider]) {
-          apiKeys[provider] = settings.http_api_key;
-        }
         ws.setHttpApiKeys(apiKeys);
         ws.setHttpBaseUrls(settings.http_base_urls || {});
 
         // Model restoration
         if (settings.selected_model) {
-          let model = settings.selected_model;
-          if (model === "gemini-2.5-pro" || model === "gemini-1.5-pro-latest")
-            model = "gemini-3.1-pro-preview";
-          if (
-            model === "gemini-2.5-flash" ||
-            model === "gemini-1.5-flash-latest"
-          )
-            model = "gemini-3-flash-preview";
-
-          // Determine correct provider for the model
-          let provider =
-            settings.selected_model_provider || ws.selectedModelProvider;
-
-          // Validate that provider matches model
-          // Check if model belongs to a different provider than what's saved
-          for (const [prov, models] of Object.entries(PROVIDER_MODELS)) {
-            if (models.some((m: { value: string; label: string }) => m.value === model)) {
-              // Found the correct provider for this model
-              if (provider !== prov) {
-                console.warn(
-                  `[settings] Correcting provider mismatch: model "${model}" belongs to provider "${prov}" but settings has "${provider}"`,
-                );
-                provider = prov;
-              }
-              break;
-            }
-          }
-
-          ws.setSelectedModel(model, false, provider);
+          ws.setSelectedModel(
+            settings.selected_model,
+            false,
+            settings.selected_model_provider || ws.selectedModelProvider,
+          );
         }
 
-        // 3. Routing Migration & Validation
-        const rawRouting = settings.intent_routing as unknown as BackendRouting | IntentRouting | null;
-        const healedRouting: BackendRouting = JSON.parse(
-          JSON.stringify(DEFAULT_BACKEND_ROUTING),
-        );
-
-        if (rawRouting) {
-          const isLegacyFlat =
-            'plan' in rawRouting &&
-            'execute' in rawRouting &&
-            !('http' in rawRouting) &&
-            !('gemini-cli' in rawRouting);
-
-          if (isLegacyFlat) {
-            // Assign legacy settings to the active backend
-            // rawRouting is IntentRouting here, not BackendRouting
-            healedRouting[backend] = { 
-              plan: (rawRouting as IntentRouting).plan,
-              execute: (rawRouting as IntentRouting).execute,
-              explain: (rawRouting as IntentRouting).explain,
-              other: (rawRouting as IntentRouting).other,
-            };
-          } else {
-            // Merge existing backend maps into our canonical defaults
-            const backendRouting = rawRouting as BackendRouting;
-            for (const key of Object.keys(backendRouting)) {
-              // Normalize legacy backend keys to current names
-              const normalizedKey =
-                key === "cli" ? "gemini" :
-                key === "claude-cli" ? "claude-code" :
-                key === "gemini-cli" ? "gemini" :
-                key === "http" ? "api" :
-                key;
-              if (healedRouting[normalizedKey]) {
-                healedRouting[normalizedKey] = {
-                  ...healedRouting[normalizedKey],
-                  ...backendRouting[key],
-                };
-              }
-            }
-          }
-
-          // Strict Validation: Ensure gemini backend only uses auto- models
-          ["plan", "execute", "explain", "other"].forEach((intent) => {
-            const r =
-              healedRouting["gemini"]?.[intent as keyof IntentRouting];
-
-            if (r && r.provider === "gemini" && !r.model.startsWith("auto-")) {
-              if (r.model.includes("pro")) r.model = "auto-gemini-3";
-              else r.model = "auto-gemini-3";
-            }
-          });
-        }
-        useWorkspaceStore.setState({ intentRouting: healedRouting });
+        // 3. Routing Restore
+        const rawRouting = settings.intent_routing as BackendRouting | null;
+        useWorkspaceStore.setState({ intentRouting: rawRouting ?? DEFAULT_BACKEND_ROUTING });
 
         if (settings.intent_auto_route !== undefined) {
           ws.setIntentAutoRoute(settings.intent_auto_route);

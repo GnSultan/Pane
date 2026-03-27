@@ -235,7 +235,7 @@ export const Conversation = memo(function Conversation({
 
       {showRefreshToast && (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
-          <div className="font-mono text-[10px] text-[var(--pane-terminal)] bg-pane-surface px-3 py-1.5 rounded-sm animate-fade-in">
+          <div className="font-mono text-[10px] text-[var(--pane-terminal)] bg-pane-bg/90 backdrop-blur-md ring-1 ring-pane-border/40 px-3 py-1.5 rounded-lg animate-fade-in">
             context refreshed — conversation continues with full memory
           </div>
         </div>
@@ -243,7 +243,7 @@ export const Conversation = memo(function Conversation({
 
       {visibleError && (
         <div className="absolute bottom-32 left-1/2 -translate-x-1/2 z-40 w-[min(480px,80%)]">
-          <div className="flex items-start gap-3 font-mono text-[10px] text-pane-error bg-pane-surface px-3 py-2 rounded-sm animate-fade-in leading-[1.6]">
+          <div className="flex items-start gap-3 font-mono text-[10px] text-pane-error bg-pane-bg/90 backdrop-blur-md ring-1 ring-pane-border/40 px-3 py-2 rounded-lg animate-fade-in leading-[1.6]">
             <span className="break-words flex-1">{visibleError}</span>
             <button
               onClick={() => setVisibleError(null)}

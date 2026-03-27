@@ -6,9 +6,10 @@ import { measureCaretPos } from '../../lib/measure-caret'
 
 interface MindChatProps {
   entryId: string
-  entryContent: string
+  entryContent?: string
   workingDir: string
   onClose: () => void
+  isFreeform?: boolean
 }
 
 export function MindChat({
@@ -16,11 +17,12 @@ export function MindChat({
   entryContent,
   workingDir,
   onClose,
+  isFreeform = false,
 }: MindChatProps) {
   const { messages, isProcessing, error, sendMessage, abortMessage } = useMindChat(
     entryId,
     workingDir,
-    entryContent
+    entryContent || ""
   )
 
   const [draft, setDraft] = useState('')
@@ -122,15 +124,29 @@ export function MindChat({
   return (
     <div className="relative h-full bg-pane-bg">
 
+      {/* Title bar — shows chat context */}
+      <div className="absolute top-0 left-0 right-0 z-20 px-10 py-4 border-b border-pane-border/20 bg-pane-bg/50 backdrop-blur-sm">
+        <div className="flex items-center justify-between">
+          <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: 'var(--pane-font-size-sm)' }}>
+            {isFreeform ? 'chat' : entryContent ? entryContent.split('\n')[0].slice(0, 50) : ''}
+          </span>
+          <button
+            onClick={onClose}
+            className="font-mono text-pane-text-secondary/40 hover:text-pane-text-secondary/60 transition-colors"
+            style={{ fontSize: 'var(--pane-font-size-xs)' }}
+            title="Close (Esc)"
+          >
+            esc
+          </button>
+        </div>
+      </div>
+
       {/* Scroll area — mirrors Conversation layout exactly */}
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pb-48 pt-8 custom-scrollbar [overflow-anchor:none]"
+        className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pb-48 pt-24 custom-scrollbar [overflow-anchor:none]"
       >
-        {/* Back chevron — ambient, doesn't scroll */}
-        {/* (handled in panel, but escape key closes) */}
-
         {/* Empty state while first response loads */}
         {visibleMessages.length === 0 && !showThinking && (
           <div className="flex items-center justify-center h-full select-none">
@@ -159,7 +175,7 @@ export function MindChat({
             <MessageBubble
               message={msg}
               toolResults={toolResultMap}
-              projectId={'mind:' + entryId}
+              projectId={isFreeform ? 'mind:freeform' : 'mind:' + entryId}
             />
           </div>
         ))}
@@ -177,7 +193,7 @@ export function MindChat({
       {/* Error — floating toast, same pattern as Conversation */}
       {error && (
         <div className="absolute bottom-36 left-1/2 -translate-x-1/2 z-40 w-[min(480px,80%)] pointer-events-none">
-          <div className="font-mono text-pane-error bg-pane-surface px-3 py-2 rounded-sm leading-[1.6]"
+          <div className="font-mono text-pane-error bg-pane-bg/90 backdrop-blur-md ring-1 ring-pane-border/40 px-3 py-2 rounded-lg leading-[1.6]"
             style={{ fontSize: '10px' }}>
             {error}
           </div>

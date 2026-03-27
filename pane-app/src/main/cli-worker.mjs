@@ -13,7 +13,8 @@ import os from "node:os";
 import readline from "node:readline";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { compileContext, mergeState } from "./session-context.mjs";
+import { compileContext, mergeState, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, readHandoff, writeHandoffWithHistory, updateLatestHandoff } from "./session-context.mjs";
+import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
 
 // Resolve the SDK's cli.js — works in both dev and production (asar).
 // In production, cli-worker.mjs is inside app.asar/out/main/, so node_modules
@@ -468,6 +469,7 @@ async function handleClaudeSpawn({
   mcpServerDest,
   tools,
   maxTurns,
+  noExec,
 }) {
   const ac = new AbortController();
   const oldAc = activeControllers.get(projectId);
@@ -504,11 +506,15 @@ async function handleClaudeSpawn({
           ELECTRON_RUN_AS_NODE: "1",
           PANE_PROJECT_ID: projectId,
           PANE_PROJECT_ROOT: workingDir,
+          ...(noExec ? { PANE_NO_EXEC: "1" } : {}),
         },
       },
     },
     abortController: ac,
   };
+
+  // Accumulate full assistant text for handoff pattern extraction at session end
+  let sessionText = "";
 
   // Auto-resume across error_max_turns: if the model hits its turn limit mid-task,
   // silently continue rather than surfacing an error. Capped at MAX_AUTO_RESUMES
@@ -554,6 +560,16 @@ async function handleClaudeSpawn({
           hitMaxTurns = true;
           maxTurnsSessionId = msg.session_id || resumeSessionId;
           break;
+        }
+
+        // Accumulate text content for handoff pattern extraction
+        if (msg.type === "assistant") {
+          const blocks = msg.message?.content || [];
+          for (const block of blocks) {
+            if (block.type === "text" && block.text) {
+              sessionText += (sessionText ? "\n\n" : "") + block.text;
+            }
+          }
         }
 
         if (RENDERER_MSG_TYPES.has(msg.type)) {
@@ -623,6 +639,38 @@ async function handleClaudeSpawn({
     if (activeControllers.get(projectId) === ac) {
       activeControllers.delete(projectId);
     }
+
+    // Refresh git status then write handoff — enables seamless model swaps FROM Claude Code
+    try {
+      const gitStatus = await getGitStatus(workingDir);
+      if (gitStatus) mergeState(projectId, { gitStatus });
+      const previousHandoff = readHandoff(projectId);
+      let handoff = generateHandoff(projectId, { writeFile: false });
+      if (sessionText) {
+        const extracted = extractFromModelOutput(sessionText, projectId);
+        handoff = mergeExtractedIntoHandoff(handoff, extracted);
+        // Layer 5: record any model corrections against the previous handoff
+        if (extracted.corrections?.length > 0) {
+          recordCorrections(projectId, extracted.corrections, previousHandoff);
+        }
+        // Layer 4: LLM fallback when regex found too little — CLI workers pass null
+        // (Claude Code output is well-structured; fallback adds little value here)
+        // updateLatestHandoff used instead of writeHandoffWithHistory to avoid a
+        // duplicate history entry (initial write happens below on the same session).
+        if (countHighConfidence(extracted) < 2 && sessionText.length > 500) {
+          extractWithLLM(sessionText, null).then(llmExtracted => {
+            if (Object.keys(llmExtracted).length > 0) {
+              const enriched = mergeExtractedIntoHandoff({ ...handoff }, llmExtracted);
+              updateLatestHandoff(projectId, enriched);
+            }
+          }).catch(() => {});
+        }
+      }
+      writeHandoffWithHistory(projectId, handoff);
+    } catch (err) {
+      console.warn("[cli-worker] Failed to write Claude handoff:", err.message);
+    }
+
     sendToMain({
       type: "event",
       projectId,
@@ -801,6 +849,9 @@ async function handleGeminiSpawn({
   }
 
   child.on("close", (code) => {
+    // Capture session text before state cleanup for handoff extraction
+    const geminiSessionText = requestStates.get(requestId)?.lastText || "";
+
     if (code !== 0) {
       const filtered = filterStderr(stderrOutput);
       if (filtered.length > 0) {
@@ -842,6 +893,38 @@ async function handleGeminiSpawn({
       activeProcesses.delete(projectId);
     }
     requestStates.delete(requestId);
+
+    // Write handoff after cleanup — enables seamless model swaps FROM Gemini CLI
+    ;(async () => {
+      try {
+        const gitStatus = await getGitStatus(workingDir);
+        if (gitStatus) mergeState(projectId, { gitStatus });
+        const previousHandoff = readHandoff(projectId);
+        let handoff = generateHandoff(projectId, { writeFile: false });
+        if (geminiSessionText) {
+          const extracted = extractFromModelOutput(geminiSessionText, projectId);
+          handoff = mergeExtractedIntoHandoff(handoff, extracted);
+          // Layer 5: record any model corrections against the previous handoff
+          if (extracted.corrections?.length > 0) {
+            recordCorrections(projectId, extracted.corrections, previousHandoff);
+          }
+          // Layer 4: LLM fallback when regex found too little (null quickCallFn = skip)
+          // updateLatestHandoff used — not writeHandoffWithHistory — to avoid a duplicate
+          // history entry when the async enrichment overwrites the initial write below.
+          if (countHighConfidence(extracted) < 2 && geminiSessionText.length > 500) {
+            extractWithLLM(geminiSessionText, null).then(llmExtracted => {
+              if (Object.keys(llmExtracted).length > 0) {
+                const enriched = mergeExtractedIntoHandoff({ ...handoff }, llmExtracted);
+                updateLatestHandoff(projectId, enriched);
+              }
+            }).catch(() => {});
+          }
+        }
+        writeHandoffWithHistory(projectId, handoff);
+      } catch (err) {
+        console.warn("[cli-worker] Failed to write Gemini handoff:", err.message);
+      }
+    })();
   });
 
   child.on("error", (err) => {
@@ -886,6 +969,7 @@ async function handleSpawn({
   maxTurns,
   systemPromptOverride,
   escalationHint,
+  noExec,
 }) {
   const command =
     messageCommand || (process.serviceData && process.serviceData.command);
@@ -908,14 +992,14 @@ async function handleSpawn({
   const gitStatus = await getGitStatus(workingDir);
 
   mergeState(projectId, {
-    lastProvider: command === "claude" ? "claude-cli" : "gemini-cli",
+    lastProvider: command === "claude" ? "claude-code" : "gemini",
     lastIntent: intent,
     turnCount: historyLength / 2 + 1,
     gitStatus,
     ...(todos ? { todos } : {}),
   });
 
-  const backend = command === "claude" ? "claude-cli" : "gemini-cli";
+  const backend = command === "claude" ? "claude-code" : "gemini";
   const context = compileContext(projectId, intent, historyLength, backend);
   const basePrompt = systemPromptOverride || context.full;
   const systemPrompt = escalationHint ? `${basePrompt}\n\n${escalationHint}` : basePrompt;
@@ -946,6 +1030,7 @@ async function handleSpawn({
       mcpServerDest,
       tools,
       maxTurns,
+      noExec,
     });
   } else {
     await handleGeminiSpawn({

@@ -773,8 +773,6 @@ const defaultSettings = {
   panel_width: null,
   punk_backend: "api",
   http_provider: "deepseek",
-  http_api_key: "",
-  http_base_url: "",
   http_api_keys: {},
   http_base_urls: {},
   selected_model: null,
@@ -978,7 +976,6 @@ function registerWatcherHandlers() {
 function registerCheckpointHandlers() {
   const CHECKPOINT_MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
   const CHECKPOINT_MAX_FILES = 200;
-  const CHECKPOINT_KEEP = 50;
 
   function checkpointDir(projectId) {
     return path.join(os.homedir(), ".pane", "checkpoints", projectId);
@@ -1069,20 +1066,6 @@ function registerCheckpointHandlers() {
       "utf-8",
     );
 
-    // Prune old checkpoints
-    try {
-      const all = (await fs.promises.readdir(dir))
-        .filter((f) => f.startsWith("cp-") && f.endsWith(".json"))
-        .sort();
-      if (all.length > CHECKPOINT_KEEP) {
-        const remove = all.slice(0, all.length - CHECKPOINT_KEEP);
-        await Promise.all(
-          remove.map((f) =>
-            fs.promises.unlink(path.join(dir, f)).catch(() => {}),
-          ),
-        );
-      }
-    } catch {}
 
     // Update manifest for external tools (punk-records reads this)
     try {
@@ -2209,6 +2192,7 @@ app.whenReady().then(async () => {
   mindWorkers = new MindWorkers({
     brainRequest,
     quickCall: (sys, usr) => punkEngine.quickCall(sys, usr),
+    agentCall: (sys, prompt, workingDir) => punkEngine.agentCall(sys, prompt, workingDir),
     sendToRenderer,
   });
   mindWorkers.start();

@@ -35,6 +35,7 @@ function formatDate(iso: string): string {
 function EntryItem({
   entry,
   isEditing,
+  hasUnread,
   onStartEdit,
   onSaveEdit,
   onCancelEdit,
@@ -44,6 +45,7 @@ function EntryItem({
 }: {
   entry: MindEntry;
   isEditing: boolean;
+  hasUnread?: boolean;
   onStartEdit: () => void;
   onSaveEdit: (content: string) => void;
   onCancelEdit: () => void;
@@ -291,13 +293,21 @@ function EntryItem({
 
           {/* Meta + actions row */}
           <div className="flex items-center justify-between mt-3">
-            <span
-              className="font-mono text-pane-text-secondary/25"
-              style={{ fontSize: "10px" }}
-            >
-              {formatDate(entry.created_at)}
-              {entry.updated_at !== entry.created_at && " · edited"}
-            </span>
+            <div className="flex items-center gap-2">
+              <span
+                className="font-mono text-pane-text-secondary/25"
+                style={{ fontSize: "10px" }}
+              >
+                {formatDate(entry.created_at)}
+                {entry.updated_at !== entry.created_at && " · edited"}
+              </span>
+              {hasUnread && (
+                <span
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
+                  style={{ background: "var(--pane-terminal)" }}
+                />
+              )}
+            </div>
 
             {/* Text word actions — ghost until hover */}
             <div className="flex items-center gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -360,6 +370,7 @@ export function Mind() {
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [textareaFocused, setTextareaFocused] = useState(false);
+  const [showFreeformChat, setShowFreeformChat] = useState(false);
   const [caretPos, setCaretPos] = useState<{
     top: number;
     left: number;
@@ -374,6 +385,7 @@ export function Mind() {
   const setChatEntryId = useMindStore((s) => s.setChatEntryId);
   const chatEntry = chatEntryId ? entries.find((e) => e.id === chatEntryId) : null;
   const setThreadEntryIds = useMindStore((s) => s.setThreadEntryIds);
+  const unreadThreadEntryIds = useMindStore((s) => s.unreadThreadEntryIds);
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const activeProjectRoot = useProjectsStore((s) => {
     const pid = s.activeProjectId;
@@ -399,14 +411,13 @@ export function Mind() {
     mindThreadListEntryIds().then(({ entryIds }) => setThreadEntryIds(new Set(entryIds))).catch(() => {});
   }, [chatEntryId]);
 
-  // Listen for worker-finding events — refresh threadEntryIds so thread indicators appear
+  // Listen for worker-finding events — refresh thread list and entry list when Mind is visible
   useEffect(() => {
     const electronAPI = (window as any).electronAPI;
     const unlisten = electronAPI.on(
       "pane://worker-finding",
       (data: { entryId?: string; workerType?: string; projectId?: string }) => {
         if (data?.entryId) {
-          // A worker wrote a thread for a specific entry — refresh thread indicators
           mindThreadListEntryIds()
             .then(({ entryIds }) => setThreadEntryIds(new Set(entryIds)))
             .catch(() => {});
@@ -546,6 +557,13 @@ export function Mind() {
     }
   };
 
+  const findingsEntries = entries
+    .filter((e) => unreadThreadEntryIds.has(e.id))
+    .sort(
+      (a, b) =>
+        new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+    );
+
   const activeEntries = entries
     .filter((e) => !e.completed)
     .sort(
@@ -631,17 +649,73 @@ export function Mind() {
                   !hasContent &&
                   "click away or ⌘↵ to save"}
               </span>
-              <button
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={handleSaveClick}
-                disabled={!hasContent || saveStatus === "saving"}
-                className="font-mono text-pane-text-secondary/50 hover:text-pane-text transition-colors disabled:opacity-0"
-                style={{ fontSize: "var(--pane-font-size-xs)" }}
-              >
-                save
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setShowFreeformChat(true)}
+                  disabled={!hasContent}
+                  className="font-mono text-pane-text-secondary/50 hover:text-pane-text transition-colors disabled:opacity-0"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  title="Open chat with this thought"
+                >
+                  chat
+                </button>
+                <button
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={handleSaveClick}
+                  disabled={!hasContent || saveStatus === "saving"}
+                  className="font-mono text-pane-text-secondary/50 hover:text-pane-text transition-colors disabled:opacity-0"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  save
+                </button>
+              </div>
             </div>
           </div>
+
+          {/* ── Findings strip — worker results not yet opened ── */}
+          {loaded && findingsEntries.length > 0 && (
+            <div className="mb-8">
+              <div className="mb-3">
+                <span
+                  className="font-mono uppercase tracking-wider"
+                  style={{ fontSize: "10px", color: "var(--pane-terminal)", opacity: 0.7 }}
+                >
+                  {findingsEntries.length} {findingsEntries.length === 1 ? "finding" : "findings"}
+                </span>
+              </div>
+              {findingsEntries.map((entry) => (
+                <button
+                  key={entry.id}
+                  onClick={() => setChatEntryId(entry.id)}
+                  className="w-full flex items-center gap-2.5 py-1.5 text-left group"
+                >
+                  <span
+                    className="w-1.5 h-1.5 rounded-full shrink-0"
+                    style={{ background: "var(--pane-terminal)" }}
+                  />
+                  <span
+                    className="font-mono shrink-0"
+                    style={{ fontSize: "10px", color: "var(--pane-terminal)", opacity: 0.8 }}
+                  >
+                    {unreadThreadEntryIds.get(entry.id) ?? "finding"}
+                  </span>
+                  <span
+                    className="font-mono text-pane-text-secondary/40 shrink-0"
+                    style={{ fontSize: "10px" }}
+                  >
+                    —
+                  </span>
+                  <span
+                    className="font-mono text-pane-text-secondary/60 group-hover:text-pane-text-secondary truncate transition-colors"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {(entry.content.split("\n")[0] ?? "").slice(0, 80) || "untitled thought"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
 
           {/* ── Entries — grouped by status ── */}
           {loaded && (
@@ -663,6 +737,7 @@ export function Mind() {
                       key={entry.id}
                       entry={entry}
                       isEditing={editingId === entry.id}
+                      hasUnread={unreadThreadEntryIds.has(entry.id)}
                       onStartEdit={() => setEditingId(entry.id)}
                       onSaveEdit={(content) => handleSaveEdit(entry.id, content)}
                       onCancelEdit={() => setEditingId(null)}
@@ -693,6 +768,7 @@ export function Mind() {
                       key={entry.id}
                       entry={entry}
                       isEditing={editingId === entry.id}
+                      hasUnread={unreadThreadEntryIds.has(entry.id)}
                       onStartEdit={() => setEditingId(entry.id)}
                       onSaveEdit={(content) => handleSaveEdit(entry.id, content)}
                       onCancelEdit={() => setEditingId(null)}
@@ -723,14 +799,24 @@ export function Mind() {
 
       {/* Chat overlay — absolute inset-0 ensures it always fills full height */}
       {/* Rendered as an overlay so scroll state of list never affects it */}
-      {chatEntryId && chatEntry && (
+      {(chatEntryId || showFreeformChat) && (chatEntryId ? chatEntry : true) && (
         <div className="absolute inset-0">
-          <MindChat
-            entryId={chatEntryId}
-            entryContent={chatEntry.content}
-            workingDir={workingDir}
-            onClose={() => setChatEntryId(null)}
-          />
+          {showFreeformChat ? (
+            <MindChat
+              entryId="freeform"
+              workingDir={workingDir}
+              onClose={() => setShowFreeformChat(false)}
+              isFreeform={true}
+            />
+          ) : (
+            <MindChat
+              entryId={chatEntryId}
+              entryContent={chatEntry?.content}
+              workingDir={workingDir}
+              onClose={() => setChatEntryId(null)}
+              isFreeform={false}
+            />
+          )}
         </div>
       )}
     </div>

@@ -11,7 +11,8 @@ const { AbortController, fetch, TextDecoder, console } = globalThis;
 
 import { PunkBackend } from "./punk-backend.mjs";
 import { ToolExecutor } from "./tool-executor.mjs";
-import { compileContext, mergeState, readState } from "./session-context.mjs";
+import { compileContext, mergeState, readState, getContextLimit, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, writeHandoffWithHistory, updateLatestHandoff, readHandoff } from "./session-context.mjs";
+import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
 import contextManager from "./context-manager.mjs";
 
 // ============================================================================
@@ -254,6 +255,22 @@ const TOOL_DEFINITIONS = [
       description:
         "Get recent terminal commands and their outputs from Pane's terminal.",
       parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_run_in_terminal",
+      description:
+        "Run a shell command and return its output. Use this for builds, tests, git operations, installing packages, or any shell task. Commands run in the project directory with the user's full shell environment including nvm, homebrew, and local tools.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "The shell command to execute." },
+          timeout: { type: "number", description: "Timeout in seconds (default 30, max 120)." },
+        },
+        required: ["command"],
+      },
     },
   },
   {
@@ -898,20 +915,9 @@ export class ApiBackend extends PunkBackend {
 
       const provider = providerOverride || settings.http_provider || "deepseek";
 
-      // Multi-key map takes precedence; fall back to legacy single key
-      let apiKey = "";
-      if (settings.http_api_keys?.[provider]) {
-        apiKey = settings.http_api_keys[provider];
-      } else if (settings.http_api_key) {
-        apiKey = settings.http_api_key;
-      }
+      let apiKey = settings.http_api_keys?.[provider] || "";
 
-      let baseUrl;
-      if (settings.http_base_urls?.[provider]) {
-        baseUrl = settings.http_base_urls[provider];
-      } else if (settings.http_base_url) {
-        baseUrl = settings.http_base_url;
-      }
+      const baseUrl = settings.http_base_urls?.[provider];
 
       console.log(
         `[http] getApiConfig: provider=${provider}, hasKey=${!!apiKey}, baseUrl=${baseUrl}`,
@@ -1239,6 +1245,7 @@ export class ApiBackend extends PunkBackend {
 
       let turn = 0;
       const maxTurns = 100;
+      let sessionOutput = ""; // Accumulate all model text for pattern extraction
 
       while (turn < maxTurns) {
         turn++;
@@ -1384,6 +1391,8 @@ export class ApiBackend extends PunkBackend {
         const finalContent = [];
         if (state.accumulated) {
           finalContent.push({ type: "text", text: state.accumulated });
+          // Accumulate text for pattern extraction in handoff
+          sessionOutput += (sessionOutput ? "\n\n" : "") + state.accumulated;
         }
         for (const tool of state.toolUses.values()) {
           let parsedInput = {};
@@ -1447,7 +1456,6 @@ export class ApiBackend extends PunkBackend {
           request.workingDir,
         );
         const toolResults = [];
-        let needsStateRefresh = false;
 
         for (const tool of state.toolUses.values()) {
           let parsedInput = {};
@@ -1460,7 +1468,6 @@ export class ApiBackend extends PunkBackend {
           let result;
           if (tool.name === "evaluate_js") {
             try {
-              const { getContextLimit } = await import("./session-context.mjs");
               const fn = new Function(
                 "getContextLimit",
                 "TOOL_DEFINITIONS",
@@ -1492,7 +1499,6 @@ export class ApiBackend extends PunkBackend {
               "Task",
             ].includes(tool.name)
           ) {
-            needsStateRefresh = true;
             if (tool.name === "TodoWrite" && parsedInput.todos) {
               // Normalize todos format - handle both string[] and Todo[] formats
               let normalizedTodos;
@@ -1593,24 +1599,59 @@ export class ApiBackend extends PunkBackend {
           });
         }
 
-        if (needsStateRefresh) {
-          const gitStatus = await this.getGitStatus(request.workingDir);
-          mergeState(request.projectId, { gitStatus });
+        // Always refresh context after tool execution — ensures every turn has fresh state
+        // (git status, working set, recent actions, session state, etc.)
+        const gitStatus = await this.getGitStatus(request.workingDir);
+        mergeState(request.projectId, { gitStatus });
 
-          // Re-compile context to get updated system prompt for the next request in this turn
-          const context = compileContext(
-            request.projectId,
-            request.intent,
-            messages.length, // use current length
-          );
-          if (messages.length > 0 && messages[0].role === "system") {
-            messages[0].content = context.full;
-          }
+        // Re-compile context to get updated system prompt for the next turn
+        const context = compileContext(
+          request.projectId,
+          request.intent,
+          messages.length, // use current length (now includes assistant response + tool results)
+        );
+        if (messages.length > 0 && messages[0].role === "system") {
+          messages[0].content = context.full;
         }
       }
 
       // Turn completed cleanly — mark all in_progress todos as done
       autoAdvanceTodos(request.projectId, "turn_end", this.onEvent.bind(this), request.requestId);
+
+      // Build handoff document then enrich with pattern extraction — single write at the end.
+      // Layer 3: extracted items carry confidence scores.
+      // Layer 4: LLM fallback fires when regex found < 2 high-confidence items.
+      // Layer 5: model corrections recorded against the previous session's handoff.
+      const previousHandoff = readHandoff(request.projectId);
+      let handoff = generateHandoff(request.projectId, { writeFile: false });
+      if (sessionOutput.length > 0) {
+        const extracted = extractFromModelOutput(sessionOutput, request.projectId);
+        handoff = mergeExtractedIntoHandoff(handoff, extracted);
+        // Layer 5: record corrections now, before writing the new handoff
+        if (extracted.corrections?.length > 0) {
+          recordCorrections(request.projectId, extracted.corrections, previousHandoff);
+        }
+        // Layer 4: async LLM fallback when regex yielded too little
+        if (countHighConfidence(extracted) < 2 && sessionOutput.length > 500) {
+          const quickCallFn = (sys, usr) => {
+            const cheapReq = { provider: null, model: null, thinking: false };
+            return this.planningCall(sys, usr, cheapReq);
+          };
+          // Fire-and-forget — initial handoff written below, LLM enrichment replaces it in-place
+          // via updateLatestHandoff (not writeHandoffWithHistory) to avoid a duplicate history entry
+          extractWithLLM(sessionOutput, quickCallFn).then(llmExtracted => {
+            if (Object.keys(llmExtracted).length > 0) {
+              const enriched = mergeExtractedIntoHandoff({ ...handoff }, llmExtracted);
+              updateLatestHandoff(request.projectId, enriched);
+            }
+          }).catch(() => {});
+        }
+      }
+      try {
+        writeHandoffWithHistory(request.projectId, handoff);
+      } catch (err) {
+        console.warn(`[http] Failed to write handoff: ${err.message}`);
+      }
 
       this.onEvent(
         request.projectId,

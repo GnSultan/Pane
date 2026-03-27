@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useProjectsStore } from "../../stores/projects";
+import { useMindStore } from "../../stores/mind";
 
 interface Notification {
   id: string;
@@ -27,6 +28,10 @@ export function TaskNotification() {
   const [workerNotifications, setWorkerNotifications] = useState<WorkerNotification[]>([]);
   const workerTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const setActiveProject = useProjectsStore((s) => s.setActiveProject);
+  const setMode = useProjectsStore((s) => s.setMode);
+  const activeProjectId = useProjectsStore((s) => s.activeProjectId);
+  const setChatEntryId = useMindStore((s) => s.setChatEntryId);
+  const addUnreadThread = useMindStore((s) => s.addUnreadThread);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -52,6 +57,8 @@ export function TaskNotification() {
       "pane://worker-finding",
       (data: { entryId?: string; workerType?: string; preview?: string }) => {
         if (!data?.workerType) return;
+        // Always mark as unread regardless of which page is visible
+        if (data.entryId) addUnreadThread(data.entryId, data.workerType);
         const wn: WorkerNotification = {
           id: `worker-${Date.now()}-${Math.random()}`,
           entryId: data.entryId,
@@ -101,9 +108,9 @@ export function TaskNotification() {
         <div
           key={notification.id}
           onClick={() => handleClick(notification)}
-          className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 px-4 py-3
+          className="bg-pane-bg/90 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 px-4 py-3
                      animate-fadeSlideUp pointer-events-auto cursor-pointer
-                     hover:bg-pane-text/[0.04] btn-press
+                     hover:bg-pane-surface/90 btn-press
                      flex items-center gap-3 min-w-[280px]"
         >
           <span className="w-2 h-2 rounded-full bg-pane-status-added shrink-0" />
@@ -129,10 +136,16 @@ export function TaskNotification() {
       {workerNotifications.map((wn) => (
         <div
           key={wn.id}
-          onClick={() => dismissWorkerNotification(wn.id)}
-          className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 px-4 py-3
+          onClick={() => {
+            dismissWorkerNotification(wn.id);
+            if (wn.entryId && activeProjectId) {
+              setMode(activeProjectId, "mind");
+              setChatEntryId(wn.entryId);
+            }
+          }}
+          className="bg-pane-bg/90 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 px-4 py-3
                      animate-fadeSlideUp pointer-events-auto cursor-pointer
-                     hover:bg-pane-text/[0.04] btn-press
+                     hover:bg-pane-surface/90 btn-press
                      flex items-start gap-3 min-w-[280px] max-w-[360px]"
         >
           <span

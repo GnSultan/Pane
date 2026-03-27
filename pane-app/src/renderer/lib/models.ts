@@ -17,7 +17,7 @@ export interface IntentRouting {
 // Map of backendId -> Routing configuration
 export type BackendRouting = Record<string, IntentRouting>;
 
-export const DEFAULT_GEMINI_CLI_ROUTING: IntentRouting = {
+export const DEFAULT_GEMINI_ROUTING: IntentRouting = {
   plan: { provider: "gemini", model: "auto-gemini-3", thinking: false },
   execute: { provider: "gemini", model: "auto-gemini-3", thinking: false },
   explain: { provider: "gemini", model: "auto-gemini-3", thinking: false },
@@ -47,7 +47,7 @@ export const DEFAULT_HTTP_ROUTING: IntentRouting = {
   },
 };
 
-export const DEFAULT_CLAUDE_CLI_ROUTING: IntentRouting = {
+export const DEFAULT_CLAUDE_CODE_ROUTING: IntentRouting = {
   plan: { provider: "anthropic", model: "claude-opus-4-6", thinking: false },
   execute: { provider: "anthropic", model: "claude-sonnet-4-6", thinking: false },
   explain: { provider: "anthropic", model: "claude-sonnet-4-6", thinking: false },
@@ -56,16 +56,10 @@ export const DEFAULT_CLAUDE_CLI_ROUTING: IntentRouting = {
 
 export const DEFAULT_BACKEND_ROUTING: BackendRouting = {
   api: DEFAULT_HTTP_ROUTING,
-  "claude-code": DEFAULT_CLAUDE_CLI_ROUTING,
-  "gemini": DEFAULT_GEMINI_CLI_ROUTING,
-  // Legacy keys — backward compat for stored settings
-  http: DEFAULT_HTTP_ROUTING,
-  "claude-cli": DEFAULT_CLAUDE_CLI_ROUTING,
-  "gemini-cli": DEFAULT_GEMINI_CLI_ROUTING,
+  "claude-code": DEFAULT_CLAUDE_CODE_ROUTING,
+  "gemini": DEFAULT_GEMINI_ROUTING,
 };
 
-// Deprecated — use DEFAULT_BACKEND_ROUTING instead
-export const DEFAULT_ROUTING = DEFAULT_GEMINI_CLI_ROUTING;
 
 export const THINKING_ENGINES: EngineOption[] = [
   {

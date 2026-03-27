@@ -162,9 +162,7 @@ export interface UserSettings {
   selected_model_provider?: string;
   punk_backend: string;
   http_provider?: string;
-  http_api_key?: string;
   http_api_keys?: Record<string, string>;
-  http_base_url?: string;
   http_base_urls?: Record<string, string>;
   intent_routing?: BackendRouting;
   intent_auto_route?: boolean;

@@ -152,6 +152,7 @@ function ThoughtConversations() {
   const chatEntryId = useMindStore((s) => s.chatEntryId);
   const entries = useMindStore((s) => s.entries);
   const threadEntryIds = useMindStore((s) => s.threadEntryIds);
+  const unreadThreadEntryIds = useMindStore((s) => s.unreadThreadEntryIds);
   const setChatEntryId = useMindStore((s) => s.setChatEntryId);
 
   // Stable sort by date — entries never jump positions when switching
@@ -171,6 +172,7 @@ function ThoughtConversations() {
     <div>
       {thoughtEntries.map((entry) => {
         const isActive = entry.id === chatEntryId;
+        const hasUnread = unreadThreadEntryIds.has(entry.id);
         return (
           <button
             key={entry.id}
@@ -184,6 +186,12 @@ function ThoughtConversations() {
             style={{ fontSize: "var(--pane-panel-font-size)" }}
           >
             <span className="truncate flex-1 text-left">{label(entry.content)}</span>
+            {hasUnread && (
+              <span
+                className="w-1.5 h-1.5 rounded-full shrink-0"
+                style={{ background: "var(--pane-terminal)" }}
+              />
+            )}
           </button>
         );
       })}
@@ -202,6 +210,7 @@ export function ControlPanel() {
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
   });
   const mindChatActive = useMindStore((s) => s.chatEntryId !== null);
+  const mindHasUnread = useMindStore((s) => s.unreadThreadEntryIds.size > 0);
   const isGitRepo = useProjectsStore((s) => {
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.git.isGitRepo ?? false;
@@ -283,7 +292,17 @@ export function ControlPanel() {
         />
         <div className="ml-auto flex items-center gap-0.5">
           <ToolbarButton
-            icon={<MindIcon />}
+            icon={
+              <span className="relative flex items-center justify-center">
+                <MindIcon />
+                {mindHasUnread && (
+                  <span
+                    className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full"
+                    style={{ background: "var(--pane-terminal)" }}
+                  />
+                )}
+              </span>
+            }
             active={mode === "mind"}
             onClick={() => handleSetMode("mind")}
             tooltip="Mind"

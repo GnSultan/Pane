@@ -18,9 +18,10 @@ import crypto from "node:crypto";
 const PANE_DIR = path.join(os.homedir(), ".pane");
 
 export class MindWorkers {
-  constructor({ brainRequest, quickCall, sendToRenderer }) {
+  constructor({ brainRequest, quickCall, agentCall, sendToRenderer }) {
     this._brainRequest = brainRequest;
     this._quickCall = quickCall;
+    this._agentCall = agentCall; // full agentic spawn — can read files, run terminal, use MCP tools
     this._sendToRenderer = sendToRenderer;
     this._lastSentinelRun = 0;
     this._sentinelInterval = null;
@@ -118,19 +119,31 @@ Respond with one word: bug, idea, task, or none.`;
 
   async _runBugWorker(entry, projectId) {
     const ctx = await this._loadProjectContext(projectId, entry.content);
+    const workingDir = await this._resolveWorkingDir(projectId);
 
-    const systemPrompt = `You are investigating a bug report for ${ctx.projectName || "this project"}.
+    const systemPrompt = `You are a bug investigator for ${ctx.projectName || "this project"}. You have full access to the codebase, Pane's indexed knowledge, and terminal.
 
-${ctx.why ? `Project purpose: ${ctx.why}\n` : ""}${ctx.principles.length > 0 ? `Established principles:\n${ctx.principles.map(p => `- ${p}`).join("\n")}\n` : ""}
-${ctx.relevantFiles.length > 0 ? `Relevant files:\n${ctx.relevantFiles.map(f => `- ${f.path}${f.description ? ` — ${f.description}` : ""}`).join("\n")}\n` : ""}${ctx.memories.length > 0 ? `Related context:\n${ctx.memories.map(m => `- ${m}`).join("\n")}\n` : ""}
-Analyze this bug report. Provide:
-1. What area of the codebase is likely affected
-2. What the probable cause is based on the context
-3. Suggested investigation steps
+${ctx.why ? `Project purpose: ${ctx.why}\n` : ""}${ctx.principles.length > 0 ? `Established principles:\n${ctx.principles.map(p => `- ${p}`).join("\n")}\n` : ""}${ctx.relevantFiles.length > 0 ? `Likely relevant files:\n${ctx.relevantFiles.map(f => `- ${f.path}${f.description ? ` — ${f.description}` : ""}`).join("\n")}\n` : ""}${ctx.memories.length > 0 ? `Related context:\n${ctx.memories.map(m => `- ${m}`).join("\n")}\n` : ""}
+Use Pane's tools to investigate efficiently — prefer them over raw search:
+- pane_find_symbol: locate functions, types, components by name without scanning
+- pane_recall: surface past decisions, lessons, or patterns related to this bug
+- pane_knowledge_graph: understand architectural relationships and constraints
+- Read: read specific files once you know where to look
+- pane_run_in_terminal: run tests or build checks to confirm or deny the bug
 
-Be concise. No speculation beyond what the context supports. No emojis.`;
+Investigate thoroughly:
+- Locate the relevant code using pane_find_symbol or pane_recall first
+- Trace the actual code path
+- Verify with terminal if tests exist
 
-    const result = await this._quickCall(systemPrompt, entry.content);
+Deliver a concise finding:
+1. Root cause (name files, functions, line ranges)
+2. How to verify (specific test, command, or reproduction steps)
+3. Suggested fix direction
+
+No speculation. No emojis.`;
+
+    const result = await this._agentCall(systemPrompt, `Investigate this bug:\n\n${entry.content}`, workingDir);
     if (result && result.trim()) {
       await this._writeWorkerThread(entry.id, result.trim(), "bug");
     }
@@ -140,19 +153,27 @@ Be concise. No speculation beyond what the context supports. No emojis.`;
 
   async _runReflectionWorker(entry, projectId) {
     const ctx = await this._loadProjectContext(projectId, entry.content);
+    const workingDir = await this._resolveWorkingDir(projectId);
 
-    const systemPrompt = `You are a thinking partner reflecting on an idea for ${ctx.projectName || "this project"}.
+    const systemPrompt = `You are a codebase analyst reflecting on an idea for ${ctx.projectName || "this project"}. You have full access to the codebase, Pane's indexed knowledge, and terminal.
 
-${ctx.why ? `Project purpose: ${ctx.why}\n` : ""}${ctx.principles.length > 0 ? `Established principles:\n${ctx.principles.map(p => `- ${p}`).join("\n")}\n` : ""}
-${ctx.memories.length > 0 ? `Related context:\n${ctx.memories.map(m => `- ${m}`).join("\n")}\n` : ""}
-Consider this idea against the project's purpose and principles.
-- Does it align with or challenge existing direction?
-- What patterns or decisions relate to this idea?
-- What implications might the author not have considered?
+${ctx.why ? `Project purpose: ${ctx.why}\n` : ""}${ctx.principles.length > 0 ? `Established principles:\n${ctx.principles.map(p => `- ${p}`).join("\n")}\n` : ""}${ctx.memories.length > 0 ? `Related context:\n${ctx.memories.map(m => `- ${m}`).join("\n")}\n` : ""}
+Use Pane's tools to explore efficiently — prefer them over raw search:
+- pane_recall: search project memory for past decisions, lessons, or patterns related to this idea
+- pane_knowledge_graph: understand architectural decisions and their rationale
+- pane_find_symbol: locate specific implementations relevant to this idea
+- pane_cross_project: check if similar patterns exist in other projects
+- Read: read specific files once you know where to look
+- Glob/Grep: only for searches the above tools can't answer
 
-Be concise and direct. Surface non-obvious connections. No emojis.`;
+Ground the reflection in what you actually find:
+- Does the codebase already have something related? Where?
+- Do prior decisions support or constrain this idea?
+- What would the author not have seen without digging in?
 
-    const result = await this._quickCall(systemPrompt, entry.content);
+Deliver a concise, evidence-based reflection. No speculation. No emojis.`;
+
+    const result = await this._agentCall(systemPrompt, `Reflect on this idea:\n\n${entry.content}`, workingDir);
     if (result && result.trim()) {
       await this._writeWorkerThread(entry.id, result.trim(), "reflection");
     }
@@ -242,6 +263,24 @@ Otherwise, list specific findings (max 3), each as a single concise sentence. No
   }
 
   // ── Shared Helpers ─────────────────────────────────────────────────────────
+
+  /**
+   * Resolve the actual filesystem root for a projectId.
+   * projectId is typically the folder name; we read the stored project root
+   * from ~/.pane/memory/{projectId}/root.txt if it exists, otherwise fall back
+   * to the home directory (agent can still navigate from there).
+   */
+  async _resolveWorkingDir(projectId) {
+    if (!projectId) return os.homedir();
+    try {
+      const rootFile = path.join(PANE_DIR, "memory", projectId, "root.txt");
+      const root = (await fs.readFile(rootFile, "utf-8")).trim();
+      if (root) return root;
+    } catch {}
+    // Fallback: projectId may itself be an absolute path (some older setups)
+    if (projectId.startsWith("/")) return projectId;
+    return os.homedir();
+  }
 
   async _loadProjectContext(projectId, query) {
     const result = {

@@ -29,11 +29,14 @@ const PWD_MARKER = "___PANE_PWD___";
 const LIVE_OUTPUT_MAX_LINES = 200;
 const OUTPUT_BUFFER_MAX = 500_000; // ~500KB, prevents unbounded memory growth
 
-// Process \r semantically: overwrite current line rather than delete it.
-// This collapses progress bars (npm, pip, cargo) into a single updating line
-// instead of accumulating hundreds of identical lines.
+// Process \r semantically: \r\n is a normal line ending (strip the \r),
+// while standalone \r (no following \n) means "overwrite current line" —
+// this collapses progress bars into a single updating line.
 function processCarriageReturns(text: string): string {
-  const lines = text.split("\n");
+  // First: normalize \r\n to \n (standard terminal line endings)
+  const normalized = text.replace(/\r\n/g, "\n");
+  // Then: process remaining standalone \r (progress bar overwrites)
+  const lines = normalized.split("\n");
   return lines.map((line) => {
     if (!line.includes("\r")) return line;
     const parts = line.split("\r");
@@ -452,6 +455,22 @@ function TerminalTabContent({
     if (textareaFocused) updateCaret();
   }, [command, textareaFocused, updateCaret]);
 
+  // Auto-resize textarea height to fit content (same pattern as InputBar).
+  // minH matches the line-height (1.5rem) so single-line always shows fully.
+  const applyInputHeight = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    const lineH = parseFloat(getComputedStyle(el).lineHeight) || 24;
+    const minH = lineH;
+    const maxH = 200;
+    el.style.height = "1px";
+    el.style.height = Math.min(Math.max(el.scrollHeight, minH), maxH) + "px";
+  }, []);
+
+  useEffect(() => {
+    applyInputHeight();
+  }, [command, applyInputHeight]);
+
   // Reposition on selection movement (arrows, mouse clicks, scroll)
   useEffect(() => {
     const el = inputRef.current;
@@ -609,7 +628,7 @@ function TerminalTabContent({
 
   return (
     <div
-      className="flex flex-col flex-1 min-h-0 w-full"
+      className="flex flex-col flex-1 min-h-0 w-full relative"
       style={{ display: isVisible ? "flex" : "none" }}
     >
       <div className="flex-1 relative min-h-0" data-no-drag>
@@ -624,7 +643,7 @@ function TerminalTabContent({
         )}
         <div
           ref={scrollRef}
-          className="h-full overflow-y-auto overflow-x-hidden px-10 pt-8 pb-4 relative z-20"
+          className="h-full overflow-y-auto overflow-x-hidden px-10 pt-8 pb-16 relative z-20"
           style={{ willChange: "transform" }}
         >
           {lines.length === 0 && (
@@ -693,16 +712,16 @@ function TerminalTabContent({
         </div>
       </div>
 
-      {/* Command input card */}
-      <div className="shrink-0 mx-6 mb-4">
-        <div className={`bg-pane-bg rounded-xl ring-1 transition-colors ${isRunning ? "ring-pane-terminal/40" : "ring-pane-border/40"}`}>
-          <div
-            className="px-5 pt-3 pb-1 font-mono select-none"
-            style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)" }}
+      {/* Command input — pinned to bottom, full bleed, matching Conversation InputBar */}
+      <div className="absolute bottom-0 left-0 right-0 z-30">
+        <div className={`bg-pane-bg rounded-xl ring-1 transition-colors flex items-center gap-2 px-4 py-3 ${isRunning ? "ring-pane-terminal/40" : "ring-pane-border/40"}`}>
+          <span
+            className="font-mono select-none shrink-0 self-start"
+            style={{ fontSize: "var(--pane-font-size-base)", lineHeight: "1.5rem", color: "var(--pane-terminal)", margin: 0, padding: 0 }}
           >
             {displayPath} $
-          </div>
-          <div ref={caretContainerRef} className="relative">
+          </span>
+          <div ref={caretContainerRef} className="flex-1 relative">
             <textarea
               ref={inputRef}
               value={command}
@@ -724,14 +743,15 @@ function TerminalTabContent({
               className="w-full bg-transparent border-none outline-none resize-none text-pane-text font-mono placeholder:text-pane-text-secondary/20"
               style={{
                 fontSize: "var(--pane-font-size-base)",
-                minHeight: "2.5rem",
-                lineHeight: "1.75",
+                lineHeight: "1.5rem",
+                padding: 0,
+                margin: 0,
+                border: 0,
                 caretColor: "transparent",
-                padding: "0 1.25rem 0.75rem",
+                appearance: "none",
+                WebkitAppearance: "none",
               }}
-              rows={1}
             />
-            {/* Static amber cursor */}
             {textareaFocused && caretPos && (
               <div
                 aria-hidden

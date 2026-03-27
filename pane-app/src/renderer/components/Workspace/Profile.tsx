@@ -391,7 +391,7 @@ function EngineSelect({
     options.forEach((opt) => {
       // Check if provider has a key.
       // Special-case: gemini provider is only shown if there's a key in httpApiKeys
-      // OR if we're in gemini-cli mode (where keys are managed by the CLI environment).
+      // OR if we're on the gemini backend (where keys are managed by the CLI environment).
       const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini";
       const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-code";
       if (!httpApiKeys?.[opt.provider] && !(isGeminiBackend && opt.provider === "gemini") && !(isClaudeBackend && opt.provider === "anthropic")) return;

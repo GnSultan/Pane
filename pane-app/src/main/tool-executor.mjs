@@ -916,6 +916,23 @@ export class ToolExecutor {
           return { success: true, output: out, toolId };
         }
 
+        case "pane_run_in_terminal": {
+          const command = (input?.command || "").trim();
+          if (!command) return { success: false, error: "No command provided.", toolId };
+          const result = await this.executeBash(toolId, command, false, null);
+          // Append to terminal history so pane_recent_terminal and the UI reflect what Claude ran
+          try {
+            const termPath = path.join(stateDir, "terminal.json");
+            let termData = null;
+            try { termData = JSON.parse(await fsPromises.readFile(termPath, "utf-8")); } catch {}
+            const commands = Array.isArray(termData?.commands) ? termData.commands : [];
+            commands.push({ cmd: command, output: result.output || result.error || "", timestamp: Date.now(), source: "claude" });
+            await fsPromises.mkdir(stateDir, { recursive: true });
+            await fsPromises.writeFile(termPath, JSON.stringify({ commands: commands.slice(-20) }));
+          } catch {}
+          return result;
+        }
+
         case "pane_recall": {
           const query = (input?.query || "").trim();
 

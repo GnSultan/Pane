@@ -5,6 +5,8 @@ interface MindState {
   chatEntryId: string | null;
   entries: MindEntry[];
   threadEntryIds: Set<string>;
+  // Maps entry id → workerType so the findings strip can label each row
+  unreadThreadEntryIds: Map<string, string>;
   loaded: boolean;
 
   setChatEntryId: (id: string | null) => void;
@@ -13,6 +15,7 @@ interface MindState {
   updateEntry: (id: string, entry: MindEntry) => void;
   removeEntry: (id: string) => void;
   setThreadEntryIds: (ids: Set<string>) => void;
+  addUnreadThread: (id: string, workerType: string) => void;
   setLoaded: (loaded: boolean) => void;
 }
 
@@ -21,9 +24,15 @@ function createMindStore() {
     chatEntryId: null,
     entries: [],
     threadEntryIds: new Set(),
+    unreadThreadEntryIds: new Map(),
     loaded: false,
 
-    setChatEntryId: (id) => set({ chatEntryId: id }),
+    setChatEntryId: (id) =>
+      set((state) => {
+        const unreadThreadEntryIds = new Map(state.unreadThreadEntryIds);
+        if (id) unreadThreadEntryIds.delete(id);
+        return { chatEntryId: id, unreadThreadEntryIds };
+      }),
 
     setEntries: (entries) => set({ entries }),
 
@@ -41,6 +50,13 @@ function createMindStore() {
       })),
 
     setThreadEntryIds: (ids) => set({ threadEntryIds: ids }),
+
+    addUnreadThread: (id, workerType) =>
+      set((state) => {
+        const unreadThreadEntryIds = new Map(state.unreadThreadEntryIds);
+        unreadThreadEntryIds.set(id, workerType);
+        return { unreadThreadEntryIds };
+      }),
 
     setLoaded: (loaded) => set({ loaded }),
   }));
