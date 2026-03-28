@@ -20,7 +20,6 @@ function ProjectRow({
   const hasUnread = useProjectsStore((s) => s.projects.get(id)?.hasUnreadCompletion ?? false);
   const isActive = useProjectsStore((s) => s.activeProjectId === id);
   const setActiveProject = useProjectsStore((s) => s.setActiveProject);
-  const removeProject = useProjectsStore((s) => s.removeProject);
   const renameProject = useProjectsStore((s) => s.renameProject);
 
   const [editing, setEditing] = useState(false);

@@ -16,6 +16,8 @@ const PUNK_PERSONAS: Record<string, { name: string; role: string }> = {
 };
 
 // ─── PostComments ──────────────────────────────────────────────────────────
+// Design: Follows ToolActivity pattern — separate card, border-only, monospace,
+// no decorative chrome. Standalone visual unit with whitespace separation.
 
 function PostComments({
   postId,
@@ -73,10 +75,10 @@ function PostComments({
   };
 
   return (
-    <div className="border-l border-pane-border/30 ml-3 pl-3 mt-2 mb-1">
+    <div className="border border-[var(--pane-border-soft)] bg-pane-bg/60 rounded-md p-3">
       {/* Message thread */}
       {messages.length > 0 && (
-        <div className="flex flex-col gap-2 mb-2">
+        <div className="flex flex-col gap-3 mb-3">
           {messages.map((msg) => {
             const isAssistant = msg.type === "assistant";
             const text = msg.content
@@ -85,7 +87,7 @@ function PostComments({
               .join("");
             if (!text) return null;
             return (
-              <div key={msg.id} className="flex flex-col gap-0.5">
+              <div key={msg.id} className="flex flex-col gap-1">
                 <span
                   className="font-mono"
                   style={{
@@ -93,14 +95,14 @@ function PostComments({
                     color: isAssistant
                       ? "var(--pane-terminal)"
                       : "var(--pane-text-secondary)",
-                    opacity: isAssistant ? 1 : 0.6,
+                    opacity: isAssistant ? 0.8 : 0.5,
                   }}
                 >
                   {isAssistant ? "pane" : "you"}
                 </span>
                 <p
                   className="text-pane-text leading-relaxed whitespace-pre-wrap"
-                  style={{ fontSize: "var(--pane-panel-font-size)" }}
+                  style={{ fontSize: "var(--pane-font-size-sm)" }}
                 >
                   {text}
                   {msg.isStreaming && (
@@ -147,7 +149,7 @@ function PostComments({
 
       {/* Thinking dots when first message not yet visible */}
       {isProcessing && messages.length === 0 && (
-        <div className="flex items-center gap-1 mb-2" style={{ height: "1.25rem" }}>
+        <div className="flex items-center gap-1 mb-3" style={{ height: "1.25rem" }}>
           <span
             className="font-mono"
             style={{
@@ -173,59 +175,59 @@ function PostComments({
       {/* Error */}
       {error && (
         <p
-          className="text-red-400 mb-1"
+          className="text-pane-error mb-3 font-mono"
           style={{ fontSize: "var(--pane-font-size-xs)" }}
         >
           {error}
         </p>
       )}
 
-      {/* Reply input */}
-      <div className="mt-3">
-        <div
-          className={`bg-pane-bg rounded-lg ring-1 transition-all relative ${
-            focused ? "ring-pane-border/60" : "ring-pane-border/30"
-          }`}
-        >
-          <textarea
-            ref={textareaRef}
-            value={input}
-            onChange={(e) => {
-              setInput(e.target.value);
-              e.target.style.height = "auto";
-              e.target.style.height = `${e.target.scrollHeight}px`;
-            }}
-            onKeyDown={handleKeyDown}
-            onFocus={() => setFocused(true)}
-            onBlur={() => setFocused(false)}
-            placeholder="reply"
-            rows={1}
-            disabled={isProcessing}
-            className="w-full bg-transparent text-pane-text font-mono resize-none outline-none placeholder:text-pane-text-secondary/30 leading-[1.75] px-3 pt-2 overflow-hidden"
-            style={{
-              fontSize: "var(--pane-font-size-sm)",
-              minHeight: "2.25rem",
-              maxHeight: "6rem",
-              paddingBottom: input.trim() ? "2rem" : "0.5rem",
-            }}
-          />
-          {input.trim() && (
-            <button
-              onMouseDown={(e) => { e.preventDefault(); handleSend(); }}
-              className="absolute bottom-1.5 right-1.5 w-7 h-7 flex items-center justify-center rounded-md text-pane-text-secondary/50 hover:text-pane-text hover:bg-pane-text/[0.06] transition-all btn-press ring-1 ring-pane-border/30"
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
-              </svg>
-            </button>
-          )}
-        </div>
+      {/* Reply input — matches ToolActivity edit input style */}
+      <div
+        className={`rounded-md border transition-all relative mt-4 ${
+          focused ? "border-pane-border/60 bg-pane-bg/80" : "border-pane-border/30 bg-pane-bg/40"
+        }`}
+      >
+        <textarea
+          ref={textareaRef}
+          value={input}
+          onChange={(e) => {
+            setInput(e.target.value);
+            e.target.style.height = "auto";
+            e.target.style.height = `${e.target.scrollHeight}px`;
+          }}
+          onKeyDown={handleKeyDown}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          placeholder="reply"
+          rows={1}
+          disabled={isProcessing}
+          className="w-full bg-transparent text-pane-text font-mono resize-none outline-none placeholder:text-pane-text-secondary/30 leading-[1.75] px-3 pt-2 overflow-hidden"
+          style={{
+            fontSize: "var(--pane-font-size-sm)",
+            minHeight: "2.25rem",
+            maxHeight: "6rem",
+            paddingBottom: input.trim() ? "2rem" : "0.5rem",
+          }}
+        />
+        {input.trim() && (
+          <button
+            onMouseDown={(e) => { e.preventDefault(); handleSend(); }}
+            className="absolute bottom-1.5 right-1.5 w-7 h-7 flex items-center justify-center rounded-md text-pane-text-secondary/50 hover:text-pane-text hover:bg-pane-text/[0.06] transition-all btn-press ring-1 ring-pane-border/30"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
+            </svg>
+          </button>
+        )}
       </div>
     </div>
   );
 }
 
 // ─── PostItem ──────────────────────────────────────────────────────────────
+// Design: Follows ToolActivity pattern — no background, border-only cards,
+// monospace, minimal chrome, linear flow. Comments are separate cards below.
 
 const POST_TRUNCATE_CHARS = 180;
 
@@ -242,98 +244,88 @@ function PostItem({
   workingDir: string;
   userName: string;
 }) {
-  const [readMore, setReadMore] = useState(false);
   const isPunk = post.contributor !== "user";
   const persona = isPunk ? PUNK_PERSONAS[post.contributor] : null;
   const name = persona ? persona.name : (userName || "you");
-  const time = new Date(post.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  const commentCount = post.comment_count ?? 0;
   const isLong = post.content.length > POST_TRUNCATE_CHARS;
-  const displayContent = isLong && !readMore
-    ? post.content.slice(0, POST_TRUNCATE_CHARS).trimEnd() + "…"
-    : post.content;
 
   return (
-    <div className="mb-2">
-      <div className="bg-pane-surface rounded-lg overflow-hidden">
+    <div className={`transition-all duration-200 ${isExpanded ? 'border border-[var(--pane-border-soft)] bg-pane-bg/60 mb-6' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-2.5'}`}>
+      <button
+        onClick={() => onToggle()}
+        className="flex items-start gap-3 w-full text-left group"
+        style={{ minHeight: '2.5rem' }}
+      >
+        {/* MicroIndicator — status dot */}
+        <div className={`mt-[7px] shrink-0 ${isExpanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-60'}`}>
+          <div className={`w-1.5 h-1.5 rounded-full ${isPunk ? 'bg-pane-terminal' : 'bg-pane-text-secondary/50'}`} />
+        </div>
 
-        {/* Header: name · role · time */}
-        <div className="flex items-center gap-2 px-4 pt-4 pb-0">
-          <span
-            className="font-mono"
-            style={{
-              fontSize: "var(--pane-font-size-xs)",
-              color: isPunk ? "var(--pane-terminal)" : "var(--pane-text-secondary)",
-              opacity: isPunk ? 0.75 : 0.55,
-            }}
-          >
-            {name}
-          </span>
-          {persona && (
+        {/* Content block */}
+        <div className="flex-1 min-w-0">
+          {/* Contributor name */}
+          <div className="mb-1">
             <span
-              className="font-mono text-pane-text-secondary/25"
-              style={{ fontSize: "var(--pane-font-size-xs)" }}
+              className="font-mono"
+              style={{
+                fontSize: "var(--pane-font-size-xs)",
+                color: isPunk ? "var(--pane-terminal)" : "var(--pane-text-secondary)",
+                opacity: isPunk ? 0.8 : 0.5,
+              }}
             >
-              · {persona.role}
+              {name}
             </span>
-          )}
-          <span
-            className="font-mono text-pane-text-secondary/20 ml-auto"
-            style={{ fontSize: "var(--pane-font-size-xs)" }}
-          >
-            {time}
-          </span>
-        </div>
-
-        {/* Body */}
-        <div
-          className={`px-4 pt-3 pb-2 ${isLong && !readMore ? "cursor-pointer" : ""}`}
-          onClick={isLong && !readMore ? () => setReadMore(true) : undefined}
-        >
-          <p
-            className="text-pane-text font-light leading-relaxed whitespace-pre-wrap"
-            style={{ fontSize: "var(--pane-panel-font-size)" }}
-          >
-            {displayContent}
-          </p>
-        </div>
-        {/* Footer row: read more (left) + comment icon (right) */}
-        <div className="flex items-center justify-between px-4 pb-3 pt-1 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-          <div>
-            {isLong && (
-              <button
-                onClick={() => setReadMore(!readMore)}
-                className="text-pane-text-secondary/30 hover:text-pane-text-secondary/55 transition-colors"
+            {persona && (
+              <span
+                className="font-mono text-pane-text-secondary/25 ml-1.5"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
               >
-                {readMore ? "less" : "read more"}
-              </button>
+                {persona.role}
+              </span>
             )}
           </div>
-          <button
-            onClick={onToggle}
-            className={`inline-flex items-center gap-1 transition-colors btn-press ${
-              isExpanded ? "text-pane-text-secondary/60" : "text-pane-text-secondary/25 hover:text-pane-text-secondary/50"
-            }`}
+
+          {/* Post content with truncation */}
+          <p
+            className="text-pane-text leading-relaxed whitespace-pre-wrap"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
-              stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-            </svg>
-            {commentCount > 0 && <span>{commentCount}</span>}
-          </button>
+            {isLong && !isExpanded
+              ? post.content.slice(0, POST_TRUNCATE_CHARS).trimEnd() + "…"
+              : post.content}
+          </p>
+
+          {/* Truncation indicator */}
+          {isLong && !isExpanded && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onToggle(); }}
+              className="mt-1 text-pane-text-secondary/30 hover:text-pane-text-secondary/55 transition-colors font-mono"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              read more
+            </button>
+          )}
         </div>
 
-        {/* Comments */}
-        {isExpanded && (
-          <div className="px-4 pb-4 border-t border-pane-border/10">
-            <PostComments
-              postId={post.id}
-              workingDir={workingDir}
-              postContent={post.content}
-            />
-          </div>
-        )}
-      </div>
+        {/* Expand/collapse indicator */}
+        <span
+          className="ml-auto shrink-0 opacity-0 group-hover:opacity-100 transition-opacity font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-text-secondary/20)" }}
+        >
+          {isExpanded ? "collapse" : "expand"}
+        </span>
+      </button>
+
+      {/* Comments as separate cards below */}
+      {isExpanded && (
+        <div className="mt-6 space-y-3">
+          <PostComments
+            postId={post.id}
+            workingDir={workingDir}
+            postContent={post.content}
+          />
+        </div>
+      )}
     </div>
   );
 }
