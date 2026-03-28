@@ -181,27 +181,15 @@ export function Workspace() {
       </div>
 
       <div data-page="terminal" className="absolute inset-0 flex bg-pane-bg">
-        {projectOrder.map((id) => (
-          <div
-            key={id}
-            className="flex-1 min-h-0 min-w-0 flex flex-col"
-            style={{ display: id === activeProjectId ? "flex" : "none" }}
-          >
-            <ProjectTerminal projectId={id} />
+        {activeProjectId && (
+          <div className="flex-1 min-h-0 min-w-0 flex flex-col">
+            <ProjectTerminal projectId={activeProjectId} />
           </div>
-        ))}
+        )}
       </div>
 
       <div data-page="git" className="absolute inset-0 flex flex-col bg-pane-bg">
-        {projectOrder.map((id) => (
-          <div
-            key={id}
-            className="absolute inset-0 flex flex-col"
-            style={{ display: id === activeProjectId ? "flex" : "none" }}
-          >
-            <GitView projectId={id} />
-          </div>
-        ))}
+        {activeProjectId && <GitView projectId={activeProjectId} />}
       </div>
 
       <div data-page="mind" className="absolute inset-0 bg-pane-bg">

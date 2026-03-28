@@ -86,23 +86,14 @@ function ProjectRow({
       )}
 
       {!editing && (
-        <>
-          <span
-            onPointerDown={startEdit}
-            className="shrink-0 text-pane-text-secondary opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-4 h-4 btn-press"
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M7 1.5l1.5 1.5-5.5 5.5H1.5V7L7 1.5z" />
-            </svg>
-          </span>
-          <span
-            onPointerDown={(e) => { e.stopPropagation(); removeProject(id); }}
-            className="shrink-0 text-pane-text-secondary opacity-0 group-hover:opacity-100 hover:text-pane-error cursor-pointer flex items-center justify-center w-4 h-4 btn-press"
-            style={{ fontSize: "var(--pane-panel-font-size)" }}
-          >
-            ×
-          </span>
-        </>
+        <span
+          onPointerDown={startEdit}
+          className="shrink-0 text-pane-text-secondary opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-4 h-4 btn-press"
+        >
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M7 1.5l1.5 1.5-5.5 5.5H1.5V7L7 1.5z" />
+          </svg>
+        </span>
       )}
     </button>
   );
