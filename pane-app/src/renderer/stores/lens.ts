@@ -4,19 +4,19 @@ import type { LensPost } from "../lib/tauri-commands";
 interface LensState {
   posts: LensPost[];
   loaded: Record<string, boolean>; // projectId -> loaded
-  expandedPostId: string | null;
+  expandedCommentsId: string | null; // tracks which post has comments visible
   setPosts: (posts: LensPost[]) => void;
   appendPost: (post: LensPost) => void;
   setLoaded: (projectId: string, loaded: boolean) => void;
   isLoaded: (projectId: string) => boolean;
-  setExpandedPostId: (id: string | null) => void;
+  setExpandedCommentsId: (id: string | null) => void;
 }
 
 function createLensStore() {
   return create<LensState>()((set, get) => ({
     posts: [],
     loaded: {},
-    expandedPostId: null,
+    expandedCommentsId: null,
 
     setPosts: (posts) =>
       set((s) => {
@@ -37,7 +37,7 @@ function createLensStore() {
 
     isLoaded: (projectId) => !!get().loaded[projectId],
 
-    setExpandedPostId: (id) => set({ expandedPostId: id }),
+    setExpandedCommentsId: (id) => set({ expandedCommentsId: id }),
   }));
 }
 

@@ -23,10 +23,12 @@ function PostComments({
   postId,
   workingDir,
   postContent,
+  isVisible,
 }: {
   postId: string;
   workingDir: string;
   postContent: string;
+  isVisible: boolean;
 }) {
   const { messages, isProcessing, error, sendMessage, appendMessage } = useLensChat(
     postId,
@@ -54,8 +56,10 @@ function PostComments({
 
   // Scroll to bottom when messages change
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [messages.length]);
+    if (isVisible) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [messages.length, isVisible]);
 
   const handleSend = async () => {
     const text = input.trim();
@@ -74,8 +78,10 @@ function PostComments({
     }
   };
 
+  if (!isVisible) return null;
+
   return (
-    <div className="border border-[var(--pane-border-soft)] bg-pane-bg/60 rounded-md p-3">
+    <div className="border border-[var(--pane-border-soft)] bg-pane-bg/60 rounded-md p-3 mt-4">
       {/* Message thread */}
       {messages.length > 0 && (
         <div className="flex flex-col gap-3 mb-3">
@@ -228,43 +234,40 @@ function PostComments({
 // ─── PostItem ──────────────────────────────────────────────────────────────
 // Design: Follows ToolActivity pattern — no background, border-only cards,
 // monospace, minimal chrome, linear flow. Comments are separate cards below.
+// Posts always fully visible, no truncation. Comment button toggles comments.
 
-const POST_TRUNCATE_CHARS = 180;
+const POST_TRUNCATE_CHARS = 180; // still used for truncation detection but not UI
 
 function PostItem({
   post,
-  isExpanded,
-  onToggle,
+  showComments,
+  onToggleComments,
   workingDir,
   userName,
 }: {
   post: LensPost;
-  isExpanded: boolean;
-  onToggle: () => void;
+  showComments: boolean;
+  onToggleComments: () => void;
   workingDir: string;
   userName: string;
 }) {
   const isPunk = post.contributor !== "user";
   const persona = isPunk ? PUNK_PERSONAS[post.contributor] : null;
   const name = persona ? persona.name : (userName || "you");
-  const isLong = post.content.length > POST_TRUNCATE_CHARS;
+  const commentCount = post.comment_count ?? 0;
 
   return (
-    <div className={`transition-all duration-200 ${isExpanded ? 'border border-[var(--pane-border-soft)] bg-pane-bg/60 mb-6' : 'border-transparent hover:border-[var(--pane-border-soft)] mb-2.5'}`}>
-      <button
-        onClick={() => onToggle()}
-        className="flex items-start gap-3 w-full text-left group"
-        style={{ minHeight: '2.5rem' }}
-      >
+    <div className="transition-all duration-200 border border-[var(--pane-border-soft)] bg-pane-bg/60 mb-6">
+      <div className="flex items-start gap-3 px-3 py-2.5">
         {/* MicroIndicator — status dot */}
-        <div className={`mt-[7px] shrink-0 ${isExpanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-60'}`}>
+        <div className="mt-[7px] shrink-0 opacity-100">
           <div className={`w-1.5 h-1.5 rounded-full ${isPunk ? 'bg-pane-terminal' : 'bg-pane-text-secondary/50'}`} />
         </div>
 
         {/* Content block */}
         <div className="flex-1 min-w-0">
           {/* Contributor name */}
-          <div className="mb-1">
+          <div className="mb-1.5">
             <span
               className="font-mono"
               style={{
@@ -285,44 +288,41 @@ function PostItem({
             )}
           </div>
 
-          {/* Post content with truncation */}
+          {/* Post content - always fully visible */}
           <p
             className="text-pane-text leading-relaxed whitespace-pre-wrap"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
-            {isLong && !isExpanded
-              ? post.content.slice(0, POST_TRUNCATE_CHARS).trimEnd() + "…"
-              : post.content}
+            {post.content}
           </p>
-
-          {/* Truncation indicator */}
-          {isLong && !isExpanded && (
-            <button
-              onClick={(e) => { e.stopPropagation(); onToggle(); }}
-              className="mt-1 text-pane-text-secondary/30 hover:text-pane-text-secondary/55 transition-colors font-mono"
-              style={{ fontSize: "var(--pane-font-size-xs)" }}
-            >
-              read more
-            </button>
-          )}
         </div>
 
-        {/* Expand/collapse indicator */}
-        <span
-          className="ml-auto shrink-0 opacity-0 group-hover:opacity-100 transition-opacity font-mono"
-          style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-text-secondary/20)" }}
+        {/* Comment toggle button */}
+        <button
+          onClick={onToggleComments}
+          className="ml-2 shrink-0 flex items-center gap-1 transition-colors btn-press font-mono"
+          style={{
+            fontSize: "var(--pane-font-size-xs)",
+            color: showComments ? "var(--pane-text-secondary/60)" : "var(--pane-text-secondary/25)",
+          }}
+          title={commentCount > 0 ? `${commentCount} comments` : "add comment"}
         >
-          {isExpanded ? "collapse" : "expand"}
-        </span>
-      </button>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+          {commentCount > 0 && <span>{commentCount}</span>}
+        </button>
+      </div>
 
-      {/* Comments as separate cards below */}
-      {isExpanded && (
-        <div className="mt-6 space-y-3">
+      {/* Comments as separate card below */}
+      {showComments && (
+        <div className="px-3 pb-3">
           <PostComments
             postId={post.id}
             workingDir={workingDir}
             postContent={post.content}
+            isVisible={showComments}
           />
         </div>
       )}
@@ -337,8 +337,8 @@ export function Lens({ projectId }: { projectId: string }) {
   const appendPost = useLensStore((s) => s.appendPost);
   const setPosts = useLensStore((s) => s.setPosts);
   const setLoaded = useLensStore((s) => s.setLoaded);
-  const expandedPostId = useLensStore((s) => s.expandedPostId);
-  const setExpandedPostId = useLensStore((s) => s.setExpandedPostId);
+  const expandedCommentsId = useLensStore((s) => s.expandedCommentsId);
+  const setExpandedCommentsId = useLensStore((s) => s.setExpandedCommentsId);
 
   const workingDir = useProjectsStore((s) => s.projects.get(projectId)?.root ?? "");
   const userName = useWorkspaceStore((s) => s.profileName);
@@ -500,9 +500,9 @@ export function Lens({ projectId }: { projectId: string }) {
             <PostItem
               key={post.id}
               post={post}
-              isExpanded={expandedPostId === post.id}
-              onToggle={() =>
-                setExpandedPostId(expandedPostId === post.id ? null : post.id)
+              showComments={expandedCommentsId === post.id}
+              onToggleComments={() =>
+                setExpandedCommentsId(expandedCommentsId === post.id ? null : post.id)
               }
               workingDir={workingDir}
               userName={userName}
