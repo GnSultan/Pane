@@ -253,7 +253,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_recent_terminal",
       description:
-        "Get recent terminal commands and their outputs from Pane's terminal.",
+        "Get recent terminal commands and their outputs from Pane's terminal. Use this FIRST whenever the user mentions an error, a running server, logs, build output, test results, or any process output — the terminal is shared and already has the data. Never ask the user to paste logs or copy output; read it here instead.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -788,45 +788,22 @@ function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
 // Families known to perform well at coding + agentic tasks.
 // Format: [id-prefix, display-provider-name, tier (1=frontier, 2=balanced, 3=fast)]
 const CODING_FAMILIES = [
-  // Tier 1 — frontier
-  ["anthropic/claude-opus",          "Anthropic",  1],
-  ["openai/o3",                       "OpenAI",     1],
-  ["openai/o4",                       "OpenAI",     1],
-  ["openai/gpt-4o",                   "OpenAI",     1],
-  ["google/gemini-2.5-pro",           "Google",     1],
-  ["google/gemini-2.0-pro",           "Google",     1],
-  ["deepseek/deepseek-r1",            "DeepSeek",   1],
-  ["x-ai/grok-3",                     "xAI",        1],
-  // Tier 2 — balanced
-  ["anthropic/claude-sonnet",         "Anthropic",  2],
-  ["openai/gpt-4",                    "OpenAI",     2],
-  ["openai/o3-mini",                  "OpenAI",     2],
-  ["openai/o1",                       "OpenAI",     2],
-  ["google/gemini-2.0-flash",         "Google",     2],
-  ["google/gemini-2.5-flash",         "Google",     2],
-  ["deepseek/deepseek-v3",            "DeepSeek",   2],
-  ["deepseek/deepseek-chat",          "DeepSeek",   2],
-  ["meta-llama/llama-4",              "Meta",       2],
-  ["meta-llama/llama-3.3",            "Meta",       2],
-  ["meta-llama/llama-3.1-405",        "Meta",       2],
-  ["qwen/qwen3",                      "Qwen",       2],
-  ["qwen/qwq",                        "Qwen",       2],
-  ["qwen/qwen2.5-coder",              "Qwen",       2],
-  ["mistralai/codestral",             "Mistral",    2],
-  ["mistralai/mistral-large",         "Mistral",    2],
-  ["mistralai/devstral",              "Mistral",    2],
-  ["x-ai/grok-2",                     "xAI",        2],
-  ["cohere/command-r-plus",           "Cohere",     2],
-  // Tier 3 — fast / cheap
-  ["anthropic/claude-haiku",          "Anthropic",  3],
-  ["openai/gpt-4o-mini",              "OpenAI",     3],
-  ["google/gemini-2.0-flash-lite",    "Google",     3],
-  ["google/gemini-flash",             "Google",     3],
-  ["meta-llama/llama-3.1-70",         "Meta",       3],
-  ["meta-llama/llama-3.2",            "Meta",       3],
-  ["qwen/qwen2.5-72",                 "Qwen",       3],
-  ["mistralai/mistral-small",         "Mistral",    3],
-  ["microsoft/phi-4",                 "Microsoft",  3],
+  // MiMo — Xiaomi reasoning/agentic models
+  ["xiaomi/mimo-v2-pro",              "Xiaomi",   1],
+  ["xiaomi/mimo-v2-omni",             "Xiaomi",   2],
+  ["xiaomi/mimo-v2-flash",            "Xiaomi",   2],
+  // StepFun
+  ["stepfun/step-3.5-flash",          "StepFun",  2],
+  // Kimi / Moonshot
+  ["moonshot/moonshot-v1",            "Kimi",     2],
+  // GLM — Z.ai, thinks before tool calls (more specific first)
+  ["z-ai/glm-4.7-flash",              "Z.ai",     3],
+  ["z-ai/glm-4.7",                    "Z.ai",     2],
+  // Qwen3 Coder (more specific first to avoid prefix collision)
+  ["qwen/qwen3-coder-next",           "Qwen",     1],
+  ["qwen/qwen3-coder",                "Qwen",     2],
+  // MiniMax — multi-agent autonomous
+  ["minimax/minimax-m2.7",            "MiniMax",  2],
 ];
 
 function _familyFor(modelId) {
@@ -878,6 +855,43 @@ function _byRelevance(a, b) {
   return (b.context_length ?? 0) - (a.context_length ?? 0);
 }
 
+// ─── Model Streaming Personality Registry ────────────────────────────────────
+// Maps model-ID prefixes (more specific first) to their known streaming
+// behavior. Used by handleStreamEvent when provider="openrouter" to know
+// which delta field carries reasoning content and whether tools are supported.
+const MODEL_STREAMING_CONFIG = [
+  // deepseek-reasoner must come before generic deepseek/
+  ["deepseek/deepseek-reasoner",  { reasoningField: "reasoning_content", supportsTools: false }],
+  ["deepseek/",                   { reasoningField: null,                 supportsTools: true  }],
+  // Xiaomi MiMo — uses delta.reasoning
+  ["xiaomi/mimo",                 { reasoningField: "reasoning",          supportsTools: true  }],
+  // StepFun — uses delta.reasoning
+  ["stepfun/",                    { reasoningField: "reasoning",          supportsTools: true  }],
+  // Z.ai GLM — thinks before tool calls, uses delta.reasoning
+  ["z-ai/glm",                    { reasoningField: "reasoning",          supportsTools: true  }],
+  // Kimi / Moonshot — standard content, no reasoning field
+  ["moonshot/",                   { reasoningField: null,                 supportsTools: true  }],
+  // Qwen3 Coder — standard content
+  ["qwen/qwen3-coder",            { reasoningField: null,                 supportsTools: true  }],
+  ["qwen/",                       { reasoningField: null,                 supportsTools: true  }],
+  // MiniMax — standard content
+  ["minimax/",                    { reasoningField: null,                 supportsTools: true  }],
+  // Frontier providers via OR — standard content
+  ["anthropic/",                  { reasoningField: null,                 supportsTools: true  }],
+  ["google/",                     { reasoningField: null,                 supportsTools: true  }],
+  ["openai/",                     { reasoningField: null,                 supportsTools: true  }],
+  ["meta-llama/",                 { reasoningField: null,                 supportsTools: true  }],
+];
+
+function getModelStreamingConfig(modelId) {
+  if (!modelId) return { reasoningField: null, supportsTools: true };
+  const lower = modelId.toLowerCase();
+  for (const [prefix, config] of MODEL_STREAMING_CONFIG) {
+    if (lower.startsWith(prefix)) return config;
+  }
+  return { reasoningField: null, supportsTools: true }; // safe default
+}
+
 export { ApiBackend as HttpBackend }; // backward compat alias
 
 export class ApiBackend extends PunkBackend {
@@ -919,8 +933,12 @@ export class ApiBackend extends PunkBackend {
 
       const baseUrl = settings.http_base_urls?.[provider];
 
+      // Log which keys are actually present so routing failures are easy to diagnose
+      const presentKeys = Object.entries(settings.http_api_keys || {})
+        .filter(([, v]) => !!v)
+        .map(([k]) => k);
       console.log(
-        `[http] getApiConfig: provider=${provider}, hasKey=${!!apiKey}, baseUrl=${baseUrl}`,
+        `[http] getApiConfig: provider=${provider}, hasKey=${!!apiKey}, baseUrl=${baseUrl}, presentKeys=[${presentKeys.join(",")}]`,
       );
       return { provider, apiKey, baseUrl };
     } catch {
@@ -941,13 +959,18 @@ export class ApiBackend extends PunkBackend {
     return true;
   }
 
-  normalizeMessages(messages, provider) {
+  normalizeMessages(messages, provider, model = null) {
     const isAnthropic = provider === "anthropic";
     const isGemini = provider === "gemini";
     const isOpenAI =
       provider === "deepseek" ||
       provider === "kimi" ||
-      provider === "openrouter";
+      provider === "openrouter" ||
+      provider === "stepfun";
+
+    // deepseek-reasoner does not support tools or reasoning_content in history.
+    // Strip both from any assistant messages so we don't get 400s on multi-turn R1.
+    const isReasoner = provider === "deepseek" && model === "deepseek-reasoner";
 
     const preFiltered = [];
     // COLLAPSE CONSECUTIVE USER MESSAGES (Retry inflation fix)
@@ -974,7 +997,15 @@ export class ApiBackend extends PunkBackend {
       // --- 1. HANDLE ASSISTANT MESSAGES ---
       if (role === "assistant") {
         if (typeof content === "string") {
-          normalized.push(msg);
+          if (isReasoner) {
+            // Strip reasoning_content — deepseek-reasoner returns 400 if it appears
+            // in a subsequent request's message history.
+            // eslint-disable-next-line no-unused-vars
+            const { reasoning_content: _rc, tool_calls: _tc, ...safe } = msg;
+            normalized.push(safe);
+          } else {
+            normalized.push(msg);
+          }
         } else if (Array.isArray(content)) {
           if (isOpenAI) {
             const text = content
@@ -984,7 +1015,8 @@ export class ApiBackend extends PunkBackend {
             const toolUses = content.filter((c) => c.type === "tool_use");
             const assistantMsg = { role: "assistant", content: text || "" };
 
-            if (toolUses.length > 0 || msg.tool_calls) {
+            // deepseek-reasoner does not support tool_calls — omit entirely
+            if (!isReasoner && (toolUses.length > 0 || msg.tool_calls)) {
               const calls =
                 msg.tool_calls ||
                 toolUses.map((tu) => ({
@@ -1016,6 +1048,9 @@ export class ApiBackend extends PunkBackend {
           Array.isArray(content) &&
           content.some((c) => c.type === "tool_result"))
       ) {
+        // deepseek-reasoner has no tool support — silently drop all tool result
+        // messages from history so they don't trigger a 400 from the API.
+        if (isReasoner) continue;
         const results = [];
         if (role === "tool" && !Array.isArray(content)) {
           results.push(msg);
@@ -1075,7 +1110,9 @@ export class ApiBackend extends PunkBackend {
     }
 
     // --- 4. AUTO-HEAL: Close orphaned tool calls ---
-    if (isOpenAI && pendingToolCallIds.size > 0) {
+    // Skip for deepseek-reasoner — it has no tool support so tool messages must
+    // never appear in the history regardless.
+    if (isOpenAI && !isReasoner && pendingToolCallIds.size > 0) {
       console.warn(
         `[http] history sequence error: ${pendingToolCallIds.size} tool calls missing results. Healing...`,
       );
@@ -1113,6 +1150,7 @@ export class ApiBackend extends PunkBackend {
   async spawn(request) {
     const abortController = new AbortController();
     this.activeRequests.set(request.projectId, abortController);
+    const spawnStartTime = Date.now();
 
     this.onEvent(
       request.projectId,
@@ -1246,34 +1284,70 @@ export class ApiBackend extends PunkBackend {
       let turn = 0;
       const maxTurns = 100;
       let sessionOutput = ""; // Accumulate all model text for pattern extraction
+      let turnRetryCount = 0;  // Retries for insufficient_system_resource
 
       while (turn < maxTurns) {
         turn++;
+
+        // Resolve model name first — state carries it so handleStreamEvent
+        // can look up the model's streaming personality at parse time.
+        const resolvedModel = this.mapModelName(apiConfig.provider, request.model);
 
         const state = {
           accumulated: "",
           toolUses: new Map(),
           finishReason: null,
+          model: resolvedModel,
         };
         this.requestStates.set(request.projectId, state);
 
+        // deepseek-reasoner (R1) does not support function calling — sending tools
+        // returns HTTP 400. It also ignores sampling params (temperature etc.).
+        const isDeepSeekReasoner =
+          apiConfig.provider === "deepseek" && resolvedModel === "deepseek-reasoner";
+
+        // max_tokens budget per provider/model:
+        //   deepseek-reasoner: 32 K (model default; CoT tokens count against budget)
+        //   deepseek-chat:      8 K (published API maximum)
+        //   stepfun:            omitted entirely — StepFun docs say not to set
+        //                       max_tokens for reasoning models; the model manages
+        //                       its own CoT budget. We still set a value here and
+        //                       delete it below for the stepfun case.
+        //   everything else:    4 K (safe default for kimi / openrouter / anthropic)
+        const maxTokens = isDeepSeekReasoner ? 32768
+          : apiConfig.provider === "deepseek" ? 8192
+          : 4096;
+
         const body = {
-          model: this.mapModelName(apiConfig.provider, request.model),
-          messages: this.normalizeMessages(messages, apiConfig.provider),
+          model: resolvedModel,
+          messages: this.normalizeMessages(messages, apiConfig.provider, resolvedModel),
           stream: true,
-          max_tokens: 4096,
+          max_tokens: maxTokens,
         };
 
         if (apiConfig.provider === "openrouter") {
           body.repetition_penalty = 1.1;
         }
 
-        // Phase-based tool filtering — planning phase gets Plan tool, discovery gets read-only
+        // StepFun docs say not to set max_tokens for reasoning models — let
+        // the model manage its own CoT budget.
+        if (apiConfig.provider === "stepfun") {
+          delete body.max_tokens;
+        }
+
+        // Phase-based tool filtering — planning phase gets Plan tool, discovery gets read-only.
+        // deepseek-reasoner does NOT support function calling — skip entirely.
+        // For OpenRouter, consult the model personality registry — some OR-proxied
+        // models (e.g. deepseek/deepseek-reasoner) also don't support tools.
         const phase = request.phase || "execution";
+        const orPersonality = apiConfig.provider === "openrouter"
+          ? getModelStreamingConfig(resolvedModel)
+          : null;
         if (
-          apiConfig.provider === "deepseek" ||
+          (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
           apiConfig.provider === "kimi" ||
-          apiConfig.provider === "openrouter"
+          apiConfig.provider === "stepfun" ||
+          (apiConfig.provider === "openrouter" && orPersonality.supportsTools)
         ) {
           body.tools = getToolsForPhase(phase);
         } else if (apiConfig.provider === "anthropic") {
@@ -1297,11 +1371,14 @@ export class ApiBackend extends PunkBackend {
         );
 
         // --- RETRY LOOP FOR TRANSIENT ERRORS ---
+        // Rate limits (429): up to 6 retries, respects Retry-After header, shows status to user.
+        // Server errors (5xx): up to 3 retries with exponential backoff (1s/2s/4s).
         let response;
         let attempt = 0;
-        const maxAttempts = 3;
+        const maxServerErrAttempts = 3;
+        const maxRateLimitAttempts = 6;
 
-        while (attempt <= maxAttempts) {
+        while (true) {
           try {
             response = await fetch(url, {
               method: "POST",
@@ -1310,30 +1387,46 @@ export class ApiBackend extends PunkBackend {
               signal: abortController.signal,
             });
 
-            // If it's a transient error (5xx or 429), retry
-            if (
-              !response.ok &&
-              (response.status >= 500 || response.status === 429) &&
-              attempt < maxAttempts
-            ) {
-              const delay = Math.pow(2, attempt) * 1000;
-              console.warn(
-                `[http] Transient error ${response.status}. Retrying in ${delay}ms (Attempt ${attempt + 1}/${maxAttempts})...`,
-              );
-              await new Promise((resolve) => setTimeout(resolve, delay));
-              attempt++;
-              continue;
+            if (!response.ok) {
+              if (response.status === 429 && attempt < maxRateLimitAttempts) {
+                // Anthropic and OpenRouter both send Retry-After in seconds.
+                // Fall back to exponential backoff with a 10s floor if header is absent.
+                const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
+                const delay = retryAfterSec > 0
+                  ? retryAfterSec * 1000
+                  : Math.min(10000 * Math.pow(2, attempt), 120000); // 10s, 20s, 40s, 80s, 120s, 120s
+                const delaySec = Math.round(delay / 1000);
+                console.warn(`[http] Rate limited (429). Waiting ${delaySec}s before retry ${attempt + 1}/${maxRateLimitAttempts}...`);
+                // Surface the wait to the user so they know Pane is handling it.
+                this.onEvent(request.projectId, {
+                  event: "status",
+                  data: { message: `rate limited — retrying in ${delaySec}s` },
+                }, request.requestId);
+                await new Promise((resolve) => setTimeout(resolve, delay));
+                // Clear status before the next attempt
+                this.onEvent(request.projectId, {
+                  event: "status",
+                  data: { message: null },
+                }, request.requestId);
+                attempt++;
+                continue;
+              }
+
+              if (response.status >= 500 && attempt < maxServerErrAttempts) {
+                const delay = Math.pow(2, attempt) * 1000;
+                console.warn(`[http] Server error ${response.status}. Retrying in ${delay}ms (attempt ${attempt + 1}/${maxServerErrAttempts})...`);
+                await new Promise((resolve) => setTimeout(resolve, delay));
+                attempt++;
+                continue;
+              }
             }
 
-            // Not a transient error, or we're out of attempts
-            break;
+            break; // success or unrecoverable error
           } catch (err) {
             if (err.name === "AbortError") throw err;
-            if (attempt < maxAttempts) {
+            if (attempt < maxServerErrAttempts) {
               const delay = Math.pow(2, attempt) * 1000;
-              console.warn(
-                `[http] Fetch failed: ${err.message}. Retrying in ${delay}ms...`,
-              );
+              console.warn(`[http] Fetch failed: ${err.message}. Retrying in ${delay}ms...`);
               await new Promise((resolve) => setTimeout(resolve, delay));
               attempt++;
               continue;
@@ -1387,6 +1480,27 @@ export class ApiBackend extends PunkBackend {
             }
           }
         }
+
+        // DeepSeek server-side resource exhaustion — retry the turn from scratch.
+        // "insufficient_system_resource" means the server couldn't complete the
+        // generation; treat it like a 503 and retry up to 2 times with a 2s delay.
+        if (state.finishReason === "insufficient_system_resource") {
+          if (turnRetryCount < 2) {
+            turnRetryCount++;
+            turn--; // don't count this as a used turn
+            const delay = 2000;
+            console.warn(
+              `[http] insufficient_system_resource — retrying turn in ${delay}ms (attempt ${turnRetryCount}/2)`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            continue;
+          } else {
+            throw new Error(
+              "DeepSeek server resources exhausted after 2 retries (insufficient_system_resource). Try again in a moment.",
+            );
+          }
+        }
+        turnRetryCount = 0; // reset on a successful turn
 
         const finalContent = [];
         if (state.accumulated) {
@@ -1653,6 +1767,28 @@ export class ApiBackend extends PunkBackend {
         console.warn(`[http] Failed to write handoff: ${err.message}`);
       }
 
+      // Signal successful completion — mirrors cli-worker's "result" event so the
+      // renderer's resultReceived flag is set and no false "Process exited" error fires.
+      this.onEvent(
+        request.projectId,
+        {
+          event: "message",
+          data: {
+            parsed: {
+              type: "result",
+              subtype: "success",
+              session_id: "",
+              result: "",
+              total_cost_usd: 0,
+              duration_ms: Date.now() - spawnStartTime,
+              usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+              num_turns: turn,
+            },
+          },
+        },
+        request.requestId,
+      );
+
       this.onEvent(
         request.projectId,
         {
@@ -1672,6 +1808,28 @@ export class ApiBackend extends PunkBackend {
           request.requestId,
         );
       } else {
+        // Emit a result event with error subtype so the renderer gets a clean
+        // error message rather than the generic "Process exited without responding".
+        this.onEvent(
+          request.projectId,
+          {
+            event: "message",
+            data: {
+              parsed: {
+                type: "result",
+                subtype: "error",
+                session_id: "",
+                result: "",
+                error: error.message || "HTTP backend error",
+                total_cost_usd: 0,
+                duration_ms: Date.now() - spawnStartTime,
+                usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+                num_turns: 0,
+              },
+            },
+          },
+          request.requestId,
+        );
         this.onEvent(
           request.projectId,
           {
@@ -1722,6 +1880,17 @@ export class ApiBackend extends PunkBackend {
       case "deepseek":
         url =
           apiConfig.baseUrl || "https://api.deepseek.com/v1/chat/completions";
+        headers = {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiConfig.apiKey}`,
+        };
+        break;
+
+      case "stepfun":
+        // StepFun is fully OpenAI-compatible. Native API is at api.stepfun.com/v1.
+        // Using native avoids OpenRouter latency and `:free` quota limits.
+        url =
+          apiConfig.baseUrl || "https://api.stepfun.com/v1/chat/completions";
         headers = {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
@@ -1853,6 +2022,8 @@ export class ApiBackend extends PunkBackend {
         return "gemini-3-flash-preview";
       case "deepseek":
         return "deepseek-chat";
+      case "stepfun":
+        return "step-3.5-flash";
       case "kimi":
         return "moonshot-v1-128k";
       case "anthropic":
@@ -1869,6 +2040,9 @@ export class ApiBackend extends PunkBackend {
 
     if (provider === "openrouter") return model;
 
+    // StepFun model IDs are used as-is (step-3.5-flash, step-2-mini, etc.)
+    if (provider === "stepfun") return model;
+
     if (provider === "gemini") {
       const map = {
         "auto-gemini-3": "gemini-3-flash-preview",
@@ -1881,6 +2055,7 @@ export class ApiBackend extends PunkBackend {
     if (provider === "deepseek") {
       const map = {
         "deepseek-v3": "deepseek-chat",
+        "deepseek-r1": "deepseek-reasoner",
         "deepseek-v3.2": "deepseek-chat",
         "deepseek-v3.2-speciale": "deepseek-reasoner",
       };
@@ -1913,21 +2088,31 @@ export class ApiBackend extends PunkBackend {
     let emitted = false;
 
     switch (provider) {
-      case "openrouter":
-      case "deepseek":
-      case "kimi":
-        if (event.choices?.[0]?.delta?.content)
-          content = event.choices[0].delta.content;
+      case "openrouter": {
+        const delta = event.choices?.[0]?.delta;
 
-        // Support for reasoning_content (DeepSeek R1 reasoning)
-        if (event.choices?.[0]?.delta?.reasoning_content)
-          thinking = event.choices[0].delta.reasoning_content;
+        // Process tool_calls FIRST. In the OpenAI streaming spec, once a model
+        // switches to tool_calls mode it must not also emit meaningful content —
+        // but some providers (StepFun, OpenRouter wrappers) occasionally send
+        // `content` in the same chunk or in subsequent chunks interleaved with
+        // tool_calls. Emitting both causes letter-by-letter JSON rendering.
+        // Fix: only extract content when there are NO tool_calls in this chunk
+        // AND no tool call has started building in this turn yet.
+        const hasDeltaToolCalls = !!(delta?.tool_calls?.length);
 
-        // Support for reasoning (OpenRouter standard)
-        if (event.choices?.[0]?.delta?.reasoning)
-          thinking = event.choices[0].delta.reasoning;
+        if (!hasDeltaToolCalls && state.toolUses.size === 0) {
+          if (delta?.content) content = delta.content;
+        }
 
-        if (event.choices?.[0]?.delta?.tool_calls) {
+        // Use the model personality registry to read the correct reasoning field.
+        // This prevents speculative double-checking of both delta.reasoning and
+        // delta.reasoning_content, which could collide if a future model uses both.
+        const personality = getModelStreamingConfig(state?.model ?? "");
+        if (personality.reasoningField && delta?.[personality.reasoningField]) {
+          thinking = delta[personality.reasoningField];
+        }
+
+        if (hasDeltaToolCalls) {
           const tc = event.choices[0].delta.tool_calls[0];
           if (tc) {
             const toolId = tc.id;
@@ -1981,6 +2166,50 @@ export class ApiBackend extends PunkBackend {
         finishReason = event.choices?.[0]?.finish_reason || null;
         if (finishReason) state.finishReason = finishReason;
         break;
+      }
+
+      // Native provider cases — fixed, known streaming formats.
+      // deepseek-reasoner uses reasoning_content; stepfun uses reasoning;
+      // kimi uses standard content only. Tool-call handling is identical
+      // to the openrouter block above so they share that logic via fallthrough.
+      case "deepseek":
+      case "kimi":
+      case "stepfun": {
+        const delta = event.choices?.[0]?.delta;
+        const hasDeltaToolCalls = !!(delta?.tool_calls?.length);
+
+        if (!hasDeltaToolCalls && state.toolUses.size === 0) {
+          if (delta?.content) content = delta.content;
+        }
+
+        // deepseek-reasoner → reasoning_content; stepfun native → reasoning
+        if (delta?.reasoning_content) thinking = delta.reasoning_content;
+        if (delta?.reasoning)         thinking = delta.reasoning;
+
+        if (hasDeltaToolCalls) {
+          const tc = event.choices[0].delta.tool_calls[0];
+          if (tc) {
+            const toolId = tc.id;
+            const toolName = tc.function?.name || "";
+            const toolArgs = tc.function?.arguments || "";
+            if (toolId) {
+              this.onEvent(projectId, { event: "message", data: { parsed: { type: "stream_event", event: { type: "content_block_start", index: state.toolUses.size + 1, content_block: { type: "tool_use", id: toolId, name: toolName, input: {} } } } } }, requestId);
+              state.toolUses.set(toolId, { id: toolId, name: toolName, input: "" });
+            }
+            if (toolArgs) {
+              const activeToolId = toolId || Array.from(state.toolUses.keys()).pop();
+              if (activeToolId) {
+                const tool = state.toolUses.get(activeToolId);
+                tool.input += toolArgs;
+                toolDelta = { id: activeToolId, partial_json: toolArgs };
+              }
+            }
+          }
+        }
+        finishReason = event.choices?.[0]?.finish_reason || null;
+        if (finishReason) state.finishReason = finishReason;
+        break;
+      }
 
       case "gemini":
         if (event.candidates?.[0]?.content?.parts) {

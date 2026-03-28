@@ -1137,6 +1137,13 @@ export function usePunk(projectId: string) {
             break;
           }
 
+          case "status": {
+            // Transient status from the backend (e.g. "rate limited — retrying in 30s").
+            // null clears it. Does not affect isProcessing.
+            store.setConversationStatusMessage(projectId, event.data?.message ?? null);
+            break;
+          }
+
           case "error": {
             const s = useProjectsStore.getState();
             s.setConversationError(projectId, event.data.message);

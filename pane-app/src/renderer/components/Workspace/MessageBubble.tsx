@@ -452,6 +452,7 @@ export function MessageBubble({
                       <MarkdownText
                         text={text}
                         isStreaming={message.isStreaming}
+                        projectId={projectId}
                       />
                     </div>
                   );

@@ -10,6 +10,7 @@ import {
   brainGetProfile,
   brainGetAvatar,
   saveConversationToMain,
+  getConversationSlice,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/punk-types";
@@ -38,6 +39,7 @@ interface PersistedConversation {
   sessionId: string | null;
   model?: string | null;
   messages: ConversationMessage[];
+  startIndex?: number; // When > 0, main process must merge with the prefix on disk
 }
 
 function precomputeProjectId(root: string): string {
@@ -59,99 +61,6 @@ async function saveConversation(
   await saveConversationToMain(conversationPath(projectId), conversation);
 }
 
-async function loadConversation(
-  projectId: string,
-): Promise<PersistedConversation | null> {
-  if (!paneDir) return null;
-  try {
-    const content = await readFile(conversationPath(projectId));
-    
-    // Check file size before parsing
-    const fileSize = content.length;
-    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
-    
-    if (fileSize > MAX_FILE_SIZE) {
-      console.warn(`[persistence] Conversation file is ${fileSize} bytes, exceeding 5MB limit`);
-      console.log(`[persistence] Attempting to compact before loading...`);
-      
-      // Try to parse and compact the conversation
-      try {
-        const parsed = JSON.parse(content.trim()) as PersistedConversation;
-        
-        if (parsed.messages && parsed.messages.length > 100) {
-          console.log(`[persistence] Compacting ${parsed.messages.length} messages to 100 most recent`);
-          parsed.messages = parsed.messages.slice(-100);
-          
-          // Save the compacted version
-          await saveConversation(projectId, parsed);
-          console.log(`[persistence] Compacted conversation saved`);
-          
-          return parsed;
-        }
-      } catch (parseErr) {
-        console.error(`[persistence] Failed to parse large conversation file:`, parseErr);
-        
-        // If we can't even parse it, try a more aggressive approach
-        console.log(`[persistence] Attempting emergency recovery by extracting messages...`);
-        
-        // Simple message extraction - find message objects in the file
-        const messageMatches = content.match(/\{"id":\s*"[^"]*"[^}]*"type":\s*"[^"]*"[^}]*"content":[^}]*\}/g);
-        if (messageMatches && messageMatches.length > 0) {
-          console.log(`[persistence] Found ${messageMatches.length} message objects`);
-          
-          // Try to parse and keep only the last 50
-          const messages: ConversationMessage[] = [];
-          const startIdx = Math.max(0, messageMatches.length - 50);
-          
-          for (let i = startIdx; i < messageMatches.length; i++) {
-            const match = messageMatches[i];
-            if (!match) continue; // Safety check
-            
-            try {
-              const msg = JSON.parse(match) as ConversationMessage;
-              messages.push(msg);
-            } catch {
-              // Skip invalid messages
-            }
-          }
-          
-          if (messages.length > 0) {
-            console.log(`[persistence] Recovered ${messages.length} messages`);
-            
-            // Try to extract model from the original content if possible
-            let model: string | null = null;
-            try {
-              const fullParse = JSON.parse(content.trim()) as { model?: string };
-              model = fullParse?.model || null;
-            } catch {
-              // Can't parse full content, model will be null
-            }
-            
-            const recovered: PersistedConversation = {
-              sessionId: null,
-              model: model,
-              messages: messages
-            };
-            
-            // Save the recovered version
-            await saveConversation(projectId, recovered);
-            console.log(`[persistence] Recovered conversation saved`);
-            
-            return recovered;
-          }
-        }
-        
-        return null;
-      }
-    }
-    
-    // File is within limits, parse normally
-    return JSON.parse(content.trim()) as PersistedConversation;
-  } catch (err) {
-    console.error(`[persistence] Failed to load conversation for ${projectId}:`, err);
-    return null;
-  }
-}
 
 export function useSettingsPersistence() {
   const loadedRef = useRef(false);
@@ -221,37 +130,40 @@ export function useSettingsPersistence() {
           const preloaded = await Promise.all(
             settings.project_roots.map(async (root: string) => {
               const tentativeId = precomputeProjectId(root);
-              const saved = await loadConversation(tentativeId).catch(
+              const slice = await getConversationSlice(tentativeId, 30).catch(
                 () => null,
               );
-              console.log(`[persistence] preloaded project ${tentativeId} from ${root}, hasSaved=${!!saved}, msgCount=${saved?.messages.length || 0}`);
-              return { root, saved };
+              console.log(`[persistence] preloaded project ${tentativeId} from ${root}, hasSaved=${!!slice}, msgCount=${slice?.messages.length || 0}, totalCount=${slice?.totalCount || 0}`);
+              return { root, slice };
             }),
           );
 
           let activeId: string | null = null;
           const projectIds: string[] = [];
-          for (const { root, saved } of preloaded) {
+          for (const { root, slice } of preloaded) {
             const tentativeId = precomputeProjectId(root);
             const id = addProject(root); // Returns the actual ID used in the store
             projectIds.push(id);
             if (root === settings.active_project_root) activeId = id;
 
-            console.log(`[persistence] project ${root}: tentativeId=${tentativeId}, actualId=${id}, hasSaved=${!!saved}`);
+            console.log(`[persistence] project ${root}: tentativeId=${tentativeId}, actualId=${id}, hasSaved=${!!slice}`);
 
             const ps = useProjectsStore.getState();
-            if (saved && saved.messages.length > 0) {
+            if (slice && slice.messages.length > 0) {
               // Deduplicate by message ID (persisted data may have duplicates from prior bugs)
               const seen = new Set<string>();
-              const dedupedMessages = saved.messages.filter((m: { id: string }) => {
+              const dedupedMessages = (slice.messages as ConversationMessage[]).filter((m) => {
                 if (seen.has(m.id)) return false;
                 seen.add(m.id);
                 return true;
               });
-              console.log(`[persistence] restoring conversation for ${id} (saved messages: ${saved.messages.length}, deduped: ${dedupedMessages.length})`);
-              ps.restoreConversation(id, dedupedMessages, saved.sessionId);
-              if (saved.model) {
-                ps.setConversationModel(id, saved.model);
+              console.log(`[persistence] restoring conversation for ${id} (loaded: ${dedupedMessages.length}, total on disk: ${slice.totalCount}, startIndex: ${slice.startIndex})`);
+              ps.restoreConversation(id, dedupedMessages, slice.sessionId, {
+                totalCount: slice.totalCount,
+                startIndex: slice.startIndex,
+              });
+              if (slice.model) {
+                ps.setConversationModel(id, slice.model);
               }
               listCheckpoints(id)
                 .then((metas) => {
@@ -490,6 +402,7 @@ export function useSettingsPersistence() {
             sessionId: p.conversation.sessionId,
             model: p.conversation.model,
             messages: p.conversation.messages,
+            startIndex: p.conversation.historyStartIndex,
           }).catch(() => {});
         }
       }

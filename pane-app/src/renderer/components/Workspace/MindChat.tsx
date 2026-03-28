@@ -128,7 +128,7 @@ export function MindChat({
       <div className="absolute top-0 left-0 right-0 z-20 px-10 py-4 border-b border-pane-border/20 bg-pane-bg/50 backdrop-blur-sm">
         <div className="flex items-center justify-between">
           <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: 'var(--pane-font-size-sm)' }}>
-            {isFreeform ? 'chat' : entryContent ? entryContent.split('\n')[0].slice(0, 50) : ''}
+            {isFreeform ? 'chat' : entryContent ? entryContent.split('\n')[0]?.slice(0, 50) || '' : ''}
           </span>
           <button
             onClick={onClose}
@@ -161,15 +161,15 @@ export function MindChat({
 
         {visibleMessages.map((msg) => (
           <div key={msg.id}>
-            {msg.workerType && (
+            {msg.punkType && (
               <p
                 className="font-mono mb-1 select-none"
                 style={{ fontSize: 'var(--pane-font-size-xs)', color: 'var(--pane-terminal)', opacity: 0.7 }}
               >
-                {msg.workerType === 'bug' ? 'bug analysis'
-                  : msg.workerType === 'reflection' ? 'reflection'
-                  : msg.workerType === 'sentinel' ? 'sentinel'
-                  : msg.workerType}
+                {msg.punkType === 'bug' ? 'bug analysis'
+                  : msg.punkType === 'reflection' ? 'reflection'
+                  : msg.punkType === 'sentinel' ? 'sentinel'
+                  : msg.punkType}
               </p>
             )}
             <MessageBubble

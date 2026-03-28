@@ -1,8 +1,10 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
+import { useMindStore } from "../../stores/mind";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
+import { SlashMenu } from "../shared";
 import type { Todo } from "../../lib/punk-types";
 import {
   PROVIDER_MODELS,
@@ -95,7 +97,7 @@ function ModelPicker({
 }: {
   value: string;
   routedModel?: string | null;
-  onChange: (v: string, thinking?: boolean) => void;
+  onChange: (v: string, thinking?: boolean, provider?: string) => void;
   autoRoute: boolean;
   onToggleAutoRoute: (v: boolean) => void;
   isProcessing?: boolean;
@@ -161,6 +163,7 @@ function ModelPicker({
       value: string;
       label: string;
       provider: string;
+      providerKey: string;
       thinking?: boolean;
       inputCost?: number | null;
       outputCost?: number | null;
@@ -191,6 +194,7 @@ function ModelPicker({
             value:      m.value,
             label:      m.label,
             provider:   displayProvider,
+            providerKey: providerKey,
             thinking:   isThinking,
             inputCost:  m.inputCost,
             outputCost: m.outputCost,
@@ -358,7 +362,7 @@ function ModelPicker({
                       key={model.value}
                       onClick={() => {
                         if (autoRoute) onToggleAutoRoute(false);
-                        onChange(model.value, model.thinking);
+                        onChange(model.value, model.thinking, model.providerKey);
                         setOpen(false);
                       }}
                       className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-mono text-left transition-colors ${
@@ -451,6 +455,12 @@ export function InputBar({
     lineHeight: number;
   } | null>(null);
   const [textareaFocused, setTextareaFocused] = useState(false);
+
+  // Slash-menu state
+  const [slashOpen, setSlashOpen] = useState(false);
+  const [slashQuery, setSlashQuery] = useState("");
+  const slashStartRef = useRef<number>(-1); // cursor position of the triggering /
+  const mindEntries = useMindStore((s) => s.entries);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
@@ -577,8 +587,60 @@ export function InputBar({
     applyTextareaHeight();
   }, [value, applyTextareaHeight]);
 
+  // Detect `/` trigger and track query for slash-menu
+  const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const next = e.target.value;
+    const pos = e.target.selectionStart ?? next.length;
+    setValue(next);
+
+    if (slashOpen) {
+      const slashIdx = slashStartRef.current - 1; // index of the triggering /
+      // Close if the slash was deleted or cursor moved before it
+      if (next[slashIdx] !== "/" || pos < slashStartRef.current) {
+        setSlashOpen(false);
+      } else {
+        // Update query: everything between the / and current cursor
+        setSlashQuery(next.slice(slashStartRef.current, pos));
+      }
+    } else {
+      // Look for a fresh / trigger: must be at start or preceded by whitespace
+      if (next[pos - 1] === "/") {
+        const charBefore = next[pos - 2];
+        if (!charBefore || charBefore === " " || charBefore === "\n") {
+          slashStartRef.current = pos; // query starts right after the /
+          setSlashQuery("");
+          setSlashOpen(true);
+        }
+      }
+    }
+  }, [slashOpen]);
+
+  const handleSlashSelect = useCallback((content: string) => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const start = slashStartRef.current;
+    const slashPos = start - 1; // position of the / itself
+    const cursorPos = ta.selectionStart ?? value.length;
+    // Replace from the / up to the current cursor with the entry content
+    const before = value.slice(0, slashPos);
+    const after = value.slice(cursorPos);
+    const next = before + content + after;
+    setValue(next);
+    setSlashOpen(false);
+    // Restore focus and move cursor to end of inserted content
+    requestAnimationFrame(() => {
+      ta.focus();
+      const newPos = before.length + content.length;
+      ta.setSelectionRange(newPos, newPos);
+    });
+  }, [value]);
+
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      // When slash menu is open, Enter/Tab/Escape/Arrows are handled by SlashMenu's window listener
+      if (slashOpen && (e.key === "Enter" || e.key === "Tab" || e.key === "Escape" || e.key === "ArrowDown" || e.key === "ArrowUp")) {
+        return; // Let SlashMenu's capture listener handle it
+      }
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         const trimmed = value.trim();
@@ -592,7 +654,7 @@ export function InputBar({
         onAbort();
       }
     },
-    [value, isProcessing, projectId, onSend, onAbort],
+    [value, isProcessing, slashOpen, projectId, onSend, onAbort],
   );
 
   return (
@@ -678,11 +740,19 @@ export function InputBar({
 
       {/* One card. Textarea owns the whole surface. Buttons float inside it. */}
       <div className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative">
+        {slashOpen && (
+          <SlashMenu
+            entries={mindEntries}
+            query={slashQuery}
+            onSelect={handleSlashSelect}
+            onDismiss={() => setSlashOpen(false)}
+          />
+        )}
           <div ref={caretContainerRef} className="relative overflow-hidden">
             <textarea
               ref={textareaRef}
               value={value}
-              onChange={(e) => setValue(e.target.value)}
+              onChange={handleChange}
               onKeyDown={handleKeyDown}
               onFocus={() => { setTextareaFocused(true); updateCaret(); }}
               onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}

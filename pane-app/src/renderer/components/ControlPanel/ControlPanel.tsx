@@ -1,11 +1,20 @@
-import { useState, useCallback, useEffect, useMemo, type ReactNode } from "react";
+import { useState, useCallback, useEffect, type ReactNode } from "react";
 import { ProjectList } from "./ProjectList";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
-import { useMindStore } from "../../stores/mind";
 
 // --- Inline SVG icons (16x16, outlined) ---
 // Pane design language: panel forms, 1.5px stroke, rx="2" matches button radius
+
+function LensIcon() {
+  // Two offset speech bubbles — back-and-forth with the punks
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="1" y="1" width="11" height="7" rx="2.5" />
+      <rect x="4" y="8" width="11" height="7" rx="2.5" />
+    </svg>
+  );
+}
 
 function MindIcon() {
   // A pane divided into three compartments — structured intelligence
@@ -94,12 +103,13 @@ function ChangeHistoryIcon() {
 
 // --- Toolbar button ---
 
-function ToolbarButton({ icon, active, disabled, onClick, tooltip }: {
+function ToolbarButton({ icon, active, disabled, onClick, tooltip, badge }: {
   icon: ReactNode;
   active?: boolean;
   disabled?: boolean;
   onClick: () => void;
   tooltip?: string;
+  badge?: boolean;
 }) {
   const [showTooltip, setShowTooltip] = useState(false);
   const [tooltipTimer, setTooltipTimer] = useState<NodeJS.Timeout | null>(null);
@@ -127,7 +137,7 @@ function ToolbarButton({ icon, active, disabled, onClick, tooltip }: {
       <button
         onClick={onClick}
         disabled={disabled}
-        className={`w-7 h-7 flex items-center justify-center rounded-xl
+        className={`w-7 h-7 flex items-center justify-center rounded-xl relative
           ${disabled
             ? "text-pane-text-secondary opacity-30 cursor-default"
             : active
@@ -136,65 +146,18 @@ function ToolbarButton({ icon, active, disabled, onClick, tooltip }: {
           }`}
       >
         {icon}
+        {badge && (
+          <span
+            className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full"
+            style={{ background: "var(--pane-terminal)" }}
+          />
+        )}
       </button>
       {showTooltip && tooltip && (
         <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-pane-bg border border-pane-border/40 rounded-lg text-pane-text-secondary text-[11px] whitespace-nowrap shadow-lg z-50">
           {tooltip}
         </div>
       )}
-    </div>
-  );
-}
-
-// --- Thought Conversations (replaces thread list when in mind chat) ---
-
-function ThoughtConversations() {
-  const chatEntryId = useMindStore((s) => s.chatEntryId);
-  const entries = useMindStore((s) => s.entries);
-  const threadEntryIds = useMindStore((s) => s.threadEntryIds);
-  const unreadThreadEntryIds = useMindStore((s) => s.unreadThreadEntryIds);
-  const setChatEntryId = useMindStore((s) => s.setChatEntryId);
-
-  // Stable sort by date — entries never jump positions when switching
-  const thoughtEntries = useMemo(() => {
-    return entries
-      .filter((e) => threadEntryIds.has(e.id) || e.id === chatEntryId)
-      .sort(
-        (a, b) =>
-          new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
-      );
-  }, [entries, chatEntryId, threadEntryIds]);
-
-  const label = (content: string) =>
-    (content.split("\n")[0] ?? "").slice(0, 48) || "untitled thought";
-
-  return (
-    <div>
-      {thoughtEntries.map((entry) => {
-        const isActive = entry.id === chatEntryId;
-        const hasUnread = unreadThreadEntryIds.has(entry.id);
-        return (
-          <button
-            key={entry.id}
-            onClick={() => setChatEntryId(isActive ? null : entry.id)}
-            title={entry.content}
-            className={`w-full flex items-center gap-1.5 h-8 px-2 truncate btn-press ${
-              isActive
-                ? "bg-pane-text/[0.08] rounded-xl text-pane-text"
-                : "text-pane-text-secondary hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40 hover:rounded-xl hover:text-pane-text"
-            }`}
-            style={{ fontSize: "var(--pane-panel-font-size)" }}
-          >
-            <span className="truncate flex-1 text-left">{label(entry.content)}</span>
-            {hasUnread && (
-              <span
-                className="w-1.5 h-1.5 rounded-full shrink-0"
-                style={{ background: "var(--pane-terminal)" }}
-              />
-            )}
-          </button>
-        );
-      })}
     </div>
   );
 }
@@ -209,11 +172,13 @@ export function ControlPanel() {
     if (!s.activeProjectId) return "conversation" as const;
     return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
   });
-  const mindChatActive = useMindStore((s) => s.chatEntryId !== null);
-  const mindHasUnread = useMindStore((s) => s.unreadThreadEntryIds.size > 0);
   const isGitRepo = useProjectsStore((s) => {
     if (!s.activeProjectId) return false;
     return s.projects.get(s.activeProjectId)?.git.isGitRepo ?? false;
+  });
+  const hasUnreadLens = useProjectsStore((s) => {
+    if (!s.activeProjectId) return false;
+    return s.projects.get(s.activeProjectId)?.hasUnreadLens ?? false;
   });
   // If we're somehow in git mode but the project isn't a git repo, go to conversation
   useEffect(() => {
@@ -222,7 +187,7 @@ export function ControlPanel() {
     }
   }, [isGitRepo, mode, activeProjectId]);
 
-  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history") => {
+  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens") => {
     if (!activeProjectId) return;
     if (mode === newMode) return;
     setMode(activeProjectId, newMode);
@@ -242,13 +207,9 @@ export function ControlPanel() {
       {/* Spacer for macOS traffic lights — enough room so they sit inside the panel */}
       <div className="h-12 shrink-0" />
 
-      {/* Thread list / thought conversations — fills available space between traffic lights and toolbar */}
+      {/* Thread list — fills available space between traffic lights and toolbar */}
       <div className="flex-1 min-h-0 overflow-y-auto py-2">
-        {mode === "mind" && mindChatActive ? (
-          <ThoughtConversations />
-        ) : (
-          <ProjectList />
-        )}
+        <ProjectList />
       </div>
 
       {/* Toolbar */}
@@ -292,17 +253,14 @@ export function ControlPanel() {
         />
         <div className="ml-auto flex items-center gap-0.5">
           <ToolbarButton
-            icon={
-              <span className="relative flex items-center justify-center">
-                <MindIcon />
-                {mindHasUnread && (
-                  <span
-                    className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full"
-                    style={{ background: "var(--pane-terminal)" }}
-                  />
-                )}
-              </span>
-            }
+            icon={<LensIcon />}
+            active={mode === "lens"}
+            onClick={() => handleSetMode("lens")}
+            tooltip="Lens"
+            badge={hasUnreadLens}
+          />
+          <ToolbarButton
+            icon={<MindIcon />}
             active={mode === "mind"}
             onClick={() => handleSetMode("mind")}
             tooltip="Mind"

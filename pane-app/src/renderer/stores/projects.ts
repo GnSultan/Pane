@@ -39,11 +39,12 @@ export interface Project {
   selectedPath: string | null;
   activeFilePath: string | null;
   activeFileContent: string | null;
-  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history";
+  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens";
   conversation: ConversationState;
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
   hasUnreadCompletion: boolean; // true when background task completes, cleared when project becomes active
+  hasUnreadLens: boolean; // true when a new Lens post/punk finding arrives while Lens is not open
   recentFiles: string[]; // last 20 opened files (FIFO)
   terminalTabs: TerminalTab[];
   activeTerminalTabId: string | null;
@@ -74,6 +75,7 @@ function createProject(root: string): Project {
     },
     fileIndex: { files: [], lastIndexed: 0, isLoading: false },
     hasUnreadCompletion: false,
+    hasUnreadLens: false,
     recentFiles: [],
     terminalTabs: [],
     activeTerminalTabId: null,
@@ -131,7 +133,7 @@ interface ProjectsState {
   // Per-project mode
   setMode: (
     projectId: string,
-    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history",
+    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens",
   ) => void;
   toggleMode: (projectId: string) => void;
 
@@ -191,10 +193,17 @@ interface ProjectsState {
   ) => void;
   clearConversation: (projectId: string) => void;
   setHasUnreadCompletion: (projectId: string, hasUnread: boolean) => void;
+  setHasUnreadLens: (projectId: string, hasUnread: boolean) => void;
   restoreConversation: (
     projectId: string,
     messages: ConversationMessage[],
     sessionId: string | null,
+    historyInfo?: { totalCount: number; startIndex: number },
+  ) => void;
+  prependOlderMessages: (
+    projectId: string,
+    messages: ConversationMessage[],
+    newStartIndex: number,
   ) => void;
   setConversationTodos: (
     projectId: string,
@@ -306,7 +315,7 @@ function createProjectsStore() {
           ? state.projects.get(state.activeProjectId)
           : undefined;
         const carryMode = currentProject?.mode;
-        const isTransientMode = carryMode === "mind" || carryMode === "profile" || carryMode === "history";
+        const isTransientMode = carryMode === "mind" || carryMode === "profile" || carryMode === "history" || carryMode === "lens";
 
         const updatedProjects = new Map(state.projects);
         const updatedProject = {
@@ -417,17 +426,23 @@ function createProjectsStore() {
 
     // Mode
     setMode: (projectId, mode) =>
-      set((state) => updateProject(state, projectId, () => ({ mode }))),
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          mode,
+          // Opening Lens clears the unread badge
+          ...(mode === "lens" ? { hasUnreadLens: false } : {}),
+        })),
+      ),
 
     toggleMode: (projectId) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
           // Toggle between Chat and Viewer (file explorer / directory browser)
-          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history";
+          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens";
           if (p.mode === "conversation") {
             nextMode = "viewer";
           } else {
-            // From git, terminal, viewer, mind, profile, or history — always go back to conversation
+            // From git, terminal, viewer, mind, profile, history, or lens — always go back to conversation
             nextMode = "conversation";
           }
           return { mode: nextMode };
@@ -714,6 +729,13 @@ function createProjectsStore() {
         })),
       ),
 
+    setHasUnreadLens: (projectId, hasUnread) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          hasUnreadLens: hasUnread,
+        })),
+      ),
+
     setConversationTodos: (projectId, todos) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -809,7 +831,7 @@ function createProjectsStore() {
         })),
       ),
 
-    restoreConversation: (projectId, messages, sessionId) =>
+    restoreConversation: (projectId, messages, sessionId, historyInfo) =>
       set((state) =>
         updateProject(state, projectId, () => ({
           conversation: {
@@ -834,6 +856,19 @@ function createProjectsStore() {
             lastCompactionAt: null,
             compactionCount: 0,
             tokensSaved: 0,
+            historyTotalCount: historyInfo?.totalCount ?? 0,
+            historyStartIndex: historyInfo?.startIndex ?? 0,
+          },
+        })),
+      ),
+
+    prependOlderMessages: (projectId, olderMessages, newStartIndex) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: {
+            ...p.conversation,
+            messages: [...olderMessages, ...p.conversation.messages],
+            historyStartIndex: newStartIndex,
           },
         })),
       ),

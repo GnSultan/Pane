@@ -108,10 +108,43 @@ import { routingStore } from "./routing-store.mjs";
 import { classifyDomain } from "./routing-oracle.mjs";
 import { ensurePriors } from "./benchmark-scout.mjs";
 import { classify as localClassify } from "./intent-classifier.mjs";
+import { routeHeuristic, detectFailureSignals, detectSuccessSignals, djb2Hash } from "./heuristic-router.mjs";
+import { routeIntegrated, recordOutcome, getClassifierStats } from "./integrated-router.mjs";
+import { readThreadState, incrementFailure, recordSuccess, updateLastPrompt, updateLastResponse, recordApproach } from "./thread-state.mjs";
 
 // Node.js globals for utility process
 const { AbortController, fetch, TextDecoder, setImmediate, console } =
   globalThis;
+
+// ============================================================================
+// Outcome scoring helpers
+// ============================================================================
+
+/**
+ * Compute a basic quality score for a completed outcome.
+ * Higher score = better outcome.
+ *
+ * @param {Object} tracked - tracked outcome data
+ * @returns {number} 0-1 score
+ */
+function computeOutcomeScore(tracked) {
+  let score = 0.5; // baseline
+
+  // Response length: very short responses are often errors or refusals
+  if (tracked.responseLength < 20) score -= 0.3;
+  else if (tracked.responseLength < 50) score -= 0.1;
+  else if (tracked.responseLength > 500) score += 0.1;
+
+  // Tool errors reduce score significantly
+  if (tracked.hadToolErrors) score -= 0.25;
+
+  // Response time: very slow is bad (could indicate struggle)
+  if (tracked.responseTimeMs > 60000) score -= 0.15;
+  else if (tracked.responseTimeMs > 30000) score -= 0.05;
+
+  // Clamp to valid range
+  return Math.max(0.01, Math.min(1.0, score));
+}
 
 const __dirname = import.meta.dirname;
 
@@ -291,6 +324,7 @@ class CliBackend extends PunkBackend {
       workingDir: request.workingDir,
       sessionId: request.sessionId,
       model: request.model,
+      provider: request.provider,
       intent: request.intent,
       history: request.history,
       command: this.command,
@@ -538,6 +572,13 @@ class PunkEngine {
     // Used by agentCall() — events are consumed internally, never forwarded to renderer.
     this._workerAgentListeners = new Map();
 
+    // Initialize learned classifier on startup (non-blocking)
+    import("./integrated-router.mjs").then(module => {
+      module.getClassifierStats && console.log("[punk] learned classifier ready");
+    }).catch(() => {
+      console.log("[punk] learned classifier not available");
+    });
+
     // Safety sweep: evict any _activeOutcomes entries older than 10 minutes
     // (covers crashes/hangs where neither processEnded nor error fires) and
     // _projectLastOutcome entries older than 30 minutes.
@@ -602,6 +643,15 @@ class PunkEngine {
     ensurePriors().catch(err =>
       console.warn("[punk] benchmark-scout failed (non-fatal):", err.message)
     );
+
+    // Initialize learned classifier (non-blocking, logs when ready)
+    const { getClassifierStats } = await import("./integrated-router.mjs");
+    const stats = getClassifierStats();
+    if (stats) {
+      console.log(`[punk] learned classifier ready (${stats.sampleCount} samples, ${stats.vocabSize} vocab)`);
+    } else {
+      console.log("[punk] learned classifier initialized");
+    }
   }
 
   async reinitialize(backendOverride) {
@@ -731,6 +781,28 @@ class PunkEngine {
           console.warn("[punk] outcome update failed (non-fatal):", err.message);
         }
 
+        // Train the learned classifier with this completed outcome
+        if (tracked.userPrompt && tracked.projectId) {
+          try {
+            // Compute a basic quality score based on response signals
+            const score = computeOutcomeScore(tracked);
+            recordOutcome({
+              projectId: tracked.projectId,
+              prompt: tracked.userPrompt,
+              taskType: tracked.taskType,
+              domain: tracked.domain,
+              model: tracked.model || "unknown",
+              provider: tracked.provider || "unknown",
+              responseTimeMs: elapsed,
+              hadToolErrors: tracked.hadToolErrors,
+              responseLength: tracked.responseLength,
+              score,
+            });
+          } catch (err) {
+            console.warn("[punk] classifier training failed (non-fatal):", err.message);
+          }
+        }
+
         // Fire principle extraction immediately — do NOT store responseText in
         // _projectLastOutcome as it would hold the full response string for every
         // quiet project indefinitely, causing memory to grow without bound.
@@ -748,6 +820,12 @@ class PunkEngine {
             userPrompt:       tracked.userPrompt,
             timestamp:        Date.now(),
           });
+
+          // Update thread-state with the last response summary for heuristic router
+          try {
+            const summary = (tracked.responseText || "").slice(0, 200);
+            updateLastResponse(tracked.projectId, summary);
+          } catch {}
         }
         this._activeOutcomes.delete(requestId);
       }
@@ -963,6 +1041,9 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     let localDecision = null;
     let strategy;
     let struggleCount = 0;
+    // Declared here so routing fallback checks (after the if/else chain) can
+    // reference it regardless of which branch ran.
+    let catalogData = null;
 
     if (resolvedRequest._systemOverride) {
       // System-initiated spawn (mind chat, etc.) — skip classification entirely.
@@ -986,10 +1067,11 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       strategy = { ...override, confidence: 1.0, reason: `/${cmd}`, signals: [] };
       console.log(`[punk] slash override → ${strategy.mode} (/${cmd})`);
     } else {
-      // ── Unified classification + routing via active backend ──
-      // Build model catalog: all available models with scores, costs, and real outcomes
+      // ── Heuristic routing — zero-latency deterministic classification ──
+      // Replaces the LLM classifier call with a pure algorithmic approach.
+      // Thread-state tracks consecutive failures for escalation stages 0-4.
+
       const settings = await this.loadSettings();
-      let catalogData = null;
       try {
         catalogData = {
           backend:  settings.punk_backend || "api",
@@ -1001,203 +1083,206 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         console.warn("[punk] failed to build model catalog:", err.message);
       }
 
-      // Build rich session snapshot for the classifier — everything Pane knows
       const history = resolvedRequest.history || [];
       const workingSet = sessionState?.workingSet || [];
 
-      // Conversation summary: last 4 turns compressed to one-liners
-      const recentTurns = history.slice(-8)
-        .filter(m => m.type === "user" || m.type === "assistant")
-        .map(m => {
-          const role = m.type === "user" ? "user" : "assistant";
-          const text = typeof m.content === "string"
-            ? m.content
-            : (Array.isArray(m.content)
-                ? m.content.filter(b => b.type === "text").map(b => b.text || "").join(" ")
-                : "");
-          return `${role}: ${text.trim().slice(0, 120)}`;
-        })
-        .filter(Boolean);
+      // ── Thread-state: failure/success detection ──
+      const threadState = readThreadState(resolvedRequest.projectId);
+      const promptHash = djb2Hash(resolvedRequest.prompt || "");
 
-      // Working set with touch counts
-      const workingSetSummary = workingSet.slice(0, 8).map(f => {
-        const name = (f.path || "").split("/").pop();
-        return f.purpose ? `${name} (${f.purpose}, ${f.touches || 0} touches)` : `${name} (${f.touches || 0} touches)`;
+      // Detect failure signals BEFORE routing — updates escalation state
+      const failureSignal = detectFailureSignals(
+        resolvedRequest.prompt || "",
+        threadState.lastUserPromptHash,
+        threadState.lastUserPromptText,
+      );
+
+      if (failureSignal.isFailure) {
+        const updated = incrementFailure(resolvedRequest.projectId, failureSignal.type);
+        threadState.consecutiveFailures = updated.consecutiveFailures;
+        threadState.escalationStage = updated.escalationStage;
+        console.log(
+          `[punk] failure detected (${failureSignal.type}) → stage ${updated.escalationStage}` +
+          ` (${updated.consecutiveFailures} consecutive)`,
+        );
+      } else if (detectSuccessSignals(resolvedRequest.prompt || "")) {
+        const updated = recordSuccess(resolvedRequest.projectId);
+        threadState.consecutiveFailures = updated.consecutiveFailures;
+        threadState.escalationStage = updated.escalationStage;
+        console.log("[punk] success signal → failures reset");
+      }
+
+      // Record the current prompt for next-turn Jaccard comparison
+      updateLastPrompt(resolvedRequest.projectId, resolvedRequest.prompt || "", promptHash);
+
+      // Struggle count for backward compat with outcome tracking
+      struggleCount = threadState.consecutiveFailures;
+
+      // ── Route via integrated engine (heuristic + learned classifier) ──
+      localDecision = await routeIntegrated({
+        message:        resolvedRequest.prompt ?? "",
+        turnCount:      history.length,
+        workingSetSize: workingSet.length,
+        pendingTodos,
+        phase:          sessionState?.phase || "idle",
+        threadState: {
+          consecutiveFailures: threadState.consecutiveFailures,
+          lastFailureType:     threadState.lastFailureType,
+          approachesTried:     threadState.approachesTried?.length || 0,
+          lastResponseSummary: threadState.lastResponseSummary,
+          lastUserPromptHash:  threadState.lastUserPromptHash,
+        },
+        backend: catalogData?.backend ?? "claude-code",
       });
 
-      // Recent actions
-      const recentActions = (sessionState?.recentActions || []).slice(0, 5).map(a =>
-        `[${a.type}] ${a.content}`
+      // If the heuristic resets failures (success detected), apply it
+      if (localDecision.resetFailures) {
+        recordSuccess(resolvedRequest.projectId);
+      }
+
+      // Record the approach for this stage
+      const approachLabel = localDecision.escalationStage >= 2 ? "explore_first"
+        : localDecision.escalationStage >= 1 ? "self_review"
+        : "direct";
+      recordApproach(resolvedRequest.projectId, approachLabel);
+
+      strategy = {
+        mode:         localDecision.mode,
+        discovery:    localDecision.discovery,
+        reasoning:    localDecision.reasoning,
+        verification: localDecision.verification,
+        confidence:   localDecision.confidence,
+        reason:       localDecision.reason || null,
+        signals:      [],
+      };
+
+      console.log(
+        `[punk] heuristic → mode=${localDecision.mode} tier=${localDecision.modelTier} ` +
+        `complexity=${localDecision.complexityScore} stage=${localDecision.escalationStage} ` +
+        `task=${localDecision.taskType}`,
       );
-
-      // Decisions locked this session
-      const decisions = (sessionState?.decisions || []).slice(0, 4).map(d => d.content);
-
-      // Brain context — read if available
-      let brainSummary = {};
-      try {
-        const brainCtxPath = path.join(os.homedir(), ".pane", "brain", "context", `${resolvedRequest.projectId}.json`);
-        const brainCtx = JSON.parse(await fs.readFile(brainCtxPath, "utf-8"));
-        brainSummary = {
-          codebaseSize: (brainCtx.codebaseMap || []).length,
-          relevantFiles: (brainCtx.relevantFiles || []).slice(0, 5).map(f => f.path?.split("/").pop() + (f.description ? ` — ${f.description}` : "")),
-          synthesis: (brainCtx.synthesis || "").slice(0, 200),
-        };
-      } catch {}
-
-      // Struggle detection — count consecutive failing turns before classifying
-      // so the classifier can factor in the struggle signal for model selection.
-      try {
-        const recentOutcomes = routingStore.getRecentProjectOutcomes(resolvedRequest.projectId, 6);
-        struggleCount = _computeStruggleCount(recentOutcomes);
-        if (struggleCount > 0) {
-          console.log(`[punk] struggle signal: ${struggleCount} consecutive failing turns`);
-        }
-      } catch (err) {
-        console.warn("[punk] struggle detection failed (non-fatal):", err.message);
-      }
-
-      // ── Fast-path: deterministic bypass for trivially obvious intents ──
-      // Fires before the LLM call to avoid wasting tokens on confirmations
-      // and short questions. Falls through to the LLM for everything else.
-      const fastPath = _fastPathClassify(
-        resolvedRequest.prompt ?? "",
-        catalogData?.backend ?? "",
-      );
-
-      if (fastPath) {
-        localDecision = fastPath;
-        console.log(`[punk] fast-path → mode=${fastPath.mode} exec=${fastPath.executionModel?.model}`);
-      } else {
-        localDecision = await localClassify({
-          message:        resolvedRequest.prompt ?? "",
-          turnCount:      history.length,
-          hasActiveTask:  !!sessionState?.activeTask,
-          activeTask:     sessionState?.activeTask?.description || null,
-          workingSetSize: workingSet.length,
-          workingSet:     workingSetSummary,
-          pendingTodos,
-          todoSummary:    (resolvedRequest.todos || [])
-            .filter(t => t.status !== "completed")
-            .slice(0, 5)
-            .map(t => t.content),
-          recentTurns,
-          recentActions,
-          decisions,
-          gitBranch:      sessionState?.gitStatus?.branch || null,
-          gitSummary:     sessionState?.gitStatus?.summary?.slice(0, 150) || null,
-          codebaseSize:   brainSummary.codebaseSize || 0,
-          relevantFiles:  brainSummary.relevantFiles || [],
-          projectDNA:     brainSummary.synthesis || null,
-          phase:          sessionState?.phase || "idle",
-          struggleCount,
-        }, (sys, usr) => this.quickCall(sys, usr), catalogData);
-      }
-
-      if (localDecision) {
-        strategy = {
-          mode:         localDecision.mode,
-          discovery:    localDecision.discovery,
-          reasoning:    localDecision.reasoning,
-          verification: localDecision.verification,
-          confidence:   fastPath ? 1.0 : 0.90,
-          reason:       localDecision.reason || null,
-          signals:      [],
-        };
-      } else {
-        console.warn("[punk] classifier returned null — falling back to direct");
-        strategy = { mode: "direct", discovery: false, reasoning: "shallow", verification: "none", confidence: 0.5, reason: "classifier unavailable", signals: [] };
-      }
     }
 
     // ── ROUTING ───────────────────────────────────────────────────────────
     // Priority order:
     //   1. User explicit model lock (model differs from routing-table default)
     //   2. Classifier route (when autoRoute is on)
-    //   3. Static routing table fallback
-    //   4. Escalation override (struggle >= 3 → frontier model + deep thinking)
+    //   3. Heuristic tier → concrete model resolution
+    //   4. Escalation is built into the heuristic router (stages 0-4)
     // autoRoute comes directly from the frontend request — always current.
     // Fallback to disk only when not present (e.g. internal spawns).
     const autoRoute = request.autoRoute ?? (await this.loadIntentAutoRoute());
     const routing   = await this.loadIntentRouting();
 
-    // Intent slot — used for fallback routing when classifier doesn't pick a model
+    // Intent slot — used for fallback routing when heuristic doesn't pick a model
     const intentSlot = strategy.mode === "discuss" ? "explain" : "execute";
     if (!resolvedRequest.intent) resolvedRequest.intent = intentSlot;
 
     const intentRoute = routing[intentSlot] || routing["execute"];
-    const classifierRoute = localDecision?.executionModel;
 
     // When autoRoute is off the user has pinned a model — respect it exactly.
     // When autoRoute is on the router owns model selection entirely.
     const userExplicitOverride = !autoRoute;
 
+    // Escalation level from heuristic router (already computed, not from old struggle detection)
+    let escalationLevel = localDecision?.escalationStage ?? 0;
+
     if (userExplicitOverride) {
       resolvedRequest.thinking = request.thinking ?? false;
       console.log(`[punk] user model lock → ${resolvedRequest.provider}/${resolvedRequest.model}`);
-    } else if (classifierRoute && autoRoute) {
-      // Smart router picked a specific model — use it.
-      resolvedRequest.provider = classifierRoute.provider;
-      resolvedRequest.model    = classifierRoute.model;
+    } else if (localDecision?.modelTier && autoRoute) {
+      // ── Heuristic tier → concrete model resolution ──
+      // The heuristic router returns a tier (cheap/mid/capable/frontier).
+      // We resolve that to a concrete provider/model from the current backend.
+      const tier = localDecision.modelTier;
+      const isGemini = catalogData?.backend === "gemini";
+      const baseProvider = isGemini ? "gemini" : "anthropic";
+
+      const TIER_MODELS = {
+        gemini: { cheap: "auto-gemini-3", mid: "auto-gemini-3", capable: "auto-gemini-3", frontier: "auto-gemini-3" },
+        anthropic: { cheap: "haiku", mid: "sonnet", capable: "sonnet", frontier: "opus" },
+      };
+      const tierMap = TIER_MODELS[baseProvider] || TIER_MODELS.anthropic;
+
+      resolvedRequest.provider = baseProvider;
+      resolvedRequest.model    = tierMap[tier] || tierMap.mid;
       resolvedRequest.thinking = strategy.reasoning === "deep";
 
-      // preferFrontier=false is a hard ceiling: even if the classifier's execution
-      // model is frontier-tier, downgrade it to the mid-tier model. This enforces
-      // the routing guidelines mechanically so the LLM can't quietly ignore them.
-      if (localDecision?.preferFrontier === false) {
-        const m = resolvedRequest.model ?? "";
-        const isFrontier = m === "opus" || m.includes("opus");
-        if (isFrontier) {
-          const mid = resolvedRequest.provider === "anthropic" ? "sonnet"
-                    : resolvedRequest.provider === "gemini"    ? "auto-gemini-3"
-                    : resolvedRequest.model; // unknown provider — leave as-is
-          console.log(`[punk] preferFrontier=false ceiling: ${resolvedRequest.model} → ${mid}`);
-          resolvedRequest.model = mid;
+      // For API backend, check key availability and remap if needed
+      if (catalogData?.backend === "api") {
+        // Try to use the best model available from any provider with a key
+        const keys = catalogData.apiKeys || {};
+        if (!keys[resolvedRequest.provider]) {
+          const firstWithKey = Object.entries(keys).find(([_, k]) => !!k)?.[0];
+          if (firstWithKey) {
+            console.log(`[punk] heuristic route ${resolvedRequest.provider} has no key → redirect to ${firstWithKey}`);
+            resolvedRequest.provider = firstWithKey;
+            // Remap tier for the new provider
+            const newTierMap = TIER_MODELS[firstWithKey] || {};
+            resolvedRequest.model = newTierMap[tier] || null;
+          }
         }
       }
 
-      console.log(`[punk] classifier routed → ${resolvedRequest.provider}/${resolvedRequest.model}`);
+      // Frontier escalation via benchmark priors (when tier is frontier, try to get the best model)
+      if (tier === "frontier") {
+        try {
+          const providerSet = new Set([resolvedRequest.provider]);
+          const frontier = routingStore.getFrontierModel(providerSet);
+          if (frontier && frontier.model !== resolvedRequest.model) {
+            console.log(`[punk] frontier tier resolved → ${frontier.model}`);
+            resolvedRequest.provider = frontier.provider;
+            resolvedRequest.model    = frontier.model;
+          }
+        } catch {}
+      }
+
+      console.log(`[punk] heuristic routed → ${resolvedRequest.provider}/${resolvedRequest.model} (tier=${tier})`);
     } else {
       // Fallback to static routing table.
       resolvedRequest.provider = intentRoute.provider;
       resolvedRequest.model    = intentRoute.model;
       resolvedRequest.thinking = intentRoute.thinking ?? false;
+
+      // Ensure fallback has a key
+      if (catalogData?.backend === "api") {
+        const keys = catalogData.apiKeys || {};
+        if (!keys[resolvedRequest.provider]) {
+          const firstWithKey = Object.entries(keys).find(([_, k]) => !!k)?.[0];
+          if (firstWithKey) {
+            resolvedRequest.provider = firstWithKey;
+            resolvedRequest.model = null;
+            console.log(`[punk] fallback redirect: ${firstWithKey}`);
+          }
+        }
+      }
     }
 
     // ── ESCALATION ────────────────────────────────────────────────────────
-    // When the session is struggling (consecutive failing turns) and the user
-    // hasn't pinned a specific model, escalate capability and inject a deeper
-    // analysis directive into the system prompt.
-    let escalationLevel = 0;
-    if (struggleCount >= 2 && !userExplicitOverride && autoRoute) {
-      escalationLevel = Math.min(4, struggleCount - 1);
+    // The heuristic router computes escalation stages 0-4 with richer hints
+    // and pre-actions. We inject the escalation hint into the system prompt
+    // and set the escalation level for downstream use.
+    if (localDecision?.escalationStage >= 1 && !userExplicitOverride && autoRoute) {
+      escalationLevel = localDecision.escalationStage;
 
-      // At struggle >= 3: upgrade to the highest-scoring model for this provider.
-      if (struggleCount >= 3) {
-        try {
-          const providerSet = new Set([resolvedRequest.provider]);
-          const frontier = routingStore.getFrontierModel(providerSet);
-          if (frontier && frontier.model !== resolvedRequest.model) {
-            console.log(
-              `[punk] escalating ${resolvedRequest.model} → ${frontier.model}` +
-              ` (struggle=${struggleCount})`,
-            );
-            resolvedRequest.provider = frontier.provider;
-            resolvedRequest.model    = frontier.model;
-          }
-        } catch (err) {
-          console.warn("[punk] frontier model lookup failed (non-fatal):", err.message);
-        }
+      // Inject the heuristic router's escalation hint (stage-aware, domain-specific)
+      if (localDecision.escalationHint) {
+        // Build the rich domain-aware hint from _buildEscalationHint for stages 2+
+        // The heuristic router's hint is a brief behavioral instruction;
+        // combine it with the full domain-specific escalation for deep context.
+        const richHint = struggleCount >= 2
+          ? _buildEscalationHint(struggleCount, localDecision.taskType)
+          : localDecision.escalationHint;
+        resolvedRequest.escalationHint  = richHint;
+        resolvedRequest.escalationLevel = escalationLevel;
       }
 
-      // Always enable deep thinking on struggling sessions.
-      resolvedRequest.thinking = true;
+      // Enable deep thinking on escalated sessions
+      if (escalationLevel >= 2) {
+        resolvedRequest.thinking = true;
+      }
 
-      // Build domain-aware escalation directive for system prompt injection.
-      const escalationHint = _buildEscalationHint(struggleCount, localDecision?.taskType ?? null);
-      resolvedRequest.escalationHint  = escalationHint;
-      resolvedRequest.escalationLevel = escalationLevel;
-      console.log(`[punk] escalation level ${escalationLevel} injected`);
+      console.log(`[punk] escalation stage ${escalationLevel} injected (heuristic)`);
     }
 
     // Force openrouter for slash-namespaced models
@@ -1205,7 +1290,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       resolvedRequest.provider = "openrouter";
     }
 
-    // Domain for outcome recording — derived from classifier or regex fallback
+    // Domain for outcome recording — derived from heuristic or regex fallback
     const domain = localDecision
       ? _taskTypeToDomain(localDecision.taskType)
       : classifyDomain(resolvedRequest.prompt ?? "");
@@ -1231,16 +1316,17 @@ Respond with a single concise principle statement (one sentence, under 150 chara
             provider:     resolvedRequest.provider,
             model:        resolvedRequest.model,
             thinking:     resolvedRequest.thinking ?? false,
-            // classifier metadata
-            classifierRouted:     !!classifierRoute,
-            classifierConfidence: classifierRoute ? 0.90 : null,
-            classifierExploring:  false,
+            // heuristic metadata
+            routedBy:         localDecision?.routedBy ?? null,
+            heuristicTier:    localDecision?.modelTier ?? null,
+            complexityScore:  localDecision?.complexityScore ?? null,
             localTaskType:    localDecision?.taskType ?? null,
             localComplexity:  localDecision?.complexity ?? null,
             localAtomHints:   localDecision?.atomHints ?? [],
-            // struggle escalation
+            // escalation (from heuristic router)
             escalationLevel,
             struggleCount,
+            preActions:       localDecision?.preActions ?? [],
           },
         },
         request.requestId,
@@ -1321,8 +1407,8 @@ Respond with a single concise principle statement (one sentence, under 150 chara
           model:               resolvedRequest.model,
           provider:            resolvedRequest.provider,
           routingConfidence: strategy.confidence,
-          oracleUsed:          !!classifierRoute,
-          oracleConfidence:    classifierRoute ? 0.90 : null,
+          oracleUsed:          localDecision?.routedBy === "integrated",
+          oracleConfidence:    localDecision?.routedBy === "integrated" ? (localDecision.confidence || 0.85) : null,
           promptLength:        (resolvedRequest.prompt ?? "").length,
           explored:            false,
         });
@@ -1332,6 +1418,8 @@ Respond with a single concise principle statement (one sentence, under 150 chara
           taskType:         strategy.mode,
           domain,
           projectId:        resolvedRequest.projectId,
+          model:            resolvedRequest.model,
+          provider:         resolvedRequest.provider,
           pendingTodoCount: (resolvedRequest.todos || []).filter(t => t.status !== "completed").length,
           responseLength:   0,
           hadToolErrors:    false,
@@ -1500,13 +1588,35 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     await this.initialize();
     // Use the routing table's explain slot — lightest model the user has
     // configured for their active backend. Never hardcode a provider here.
+    const settings = await this.loadSettings();
     const routing = await this.loadIntentRouting();
     const explainRoute = routing["explain"] || routing["execute"] || {};
+
     const request = {
       provider: explainRoute.provider || null,
-      model:    explainRoute.model    || null,
+      model: explainRoute.model || null,
       thinking: false,
     };
+
+    // If using API backend, ensure we have a key for the chosen provider.
+    // If not, try to find ANY provider that HAS a key.
+    if (settings.punk_backend === "api" || !settings.punk_backend) {
+      const keys = settings.http_api_keys || {};
+      const currentProvider = request.provider || settings.http_provider || "deepseek";
+
+      if (!keys[currentProvider]) {
+        // Current choice has no key — pick the first provider that DOES.
+        const firstWithKey = Object.entries(keys).find(([_, k]) => !!k)?.[0];
+        if (firstWithKey) {
+          request.provider = firstWithKey;
+          // When switching provider, we MUST use a model that exists for it.
+          // mapModelName with null model will return the default for that provider.
+          request.model = null;
+          console.log(`[punk] quickCall: ${currentProvider} has no key, switching to ${firstWithKey}`);
+        }
+      }
+    }
+
     return this.backend.planningCall(systemPrompt, userPrompt, request);
   }
 
@@ -1621,7 +1731,7 @@ export async function registerPunkHandlers() {
   });
 
   ipcMain.handle("send_to_mind", async (_event, args) => {
-    const { threadId, prompt, workingDir, sessionId, model, requestId, entryContent } = args;
+    const { threadId, prompt, workingDir, sessionId, model, provider, thinking, requestId, entryContent } = args;
     console.log(`[pane] Mind chat: thread=${threadId}, prompt=${(prompt || "").slice(0, 60)}`);
     const mindSystemPrompt =
       "You are a thinking partner inside Pane Mind. You help the user think through ideas by exploring code, finding relevant patterns, and offering analysis. You can read files and search the codebase but CANNOT write, edit, or execute anything. Be concise and direct. No emojis.\n\nThe thought being explored:\n" +
@@ -1632,6 +1742,8 @@ export async function registerPunkHandlers() {
       workingDir,
       sessionId: sessionId || null,
       model: model || null,
+      provider: provider || null,
+      thinking: thinking ?? false,
       requestId,
       tools: ["Read", "Glob", "Grep"],
       maxTurns: 15,
@@ -1642,6 +1754,32 @@ export async function registerPunkHandlers() {
 
   ipcMain.handle("abort_mind", async (_event, args) => {
     await punkEngine.abort("mind:" + args.threadId);
+  });
+
+  ipcMain.handle("send_to_lens", async (_event, args) => {
+    const { postId, prompt, workingDir, sessionId, model, provider, thinking, requestId, postContent } = args;
+    console.log(`[pane] Lens chat: post=${postId}, prompt=${(prompt || "").slice(0, 60)}`);
+    const lensSystemPrompt =
+      "You are a focused collaborator inside Pane Lens. The user is discussing a specific observation about their codebase. Help them explore it — answer questions, find related code, surface implications. Be concise and direct. No emojis.\n\nThe observation:\n" +
+      (postContent || "");
+    await punkEngine.spawn({
+      projectId: "lens:" + postId,
+      prompt,
+      workingDir,
+      sessionId: sessionId || null,
+      model: model || null,
+      provider: provider || null,
+      thinking: thinking ?? false,
+      requestId,
+      tools: ["Read", "Glob", "Grep"],
+      maxTurns: 10,
+      systemPromptOverride: lensSystemPrompt,
+      _systemOverride: true,
+    });
+  });
+
+  ipcMain.handle("abort_lens", async (_event, args) => {
+    await punkEngine.abort("lens:" + args.postId);
   });
 
   ipcMain.handle("terminate_punk_session", async (_event, args) => {

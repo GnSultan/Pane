@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect } from "react";
+import { useState, useMemo, useRef, useLayoutEffect } from "react";
 import type {
   ToolUseBlock,
   ToolResultBlock,
@@ -9,6 +9,8 @@ import type {
 } from "../../lib/punk-types";
 import { MarkdownText } from "./MarkdownText";
 import { MicroIndicator } from "../shared";
+import { useProjectsStore } from "../../stores/projects";
+import { writePty } from "../../lib/tauri-commands";
 
 interface ToolActivityProps {
   toolUse: ToolUseBlock;
@@ -28,6 +30,58 @@ function parseMcpName(name: string): { server: string; tool: string } | null {
 }
 
 function summarizeTool(name: string, input: Record<string, unknown>): string {
+  // Bare pane_* tool names from API backend (no mcp__ prefix)
+  if (name.startsWith("pane_")) {
+    switch (name) {
+      case "pane_run_in_terminal": {
+        const cmd = (input.command as string) || "";
+        return "terminal" + (cmd ? ` ${cmd.length > 60 ? cmd.slice(0, 60) + "…" : cmd}` : "");
+      }
+      case "pane_recall": {
+        const q = (input.query as string) || "";
+        return q ? `recall ${q}` : "recall";
+      }
+      case "pane_recall_all": {
+        const q = (input.query as string) || "";
+        return q ? `recall all ${q}` : "recall all";
+      }
+      case "pane_remember": {
+        const c = (input.content as string) || "";
+        return "remember" + (c ? ` ${c.slice(0, 60)}` : "");
+      }
+      case "pane_brief": return "brief";
+      case "pane_recent_terminal": return "recent terminal";
+      case "pane_search_changes": {
+        const q = (input.query as string) || "";
+        return q ? `search changes ${q}` : "search changes";
+      }
+      case "pane_checkpoints": return "checkpoints";
+      case "pane_change_history": return "change history";
+      case "pane_set_why": return "set why";
+      case "pane_set_philosophy": return "set philosophy";
+      case "pane_set_rule": return "set rule";
+      case "pane_synthesize": {
+        const q = (input.query as string) || "";
+        return q ? `synthesize ${q}` : "synthesize";
+      }
+      case "pane_cross_project": {
+        const q = (input.query as string) || "";
+        return q ? `cross project ${q}` : "cross project";
+      }
+      case "pane_knowledge_graph": return "knowledge graph";
+      case "pane_find_symbol": {
+        const q = (input.query as string) || (input.symbol as string) || "";
+        return q ? `find symbol ${q}` : "find symbol";
+      }
+      case "pane_open_files": return "open files";
+      case "pane_profile": return "profile";
+      case "pane_project_context": return "project context";
+      default:
+        // generic: strip "pane_" prefix, replace underscores with spaces
+        return name.slice(5).replace(/_/g, " ");
+    }
+  }
+
   const mcp = parseMcpName(name);
   if (mcp) return mcp.tool;
 
@@ -82,6 +136,9 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
 }
 
 function getToolLabel(name: string): string {
+  // Bare pane_* tool names from API backend (no mcp__ prefix)
+  if (name.startsWith("pane_")) return "pane";
+
   const mcp = parseMcpName(name);
   if (mcp) return mcp.server;
 
@@ -116,16 +173,13 @@ export function ExpandedEditInput({ input }: { input: Record<string, unknown> })
   const newStr = (input.new_string as string) || "";
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Scroll to bottom to show the replacement section
-  useEffect(() => {
-    if (containerRef.current && newStr) {
-      const container = containerRef.current;
-      // Scroll to bottom after a brief delay to ensure content is rendered
-      setTimeout(() => {
-        container.scrollTop = container.scrollHeight;
-      }, 50);
+  // useLayoutEffect fires before paint — scroll position is correct on first frame,
+  // no flash of the top of the file before snapping to the current write position.
+  useLayoutEffect(() => {
+    if (containerRef.current) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
-  }, [newStr]);
+  }, [oldStr, newStr]);
 
   return (
     <div
@@ -158,9 +212,19 @@ export function ExpandedEditInput({ input }: { input: Record<string, unknown> })
 
 export function ExpandedWriteInput({ input }: { input: Record<string, unknown> }) {
   const content = (input.content as string) || "";
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // useLayoutEffect fires before paint — ensures the scroll tracks the stream
+  // position on every frame without a top-of-file flash.
+  useLayoutEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [content]);
 
   return (
     <div
+      ref={scrollRef}
       className="font-mono overflow-x-auto max-h-[400px] overflow-y-auto
                  leading-[1.6]"
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
@@ -246,34 +310,65 @@ function ExpandedReadInput({ result }: { result?: ToolResultBlock }) {
 function ExpandedBashInput({ input }: { input: Record<string, unknown> }) {
   const cmd = (input.command as string) || "";
   const [copied, setCopied] = useState(false);
+  const [ran, setRan] = useState(false);
 
-  const handleCopy = () => {
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
     navigator.clipboard.writeText(cmd).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
     }).catch(() => {});
   };
 
+  const handleRun = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const s = useProjectsStore.getState();
+    const projectId = s.activeProjectId;
+    if (!projectId) return;
+    const tabId = s.projects.get(projectId)?.activeTerminalTabId;
+    if (!tabId) return;
+    writePty(tabId, cmd + "\n").catch(() => {});
+    s.setMode(projectId, "terminal");
+    setRan(true);
+    setTimeout(() => setRan(false), 1200);
+  };
+
   return (
-    <button
-      onClick={handleCopy}
-      className="w-full text-left font-mono leading-[1.6]
-                 hover:bg-pane-text/[0.02] transition-colors group"
+    <div
+      className="w-full font-mono leading-[1.6] group hover:bg-pane-text/[0.02] transition-colors"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
-      title="click to copy"
     >
       <pre className="px-4 py-4 text-pane-text-secondary whitespace-pre-wrap break-words flex items-start justify-between gap-2">
         <span>$ {cmd}</span>
-        <span className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-pane-text-secondary/50">
-          {copied ? "✓" : "copy"}
+        <span className="shrink-0 flex items-center gap-3 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            onClick={handleCopy}
+            className="text-pane-text-secondary/50 hover:text-pane-text-secondary transition-colors"
+            title="copy"
+          >
+            {copied ? "✓" : "copy"}
+          </button>
+          <button
+            onClick={handleRun}
+            className="transition-colors"
+            style={{ color: ran ? "var(--pane-status-added)" : "var(--pane-terminal)" }}
+            title="run in terminal"
+          >
+            {ran ? "✓" : "run"}
+          </button>
         </span>
       </pre>
-    </button>
+    </div>
   );
 }
 
 function ExpandedMcpInput({ input, toolName }: { input: Record<string, unknown>; toolName: string }) {
   const mcp = parseMcpName(toolName);
+  // Resolve display labels for both bare pane_* names and mcp__ prefixed names
+  const displayServer = toolName.startsWith("pane_") ? "pane" : mcp?.server ?? null;
+  const displayTool = toolName.startsWith("pane_")
+    ? toolName.slice(5).replace(/_/g, " ")
+    : mcp?.tool ?? null;
   const entries = Object.entries(input).filter(
     ([, v]) => v !== null && v !== undefined && v !== "",
   );
@@ -282,9 +377,9 @@ function ExpandedMcpInput({ input, toolName }: { input: Record<string, unknown>;
       className="font-mono leading-[1.6]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
-      {mcp && (
+      {displayServer && displayTool && (
         <div className="px-4 py-4 text-pane-text-secondary border-b border-pane-text-secondary/10">
-          {mcp.server} / {mcp.tool}
+          {displayServer} / {displayTool}
         </div>
       )}
       <div>
@@ -358,7 +453,7 @@ function ExpandedPlanInput({ input }: { input: Record<string, unknown> }) {
 }
 
 function renderExpandedInput(name: string, input: Record<string, unknown>, result?: ToolResultBlock) {
-  if (parseMcpName(name)) {
+  if (name.startsWith("pane_") || parseMcpName(name)) {
     return <ExpandedMcpInput input={input} toolName={name} />;
   }
   switch (name) {
@@ -453,15 +548,6 @@ function formatErrorContent(content: unknown): string {
 
 export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
-  const contentRef = useRef<HTMLDivElement>(null);
-
-  // Auto-scroll for expanding tool output
-  useEffect(() => {
-    if (contentRef.current && !toolResult) {
-      // While it's running/streaming
-      contentRef.current.scrollTop = contentRef.current.scrollHeight;
-    }
-  }, [toolUse.input, toolResult]);
 
   // Summary updates as parameters stream in, then stabilizes once complete
   const summary = useMemo(
@@ -487,6 +573,8 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
       const parts = toolUse.name.slice(5).split("__");
       if (parts.length >= 2) return parts.slice(1).join(" ");
     }
+    // Bare pane_* tools are always collapsed by default (quiet MCP tools)
+    if (toolUse.name.startsWith("pane_")) return toolUse.name;
     return toolUse.name;
   })();
 
@@ -532,9 +620,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
       </button>
 
       {expanded && (
-        <div
-          ref={contentRef}
-        >
+        <div>
           {renderExpandedInput(toolUse.name, toolUse.input, toolResult)}
 
           {/* Error output — clean, unified, no markdown noise */}

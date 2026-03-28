@@ -24,11 +24,11 @@ import { modelManager } from "./model-manager.mjs";
 import { startBackupSchedule } from "./backup-engine.mjs";
 import { initCloudAuth } from "./cloud-auth.mjs";
 import { registerCloudSyncHandlers } from "./cloud-sync.mjs";
-import { MindWorkers } from "./mind-workers.mjs";
+import { MindPunks } from "./mind-punks.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
-let mindWorkers = null;
+let mindPunks = null;
 // Punk engine runs in a UtilityProcess to keep the main thread free.
 // Main process is a thin relay — never touches JSON.parse or model output.
 async function registerClaudeHandlers() {
@@ -929,7 +929,7 @@ function registerWatcherHandlers() {
       if (pendingPaths.size > 0) {
         const paths = Array.from(pendingPaths);
         sendToRenderer("pane://file-changed", paths);
-        if (mindWorkers) mindWorkers.onFilesChanged(paths);
+        if (mindPunks) mindPunks.onFilesChanged(paths);
         pendingPaths = /* @__PURE__ */ new Set();
       }
       debounceTimer = null;
@@ -1455,6 +1455,50 @@ function registerStateHandlers() {
     await writeStateFile(args.projectId, "terminal.json", args.data);
   });
 
+  // Atomically appends one completed command to the shared multi-tab terminal history.
+  // Each tab calls this independently — the main process serialises writes so tabs
+  // don't overwrite each other.
+  ipcMain.handle("append_terminal_command", async (_event, { projectId, entry }) => {
+    const termPath = path.join(stateDir(projectId), "terminal.json");
+    let data = { commands: [] };
+    try {
+      const raw = await fs.promises.readFile(termPath, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed.commands)) data.commands = parsed.commands;
+    } catch {}
+    // Remove any stale partial entry for this tab (command just finished)
+    data.commands = data.commands.filter(
+      (c) => !(c.tabId === entry.tabId && c.partial === true),
+    );
+    data.commands.push(entry);
+    data.commands = data.commands.slice(-50);
+    await fs.promises.mkdir(stateDir(projectId), { recursive: true });
+    await fs.promises.writeFile(termPath, JSON.stringify(data), "utf-8");
+  });
+
+  // Upserts a live snapshot for a long-running command — replaces the previous
+  // partial entry for this tab so the model always sees recent output.
+  ipcMain.handle("update_terminal_running", async (_event, { projectId, entry }) => {
+    const termPath = path.join(stateDir(projectId), "terminal.json");
+    let data = { commands: [] };
+    try {
+      const raw = await fs.promises.readFile(termPath, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed.commands)) data.commands = parsed.commands;
+    } catch {}
+    const idx = data.commands.findIndex(
+      (c) => c.tabId === entry.tabId && c.partial === true,
+    );
+    if (idx !== -1) {
+      data.commands[idx] = entry;
+    } else {
+      data.commands.push(entry);
+      data.commands = data.commands.slice(-50);
+    }
+    await fs.promises.mkdir(stateDir(projectId), { recursive: true });
+    await fs.promises.writeFile(termPath, JSON.stringify(data), "utf-8");
+  });
+
   ipcMain.handle("write_project_state", async (_event, args) => {
     await writeStateFile(args.projectId, "project.json", args.data);
   });
@@ -1464,10 +1508,25 @@ function registerStateHandlers() {
     const MAX_FILE_SIZE = 5 * 1024 * 1024;
     const THRESHOLD_SIZE = 4 * 1024 * 1024;
 
+    // If the renderer only has a slice of the conversation (startIndex > 0),
+    // we must read the prefix from disk and prepend it so we don't lose history.
+    let messages = conversation.messages;
+    if (conversation.startIndex > 0) {
+      try {
+        const existing = JSON.parse(await fs.promises.readFile(filePath, "utf-8"));
+        const prefix = Array.isArray(existing.messages)
+          ? existing.messages.slice(0, conversation.startIndex)
+          : [];
+        messages = [...prefix, ...messages];
+      } catch {
+        // File doesn't exist yet or is corrupt — just use what the renderer has
+      }
+    }
+
     const data = {
       sessionId: conversation.sessionId,
       model: conversation.model,
-      messages: conversation.messages,
+      messages,
     };
 
     // All JSON.stringify/size-checking happens in Node.js, never the renderer.
@@ -1509,6 +1568,32 @@ function registerStateHandlers() {
     const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
     await fs.promises.writeFile(tmpPath, json, { encoding: "utf-8" });
     await fs.promises.rename(tmpPath, filePath);
+  });
+
+  // Returns a slice of a conversation file — used to load just the last N messages
+  // on startup, and to load older messages on demand. Keeps the renderer lean.
+  ipcMain.handle("get_conversation_slice", async (_event, { projectId, beforeIndex, count }) => {
+    const filePath = path.join(os.homedir(), ".pane", "conversations", `${projectId}.json`);
+    try {
+      const content = await fs.promises.readFile(filePath, "utf-8");
+      const parsed = JSON.parse(content.trim());
+      const allMessages = Array.isArray(parsed.messages) ? parsed.messages : [];
+      const totalCount = allMessages.length;
+
+      // beforeIndex undefined → initial load, take the last `count` messages
+      const end = (beforeIndex != null && beforeIndex >= 0) ? beforeIndex : totalCount;
+      const start = Math.max(0, end - count);
+
+      return {
+        messages: allMessages.slice(start, end),
+        totalCount,
+        startIndex: start,
+        sessionId: parsed.sessionId ?? null,
+        model: parsed.model ?? null,
+      };
+    } catch {
+      return { messages: [], totalCount: 0, startIndex: 0, sessionId: null, model: null };
+    }
   });
 }
 
@@ -2032,9 +2117,9 @@ function registerBrainHandlers() {
 
   ipcMain.handle("brain_mind_add", async (_event, args) => {
     const result = await brainRequest("mind_add", { content: args.content, projectId: args.projectId || null });
-    // Fire-and-forget: workers analyze new entries asynchronously
-    if (result?.entry && mindWorkers) {
-      setTimeout(() => mindWorkers.onMindEntryAdded(result.entry, args.projectId).catch(() => {}), 2000);
+    // Fire-and-forget: punks analyze new entries asynchronously
+    if (result?.entry && mindPunks) {
+      setTimeout(() => mindPunks.onMindEntryAdded(result.entry, args.projectId).catch(() => {}), 2000);
     }
     return result;
   });
@@ -2057,6 +2142,51 @@ function registerBrainHandlers() {
   ipcMain.handle('brain_mind_thread_add_turn', async (_event, args) => brainRequest('mind_thread_add_turn', {thread_id: args.threadId, role: args.role, content_json: args.contentJson}));
   ipcMain.handle('brain_mind_thread_set_session', async (_event, args) => brainRequest('mind_thread_set_session', {thread_id: args.threadId, session_id: args.sessionId}));
   ipcMain.handle('brain_mind_thread_delete', async (_event, args) => brainRequest('mind_thread_delete', {id: args.id}));
+
+  // Punk proactive trigger: fired by renderer when user opens or switches to a project
+  ipcMain.handle('punk_project_active', (_event, args) => {
+    if (mindPunks && args.projectId) {
+      mindPunks.onProjectActive(args.projectId, args.projectRoot ?? null);
+    }
+    return null;
+  });
+
+  ipcMain.handle('lens_post_add', async (_event, args) => {
+    const result = await brainRequest('lens_post_add', { contributor: args.contributor, content: args.content, projectId: args.projectId ?? null, entryId: args.entryId ?? null });
+    // Fire-and-forget: punks react to user posts
+    if (result?.post && result.post.contributor === "user" && mindPunks) {
+      setTimeout(() => mindPunks.onLensPostAdded(result.post, args.projectId ?? null).catch(() => {}), 2000);
+    }
+    return result?.post ?? null;
+  });
+
+  ipcMain.handle('lens_posts_list', async (_event, args) => {
+    const result = await brainRequest('lens_posts_list', { projectId: args.projectId ?? null });
+    return result?.posts ?? [];
+  });
+
+  ipcMain.handle('lens_comments_list', async (_event, args) => {
+    const result = await brainRequest('lens_comments_list', { postId: args.postId });
+    return result?.comments ?? [];
+  });
+
+  ipcMain.handle('lens_comment_add', async (_event, args) => {
+    const result = await brainRequest('lens_comment_add', { postId: args.postId, role: args.role, content: args.content });
+    // Fire-and-forget: owning punk replies when user comments on a punk post
+    if (result?.comment && args.role === "user" && mindPunks) {
+      brainRequest('lens_post_get', { postId: args.postId }).then((postResult) => {
+        const post = postResult?.post;
+        if (post && post.contributor !== "user") {
+          setTimeout(() => mindPunks.onLensCommentAdded(result.comment, post, post.project_id).catch(() => {}), 1000);
+        }
+      }).catch(() => {});
+    }
+    return result?.comment ?? null;
+  });
+
+  ipcMain.handle('lens_comment_set_session', async (_event, args) => {
+    await brainRequest('lens_comment_set_session', { postId: args.postId, sessionId: args.sessionId });
+  });
 
 }
 
@@ -2185,17 +2315,17 @@ app.whenReady().then(async () => {
     brainRequest("index_events", { projectId, events })
   );
 
-  // Mind workers: background intelligence that acts on thoughts
+  // Mind punks: background intelligence with personality that acts on thoughts
   // Variable is used by brain_mind_add handler declared earlier in this scope,
   // but only called at runtime after this initialization completes.
   /* eslint-disable-next-line no-use-before-define -- runtime order is safe */
-  mindWorkers = new MindWorkers({
+  mindPunks = new MindPunks({
     brainRequest,
     quickCall: (sys, usr) => punkEngine.quickCall(sys, usr),
     agentCall: (sys, prompt, workingDir) => punkEngine.agentCall(sys, prompt, workingDir),
     sendToRenderer,
   });
-  mindWorkers.start();
+  mindPunks.start();
 
   // Daily backup at midnight — silent, automatic, 7-day rotation + cloud push
   startBackupSchedule();

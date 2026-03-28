@@ -221,6 +221,11 @@ export interface PunkEventError {
   data: { message: string };
 }
 
+export interface PunkEventStatus {
+  event: "status";
+  data: { message: string | null };
+}
+
 export interface PunkEventCompactionStart {
   event: "compaction_start";
   data: { reason: string; strategy: string };
@@ -377,6 +382,7 @@ export type PunkStreamEvent = (
   | PunkEventRouting
   | PunkEventStrategy
   | PunkEventError
+  | PunkEventStatus
   | PunkEventCompactionStart
   | PunkEventCompactionComplete
   | PunkEventTodosUpdated
@@ -436,8 +442,8 @@ export interface ConversationMessage {
   checkpointId?: string;
   // Present when type === "plan"
   planData?: PlanData;
-  // Present on worker-generated turns (bug, reflection, sentinel)
-  workerType?: string;
+  // Present on punk-generated turns (bug, reflection, sentinel)
+  punkType?: string;
 }
 
 // File checkpoint types
@@ -484,6 +490,9 @@ export interface ConversationState {
   lastCompactionAt: number | null;
   compactionCount: number;
   tokensSaved: number;
+  // Pagination — how much history is on disk vs. loaded in memory
+  historyTotalCount: number; // Total messages in the conversation file
+  historyStartIndex: number; // Index of the first loaded message (0 = all loaded)
 }
 
 // Memory event types for automatic extraction
@@ -526,5 +535,7 @@ export function createEmptyConversation(): ConversationState {
     lastCompactionAt: null,
     compactionCount: 0,
     tokensSaved: 0,
+    historyTotalCount: 0,
+    historyStartIndex: 0,
   };
 }

@@ -83,6 +83,10 @@ export const MODEL_CONTEXT_LIMITS = {
   "deepseek/deepseek-chat": 128000,
   "qwen/qwen3-coder": 262144,
   "qwen/qwen3-coder:free": 262144,
+  // Native StepFun model IDs (direct API, not via OpenRouter)
+  "step-3.5-flash": 256000,
+  "step-2-mini": 32000,
+  // OpenRouter-wrapped StepFun
   "stepfun/step-3.5-flash:free": 128000,
   "meta-llama/llama-3.3-70b-instruct:free": 128000,
   "nousresearch/hermes-3-llama-3.1-405b:free": 128000,
@@ -123,6 +127,8 @@ export function getContextLimit(model) {
     "arcee-ai/trinity-mini",
     "openai/gpt-oss-120b",
     "z-ai/glm-4.5-air",
+    "step-3.5-flash",
+    "step-2-mini",
     "stepfun/step-3.5-flash",
     "meta-llama/llama-3.3",
     "nousresearch/hermes-3",
@@ -356,7 +362,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     "→ pane_knowledge_graph — structural connections between decisions: what depends on what",
     "→ pane_cross_project — has this exact problem been solved in another project?",
     "→ pane_open_files — full content of the file currently open (not just the working set preview)",
-    "→ pane_recent_terminal — full terminal history beyond the recentActions already in context",
+    "→ pane_recent_terminal — the user's terminal is shared; read it first whenever they mention an error, server output, logs, or any running process — before asking them for anything",
     "→ pane_synthesize — deeper architectural narrative than the DNA section already injected",
     "→ pane_run_in_terminal — execute: builds, tests, git, verification",
     "→ pane_remember / pane_set_rule / pane_set_why — persist discoveries (mandatory, not optional)",
@@ -366,12 +372,13 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     "**Task playbooks**",
     "",
     "Bug investigation:",
-    "1. Check injected memories and working set — has this been seen before?",
-    "2. pane_recall if not in context — prior encounters, known fixes",
-    "3. pane_find_symbol — locate the exact function or component, do not grep by name",
-    "4. Read — only the specific section, not the whole file",
-    "5. pane_run_in_terminal — reproduce it; confirm the fix",
-    "6. pane_remember(error_fix) — root cause and fix; future sessions must not re-investigate",
+    "1. pane_recent_terminal — read the terminal first; errors, stack traces, and server output are already there",
+    "2. Check injected memories and working set — has this been seen before?",
+    "3. pane_recall if not in context — prior encounters, known fixes",
+    "4. pane_find_symbol — locate the exact function or component, do not grep by name",
+    "5. Read — only the specific section, not the whole file",
+    "6. pane_run_in_terminal — reproduce it; confirm the fix",
+    "7. pane_remember(error_fix) — root cause and fix; future sessions must not re-investigate",
     "",
     "Feature work:",
     "1. Read injected DNA and principles — understand constraints before designing",
@@ -413,6 +420,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     "- Never use Glob to explore file structure. The codebase map is already in your context.",
     "- Never read a file from the working set — it is already pre-loaded.",
     "- Never speculate about whether a build or test passes. Run it.",
+    "- Never ask the user to paste logs, copy terminal output, open the browser console, or run a command for you. The terminal is shared — use pane_recent_terminal to read what is already there, then pane_run_in_terminal if you need to run something new.",
     "- Never end a session where root causes, decisions, or new patterns were found without persisting them.",
     "",
   );
@@ -725,6 +733,58 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     dynamicParts.push("Active project standards (extracted from how you work on this project — apply when relevant):");
     for (const p of principles) dynamicParts.push(`- ${p.content}`);
     dynamicParts.push("");
+  }
+
+  // ── Escalation behavior contract (heuristic router stages 2-4) ─────────
+  // When the heuristic router detected consecutive failures and escalated,
+  // inject mandatory behavior changes into the dynamic context so the model
+  // follows the escalation protocol regardless of backend.
+  if (contextShape?.escalationStage >= 2) {
+    const stage = contextShape.escalationStage;
+    dynamicParts.push("⚠ ESCALATION ACTIVE — mandatory behavioral contract:");
+    dynamicParts.push("");
+
+    if (stage >= 2) {
+      dynamicParts.push("STAGE 2 — EXPLORE FIRST:");
+      dynamicParts.push("- You MUST read relevant files BEFORE implementing anything.");
+      dynamicParts.push("- Find patterns in the codebase that inform your approach.");
+      dynamicParts.push("- State what you found and what you'll do differently.");
+      dynamicParts.push("- Previous approach failed — do not retry the same strategy.");
+      dynamicParts.push("");
+    }
+
+    if (stage >= 3) {
+      dynamicParts.push("STAGE 3 — WEB SEARCH + EXPLORE:");
+      dynamicParts.push("- Search the web for docs, error messages, and similar issues.");
+      dynamicParts.push("- State what you found from the web search.");
+      dynamicParts.push("- THEN explore the codebase with fresh eyes.");
+      dynamicParts.push("- Only implement after both web and codebase research.");
+      dynamicParts.push("");
+    }
+
+    if (stage >= 4) {
+      dynamicParts.push("STAGE 4 — FULL RESET:");
+      dynamicParts.push("- Abandon ALL assumptions from previous attempts.");
+      dynamicParts.push("- Read every relevant file as if you've never seen this codebase.");
+      dynamicParts.push("- Search the web for documentation and known issues.");
+      dynamicParts.push("- Decompose the problem into sub-problems.");
+      dynamicParts.push("- Solve only the failing sub-problem, verify, then integrate.");
+      dynamicParts.push("");
+    }
+
+    if (contextShape?.preActions?.length > 0) {
+      dynamicParts.push("Pre-actions you must complete before implementing:");
+      for (const action of contextShape.preActions) {
+        if (action.type === "explore_codebase") {
+          dynamicParts.push(`- Explore codebase for: "${action.query}"${action.deep ? " (deep — read ALL relevant files)" : ""}`);
+        } else if (action.type === "web_search") {
+          dynamicParts.push(`- Web search for: ${(action.queries || []).join(", ")}`);
+        } else if (action.type === "clean_slate") {
+          dynamicParts.push("- Start with zero assumptions from previous context");
+        }
+      }
+      dynamicParts.push("");
+    }
   }
 
   // Mind entries: active thoughts from the user's Mind

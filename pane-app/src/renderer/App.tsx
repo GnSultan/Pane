@@ -1,5 +1,5 @@
 import { useEffect, useCallback } from "react";
-import { setWindowTitle, destroyPty } from "./lib/tauri-commands";
+import { setWindowTitle, destroyPty, punkProjectActive } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ControlPanel } from "./components/ControlPanel/ControlPanel";
 import { Workspace } from "./components/Workspace/Workspace";
@@ -82,6 +82,14 @@ function App() {
       : undefined;
     const title = project ? `${project.name} — Pane` : "Pane";
     setWindowTitle(title).catch(console.error);
+  }, [activeProjectId]);
+
+  // Notify punks when the user opens or switches to a project so they can
+  // schedule proactive Lens activity (respects per-punk 6-hour cooldowns).
+  useEffect(() => {
+    if (!activeProjectId) return;
+    const project = useProjectsStore.getState().projects.get(activeProjectId);
+    punkProjectActive(activeProjectId, project?.root ?? null).catch(() => {});
   }, [activeProjectId]);
 
   useEffect(() => {

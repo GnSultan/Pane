@@ -4,10 +4,8 @@ import {
   brainMindGetAll,
   brainMindDelete,
   brainMindUpdate,
-  mindThreadListEntryIds,
   type MindEntry,
 } from "../../lib/tauri-commands";
-import { MindChat } from "./MindChat";
 import { useProjectsStore } from "../../stores/projects";
 import { useMindStore } from "../../stores/mind";
 import { measureCaretPos } from "../../lib/measure-caret";
@@ -41,7 +39,6 @@ function EntryItem({
   onCancelEdit,
   onToggleComplete,
   onDelete,
-  onChat,
 }: {
   entry: MindEntry;
   isEditing: boolean;
@@ -51,7 +48,6 @@ function EntryItem({
   onCancelEdit: () => void;
   onToggleComplete: () => void;
   onDelete: () => void;
-  onChat?: () => void;
 }) {
   const [editValue, setEditValue] = useState(entry.content);
   const editRef = useRef<HTMLTextAreaElement>(null);
@@ -337,15 +333,6 @@ function EntryItem({
               >
                 {confirmDelete ? "confirm?" : "delete"}
               </button>
-              {onChat && (
-                <button
-                  onClick={(e) => { e.stopPropagation(); onChat(); }}
-                  className="font-mono text-pane-text-secondary/40 hover:text-pane-terminal hover:!opacity-100 transition-colors"
-                  style={{ fontSize: "10px" }}
-                >
-                  think
-                </button>
-              )}
             </div>
           </div>
         </div>
@@ -370,7 +357,6 @@ export function Mind() {
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [textareaFocused, setTextareaFocused] = useState(false);
-  const [showFreeformChat, setShowFreeformChat] = useState(false);
   const [caretPos, setCaretPos] = useState<{
     top: number;
     left: number;
@@ -381,17 +367,8 @@ export function Mind() {
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSaveRef = useRef<Promise<void> | null>(null);
 
-  const chatEntryId = useMindStore((s) => s.chatEntryId);
-  const setChatEntryId = useMindStore((s) => s.setChatEntryId);
-  const chatEntry = chatEntryId ? entries.find((e) => e.id === chatEntryId) : null;
-  const setThreadEntryIds = useMindStore((s) => s.setThreadEntryIds);
   const unreadThreadEntryIds = useMindStore((s) => s.unreadThreadEntryIds);
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
-  const activeProjectRoot = useProjectsStore((s) => {
-    const pid = s.activeProjectId;
-    return pid ? s.projects.get(pid)?.root : undefined;
-  });
-  const workingDir = activeProjectRoot || "";
 
   // Load entries once
   useEffect(() => {
@@ -400,28 +377,16 @@ export function Mind() {
       .then((result) => {
         setEntries(result.entries ?? []);
         setLoaded(true);
-        mindThreadListEntryIds().then(({ entryIds }) => setThreadEntryIds(new Set(entryIds))).catch(() => {});
       })
       .catch(() => setLoaded(true));
-  }, [loaded, setEntries, setLoaded, setThreadEntryIds]);
+  }, [loaded, setEntries, setLoaded]);
 
-  // Refresh threadEntryIds when chatEntryId changes (a new thread may be created)
-  useEffect(() => {
-    if (chatEntryId === null) return;
-    mindThreadListEntryIds().then(({ entryIds }) => setThreadEntryIds(new Set(entryIds))).catch(() => {});
-  }, [chatEntryId]);
-
-  // Listen for worker-finding events — refresh thread list and entry list when Mind is visible
+  // Listen for punk-finding events — reload entry list when sentinel creates new entries
   useEffect(() => {
     const electronAPI = (window as any).electronAPI;
     const unlisten = electronAPI.on(
-      "pane://worker-finding",
-      (data: { entryId?: string; workerType?: string; projectId?: string }) => {
-        if (data?.entryId) {
-          mindThreadListEntryIds()
-            .then(({ entryIds }) => setThreadEntryIds(new Set(entryIds)))
-            .catch(() => {});
-        }
+      "pane://punk-finding",
+      (data: { entryId?: string; punkType?: string; projectId?: string }) => {
         if (data?.projectId && !data?.entryId) {
           // Sentinel created new mind entries — reload the full entry list
           brainMindGetAll()
@@ -431,7 +396,7 @@ export function Mind() {
       }
     );
     return () => unlisten();
-  }, [setThreadEntryIds, setEntries]);
+  }, [setEntries]);
 
   // Update static caret position
   const updateCaret = useCallback(() => {
@@ -557,13 +522,6 @@ export function Mind() {
     }
   };
 
-  const findingsEntries = entries
-    .filter((e) => unreadThreadEntryIds.has(e.id))
-    .sort(
-      (a, b) =>
-        new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
-    );
-
   const activeEntries = entries
     .filter((e) => !e.completed)
     .sort(
@@ -584,7 +542,7 @@ export function Mind() {
   return (
     <div className="h-full relative">
       {/* Scrollable list view */}
-      <div className={`absolute inset-0 overflow-y-auto overflow-x-hidden custom-scrollbar ${chatEntryId && chatEntry ? 'invisible pointer-events-none' : ''}`}>
+      <div className="absolute inset-0 overflow-y-auto overflow-x-hidden custom-scrollbar">
         <div className="max-w-[780px] mx-auto w-full px-10 pt-[35vh] pb-48">
           {/* ── Compose zone ── */}
           <div
@@ -652,16 +610,6 @@ export function Mind() {
               <div className="flex items-center gap-2">
                 <button
                   onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => setShowFreeformChat(true)}
-                  disabled={!hasContent}
-                  className="font-mono text-pane-text-secondary/50 hover:text-pane-text transition-colors disabled:opacity-0"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  title="Open chat with this thought"
-                >
-                  chat
-                </button>
-                <button
-                  onMouseDown={(e) => e.preventDefault()}
                   onClick={handleSaveClick}
                   disabled={!hasContent || saveStatus === "saving"}
                   className="font-mono text-pane-text-secondary/50 hover:text-pane-text transition-colors disabled:opacity-0"
@@ -672,50 +620,6 @@ export function Mind() {
               </div>
             </div>
           </div>
-
-          {/* ── Findings strip — worker results not yet opened ── */}
-          {loaded && findingsEntries.length > 0 && (
-            <div className="mb-8">
-              <div className="mb-3">
-                <span
-                  className="font-mono uppercase tracking-wider"
-                  style={{ fontSize: "10px", color: "var(--pane-terminal)", opacity: 0.7 }}
-                >
-                  {findingsEntries.length} {findingsEntries.length === 1 ? "finding" : "findings"}
-                </span>
-              </div>
-              {findingsEntries.map((entry) => (
-                <button
-                  key={entry.id}
-                  onClick={() => setChatEntryId(entry.id)}
-                  className="w-full flex items-center gap-2.5 py-1.5 text-left group"
-                >
-                  <span
-                    className="w-1.5 h-1.5 rounded-full shrink-0"
-                    style={{ background: "var(--pane-terminal)" }}
-                  />
-                  <span
-                    className="font-mono shrink-0"
-                    style={{ fontSize: "10px", color: "var(--pane-terminal)", opacity: 0.8 }}
-                  >
-                    {unreadThreadEntryIds.get(entry.id) ?? "finding"}
-                  </span>
-                  <span
-                    className="font-mono text-pane-text-secondary/40 shrink-0"
-                    style={{ fontSize: "10px" }}
-                  >
-                    —
-                  </span>
-                  <span
-                    className="font-mono text-pane-text-secondary/60 group-hover:text-pane-text-secondary truncate transition-colors"
-                    style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  >
-                    {(entry.content.split("\n")[0] ?? "").slice(0, 80) || "untitled thought"}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
 
           {/* ── Entries — grouped by status ── */}
           {loaded && (
@@ -745,7 +649,6 @@ export function Mind() {
                         handleToggleComplete(entry.id, !!entry.completed)
                       }
                       onDelete={() => handleDelete(entry.id)}
-                      onChat={() => setChatEntryId(entry.id)}
                     />
                   ))}
                 </div>
@@ -776,7 +679,6 @@ export function Mind() {
                         handleToggleComplete(entry.id, !!entry.completed)
                       }
                       onDelete={() => handleDelete(entry.id)}
-                      onChat={() => setChatEntryId(entry.id)}
                     />
                   ))}
                 </div>
@@ -797,28 +699,6 @@ export function Mind() {
         </div>
       </div>
 
-      {/* Chat overlay — absolute inset-0 ensures it always fills full height */}
-      {/* Rendered as an overlay so scroll state of list never affects it */}
-      {(chatEntryId || showFreeformChat) && (chatEntryId ? chatEntry : true) && (
-        <div className="absolute inset-0">
-          {showFreeformChat ? (
-            <MindChat
-              entryId="freeform"
-              workingDir={workingDir}
-              onClose={() => setShowFreeformChat(false)}
-              isFreeform={true}
-            />
-          ) : (
-            <MindChat
-              entryId={chatEntryId}
-              entryContent={chatEntry?.content}
-              workingDir={workingDir}
-              onClose={() => setChatEntryId(null)}
-              isFreeform={false}
-            />
-          )}
-        </div>
-      )}
     </div>
   );
 }

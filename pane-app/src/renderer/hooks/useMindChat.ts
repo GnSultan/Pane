@@ -6,21 +6,19 @@ import {
   mindThreadCreate,
   mindThreadAddTurn,
   mindThreadSetSession,
-  sendToPunk,
+  sendToMind,
   abortPunk,
   extractPreferencesFromTurn,
   brainIndexEvents,
   recordMemoryEvents,
 } from '../lib/tauri-commands';
+import { useWorkspaceStore } from '../stores/workspace';
 
 function nextId(): string {
   // crypto.randomUUID() is immune to HMR counter resets and never duplicates,
   // even when called inside React state updaters (StrictMode double-invocation safe)
   return 'mind-' + crypto.randomUUID();
 }
-
-const MIND_SYSTEM_PROMPT =
-  'You are a thinking partner inside Pane Mind. You help the user think through ideas by exploring code, finding relevant patterns, and offering analysis. You can read files and search the codebase but CANNOT write, edit, or execute anything. Be concise and direct. No emojis.\n\nThe thought being explored:\n';
 
 // ─── rAF-batched text flush (mirrors usePunk.ts flushTextDelta) ────────────
 
@@ -161,23 +159,22 @@ export function useMindChat(
       }
 
       const threadId = threadIdRef.current!;
-      const projectId = 'mind:' + threadId;
       const key = streamKey.current;
 
-      // If there's no active session but we have worker-generated turns,
-      // include the last worker analysis so the model has context
+      // If there's no active session but we have punk-generated turns,
+      // include the last punk analysis so the model has context
       let effectivePrompt = prompt;
       if (!sessionIdRef.current && messages.length > 0) {
-        const lastWorkerMsg = [...messages].reverse().find(
-          (m) => m.type === 'assistant' && m.workerType
+        const lastPunkMsg = [...messages].reverse().find(
+          (m) => m.type === 'assistant' && m.punkType
         );
-        if (lastWorkerMsg) {
-          const workerText = lastWorkerMsg.content
+        if (lastPunkMsg) {
+          const punkText = lastPunkMsg.content
             .filter((b): b is TextBlock => b.type === 'text')
             .map((b) => b.text)
             .join('\n');
-          if (workerText) {
-            effectivePrompt = `Previous analysis by Pane (${lastWorkerMsg.workerType}):\n${workerText}\n\nFollow-up:\n${prompt}`;
+          if (punkText) {
+            effectivePrompt = `Previous analysis by Pane (${lastPunkMsg.punkType}):\n${punkText}\n\nFollow-up:\n${prompt}`;
           }
         }
       }
@@ -199,7 +196,7 @@ export function useMindChat(
       // Track whether an assistant message is being streamed in this turn
       let assistantMsgId = '';
       // Track turn text for memory extraction on processEnded
-      let turnUserText = prompt;
+      const turnUserText = prompt;
       let turnAssistantText = '';
 
       // rAF text flush — appends full buffered text to the last assistant message.
@@ -492,23 +489,24 @@ export function useMindChat(
         }
       };
 
+      const selectedModel = useWorkspaceStore.getState().selectedModel;
+      const selectedModelProvider = useWorkspaceStore.getState().selectedModelProvider;
+      const selectedModelThinking = useWorkspaceStore.getState().selectedModelThinking ?? false;
+
       try {
-        await sendToPunk(
-          projectId,
+        await sendToMind(
+          threadId,
           effectivePrompt,
           workingDir,
           sessionIdRef.current,
-          null,
-          handleEvent,
-          {
-            systemPromptOverride: MIND_SYSTEM_PROMPT + (entryContent || '(no thought content)'),
-            _systemOverride: true,
-            tools: ['Read', 'Glob', 'Grep'],
-            maxTurns: 15,
-          }
+          selectedModel,
+          selectedModelProvider,
+          selectedModelThinking,
+          entryContent || '(no thought content)',
+          handleEvent
         );
       } catch (err) {
-        console.error('[mind] sendToPunk failed:', err);
+        console.error('[mind] sendToMind failed:', err);
         setError(err instanceof Error ? err.message : 'Failed to send message');
         setIsProcessing(false);
       }
@@ -529,9 +527,8 @@ export function useMindChat(
     sendMessage(prompt).catch((err) => {
       setError(err instanceof Error ? err.message : 'Failed to start');
     });
-  // sendMessage intentionally omitted — stable per entryId, don't want re-fires
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entryId, threadLoaded, entryContent]);
+  // sendMessage is a stable useCallback per entryId
+  }, [entryId, threadLoaded, entryContent, sendMessage]);
 
   const abortMessage = useCallback(() => {
     if (threadIdRef.current) {

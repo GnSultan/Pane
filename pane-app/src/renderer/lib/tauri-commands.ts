@@ -42,9 +42,23 @@ export async function saveScrollPositions(
 
 export async function saveConversationToMain(
   filePath: string,
-  conversation: { sessionId: string | null; model?: string | null; messages: unknown[] },
+  conversation: { sessionId: string | null; model?: string | null; messages: unknown[]; startIndex?: number },
 ): Promise<void> {
   return electronAPI.invoke("save_conversation", { filePath, conversation });
+}
+
+export async function getConversationSlice(
+  projectId: string,
+  count: number,
+  beforeIndex?: number,
+): Promise<{
+  messages: unknown[];
+  totalCount: number;
+  startIndex: number;
+  sessionId: string | null;
+  model: string | null;
+}> {
+  return electronAPI.invoke("get_conversation_slice", { projectId, count, beforeIndex });
 }
 
 export async function getHomeDir(): Promise<string> {
@@ -684,6 +698,32 @@ export async function writeTerminalState(
   return electronAPI.invoke("write_terminal_state", { projectId, data });
 }
 
+export interface TerminalCommandEntry {
+  cmd: string;
+  output: string;
+  cwd: string;
+  timestamp: number;
+  tabId: string;
+  tabTitle: string;
+  partial?: boolean;
+}
+
+/** Atomically appends one completed command to the shared terminal history (all tabs merged). */
+export async function appendTerminalCommand(
+  projectId: string,
+  entry: TerminalCommandEntry,
+): Promise<void> {
+  return electronAPI.invoke("append_terminal_command", { projectId, entry });
+}
+
+/** Upserts a live "partial" snapshot for a long-running command (replaces previous partial for this tab). */
+export async function updateTerminalRunning(
+  projectId: string,
+  entry: TerminalCommandEntry & { partial: true },
+): Promise<void> {
+  return electronAPI.invoke("update_terminal_running", { projectId, entry });
+}
+
 export async function writeProjectState(
   projectId: string,
   data: ProjectState,
@@ -971,12 +1011,155 @@ export async function mindThreadDelete(id: string): Promise<{ id: string }> {
   return electronAPI.invoke("brain_mind_thread_delete", { id });
 }
 
+// --- Lens ---
+
+export interface LensPost {
+  id: string;
+  contributor: "user" | "bug" | "reflection" | "sentinel";
+  content: string;
+  project_id: string | null;
+  entry_id: string | null;
+  created_at: string;
+  comment_count?: number;
+}
+
+export async function lensPostAdd(
+  contributor: LensPost["contributor"],
+  content: string,
+  projectId: string | null,
+  entryId?: string | null,
+): Promise<LensPost> {
+  return electronAPI.invoke("lens_post_add", { contributor, content, projectId, entryId: entryId ?? null });
+}
+
+export async function lensPostsList(projectId: string): Promise<LensPost[]> {
+  return electronAPI.invoke("lens_posts_list", { projectId });
+}
+
+// Notify punks that the user has opened or switched to a project.
+// Fire-and-forget — punks schedule proactive work with a delay.
+export async function punkProjectActive(projectId: string, projectRoot: string | null = null): Promise<void> {
+  return electronAPI.invoke("punk_project_active", { projectId, projectRoot });
+}
+
+export interface LensComment {
+  id: string;
+  post_id: string;
+  role: string;
+  content: string;
+  session_id: string | null;
+  timestamp: string;
+}
+
+export async function lensCommentsList(postId: string): Promise<LensComment[]> {
+  return electronAPI.invoke("lens_comments_list", { postId });
+}
+
+export async function lensCommentAdd(postId: string, role: string, content: string): Promise<LensComment> {
+  return electronAPI.invoke("lens_comment_add", { postId, role, content });
+}
+
+export async function lensCommentSetSession(postId: string, sessionId: string): Promise<void> {
+  return electronAPI.invoke("lens_comment_set_session", { postId, sessionId });
+}
+
+export async function abortLens(postId: string): Promise<void> {
+  return electronAPI.invoke("abort_lens", { postId });
+}
+
+export async function sendToLens(
+  postId: string,
+  prompt: string,
+  workingDir: string,
+  sessionId: string | null,
+  model: string | null,
+  provider: string | null,
+  thinking: boolean,
+  postContent: string,
+  onEvent: (event: PunkStreamEvent) => void,
+): Promise<void> {
+  const requestId = Math.random().toString(36).slice(2, 11);
+  let cleanup: (() => void) | null = null;
+
+  const closeListener = () => {
+    draining = false;
+    port1.close();
+    port2.close();
+    setTimeout(() => cleanup?.(), 0);
+  };
+
+  const queue: PunkStreamEvent[] = [];
+  let draining = false;
+  const { port1, port2 } = new MessageChannel();
+
+  port2.onmessage = () => {
+    if (queue.length === 0) {
+      draining = false;
+      return;
+    }
+
+    const BUDGET_MS = 4;
+    const deadline = performance.now() + BUDGET_MS;
+
+    while (queue.length > 0) {
+      const event = queue.shift()!;
+      onEvent(event);
+
+      const isTerminal =
+        event.event === "error" || event.event === "processEnded";
+
+      if (isTerminal) {
+        closeListener();
+        return;
+      }
+
+      if (performance.now() >= deadline) break;
+    }
+
+    if (queue.length > 0) port1.postMessage(null);
+    else draining = false;
+  };
+
+  cleanup = electronAPI.on(
+    `punk-stream:lens:${postId}`,
+    (event: PunkStreamEvent) => {
+      if (event.requestId && event.requestId !== requestId) return;
+      queue.push(event);
+      if (!draining) {
+        draining = true;
+        port1.postMessage(null);
+      }
+    },
+  );
+
+  try {
+    await electronAPI.invoke("send_to_lens", {
+      postId,
+      prompt,
+      workingDir,
+      sessionId,
+      model,
+      provider,
+      thinking,
+      requestId,
+      postContent,
+    });
+  } catch (err) {
+    port1.close();
+    port2.close();
+    cleanup?.();
+    throw err;
+  }
+}
+
 export async function sendToMind(
   threadId: string,
   prompt: string,
   workingDir: string,
   sessionId: string | null,
   model: string | null,
+  provider: string | null,
+  thinking: boolean,
   entryContent: string,
   onEvent: (event: PunkStreamEvent) => void,
 ): Promise<void> {
@@ -1041,6 +1224,8 @@ export async function sendToMind(
       workingDir,
       sessionId,
       model,
+      provider,
+      thinking,
       requestId,
       entryContent,
     });

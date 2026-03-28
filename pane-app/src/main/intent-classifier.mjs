@@ -145,17 +145,18 @@ Key signals for "direct":
 - Working set has 1-2 files
 
 Routing guidelines — follow these tiers strictly, do NOT default to the highest-capability model:
-- "discuss" / "quick-answer" / "conversation": always pick the cheapest capable model (haiku tier or equivalent).
+- "discuss" / "quick-answer" / "conversation": always pick the cheapest capable model (flash/haiku tier or equivalent).
 - "direct" + complexity=low: cheapest capable model.
-- "direct" + complexity=medium: mid-tier model (sonnet tier or equivalent). Do NOT use the frontier model.
+- "direct" + complexity=medium: mid-tier model (v3/sonnet tier or equivalent). Do NOT use the frontier model.
 - "direct" + complexity=high: mid-tier model is still preferred unless the task clearly requires frontier reasoning (e.g. deep algorithmic debugging, novel architecture). Frontier model is the exception, not the default.
-- "orchestrate" + complexity=low/medium: sonnet tier for both planning and execution.
-- "orchestrate" + complexity=high: frontier model for planning only, sonnet tier for execution. Do NOT use frontier for both.
+- "orchestrate" + complexity=low/medium: mid-tier model for both planning and execution.
+- "orchestrate" + complexity=high: frontier model for planning only, mid-tier model for execution. Do NOT use frontier for both.
 - Only use frontier model for execution when: complexity=high AND mode=orchestrate AND the task is genuinely novel/architectural. Never for routine implement/refactor/debug.
 - When struggle_count >= 2: escalate planning model one tier up.
 - When struggle_count >= 3: require reasoning="deep" and pick the frontier model unconditionally.
 - Prefer models with real performance data over benchmark-only models when available.
 - If only one provider is available, pick models from that provider. Don't hallucinate models.
+- Prioritize suitable models from the user's currently selected provider if specified.
 
 Discovery: true if the task scope is unclear and needs codebase exploration before planning. false if recent conversation already established the scope or there are pending todos to continue.
 Reasoning: "deep" for architecture/debugging/complex tasks, "shallow" for simple changes/quick answers.
@@ -227,6 +228,11 @@ Output valid JSON only. No explanation outside the JSON.`;
   // Project DNA
   if (input.projectDNA) {
     ctx.push(`Project DNA: ${input.projectDNA}`);
+  }
+
+  // Preferred provider
+  if (input.preferredProvider) {
+    ctx.push(`User's currently selected provider: ${input.preferredProvider}`);
   }
 
   // Struggle signal — consecutive failing turns

@@ -4,6 +4,7 @@ import { usePunk } from "../../hooks/usePunk";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
+import { getConversationSlice, readFile } from "../../lib/tauri-commands";
 import type {
   ConversationMessage,
   ToolResultBlock,
@@ -80,6 +81,41 @@ export const Conversation = memo(function Conversation({
   const error = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.error ?? null,
   );
+  const historyStartIndex = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.historyStartIndex ?? 0,
+  );
+  const hasOlderMessages = historyStartIndex > 0;
+
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+
+  const handleLoadOlder = useCallback(async () => {
+    if (!projectId || isLoadingOlder || !hasOlderMessages) return;
+    setIsLoadingOlder(true);
+    try {
+      const slice = await getConversationSlice(projectId, 30, historyStartIndex);
+      if (slice.messages.length > 0) {
+        // Preserve scroll position: capture distance from top before prepend
+        const container = scrollRef.current;
+        const scrollHeightBefore = container?.scrollHeight ?? 0;
+        useProjectsStore.getState().prependOlderMessages(
+          projectId,
+          slice.messages as ConversationMessage[],
+          slice.startIndex,
+        );
+        // After React re-renders, restore relative scroll position
+        requestAnimationFrame(() => {
+          if (container) {
+            const added = container.scrollHeight - scrollHeightBefore;
+            container.scrollTop += added;
+          }
+        });
+      }
+    } catch (err) {
+      console.error("[conversation] failed to load older messages:", err);
+    } finally {
+      setIsLoadingOlder(false);
+    }
+  }, [projectId, isLoadingOlder, hasOlderMessages, historyStartIndex]);
 
   // toolResultMap: only recompute when the count of system messages changes,
   // not on every text delta. Text deltas only touch the last assistant message.
@@ -102,8 +138,7 @@ export const Conversation = memo(function Conversation({
       }
     }
     return map;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [systemMessageCount]);
+  }, [messages, systemMessageCount]);
 
   const { sendMessage, abortMessage } = usePunk(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -203,6 +238,26 @@ export const Conversation = memo(function Conversation({
     return () => window.removeEventListener("pane:send-message", handler);
   }, [projectId, handleSend]);
 
+  // Open file paths clicked in conversation messages
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { path, projectId: targetId } = (e as CustomEvent).detail;
+      if (targetId !== projectId || !path) return;
+      const store = useProjectsStore.getState();
+      const root = store.projects.get(projectId)?.root ?? "";
+      // Resolve relative paths against project root
+      const resolved =
+        path.startsWith("/") || path.startsWith("~")
+          ? path
+          : `${root}/${path.replace(/^\.\//, "")}`;
+      readFile(resolved)
+        .then((content) => store.openFile(projectId, resolved, content))
+        .catch(() => {}); // file might not exist — silently ignore
+    };
+    window.addEventListener("pane:open-path", handler);
+    return () => window.removeEventListener("pane:open-path", handler);
+  }, [projectId]);
+
   return (
     <div className="relative h-full w-full">
       <div
@@ -211,7 +266,19 @@ export const Conversation = memo(function Conversation({
         data-conv-scroll
         data-no-drag
       >
-        {messages.length === 0 && (
+        {hasOlderMessages && (
+          <div className="flex justify-center py-3">
+            <button
+              onClick={handleLoadOlder}
+              disabled={isLoadingOlder}
+              className="font-mono text-[10px] text-[var(--pane-terminal)] opacity-60 hover:opacity-100 disabled:opacity-30 transition-opacity"
+            >
+              {isLoadingOlder ? "loading..." : "load older messages"}
+            </button>
+          </div>
+        )}
+
+        {messages.length === 0 && !hasOlderMessages && (
           <div className="flex items-center justify-center h-full select-none">
             <span
               className="text-pane-text-secondary/40 font-mono tracking-[0.25em] uppercase"
@@ -241,21 +308,25 @@ export const Conversation = memo(function Conversation({
         </div>
       )}
 
-      {visibleError && (
-        <div className="absolute bottom-32 left-1/2 -translate-x-1/2 z-40 w-[min(480px,80%)]">
-          <div className="flex items-start gap-3 font-mono text-[10px] text-pane-error bg-pane-bg/90 backdrop-blur-md ring-1 ring-pane-border/40 px-3 py-2 rounded-lg animate-fade-in leading-[1.6]">
-            <span className="break-words flex-1">{visibleError}</span>
-            <button
-              onClick={() => setVisibleError(null)}
-              className="shrink-0 text-pane-text-secondary/40 hover:text-pane-text-secondary transition-colors mt-px"
-            >
-              ×
-            </button>
+      <div className="absolute bottom-0 left-0 right-0 z-30 flex flex-col">
+        {visibleError && (
+          <div className="px-4 pb-2">
+            <div className="flex items-start gap-3 font-mono text-[11px] text-pane-error bg-pane-bg ring-1 ring-pane-error/25 px-4 py-3 rounded-xl animate-fade-in leading-[1.6]">
+              <span
+                className="flex-1 overflow-y-auto max-h-[100px]"
+                style={{ overflowWrap: "anywhere" }}
+              >
+                {visibleError}
+              </span>
+              <button
+                onClick={() => setVisibleError(null)}
+                className="shrink-0 text-pane-error hover:text-pane-error/60 transition-colors text-base leading-none mt-0.5"
+              >
+                ×
+              </button>
+            </div>
           </div>
-        </div>
-      )}
-
-      <div className="absolute bottom-0 left-0 right-0 z-30">
+        )}
         <InputBar
           projectId={projectId}
           onSend={handleSend}

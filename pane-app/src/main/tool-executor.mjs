@@ -906,13 +906,32 @@ export class ToolExecutor {
         case "pane_recent_terminal": {
           const data = await readJson(path.join(stateDir, "terminal.json"));
           if (!data?.commands?.length) return { success: true, output: "No terminal history.", toolId };
-          const cmds = data.commands.slice(-20);
+          const cmds = data.commands.slice(-50);
+
+          // Show tab labels when more than one source is present
+          const sources = new Set(cmds.map(c => c.tabId || c.source || "terminal"));
+          const needsLabels = sources.size > 1;
+
           const out = cmds.map(c => {
-            const output = c.output?.length > 1000
-              ? c.output.slice(0, 1000) + "\n... (truncated)"
-              : c.output || "(no output)";
-            return `$ ${c.cmd}\n${output}`;
+            // Tail of output — most useful for servers where latest lines matter most
+            const raw = c.output || "(no output)";
+            const output = raw.length > 1000 ? "...\n" + raw.slice(-1000) : raw;
+            const runningMark = c.partial ? " (running)" : "";
+
+            let prefix = "";
+            if (needsLabels) {
+              if (c.source === "claude" || c.tabId === "claude") {
+                prefix = "[claude] ";
+              } else if (c.tabTitle) {
+                prefix = `[${c.tabTitle}] `;
+              } else if (c.tabId) {
+                prefix = "[terminal] ";
+              }
+            }
+
+            return `${prefix}$ ${c.cmd}${runningMark}\n${output}`;
           }).join("\n\n");
+
           return { success: true, output: out, toolId };
         }
 
@@ -926,9 +945,16 @@ export class ToolExecutor {
             let termData = null;
             try { termData = JSON.parse(await fsPromises.readFile(termPath, "utf-8")); } catch {}
             const commands = Array.isArray(termData?.commands) ? termData.commands : [];
-            commands.push({ cmd: command, output: result.output || result.error || "", timestamp: Date.now(), source: "claude" });
+            commands.push({
+              cmd: command,
+              output: result.output || result.error || "",
+              timestamp: Date.now(),
+              tabId: "claude",
+              tabTitle: "claude",
+              source: "claude",
+            });
             await fsPromises.mkdir(stateDir, { recursive: true });
-            await fsPromises.writeFile(termPath, JSON.stringify({ commands: commands.slice(-20) }));
+            await fsPromises.writeFile(termPath, JSON.stringify({ commands: commands.slice(-50) }));
           } catch {}
           return result;
         }

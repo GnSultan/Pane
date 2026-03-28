@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from "react";
 import { useProjectsStore } from "../../stores/projects";
-import { useMindStore } from "../../stores/mind";
 
 interface Notification {
   id: string;
@@ -9,15 +8,15 @@ interface Notification {
   timestamp: number;
 }
 
-interface WorkerNotification {
+interface PunkNotification {
   id: string;
   entryId?: string;
-  workerType: string;
+  punkType: string;
   preview: string;
   timestamp: number;
 }
 
-const WORKER_LABELS: Record<string, string> = {
+const PUNK_LABELS: Record<string, string> = {
   bug: "bug analysis",
   reflection: "reflection",
   sentinel: "sentinel finding",
@@ -25,13 +24,13 @@ const WORKER_LABELS: Record<string, string> = {
 
 export function TaskNotification() {
   const [notifications, setNotifications] = useState<Notification[]>([]);
-  const [workerNotifications, setWorkerNotifications] = useState<WorkerNotification[]>([]);
-  const workerTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const [punkNotifications, setPunkNotifications] = useState<PunkNotification[]>([]);
+  const punkTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const notifTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const setActiveProject = useProjectsStore((s) => s.setActiveProject);
+  const setHasUnreadCompletion = useProjectsStore((s) => s.setHasUnreadCompletion);
   const setMode = useProjectsStore((s) => s.setMode);
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
-  const setChatEntryId = useMindStore((s) => s.setChatEntryId);
-  const addUnreadThread = useMindStore((s) => s.addUnreadThread);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -44,63 +43,105 @@ export function TaskNotification() {
       };
 
       setNotifications((prev) => [...prev, notification]);
+
+      // Auto-dismiss the toast after 3s — dot persists until user activates the project
+      const timer = setTimeout(() => {
+        setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
+        notifTimers.current.delete(notification.id);
+      }, 3000);
+      notifTimers.current.set(notification.id, timer);
     };
 
     window.addEventListener("pane:task-complete", handler);
-    return () => window.removeEventListener("pane:task-complete", handler);
+    return () => {
+      window.removeEventListener("pane:task-complete", handler);
+      for (const timer of notifTimers.current.values()) clearTimeout(timer);
+      notifTimers.current.clear();
+    };
   }, []);
 
-  // Listen for worker findings from mind-workers
+  // Listen for punk findings from mind-punks
   useEffect(() => {
     const electronAPI = (window as any).electronAPI;
     const unlisten = electronAPI.on(
-      "pane://worker-finding",
-      (data: { entryId?: string; workerType?: string; preview?: string }) => {
-        if (!data?.workerType) return;
-        // Always mark as unread regardless of which page is visible
-        if (data.entryId) addUnreadThread(data.entryId, data.workerType);
-        const wn: WorkerNotification = {
-          id: `worker-${Date.now()}-${Math.random()}`,
+      "pane://punk-finding",
+      (data: { entryId?: string; punkType?: string; preview?: string }) => {
+        if (!data?.punkType) return;
+        const pn: PunkNotification = {
+          id: `punk-${Date.now()}-${Math.random()}`,
           entryId: data.entryId,
-          workerType: data.workerType,
+          punkType: data.punkType,
           preview: data.preview || "",
           timestamp: Date.now(),
         };
-        setWorkerNotifications((prev) => [...prev.slice(-4), wn]); // keep max 5
+        setPunkNotifications((prev) => [...prev.slice(-4), pn]); // keep max 5
+
+        // Mark lens as having unread activity — unless user is already on Lens
+        const s = useProjectsStore.getState();
+        if (s.activeProjectId) {
+          const currentMode = s.projects.get(s.activeProjectId)?.mode;
+          if (currentMode !== "lens") {
+            s.setHasUnreadLens(s.activeProjectId, true);
+          }
+        }
 
         // Auto-dismiss after 8 seconds
         const timer = setTimeout(() => {
-          setWorkerNotifications((prev) => prev.filter((n) => n.id !== wn.id));
-          workerTimers.current.delete(wn.id);
+          setPunkNotifications((prev) => prev.filter((n) => n.id !== pn.id));
+          punkTimers.current.delete(pn.id);
         }, 8000);
-        workerTimers.current.set(wn.id, timer);
+        punkTimers.current.set(pn.id, timer);
       }
     );
     return () => {
       unlisten();
       // Clear all pending auto-dismiss timers on unmount
-      for (const timer of workerTimers.current.values()) clearTimeout(timer);
-      workerTimers.current.clear();
+      for (const timer of punkTimers.current.values()) clearTimeout(timer);
+      punkTimers.current.clear();
     };
   }, []);
 
+  // Listen for new Lens posts — set badge if user isn't already on Lens
+  useEffect(() => {
+    const electronAPI = (window as any).electronAPI;
+    const unlisten = electronAPI.on(
+      "pane://lens-post",
+      (post: { project_id?: string }) => {
+        if (!post?.project_id) return;
+        const s = useProjectsStore.getState();
+        const isViewingLens =
+          s.activeProjectId === post.project_id &&
+          s.projects.get(post.project_id)?.mode === "lens";
+        if (!isViewingLens) {
+          s.setHasUnreadLens(post.project_id, true);
+        }
+      }
+    );
+    return () => unlisten();
+  }, []);
+
   const handleClick = (notification: Notification) => {
-    setActiveProject(notification.projectId);
+    const timer = notifTimers.current.get(notification.id);
+    if (timer) { clearTimeout(timer); notifTimers.current.delete(notification.id); }
+    setActiveProject(notification.projectId); // setActiveProject already clears hasUnreadCompletion
     setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
   };
 
-  const handleDismiss = (e: React.MouseEvent, notificationId: string) => {
+  const handleDismiss = (e: React.MouseEvent, notificationId: string, projectId: string) => {
     e.stopPropagation();
+    const timer = notifTimers.current.get(notificationId);
+    if (timer) { clearTimeout(timer); notifTimers.current.delete(notificationId); }
+    setHasUnreadCompletion(projectId, false);
     setNotifications((prev) => prev.filter((n) => n.id !== notificationId));
   };
 
-  const dismissWorkerNotification = (id: string) => {
-    setWorkerNotifications((prev) => prev.filter((n) => n.id !== id));
-    const timer = workerTimers.current.get(id);
-    if (timer) { clearTimeout(timer); workerTimers.current.delete(id); }
+  const dismissPunkNotification = (id: string) => {
+    setPunkNotifications((prev) => prev.filter((n) => n.id !== id));
+    const timer = punkTimers.current.get(id);
+    if (timer) { clearTimeout(timer); punkTimers.current.delete(id); }
   };
 
-  if (notifications.length === 0 && workerNotifications.length === 0) return null;
+  if (notifications.length === 0 && punkNotifications.length === 0) return null;
 
   return (
     <div className="fixed top-3.5 right-3.5 flex flex-col gap-2 z-50 pointer-events-none">
@@ -123,7 +164,7 @@ export function TaskNotification() {
             </p>
           </div>
           <button
-            onClick={(e) => handleDismiss(e, notification.id)}
+            onClick={(e) => handleDismiss(e, notification.id, notification.projectId)}
             className="text-pane-text-secondary/40 hover:text-pane-text-secondary
                        w-5 h-5 flex items-center justify-center btn-press"
             style={{ fontSize: "var(--pane-panel-font-size)" }}
@@ -133,15 +174,12 @@ export function TaskNotification() {
         </div>
       ))}
 
-      {workerNotifications.map((wn) => (
+      {punkNotifications.map((pn) => (
         <div
-          key={wn.id}
+          key={pn.id}
           onClick={() => {
-            dismissWorkerNotification(wn.id);
-            if (wn.entryId && activeProjectId) {
-              setMode(activeProjectId, "mind");
-              setChatEntryId(wn.entryId);
-            }
+            dismissPunkNotification(pn.id);
+            if (activeProjectId) setMode(activeProjectId, "lens");
           }}
           className="bg-pane-bg/90 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 px-4 py-3
                      animate-fadeSlideUp pointer-events-auto cursor-pointer
@@ -157,21 +195,21 @@ export function TaskNotification() {
               className="font-mono"
               style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)" }}
             >
-              {WORKER_LABELS[wn.workerType] ?? wn.workerType}
+              {PUNK_LABELS[pn.punkType] ?? pn.punkType}
             </p>
-            {wn.preview && (
+            {pn.preview && (
               <p
                 className="text-pane-text-secondary truncate"
                 style={{ fontSize: "var(--pane-panel-font-size-sm)" }}
               >
-                {wn.preview}
+                {pn.preview}
               </p>
             )}
           </div>
           <button
             onClick={(e) => {
               e.stopPropagation();
-              dismissWorkerNotification(wn.id);
+              dismissPunkNotification(pn.id);
             }}
             className="text-pane-text-secondary/40 hover:text-pane-text-secondary
                        w-5 h-5 flex items-center justify-center btn-press shrink-0"

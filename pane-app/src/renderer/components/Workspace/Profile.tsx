@@ -9,6 +9,7 @@ import {
   engineKey,
   DEFAULT_BACKEND_ROUTING,
   type EngineOption,
+  type IntentRouting,
   isThinkingModel,
   getContextWindowForModel,
 } from "../../lib/models";
@@ -394,7 +395,10 @@ function EngineSelect({
       // OR if we're on the gemini backend (where keys are managed by the CLI environment).
       const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini";
       const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-code";
-      if (!httpApiKeys?.[opt.provider] && !(isGeminiBackend && opt.provider === "gemini") && !(isClaudeBackend && opt.provider === "anthropic")) return;
+      
+      const isCoreProvider = ["deepseek", "anthropic", "gemini"].includes(opt.provider);
+      
+      if (!isCoreProvider && !httpApiKeys?.[opt.provider] && !(isGeminiBackend && opt.provider === "gemini") && !(isClaudeBackend && opt.provider === "anthropic")) return;
 
       if (!groups[opt.provider]) groups[opt.provider] = [];
       groups[opt.provider]!.push(opt);
@@ -495,8 +499,8 @@ function AiEnginesSection({
         if (o.model.startsWith("auto-")) return o.provider === nativeProvider;
         // Native CLI provider: CLI handles auth, no HTTP key check needed
         if (nativeProvider && o.provider === nativeProvider) return true;
-        // HTTP: show if the required API key is present
-        return o.provider === "openrouter" || !!httpApiKeys?.[o.provider];
+        // HTTP: show only if the required API key is present (OpenRouter is not special)
+        return !!httpApiKeys?.[o.provider];
       }),
     [nativeProvider, httpApiKeys],
   );
@@ -506,6 +510,49 @@ function AiEnginesSection({
 
   const autoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
   const setIntentRouting = useWorkspaceStore((s) => s.setIntentRouting);
+
+  // Auto-heal: when keys change or routing is loaded from settings, reset any slot
+  // that points to a provider for which no key exists. This prevents silent failures
+  // when a user removes an API key or loads a config from a different machine.
+  useEffect(() => {
+    // CLI backends authenticate themselves — no key-based routing needed
+    if (punkBackend !== "api") return;
+
+    // For "api" backend, nativeProvider is always null so every provider
+    // needs an explicit key in httpApiKeys to be considered valid.
+    const isKeyless = (provider: string) => !httpApiKeys?.[provider];
+
+    const firstThinking = filteredThinking[0];
+    const firstBuilding = filteredBuilding[0];
+
+    // Nothing we can do if there are no configured engines at all
+    if (!firstThinking && !firstBuilding) return;
+
+    const current = routing;
+    const updates: Partial<IntentRouting> = {};
+
+    if (current?.plan && isKeyless(current.plan.provider) && firstThinking) {
+      updates.plan = { provider: firstThinking.provider, model: firstThinking.model, thinking: firstThinking.thinking };
+    }
+    if (current?.execute && isKeyless(current.execute.provider) && (firstBuilding || firstThinking)) {
+      const fallback = firstBuilding ?? firstThinking!;
+      updates.execute = { provider: fallback.provider, model: fallback.model, thinking: fallback.thinking };
+    }
+    if (current?.explain && isKeyless(current.explain.provider) && firstThinking) {
+      updates.explain = { provider: firstThinking.provider, model: firstThinking.model, thinking: firstThinking.thinking };
+    }
+    if (current?.other && isKeyless(current.other.provider) && (firstBuilding || firstThinking)) {
+      const fallback = firstBuilding ?? firstThinking!;
+      updates.other = { provider: fallback.provider, model: fallback.model, thinking: fallback.thinking };
+    }
+
+    if (Object.keys(updates).length > 0) {
+      setIntentRouting({ ...current, ...updates } as IntentRouting);
+    }
+    // Only re-run when keys or backend changes — routing deliberately excluded to prevent loops
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [httpApiKeys, punkBackend]);
+
   const setIntentAutoRoute = useWorkspaceStore((s) => s.setIntentAutoRoute);
 
   const handleThinkingChange = (opt: EngineOption) => {
@@ -896,12 +943,6 @@ const PROVIDERS = [
     label: "DeepSeek",
     placeholder: "sk-...",
     docsUrl: "https://platform.deepseek.com/api_keys",
-  },
-  {
-    key: "kimi",
-    label: "Kimi (Moonshot)",
-    placeholder: "sk-...",
-    docsUrl: "https://platform.moonshot.cn/console/api-keys",
   },
   {
     key: "anthropic",

@@ -199,12 +199,14 @@ interface MarkdownTextProps {
   text: string;
   isStreaming?: boolean;
   isThinking?: boolean;
+  projectId?: string; // when provided, file paths become clickable
 }
 
 export const MarkdownText = memo(function MarkdownText({
   text,
   isStreaming,
   isThinking,
+  projectId,
 }: MarkdownTextProps) {
   if (!text) return null;
 
@@ -286,7 +288,7 @@ export const MarkdownText = memo(function MarkdownText({
               >
                 {groupItem.blocks.map((b, bi) => (
                   <span key={bi}>
-                    {"content" in b && typeof b.content === "string" && renderInline(b.content, isThinking)}
+                    {"content" in b && typeof b.content === "string" && renderInline(b.content, isThinking, projectId)}
                   </span>
                 ))}
               </Tag>
@@ -325,7 +327,7 @@ export const MarkdownText = memo(function MarkdownText({
           }
           
           // For regular IncrementalBlock items
-          return renderIncrementalBlock(item as IncrementalBlock, i, isThinking);
+          return renderIncrementalBlock(item as IncrementalBlock, i, isThinking, projectId);
         })}
       </div>
     );
@@ -345,7 +347,7 @@ export const MarkdownText = memo(function MarkdownText({
     );
   }
 
-  return <>{blocks.map((block, i) => renderBlock(block, i, isThinking))}</>;
+  return <>{blocks.map((block, i) => renderBlock(block, i, isThinking, projectId))}</>;
 });
 
 // --- Block-level parsing ---
@@ -520,7 +522,7 @@ const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_sea
 const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|${TOOL_NAMES})(?::)?)`, "g");
 const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^(?:${TOOL_NAMES})(?::)?$`);
 
-function renderBlock(block: Block, key: number, isThinking?: boolean) {
+function renderBlock(block: Block, key: number, isThinking?: boolean, projectId?: string) {
   switch (block.type) {
     case "code": {
       const trimmedContent = block.content.trim();
@@ -577,7 +579,7 @@ function renderBlock(block: Block, key: number, isThinking?: boolean) {
           className={`${isThinking ? s.className : `text-pane-text ${s.className}`}`}
           style={{ fontSize: isThinking ? "inherit" : s.fontSize }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </div>
       );
     }
@@ -600,7 +602,7 @@ function renderBlock(block: Block, key: number, isThinking?: boolean) {
             className={`text-pane-text-secondary leading-[1.75] ${isThinking ? "" : "italic"}`}
             style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
           >
-            {renderInline(block.content, isThinking)}
+            {renderInline(block.content, isThinking, projectId)}
           </p>
         </div>
       );
@@ -673,7 +675,7 @@ function renderBlock(block: Block, key: number, isThinking?: boolean) {
             maxWidth: "65ch" 
           }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </p>
       );
   }
@@ -775,6 +777,7 @@ function renderIncrementalBlock(
   block: IncrementalBlock,
   key: number,
   isThinking?: boolean,
+  projectId?: string,
 ) {
   switch (block.type) {
     case "code_start": {
@@ -816,7 +819,7 @@ function renderIncrementalBlock(
           className={`${isThinking ? s.className : `text-pane-text ${s.className}`}`}
           style={{ fontSize: isThinking ? "inherit" : s.fontSize }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </div>
       );
     }
@@ -828,7 +831,7 @@ function renderIncrementalBlock(
           className={`${isThinking ? "leading-[1.7] my-1" : "text-pane-text leading-[1.7] my-1"}`}
           style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </li>
       );
 
@@ -840,7 +843,7 @@ function renderIncrementalBlock(
           className={`${isThinking ? "leading-[1.75] whitespace-pre-wrap break-words" : "text-pane-text leading-[1.75] whitespace-pre-wrap break-words"}`}
           style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </span>
       );
   }
@@ -848,7 +851,7 @@ function renderIncrementalBlock(
 
 // --- Inline parsing ---
 
-function renderInline(text: string, isThinking?: boolean): (string | React.JSX.Element)[] {
+function renderInline(text: string, isThinking?: boolean, projectId?: string): (string | React.JSX.Element)[] {
   const cleaned = stripEmojis(text);
   const parts: (string | React.JSX.Element)[] = [];
   // Match: [link](url), `code`, **bold**, *italic*
@@ -872,14 +875,31 @@ function renderInline(text: string, isThinking?: boolean): (string | React.JSX.E
       if (matchStart > txtIdx) {
         result.push(txt.slice(txtIdx, matchStart));
       }
+      // Strip trailing colon from paths like "src/foo.ts:" (tool output formatting)
+      const cleanPath = matchPath.replace(/:$/, "");
       result.push(
-        <code
-          key={`path-${startIndex}-${matchStart}`}
-          className="font-mono text-pane-error"
-          style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
-        >
-          {matchPath}
-        </code>
+        projectId ? (
+          <button
+            key={`path-${startIndex}-${matchStart}`}
+            onClick={() =>
+              window.dispatchEvent(
+                new CustomEvent("pane:open-path", { detail: { path: cleanPath, projectId } }),
+              )
+            }
+            className="font-mono text-pane-error hover:opacity-70 hover:underline cursor-pointer transition-opacity"
+            style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
+          >
+            {matchPath}
+          </button>
+        ) : (
+          <code
+            key={`path-${startIndex}-${matchStart}`}
+            className="font-mono text-pane-error"
+            style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
+          >
+            {matchPath}
+          </code>
+        )
       );
       txtIdx = matchStart + matchPath.length;
     }

@@ -4,6 +4,7 @@ import { FileExplorer } from "./FileExplorer";
 import { Terminal } from "./Terminal";
 import { Profile } from "./Profile";
 import { Mind } from "./Mind";
+import { Lens } from "./Lens";
 import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
 import { GitStatus } from "../ControlPanel/GitStatus";
 import { useProjectsStore } from "../../stores/projects";
@@ -205,6 +206,10 @@ export function Workspace() {
 
       <div data-page="mind" className="absolute inset-0 bg-pane-bg">
         <Mind />
+      </div>
+
+      <div data-page="lens" className="absolute inset-0 bg-pane-bg">
+        {activeProjectId && <Lens projectId={activeProjectId} />}
       </div>
 
       <div data-page="profile" className="absolute inset-0 bg-pane-bg">

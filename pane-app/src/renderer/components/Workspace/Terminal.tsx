@@ -7,7 +7,8 @@ import {
   onPtyData,
   onPtyExit,
   getHomeDir,
-  writeTerminalState,
+  appendTerminalCommand,
+  updateTerminalRunning,
 } from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";
 import type { TerminalTab } from "../../stores/projects";
@@ -52,10 +53,12 @@ function tailLines(text: string, max: number): string {
 }
 
 // Detect progress bar lines and extract fill level.
-// pct is null when fill chars exist but no numeric progress is found (indeterminate).
-function parseProgress(line: string): { pct: number | null; label: string | null } | null {
-  // Must have 4+ consecutive fill characters — the core signal
-  if (!/[#=█░▓▒▪■~\-]{4,}/.test(line)) return null;
+// Only match real progress bars: block/hash fill chars AND a numeric value.
+// Excludes - and ~ which are too common in normal shell output (git diffs, separators, etc.).
+// Never renders without a concrete percentage — no indeterminate ghost lines.
+function parseProgress(line: string): { pct: number; label: string } | null {
+  // Must have 4+ unambiguous fill characters (no dash/tilde)
+  if (!/[#=█░▓▒▪■]{4,}/.test(line)) return null;
 
   // Percentage format: 47%
   const pctMatch = line.match(/(\d{1,3})%/);
@@ -74,34 +77,25 @@ function parseProgress(line: string): { pct: number | null; label: string | null
     }
   }
 
-  // Fill chars with no numeric info — indeterminate
-  return { pct: null, label: null };
+  // Fill chars but no numeric info — not enough signal, skip
+  return null;
 }
 
-function ProgressBar({ pct, label }: { pct: number | null; label: string | null }) {
+function ProgressBar({ pct, label }: { pct: number; label: string }) {
   return (
     <div className="flex items-center gap-3 mt-2 mb-1">
       <div className="flex-1 h-[2px] bg-pane-border/40 rounded-full overflow-hidden">
-        {pct !== null ? (
-          <div
-            className="h-full rounded-full transition-all duration-150"
-            style={{ width: `${pct}%`, background: "var(--pane-terminal)" }}
-          />
-        ) : (
-          <div
-            className="h-full w-1/3 rounded-full animate-pulse"
-            style={{ background: "var(--pane-terminal)" }}
-          />
-        )}
+        <div
+          className="h-full rounded-full transition-all duration-150"
+          style={{ width: `${pct}%`, background: "var(--pane-terminal)" }}
+        />
       </div>
-      {label && (
-        <span
-          className="shrink-0 tabular-nums"
-          style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)" }}
-        >
-          {label}
-        </span>
-      )}
+      <span
+        className="shrink-0 tabular-nums"
+        style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)" }}
+      >
+        {label}
+      </span>
     </div>
   );
 }
@@ -177,7 +171,8 @@ interface TabState {
     output: string;
     cwd: string;
     timestamp: number;
-  }>; // last 20 commands
+  }>; // last 20 commands (local UI state, not used for persistence anymore)
+  snapshotTimer: ReturnType<typeof setInterval> | null; // periodic live-output snapshot
 }
 
 const tabStates = new Map<string, TabState>();
@@ -195,6 +190,7 @@ function getTabState(tabId: string, initialCwd: string): TabState {
       echoSkipped: false,
       lastCommand: "",
       recentCommands: [],
+      snapshotTimer: null,
     };
     tabStates.set(tabId, state);
   }
@@ -409,18 +405,25 @@ function TerminalTabContent({
         ts.echoSkipped = false;
         setIsRunning(false);
 
-        // Sync terminal state for MCP server
+        // Sync terminal state for MCP server — atomic append (multi-tab safe)
         if (ts.lastCommand) {
+          // Stop the live-output snapshot timer; command is done
+          if (ts.snapshotTimer) {
+            clearInterval(ts.snapshotTimer);
+            ts.snapshotTimer = null;
+          }
+          const finishedCwd = newCwd || ts.cwd;
+          const tabTitle = finishedCwd.split("/").pop() || finishedCwd || "terminal";
           const entry = {
             cmd: ts.lastCommand,
             output: output.slice(0, 2000),
-            cwd: newCwd || cwd,
+            cwd: finishedCwd,
             timestamp: Date.now(),
+            tabId,
+            tabTitle,
           };
           ts.recentCommands = [...ts.recentCommands, entry].slice(-20);
-          writeTerminalState(projectId, { commands: ts.recentCommands }).catch(
-            () => {},
-          );
+          appendTerminalCommand(projectId, entry).catch(() => {});
         }
       }
     });
@@ -432,6 +435,11 @@ function TerminalTabContent({
     });
 
     return () => {
+      // Stop live snapshot timer if tab is destroyed mid-command
+      if (ts.snapshotTimer) {
+        clearInterval(ts.snapshotTimer);
+        ts.snapshotTimer = null;
+      }
       cleanupData();
       cleanupExit();
       destroyPty(tabId).catch(() => {});
@@ -533,6 +541,32 @@ function TerminalTabContent({
       ts.outputBuffer = "";
       ts.echoSkipped = false;
       ts.lastCommand = trimmedCmd;
+
+      // Start a periodic snapshot so long-running commands (servers, builds, watchers)
+      // are visible to the model via pane_recent_terminal even before they complete.
+      // Fires every 10s; first tick is at 10s (short commands finish before then).
+      if (ts.snapshotTimer) clearInterval(ts.snapshotTimer);
+      ts.snapshotTimer = setInterval(() => {
+        if (!ts.isRunning) {
+          clearInterval(ts.snapshotTimer!);
+          ts.snapshotTimer = null;
+          return;
+        }
+        const tail = ts.outputBuffer.slice(-3000);
+        if (tail) {
+          const liveCwd = ts.cwd;
+          const tabTitle = liveCwd.split("/").pop() || liveCwd || "terminal";
+          updateTerminalRunning(projectId, {
+            cmd: ts.lastCommand,
+            output: tail,
+            cwd: liveCwd,
+            timestamp: Date.now(),
+            tabId,
+            tabTitle,
+            partial: true,
+          }).catch(() => {});
+        }
+      }, 10_000);
 
       // Write the command + completion marker to the PTY
       const markerCmd = `${trimmedCmd}; echo "${CMD_END_MARKER}$?${PWD_MARKER}$(pwd)"`;
@@ -714,7 +748,7 @@ function TerminalTabContent({
 
       {/* Command input — pinned to bottom, full bleed, matching Conversation InputBar */}
       <div className="absolute bottom-0 left-0 right-0 z-30">
-        <div className={`bg-pane-bg rounded-xl ring-1 transition-colors flex items-center gap-2 px-4 py-3 ${isRunning ? "ring-pane-terminal/40" : "ring-pane-border/40"}`}>
+        <div className="bg-pane-bg rounded-xl flex items-center gap-2 px-4 py-3">
           <span
             className="font-mono select-none shrink-0 self-start"
             style={{ fontSize: "var(--pane-font-size-base)", lineHeight: "1.5rem", color: "var(--pane-terminal)", margin: 0, padding: 0 }}
@@ -842,14 +876,16 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
 
   return (
     <div className="flex flex-col h-full w-full">
-      <TerminalTabBar
-        tabs={tabs}
-        activeTabId={activeTabId}
-        homeDir={homeDir}
-        onSelect={handleSelectTab}
-        onClose={handleCloseTab}
-        onNew={handleNewTab}
-      />
+      {tabs.length > 1 && (
+        <TerminalTabBar
+          tabs={tabs}
+          activeTabId={activeTabId}
+          homeDir={homeDir}
+          onSelect={handleSelectTab}
+          onClose={handleCloseTab}
+          onNew={handleNewTab}
+        />
+      )}
       {tabs.map((tab) => (
         <TerminalTabContent
           key={tab.id}

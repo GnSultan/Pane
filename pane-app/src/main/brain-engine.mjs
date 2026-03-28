@@ -480,6 +480,32 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_mind_turns_thread ON mind_turns(thread_id);
   `);
 
+  // Lens posts — chronological feed for user + worker observations
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lens_posts (
+      id TEXT PRIMARY KEY,
+      contributor TEXT NOT NULL,
+      content TEXT NOT NULL,
+      project_id TEXT,
+      entry_id TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_lens_project ON lens_posts(project_id);
+  `);
+
+  // Lens comments — threaded replies per post
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lens_comments (
+      id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      session_id TEXT,
+      timestamp TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_lens_comments_post ON lens_comments(post_id);
+  `);
+
   // Migrations for unified atom pool — add priority, sort_order, facet to nodes
   try {
     db.exec("ALTER TABLE nodes ADD COLUMN priority REAL DEFAULT 0.5");
@@ -2495,6 +2521,61 @@ process.parentPort.on("message", async ({ data }) => {
         db.prepare(`DELETE FROM mind_turns WHERE thread_id = ?`).run(data.id);
         db.prepare(`DELETE FROM mind_threads WHERE id = ?`).run(data.id);
         sendToMain({ type: "mind_thread_deleted", requestId: data.requestId, id: data.id });
+        break;
+      }
+
+      case "lens_post_add": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const id = `lp-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const created_at = new Date().toISOString();
+        db.prepare(`INSERT INTO lens_posts (id, contributor, content, project_id, entry_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`).run(id, data.contributor, data.content, data.projectId ?? null, data.entryId ?? null, created_at);
+        const post = { id, contributor: data.contributor, content: data.content, project_id: data.projectId ?? null, entry_id: data.entryId ?? null, created_at };
+        sendToMain({ type: "lens_post", requestId: data.requestId, post });
+        break;
+      }
+
+      case "lens_posts_list": {
+        if (!db) { sendToMain({ type: "lens_posts", requestId: data.requestId, posts: [] }); break; }
+        const posts = db.prepare(`
+          SELECT lp.*, COUNT(lc.id) as comment_count
+          FROM lens_posts lp
+          LEFT JOIN lens_comments lc ON lc.post_id = lp.id
+          WHERE lp.project_id = ?
+          GROUP BY lp.id
+          ORDER BY lp.created_at ASC
+        `).all(data.projectId ?? null);
+        sendToMain({ type: "lens_posts", requestId: data.requestId, posts });
+        break;
+      }
+
+      case "lens_post_get": {
+        if (!db) { sendToMain({ type: "lens_post", requestId: data.requestId, post: null }); break; }
+        const post = db.prepare(`SELECT * FROM lens_posts WHERE id = ?`).get(data.postId);
+        sendToMain({ type: "lens_post", requestId: data.requestId, post: post ?? null });
+        break;
+      }
+
+      case "lens_comments_list": {
+        if (!db) { sendToMain({ type: "lens_comments", requestId: data.requestId, comments: [] }); break; }
+        const comments = db.prepare(`SELECT * FROM lens_comments WHERE post_id = ? ORDER BY timestamp ASC`).all(data.postId);
+        sendToMain({ type: "lens_comments", requestId: data.requestId, comments });
+        break;
+      }
+
+      case "lens_comment_add": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const commentId = `lc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const commentTimestamp = new Date().toISOString();
+        db.prepare(`INSERT INTO lens_comments (id, post_id, role, content, session_id, timestamp) VALUES (?, ?, ?, ?, NULL, ?)`).run(commentId, data.postId, data.role, data.content, commentTimestamp);
+        const comment = { id: commentId, post_id: data.postId, role: data.role, content: data.content, session_id: null, timestamp: commentTimestamp };
+        sendToMain({ type: "lens_comment", requestId: data.requestId, comment });
+        break;
+      }
+
+      case "lens_comment_set_session": {
+        if (!db) { sendToMain({ type: "lens_comment_session_set", requestId: data.requestId }); break; }
+        db.prepare(`UPDATE lens_comments SET session_id = ? WHERE post_id = ? AND session_id IS NULL`).run(data.sessionId, data.postId);
+        sendToMain({ type: "lens_comment_session_set", requestId: data.requestId });
         break;
       }
 

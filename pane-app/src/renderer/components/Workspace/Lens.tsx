@@ -1,0 +1,583 @@
+import { useEffect, useRef, useState, useCallback } from "react";
+import { useShallow } from "zustand/react/shallow";
+import { useLensStore } from "../../stores/lens";
+import { useProjectsStore } from "../../stores/projects";
+import { useWorkspaceStore } from "../../stores/workspace";
+import { useMindStore } from "../../stores/mind";
+import { lensPostAdd, lensPostsList, type LensPost } from "../../lib/tauri-commands";
+import { useLensChat } from "../../hooks/useLensChat";
+import { SlashMenu } from "../shared";
+import type { TextBlock } from "../../lib/punk-types";
+
+const PUNK_PERSONAS: Record<string, { name: string; role: string }> = {
+  bug:        { name: "maya", role: "debugger" },
+  reflection: { name: "noor", role: "constructive thinker" },
+  sentinel:   { name: "zara", role: "the auditor" },
+};
+
+// ─── PostComments ──────────────────────────────────────────────────────────
+
+function PostComments({
+  postId,
+  workingDir,
+  postContent,
+}: {
+  postId: string;
+  workingDir: string;
+  postContent: string;
+}) {
+  const { messages, isProcessing, error, sendMessage, appendMessage } = useLensChat(
+    postId,
+    workingDir,
+    postContent
+  );
+
+  const [input, setInput] = useState("");
+  const [focused, setFocused] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Listen for worker replies pushed from the main process
+  useEffect(() => {
+    const electronAPI = (window as any).electronAPI;
+    const unlisten = electronAPI.on("pane://lens-comment", (data: { postId: string; comment: any }) => {
+      if (data.postId !== postId) return;
+      try {
+        const msg = JSON.parse(data.comment.content);
+        if (msg?.id && msg?.type) appendMessage(msg);
+      } catch {}
+    });
+    return () => unlisten();
+  }, [postId, appendMessage]);
+
+  // Scroll to bottom when messages change
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [messages.length]);
+
+  const handleSend = async () => {
+    const text = input.trim();
+    if (!text || isProcessing) return;
+    setInput("");
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+    }
+    await sendMessage(text);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  return (
+    <div className="border-l border-pane-border/30 ml-3 pl-3 mt-2 mb-1">
+      {/* Message thread */}
+      {messages.length > 0 && (
+        <div className="flex flex-col gap-2 mb-2">
+          {messages.map((msg) => {
+            const isAssistant = msg.type === "assistant";
+            const text = msg.content
+              .filter((b): b is TextBlock => b.type === "text")
+              .map((b) => b.text)
+              .join("");
+            if (!text) return null;
+            return (
+              <div key={msg.id} className="flex flex-col gap-0.5">
+                <span
+                  className="font-mono"
+                  style={{
+                    fontSize: "var(--pane-font-size-xs)",
+                    color: isAssistant
+                      ? "var(--pane-terminal)"
+                      : "var(--pane-text-secondary)",
+                    opacity: isAssistant ? 1 : 0.6,
+                  }}
+                >
+                  {isAssistant ? "pane" : "you"}
+                </span>
+                <p
+                  className="text-pane-text leading-relaxed whitespace-pre-wrap"
+                  style={{ fontSize: "var(--pane-panel-font-size)" }}
+                >
+                  {text}
+                  {msg.isStreaming && (
+                    <span
+                      className="inline-block ml-1 animate-pulse"
+                      style={{ color: "var(--pane-terminal)" }}
+                    >
+                      ▋
+                    </span>
+                  )}
+                </p>
+              </div>
+            );
+          })}
+
+          {/* Thinking dots — AI processing but no content yet */}
+          {isProcessing && messages.length > 0 && messages[messages.length - 1]?.type === "user" && (
+            <div className="flex items-center gap-1" style={{ height: "1.25rem" }}>
+              <span
+                className="font-mono"
+                style={{
+                  fontSize: "var(--pane-font-size-xs)",
+                  color: "var(--pane-terminal)",
+                }}
+              >
+                pane
+              </span>
+              <span
+                className="animate-pulse"
+                style={{
+                  fontSize: "var(--pane-font-size-xs)",
+                  color: "var(--pane-terminal)",
+                  opacity: 0.6,
+                }}
+              >
+                ...
+              </span>
+            </div>
+          )}
+
+          <div ref={bottomRef} />
+        </div>
+      )}
+
+      {/* Thinking dots when first message not yet visible */}
+      {isProcessing && messages.length === 0 && (
+        <div className="flex items-center gap-1 mb-2" style={{ height: "1.25rem" }}>
+          <span
+            className="font-mono"
+            style={{
+              fontSize: "var(--pane-font-size-xs)",
+              color: "var(--pane-terminal)",
+            }}
+          >
+            pane
+          </span>
+          <span
+            className="animate-pulse"
+            style={{
+              fontSize: "var(--pane-font-size-xs)",
+              color: "var(--pane-terminal)",
+              opacity: 0.6,
+            }}
+          >
+            ...
+          </span>
+        </div>
+      )}
+
+      {/* Error */}
+      {error && (
+        <p
+          className="text-red-400 mb-1"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          {error}
+        </p>
+      )}
+
+      {/* Reply input */}
+      <div className="mt-3">
+        <div
+          className={`bg-pane-bg rounded-lg ring-1 transition-all relative ${
+            focused ? "ring-pane-border/60" : "ring-pane-border/30"
+          }`}
+        >
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={(e) => {
+              setInput(e.target.value);
+              e.target.style.height = "auto";
+              e.target.style.height = `${e.target.scrollHeight}px`;
+            }}
+            onKeyDown={handleKeyDown}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            placeholder="reply"
+            rows={1}
+            disabled={isProcessing}
+            className="w-full bg-transparent text-pane-text font-mono resize-none outline-none placeholder:text-pane-text-secondary/30 leading-[1.75] px-3 pt-2 overflow-hidden"
+            style={{
+              fontSize: "var(--pane-font-size-sm)",
+              minHeight: "2.25rem",
+              maxHeight: "6rem",
+              paddingBottom: input.trim() ? "2rem" : "0.5rem",
+            }}
+          />
+          {input.trim() && (
+            <button
+              onMouseDown={(e) => { e.preventDefault(); handleSend(); }}
+              className="absolute bottom-1.5 right-1.5 w-7 h-7 flex items-center justify-center rounded-md text-pane-text-secondary/50 hover:text-pane-text hover:bg-pane-text/[0.06] transition-all btn-press ring-1 ring-pane-border/30"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
+              </svg>
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── PostItem ──────────────────────────────────────────────────────────────
+
+const POST_TRUNCATE_CHARS = 180;
+
+function PostItem({
+  post,
+  isExpanded,
+  onToggle,
+  workingDir,
+  userName,
+}: {
+  post: LensPost;
+  isExpanded: boolean;
+  onToggle: () => void;
+  workingDir: string;
+  userName: string;
+}) {
+  const [readMore, setReadMore] = useState(false);
+  const isPunk = post.contributor !== "user";
+  const persona = isPunk ? PUNK_PERSONAS[post.contributor] : null;
+  const name = persona ? persona.name : (userName || "you");
+  const time = new Date(post.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const commentCount = post.comment_count ?? 0;
+  const isLong = post.content.length > POST_TRUNCATE_CHARS;
+  const displayContent = isLong && !readMore
+    ? post.content.slice(0, POST_TRUNCATE_CHARS).trimEnd() + "…"
+    : post.content;
+
+  return (
+    <div className="mb-2">
+      <div className="bg-pane-surface rounded-lg overflow-hidden">
+
+        {/* Header: name · role · time */}
+        <div className="flex items-center gap-2 px-4 pt-4 pb-0">
+          <span
+            className="font-mono"
+            style={{
+              fontSize: "var(--pane-font-size-xs)",
+              color: isPunk ? "var(--pane-terminal)" : "var(--pane-text-secondary)",
+              opacity: isPunk ? 0.75 : 0.55,
+            }}
+          >
+            {name}
+          </span>
+          {persona && (
+            <span
+              className="font-mono text-pane-text-secondary/25"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              · {persona.role}
+            </span>
+          )}
+          <span
+            className="font-mono text-pane-text-secondary/20 ml-auto"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {time}
+          </span>
+        </div>
+
+        {/* Body */}
+        <div
+          className={`px-4 pt-3 pb-2 ${isLong && !readMore ? "cursor-pointer" : ""}`}
+          onClick={isLong && !readMore ? () => setReadMore(true) : undefined}
+        >
+          <p
+            className="text-pane-text font-light leading-relaxed whitespace-pre-wrap"
+            style={{ fontSize: "var(--pane-panel-font-size)" }}
+          >
+            {displayContent}
+          </p>
+        </div>
+        {/* Footer row: read more (left) + comment icon (right) */}
+        <div className="flex items-center justify-between px-4 pb-3 pt-1 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+          <div>
+            {isLong && (
+              <button
+                onClick={() => setReadMore(!readMore)}
+                className="text-pane-text-secondary/30 hover:text-pane-text-secondary/55 transition-colors"
+              >
+                {readMore ? "less" : "read more"}
+              </button>
+            )}
+          </div>
+          <button
+            onClick={onToggle}
+            className={`inline-flex items-center gap-1 transition-colors btn-press ${
+              isExpanded ? "text-pane-text-secondary/60" : "text-pane-text-secondary/25 hover:text-pane-text-secondary/50"
+            }`}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            {commentCount > 0 && <span>{commentCount}</span>}
+          </button>
+        </div>
+
+        {/* Comments */}
+        {isExpanded && (
+          <div className="px-4 pb-4 border-t border-pane-border/10">
+            <PostComments
+              postId={post.id}
+              workingDir={workingDir}
+              postContent={post.content}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Lens ──────────────────────────────────────────────────────────────────
+
+export function Lens({ projectId }: { projectId: string }) {
+  const posts = useLensStore(useShallow((s) => s.posts.filter((p) => p.project_id === projectId)));
+  const appendPost = useLensStore((s) => s.appendPost);
+  const setPosts = useLensStore((s) => s.setPosts);
+  const setLoaded = useLensStore((s) => s.setLoaded);
+  const expandedPostId = useLensStore((s) => s.expandedPostId);
+  const setExpandedPostId = useLensStore((s) => s.setExpandedPostId);
+
+  const workingDir = useProjectsStore((s) => s.projects.get(projectId)?.root ?? "");
+  const userName = useWorkspaceStore((s) => s.profileName);
+
+  const [composing, setComposing] = useState(false);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composeRef = useRef<HTMLDivElement>(null);
+
+  // Slash-menu state for mind entry quick-insert
+  const [slashOpen, setSlashOpen] = useState(false);
+  const [slashQuery, setSlashQuery] = useState("");
+  const slashStartRef = useRef<number>(-1);
+  const mindEntries = useMindStore((s) => s.entries);
+
+  // Load posts on first visit — always re-fetch so navigation away and back is safe
+  useEffect(() => {
+    lensPostsList(projectId).then((fetched) => {
+      setPosts(fetched);
+      setLoaded(projectId, true);
+    });
+  }, [projectId]);
+
+  // Listen for new posts from workers via IPC
+  useEffect(() => {
+    const electronAPI = (window as any).electronAPI;
+    const unlisten = electronAPI.on("pane://lens-post", (post: LensPost) => {
+      if (post.project_id === projectId) appendPost(post);
+    });
+    return () => unlisten();
+  }, [projectId]);
+
+  // Scroll to bottom when posts change
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [posts.length]);
+
+  // Auto-focus textarea when compose opens
+  useEffect(() => {
+    if (composing) {
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    }
+  }, [composing]);
+
+  // Close compose on click outside
+  useEffect(() => {
+    if (!composing) return;
+    const handler = (e: MouseEvent) => {
+      if (composeRef.current && !composeRef.current.contains(e.target as Node)) {
+        if (!input.trim()) {
+          setComposing(false);
+          setInput("");
+        }
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [composing, input]);
+
+  const handleComposeChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const next = e.target.value;
+    const pos = e.target.selectionStart ?? next.length;
+    setInput(next);
+    // Auto-resize
+    e.target.style.height = "auto";
+    e.target.style.height = `${e.target.scrollHeight}px`;
+
+    if (slashOpen) {
+      const slashIdx = slashStartRef.current - 1;
+      if (next[slashIdx] !== "/" || pos < slashStartRef.current) {
+        setSlashOpen(false);
+      } else {
+        setSlashQuery(next.slice(slashStartRef.current, pos));
+      }
+    } else {
+      if (next[pos - 1] === "/") {
+        const charBefore = next[pos - 2];
+        if (!charBefore || charBefore === " " || charBefore === "\n") {
+          slashStartRef.current = pos;
+          setSlashQuery("");
+          setSlashOpen(true);
+        }
+      }
+    }
+  }, [slashOpen]);
+
+  const handleSlashSelect = useCallback((content: string) => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const slashIdx = slashStartRef.current - 1;
+    const cursorPos = ta.selectionStart ?? input.length;
+    const before = input.slice(0, slashIdx);
+    const after = input.slice(cursorPos);
+    const next = before + content + after;
+    setInput(next);
+    setSlashOpen(false);
+    requestAnimationFrame(() => {
+      ta.focus();
+      const newPos = before.length + content.length;
+      ta.setSelectionRange(newPos, newPos);
+      ta.style.height = "auto";
+      ta.style.height = `${ta.scrollHeight}px`;
+    });
+  }, [input]);
+
+  const handleSend = async () => {
+    const text = input.trim();
+    if (!text || sending) return;
+    setSending(true);
+    setInput("");
+    try {
+      const post = await lensPostAdd("user", text, projectId);
+      appendPost(post);
+      setComposing(false);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Slash menu captures Enter/Tab/Escape/Arrows — don't double-handle
+    if (slashOpen && (e.key === "Enter" || e.key === "Tab" || e.key === "Escape" || e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+    if (e.key === "Escape") {
+      setComposing(false);
+      setInput("");
+    }
+  };
+
+  return (
+    <div className="absolute inset-0 flex flex-col">
+      {/* Feed */}
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto overflow-x-hidden custom-scrollbar py-4"
+      >
+        <div className="max-w-2xl mx-auto w-full px-4">
+        {posts.length === 0 && !composing ? (
+          <div className="flex items-center justify-center h-full py-20">
+            <button
+              onClick={() => setComposing(true)}
+              className="font-mono text-pane-text-secondary/30 hover:text-pane-text-secondary/50 transition-colors btn-press"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              what do you notice
+            </button>
+          </div>
+        ) : (
+          posts.map((post) => (
+            <PostItem
+              key={post.id}
+              post={post}
+              isExpanded={expandedPostId === post.id}
+              onToggle={() =>
+                setExpandedPostId(expandedPostId === post.id ? null : post.id)
+              }
+              workingDir={workingDir}
+              userName={userName}
+            />
+          ))
+        )}
+        </div>
+      </div>
+
+      {/* Compose — expand on demand */}
+      <div ref={composeRef} className="shrink-0">
+        {composing ? (
+          <div className="bg-pane-bg rounded-t-xl ring-1 ring-pane-border/40 relative">
+            {slashOpen && (
+              <SlashMenu
+                entries={mindEntries}
+                query={slashQuery}
+                onSelect={handleSlashSelect}
+                onDismiss={() => setSlashOpen(false)}
+              />
+            )}
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={handleComposeChange}
+              onKeyDown={handleKeyDown}
+              placeholder="what do you notice"
+              disabled={sending}
+              className="w-full bg-transparent text-pane-text font-mono resize-none outline-none placeholder:text-pane-text-secondary leading-[1.75] px-5 pt-4 overflow-y-auto overflow-x-hidden"
+              style={{
+                fontSize: "var(--pane-font-size)",
+                minHeight: "80px",
+                maxHeight: "30vh",
+                paddingBottom: "36px",
+              }}
+            />
+            {/* Send — top right, only when there's text */}
+            {input.trim().length > 0 && (
+              <button
+                onClick={handleSend}
+                className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
+                </svg>
+              </button>
+            )}
+            {/* Bottom hint row */}
+            <div
+              className="absolute bottom-0 left-0 right-0 flex items-center px-3 pb-2 pointer-events-none"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              <span className="font-mono text-pane-text-secondary/20">
+                enter to post · shift+enter for newline · esc to cancel
+              </span>
+            </div>
+          </div>
+        ) : (
+          <button
+            onClick={() => setComposing(true)}
+            className="w-full text-left font-mono text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors btn-press px-5 py-3"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            + observe
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}

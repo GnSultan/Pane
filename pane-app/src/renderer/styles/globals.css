@@ -415,7 +415,8 @@
 [data-mode="git"] > [data-page="git"],
 [data-mode="mind"] > [data-page="mind"],
 [data-mode="profile"] > [data-page="profile"],
-[data-mode="history"] > [data-page="history"] {
+[data-mode="history"] > [data-page="history"],
+[data-mode="lens"] > [data-page="lens"] {
   pointer-events: auto;
   z-index: 20;
   content-visibility: visible;
