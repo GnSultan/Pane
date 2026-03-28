@@ -1370,13 +1370,33 @@ export class ApiBackend extends PunkBackend {
           request,
         );
 
-        // --- RETRY LOOP FOR TRANSIENT ERRORS ---
-        // Rate limits (429): up to 6 retries, respects Retry-After header, shows status to user.
-        // Server errors (5xx): up to 3 retries with exponential backoff (1s/2s/4s).
+        // ============================================================================
+        // ENDURANCE RETRY LOGIC — Pane's resilience layer
+        // ============================================================================
+        // 
+        // Philosophy: API rejections are not failures — they're feedback.
+        // Pane should never give up on transient errors. Network hiccups,
+        // rate limits, and upstream server issues are expected in production.
+        // 
+        // Retry strategy by error type:
+        //   • 429 (Rate Limit):      7+ retries with jitter, respects Retry-After
+        //   • 5xx (Server Error):    7+ retries with exponential backoff + jitter
+        //   • Network failures:      7+ retries with progressive delays
+        //   • 400/401/403/422:       Immediate fail (client errors are not transient)
+        //   • 502/503/504:           Treated as network issues, 7+ retries
+        //
+        // Backoff formula: delay = base * 2^attempt + jitter
+        // Jitter prevents thundering herd when many clients retry simultaneously
+        // ============================================================================
+
         let response;
         let attempt = 0;
-        const maxServerErrAttempts = 3;
-        const maxRateLimitAttempts = 6;
+        const MAX_RETRIES = 7; // Minimum per requirement
+        const BASE_DELAY_MS = 1000; // 1 second base
+        
+        // Track retry history for debugging
+        const retryHistory = [];
+        let lastErrorType = null;
 
         while (true) {
           try {
@@ -1388,53 +1408,153 @@ export class ApiBackend extends PunkBackend {
             });
 
             if (!response.ok) {
-              if (response.status === 429 && attempt < maxRateLimitAttempts) {
-                // Anthropic and OpenRouter both send Retry-After in seconds.
-                // Fall back to exponential backoff with a 10s floor if header is absent.
+              const status = response.status;
+              
+              // 400-series client errors: NOT retryable (except 429)
+              if (status >= 400 && status < 500 && status !== 429) {
+                // Explicitly categorize common client errors
+                if (status === 400) {
+                  lastErrorType = "bad_request";
+                  console.error(`[http] Bad request (400): ${response.statusText}`);
+                } else if (status === 401) {
+                  lastErrorType = "unauthorized";
+                  console.error(`[http] Unauthorized (401): Check API key configuration`);
+                } else if (status === 403) {
+                  lastErrorType = "forbidden";
+                  console.error(`[http] Forbidden (403): ${response.statusText}`);
+                } else if (status === 422) {
+                  lastErrorType = "validation_error";
+                  console.error(`[http] Validation error (422): ${response.statusText}`);
+                } else {
+                  lastErrorType = `client_error_${status}`;
+                  console.error(`[http] Client error (${status}): ${response.statusText}`);
+                }
+                break; // Don't retry client errors
+              }
+
+              // 429 Rate Limit: 7+ retries with adaptive backoff
+              if (status === 429 && attempt < MAX_RETRIES) {
+                lastErrorType = "rate_limit";
                 const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
-                const delay = retryAfterSec > 0
-                  ? retryAfterSec * 1000
-                  : Math.min(10000 * Math.pow(2, attempt), 120000); // 10s, 20s, 40s, 80s, 120s, 120s
+                
+                // Adaptive backoff: respect provider's recommended delay or exponential with jitter
+                let delay;
+                if (retryAfterSec > 0) {
+                  // Provider tells us exactly how long to wait
+                  delay = retryAfterSec * 1000;
+                } else {
+                  // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, 32s, 64s
+                  const exponential = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 60000);
+                  const jitter = Math.random() * 1000; // ±1s jitter
+                  delay = exponential + jitter;
+                }
+                
                 const delaySec = Math.round(delay / 1000);
-                console.warn(`[http] Rate limited (429). Waiting ${delaySec}s before retry ${attempt + 1}/${maxRateLimitAttempts}...`);
-                // Surface the wait to the user so they know Pane is handling it.
+                retryHistory.push({ status: 429, attempt: attempt + 1, delay: delaySec });
+                
+                console.warn(`[http] Rate limited (429). Waiting ${delaySec}s before retry ${attempt + 1}/${MAX_RETRIES}...`);
+                
+                // Surface the wait to the user so they know Pane is handling it
                 this.onEvent(request.projectId, {
                   event: "status",
-                  data: { message: `rate limited — retrying in ${delaySec}s` },
+                  data: { message: `rate limited — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})` },
                 }, request.requestId);
+                
                 await new Promise((resolve) => setTimeout(resolve, delay));
-                // Clear status before the next attempt
+                
+                // Clear status before next attempt
                 this.onEvent(request.projectId, {
                   event: "status",
                   data: { message: null },
                 }, request.requestId);
+                
                 attempt++;
                 continue;
               }
 
-              if (response.status >= 500 && attempt < maxServerErrAttempts) {
-                const delay = Math.pow(2, attempt) * 1000;
-                console.warn(`[http] Server error ${response.status}. Retrying in ${delay}ms (attempt ${attempt + 1}/${maxServerErrAttempts})...`);
+              // 5xx server errors: 7+ retries with exponential backoff + jitter
+              if (status >= 500 && attempt < MAX_RETRIES) {
+                lastErrorType = `server_error_${status}`;
+                const jitter = Math.random() * 500;
+                const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
+                const delaySec = Math.round(delay / 1000);
+                
+                retryHistory.push({ status, attempt: attempt + 1, delay: delaySec });
+                
+                console.warn(`[http] Server error ${status}. Retrying in ${delaySec}s (attempt ${attempt + 1}/${MAX_RETRIES})...`);
+                this.onEvent(request.projectId, {
+                  event: "status",
+                  data: { message: `server error ${status} — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})` },
+                }, request.requestId);
+                
                 await new Promise((resolve) => setTimeout(resolve, delay));
+                
+                this.onEvent(request.projectId, {
+                  event: "status",
+                  data: { message: null },
+                }, request.requestId);
+                
                 attempt++;
                 continue;
               }
             }
 
-            break; // success or unrecoverable error
+            // Success or unrecoverable error
+            break;
           } catch (err) {
-            if (err.name === "AbortError") throw err;
-            if (attempt < maxServerErrAttempts) {
-              const delay = Math.pow(2, attempt) * 1000;
-              console.warn(`[http] Fetch failed: ${err.message}. Retrying in ${delay}ms...`);
+            // Network-level failures: 7+ retries with progressive backoff
+            if (err.name === "AbortError") {
+              // User cancelled — don't retry
+              throw err;
+            }
+            
+            if (attempt < MAX_RETRIES) {
+              lastErrorType = "network_failure";
+              const jitter = Math.random() * 500;
+              const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
+              const delaySec = Math.round(delay / 1000);
+              
+              // Distinguish network error types for better diagnostics
+              let errorMsg = err.message || String(err);
+              let errorCategory = "network";
+              if (errorMsg.includes("ECONNREFUSED") || errorMsg.includes("connect")) {
+                errorCategory = "connection_refused";
+              } else if (errorMsg.includes("ETIMEDOUT") || errorMsg.includes("timeout")) {
+                errorCategory = "timeout";
+              } else if (errorMsg.includes("ENOTFOUND") || errorMsg.includes("DNS")) {
+                errorCategory = "dns";
+              }
+              
+              retryHistory.push({ error: errorCategory, attempt: attempt + 1, delay: delaySec });
+              
+              console.warn(`[http] ${errorCategory} failure: ${errorMsg}. Retrying in ${delaySec}s (attempt ${attempt + 1}/${MAX_RETRIES})...`);
+              this.onEvent(request.projectId, {
+                event: "status",
+                data: { message: `${errorCategory} — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})` },
+              }, request.requestId);
+              
               await new Promise((resolve) => setTimeout(resolve, delay));
+              
+              this.onEvent(request.projectId, {
+                event: "status",
+                data: { message: null },
+              }, request.requestId);
+              
               attempt++;
               continue;
             }
+            
+            // Max retries exceeded for network failure
+            console.error(`[http] Network failure after ${MAX_RETRIES} attempts: ${err.message}`);
             throw err;
           }
         }
         // --- END RETRY LOOP ---
+
+        // Log retry summary if retries were used
+        if (retryHistory.length > 0) {
+          console.log(`[http] Retry summary: ${retryHistory.length} attempts, history:`, JSON.stringify(retryHistory));
+        }
 
         if (!response.ok) {
           const errorText = await response
@@ -2528,58 +2648,107 @@ export class ApiBackend extends PunkBackend {
     const cleanBody = { ...(finalBody || body), stream: true };
     delete cleanBody.tools;
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(cleanBody),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Planning call failed: HTTP ${response.status}: ${errorText}`);
-    }
-
-    // Stream the response — extract text deltas and call onChunk as they arrive
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let fullText = "";
-    let buffer = "";
+    // ============================================================================
+    // Endurance retry loop for planning calls
+    // ============================================================================
+    const MAX_RETRIES = 7;
+    const BASE_DELAY_MS = 1000;
+    let attempt = 0;
+    let lastError = null;
 
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(cleanBody),
+        });
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop(); // keep incomplete last line
-
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") continue;
-
-        let parsed;
-        try { parsed = JSON.parse(data); } catch { continue; }
-
-        let delta = "";
-        if (apiConfig.provider === "anthropic") {
-          // Anthropic: content_block_delta with text_delta
-          if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta") {
-            delta = parsed.delta.text || "";
+        if (!response.ok) {
+          const status = response.status;
+          
+          // Client errors (4xx except 429) are not retryable
+          if (status >= 400 && status < 500 && status !== 429) {
+            const errorText = await response.text().catch(() => response.statusText);
+            throw new Error(`Planning call failed: HTTP ${status}: ${errorText}`);
           }
-        } else {
-          // OpenAI-compatible (DeepSeek, OpenRouter, Kimi, etc.)
-          delta = parsed.choices?.[0]?.delta?.content || "";
+
+          // Rate limit or server error: retry with backoff
+          if (attempt < MAX_RETRIES) {
+            const retryAfterSec = status === 429 ? parseInt(response.headers.get("retry-after") || "0", 10) : 0;
+            const jitter = Math.random() * 500;
+            const delay = retryAfterSec > 0
+              ? retryAfterSec * 1000
+              : Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
+            
+            console.warn(`[http] Planning call ${status}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            attempt++;
+            continue;
+          }
+
+          const errorText = await response.text().catch(() => response.statusText);
+          throw new Error(`Planning call failed after ${MAX_RETRIES} attempts: HTTP ${status}: ${errorText}`);
         }
 
-        if (delta) {
-          fullText += delta;
-          if (onChunk) onChunk(delta);
+        // Stream the response — extract text deltas and call onChunk as they arrive
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let fullText = "";
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop(); // keep incomplete last line
+
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (data === "[DONE]") continue;
+
+            let parsed;
+            try { parsed = JSON.parse(data); } catch { continue; }
+
+            let delta = "";
+            if (apiConfig.provider === "anthropic") {
+              // Anthropic: content_block_delta with text_delta
+              if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta") {
+                delta = parsed.delta.text || "";
+              }
+            } else {
+              // OpenAI-compatible (DeepSeek, OpenRouter, Kimi, etc.)
+              delta = parsed.choices?.[0]?.delta?.content || "";
+            }
+
+            if (delta) {
+              fullText += delta;
+              if (onChunk) onChunk(delta);
+            }
+          }
         }
+
+        return fullText;
+
+      } catch (err) {
+        if (err.name === "AbortError") throw err;
+        
+        if (attempt < MAX_RETRIES) {
+          const jitter = Math.random() * 500;
+          const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
+          
+          console.warn(`[http] Planning call network error: ${err.message}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          attempt++;
+          continue;
+        }
+        
+        throw new Error(`Planning call failed after ${MAX_RETRIES} attempts: ${err.message}`);
       }
     }
-
-    return fullText;
   }
 
   /**
@@ -2612,28 +2781,76 @@ export class ApiBackend extends PunkBackend {
     const cleanBody = { ...(finalBody || body) };
     delete cleanBody.tools;
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(cleanBody),
-    });
+    // ============================================================================
+    // Endurance retry loop for conversation calls
+    // ============================================================================
+    const MAX_RETRIES = 7;
+    const BASE_DELAY_MS = 1000;
+    let attempt = 0;
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Conversation call failed: HTTP ${response.status}: ${errorText}`);
-    }
+    while (true) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(cleanBody),
+        });
 
-    const json = await response.json();
+        if (!response.ok) {
+          const status = response.status;
+          
+          // Client errors (4xx except 429) are not retryable
+          if (status >= 400 && status < 500 && status !== 429) {
+            const errorText = await response.text().catch(() => response.statusText);
+            throw new Error(`Conversation call failed: HTTP ${status}: ${errorText}`);
+          }
 
-    // Extract text from response based on provider
-    if (apiConfig.provider === "anthropic") {
-      return json.content?.[0]?.text || "";
+          // Rate limit or server error: retry with backoff
+          if (attempt < MAX_RETRIES) {
+            const retryAfterSec = status === 429 ? parseInt(response.headers.get("retry-after") || "0", 10) : 0;
+            const jitter = Math.random() * 500;
+            const delay = retryAfterSec > 0
+              ? retryAfterSec * 1000
+              : Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
+            
+            console.warn(`[http] Conversation call ${status}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            attempt++;
+            continue;
+          }
+
+          const errorText = await response.text().catch(() => response.statusText);
+          throw new Error(`Conversation call failed after ${MAX_RETRIES} attempts: HTTP ${status}: ${errorText}`);
+        }
+
+        const json = await response.json();
+
+        // Extract text from response based on provider
+        if (apiConfig.provider === "anthropic") {
+          return json.content?.[0]?.text || "";
+        }
+        if (apiConfig.provider === "gemini") {
+          return json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        }
+        // OpenAI-compatible (DeepSeek, OpenRouter, Kimi)
+        return json.choices?.[0]?.message?.content || "";
+
+      } catch (err) {
+        if (err.name === "AbortError") throw err;
+        
+        if (attempt < MAX_RETRIES) {
+          const jitter = Math.random() * 500;
+          const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
+          
+          console.warn(`[http] Conversation call network error: ${err.message}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          attempt++;
+          continue;
+        }
+        
+        throw new Error(`Conversation call failed after ${MAX_RETRIES} attempts: ${err.message}`);
+      }
     }
-    if (apiConfig.provider === "gemini") {
-      return json.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    }
-    // OpenAI-compatible (DeepSeek, OpenRouter, Kimi)
-    return json.choices?.[0]?.message?.content || "";
   }
 
   /**
