@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { memo, useMemo, useState, useEffect } from "react";
 import type React from "react";
 
 /**
@@ -9,6 +9,50 @@ import type React from "react";
  *
  * All sizes scale with --pane-font-size CSS variable (Cmd+/- adjustable).
  */
+
+// Module-level time-budgeted parse queue.
+//
+// Problem: on restore, 30+ messages each schedule a setTimeout(0) for
+// parseBlocks, and each LazyHighlightedCode schedules another for
+// renderHighlightedCode. Even though no individual call exceeds 20ms,
+// they all fire in rapid succession (same macrotask batch) and
+// collectively block the main thread for 500ms+.
+//
+// Solution: funnel all deferred work through this queue. Each tick
+// processes jobs until the 14ms per-frame budget is consumed, then
+// yields via setTimeout(0) so the browser can paint/handle input
+// before the next batch. Jobs queued while a tick is running are
+// picked up automatically in the next tick.
+const _parseQueue = (() => {
+  const q: Array<() => void> = [];
+  let scheduled = false;
+
+  function tick() {
+    scheduled = false;
+    const deadline = performance.now() + 14; // ~one frame budget
+    while (q.length > 0 && performance.now() < deadline) {
+      q.shift()!();
+    }
+    if (q.length > 0) {
+      scheduled = true;
+      setTimeout(tick, 0);
+    }
+  }
+
+  return {
+    enqueue(job: () => void): () => void {
+      q.push(job);
+      if (!scheduled) {
+        scheduled = true;
+        setTimeout(tick, 0);
+      }
+      return () => {
+        const i = q.indexOf(job);
+        if (i !== -1) q.splice(i, 1);
+      };
+    },
+  };
+})();
 
 // --- Syntax Highlighting ---
 
@@ -217,10 +261,19 @@ export const MarkdownText = memo(function MarkdownText({
   const shouldParseMarkdown = !isStreaming && text.length <= 30_000;
   const shouldParseIncremental = isStreaming;
 
-  const blocks = useMemo(
-    () => (shouldParseMarkdown ? parseBlocks(wrapBareJson(text)) : null),
-    [text, shouldParseMarkdown],
-  );
+  // Defer full markdown parsing to after first paint. wrapBareJson uses a
+  // greedy regex that is slow on code-heavy messages, and parseBlocks running
+  // synchronously across 30 restored messages blocks the main thread.
+  // Initial render shows plain text; blocks fill in on the next idle frame.
+  const [blocks, setBlocks] = useState<Block[] | null>(null);
+  useEffect(() => {
+    if (!shouldParseMarkdown) { setBlocks(null); return; }
+    let cancelled = false;
+    const cancel = _parseQueue.enqueue(() => {
+      if (!cancelled) setBlocks(parseBlocks(text));
+    });
+    return () => { cancelled = true; cancel(); };
+  }, [text, shouldParseMarkdown]);
 
   const incrementalBlocks = useMemo(
     () => (shouldParseIncremental ? parseIncremental(text) : null),
@@ -334,15 +387,14 @@ export const MarkdownText = memo(function MarkdownText({
   }
 
   if (!blocks) {
+    // Plain text while parseBlocks is deferred — avoids running PATH_REGEX
+    // synchronously across all restored messages before the first paint.
     return (
       <p
         className={`${isThinking ? "whitespace-pre-wrap" : "text-pane-text leading-[1.75] whitespace-pre-wrap mb-5"}`}
-        style={{
-          fontSize: isThinking ? "inherit" : "var(--pane-font-size)",
-          maxWidth: "65ch",
-        }}
+        style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)", maxWidth: "65ch" }}
       >
-        {renderInline(text, isThinking)}
+        {text}
       </p>
     );
   }
@@ -371,24 +423,6 @@ type IncrementalBlock =
   | { type: "list_item"; content: string; ordered: boolean }
   | { type: "inline"; content: string };
 
-/**
- * If the text contains bare JSON objects/arrays (not wrapped in code fences),
- * wrap them so they render as formatted code blocks instead of raw text.
- */
-function wrapBareJson(text: string): string {
-  return text.replace(
-    /(^|\n)([ \t]*\{[\s\S]*?\}[ \t]*|\[[\s\S]*?\][ \t]*)(?=\n|$)/g,
-    (match, prefix, json) => {
-      const trimmed = json.trim();
-      try {
-        JSON.parse(trimmed);
-        return `${prefix}\`\`\`json\n${trimmed}\n\`\`\``;
-      } catch {
-        return match; // not valid JSON — leave as-is
-      }
-    }
-  );
-}
 
 function parseBlocks(text: string): Block[] {
   const lines = text.split("\n");
@@ -510,11 +544,41 @@ function parseBlocks(text: string): Block[] {
     }
     if (paraLines.length > 0) {
       blocks.push({ type: "paragraph", content: paraLines.join("\n") });
+    } else {
+      // No lines were consumed — the current line matched a paragraph-break
+      // condition (e.g. starts with `|` but isn't a valid table) yet wasn't
+      // caught by any earlier outer guard. Treat it as a plain text line to
+      // prevent an infinite loop.
+      blocks.push({ type: "paragraph", content: lines[i]! });
+      i++;
     }
   }
 
   return blocks;
 }
+
+// Defers syntax highlighting to after first paint so initial render of restored
+// conversations doesn't block the main thread. Code blocks appear as plain text
+// first, then get colored after mount. Uses requestIdleCallback so each block
+// is spread across idle frames rather than all firing in one effect flush.
+const LazyHighlightedCode = memo(function LazyHighlightedCode({
+  code,
+  lang,
+}: {
+  code: string;
+  lang: string;
+}) {
+  const [tokens, setTokens] = useState<React.JSX.Element[] | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const cancel = _parseQueue.enqueue(() => {
+      if (!cancelled) setTokens(renderHighlightedCode(code, lang));
+    });
+    return () => { cancelled = true; cancel(); };
+  }, [code, lang]);
+  if (!tokens) return <>{code}</>;
+  return <>{tokens}</>;
+});
 
 // --- Block rendering ---
 
@@ -545,7 +609,7 @@ function renderBlock(block: Block, key: number, isThinking?: boolean, projectId?
           >
             <pre className="whitespace-pre-wrap break-words m-0">
               <code className={isSpecial ? "text-pane-error" : undefined}>
-                {isSpecial ? block.content : renderHighlightedCode(block.content, block.lang)}
+                {isSpecial ? block.content : <LazyHighlightedCode code={block.content} lang={block.lang} />}
               </code>
             </pre>
           </div>

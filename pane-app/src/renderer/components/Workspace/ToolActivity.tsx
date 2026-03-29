@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useLayoutEffect } from "react";
+import { useState, useMemo, useRef, useEffect } from "react";
 import type {
   ToolUseBlock,
   ToolResultBlock,
@@ -173,9 +173,9 @@ export function ExpandedEditInput({ input }: { input: Record<string, unknown> })
   const newStr = (input.new_string as string) || "";
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // useLayoutEffect fires before paint — scroll position is correct on first frame,
+  // useEffect fires before paint — scroll position is correct on first frame,
   // no flash of the top of the file before snapping to the current write position.
-  useLayoutEffect(() => {
+  useEffect(() => {
     if (containerRef.current) {
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
@@ -214,9 +214,9 @@ export function ExpandedWriteInput({ input }: { input: Record<string, unknown> }
   const content = (input.content as string) || "";
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // useLayoutEffect fires before paint — ensures the scroll tracks the stream
+  // useEffect fires before paint — ensures the scroll tracks the stream
   // position on every frame without a top-of-file flash.
-  useLayoutEffect(() => {
+  useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
@@ -578,9 +578,13 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
     return toolUse.name;
   })();
 
+  // Auto-expand only during active streaming — not for completed (historical) tools.
+  // Rendering expanded Edit/Write blocks for 30+ historical messages forces the browser
+  // to lay out full file contents in whitespace-pre-wrap, blocking the main thread for
+  // several seconds on restore. Completed tools are collapsed; user can expand on demand.
   const expanded = userToggle !== null
     ? userToggle
-    : (isFailed || alwaysExpanded.includes(baseToolName)) && !alwaysCollapsed.includes(baseToolName);
+    : (isFailed || (alwaysExpanded.includes(baseToolName) && !isComplete)) && !alwaysCollapsed.includes(baseToolName);
 
   const label = getToolLabel(toolUse.name);
 

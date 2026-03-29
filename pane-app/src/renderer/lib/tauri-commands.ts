@@ -3,6 +3,11 @@ import type { PunkStreamEvent, ConversationMessage, Todo } from "./punk-types";
 // Electron IPC bridge
 const electronAPI = (window as any).electronAPI;
 
+// Startup diagnostics — forwards renderer logs to ~/.pane/startup.log via IPC
+export function diagLog(msg: string): void {
+  electronAPI.invoke("diag_log", msg).catch(() => {});
+}
+
 export interface FileEntry {
   name: string;
   path: string;
@@ -41,10 +46,10 @@ export async function saveScrollPositions(
 }
 
 export async function saveConversationToMain(
-  filePath: string,
+  projectId: string,
   conversation: { sessionId: string | null; model?: string | null; messages: unknown[]; startIndex?: number },
 ): Promise<void> {
-  return electronAPI.invoke("save_conversation", { filePath, conversation });
+  return electronAPI.invoke("save_conversation", { projectId, conversation });
 }
 
 export async function getConversationSlice(
@@ -59,6 +64,14 @@ export async function getConversationSlice(
   model: string | null;
 }> {
   return electronAPI.invoke("get_conversation_slice", { projectId, count, beforeIndex });
+}
+
+export async function searchConversations(
+  query: string,
+  projectId?: string | null,
+  limit = 20,
+): Promise<{ results: Array<{ message: unknown; projectId: string }> }> {
+  return electronAPI.invoke("search_conversations", { query, projectId: projectId ?? null, limit });
 }
 
 export async function getHomeDir(): Promise<string> {

@@ -5,6 +5,7 @@ import "@fontsource-variable/dm-sans";
 import "@fontsource-variable/geist-mono";
 import "./styles/globals.css";
 
+
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <ErrorBoundary>
     <App />

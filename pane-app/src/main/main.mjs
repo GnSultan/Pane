@@ -11,6 +11,30 @@ import windowStateKeeper from "electron-window-state";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
+
+// Startup diagnostics — writes to ~/.pane/startup.log
+const DIAG_LOG = path.join(os.homedir(), ".pane", "startup.log");
+const _diagT0 = Date.now();
+function diagLog(msg) {
+  const line = `+${Date.now() - _diagT0}ms [main] ${msg}\n`;
+  process.stdout.write(line);
+  try { fs.appendFileSync(DIAG_LOG, line); } catch {}
+}
+// Also register IPC so renderer can write to the same log
+function registerDiagHandler() {
+  ipcMain.handle("diag_log", (_e, msg) => {
+    const line = `+${Date.now() - _diagT0}ms [renderer] ${msg}\n`;
+    process.stdout.write(line);
+    try { fs.appendFileSync(DIAG_LOG, line); } catch {}
+  });
+}
+try { fs.writeFileSync(DIAG_LOG, `--- startup ${new Date().toISOString()} ---\n`); } catch {}
+// Main-process heartbeat — fires every 50ms for 10s to show if main is blocked
+const _mainHb = setInterval(() => {
+  const line = `+${Date.now() - _diagT0}ms [main-hb]\n`;
+  try { fs.appendFileSync(DIAG_LOG, line); } catch {}
+}, 50);
+setTimeout(() => clearInterval(_mainHb), 10000);
 import { promisify } from "node:util";
 import ignore from "ignore";
 import chokidar from "chokidar";
@@ -25,6 +49,7 @@ import { startBackupSchedule } from "./backup-engine.mjs";
 import { initCloudAuth } from "./cloud-auth.mjs";
 import { registerCloudSyncHandlers } from "./cloud-sync.mjs";
 import { MindPunks } from "./mind-punks.mjs";
+import { getPaneDb, extractMessageText } from "./pane-db.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -275,18 +300,30 @@ function registerCommandHandlers() {
     await fs.promises.writeFile(args.path, args.content, { encoding: "utf-8", flag: "w" });
   });
 
-  const SCROLL_POSITIONS_PATH = path.join(os.homedir(), ".pane", "scroll-positions.json");
-  ipcMain.handle("load_scroll_positions", async () => {
+  ipcMain.handle("load_scroll_positions", () => {
     try {
-      const content = await fs.promises.readFile(SCROLL_POSITIONS_PATH, "utf-8");
-      return JSON.parse(content);
+      const db = getPaneDb();
+      const rows = db.stmts.getAllScrolls.all();
+      return Object.fromEntries(rows.map(r => [
+        r.project_id,
+        r.position === "bottom" ? "bottom" : Number(r.position),
+      ]));
     } catch {
       return {};
     }
   });
-  ipcMain.handle("save_scroll_positions", async (_event, args) => {
-    await fs.promises.mkdir(path.dirname(SCROLL_POSITIONS_PATH), { recursive: true });
-    await fs.promises.writeFile(SCROLL_POSITIONS_PATH, JSON.stringify(args.positions), "utf-8");
+  ipcMain.handle("save_scroll_positions", (_event, args) => {
+    try {
+      const db = getPaneDb();
+      const insertAll = db.transaction((positions) => {
+        for (const [pid, pos] of Object.entries(positions)) {
+          db.stmts.upsertScroll.run(pid, String(pos), Date.now());
+        }
+      });
+      insertAll(args.positions);
+    } catch (e) {
+      console.error("[pane-db] save_scroll_positions error:", e.message);
+    }
   });
   ipcMain.handle("rename_file", async (_event, args) => {
     await fs.promises.rename(args.oldPath, args.newPath);
@@ -782,11 +819,15 @@ const defaultSettings = {
 };
 function registerSettingsHandlers() {
   ipcMain.handle("load_settings", async () => {
+    diagLog("load_settings called");
     const filePath = settingsPath();
     try {
       const content = await fs.promises.readFile(filePath, "utf-8");
-      return { ...defaultSettings, ...JSON.parse(content) };
+      const result = { ...defaultSettings, ...JSON.parse(content) };
+      diagLog(`load_settings returning roots=${result.project_roots?.length}`);
+      return result;
     } catch {
+      diagLog("load_settings returning defaults");
       return defaultSettings;
     }
   });
@@ -973,7 +1014,7 @@ function registerWatcherHandlers() {
     }
   });
 }
-function registerCheckpointHandlers() {
+function registerCheckpointHandlers(db) {
   const CHECKPOINT_MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
   const CHECKPOINT_MAX_FILES = 200;
 
@@ -1066,34 +1107,26 @@ function registerCheckpointHandlers() {
       "utf-8",
     );
 
+    // Insert metadata into SQLite
+    db.stmts.insertCheckpoint.run(
+      cpId, projectId, messageId ?? null,
+      checkpoint.timestamp, files.length, headCommit,
+    );
 
-    // Update manifest for external tools (punk-records reads this)
+    // Keep manifest.json in sync for tool-executor.mjs and pane-mcp-server.mjs
     try {
-      const remaining = (await fs.promises.readdir(dir))
-        .filter((f) => f.startsWith("cp-") && f.endsWith(".json"))
-        .sort();
-      const manifest = [];
-      for (const f of remaining) {
-        try {
-          const raw = await fs.promises.readFile(path.join(dir, f), "utf-8");
-          const cp = JSON.parse(raw);
-          manifest.push({
-            id: cp.id,
-            timestamp: cp.timestamp,
-            messageId: cp.messageId,
-            fileCount: cp.files.length,
-            headCommit: cp.headCommit,
-            workingDir,
-          });
-        } catch {}
-      }
+      const allMeta = db.stmts.listCheckpoints.all(projectId);
+      const manifest = allMeta.map(m => ({
+        id: m.id,
+        timestamp: m.created_at,
+        messageId: m.message_id,
+        fileCount: m.file_count,
+        headCommit: m.head_commit,
+        workingDir,
+      }));
       await fs.promises.writeFile(
         path.join(dir, "manifest.json"),
-        JSON.stringify({
-          projectId,
-          projectRoot: workingDir,
-          checkpoints: manifest,
-        }),
+        JSON.stringify({ projectId, projectRoot: workingDir, checkpoints: manifest }),
         "utf-8",
       );
     } catch {}
@@ -1176,29 +1209,14 @@ function registerCheckpointHandlers() {
     return { success: true, restoredFiles: restored };
   });
 
-  ipcMain.handle("list_checkpoints", async (_event, args) => {
-    const { projectId } = args;
+  ipcMain.handle("list_checkpoints", (_event, args) => {
     try {
-      const entries = await fs.promises.readdir(checkpointDir(projectId));
-      const metas = [];
-      for (const entry of entries) {
-        if (!entry.startsWith("cp-") || !entry.endsWith(".json")) continue;
-        try {
-          const raw = await fs.promises.readFile(
-            path.join(checkpointDir(projectId), entry),
-            "utf-8",
-          );
-          const cp = JSON.parse(raw);
-          metas.push({
-            id: cp.id,
-            timestamp: cp.timestamp,
-            messageId: cp.messageId,
-            fileCount: cp.files.length,
-          });
-        } catch {}
-      }
-      metas.sort((a, b) => a.timestamp - b.timestamp);
-      return metas;
+      return db.stmts.listCheckpoints.all(args.projectId).map(m => ({
+        id: m.id,
+        timestamp: m.created_at,
+        messageId: m.message_id,
+        fileCount: m.file_count,
+      }));
     } catch {
       return [];
     }
@@ -1265,57 +1283,43 @@ function registerCheckpointHandlers() {
 
   ipcMain.handle("delete_project_checkpoints", async (_event, args) => {
     try {
-      await fs.promises.rm(checkpointDir(args.projectId), {
-        recursive: true,
-        force: true,
-      });
+      db.stmts.deleteCheckpointsByProject.run(args.projectId);
+      await fs.promises.rm(checkpointDir(args.projectId), { recursive: true, force: true });
     } catch {}
   });
 
   // --- Change History Handlers ---
+  // Primary store: SQLite (change_history table).
+  // Shadow file: ~/.pane/change-history/{projectId}/changes.json is kept in sync
+  // so tool-executor.mjs (UtilityProcess) and pane-mcp-server.mjs can read it
+  // directly without IPC.
+
   function changeHistoryDir(projectId) {
     return path.join(os.homedir(), ".pane", "change-history", projectId);
   }
 
-  function changeHistoryFile(projectId) {
-    return path.join(changeHistoryDir(projectId), "changes.json");
-  }
-
-  // Per-project write queue — serializes concurrent writes so they never race.
-  const changeHistoryQueues = new Map(); // projectId -> Promise
-
-  async function readChangeHistory(projectId) {
+  // Write a shadow copy of all changes to disk for out-of-process readers.
+  async function writeShadowChangeFile(projectId) {
     try {
-      const file = changeHistoryFile(projectId);
-      const data = await fs.promises.readFile(file, "utf-8");
-      return JSON.parse(data);
-    } catch {
-      return [];
+      const rows = db.stmts.getChanges.all(projectId);
+      // Remap to legacy shape so tool-executor.mjs reads without modification
+      const legacy = rows.map(r => ({
+        id: r.id,
+        timestamp: r.timestamp,
+        file: r.file_path,
+        oldString: r.old_string,
+        newString: r.new_string,
+        description: r.description,
+      }));
+      const dir = changeHistoryDir(projectId);
+      await fs.promises.mkdir(dir, { recursive: true });
+      const file = path.join(dir, "changes.json");
+      const tmp = file + ".tmp";
+      await fs.promises.writeFile(tmp, JSON.stringify(legacy, null, 2), "utf-8");
+      await fs.promises.rename(tmp, file);
+    } catch (e) {
+      console.error("[change-history] shadow write failed:", e.message);
     }
-  }
-
-  async function writeChangeHistory(projectId, changes) {
-    const dir = changeHistoryDir(projectId);
-    await fs.promises.mkdir(dir, { recursive: true });
-    const file = changeHistoryFile(projectId);
-    // Atomic write: write to temp file then rename — prevents partial-write corruption
-    const tmp = file + ".tmp";
-    await fs.promises.writeFile(tmp, JSON.stringify(changes, null, 2), "utf-8");
-    await fs.promises.rename(tmp, file);
-  }
-
-  // Enqueue a change-history write for a project.
-  // All writes for the same project are chained — no two run concurrently.
-  function enqueueChangeWrite(projectId, fn) {
-    const prev = changeHistoryQueues.get(projectId) ?? Promise.resolve();
-    const next = prev.then(fn).catch(err =>
-      console.error("[change-history] write failed:", err.message)
-    );
-    // Keep only the tail — old resolved promises can be GC'd
-    changeHistoryQueues.set(projectId, next.then(() => {
-      if (changeHistoryQueues.get(projectId) === next) changeHistoryQueues.delete(projectId);
-    }));
-    return next;
   }
 
   ipcMain.handle("record_change", async (_event, args) => {
@@ -1327,101 +1331,92 @@ function registerCheckpointHandlers() {
       relFile = path.relative(workingDir, filePath);
     }
 
-    const change = {
-      id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: timestamp || Date.now(),
-      file: relFile,
-      oldString,
-      newString,
-      description: description || "",
-    };
+    const id = `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    db.stmts.insertChange.run(
+      id, projectId, relFile,
+      oldString ?? null, newString ?? "",
+      description ?? "", timestamp || Date.now(),
+      workingDir ?? null,
+    );
 
-    await enqueueChangeWrite(projectId, async () => {
-      const changes = await readChangeHistory(projectId);
-      changes.unshift(change);
-      await writeChangeHistory(projectId, changes.slice(0, 500));
-    });
-
-    return { id: change.id, success: true };
+    // Fire-and-forget shadow sync — don't block the IPC response
+    writeShadowChangeFile(projectId);
+    return { id, success: true };
   });
 
-  ipcMain.handle("get_change_history", async (_event, args) => {
-    const { projectId } = args;
-    const changes = await readChangeHistory(projectId);
+  ipcMain.handle("get_change_history", (_event, args) => {
+    const rows = db.stmts.getChanges.all(args.projectId);
+    // Return in legacy shape so ChangeHistoryPanel works without changes
+    const changes = rows.map(r => ({
+      id: r.id,
+      timestamp: r.timestamp,
+      file: r.file_path,
+      oldString: r.old_string,
+      newString: r.new_string,
+      description: r.description,
+    }));
     return { changes };
   });
 
   ipcMain.handle("revert_change", async (_event, args) => {
     const { projectId, changeId, workingDir } = args;
-    
-    const changes = await readChangeHistory(projectId);
-    const changeIndex = changes.findIndex((c) => c.id === changeId);
-    
-    if (changeIndex === -1) {
-      return { success: false, error: "Change not found" };
-    }
-    
-    const change = changes[changeIndex];
-    const resolvedPath = path.isAbsolute(change.file) 
-      ? change.file 
-      : path.join(workingDir, change.file);
-    
+
+    const row = db.stmts.getChangeById.get(changeId);
+    if (!row) return { success: false, error: "Change not found" };
+
+    const resolvedPath = path.isAbsolute(row.file_path)
+      ? row.file_path
+      : path.join(workingDir, row.file_path);
+
     try {
       const currentContent = await fs.promises.readFile(resolvedPath, "utf-8");
-      
-      // Verify the current content matches newString
-      if (!currentContent.includes(change.newString)) {
+
+      if (!currentContent.includes(row.new_string)) {
         return { success: false, error: "File content doesn't match expected change" };
       }
-      
-      // Revert: replace newString with oldString
-      const revertedContent = currentContent.replace(change.newString, change.oldString);
+
+      const revertedContent = currentContent.replace(row.new_string, row.old_string ?? "");
       await fs.promises.writeFile(resolvedPath, revertedContent, "utf-8");
-      
-      // Remove the change from history
-      changes.splice(changeIndex, 1);
-      await writeChangeHistory(projectId, changes);
-      
-      return { 
-        success: true, 
-        output: `Reverted change in ${change.file}`,
-        file: change.file,
-      };
+
+      db.stmts.deleteChangeById.run(changeId);
+      writeShadowChangeFile(projectId);
+
+      return { success: true, output: `Reverted change in ${row.file_path}`, file: row.file_path };
     } catch (error) {
       return { success: false, error: error.message };
     }
   });
 
-  ipcMain.handle("search_changes", async (_event, args) => {
+  ipcMain.handle("search_changes", (_event, args) => {
     const { projectId, query, filePath } = args;
-    
-    const changes = await readChangeHistory(projectId);
-    let filtered = changes;
-    
-    if (filePath) {
-      filtered = filtered.filter((c) => c.file === filePath);
+    let rows;
+    if (filePath && !query) {
+      rows = db.stmts.searchChangesByFile.all(projectId, filePath);
+    } else if (query) {
+      const like = `%${query}%`;
+      rows = filePath
+        ? db.stmts.searchChangesByFile.all(projectId, filePath).filter(r =>
+            r.description?.toLowerCase().includes(query.toLowerCase()) ||
+            r.new_string?.toLowerCase().includes(query.toLowerCase()) ||
+            r.old_string?.toLowerCase().includes(query.toLowerCase())
+          )
+        : db.stmts.searchChanges.all(projectId, like, like, like, like);
+    } else {
+      rows = db.stmts.getChanges.all(projectId);
     }
-    
-    if (query) {
-      const lowerQuery = query.toLowerCase();
-      filtered = filtered.filter((c) => 
-        c.description?.toLowerCase().includes(lowerQuery) ||
-        c.oldString?.toLowerCase().includes(lowerQuery) ||
-        c.newString?.toLowerCase().includes(lowerQuery) ||
-        c.file.toLowerCase().includes(lowerQuery)
-      );
-    }
-    
-    return { changes: filtered };
+    const changes = rows.map(r => ({
+      id: r.id, timestamp: r.timestamp, file: r.file_path,
+      oldString: r.old_string, newString: r.new_string, description: r.description,
+    }));
+    return { changes };
   });
 
   ipcMain.handle("delete_change_history", async (_event, args) => {
     const { projectId } = args;
     try {
-      await fs.promises.rm(changeHistoryDir(projectId), {
-        recursive: true,
-        force: true,
-      });
+      db.stmts.deleteAllChanges.run(projectId);
+      // Also remove shadow file directory
+      await fs.promises.rm(changeHistoryDir(projectId), { recursive: true, force: true });
       return { success: true };
     } catch (error) {
       return { success: false, error: error.message };
@@ -1432,60 +1427,42 @@ function registerCheckpointHandlers() {
 // --- State + Memory handlers for Pane Intelligence Layer ---
 // Writes state to ~/.pane/state/{projectId}/ for the MCP server to read.
 // Writes memory to ~/.pane/memory/{projectId}/ for cross-session persistence.
-function registerStateHandlers() {
-  function stateDir(projectId) {
-    return path.join(os.homedir(), ".pane", "state", projectId);
+function registerStateHandlers(db) {
+  function upsertBlob(projectId, key, data) {
+    db.stmts.upsertBlob.run(projectId, key, JSON.stringify(data), Date.now());
   }
 
-  async function writeStateFile(projectId, filename, data) {
-    const dir = stateDir(projectId);
-    await fs.promises.mkdir(dir, { recursive: true });
-    await fs.promises.writeFile(
-      path.join(dir, filename),
-      JSON.stringify(data),
-      "utf-8",
-    );
+  function readBlob(projectId, key) {
+    const row = db.stmts.getBlob.get(projectId, key);
+    return row ? JSON.parse(row.data) : null;
   }
 
-  ipcMain.handle("write_editor_state", async (_event, args) => {
-    await writeStateFile(args.projectId, "editor.json", args.data);
+  ipcMain.handle("write_editor_state", (_event, args) => {
+    upsertBlob(args.projectId, "editor", args.data);
   });
 
-  ipcMain.handle("write_terminal_state", async (_event, args) => {
-    await writeStateFile(args.projectId, "terminal.json", args.data);
+  ipcMain.handle("write_terminal_state", (_event, args) => {
+    upsertBlob(args.projectId, "terminal", args.data);
   });
 
   // Atomically appends one completed command to the shared multi-tab terminal history.
-  // Each tab calls this independently — the main process serialises writes so tabs
-  // don't overwrite each other.
-  ipcMain.handle("append_terminal_command", async (_event, { projectId, entry }) => {
-    const termPath = path.join(stateDir(projectId), "terminal.json");
-    let data = { commands: [] };
-    try {
-      const raw = await fs.promises.readFile(termPath, "utf-8");
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed.commands)) data.commands = parsed.commands;
-    } catch {}
-    // Remove any stale partial entry for this tab (command just finished)
+  // better-sqlite3 is synchronous — no concurrent write races possible.
+  ipcMain.handle("append_terminal_command", (_event, { projectId, entry }) => {
+    let data = readBlob(projectId, "terminal") ?? { commands: [] };
+    if (!Array.isArray(data.commands)) data.commands = [];
+    // Remove stale partial entry for this tab (command just finished)
     data.commands = data.commands.filter(
       (c) => !(c.tabId === entry.tabId && c.partial === true),
     );
     data.commands.push(entry);
     data.commands = data.commands.slice(-50);
-    await fs.promises.mkdir(stateDir(projectId), { recursive: true });
-    await fs.promises.writeFile(termPath, JSON.stringify(data), "utf-8");
+    upsertBlob(projectId, "terminal", data);
   });
 
-  // Upserts a live snapshot for a long-running command — replaces the previous
-  // partial entry for this tab so the model always sees recent output.
-  ipcMain.handle("update_terminal_running", async (_event, { projectId, entry }) => {
-    const termPath = path.join(stateDir(projectId), "terminal.json");
-    let data = { commands: [] };
-    try {
-      const raw = await fs.promises.readFile(termPath, "utf-8");
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed.commands)) data.commands = parsed.commands;
-    } catch {}
+  // Upserts a live snapshot for a long-running command.
+  ipcMain.handle("update_terminal_running", (_event, { projectId, entry }) => {
+    let data = readBlob(projectId, "terminal") ?? { commands: [] };
+    if (!Array.isArray(data.commands)) data.commands = [];
     const idx = data.commands.findIndex(
       (c) => c.tabId === entry.tabId && c.partial === true,
     );
@@ -1495,104 +1472,92 @@ function registerStateHandlers() {
       data.commands.push(entry);
       data.commands = data.commands.slice(-50);
     }
-    await fs.promises.mkdir(stateDir(projectId), { recursive: true });
-    await fs.promises.writeFile(termPath, JSON.stringify(data), "utf-8");
+    upsertBlob(projectId, "terminal", data);
   });
 
-  ipcMain.handle("write_project_state", async (_event, args) => {
-    await writeStateFile(args.projectId, "project.json", args.data);
+  ipcMain.handle("write_project_state", (_event, args) => {
+    upsertBlob(args.projectId, "project", args.data);
   });
 
-  ipcMain.handle("save_conversation", async (_event, args) => {
-    const { filePath, conversation } = args;
-    const MAX_FILE_SIZE = 5 * 1024 * 1024;
-    const THRESHOLD_SIZE = 4 * 1024 * 1024;
+  // save_conversation: accepts projectId instead of filePath.
+  // Upserts the renderer's in-memory slice — INSERT OR REPLACE handles both
+  // new messages and streaming updates. Rows in the DB outside the renderer's
+  // slice (the history prefix) are untouched; no prefix-merge needed.
+  ipcMain.handle("save_conversation", (_event, args) => {
+    const { projectId, conversation } = args;
+    const { sessionId, model, messages } = conversation;
+    const t0 = Date.now();
+    diagLog(`save_conversation called: ${messages.length} msgs for ${projectId}`);
 
-    // If the renderer only has a slice of the conversation (startIndex > 0),
-    // we must read the prefix from disk and prepend it so we don't lose history.
-    let messages = conversation.messages;
-    if (conversation.startIndex > 0) {
-      try {
-        const existing = JSON.parse(await fs.promises.readFile(filePath, "utf-8"));
-        const prefix = Array.isArray(existing.messages)
-          ? existing.messages.slice(0, conversation.startIndex)
-          : [];
-        messages = [...prefix, ...messages];
-      } catch {
-        // File doesn't exist yet or is corrupt — just use what the renderer has
+    const save = db.transaction(() => {
+      for (const msg of messages) {
+        const id = msg.id || `msg-${projectId}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+        const contentJson = JSON.stringify(msg);
+        db.stmts.insertMessage.run(
+          id, projectId, msg.type ?? "assistant",
+          contentJson,
+          msg.created_at ?? msg.timestamp ?? Date.now(),
+          msg.cost_usd ?? null, msg.duration_ms ?? null,
+          msg.input_tokens ?? null, msg.output_tokens ?? null,
+          msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
+        );
+        // Keep FTS in sync: delete old entry (if any), insert fresh
+        const text = extractMessageText(contentJson);
+        if (text) {
+          db.stmts.deleteFts.run(id);
+          db.stmts.insertFts.run(projectId, id, text);
+        }
       }
-    }
+      db.stmts.upsertConvMeta.run(projectId, sessionId ?? null, model ?? null, Date.now());
+    });
 
-    const data = {
-      sessionId: conversation.sessionId,
-      model: conversation.model,
-      messages,
-    };
-
-    // All JSON.stringify/size-checking happens in Node.js, never the renderer.
-    let json = JSON.stringify(data);
-
-    if (json.length > THRESHOLD_SIZE) {
-      const originalCount = data.messages.length;
-      let keepCount = json.length > MAX_FILE_SIZE
-        ? Math.min(50, originalCount)
-        : Math.min(100, originalCount);
-
-      data.messages = data.messages.slice(-keepCount);
-      json = JSON.stringify(data);
-
-      if (json.length > MAX_FILE_SIZE) {
-        data.messages = data.messages.map((msg) => {
-          if (msg.content && typeof msg.content === "object") {
-            const content = Array.isArray(msg.content) ? msg.content : [msg.content];
-            return {
-              ...msg,
-              content: content.map((item) => {
-                if (item && typeof item === "object" && typeof item.text === "string" && item.text.length > 2000) {
-                  return { ...item, text: item.text.substring(0, 1500) + "\n\n... [truncated] ...\n\n" + item.text.substring(item.text.length - 500) };
-                }
-                return item;
-              }),
-            };
-          }
-          return msg;
-        });
-        json = JSON.stringify(data);
-      }
-    }
-
-    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-    // Unique tmp path per write — concurrent saves each get their own tmp file,
-    // so writeFile calls never interleave on the same file descriptor.
-    // The rename is atomic: last writer wins with a complete snapshot.
-    const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
-    await fs.promises.writeFile(tmpPath, json, { encoding: "utf-8" });
-    await fs.promises.rename(tmpPath, filePath);
-  });
-
-  // Returns a slice of a conversation file — used to load just the last N messages
-  // on startup, and to load older messages on demand. Keeps the renderer lean.
-  ipcMain.handle("get_conversation_slice", async (_event, { projectId, beforeIndex, count }) => {
-    const filePath = path.join(os.homedir(), ".pane", "conversations", `${projectId}.json`);
     try {
-      const content = await fs.promises.readFile(filePath, "utf-8");
-      const parsed = JSON.parse(content.trim());
-      const allMessages = Array.isArray(parsed.messages) ? parsed.messages : [];
-      const totalCount = allMessages.length;
+      save();
+      diagLog(`save_conversation done in ${Date.now()-t0}ms`);
+    } catch (e) {
+      console.error("[pane-db] save_conversation error:", e.message);
+    }
+  });
 
-      // beforeIndex undefined → initial load, take the last `count` messages
+  // Returns a slice of messages from SQLite — sub-millisecond indexed query
+  // regardless of total conversation size.
+  ipcMain.handle("get_conversation_slice", (_event, { projectId, beforeIndex, count }) => {
+    const _t = Date.now();
+    try {
+      const totalCount = db.stmts.countMessages.get(projectId).cnt;
       const end = (beforeIndex != null && beforeIndex >= 0) ? beforeIndex : totalCount;
       const start = Math.max(0, end - count);
-
-      return {
-        messages: allMessages.slice(start, end),
+      const rows = db.stmts.selectMessagesSlice.all(projectId, end - start, start);
+      const meta = db.stmts.getConvMeta.get(projectId);
+      const result = {
+        messages: rows.map(r => JSON.parse(r.content)),
         totalCount,
         startIndex: start,
-        sessionId: parsed.sessionId ?? null,
-        model: parsed.model ?? null,
+        sessionId: meta?.session_id ?? null,
+        model: meta?.model ?? null,
       };
+      diagLog(`get_conversation_slice: ${result.messages.length} msgs in ${Date.now()-_t}ms`);
+      return result;
     } catch {
       return { messages: [], totalCount: 0, startIndex: 0, sessionId: null, model: null };
+    }
+  });
+
+  // Full-text search across conversation messages using FTS5.
+  // projectId = null searches all projects. Results are ranked by relevance.
+  ipcMain.handle("search_conversations", (_event, { query, projectId = null, limit = 20 }) => {
+    try {
+      if (!query?.trim()) return { results: [] };
+      const rows = db.stmts.searchMessages.all({ query: query.trim(), projectId, limit });
+      return {
+        results: rows.map(r => ({
+          message: JSON.parse(r.content),
+          projectId: r.project_id,
+        })),
+      };
+    } catch (e) {
+      console.error("[pane-db] search_conversations error:", e.message);
+      return { results: [] };
     }
   });
 }
@@ -1856,26 +1821,31 @@ Only include items with clear evidence. Empty arrays if nothing found.`;
 }
 
 // --- Session Context (per-project active state for context compilation) ---
-function registerSessionHandlers() {
+// Dual-write: SQLite (state_blobs key='session') + file on disk.
+// session-context.mjs runs in UtilityProcess workers and reads the file directly
+// with fs.readFileSync — we keep the file in sync so it never needs to change.
+function registerSessionHandlers(db) {
   const SESSION_DIR = path.join(os.homedir(), ".pane", "session");
 
-  ipcMain.handle("session_merge_state", async (_event, args) => {
-    const { projectId, delta } = args;
+  function writeSessionFile(projectId, state) {
     const stateDir = path.join(SESSION_DIR, projectId);
-    const statePath = path.join(stateDir, "state.json");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify(state, null, 2), "utf-8");
+  }
 
-    let current = {
+  ipcMain.handle("session_merge_state", (_event, args) => {
+    const { projectId, delta } = args;
+
+    const row = db.stmts.getBlob.get(projectId, "session");
+    let current = row ? JSON.parse(row.data) : {
       activeTask: null, workingSet: [], decisions: [],
       recentActions: [], turnCount: 0, lastProvider: null, lastIntent: null,
       startedAt: Date.now(),
     };
-    try { current = JSON.parse(await fs.promises.readFile(statePath, "utf-8")); } catch {}
 
-    // Active task
     if (delta.activeTask !== undefined) {
       current.activeTask = delta.activeTask ? { ...current.activeTask, ...delta.activeTask } : null;
     }
-    // Working set: upsert by path, cap at 10
     if (delta.workingSet?.length) {
       for (const file of delta.workingSet) {
         const idx = current.workingSet.findIndex(f => f.path === file.path);
@@ -1888,7 +1858,6 @@ function registerSessionHandlers() {
       current.workingSet.sort((a, b) => (b.touches || 0) - (a.touches || 0));
       current.workingSet = current.workingSet.slice(0, 10);
     }
-    // Decisions: prepend new, deduplicate, cap at 8
     if (delta.decisions?.length) {
       for (const d of delta.decisions) {
         const key = d.content.slice(0, 60).toLowerCase();
@@ -1897,7 +1866,6 @@ function registerSessionHandlers() {
       }
       current.decisions = current.decisions.slice(0, 8);
     }
-    // Recent actions: prepend, cap at 8
     if (delta.recentActions?.length) {
       current.recentActions = [...delta.recentActions, ...current.recentActions].slice(0, 8);
     }
@@ -1906,25 +1874,23 @@ function registerSessionHandlers() {
     if (delta.lastIntent)   current.lastIntent = delta.lastIntent;
     if (delta.gitStatus !== undefined) current.gitStatus = delta.gitStatus;
 
-    await fs.promises.mkdir(stateDir, { recursive: true });
-    await fs.promises.writeFile(statePath, JSON.stringify(current, null, 2), "utf-8");
+    db.stmts.upsertBlob.run(projectId, "session", JSON.stringify(current), Date.now());
+    writeSessionFile(projectId, current); // keep file in sync for UtilityProcess readers
     return current;
   });
 
-  ipcMain.handle("session_clear_state", async (_event, args) => {
+  ipcMain.handle("session_clear_state", (_event, args) => {
     const { projectId } = args;
-    const statePath = path.join(SESSION_DIR, projectId, "state.json");
     const blank = { activeTask: null, workingSet: [], decisions: [], recentActions: [],
       turnCount: 0, lastProvider: null, lastIntent: null, startedAt: Date.now() };
-    await fs.promises.mkdir(path.dirname(statePath), { recursive: true });
-    await fs.promises.writeFile(statePath, JSON.stringify(blank, null, 2), "utf-8");
+    db.stmts.upsertBlob.run(projectId, "session", JSON.stringify(blank), Date.now());
+    writeSessionFile(projectId, blank);
     return blank;
   });
 
-  ipcMain.handle("session_read_state", async (_event, args) => {
-    const statePath = path.join(SESSION_DIR, args.projectId, "state.json");
-    try { return JSON.parse(await fs.promises.readFile(statePath, "utf-8")); }
-    catch { return null; }
+  ipcMain.handle("session_read_state", (_event, args) => {
+    const row = db.stmts.getBlob.get(args.projectId, "session");
+    return row ? JSON.parse(row.data) : null;
   });
 }
 
@@ -2191,15 +2157,23 @@ function registerBrainHandlers() {
 }
 
 async function registerIpcHandlers() {
+  const { initPaneDb, runMigrationIfNeeded } = await import("./pane-db.mjs");
+  diagLog("initPaneDb start");
+  const db = initPaneDb();
+  diagLog("initPaneDb done");
+  await runMigrationIfNeeded(db);
+  diagLog("migration done");
+
+  registerDiagHandler();
   registerCommandHandlers();
   registerSettingsHandlers();
   await registerClaudeHandlers();
   registerWatcherHandlers();
   registerPtyHandlers();
-  registerCheckpointHandlers();
-  registerStateHandlers();
+  registerCheckpointHandlers(db);
+  registerStateHandlers(db);
   registerMemoryHandlers();
-  registerSessionHandlers();
+  registerSessionHandlers(db);
   registerBrainHandlers();
 }
 let mainWindow = null;
@@ -2259,12 +2233,6 @@ function createWindow() {
     mainWindow = null;
   });
 
-  mainWindow.webContents.on("render-process-gone", (event, details) => {
-    console.error(`[pane] Renderer process gone: ${details.reason} (${details.exitCode})`);
-    if (details.reason === "crashed" || details.reason === "oom") {
-      console.warn("[pane] Renderer crashed or OOM, reload might be needed.");
-    }
-  });
 }
 // Single-instance lock — required for Windows deep link (second-instance event).
 // Skip in dev: the production app may already hold the lock, which would

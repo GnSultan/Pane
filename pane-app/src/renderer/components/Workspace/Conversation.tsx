@@ -1,10 +1,11 @@
-import { useRef, useEffect, useCallback, useMemo, memo, useState } from "react";
+import { useRef, useEffect, useCallback, useMemo, memo, useState, startTransition } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { usePunk } from "../../hooks/usePunk";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
-import { getConversationSlice, readFile } from "../../lib/tauri-commands";
+import { getConversationSlice, listCheckpoints, readFile } from "../../lib/tauri-commands";
+import { restoringProjects } from "../../hooks/useSettingsPersistence";
 import type {
   ConversationMessage,
   ToolResultBlock,
@@ -149,6 +150,44 @@ export const Conversation = memo(function Conversation({
   streamingRef.current = isActive;
 
   const { applyRestored } = useScrollPosition(projectId, scrollRef, followRef, streamingRef);
+
+  // Lazy load: fetch the last 30 messages from SQLite on mount.
+  // startTransition marks the store update as non-urgent so React can paint
+  // the empty shell first, preventing the main-thread hang on restoration.
+  useEffect(() => {
+    const ps = useProjectsStore.getState();
+    const hasMessages = (ps.projects.get(projectId)?.conversation.messages.length ?? 0) > 0;
+    if (hasMessages) return;
+    getConversationSlice(projectId, 30)
+      .then((slice) => {
+        if (slice.messages.length === 0) return;
+        const seen = new Set<string>();
+        const deduped = (slice.messages as ConversationMessage[]).filter((m) => {
+          if (seen.has(m.id)) return false;
+          seen.add(m.id);
+          return true;
+        });
+        // Mark as restoring before the transition so unsubConversation
+        // skips the save_conversation IPC triggered by countChanged (0→N).
+        restoringProjects.add(projectId);
+        startTransition(() => {
+          const store = useProjectsStore.getState();
+          store.restoreConversation(projectId, deduped, slice.sessionId, {
+            totalCount: slice.totalCount,
+            startIndex: slice.startIndex,
+          });
+          if (slice.model) store.setConversationModel(projectId, slice.model);
+          restoringProjects.delete(projectId);
+        });
+        // Load checkpoint metadata after conversation is restored
+        listCheckpoints(projectId)
+          .then((metas) => {
+            if (metas.length > 0) useProjectsStore.getState().setCheckpoints(projectId, metas);
+          })
+          .catch(() => {});
+      })
+      .catch(() => {});
+  }, [projectId]);
 
   // Restore saved scroll position when messages first arrive from disk.
   useEffect(() => {

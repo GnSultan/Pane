@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, memo } from "react";
+import { useEffect, useRef, useState, useCallback, memo, useTransition } from "react";
 import { Conversation } from "./Conversation";
 import { FileExplorer } from "./FileExplorer";
 import { Terminal } from "./Terminal";
@@ -22,10 +22,13 @@ const electronAPI = window.electronAPI as ElectronAPI;
 // without repainting — sub-millisecond at any refresh rate.
 const ConversationLayer = memo(function ConversationLayer({ projectId }: { projectId: string }) {
   const ref = useRef<HTMLDivElement>(null);
-  const store = useProjectsStore.getState();
-  const initiallyActive =
-    store.activeProjectId === projectId &&
-    (store.projects.get(projectId)?.mode ?? "conversation") === "conversation";
+
+  // Always start unmounted. startTransition defers the heavy Conversation render
+  // so the initial paint (empty area) happens first, keeping the app responsive
+  // when restoring a conversation with many large code blocks.
+  const [mounted, setMounted] = useState(false);
+  const mountedRef = useRef(false);
+  const [, startTransition] = useTransition();
 
   useEffect(() => {
     const apply = (state: ReturnType<typeof useProjectsStore.getState>) => {
@@ -33,6 +36,10 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
       const isActive = state.activeProjectId === projectId;
       const mode = state.projects.get(projectId)?.mode ?? "conversation";
       const shouldShow = isActive && mode === "conversation";
+      if (shouldShow && !mountedRef.current) {
+        mountedRef.current = true;
+        startTransition(() => setMounted(true));
+      }
       ref.current.style.zIndex = shouldShow ? "1" : "0";
       ref.current.style.pointerEvents = shouldShow ? "auto" : "none";
     };
@@ -46,6 +53,12 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
     });
   }, [projectId]);
 
+  // Derive initial styles from store without useState to avoid stale closure
+  const store = useProjectsStore.getState();
+  const initiallyActive =
+    store.activeProjectId === projectId &&
+    (store.projects.get(projectId)?.mode ?? "conversation") === "conversation";
+
   return (
     <div
       ref={ref}
@@ -55,7 +68,7 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
         pointerEvents: initiallyActive ? "auto" : "none",
       }}
     >
-      <Conversation projectId={projectId} />
+      {mounted && <Conversation projectId={projectId} />}
     </div>
   );
 });

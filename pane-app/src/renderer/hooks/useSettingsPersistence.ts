@@ -5,12 +5,10 @@ import {
   getCwd,
   detectProjectRoot,
   readFile,
-  getHomeDir,
-  listCheckpoints,
   brainGetProfile,
   brainGetAvatar,
   saveConversationToMain,
-  getConversationSlice,
+  diagLog,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/punk-types";
@@ -31,7 +29,12 @@ export const appReadyPromise = new Promise<void>((resolve) => {
 // Use a ref for settingsLoaded to avoid HMR resets if possible,
 // but for now let's just make sure it's reliable.
 let settingsLoadedGlobal = false;
-let paneDir = "";
+
+// Projects whose conversations are currently being loaded from SQLite.
+// Populated in Conversation.tsx before startTransition fires restoreConversation,
+// cleared inside the same transition after the store update. Prevents
+// unsubConversation from triggering save_conversation for data we just read.
+export const restoringProjects = new Set<string>();
 
 // --- Conversation persistence helpers ---
 
@@ -39,26 +42,17 @@ interface PersistedConversation {
   sessionId: string | null;
   model?: string | null;
   messages: ConversationMessage[];
-  startIndex?: number; // When > 0, main process must merge with the prefix on disk
+  startIndex?: number;
 }
 
-function precomputeProjectId(root: string): string {
-  const name = root.split("/").filter(Boolean).pop() || root;
-  return name.toLowerCase().replace(/[^a-z0-9]/g, "-");
-}
-
-function conversationPath(projectId: string): string {
-  return `${paneDir}/conversations/${projectId}.json`;
-}
 
 async function saveConversation(
   projectId: string,
   conversation: PersistedConversation,
 ): Promise<void> {
-  if (!paneDir) return;
-  // All JSON.stringify / compaction happens in the main process (Node.js),
-  // so the renderer main thread is never blocked.
-  await saveConversationToMain(conversationPath(projectId), conversation);
+  diagLog(`saveConversation called: ${conversation.messages.length} msgs | ${new Error().stack?.split('\n').slice(1,4).join(' | ')}`);
+  // Passes projectId directly — main process owns storage (SQLite).
+  await saveConversationToMain(projectId, conversation);
 }
 
 
@@ -121,56 +115,17 @@ export function useSettingsPersistence() {
           ws.setIntentAutoRoute(settings.intent_auto_route);
         }
 
-        // 4. Project & Conversation restoration
+        // 4. Project restoration — conversations load lazily in Conversation.tsx
         const { addProject, setActiveProject, toggleDir } =
           useProjectsStore.getState();
 
         if (settings.project_roots?.length > 0) {
-          paneDir = `${await getHomeDir()}/.pane`;
-          const preloaded = await Promise.all(
-            settings.project_roots.map(async (root: string) => {
-              const tentativeId = precomputeProjectId(root);
-              const slice = await getConversationSlice(tentativeId, 30).catch(
-                () => null,
-              );
-              console.log(`[persistence] preloaded project ${tentativeId} from ${root}, hasSaved=${!!slice}, msgCount=${slice?.messages.length || 0}, totalCount=${slice?.totalCount || 0}`);
-              return { root, slice };
-            }),
-          );
-
           let activeId: string | null = null;
           const projectIds: string[] = [];
-          for (const { root, slice } of preloaded) {
-            const tentativeId = precomputeProjectId(root);
-            const id = addProject(root); // Returns the actual ID used in the store
+          for (const root of settings.project_roots as string[]) {
+            const id = addProject(root);
             projectIds.push(id);
             if (root === settings.active_project_root) activeId = id;
-
-            console.log(`[persistence] project ${root}: tentativeId=${tentativeId}, actualId=${id}, hasSaved=${!!slice}`);
-
-            const ps = useProjectsStore.getState();
-            if (slice && slice.messages.length > 0) {
-              // Deduplicate by message ID (persisted data may have duplicates from prior bugs)
-              const seen = new Set<string>();
-              const dedupedMessages = (slice.messages as ConversationMessage[]).filter((m) => {
-                if (seen.has(m.id)) return false;
-                seen.add(m.id);
-                return true;
-              });
-              console.log(`[persistence] restoring conversation for ${id} (loaded: ${dedupedMessages.length}, total on disk: ${slice.totalCount}, startIndex: ${slice.startIndex})`);
-              ps.restoreConversation(id, dedupedMessages, slice.sessionId, {
-                totalCount: slice.totalCount,
-                startIndex: slice.startIndex,
-              });
-              if (slice.model) {
-                ps.setConversationModel(id, slice.model);
-              }
-              listCheckpoints(id)
-                .then((metas) => {
-                  if (metas.length > 0) ps.setCheckpoints(id, metas);
-                })
-                .catch(() => {});
-            }
           }
           if (activeId) setActiveProject(activeId);
 
@@ -390,6 +345,11 @@ export function useSettingsPersistence() {
         const p = state.projects.get(id);
         const pp = prev.projects.get(id);
         if (!p) continue;
+
+        // Skip while conversation is being loaded from SQLite. The
+        // restoringProjects set is populated in Conversation.tsx before
+        // startTransition fires and cleared after the store update completes.
+        if (restoringProjects.has(id)) continue;
 
         // Save when message count changes or session finishes
         const countChanged =

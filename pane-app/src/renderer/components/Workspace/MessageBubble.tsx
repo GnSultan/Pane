@@ -285,17 +285,8 @@ export function MessageBubble({
   if (message.type === "user") {
     const text = getMessageText(message);
     const [isExpanded, setIsExpanded] = useState(false);
-    const [showExpand, setShowExpand] = useState(false);
-    const textRef = useRef<HTMLParagraphElement>(null);
-
-    useEffect(() => {
-      if (textRef.current) {
-        const lineHeight = 24; // Approximate line height
-        const maxLines = 10; // Maximum lines before showing expand button
-        const maxHeight = lineHeight * maxLines;
-        setShowExpand(textRef.current.scrollHeight > maxHeight);
-      }
-    }, [text]);
+    // Text-based heuristic avoids scrollHeight DOM read (forces layout reflow on every user message)
+    const showExpand = text.split('\n').length > 10 || text.length > 600;
 
     const truncatedText = isExpanded || !showExpand ? text : text.split('\n').slice(0, 10).join('\n');
 
@@ -306,7 +297,6 @@ export function MessageBubble({
           style={{ maxWidth: "65ch" }}
         >
           <p
-            ref={textRef}
             className="text-pane-text font-mono leading-[1.75] whitespace-pre-wrap px-4 py-4"
             style={{
               fontSize: "var(--pane-font-size)",

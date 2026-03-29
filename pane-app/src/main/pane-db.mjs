@@ -1,0 +1,531 @@
+/**
+ * pane-db.mjs — SQLite persistence layer for Pane app data.
+ *
+ * Opens ~/.pane/pane.db and owns all data tables:
+ *   messages, conversation_meta, change_history,
+ *   checkpoints, state_blobs, scroll_positions
+ *
+ * better-sqlite3 is synchronous by design. All exported functions are
+ * synchronous unless they touch the filesystem for migration (async).
+ *
+ * Only opened by the main process. UtilityProcess workers (punk-engine,
+ * brain-engine) must NOT import this module — they cannot share the same
+ * SQLite connection safely.
+ */
+
+import __cjs_mod__ from "node:module";
+const require2 = __cjs_mod__.createRequire(import.meta.url);
+const Database = require2("better-sqlite3");
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+
+const PANE_DIR = path.join(os.homedir(), ".pane");
+const DB_PATH = path.join(PANE_DIR, "pane.db");
+
+let _db = null;
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+export function initPaneDb() {
+  if (_db) return _db;
+
+  fs.mkdirSync(PANE_DIR, { recursive: true });
+  _db = new Database(DB_PATH);
+
+  // WAL mode: allows concurrent reads while a write is in progress.
+  // synchronous = NORMAL: safe with WAL, much faster than FULL.
+  _db.pragma("journal_mode = WAL");
+  _db.pragma("synchronous = NORMAL");
+  _db.pragma("foreign_keys = ON");
+
+  _createSchema(_db);
+  _prepareStatements(_db);
+
+  return _db;
+}
+
+export function getPaneDb() {
+  if (!_db) throw new Error("[pane-db] DB not initialized — call initPaneDb() first");
+  return _db;
+}
+
+// ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
+
+function _createSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS migration_version (
+      id      INTEGER PRIMARY KEY CHECK (id = 1),
+      version INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id            TEXT    PRIMARY KEY,
+      project_id    TEXT    NOT NULL,
+      type          TEXT    NOT NULL,
+      content       TEXT    NOT NULL,
+      created_at    INTEGER NOT NULL,
+      cost_usd      REAL,
+      duration_ms   INTEGER,
+      input_tokens  INTEGER,
+      output_tokens INTEGER,
+      checkpoint_id TEXT,
+      model         TEXT,
+      num_turns     INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_project
+      ON messages(project_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS conversation_meta (
+      project_id TEXT    PRIMARY KEY,
+      session_id TEXT,
+      model      TEXT,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS change_history (
+      id          TEXT    PRIMARY KEY,
+      project_id  TEXT    NOT NULL,
+      file_path   TEXT    NOT NULL,
+      old_string  TEXT,
+      new_string  TEXT    NOT NULL,
+      description TEXT    DEFAULT '',
+      timestamp   INTEGER NOT NULL,
+      working_dir TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_changes_project
+      ON change_history(project_id, timestamp);
+
+    CREATE TABLE IF NOT EXISTS checkpoints (
+      id          TEXT    PRIMARY KEY,
+      project_id  TEXT    NOT NULL,
+      message_id  TEXT,
+      created_at  INTEGER NOT NULL,
+      file_count  INTEGER NOT NULL DEFAULT 0,
+      head_commit TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_checkpoints_project
+      ON checkpoints(project_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS state_blobs (
+      project_id TEXT    NOT NULL,
+      key        TEXT    NOT NULL,
+      data       TEXT    NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (project_id, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS scroll_positions (
+      project_id TEXT    PRIMARY KEY,
+      position   TEXT    NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    -- FTS5 full-text search across all conversation messages.
+    -- Stores extracted plain text from message content blocks.
+    -- porter unicode61 tokenizer handles stemming (search "running" finds "run").
+    -- project_id and message_id are UNINDEXED — stored but not tokenized,
+    -- used to join back to the messages table on search results.
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+      project_id  UNINDEXED,
+      message_id  UNINDEXED,
+      text_content,
+      tokenize = 'porter unicode61'
+    );
+
+    -- Keep FTS in sync when messages are deleted.
+    CREATE TRIGGER IF NOT EXISTS messages_fts_delete
+    AFTER DELETE ON messages
+    BEGIN
+      DELETE FROM messages_fts WHERE message_id = old.id;
+    END;
+  `);
+}
+
+// ---------------------------------------------------------------------------
+// Prepared statements (attached to db object for easy access)
+// ---------------------------------------------------------------------------
+
+function _prepareStatements(db) {
+  db.stmts = {
+    // migration
+    getMigrationVersion: db.prepare("SELECT version FROM migration_version WHERE id = 1"),
+    setMigrationVersion: db.prepare("INSERT OR REPLACE INTO migration_version (id, version) VALUES (1, ?)"),
+
+    // messages
+    insertMessage: db.prepare(`
+      INSERT OR REPLACE INTO messages
+        (id, project_id, type, content, created_at,
+         cost_usd, duration_ms, input_tokens, output_tokens,
+         checkpoint_id, model, num_turns)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    countMessages: db.prepare("SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ?"),
+    deleteAllMessages: db.prepare("DELETE FROM messages WHERE project_id = ?"),
+    selectMessagesSlice: db.prepare(`
+      SELECT content FROM messages
+      WHERE project_id = ?
+      ORDER BY created_at ASC, rowid ASC
+      LIMIT ? OFFSET ?
+    `),
+
+    // conversation_meta
+    upsertConvMeta: db.prepare(`
+      INSERT OR REPLACE INTO conversation_meta (project_id, session_id, model, updated_at)
+      VALUES (?, ?, ?, ?)
+    `),
+    getConvMeta: db.prepare("SELECT session_id, model FROM conversation_meta WHERE project_id = ?"),
+
+    // change_history
+    insertChange: db.prepare(`
+      INSERT INTO change_history
+        (id, project_id, file_path, old_string, new_string, description, timestamp, working_dir)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    getChanges: db.prepare(
+      "SELECT * FROM change_history WHERE project_id = ? ORDER BY timestamp DESC LIMIT 500"
+    ),
+    getChangeById: db.prepare("SELECT * FROM change_history WHERE id = ?"),
+    deleteChangeById: db.prepare("DELETE FROM change_history WHERE id = ?"),
+    deleteAllChanges: db.prepare("DELETE FROM change_history WHERE project_id = ?"),
+    searchChanges: db.prepare(
+      "SELECT * FROM change_history WHERE project_id = ? AND (file_path LIKE ? OR description LIKE ? OR new_string LIKE ? OR old_string LIKE ?) ORDER BY timestamp DESC LIMIT 200"
+    ),
+    searchChangesByFile: db.prepare(
+      "SELECT * FROM change_history WHERE project_id = ? AND file_path = ? ORDER BY timestamp DESC LIMIT 200"
+    ),
+
+    // checkpoints
+    insertCheckpoint: db.prepare(`
+      INSERT OR REPLACE INTO checkpoints
+        (id, project_id, message_id, created_at, file_count, head_commit)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `),
+    listCheckpoints: db.prepare(
+      "SELECT * FROM checkpoints WHERE project_id = ? ORDER BY created_at ASC"
+    ),
+    getCheckpoint: db.prepare("SELECT * FROM checkpoints WHERE id = ?"),
+    deleteCheckpointsByProject: db.prepare("DELETE FROM checkpoints WHERE project_id = ?"),
+
+    // state_blobs
+    upsertBlob: db.prepare(`
+      INSERT OR REPLACE INTO state_blobs (project_id, key, data, updated_at)
+      VALUES (?, ?, ?, ?)
+    `),
+    getBlob: db.prepare("SELECT data FROM state_blobs WHERE project_id = ? AND key = ?"),
+
+    // scroll_positions
+    upsertScroll: db.prepare(`
+      INSERT OR REPLACE INTO scroll_positions (project_id, position, updated_at)
+      VALUES (?, ?, ?)
+    `),
+    getAllScrolls: db.prepare("SELECT project_id, position FROM scroll_positions"),
+
+    // FTS5 — full-text search across messages
+    // Delete + re-insert pattern handles both new inserts and updates cleanly.
+    deleteFts: db.prepare("DELETE FROM messages_fts WHERE message_id = ?"),
+    insertFts: db.prepare(
+      "INSERT INTO messages_fts (project_id, message_id, text_content) VALUES (?, ?, ?)"
+    ),
+    // Full-text search. Pass { query, projectId, limit } as named params.
+    // projectId = null searches across all projects.
+    searchMessages: db.prepare(`
+      SELECT m.content, m.project_id
+      FROM messages_fts f
+      JOIN messages m ON m.id = f.message_id
+      WHERE messages_fts MATCH @query
+        AND (@projectId IS NULL OR f.project_id = @projectId)
+      ORDER BY rank
+      LIMIT @limit
+    `),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Text extraction helper for FTS indexing
+// ---------------------------------------------------------------------------
+
+// Extracts plain text from a stored message content JSON string.
+// Indexes only text blocks — skips tool calls, tool results, thinking blocks.
+export function extractMessageText(contentJson) {
+  try {
+    const msg = JSON.parse(contentJson);
+    const blocks = Array.isArray(msg.content) ? msg.content : [];
+    return blocks
+      .filter(b => b.type === "text" && typeof b.text === "string")
+      .map(b => b.text)
+      .join(" ")
+      .trim();
+  } catch {
+    return "";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One-time migration from legacy JSON files
+// ---------------------------------------------------------------------------
+
+export async function runMigrationIfNeeded(db) {
+  const row = db.stmts.getMigrationVersion.get();
+  const version = row?.version ?? 0;
+
+  if (version < 1) {
+    console.log("[pane-db] Running one-time migration from JSON files...");
+    try { await _migrateConversations(db); } catch (e) { console.error("[pane-db] conv migration error:", e.message); }
+    try { await _migrateChangeHistory(db); } catch (e) { console.error("[pane-db] change migration error:", e.message); }
+    try { await _migrateCheckpoints(db); }  catch (e) { console.error("[pane-db] checkpoint migration error:", e.message); }
+    try { await _migrateStateBlobs(db); }   catch (e) { console.error("[pane-db] state migration error:", e.message); }
+    try { await _migrateScrollPositions(db); } catch (e) { console.error("[pane-db] scroll migration error:", e.message); }
+    db.stmts.setMigrationVersion.run(1);
+    console.log("[pane-db] Migration v1 complete.");
+  }
+
+  if (version < 3) {
+    console.log("[pane-db] Running migration v2/v3: importing archived conversations...");
+    try { await _migrateArchivedConversations(db); } catch (e) { console.error("[pane-db] archived migration error:", e.message); }
+    db.stmts.setMigrationVersion.run(3);
+    console.log("[pane-db] Migration v3 complete.");
+  }
+}
+
+async function _migrateConversations(db) {
+  const convDir = path.join(PANE_DIR, "conversations");
+  let files;
+  try { files = fs.readdirSync(convDir).filter(f => f.endsWith(".json")); }
+  catch { return; } // directory doesn't exist yet
+
+  for (const file of files) {
+    const projectId = file.replace(".json", "");
+    try {
+      const raw = fs.readFileSync(path.join(convDir, file), "utf-8");
+      const data = JSON.parse(raw.trim());
+      const messages = Array.isArray(data.messages) ? data.messages : [];
+
+      const insertMessages = db.transaction((msgs) => {
+        for (let i = 0; i < msgs.length; i++) {
+          const msg = msgs[i];
+          const id = msg.id || `migrated-${projectId}-${i}`;
+          const contentJson = JSON.stringify(msg);
+          db.stmts.insertMessage.run(
+            id, projectId, msg.type ?? "assistant",
+            contentJson,
+            msg.created_at ?? msg.timestamp ?? (Date.now() + i),
+            msg.cost_usd ?? null, msg.duration_ms ?? null,
+            msg.input_tokens ?? null, msg.output_tokens ?? null,
+            msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
+          );
+          const text = extractMessageText(contentJson);
+          if (text) {
+            db.stmts.deleteFts.run(id);
+            db.stmts.insertFts.run(projectId, id, text);
+          }
+        }
+        db.stmts.upsertConvMeta.run(projectId, data.sessionId ?? null, data.model ?? null, Date.now());
+      });
+
+      insertMessages(messages);
+      console.log(`[pane-db] migrated ${messages.length} messages for project ${projectId}`);
+    } catch (e) {
+      console.error(`[pane-db] failed to migrate conversation ${file}:`, e.message);
+    }
+  }
+}
+
+// Migration v2: import conversations from archived .bak files that were skipped by v1.
+// Prefers <name>.json.bak, falls back to <name>.json.fix.bak if the primary is corrupt.
+// Skips projects that already have messages in SQLite (e.g. pane was migrated in v1).
+async function _migrateArchivedConversations(db) {
+  const archivedDir = path.join(PANE_DIR, "conversations", "archived");
+  let allFiles;
+  try { allFiles = fs.readdirSync(archivedDir); }
+  catch { return; } // archived dir doesn't exist
+
+  // Collect candidate files per project: primary (.json.bak) and fix (.json.fix.bak)
+  const primaries = new Map(); // projectId → primary filePath
+  const fixes = new Map();     // projectId → fix filePath
+  for (const file of allFiles) {
+    const primaryMatch = file.match(/^(.+)\.json\.bak$/);
+    const fixMatch = file.match(/^(.+)\.json\.fix\.bak$/);
+    if (primaryMatch) primaries.set(primaryMatch[1], path.join(archivedDir, file));
+    else if (fixMatch) fixes.set(fixMatch[1], path.join(archivedDir, file));
+  }
+  // Build candidate list: all project IDs from either set
+  const allIds = new Set([...primaries.keys(), ...fixes.keys()]);
+  const candidates = new Map();
+  for (const id of allIds) {
+    // Prefer primary; fix is the fallback if primary is absent
+    candidates.set(id, { primary: primaries.get(id), fix: fixes.get(id) });
+  }
+
+  for (const [projectId, { primary, fix }] of candidates) {
+    // Skip if already has messages (v1 already migrated it)
+    const existing = db.prepare("SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ?").get(projectId);
+    if (existing?.cnt > 0) {
+      console.log(`[pane-db] skipping archived ${projectId}: already has ${existing.cnt} messages`);
+      continue;
+    }
+
+    // Try primary first, then fix as fallback
+    const filesToTry = [primary, fix].filter(Boolean);
+    let migrated = false;
+    for (const filePath of filesToTry) {
+      try {
+        const raw = fs.readFileSync(filePath, "utf-8");
+        const data = JSON.parse(raw.trim());
+        const messages = Array.isArray(data.messages) ? data.messages : [];
+        if (messages.length === 0) continue;
+
+        const insertMessages = db.transaction((msgs) => {
+          for (let i = 0; i < msgs.length; i++) {
+            const msg = msgs[i];
+            const id = msg.id || `archived-${projectId}-${i}`;
+            const contentJson = JSON.stringify(msg);
+            db.stmts.insertMessage.run(
+              id, projectId, msg.type ?? "assistant",
+              contentJson,
+              msg.created_at ?? msg.timestamp ?? (Date.now() + i),
+              msg.cost_usd ?? null, msg.duration_ms ?? null,
+              msg.input_tokens ?? null, msg.output_tokens ?? null,
+              msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
+            );
+            const text = extractMessageText(contentJson);
+            if (text) {
+              db.stmts.deleteFts.run(id);
+              db.stmts.insertFts.run(projectId, id, text);
+            }
+          }
+          db.stmts.upsertConvMeta.run(projectId, data.sessionId ?? null, data.model ?? null, Date.now());
+        });
+
+        insertMessages(messages);
+        console.log(`[pane-db] archived migration: ${messages.length} messages for ${projectId} (${path.basename(filePath)})`);
+        migrated = true;
+        break;
+      } catch (e) {
+        console.error(`[pane-db] failed to parse ${path.basename(filePath)} for ${projectId}: ${e.message}`);
+      }
+    }
+    if (!migrated) console.error(`[pane-db] no valid backup found for ${projectId}`);
+  }
+}
+
+async function _migrateChangeHistory(db) {
+  const historyDir = path.join(PANE_DIR, "change-history");
+  let projects;
+  try { projects = fs.readdirSync(historyDir); }
+  catch { return; }
+
+  for (const projectId of projects) {
+    const file = path.join(historyDir, projectId, "changes.json");
+    try {
+      const raw = fs.readFileSync(file, "utf-8");
+      const changes = JSON.parse(raw.trim());
+      if (!Array.isArray(changes)) continue;
+
+      const insertAll = db.transaction((items) => {
+        for (const c of items) {
+          // Existing records use `file` field; new schema uses `file_path`
+          db.stmts.insertChange.run(
+            c.id ?? `ch-migrated-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+            projectId,
+            c.file ?? c.file_path ?? "",
+            c.oldString ?? c.old_string ?? null,
+            c.newString ?? c.new_string ?? "",
+            c.description ?? "",
+            c.timestamp ?? Date.now(),
+            c.workingDir ?? c.working_dir ?? null,
+          );
+        }
+      });
+      insertAll(changes);
+      console.log(`[pane-db] migrated ${changes.length} changes for project ${projectId}`);
+    } catch (e) {
+      console.error(`[pane-db] failed to migrate change history for ${projectId}:`, e.message);
+    }
+  }
+}
+
+async function _migrateCheckpoints(db) {
+  const cpBaseDir = path.join(PANE_DIR, "checkpoints");
+  let projects;
+  try { projects = fs.readdirSync(cpBaseDir); }
+  catch { return; }
+
+  for (const projectId of projects) {
+    const dir = path.join(cpBaseDir, projectId);
+    let entries;
+    try { entries = fs.readdirSync(dir); }
+    catch { continue; }
+
+    const insertAll = db.transaction((items) => {
+      for (const { id, messageId, timestamp, fileCount, headCommit } of items) {
+        db.stmts.insertCheckpoint.run(id, projectId, messageId ?? null, timestamp, fileCount, headCommit ?? null);
+      }
+    });
+
+    const items = [];
+    for (const entry of entries) {
+      if (!entry.startsWith("cp-") || !entry.endsWith(".json")) continue;
+      try {
+        const cp = JSON.parse(fs.readFileSync(path.join(dir, entry), "utf-8"));
+        items.push({
+          id: cp.id,
+          messageId: cp.messageId ?? null,
+          timestamp: cp.timestamp ?? Date.now(),
+          fileCount: Array.isArray(cp.files) ? cp.files.length : 0,
+          headCommit: cp.headCommit ?? null,
+        });
+      } catch {}
+    }
+    if (items.length) {
+      insertAll(items);
+      console.log(`[pane-db] migrated ${items.length} checkpoints for project ${projectId}`);
+    }
+  }
+}
+
+async function _migrateStateBlobs(db) {
+  const stateDir = path.join(PANE_DIR, "state");
+  const sessionDir = path.join(PANE_DIR, "session");
+  let projects = new Set();
+
+  try { for (const p of fs.readdirSync(stateDir)) projects.add(p); } catch {}
+  try { for (const p of fs.readdirSync(sessionDir)) projects.add(p); } catch {}
+
+  const insertBlob = db.transaction((projectId, key, data) => {
+    db.stmts.upsertBlob.run(projectId, key, JSON.stringify(data), Date.now());
+  });
+
+  for (const projectId of projects) {
+    for (const key of ["editor", "terminal", "project"]) {
+      try {
+        const raw = fs.readFileSync(path.join(stateDir, projectId, `${key}.json`), "utf-8");
+        insertBlob(projectId, key, JSON.parse(raw));
+      } catch {}
+    }
+    try {
+      const raw = fs.readFileSync(path.join(sessionDir, projectId, "state.json"), "utf-8");
+      insertBlob(projectId, "session", JSON.parse(raw));
+    } catch {}
+  }
+}
+
+async function _migrateScrollPositions(db) {
+  const file = path.join(PANE_DIR, "scroll-positions.json");
+  try {
+    const raw = fs.readFileSync(file, "utf-8");
+    const positions = JSON.parse(raw.trim());
+    const insertAll = db.transaction((entries) => {
+      for (const [projectId, position] of entries) {
+        db.stmts.upsertScroll.run(projectId, String(position), Date.now());
+      }
+    });
+    insertAll(Object.entries(positions));
+  } catch {} // file may not exist yet
+}
