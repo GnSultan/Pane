@@ -37,12 +37,11 @@ async function registerClaudeHandlers() {
   // Punk is the default engine; keep these names for backwards compatibility.
   await registerPunkHandlers();
   ipcMain.handle("send_to_claude", async (_event, args) => {
-    const { projectId, prompt, workingDir, sessionId, model, intent } = args;
+    const { projectId, prompt, workingDir, model, intent } = args;
     await punkEngine.spawn({
       projectId,
       prompt,
       workingDir,
-      sessionId,
       model,
       intent,
     });
@@ -1458,7 +1457,7 @@ function registerStateHandlers(db) {
   // slice (the history prefix) are untouched; no prefix-merge needed.
   ipcMain.handle("save_conversation", (_event, args) => {
     const { projectId, conversation } = args;
-    const { sessionId, model, messages } = conversation;
+    const { model, messages } = conversation;
 
     const save = db.transaction(() => {
       for (const msg of messages) {
@@ -1479,7 +1478,7 @@ function registerStateHandlers(db) {
           db.stmts.insertFts.run(projectId, id, text);
         }
       }
-      db.stmts.upsertConvMeta.run(projectId, sessionId ?? null, model ?? null, Date.now());
+      db.stmts.upsertConvMeta.run(projectId, null, model ?? null, Date.now());
     });
 
     try {
@@ -1503,12 +1502,11 @@ function registerStateHandlers(db) {
         messages: rows.map(r => JSON.parse(r.content)),
         totalCount,
         startIndex: start,
-        sessionId: meta?.session_id ?? null,
         model: meta?.model ?? null,
       };
       return result;
     } catch {
-      return { messages: [], totalCount: 0, startIndex: 0, sessionId: null, model: null };
+      return { messages: [], totalCount: 0, startIndex: 0, model: null };
     }
   });
 
@@ -2098,6 +2096,11 @@ function registerBrainHandlers() {
   ipcMain.handle('lens_posts_list', async (_event, args) => {
     const result = await brainRequest('lens_posts_list', { projectId: args.projectId ?? null });
     return result?.posts ?? [];
+  });
+
+  ipcMain.handle('lens_post_delete', async (_event, args) => {
+    await brainRequest('lens_post_delete', { postId: args.postId });
+    return { success: true };
   });
 
   ipcMain.handle('lens_comments_list', async (_event, args) => {

@@ -2555,6 +2555,15 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
+      case "lens_post_delete": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        // Delete post and cascade to all comments
+        const delPost = db.prepare(`DELETE FROM lens_posts WHERE id = ? RETURNING *`).get(data.postId);
+        const delComments = db.prepare(`DELETE FROM lens_comments WHERE post_id = ?`).run(data.postId);
+        sendToMain({ type: "lens_post_deleted", requestId: data.requestId, deleted: true });
+        break;
+      }
+
       case "lens_comments_list": {
         if (!db) { sendToMain({ type: "lens_comments", requestId: data.requestId, comments: [] }); break; }
         const comments = db.prepare(`SELECT * FROM lens_comments WHERE post_id = ? ORDER BY timestamp ASC`).all(data.postId);

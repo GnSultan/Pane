@@ -4,7 +4,7 @@ import { useLensStore } from "../../stores/lens";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useMindStore } from "../../stores/mind";
-import { lensPostAdd, lensPostsList, type LensPost } from "../../lib/tauri-commands";
+import { lensPostAdd, lensPostsList, lensPostDelete, type LensPost } from "../../lib/tauri-commands";
 import { useLensChat } from "../../hooks/useLensChat";
 import { SlashMenu } from "../shared";
 import type { TextBlock } from "../../lib/punk-types";
@@ -16,8 +16,6 @@ const PUNK_PERSONAS: Record<string, { name: string; role: string }> = {
 };
 
 // ─── PostComments ──────────────────────────────────────────────────────────
-// Design: Follows ToolActivity pattern — separate card, border-only, monospace,
-// no decorative chrome. Standalone visual unit with whitespace separation.
 
 function PostComments({
   postId,
@@ -37,11 +35,10 @@ function PostComments({
   );
 
   const [input, setInput] = useState("");
-  const [focused, setFocused] = useState(false);
+  const [expandedMsgId, setExpandedMsgId] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Listen for worker replies pushed from the main process
   useEffect(() => {
     const electronAPI = (window as any).electronAPI;
     const unlisten = electronAPI.on("pane://lens-comment", (data: { postId: string; comment: any }) => {
@@ -54,7 +51,6 @@ function PostComments({
     return () => unlisten();
   }, [postId, appendMessage]);
 
-  // Scroll to bottom when messages change
   useEffect(() => {
     if (isVisible) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -65,9 +61,7 @@ function PostComments({
     const text = input.trim();
     if (!text || isProcessing) return;
     setInput("");
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
     await sendMessage(text);
   };
 
@@ -81,10 +75,10 @@ function PostComments({
   if (!isVisible) return null;
 
   return (
-    <div className="border border-[var(--pane-border-soft)] bg-pane-bg/60 rounded-md p-3 mt-4">
-      {/* Message thread */}
+    <div className="pl-5 mt-1.5 mb-1">
+      {/* Comment thread — each comment truncated, tap to expand */}
       {messages.length > 0 && (
-        <div className="flex flex-col gap-3 mb-3">
+        <div className="flex flex-col gap-1 mb-2">
           {messages.map((msg) => {
             const isAssistant = msg.type === "assistant";
             const text = msg.content
@@ -92,60 +86,38 @@ function PostComments({
               .map((b) => b.text)
               .join("");
             if (!text) return null;
+            const isExpanded = expandedMsgId === msg.id;
+            const isLong = text.length > 80;
             return (
-              <div key={msg.id} className="flex flex-col gap-1">
+              <div key={msg.id} className="flex gap-2 items-baseline min-w-0">
                 <span
-                  className="font-mono"
+                  className="font-mono shrink-0"
                   style={{
                     fontSize: "var(--pane-font-size-xs)",
-                    color: isAssistant
-                      ? "var(--pane-terminal)"
-                      : "var(--pane-text-secondary)",
-                    opacity: isAssistant ? 0.8 : 0.5,
+                    color: isAssistant ? "var(--pane-terminal)" : "var(--pane-text-secondary)",
+                    opacity: isAssistant ? 0.7 : 0.4,
                   }}
                 >
                   {isAssistant ? "pane" : "you"}
                 </span>
-                <p
-                  className="text-pane-text leading-relaxed whitespace-pre-wrap"
-                  style={{ fontSize: "var(--pane-font-size-sm)" }}
+                <span
+                  className={`text-pane-text/60 leading-snug whitespace-pre-wrap min-w-0 flex-1 ${!isExpanded && isLong ? "line-clamp-1" : ""} ${isLong ? "cursor-pointer" : ""}`}
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  onClick={() => isLong && setExpandedMsgId(isExpanded ? null : msg.id)}
                 >
                   {text}
                   {msg.isStreaming && (
-                    <span
-                      className="inline-block ml-1 animate-pulse"
-                      style={{ color: "var(--pane-terminal)" }}
-                    >
-                      ▋
-                    </span>
+                    <span className="inline-block ml-1 animate-pulse" style={{ color: "var(--pane-terminal)" }}>▋</span>
                   )}
-                </p>
+                </span>
               </div>
             );
           })}
 
-          {/* Thinking dots — AI processing but no content yet */}
-          {isProcessing && messages.length > 0 && messages[messages.length - 1]?.type === "user" && (
-            <div className="flex items-center gap-1" style={{ height: "1.25rem" }}>
-              <span
-                className="font-mono"
-                style={{
-                  fontSize: "var(--pane-font-size-xs)",
-                  color: "var(--pane-terminal)",
-                }}
-              >
-                pane
-              </span>
-              <span
-                className="animate-pulse"
-                style={{
-                  fontSize: "var(--pane-font-size-xs)",
-                  color: "var(--pane-terminal)",
-                  opacity: 0.6,
-                }}
-              >
-                ...
-              </span>
+          {isProcessing && messages[messages.length - 1]?.type === "user" && (
+            <div className="flex items-center gap-2">
+              <span className="font-mono shrink-0" style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)", opacity: 0.7 }}>pane</span>
+              <span className="animate-pulse font-mono" style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)", opacity: 0.5 }}>...</span>
             </div>
           )}
 
@@ -153,47 +125,19 @@ function PostComments({
         </div>
       )}
 
-      {/* Thinking dots when first message not yet visible */}
       {isProcessing && messages.length === 0 && (
-        <div className="flex items-center gap-1 mb-3" style={{ height: "1.25rem" }}>
-          <span
-            className="font-mono"
-            style={{
-              fontSize: "var(--pane-font-size-xs)",
-              color: "var(--pane-terminal)",
-            }}
-          >
-            pane
-          </span>
-          <span
-            className="animate-pulse"
-            style={{
-              fontSize: "var(--pane-font-size-xs)",
-              color: "var(--pane-terminal)",
-              opacity: 0.6,
-            }}
-          >
-            ...
-          </span>
+        <div className="flex items-center gap-2 mb-2">
+          <span className="font-mono shrink-0" style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)", opacity: 0.7 }}>pane</span>
+          <span className="animate-pulse font-mono" style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)", opacity: 0.5 }}>...</span>
         </div>
       )}
 
-      {/* Error */}
       {error && (
-        <p
-          className="text-pane-error mb-3 font-mono"
-          style={{ fontSize: "var(--pane-font-size-xs)" }}
-        >
-          {error}
-        </p>
+        <p className="text-pane-error mb-2 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>{error}</p>
       )}
 
-      {/* Reply input — matches ToolActivity edit input style */}
-      <div
-        className={`rounded-md border transition-all relative mt-4 ${
-          focused ? "border-pane-border/60 bg-pane-bg/80" : "border-pane-border/30 bg-pane-bg/40"
-        }`}
-      >
+      {/* Reply input — no border, bg-pane-surface defines the container */}
+      <div className="bg-pane-surface rounded-md relative">
         <textarea
           ref={textareaRef}
           value={input}
@@ -203,25 +147,23 @@ function PostComments({
             e.target.style.height = `${e.target.scrollHeight}px`;
           }}
           onKeyDown={handleKeyDown}
-          onFocus={() => setFocused(true)}
-          onBlur={() => setFocused(false)}
           placeholder="reply"
           rows={1}
           disabled={isProcessing}
-          className="w-full bg-transparent text-pane-text font-mono resize-none outline-none placeholder:text-pane-text-secondary/30 leading-[1.75] px-3 pt-2 overflow-hidden"
+          className="w-full bg-transparent text-pane-text font-mono resize-none outline-none placeholder:text-pane-text-secondary/30 leading-[1.75] px-3 pt-1.5 overflow-hidden"
           style={{
-            fontSize: "var(--pane-font-size-sm)",
-            minHeight: "2.25rem",
+            fontSize: "var(--pane-font-size-xs)",
+            minHeight: "2rem",
             maxHeight: "6rem",
-            paddingBottom: input.trim() ? "2rem" : "0.5rem",
+            paddingBottom: input.trim() ? "1.75rem" : "0.375rem",
           }}
         />
         {input.trim() && (
           <button
             onMouseDown={(e) => { e.preventDefault(); handleSend(); }}
-            className="absolute bottom-1.5 right-1.5 w-7 h-7 flex items-center justify-center rounded-md text-pane-text-secondary/50 hover:text-pane-text hover:bg-pane-text/[0.06] transition-all btn-press ring-1 ring-pane-border/30"
+            className="absolute bottom-1 right-1 w-6 h-6 flex items-center justify-center rounded text-pane-text-secondary/50 hover:text-pane-text hover:bg-pane-text/[0.06] transition-all btn-press"
           >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
             </svg>
           </button>
@@ -232,11 +174,8 @@ function PostComments({
 }
 
 // ─── PostItem ──────────────────────────────────────────────────────────────
-// Design: Follows ToolActivity pattern — no background, border-only cards,
-// monospace, minimal chrome, linear flow. Comments are separate cards below.
-// Posts always fully visible, no truncation. Comment button toggles comments.
 
-const POST_TRUNCATE_CHARS = 180; // still used for truncation detection but not UI
+const POST_CLAMP_THRESHOLD = 220;
 
 function PostItem({
   post,
@@ -244,30 +183,33 @@ function PostItem({
   onToggleComments,
   workingDir,
   userName,
+  onDelete,
 }: {
   post: LensPost;
   showComments: boolean;
   onToggleComments: () => void;
   workingDir: string;
   userName: string;
+  onDelete: () => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const isPunk = post.contributor !== "user";
   const persona = isPunk ? PUNK_PERSONAS[post.contributor] : null;
   const name = persona ? persona.name : (userName || "you");
   const commentCount = post.comment_count ?? 0;
+  const isLong = post.content.length > POST_CLAMP_THRESHOLD;
 
   return (
-    <div className="transition-all duration-200 border border-[var(--pane-border-soft)] bg-pane-bg/60 mb-6">
-      <div className="flex items-start gap-3 px-3 py-2.5">
-        {/* MicroIndicator — status dot */}
-        <div className="mt-[7px] shrink-0 opacity-100">
-          <div className={`w-1.5 h-1.5 rounded-full ${isPunk ? 'bg-pane-terminal' : 'bg-pane-text-secondary/50'}`} />
+    <div className="mb-5">
+      <div className="flex items-start gap-2.5 px-1 py-1">
+        {/* Status dot */}
+        <div className="mt-[6px] shrink-0">
+          <div className={`w-1.5 h-1.5 rounded-full ${isPunk ? "bg-pane-terminal" : "bg-pane-text-secondary/40"}`} />
         </div>
 
-        {/* Content block */}
         <div className="flex-1 min-w-0">
-          {/* Contributor name */}
-          <div className="mb-1.5">
+          {/* Name */}
+          <div className="mb-1">
             <span
               className="font-mono"
               style={{
@@ -279,52 +221,84 @@ function PostItem({
               {name}
             </span>
             {persona && (
-              <span
-                className="font-mono text-pane-text-secondary/25 ml-1.5"
-                style={{ fontSize: "var(--pane-font-size-xs)" }}
-              >
+              <span className="font-mono text-pane-text-secondary/25 ml-1.5" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                 {persona.role}
               </span>
             )}
           </div>
 
-          {/* Post content - always fully visible */}
+          {/* Content — clamped to 4 lines, expand on demand */}
           <p
-            className="text-pane-text leading-relaxed whitespace-pre-wrap"
+            className={`text-pane-text leading-relaxed whitespace-pre-wrap ${!expanded && isLong ? "line-clamp-4" : ""}`}
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
             {post.content}
           </p>
-        </div>
 
-        {/* Comment toggle button */}
-        <button
-          onClick={onToggleComments}
-          className="ml-2 shrink-0 flex items-center gap-1 transition-colors btn-press font-mono"
-          style={{
-            fontSize: "var(--pane-font-size-xs)",
-            color: showComments ? "var(--pane-text-secondary/60)" : "var(--pane-text-secondary/25)",
-          }}
-          title={commentCount > 0 ? `${commentCount} comments` : "add comment"}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
-            stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-          </svg>
-          {commentCount > 0 && <span>{commentCount}</span>}
-        </button>
+          {/* Bottom row — read more (left) + comment button (middle) + delete button (right) */}
+          <div className="flex items-center justify-between mt-1.5">
+            <div>
+              {isLong && (
+                <button
+                  onClick={() => setExpanded(!expanded)}
+                  className="font-mono transition-colors btn-press"
+                  style={{
+                    fontSize: "var(--pane-font-size-xs)",
+                    color: "var(--pane-text-secondary)",
+                    opacity: 0.3,
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.opacity = "0.6")}
+                  onMouseLeave={(e) => (e.currentTarget.style.opacity = "0.3")}
+                >
+                  {expanded ? "less" : "more"}
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onToggleComments}
+                className="flex items-center gap-1 transition-colors btn-press font-mono"
+                style={{
+                  fontSize: "var(--pane-font-size-xs)",
+                  color: "var(--pane-text-secondary)",
+                  opacity: showComments ? 0.6 : 0.25,
+                }}
+                title={commentCount > 0 ? `${commentCount} comments` : "comment"}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                </svg>
+                {commentCount > 0 && <span>{commentCount}</span>}
+              </button>
+              <button
+                onClick={onDelete}
+                className="flex items-center gap-1 transition-colors btn-press font-mono"
+                style={{
+                  fontSize: "var(--pane-font-size-xs)",
+                  color: "var(--pane-text-secondary)",
+                  opacity: 0.25,
+                }}
+                title="delete"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
 
-      {/* Comments as separate card below */}
+      {/* Comments — outside post, indented to align with content */}
       {showComments && (
-        <div className="px-3 pb-3">
-          <PostComments
-            postId={post.id}
-            workingDir={workingDir}
-            postContent={post.content}
-            isVisible={showComments}
-          />
-        </div>
+        <PostComments
+          postId={post.id}
+          workingDir={workingDir}
+          postContent={post.content}
+          isVisible={showComments}
+        />
       )}
     </div>
   );
@@ -336,7 +310,9 @@ export function Lens({ projectId }: { projectId: string }) {
   const posts = useLensStore(useShallow((s) => s.posts.filter((p) => p.project_id === projectId)));
   const appendPost = useLensStore((s) => s.appendPost);
   const setPosts = useLensStore((s) => s.setPosts);
+  const deletePost = useLensStore((s) => s.deletePost);
   const setLoaded = useLensStore((s) => s.setLoaded);
+  const clearUnreadPunkPosts = useLensStore((s) => s.clearUnreadPunkPosts);
   const expandedCommentsId = useLensStore((s) => s.expandedCommentsId);
   const setExpandedCommentsId = useLensStore((s) => s.setExpandedCommentsId);
 
@@ -362,6 +338,11 @@ export function Lens({ projectId }: { projectId: string }) {
       setPosts(fetched);
       setLoaded(projectId, true);
     });
+  }, [projectId]);
+
+  // Clear unread punk posts when user navigates to Lens
+  useEffect(() => {
+    clearUnreadPunkPosts(projectId);
   }, [projectId]);
 
   // Listen for new posts from workers via IPC
@@ -462,6 +443,15 @@ export function Lens({ projectId }: { projectId: string }) {
     }
   };
 
+  const handleDelete = useCallback(async (postId: string) => {
+    try {
+      await lensPostDelete(postId);
+      deletePost(postId);
+    } catch (error) {
+      console.error("Failed to delete post:", error);
+    }
+  }, [deletePost]);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     // Slash menu captures Enter/Tab/Escape/Arrows — don't double-handle
     if (slashOpen && (e.key === "Enter" || e.key === "Tab" || e.key === "Escape" || e.key === "ArrowDown" || e.key === "ArrowUp")) {
@@ -506,6 +496,7 @@ export function Lens({ projectId }: { projectId: string }) {
               }
               workingDir={workingDir}
               userName={userName}
+              onDelete={() => handleDelete(post.id)}
             />
           ))
         )}

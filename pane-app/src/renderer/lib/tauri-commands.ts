@@ -43,7 +43,7 @@ export async function saveScrollPositions(
 
 export async function saveConversationToMain(
   projectId: string,
-  conversation: { sessionId: string | null; model?: string | null; messages: unknown[]; startIndex?: number },
+  conversation: { model?: string | null; messages: unknown[]; startIndex?: number },
 ): Promise<void> {
   return electronAPI.invoke("save_conversation", { projectId, conversation });
 }
@@ -56,7 +56,6 @@ export async function getConversationSlice(
   messages: unknown[];
   totalCount: number;
   startIndex: number;
-  sessionId: string | null;
   model: string | null;
 }> {
   return electronAPI.invoke("get_conversation_slice", { projectId, count, beforeIndex });
@@ -219,7 +218,6 @@ export async function sendToPunk(
   projectId: string,
   prompt: string,
   workingDir: string,
-  sessionId: string | null,
   model: string | null,
   onEvent: (event: PunkStreamEvent) => void,
   intentOrOptions?: string | SendToPunkOptions,
@@ -343,7 +341,6 @@ export async function sendToPunk(
       projectId,
       prompt,
       workingDir,
-      sessionId,
       model,
       intent: opts.intent,
       history: opts.history,
@@ -1045,6 +1042,10 @@ export async function lensPostsList(projectId: string): Promise<LensPost[]> {
   return electronAPI.invoke("lens_posts_list", { projectId });
 }
 
+export async function lensPostDelete(postId: string): Promise<{ success: boolean }> {
+  return electronAPI.invoke("lens_post_delete", { postId });
+}
+
 // Notify punks that the user has opened or switched to a project.
 // Fire-and-forget — punks schedule proactive work with a delay.
 export async function punkProjectActive(projectId: string, projectRoot: string | null = null): Promise<void> {
@@ -1080,7 +1081,6 @@ export async function sendToLens(
   postId: string,
   prompt: string,
   workingDir: string,
-  sessionId: string | null,
   model: string | null,
   provider: string | null,
   thinking: boolean,
@@ -1146,7 +1146,6 @@ export async function sendToLens(
       postId,
       prompt,
       workingDir,
-      sessionId,
       model,
       provider,
       thinking,
@@ -1165,7 +1164,6 @@ export async function sendToMind(
   threadId: string,
   prompt: string,
   workingDir: string,
-  sessionId: string | null,
   model: string | null,
   provider: string | null,
   thinking: boolean,
@@ -1231,7 +1229,6 @@ export async function sendToMind(
       threadId,
       prompt,
       workingDir,
-      sessionId,
       model,
       provider,
       thinking,
