@@ -4,6 +4,7 @@ import { usePunk } from "../../hooks/usePunk";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
+import { PunkActivityStrip } from "./PunkActivityStrip";
 import { getConversationSlice, listCheckpoints, readFile } from "../../lib/tauri-commands";
 import { restoringProjects } from "../../hooks/useSettingsPersistence";
 import type {
@@ -172,7 +173,7 @@ export const Conversation = memo(function Conversation({
         restoringProjects.add(projectId);
         startTransition(() => {
           const store = useProjectsStore.getState();
-          store.restoreConversation(projectId, deduped, slice.sessionId, {
+          store.restoreConversation(projectId, deduped, {
             totalCount: slice.totalCount,
             startIndex: slice.startIndex,
           });
@@ -316,6 +317,8 @@ export const Conversation = memo(function Conversation({
             </button>
           </div>
         )}
+
+        <PunkActivityStrip projectId={projectId} />
 
         {messages.length === 0 && !hasOlderMessages && (
           <div className="flex items-center justify-center h-full select-none">

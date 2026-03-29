@@ -37,6 +37,8 @@ const __dirname = import.meta.dirname;
 
 // Claude: projectId -> AbortController (for graceful cancellation)
 const activeControllers = new Map();
+// Claude: projectId -> sessionId (for within-conversation continuity)
+const activeClaudeSessionIds = new Map();
 // Gemini: projectId -> child process
 const activeProcesses = new Map();
 // Per-request state (used by Gemini normalizer)
@@ -463,9 +465,9 @@ async function handleClaudeSpawn({
   requestId,
   prompt,
   workingDir,
-  sessionId,
   model,
   systemPrompt,
+  historyLength,
   mcpServerDest,
   tools,
   maxTurns,
@@ -486,7 +488,6 @@ async function handleClaudeSpawn({
   const options = {
     cwd: workingDir,
     model: model || undefined,
-    resume: sessionId || undefined,
     appendSystemPrompt: systemPrompt || undefined,
     pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
     executable: process.execPath,
@@ -520,7 +521,9 @@ async function handleClaudeSpawn({
   // silently continue rather than surfacing an error. Capped at MAX_AUTO_RESUMES
   // to prevent infinite loops on genuinely stuck sessions.
   const MAX_AUTO_RESUMES = 10;
-  let resumeSessionId = sessionId;
+  // Resume within-conversation continuity if history exists; new conversations (historyLength=0) start fresh.
+  // Pane context infrastructure handles project-level context; session resume handles conversation-level history.
+  let resumeSessionId = historyLength > 0 ? (activeClaudeSessionIds.get(projectId) || null) : null;
   let autoResumes = 0;
   let sdkInfoEmitted = false;
 
@@ -538,7 +541,10 @@ async function handleClaudeSpawn({
         // Capture session_id from init so we can resume on max_turns
         if (!sdkInfoEmitted && msg.type === "system" && msg.subtype === "init") {
           sdkInfoEmitted = true;
-          if (msg.session_id) resumeSessionId = msg.session_id;
+          if (msg.session_id) {
+            resumeSessionId = msg.session_id;
+            activeClaudeSessionIds.set(projectId, msg.session_id);
+          }
           // Fire-and-forget: fetch SDK metadata (models + account) once per session
           Promise.all([
             q.supportedModels?.().catch(() => null),
@@ -696,7 +702,6 @@ async function handleGeminiSpawn({
   requestId,
   prompt,
   workingDir,
-  sessionId,
   model,
   systemPrompt,
   history,
@@ -736,13 +741,8 @@ async function handleGeminiSpawn({
     );
   } catch {}
 
-  // If the renderer passed back a real Gemini session ID (from a previous init event),
-  // use --resume so Gemini loads its own conversation history natively.
-  // Our fake placeholder IDs start with "gemini-" — those are not real sessions.
-  const isResumingSession = sessionId && !sessionId.startsWith("gemini-");
-
   let historyPreamble = "";
-  if (!isResumingSession && history && history.length > 0) {
+  if (history && history.length > 0) {
     // History preamble is only needed on first-turn or when session cannot be resumed.
     // When resuming, Gemini loads full history from its session file — no limit, no preamble.
     const turns = history
@@ -775,8 +775,6 @@ async function handleGeminiSpawn({
     }
   }
 
-  // Build full prompt: system context + history (if any) + user message.
-  // When resuming a session the history preamble is empty — Gemini handles it natively.
   const fullPrompt = systemPrompt
     ? `${systemPrompt}\n\n---\n\n${historyPreamble}${prompt}`
     : `${historyPreamble}${prompt}`;
@@ -784,7 +782,6 @@ async function handleGeminiSpawn({
   // Prompt is passed via stdin (not -p flag) to avoid shell arg length limits and
   // quoting fragility with large prompts containing code, JSON, or special characters.
   const cmdParts = ["gemini", "--output-format", "stream-json", "--yolo"];
-  if (isResumingSession) cmdParts.push("--resume", sessionId);
   if (model && /gemini/i.test(model)) cmdParts.push("--model", model);
 
   const shellCmd = cmdParts.map((arg) => shellEscape(arg)).join(" ");
@@ -958,7 +955,6 @@ async function handleSpawn({
   projectId,
   prompt,
   workingDir,
-  sessionId,
   model,
   intent,
   history,
@@ -1024,9 +1020,9 @@ async function handleSpawn({
       requestId,
       prompt,
       workingDir,
-      sessionId,
       model,
       systemPrompt,
+      historyLength,
       mcpServerDest,
       tools,
       maxTurns,
@@ -1038,7 +1034,6 @@ async function handleSpawn({
       requestId,
       prompt,
       workingDir,
-      sessionId,
       model,
       systemPrompt,
       history,

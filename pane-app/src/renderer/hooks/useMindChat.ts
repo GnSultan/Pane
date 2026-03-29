@@ -59,7 +59,6 @@ export function useMindChat(
   const [threadLoaded, setThreadLoaded] = useState(false);
 
   const threadIdRef = useRef<string | null>(null);
-  const sessionIdRef = useRef<string | null>(null);
   const autoSentRef = useRef(false);
 
   // Stable stream-state key per render cycle — cleared on entry change
@@ -77,7 +76,6 @@ export function useMindChat(
     setError(null);
     setThreadLoaded(false);
     threadIdRef.current = null;
-    sessionIdRef.current = null;
     autoSentRef.current = false;
 
     if (!entryId) {
@@ -95,7 +93,6 @@ export function useMindChat(
 
         if (thread?.id) {
           threadIdRef.current = thread.id;
-          sessionIdRef.current = thread.session_id ?? null;
 
           const loaded: ConversationMessage[] = turns
             .map((turn) => {
@@ -161,10 +158,9 @@ export function useMindChat(
       const threadId = threadIdRef.current!;
       const key = streamKey.current;
 
-      // If there's no active session but we have punk-generated turns,
-      // include the last punk analysis so the model has context
+      // Include the last punk analysis as context when messages exist
       let effectivePrompt = prompt;
-      if (!sessionIdRef.current && messages.length > 0) {
+      if (messages.length > 0) {
         const lastPunkMsg = [...messages].reverse().find(
           (m) => m.type === 'assistant' && m.punkType
         );
@@ -270,11 +266,8 @@ export function useMindChat(
             // ── system:init — capture session ID ──────────────────────────
             if (parsed.type === 'system') {
               const p = parsed as any;
-              if (p.subtype === 'init' && p.session_id) {
-                sessionIdRef.current = p.session_id;
-                if (threadIdRef.current) {
-                  mindThreadSetSession(threadIdRef.current, p.session_id).catch(() => {});
-                }
+              if (p.subtype === 'init' && p.session_id && threadIdRef.current) {
+                mindThreadSetSession(threadIdRef.current, p.session_id).catch(() => {});
               }
               break;
             }
@@ -498,7 +491,6 @@ export function useMindChat(
           threadId,
           effectivePrompt,
           workingDir,
-          sessionIdRef.current,
           selectedModel,
           selectedModelProvider,
           selectedModelThinking,

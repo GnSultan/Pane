@@ -38,7 +38,6 @@ export const restoringProjects = new Set<string>();
 // --- Conversation persistence helpers ---
 
 interface PersistedConversation {
-  sessionId: string | null;
   model?: string | null;
   messages: ConversationMessage[];
   startIndex?: number;
@@ -357,7 +356,6 @@ export function useSettingsPersistence() {
 
         if (countChanged || finished) {
           saveConversation(id, {
-            sessionId: p.conversation.sessionId,
             model: p.conversation.model,
             messages: p.conversation.messages,
             startIndex: p.conversation.historyStartIndex,

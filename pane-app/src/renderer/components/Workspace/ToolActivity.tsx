@@ -15,6 +15,7 @@ import { writePty } from "../../lib/tauri-commands";
 interface ToolActivityProps {
   toolUse: ToolUseBlock;
   toolResult?: ToolResultBlock;
+  isHistorical?: boolean;
 }
 
 // Parse MCP tool names: "mcp__server-name__tool_name" → { server, tool }
@@ -546,7 +547,7 @@ function formatErrorContent(content: unknown): string {
   return lines.slice(0, 3).join("\n") || raw.trim().slice(0, 120);
 }
 
-export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
+export function ToolActivity({ toolUse, toolResult, isHistorical }: ToolActivityProps) {
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
 
   // Summary updates as parameters stream in, then stabilizes once complete
@@ -578,13 +579,13 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
     return toolUse.name;
   })();
 
-  // Auto-expand only during active streaming — not for completed (historical) tools.
-  // Rendering expanded Edit/Write blocks for 30+ historical messages forces the browser
-  // to lay out full file contents in whitespace-pre-wrap, blocking the main thread for
-  // several seconds on restore. Completed tools are collapsed; user can expand on demand.
+  // Edit/Write are always expanded for live messages — completed or not. Users need to see what changed.
+  // Historical messages (restored from DB) start collapsed — user can expand on demand.
   const expanded = userToggle !== null
     ? userToggle
-    : (isFailed || (alwaysExpanded.includes(baseToolName) && !isComplete)) && !alwaysCollapsed.includes(baseToolName);
+    : isHistorical
+      ? false
+      : (isFailed || alwaysExpanded.includes(baseToolName)) && !alwaysCollapsed.includes(baseToolName);
 
   const label = getToolLabel(toolUse.name);
 
@@ -657,6 +658,7 @@ export function ToolActivity({ toolUse, toolResult }: ToolActivityProps) {
 interface ServerToolActivityProps {
   block: ServerToolUseBlock;
   searchResult?: WebSearchToolResultBlock;
+  isHistorical?: boolean;
 }
 
 export function ServerToolActivity({ block, searchResult }: ServerToolActivityProps) {

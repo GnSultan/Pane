@@ -198,7 +198,6 @@ const DEFAULT_INTENT_ROUTING = {
  * @property {string} projectId
  * @property {string} prompt
  * @property {string} workingDir
- * @property {string|null} sessionId
  * @property {string|null} model
  * @property {string} [requestId]       - Unique request ID to prevent event leakage
  * @property {string|null} [provider]   - Provider override from intent routing
@@ -274,9 +273,6 @@ class CliBackend extends PunkBackend {
     this.activeRequests = new Map(); // requestId -> projectId
   }
 
-  /** Only claude-agent-sdk supports resuming a session by ID. Gemini ignores sessionId. */
-  get supportsSessionResume() { return this.command === "claude"; }
-
   getWorker() {
     if (this.worker && !this.worker.killed) return this.worker;
 
@@ -322,7 +318,6 @@ class CliBackend extends PunkBackend {
       projectId: request.projectId,
       prompt: request.prompt,
       workingDir: request.workingDir,
-      sessionId: request.sessionId,
       model: request.model,
       provider: request.provider,
       intent: request.intent,
@@ -389,7 +384,6 @@ class CliBackend extends PunkBackend {
       projectId,
       prompt: stepPrompt,
       requestId: stepRequestId,
-      sessionId: null, // fresh session — no conversation history
       history: [],     // belt-and-suspenders: no history
     };
 
@@ -1650,7 +1644,6 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       projectId,
       prompt,
       workingDir,
-      sessionId: null,
       model: null,
       intent: 'other',
       history: [],
@@ -1691,7 +1684,6 @@ export async function registerPunkHandlers() {
       projectId,
       prompt,
       workingDir,
-      sessionId,
       model,
       intent,
       history,
@@ -1710,7 +1702,6 @@ export async function registerPunkHandlers() {
       projectId,
       prompt,
       workingDir,
-      sessionId,
       model,
       intent,
       history,
@@ -1731,7 +1722,7 @@ export async function registerPunkHandlers() {
   });
 
   ipcMain.handle("send_to_mind", async (_event, args) => {
-    const { threadId, prompt, workingDir, sessionId, model, provider, thinking, requestId, entryContent } = args;
+    const { threadId, prompt, workingDir, model, provider, thinking, requestId, entryContent } = args;
     console.log(`[pane] Mind chat: thread=${threadId}, prompt=${(prompt || "").slice(0, 60)}`);
     const mindSystemPrompt =
       "You are a thinking partner inside Pane Mind. You help the user think through ideas by exploring code, finding relevant patterns, and offering analysis. You can read files and search the codebase but CANNOT write, edit, or execute anything. Be concise and direct. No emojis.\n\nThe thought being explored:\n" +
@@ -1740,7 +1731,6 @@ export async function registerPunkHandlers() {
       projectId: "mind:" + threadId,
       prompt,
       workingDir,
-      sessionId: sessionId || null,
       model: model || null,
       provider: provider || null,
       thinking: thinking ?? false,
@@ -1757,7 +1747,7 @@ export async function registerPunkHandlers() {
   });
 
   ipcMain.handle("send_to_lens", async (_event, args) => {
-    const { postId, prompt, workingDir, sessionId, model, provider, thinking, requestId, postContent } = args;
+    const { postId, prompt, workingDir, model, provider, thinking, requestId, postContent } = args;
     console.log(`[pane] Lens chat: post=${postId}, prompt=${(prompt || "").slice(0, 60)}`);
     const lensSystemPrompt =
       "You are a focused collaborator inside Pane Lens. The user is discussing a specific observation about their codebase. Help them explore it — answer questions, find related code, surface implications. Be concise and direct. No emojis.\n\nThe observation:\n" +
@@ -1766,7 +1756,6 @@ export async function registerPunkHandlers() {
       projectId: "lens:" + postId,
       prompt,
       workingDir,
-      sessionId: sessionId || null,
       model: model || null,
       provider: provider || null,
       thinking: thinking ?? false,

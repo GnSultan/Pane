@@ -1042,7 +1042,7 @@ export async function lensPostsList(projectId: string): Promise<LensPost[]> {
   return electronAPI.invoke("lens_posts_list", { projectId });
 }
 
-export async function lensPostDelete(postId: string): Promise<{ success: boolean }> {
+export async function lensPostDelete(postId: string): Promise<{ deleted: boolean }> {
   return electronAPI.invoke("lens_post_delete", { postId });
 }
 

@@ -172,7 +172,6 @@ interface ProjectsState {
   appendToLastAssistantText: (projectId: string, text: string) => void;
   appendToLastAssistantThinking: (projectId: string, thinking: string) => void;
   setLastThinkingSignature: (projectId: string, signature: string) => void;
-  setConversationSessionId: (projectId: string, sessionId: string | null) => void;
   setConversationModel: (projectId: string, model: string) => void;
   setConversationStatusMessage: (
     projectId: string,
@@ -197,7 +196,6 @@ interface ProjectsState {
   restoreConversation: (
     projectId: string,
     messages: ConversationMessage[],
-    sessionId: string | null,
     historyInfo?: { totalCount: number; startIndex: number },
   ) => void;
   prependOlderMessages: (
@@ -626,13 +624,6 @@ function createProjectsStore() {
         }),
       ),
 
-    setConversationSessionId: (projectId, sessionId) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, sessionId },
-        })),
-      ),
-
     setConversationModel: (projectId, model) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -831,12 +822,11 @@ function createProjectsStore() {
         })),
       ),
 
-    restoreConversation: (projectId, messages, sessionId, historyInfo) =>
+    restoreConversation: (projectId, messages, historyInfo) =>
       set((state) =>
         updateProject(state, projectId, () => ({
           conversation: {
-            messages,
-            sessionId,
+            messages: messages.map((m) => ({ ...m, isHistorical: true })),
             model: null,
             routedModel: null,
             serviceTier: null,
@@ -867,7 +857,7 @@ function createProjectsStore() {
         updateProject(state, projectId, (p) => ({
           conversation: {
             ...p.conversation,
-            messages: [...olderMessages, ...p.conversation.messages],
+            messages: [...olderMessages.map((m) => ({ ...m, isHistorical: true })), ...p.conversation.messages],
             historyStartIndex: newStartIndex,
           },
         })),

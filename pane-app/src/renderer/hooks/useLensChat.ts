@@ -51,8 +51,6 @@ export function useLensChat(
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const sessionIdRef = useRef<string | null>(null);
-
   // Stable stream-state key per render cycle — cleared on postId change
   const streamKey = useRef('lens-stream-' + Math.random().toString(36).slice(2));
 
@@ -66,7 +64,6 @@ export function useLensChat(
 
     setIsProcessing(false);
     setError(null);
-    sessionIdRef.current = null;
 
     if (!postId) {
       setMessages([]);
@@ -202,7 +199,6 @@ export function useLensChat(
             if (parsed.type === 'system') {
               const p = parsed as any;
               if (p.subtype === 'init' && p.session_id) {
-                sessionIdRef.current = p.session_id;
                 lensCommentSetSession(postId, p.session_id).catch(() => {});
               }
               break;
@@ -347,7 +343,6 @@ export function useLensChat(
           postId,
           prompt,
           workingDir,
-          sessionIdRef.current,
           selectedModel,
           selectedModelProvider,
           selectedModelThinking,

@@ -444,6 +444,8 @@ export interface ConversationMessage {
   planData?: PlanData;
   // Present on punk-generated turns (bug, reflection, sentinel)
   punkType?: string;
+  // True for messages restored from history — tools start collapsed
+  isHistorical?: boolean;
 }
 
 // File checkpoint types
@@ -465,7 +467,6 @@ export type ContextPressure = "none" | "building" | "high";
 
 export interface ConversationState {
   messages: ConversationMessage[];
-  sessionId: string | null;
   model: string | null;
   routedModel: string | null; // Model chosen by smart router for current request
   serviceTier: string | null;
@@ -515,7 +516,6 @@ export interface MemoryEvent {
 export function createEmptyConversation(): ConversationState {
   return {
     messages: [],
-    sessionId: null,
     model: null,
     routedModel: null,
     serviceTier: null,

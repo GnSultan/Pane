@@ -326,7 +326,7 @@ async function _migrateConversations(db) {
             db.stmts.insertFts.run(projectId, id, text);
           }
         }
-        db.stmts.upsertConvMeta.run(projectId, data.sessionId ?? null, data.model ?? null, Date.now());
+        db.stmts.upsertConvMeta.run(projectId, null, data.model ?? null, Date.now());
       });
 
       insertMessages(messages);
@@ -400,7 +400,7 @@ async function _migrateArchivedConversations(db) {
               db.stmts.insertFts.run(projectId, id, text);
             }
           }
-          db.stmts.upsertConvMeta.run(projectId, data.sessionId ?? null, data.model ?? null, Date.now());
+          db.stmts.upsertConvMeta.run(projectId, null, data.model ?? null, Date.now());
         });
 
         insertMessages(messages);

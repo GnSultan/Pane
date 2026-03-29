@@ -896,7 +896,6 @@ export function usePunk(projectId: string) {
 
       let assistantMessageAdded = false;
       let resultReceived = false;
-      const sessionId = project.conversation.sessionId;
       let resultSafetyTimer: ReturnType<typeof setTimeout> | null = null;
       let orchestrationActive = false; // true while TaskRunner is running steps
 
@@ -1051,7 +1050,6 @@ export function usePunk(projectId: string) {
             if (!resultReceived) {
               const s = useProjectsStore.getState();
               if (!s.projects.get(projectId)?.conversation.error) {
-                s.setConversationSessionId(projectId, null);
                 s.setConversationError(
                   projectId,
                   "Process exited without responding — session may be invalid. Try again.",
@@ -1402,7 +1400,6 @@ export function usePunk(projectId: string) {
           projectId,
           prompt,
           project.root,
-          sessionId,
           routedModel,
           handleEvent,
           intent,
@@ -1515,7 +1512,6 @@ function handlePunkMessage(
   switch (msg.type) {
     case "system": {
       if (msg.subtype === "init" && msg.session_id) {
-        store.setConversationSessionId(projectId, msg.session_id);
         if (msg.model) {
           store.setConversationModel(projectId, msg.model);
         }
@@ -1663,12 +1659,6 @@ function handlePunkMessage(
         if (msg.subtype === "interrupted") return assistantMessageExists;
 
         console.warn("[pane] Claude non-success result:", msg.subtype, msg);
-
-        // error_max_turns: session is still valid — keep the session ID so the
-        // next message resumes the conversation rather than starting fresh.
-        if (msg.subtype !== "error_max_turns") {
-          store.setConversationSessionId(projectId, null);
-        }
 
         const existing = store.projects.get(projectId)?.conversation.error;
         if (!existing) {

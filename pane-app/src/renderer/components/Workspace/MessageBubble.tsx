@@ -468,7 +468,7 @@ export function MessageBubble({
             const result = toolResults.get(toolBlock.id);
             return (
               <div key={gi} className="my-0.5">
-                <ToolActivity toolUse={toolBlock} toolResult={result} />
+                <ToolActivity toolUse={toolBlock} toolResult={result} isHistorical={message.isHistorical} />
               </div>
             );
           }
@@ -485,6 +485,7 @@ export function MessageBubble({
                 <ServerToolActivity
                   block={serverBlock}
                   searchResult={searchResult}
+                  isHistorical={message.isHistorical}
                 />
               </div>
             );

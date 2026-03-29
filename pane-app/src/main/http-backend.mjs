@@ -1202,7 +1202,7 @@ export class ApiBackend extends PunkBackend {
             parsed: {
               type: "system",
               subtype: "init",
-              session_id: request.sessionId || `http-${Date.now()}`,
+              session_id: `http-${Date.now()}`,
               tools: getToolsForPhase(request.phase || "execution"),
               model: request.model || this.getDefaultModel(apiConfig.provider),
             },

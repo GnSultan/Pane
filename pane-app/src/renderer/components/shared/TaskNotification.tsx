@@ -85,11 +85,11 @@ export function TaskNotification() {
           }
         }
 
-        // Auto-dismiss after 8 seconds
+        // Auto-dismiss after 3 seconds — conversation strip provides persistence
         const timer = setTimeout(() => {
           setPunkNotifications((prev) => prev.filter((n) => n.id !== pn.id));
           punkTimers.current.delete(pn.id);
-        }, 8000);
+        }, 3000);
         punkTimers.current.set(pn.id, timer);
       }
     );

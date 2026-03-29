@@ -847,6 +847,7 @@ export class ToolExecutor {
         case "bash":
           return await this.executeBash(toolId, input.command, input.is_background || input.background || false, input.dir_path || null);
 
+        case "Read":
         case "read_file":
           return await this.executeReadFile(toolId, input.file_path || input.path, input.start_line || null, input.end_line || null);
 
@@ -859,9 +860,11 @@ export class ToolExecutor {
         case "replace":
           return await this.executeReplace(toolId, input.file_path || input.path, input.old_string, input.new_string);
 
+        case "Glob":
         case "glob":
           return await this.executeGlob(toolId, input.pattern, input.dir_path || null);
 
+        case "Grep":
         case "grep_search":
           return await this.executeGrepSearch(toolId, input.pattern || input.query, input.dir_path || input.path || ".", input.include_pattern || null);
 
