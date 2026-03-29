@@ -3,10 +3,6 @@ import type { PunkStreamEvent, ConversationMessage, Todo } from "./punk-types";
 // Electron IPC bridge
 const electronAPI = (window as any).electronAPI;
 
-// Startup diagnostics — forwards renderer logs to ~/.pane/startup.log via IPC
-export function diagLog(msg: string): void {
-  electronAPI.invoke("diag_log", msg).catch(() => {});
-}
 
 export interface FileEntry {
   name: string;

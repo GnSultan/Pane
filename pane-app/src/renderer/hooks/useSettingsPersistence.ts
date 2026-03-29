@@ -8,7 +8,6 @@ import {
   brainGetProfile,
   brainGetAvatar,
   saveConversationToMain,
-  diagLog,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/punk-types";
@@ -50,7 +49,6 @@ async function saveConversation(
   projectId: string,
   conversation: PersistedConversation,
 ): Promise<void> {
-  diagLog(`saveConversation called: ${conversation.messages.length} msgs | ${new Error().stack?.split('\n').slice(1,4).join(' | ')}`);
   // Passes projectId directly — main process owns storage (SQLite).
   await saveConversationToMain(projectId, conversation);
 }

@@ -12,29 +12,6 @@ import { execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
 
-// Startup diagnostics — writes to ~/.pane/startup.log
-const DIAG_LOG = path.join(os.homedir(), ".pane", "startup.log");
-const _diagT0 = Date.now();
-function diagLog(msg) {
-  const line = `+${Date.now() - _diagT0}ms [main] ${msg}\n`;
-  process.stdout.write(line);
-  try { fs.appendFileSync(DIAG_LOG, line); } catch {}
-}
-// Also register IPC so renderer can write to the same log
-function registerDiagHandler() {
-  ipcMain.handle("diag_log", (_e, msg) => {
-    const line = `+${Date.now() - _diagT0}ms [renderer] ${msg}\n`;
-    process.stdout.write(line);
-    try { fs.appendFileSync(DIAG_LOG, line); } catch {}
-  });
-}
-try { fs.writeFileSync(DIAG_LOG, `--- startup ${new Date().toISOString()} ---\n`); } catch {}
-// Main-process heartbeat — fires every 50ms for 10s to show if main is blocked
-const _mainHb = setInterval(() => {
-  const line = `+${Date.now() - _diagT0}ms [main-hb]\n`;
-  try { fs.appendFileSync(DIAG_LOG, line); } catch {}
-}, 50);
-setTimeout(() => clearInterval(_mainHb), 10000);
 import { promisify } from "node:util";
 import ignore from "ignore";
 import chokidar from "chokidar";
@@ -819,15 +796,11 @@ const defaultSettings = {
 };
 function registerSettingsHandlers() {
   ipcMain.handle("load_settings", async () => {
-    diagLog("load_settings called");
     const filePath = settingsPath();
     try {
       const content = await fs.promises.readFile(filePath, "utf-8");
-      const result = { ...defaultSettings, ...JSON.parse(content) };
-      diagLog(`load_settings returning roots=${result.project_roots?.length}`);
-      return result;
+      return { ...defaultSettings, ...JSON.parse(content) };
     } catch {
-      diagLog("load_settings returning defaults");
       return defaultSettings;
     }
   });
@@ -1486,8 +1459,6 @@ function registerStateHandlers(db) {
   ipcMain.handle("save_conversation", (_event, args) => {
     const { projectId, conversation } = args;
     const { sessionId, model, messages } = conversation;
-    const t0 = Date.now();
-    diagLog(`save_conversation called: ${messages.length} msgs for ${projectId}`);
 
     const save = db.transaction(() => {
       for (const msg of messages) {
@@ -1513,7 +1484,6 @@ function registerStateHandlers(db) {
 
     try {
       save();
-      diagLog(`save_conversation done in ${Date.now()-t0}ms`);
     } catch (e) {
       console.error("[pane-db] save_conversation error:", e.message);
     }
@@ -1536,7 +1506,6 @@ function registerStateHandlers(db) {
         sessionId: meta?.session_id ?? null,
         model: meta?.model ?? null,
       };
-      diagLog(`get_conversation_slice: ${result.messages.length} msgs in ${Date.now()-_t}ms`);
       return result;
     } catch {
       return { messages: [], totalCount: 0, startIndex: 0, sessionId: null, model: null };
@@ -2158,13 +2127,9 @@ function registerBrainHandlers() {
 
 async function registerIpcHandlers() {
   const { initPaneDb, runMigrationIfNeeded } = await import("./pane-db.mjs");
-  diagLog("initPaneDb start");
   const db = initPaneDb();
-  diagLog("initPaneDb done");
   await runMigrationIfNeeded(db);
-  diagLog("migration done");
 
-  registerDiagHandler();
   registerCommandHandlers();
   registerSettingsHandlers();
   await registerClaudeHandlers();

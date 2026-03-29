@@ -39,6 +39,27 @@ export class MindPunks {
     this._bugPunkInterval = null;
     this._reflectionPunkInterval = null;
     this._proactiveTimers = new Set(); // pending activation-trigger timeouts
+
+    // Global concurrency cap: at most 1 proactive agentCall running at a time.
+    // Without this, opening 9 projects schedules 18 concurrent Claude processes
+    // (Maya + Noor × 9) each using 3-5GB → OOM in minutes.
+    this._activeAgentCalls = 0;
+    this._MAX_CONCURRENT_AGENTS = 1;
+  }
+
+  // ── Agent concurrency guard ────────────────────────────────────────────────
+
+  async _runAgent(systemPrompt, prompt, workingDir) {
+    if (this._activeAgentCalls >= this._MAX_CONCURRENT_AGENTS) {
+      console.log(`[punks] agentCall skipped — ${this._activeAgentCalls} already running (cap=${this._MAX_CONCURRENT_AGENTS})`);
+      return null;
+    }
+    this._activeAgentCalls++;
+    try {
+      return await this._agentCall(systemPrompt, prompt, workingDir);
+    } finally {
+      this._activeAgentCalls--;
+    }
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -295,7 +316,7 @@ Deliver a concise finding:
 
 No speculation. No emojis.`;
 
-    const result = await this._agentCall(systemPrompt, `Investigate this bug:\n\n${entry.content}`, workingDir);
+    const result = await this._runAgent(systemPrompt, `Investigate this bug:\n\n${entry.content}`, workingDir);
     if (result && result.trim()) {
       if (source === "mind") await this._writePunkThread(entry.id, result.trim(), "bug");
       if (replyToPostId) {
@@ -330,7 +351,7 @@ Ground the reflection in what you actually find:
 
 Deliver a concise, evidence-based reflection. No speculation. No emojis.`;
 
-    const result = await this._agentCall(systemPrompt, `Reflect on this idea:\n\n${entry.content}`, workingDir);
+    const result = await this._runAgent(systemPrompt, `Reflect on this idea:\n\n${entry.content}`, workingDir);
     if (result && result.trim()) {
       if (source === "mind") await this._writePunkThread(entry.id, result.trim(), "reflection");
       if (replyToPostId) {
@@ -492,7 +513,7 @@ Investigate it thoroughly:
 Report what you found: what you chose to investigate, what you actually looked at, and what it means. If everything looks solid, say that — but be specific about what you checked. No speculation. No emojis.`;
 
     console.log(`[punks] maya starting proactive investigation for ${projectId}`);
-    const result = await this._agentCall(
+    const result = await this._runAgent(
       systemPrompt,
       "You're on the clock. Choose something to investigate and dig in.",
       resolvedDir
@@ -527,7 +548,7 @@ Go to the actual code:
 Share what you found: what you chose to look at, what you discovered in the code, and what you think about it. Be direct and specific. No speculation beyond what the code actually shows. No emojis.`;
 
     console.log(`[punks] noor starting proactive reflection for ${projectId}`);
-    const result = await this._agentCall(
+    const result = await this._runAgent(
       systemPrompt,
       "You're on the clock. Choose something interesting to explore and dig in.",
       resolvedDir
