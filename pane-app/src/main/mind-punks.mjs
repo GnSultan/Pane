@@ -309,12 +309,7 @@ Investigate thoroughly:
 - Trace the actual code path
 - Verify with terminal if tests exist
 
-Deliver a concise finding:
-1. Root cause (name files, functions, line ranges)
-2. How to verify (specific test, command, or reproduction steps)
-3. Suggested fix direction
-
-No speculation. No emojis.`;
+Format your response as: [file:line] — [what's wrong and what it could cause]. Keep it under 50 words. No speculation. No emojis.`;
 
     const result = await this._runAgent(systemPrompt, `Investigate this bug:\n\n${entry.content}`, workingDir);
     if (result && result.trim()) {
@@ -349,7 +344,7 @@ Ground the reflection in what you actually find:
 - Do prior decisions support or constrain this idea?
 - What would the author not have seen without digging in?
 
-Deliver a concise, evidence-based reflection. No speculation. No emojis.`;
+Format your response as: [area/pattern] — [one-line observation tied to project intent]. Keep it under 50 words. No speculation. No emojis.`;
 
     const result = await this._runAgent(systemPrompt, `Reflect on this idea:\n\n${entry.content}`, workingDir);
     if (result && result.trim()) {
@@ -407,7 +402,7 @@ Scan for:
 3. Patterns growing in a concerning direction
 
 If everything looks healthy, respond with exactly "healthy".
-Otherwise, list specific findings (max 3), each as a single concise sentence. No emojis.`;
+Otherwise, format each finding as [area]: [one sentence]. Keep it under 50 words. No emojis.`;
 
       const result = await this._quickCall(systemPrompt, "Run health check.");
       scanned++;
@@ -510,7 +505,7 @@ Investigate it thoroughly:
 - Look for edge cases, missing error handling, race conditions, or brittle assumptions
 - Run tests if they exist (pane_run_in_terminal)
 
-Report what you found: what you chose to investigate, what you actually looked at, and what it means. If everything looks solid, say that — but be specific about what you checked. No speculation. No emojis.`;
+Format your response as: [file:line] — [what's wrong and what it could cause]. Keep it under 50 words. No speculation. No emojis.`;
 
     console.log(`[punks] maya starting proactive investigation for ${projectId}`);
     const result = await this._runAgent(
@@ -545,7 +540,7 @@ Go to the actual code:
 - Don't just describe — trace through what it does
 - Connect what you find to the project's purpose or principles if it's relevant
 
-Share what you found: what you chose to look at, what you discovered in the code, and what you think about it. Be direct and specific. No speculation beyond what the code actually shows. No emojis.`;
+Format your response as: [area/pattern] — [one-line observation tied to project intent]. Keep it under 50 words. No speculation. No emojis.`;
 
     console.log(`[punks] noor starting proactive reflection for ${projectId}`);
     const result = await this._runAgent(
