@@ -631,10 +631,14 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     dynamicParts.push("");
   }
 
-  if (state.todos?.length > 0) {
+  // NEW: Filter completed todos from current task list display
+  // Completed todos are already done — they don't need to be shown in the active task list
+  const activeTodos = (state.todos || []).filter(t => t.status !== "completed");
+
+  if (activeTodos.length > 0) {
     dynamicParts.push("Task list:");
-    for (const t of state.todos) {
-      const mark = t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[→]" : "[ ]";
+    for (const t of activeTodos) {
+      const mark = t.status === "in_progress" ? "[→]" : "[ ]";
       dynamicParts.push(`${mark} ${t.content}`);
     }
     dynamicParts.push("");
@@ -844,8 +848,29 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
 
       if (recentAgeHours < 24 && recentAccomplishments.length > 0) {
         const ageLabel = recentAgeHours >= 6 ? ` (~${Math.round(recentAgeHours)}h ago)` : "";
-        dynamicParts.push(`Previous session outcome${ageLabel} (correct anything wrong before proceeding):`);
-        for (const { text, label } of recentAccomplishments) dynamicParts.push(`✓ ${text}${label}`);
+
+        // Show completed work from previous sessions separately
+        // This helps the model distinguish between "already done" and "currently working on"
+        const recentCompleted = (recent.completed_from_history || []).reduce((out, raw) => {
+          const item = normalizeHandoffItem(raw);
+          if (!item || item.confidence < 0.60) return out;
+          const label = item.confidence < 0.80 ? ` (uncertain)` : "";
+          out.push({ text: item.text, label });
+          return out;
+        }, []);
+
+        if (recentCompleted.length > 0) {
+          dynamicParts.push(`Previous session completed${ageLabel} (done — do not repeat):`);
+          for (const { text, label } of recentCompleted) dynamicParts.push(`✓ ${text}${label}`);
+          dynamicParts.push("");
+        }
+
+        // Show outcomes from current session separately from history
+        if (recentAccomplishments.length > 0) {
+          dynamicParts.push(`Current session outcome${ageLabel} (just completed):`);
+          for (const { text, label } of recentAccomplishments) dynamicParts.push(`✓ ${text}${label}`);
+        }
+
         if (recent.currentObjective) dynamicParts.push(`Still working on: ${recent.currentObjective}`);
 
         const recentBlockers = visibleItems(recent.blockers);
@@ -1148,7 +1173,8 @@ function _buildDirective(intent, taskType, complexity, reasoning, verification) 
 // ---------------------------------------------------------------------------
 //
 // The handoff document is the bridge between sessions and model swaps. It captures:
-// - What was accomplished (facts extracted from session state)
+// - What was accomplished (facts extracted from session state.recentActions)
+// - Work already completed in previous sessions (completed_from_history)
 // - Current objective and progress (for the next model to pick up immediately)
 // - Decisions made (immutable once locked)
 // - Key findings (discoveries worth remembering)
@@ -1162,6 +1188,7 @@ function _buildDirective(intent, taskType, complexity, reasoning, verification) 
 //   turn: number,
 //   model: string,
 //   accomplishment: string[],      // What was accomplished this turn
+//   completed_from_history: ScoredItem[],  // NEW: Work already done in previous sessions
 //   currentObjective: string,       // What is being worked on
 //   progress: string,               // How far along
 //   decisionsLocked: string[],      // Immutable decisions from this turn
@@ -1171,6 +1198,47 @@ function _buildDirective(intent, taskType, complexity, reasoning, verification) 
 //   workingSet: { path, purpose }[], // Files most likely to need changes
 // }
 
+// ---------------------------------------------------------------------------
+// Extract completed items from a single handoff object.
+// Returns a normalized ScoredItem[] with confidence sources.
+// ---------------------------------------------------------------------------
+function extractCompletedFromHandoff(handoff) {
+  if (!handoff) return [];
+
+  const items = [];
+  const seen = new Set();
+
+  // Helper to add an item with optional deduplication
+  const addItem = (text, confidence, source) => {
+    if (!text || text.trim().length === 0) return;
+    const key = text.trim().toLowerCase().slice(0, 60);
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push({ text, confidence, source });
+  };
+
+  // Extract from accomplishment (hard outcomes from this turn)
+  if (handoff.accomplishment) {
+    for (const item of (handoff.accomplishment || [])) {
+      if (typeof item === 'string') {
+        addItem(item, BASE_CONFIDENCE.state_accomplishment, 'handoff_accomplishment');
+      } else if (item.text) {
+        addItem(item.text, item.confidence, item.source || 'handoff_accomplishment');
+      }
+    }
+  }
+
+  // Extract from progress string (when it describes completed work)
+  // e.g., "3/5 tasks completed" or "Working on: X" (in_progress is not completed)
+  if (handoff.progress && handoff.progress.includes('completed')) {
+    // Could extract individual tasks from "3/5 tasks completed" if we had the task list,
+    // but for now we just mark the progress milestone
+    addItem(`${handoff.progress} (from previous session)`, BASE_CONFIDENCE.state_progress, 'handoff_progress');
+  }
+
+  return items.slice(0, 3); // Max 3 completed items from history
+}
+
 export function generateHandoff(projectId, { writeFile = true } = {}) {
   const state = readState(projectId);
   const handoff = {
@@ -1178,6 +1246,7 @@ export function generateHandoff(projectId, { writeFile = true } = {}) {
     turn: state.turnCount,
     model: state.lastProvider,
     accomplishment: [],
+    completed_from_history: [], // NEW: Work already done in previous sessions
     currentObjective: state.activeTask?.description || "",
     progress: "",
     decisionsLocked: state.decisions.map(d => d.content),
@@ -1201,6 +1270,25 @@ export function generateHandoff(projectId, { writeFile = true } = {}) {
                 : a.type === "file_edit" ? "state_action"
                 :                          "state_command",
     }));
+  }
+
+  // Extract completed items from previous sessions — tagged as completed_from_history
+  // This separates previous session work from current session accomplishments
+  const history = readHandoffHistory(projectId);
+  if (history?.length > 0) {
+    const historyCompleted = [];
+    for (const h of history) {
+      if (h.completed_from_history?.length) {
+        historyCompleted.push(...h.completed_from_history);
+      }
+    }
+    if (historyCompleted.length > 0) {
+      handoff.completed_from_history = mergeItemArrays(
+        historyCompleted,
+        [],
+        3 // Max 3 items total from history
+      );
+    }
   }
 
   // Progress from active todo

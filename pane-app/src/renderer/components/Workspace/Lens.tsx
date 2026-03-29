@@ -9,38 +9,7 @@ import { useLensChat } from "../../hooks/useLensChat";
 import { SlashMenu } from "../shared";
 import type { TextBlock } from "../../lib/punk-types";
 
-// Simple confirmation dialog
-function ConfirmDialog({ open, title, message, onConfirm, onCancel }: {
-  open: boolean;
-  title: string;
-  message: string;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onCancel}>
-      <div className="bg-pane-bg border border-pane-border/60 rounded-xl shadow-2xl p-5 max-w-sm w-[90%]" onClick={e => e.stopPropagation()}>
-        <h3 className="font-semibold text-pane-text mb-2" style={{ fontSize: "var(--pane-font-size-sm)" }}>{title}</h3>
-        <p className="text-pane-text-secondary mb-6" style={{ fontSize: "var(--pane-font-size-xs)" }}>{message}</p>
-        <div className="flex justify-end gap-2">
-          <button
-            onClick={onCancel}
-            className="px-3 py-1.5 rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.05] transition-colors text-sm"
-          >
-            cancel
-          </button>
-          <button
-            onClick={() => { onConfirm(); onCancel(); }}
-            className="px-3 py-1.5 rounded-lg bg-red-500/10 text-red-500 hover:bg-red-500/20 transition-colors text-sm"
-          >
-            delete
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
+// Delete confirmation helper — matches Mind pattern (1-click "confirm?", 2-click delete with auto-revert)
 
 const PUNK_PERSONAS: Record<string, { name: string; role: string }> = {
   bug:        { name: "maya", role: "debugger" },
@@ -226,11 +195,23 @@ function PostItem({
   onDelete: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isPunk = post.contributor !== "user";
   const persona = isPunk ? PUNK_PERSONAS[post.contributor] : null;
   const name = persona ? persona.name : (userName || "you");
   const commentCount = post.comment_count ?? 0;
   const isLong = post.content.length > POST_CLAMP_THRESHOLD;
+
+  const handleDeleteClick = () => {
+    if (confirmDelete) {
+      if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
+      onDelete();
+    } else {
+      setConfirmDelete(true);
+      deleteTimerRef.current = setTimeout(() => setConfirmDelete(false), 2500);
+    }
+  };
 
   return (
     <div className="mb-5">
@@ -305,21 +286,17 @@ function PostItem({
                 {commentCount > 0 && <span>{commentCount}</span>}
               </button>
               <button
-                onClick={onDelete}
-                className="flex items-center gap-1 transition-all btn-press font-mono hover:bg-red-500/10 rounded"
+                onClick={handleDeleteClick}
+                className="flex items-center transition-colors btn-press font-mono hover:!opacity-100"
                 style={{
                   fontSize: "var(--pane-font-size-xs)",
-                  color: "var(--pane-text-secondary)",
-                  opacity: 0.35,
+                  color: confirmDelete
+                    ? "var(--pane-error)"
+                    : "var(--pane-text-secondary)",
+                  opacity: confirmDelete ? 0.8 : 0.25,
                 }}
-                onMouseEnter={(e) => e.currentTarget.style.opacity = "0.7"}
-                onMouseLeave={(e) => e.currentTarget.style.opacity = "0.35"}
-                title="delete"
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
-                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
-                </svg>
+                {confirmDelete ? "confirm?" : "delete"}
               </button>
             </div>
           </div>
@@ -351,8 +328,6 @@ export function Lens({ projectId }: { projectId: string }) {
   const expandedCommentsId = useLensStore((s) => s.expandedCommentsId);
   const setExpandedCommentsId = useLensStore((s) => s.setExpandedCommentsId);
 
-  // Delete confirmation state
-  const [deleteConfirm, setDeleteConfirm] = useState<{ postId: string; content: string } | null>(null);
 
   const workingDir = useProjectsStore((s) => s.projects.get(projectId)?.root ?? "");
   const userName = useWorkspaceStore((s) => s.profileName);
@@ -490,14 +465,6 @@ export function Lens({ projectId }: { projectId: string }) {
     }
   }, [deletePost]);
 
-  const confirmDelete = useCallback((postId: string, content: string) => {
-    setDeleteConfirm({ postId, content });
-  }, []);
-
-  const cancelDelete = useCallback(() => {
-    setDeleteConfirm(null);
-  }, []);
-
   const handleKeyDown = (e: React.KeyboardEvent) => {
     // Slash menu captures Enter/Tab/Escape/Arrows — don't double-handle
     if (slashOpen && (e.key === "Enter" || e.key === "Tab" || e.key === "Escape" || e.key === "ArrowDown" || e.key === "ArrowUp")) {
@@ -542,7 +509,7 @@ export function Lens({ projectId }: { projectId: string }) {
               }
               workingDir={workingDir}
               userName={userName}
-              onDelete={() => confirmDelete(post.id, post.content)}
+              onDelete={() => handleDelete(post.id)}
             />
           ))
         )}
@@ -608,14 +575,6 @@ export function Lens({ projectId }: { projectId: string }) {
         )}
       </div>
 
-      {/* Delete confirmation dialog */}
-      <ConfirmDialog
-        open={!!deleteConfirm}
-        title="Delete lens entry"
-        message={`Are you sure? This will permanently delete: "${deleteConfirm?.content?.slice(0, 100) ?? ''}${(deleteConfirm?.content?.length ?? 0) > 100 ? '…' : ''}"`}
-        onConfirm={() => { if (deleteConfirm) handleDelete(deleteConfirm.postId); }}
-        onCancel={cancelDelete}
-      />
     </div>
   );
 }

@@ -51,22 +51,20 @@ export function ThinkingBlockDisplay({
           variant={isStreaming ? "strong" : "subtle"}
           animate={isStreaming}
           size={5}
-          ariaLabel={isStreaming ? "thinking" : "reasoning complete"}
+          ariaLabel="contemplating"
         />
         <span
           className="font-mono mr-1"
           style={{ fontSize: "var(--pane-font-size-sm)" }}
         >
-          <span 
+          <span
             className={
-              isBreathing 
-                ? "text-pane-text-secondary/40 animate-pulse" 
-                : isStreaming 
-                  ? "text-pane-text-secondary/50" 
-                  : "text-pane-text-secondary/30"
+              isBreathing
+                ? "text-pane-text-secondary/40 animate-pulse"
+                : "text-pane-text-secondary/30"
             }
           >
-            {isStreaming ? "thinking..." : "reasoning"}
+            contemplating
           </span>
         </span>
         <span 
