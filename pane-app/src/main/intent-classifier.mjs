@@ -37,7 +37,7 @@ const VALID_FILE_DEPTH  = new Set(["none", "names", "shallow", "deep"]);
 // SDK_ALIASES: short model names that the agent SDK and gemini CLI resolve automatically.
 // For these backends we show ONLY aliases — 3 clean tiers, no versioned noise.
 const SDK_ALIASES    = new Set(["opus", "sonnet", "haiku"]);
-const GEMINI_ALIASES = new Set(["auto-gemini-3"]);
+const GEMINI_ALIASES = new Set(["gemini-3-flash-preview"]);
 
 function buildModelCatalog({ backend, apiKeys, priors, profiles }) {
   // Determine which providers are available.

@@ -8,7 +8,8 @@
       "env": {
         "PANE_PROJECT_ID": "pane",
         "PANE_PROJECT_ROOT": "/Users/macbook/Pane"
-      }
+      },
+      "trust": true
     }
   }
 }

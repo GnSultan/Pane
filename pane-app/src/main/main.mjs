@@ -36,6 +36,42 @@ let mindPunks = null;
 async function registerClaudeHandlers() {
   // Punk is the default engine; keep these names for backwards compatibility.
   await registerPunkHandlers();
+
+  // ── Token Usage Persistence Hook ───────────────────────────────────────
+  // Intercept all token_usage events from backends (HTTP and CLI) and record
+  // them to SQLite for long-term analytics.
+  const origHandleBackendEvent = punkEngine.handleBackendEvent.bind(punkEngine);
+  punkEngine.handleBackendEvent = (projectId, event, requestId) => {
+    if (event.event === "token_usage") {
+      try {
+        const db = getPaneDb();
+        if (!db.stmts.insertTokenUsage) {
+          console.warn("[main] Database not initialized, skipping token usage recording");
+          return;
+        }
+        const usage = event.data;
+        const id = `tu-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+        db.stmts.insertTokenUsage.run(
+          id,
+          projectId,
+          usage.provider,
+          usage.activity_type,
+          usage.model,
+          usage.input_tokens,
+          usage.output_tokens,
+          usage.cache_creation_input_tokens || 0,
+          usage.cache_read_input_tokens || 0,
+          usage.cost_usd,
+          usage.duration_ms || 0,
+          Date.now(),
+        );
+      } catch (err) {
+        console.error("[main] Failed to record token usage:", err.message);
+      }
+    }
+    return origHandleBackendEvent(projectId, event, requestId);
+  };
+
   ipcMain.handle("send_to_claude", async (_event, args) => {
     const { projectId, prompt, workingDir, model, intent } = args;
     await punkEngine.spawn({
@@ -51,6 +87,23 @@ async function registerClaudeHandlers() {
   });
   ipcMain.handle("terminate_claude_session", async (_event, args) => {
     await punkEngine.terminate(args.projectId);
+  });
+  ipcMain.handle("get_token_analytics", async (_event, { projectId, sinceMs }) => {
+    try {
+      const db = getPaneDb();
+      if (!db.stmts.getTokenAnalytics) {
+        console.warn("[main] Database not fully initialized, returning empty analytics");
+        return [];
+      }
+      if (projectId) {
+        return db.stmts.getTokenAnalytics.all(projectId, sinceMs || 0);
+      } else {
+        return db.stmts.getGlobalTokenAnalytics.all(sinceMs || 0);
+      }
+    } catch (err) {
+      console.error("[main] get_token_analytics error:", err.message);
+      return [];
+    }
   });
   ipcMain.handle("check_claude_version", async () => {
     try {
@@ -637,11 +690,10 @@ function registerCommandHandlers() {
       // 5. Pane session change history — what the AI assistant actually did
       let changeDescriptions = [];
       try {
-        const historyFile = path.join(os.homedir(), ".pane", "change-history", projectId, "changes.json");
-        const changes = JSON.parse(await fs.promises.readFile(historyFile, "utf-8"));
-        for (const c of changes.slice(-40)) {
-          if (c.description) changeDescriptions.push(`- ${c.file}: ${c.description}`);
-          else if (c.file) changeDescriptions.push(`- modified ${c.file}`);
+        const rows = db.stmts.getChanges.all(projectId);
+        for (const c of rows.slice(0, 40)) {
+          if (c.description) changeDescriptions.push(`- ${c.file_path}: ${c.description}`);
+          else if (c.file_path) changeDescriptions.push(`- modified ${c.file_path}`);
         }
       } catch {}
 
@@ -1262,37 +1314,6 @@ function registerCheckpointHandlers(db) {
 
   // --- Change History Handlers ---
   // Primary store: SQLite (change_history table).
-  // Shadow file: ~/.pane/change-history/{projectId}/changes.json is kept in sync
-  // so tool-executor.mjs (UtilityProcess) and pane-mcp-server.mjs can read it
-  // directly without IPC.
-
-  function changeHistoryDir(projectId) {
-    return path.join(os.homedir(), ".pane", "change-history", projectId);
-  }
-
-  // Write a shadow copy of all changes to disk for out-of-process readers.
-  async function writeShadowChangeFile(projectId) {
-    try {
-      const rows = db.stmts.getChanges.all(projectId);
-      // Remap to legacy shape so tool-executor.mjs reads without modification
-      const legacy = rows.map(r => ({
-        id: r.id,
-        timestamp: r.timestamp,
-        file: r.file_path,
-        oldString: r.old_string,
-        newString: r.new_string,
-        description: r.description,
-      }));
-      const dir = changeHistoryDir(projectId);
-      await fs.promises.mkdir(dir, { recursive: true });
-      const file = path.join(dir, "changes.json");
-      const tmp = file + ".tmp";
-      await fs.promises.writeFile(tmp, JSON.stringify(legacy, null, 2), "utf-8");
-      await fs.promises.rename(tmp, file);
-    } catch (e) {
-      console.error("[change-history] shadow write failed:", e.message);
-    }
-  }
 
   ipcMain.handle("record_change", async (_event, args) => {
     const { projectId, filePath, oldString, newString, description, timestamp, workingDir } = args;
@@ -1311,8 +1332,6 @@ function registerCheckpointHandlers(db) {
       workingDir ?? null,
     );
 
-    // Fire-and-forget shadow sync — don't block the IPC response
-    writeShadowChangeFile(projectId);
     return { id, success: true };
   });
 
@@ -1351,7 +1370,6 @@ function registerCheckpointHandlers(db) {
       await fs.promises.writeFile(resolvedPath, revertedContent, "utf-8");
 
       db.stmts.deleteChangeById.run(changeId);
-      writeShadowChangeFile(projectId);
 
       return { success: true, output: `Reverted change in ${row.file_path}`, file: row.file_path };
     } catch (error) {
@@ -1387,8 +1405,6 @@ function registerCheckpointHandlers(db) {
     const { projectId } = args;
     try {
       db.stmts.deleteAllChanges.run(projectId);
-      // Also remove shadow file directory
-      await fs.promises.rm(changeHistoryDir(projectId), { recursive: true, force: true });
       return { success: true };
     } catch (error) {
       return { success: false, error: error.message };
@@ -2129,9 +2145,17 @@ function registerBrainHandlers() {
 }
 
 async function registerIpcHandlers() {
-  const { initPaneDb, runMigrationIfNeeded } = await import("./pane-db.mjs");
-  const db = initPaneDb();
-  await runMigrationIfNeeded(db);
+  let db = null;
+  try {
+    const { initPaneDb } = await import("./pane-db.mjs");
+    db = initPaneDb();
+    console.log("[main] Database initialized successfully");
+  } catch (err) {
+    console.error("[main] Failed to initialize database:", err.message);
+    console.error("[main] App will continue with limited functionality");
+    // Create a mock db object to prevent crashes
+    db = { stmts: {} };
+  }
 
   registerCommandHandlers();
   registerSettingsHandlers();
@@ -2172,7 +2196,7 @@ function createWindow() {
     icon: iconPath,
     show: false,
     webPreferences: {
-      preload: path.join(__dirname, "../preload/preload.js"),
+      preload: path.join(__dirname, "../preload/preload.mjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -2246,6 +2270,8 @@ app.whenReady().then(async () => {
       projectWhy:  projectWhy || "",
     });
   });
+
+  punkEngine.setBrainRequest((type, data) => brainRequest(type, data));
 
   punkEngine.setBrainIndexer((projectId, events) =>
     brainRequest("index_events", { projectId, events })

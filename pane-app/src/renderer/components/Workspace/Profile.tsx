@@ -20,8 +20,7 @@ import {
   brainUpdateRules,
   brainUpdatePhilosophy,
   reinitializePunkBackend,
-  checkClaudeVersion,
-  checkGeminiVersion,
+  getBackendAvailability,
   cloudLogin,
   cloudLogout,
   cloudGetUser,
@@ -385,6 +384,20 @@ function EngineSelect({
   openRouterModels?: Array<{ id: string; name: string; context_length: number }>;
   httpApiKeys?: Record<string, string>;
 }) {
+  // Determine backend source for an engine
+  const getBackendSource = useCallback((engine: EngineOption): string => {
+    // Claude Code CLI models
+    if (engine.provider === "anthropic") {
+      return "claude-code";
+    }
+    // Gemini CLI models
+    if (engine.provider === "gemini") {
+      return "gemini-cli";
+    }
+    // All other models go to HTTP API
+    return "http-api";
+  }, []);
+
   const groupedOptions = useMemo(() => {
     const groups: Record<string, EngineOption[]> = {};
 
@@ -464,11 +477,17 @@ function EngineSelect({
     >
       {Object.entries(groupedOptions).map(([provider, opts]) => (
         <optgroup key={provider} label={provider} className="bg-pane-bg">
-          {opts.map((opt: EngineOption) => (
-            <option key={engineKey(opt)} value={engineKey(opt)}>
-              {opt.label}
-            </option>
-          ))}
+          {opts.map((opt: EngineOption) => {
+            const backendSource = getBackendSource(opt);
+            const backendIndicator = backendSource === "claude-code" ? "[Claude Code] "
+              : backendSource === "gemini-cli" ? "[Gemini CLI] "
+              : "[HTTP API] ";
+            return (
+              <option key={engineKey(opt)} value={engineKey(opt)}>
+                {backendIndicator}{opt.label}
+              </option>
+            );
+          })}
         </optgroup>
       ))}
     </select>
@@ -480,29 +499,47 @@ function AiEnginesSection({
 }: {
   httpApiKeys: Record<string, string>;
 }) {
-  const punkBackend = useWorkspaceStore((s) => s.punkBackend);
   const routing = useWorkspaceStore(useShallow((s) => s.getEffectiveRouting()));
   const openRouterModels = useWorkspaceStore((s) => s.openRouterModels);
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
 
-  // The provider that the current CLI backend authenticates natively —
-  // no HTTP API key needed for these (the CLI handles auth itself).
-  const nativeProvider =
-    punkBackend === "claude-code" ? "anthropic" :
-    punkBackend === "gemini" ? "gemini" :
-    null;
+  // For transparent routing, we show all engines but need to know which are usable
+  // CLI providers (anthropic for Claude Code, gemini for Gemini CLI) are always usable if installed
+  // HTTP providers need API keys
+  const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
+  const [geminiAvailable, setGeminiAvailable] = useState(false);
+
+  useEffect(() => {
+    getBackendAvailability()
+      .then((availability) => {
+        setClaudeCodeAvailable(availability.claude);
+        setGeminiAvailable(availability.gemini);
+      })
+      .catch(() => {
+        setClaudeCodeAvailable(false);
+        setGeminiAvailable(false);
+      });
+  }, []);
 
   const filterEngines = useCallback(
     (engines: EngineOption[]) =>
       engines.filter((o) => {
-        // auto-* models are CLI-managed routing — only show for their native backend
-        if (o.model.startsWith("auto-")) return o.provider === nativeProvider;
-        // Native CLI provider: CLI handles auth, no HTTP key check needed
-        if (nativeProvider && o.provider === nativeProvider) return true;
-        // HTTP: show only if the required API key is present (OpenRouter is not special)
-        return !!httpApiKeys?.[o.provider];
+        // Filter out auto-* models as they're CLI routing hints
+        if (o.model.startsWith("auto-")) return false;
+        
+        // Check if engine is usable
+        const isUsable = (() => {
+          // Claude Code CLI handles anthropic provider authentication
+          if (o.provider === "anthropic") return claudeCodeAvailable;
+          // Gemini CLI handles gemini provider authentication
+          if (o.provider === "gemini") return geminiAvailable;
+          // HTTP providers need API keys
+          return !!httpApiKeys?.[o.provider];
+        })();
+        
+        return isUsable;
       }),
-    [nativeProvider, httpApiKeys],
+    [claudeCodeAvailable, geminiAvailable, httpApiKeys],
   );
 
   const filteredThinking = useMemo(() => filterEngines(THINKING_ENGINES), [filterEngines]);
@@ -511,37 +548,38 @@ function AiEnginesSection({
   const autoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
   const setIntentRouting = useWorkspaceStore((s) => s.setIntentRouting);
 
-  // Auto-heal: when keys change or routing is loaded from settings, reset any slot
-  // that points to a provider for which no key exists. This prevents silent failures
-  // when a user removes an API key or loads a config from a different machine.
+  // Auto-heal: when availability changes (CLI installed/uninstalled, keys added/removed),
+  // reset any slot that points to a provider that is no longer usable.
   useEffect(() => {
-    // CLI backends authenticate themselves — no key-based routing needed
-    if (punkBackend !== "api") return;
-
-    // For "api" backend, nativeProvider is always null so every provider
-    // needs an explicit key in httpApiKeys to be considered valid.
-    const isKeyless = (provider: string) => !httpApiKeys?.[provider];
+    const isProviderUsable = (provider: string) => {
+      // Claude Code CLI handles anthropic provider
+      if (provider === "anthropic") return claudeCodeAvailable;
+      // Gemini CLI handles gemini provider
+      if (provider === "gemini") return geminiAvailable;
+      // HTTP providers need API keys
+      return !!httpApiKeys?.[provider];
+    };
 
     const firstThinking = filteredThinking[0];
     const firstBuilding = filteredBuilding[0];
 
-    // Nothing we can do if there are no configured engines at all
+    // Nothing we can do if there are no usable engines at all
     if (!firstThinking && !firstBuilding) return;
 
     const current = routing;
     const updates: Partial<IntentRouting> = {};
 
-    if (current?.plan && isKeyless(current.plan.provider) && firstThinking) {
+    if (current?.plan && !isProviderUsable(current.plan.provider) && firstThinking) {
       updates.plan = { provider: firstThinking.provider, model: firstThinking.model, thinking: firstThinking.thinking };
     }
-    if (current?.execute && isKeyless(current.execute.provider) && (firstBuilding || firstThinking)) {
+    if (current?.execute && !isProviderUsable(current.execute.provider) && (firstBuilding || firstThinking)) {
       const fallback = firstBuilding ?? firstThinking!;
       updates.execute = { provider: fallback.provider, model: fallback.model, thinking: fallback.thinking };
     }
-    if (current?.explain && isKeyless(current.explain.provider) && firstThinking) {
+    if (current?.explain && !isProviderUsable(current.explain.provider) && firstThinking) {
       updates.explain = { provider: firstThinking.provider, model: firstThinking.model, thinking: firstThinking.thinking };
     }
-    if (current?.other && isKeyless(current.other.provider) && (firstBuilding || firstThinking)) {
+    if (current?.other && !isProviderUsable(current.other.provider) && (firstBuilding || firstThinking)) {
       const fallback = firstBuilding ?? firstThinking!;
       updates.other = { provider: fallback.provider, model: fallback.model, thinking: fallback.thinking };
     }
@@ -549,9 +587,8 @@ function AiEnginesSection({
     if (Object.keys(updates).length > 0) {
       setIntentRouting({ ...current, ...updates } as IntentRouting);
     }
-    // Only re-run when keys or backend changes — routing deliberately excluded to prevent loops
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [httpApiKeys, punkBackend]);
+    // Only re-run when availability changes
+  }, [httpApiKeys, claudeCodeAvailable, geminiAvailable]);
 
   const setIntentAutoRoute = useWorkspaceStore((s) => s.setIntentAutoRoute);
 
@@ -567,85 +604,52 @@ function AiEnginesSection({
         model: opt.model,
         thinking: opt.thinking || isReasoningProvider,
       },
-      execute:
-        routing?.execute ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
-        DEFAULT_BACKEND_ROUTING["api"]!.execute,
-      explain:
-        routing?.explain ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
-        DEFAULT_BACKEND_ROUTING["api"]!.explain,
-      other:
-        routing?.other ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
-        DEFAULT_BACKEND_ROUTING["api"]!.other,
+      execute: routing?.execute || DEFAULT_BACKEND_ROUTING["api"]!.execute,
+      explain: routing?.explain || DEFAULT_BACKEND_ROUTING["api"]!.explain,
+      other: routing?.other || DEFAULT_BACKEND_ROUTING["api"]!.other,
     };
     setIntentRouting(next);
-    reinitializePunkBackend(punkBackend).catch(() => {});
+    // Reinitialize to apply routing changes
+    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleBuildingChange = (opt: EngineOption) => {
     const next = {
-      plan:
-        routing?.plan ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
-        DEFAULT_BACKEND_ROUTING["api"]!.plan,
+      plan: routing?.plan || DEFAULT_BACKEND_ROUTING["api"]!.plan,
       execute: {
         provider: opt.provider,
         model: opt.model,
         thinking: opt.thinking,
       },
-      explain:
-        routing?.explain ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
-        DEFAULT_BACKEND_ROUTING["api"]!.explain,
-      other:
-        routing?.other ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
-        DEFAULT_BACKEND_ROUTING["api"]!.other,
+      explain: routing?.explain || DEFAULT_BACKEND_ROUTING["api"]!.explain,
+      other: routing?.other || DEFAULT_BACKEND_ROUTING["api"]!.other,
     };
     setIntentRouting(next);
-    reinitializePunkBackend(punkBackend).catch(() => {});
+    // Reinitialize to apply routing changes
+    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleExplainChange = (opt: EngineOption) => {
     const next = {
-      plan:
-        routing?.plan ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
-        DEFAULT_BACKEND_ROUTING["api"]!.plan,
-      execute:
-        routing?.execute ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
-        DEFAULT_BACKEND_ROUTING["api"]!.execute,
+      plan: routing?.plan || DEFAULT_BACKEND_ROUTING["api"]!.plan,
+      execute: routing?.execute || DEFAULT_BACKEND_ROUTING["api"]!.execute,
       explain: {
         provider: opt.provider,
         model: opt.model,
         thinking: opt.thinking,
       },
-      other:
-        routing?.other ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
-        DEFAULT_BACKEND_ROUTING["api"]!.other,
+      other: routing?.other || DEFAULT_BACKEND_ROUTING["api"]!.other,
     };
     setIntentRouting(next);
-    reinitializePunkBackend(punkBackend).catch(() => {});
+    // Reinitialize to apply routing changes
+    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleOtherChange = (opt: EngineOption) => {
     const next = {
-      plan:
-        routing?.plan ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
-        DEFAULT_BACKEND_ROUTING["api"]!.plan,
-      execute:
-        routing?.execute ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
-        DEFAULT_BACKEND_ROUTING["api"]!.execute,
-      explain:
-        routing?.explain ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
-        DEFAULT_BACKEND_ROUTING["api"]!.explain,
+      plan: routing?.plan || DEFAULT_BACKEND_ROUTING["api"]!.plan,
+      execute: routing?.execute || DEFAULT_BACKEND_ROUTING["api"]!.execute,
+      explain: routing?.explain || DEFAULT_BACKEND_ROUTING["api"]!.explain,
       other: {
         provider: opt.provider,
         model: opt.model,
@@ -653,21 +657,21 @@ function AiEnginesSection({
       },
     };
     setIntentRouting(next);
-    reinitializePunkBackend(punkBackend).catch(() => {});
+    // Reinitialize to apply routing changes
+    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleAutoRouteToggle = () => {
     setIntentAutoRoute(!autoRoute);
-    const { punkBackend } = useWorkspaceStore.getState();
-    reinitializePunkBackend(punkBackend).catch(() => {});
+    // Reinitialize to apply routing changes
+    reinitializePunkBackend("api").catch(() => {});
   };
 
   const getActiveOption = (
     current: { provider: string; model: string; thinking: boolean } | undefined,
     baseOptions: EngineOption[],
   ) => {
-    const routingDefault =
-      DEFAULT_BACKEND_ROUTING[punkBackend] || DEFAULT_BACKEND_ROUTING["api"];
+    const routingDefault = DEFAULT_BACKEND_ROUTING["api"];
     const target = current || routingDefault?.plan || baseOptions[0]!;
 
     // 1. Try to find in hardcoded options first
@@ -711,10 +715,17 @@ function AiEnginesSection({
   const explainingEngine = getActiveOption(routing?.explain, filteredThinking);
   const otherEngine = getActiveOption(routing?.other, filteredBuilding);
 
-  const missingThinkingKey = !httpApiKeys[thinkingEngine.requiresKey];
-  const missingBuildingKey = !httpApiKeys[buildingEngine.requiresKey];
-  const missingExplainingKey = !httpApiKeys[explainingEngine.requiresKey];
-  const missingOtherKey = !httpApiKeys[otherEngine.requiresKey];
+  // Check if each engine's provider is usable
+  const isProviderUsable = (provider: string) => {
+    if (provider === "anthropic") return claudeCodeAvailable;
+    if (provider === "gemini") return geminiAvailable;
+    return !!httpApiKeys[provider];
+  };
+
+  const missingThinkingKey = !isProviderUsable(thinkingEngine.provider);
+  const missingBuildingKey = !isProviderUsable(buildingEngine.provider);
+  const missingExplainingKey = !isProviderUsable(explainingEngine.provider);
+  const missingOtherKey = !isProviderUsable(otherEngine.provider);
 
   return (
     <div className="flex flex-col gap-4">
@@ -803,12 +814,12 @@ function AiEnginesSection({
                   )}
                 </div>
               </div>
-              {missingThinkingKey && thinkingEngine.provider !== nativeProvider && (
+              {missingThinkingKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ no API key for {thinkingEngine.requiresKey} — add it below
+                  ⚠ {thinkingEngine.provider === "anthropic" ? "Claude Code not installed" : thinkingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${thinkingEngine.requiresKey}`} — {thinkingEngine.provider === "anthropic" || thinkingEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
@@ -837,12 +848,12 @@ function AiEnginesSection({
                   onChange={handleBuildingChange}
                 />
               </div>
-              {missingBuildingKey && buildingEngine.provider !== nativeProvider && (
+              {missingBuildingKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ no API key for {buildingEngine.requiresKey} — add it below
+                  ⚠ {buildingEngine.provider === "anthropic" ? "Claude Code not installed" : buildingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${buildingEngine.requiresKey}`} — {buildingEngine.provider === "anthropic" || buildingEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
@@ -871,12 +882,12 @@ function AiEnginesSection({
                   onChange={handleExplainChange}
                 />
               </div>
-              {missingExplainingKey && explainingEngine.provider !== nativeProvider && (
+              {missingExplainingKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ no API key for {explainingEngine.requiresKey} — add it below
+                  ⚠ {explainingEngine.provider === "anthropic" ? "Claude Code not installed" : explainingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${explainingEngine.requiresKey}`} — {explainingEngine.provider === "anthropic" || explainingEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
@@ -905,12 +916,12 @@ function AiEnginesSection({
                   onChange={handleOtherChange}
                 />
               </div>
-              {missingOtherKey && otherEngine.provider !== nativeProvider && (
+              {missingOtherKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ no API key for {otherEngine.requiresKey} — add it below
+                  ⚠ {otherEngine.provider === "anthropic" ? "Claude Code not installed" : otherEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${otherEngine.requiresKey}`} — {otherEngine.provider === "anthropic" || otherEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
@@ -1327,6 +1338,8 @@ function CloudSection() {
 
 // ─── Main Profile View ────────────────────────────────────────────────────────
 
+import { TokenAnalytics } from "./TokenAnalytics";
+
 // Accordion Section Component
 function AccordionSection({
   title,
@@ -1403,7 +1416,6 @@ export function Profile() {
   const setCompletionSound = useWorkspaceStore((s) => s.setCompletionSound);
   const playCompletionSound = useWorkspaceStore((s) => s.playCompletionSound);
   const punkBackend = useWorkspaceStore((s) => s.punkBackend);
-  const setPunkBackend = useWorkspaceStore((s) => s.setPunkBackend);
   const httpApiKeys = useWorkspaceStore((s) => s.httpApiKeys);
   const setHttpApiKeys = useWorkspaceStore((s) => s.setHttpApiKeys);
 
@@ -1422,12 +1434,20 @@ export function Profile() {
   const [geminiAvailable, setGeminiAvailable] = useState(false);
 
   useEffect(() => {
-    checkClaudeVersion()
-      .then((info) => setClaudeCodeAvailable(!!info.current))
-      .catch(() => setClaudeCodeAvailable(false));
-    checkGeminiVersion()
-      .then((info) => setGeminiAvailable(!!info.current))
-      .catch(() => setGeminiAvailable(false));
+    getBackendAvailability()
+      .then((availability) => {
+        setClaudeCodeAvailable(availability.claude);
+        setGeminiAvailable(availability.gemini);
+        // Update store with backend availability
+        useWorkspaceStore.getState().setBackendAvailability({
+          claudeCode: availability.claude,
+          geminiCli: availability.gemini,
+        });
+      })
+      .catch(() => {
+        setClaudeCodeAvailable(false);
+        setGeminiAvailable(false);
+      });
   }, []);
 
   useEffect(() => {
@@ -1440,30 +1460,6 @@ export function Profile() {
       })
       .catch(() => {});
   }, []);
-
-  // Handle backend switching
-  const handleBackendChange = async (backend: string) => {
-    if (backend === punkBackend) return;
-    setPunkBackend(backend);
-
-    // Sync provider and model for Gemini CLI to ensure UI reflects the switch
-    if (backend === "gemini") {
-      useWorkspaceStore
-        .getState()
-        .setSelectedModel("auto-gemini-3", false, "gemini");
-    } else if (backend === "claude-code") {
-      useWorkspaceStore
-        .getState()
-        .setSelectedModel("sonnet", false, "anthropic");
-    } else if (backend === "api") {
-      // Default to DeepSeek for API if no prior selection
-      useWorkspaceStore
-        .getState()
-        .setSelectedModel("deepseek-chat", false, "deepseek");
-    }
-
-    await reinitializePunkBackend(backend).catch(() => {});
-  };
 
   // API key changes go straight to the store.
   // useSettingsPersistence watches the store and saves automatically.
@@ -1587,6 +1583,13 @@ export function Profile() {
         <path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z" />
       </svg>
     ),
+    usage: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 20V10" />
+        <path d="M18 20V4" />
+        <path d="M6 20v-4" />
+      </svg>
+    ),
   };
 
   return (
@@ -1695,6 +1698,16 @@ export function Profile() {
           </div>
         </AccordionSection>
 
+        {/* Usage Section */}
+        <AccordionSection
+          title="usage & spend"
+          icon={icons.usage}
+          isExpanded={expandedSection === "usage"}
+          onToggle={() => setExpandedSection(expandedSection === "usage" ? null : "usage")}
+        >
+          <TokenAnalytics projectId={null} />
+        </AccordionSection>
+
         {/* Philosophy Section */}
         <AccordionSection
           title="philosophy"
@@ -1737,9 +1750,9 @@ export function Profile() {
           </span>
         </AccordionSection>
 
-        {/* AI Backend Section */}
+        {/* Backend Availability Section */}
         <AccordionSection
-          title="ai backend"
+          title="backend availability"
           icon={icons.aiBackend}
           isExpanded={expandedSection === "aiBackend"}
           onToggle={() => setExpandedSection(expandedSection === "aiBackend" ? null : "aiBackend")}
@@ -1747,44 +1760,90 @@ export function Profile() {
           <div className="flex flex-col gap-3">
             <div className="flex items-center justify-between">
               <span className="text-pane-text-secondary/60 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                active mode
+                transparent routing
               </span>
-              <div className="flex gap-1">
-                {(["api", "claude-code", "gemini"] as const)
-                  .filter((b) => b === "api" || (b === "claude-code" && claudeCodeAvailable) || (b === "gemini" && geminiAvailable))
-                  .map((backend) => (
-                  <button
-                    key={backend}
-                    onClick={() => handleBackendChange(backend)}
-                    className={`px-3 py-1.5 rounded-lg font-mono transition-all ${punkBackend === backend ? "bg-pane-text/[0.12] text-pane-text ring-1 ring-pane-text/20" : "text-pane-text-secondary/40 hover:text-pane-text-secondary hover:bg-pane-text/[0.04]"}`}
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  >
-                    {backend === "claude-code" ? "Claude Code" : backend === "gemini" ? "Gemini" : "API"}
-                  </button>
-                ))}
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 rounded-full bg-pane-status-added animate-pulse" />
+                <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                  all backends available
+                </span>
               </div>
             </div>
 
-            {/* Backend info cards */}
-            <div className="mt-2 p-3 bg-pane-surface/50 rounded-lg">
-              {(punkBackend === "claude-code" || punkBackend === "gemini") ? (
-                <div className="flex items-center gap-2 text-pane-text-secondary">
-                  <div className="w-2 h-2 rounded-full bg-pane-status-added animate-pulse" />
-                  <span className="font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    {punkBackend === "claude-code" ? "Claude Code" : "Gemini"} — local command authentication ready
+            {/* Backend availability cards */}
+            <div className="space-y-2">
+              <div className="p-3 bg-pane-surface/50 rounded-lg">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className={`w-2 h-2 rounded-full ${claudeCodeAvailable ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
+                    <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+                      Claude Code
+                    </span>
+                  </div>
+                  <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                    {claudeCodeAvailable ? "available" : "not installed"}
                   </span>
                 </div>
-              ) : (
-                <div className="flex items-center gap-2 text-pane-text-secondary">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <circle cx="12" cy="12" r="10" />
-                    <path d="M12 16v-4M12 8h.01" />
-                  </svg>
-                  <span className="font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    API mode — configure keys and model routing
+                {claudeCodeAvailable && (
+                  <div className="mt-2 pl-4">
+                    <span className="font-mono text-pane-text-secondary/50" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      Claude models route locally via CLI
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div className="p-3 bg-pane-surface/50 rounded-lg">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className={`w-2 h-2 rounded-full ${geminiAvailable ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
+                    <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+                      Gemini CLI
+                    </span>
+                  </div>
+                  <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                    {geminiAvailable ? "available" : "not installed"}
                   </span>
                 </div>
-              )}
+                {geminiAvailable && (
+                  <div className="mt-2 pl-4">
+                    <span className="font-mono text-pane-text-secondary/50" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      Gemini models route locally via CLI
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div className="p-3 bg-pane-surface/50 rounded-lg">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-pane-status-added" />
+                    <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+                      HTTP API
+                    </span>
+                  </div>
+                  <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                    always available
+                  </span>
+                </div>
+                <div className="mt-2 pl-4">
+                  <span className="font-mono text-pane-text-secondary/50" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                    OpenRouter & direct API models
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-2 p-3 bg-pane-surface/30 rounded-lg border border-pane-border/20">
+              <div className="flex items-center gap-2">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M12 16v-4M12 8h.01" />
+                </svg>
+                <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                  Models are automatically routed to the appropriate backend
+                </span>
+              </div>
             </div>
           </div>
         </AccordionSection>

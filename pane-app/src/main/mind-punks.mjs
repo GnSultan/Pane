@@ -313,11 +313,12 @@ Format your response as: [file:line] — [what's wrong and what it could cause].
 
     const result = await this._runAgent(systemPrompt, `Investigate this bug:\n\n${entry.content}`, workingDir);
     if (result && result.trim()) {
-      if (source === "mind") await this._writePunkThread(entry.id, result.trim(), "bug");
       if (replyToPostId) {
+        // User posted this to Lens directly — reply in the comment thread
         await this._writeLensComment(replyToPostId, result.trim());
       } else {
-        await this._writeLensPost("bug", result.trim(), projectId, entry.id);
+        // Originated from Mind — post finding to Lens, linked back to the entry
+        await this._writeLensPost("bug", result.trim(), projectId, source === "mind" ? entry.id : null);
       }
     }
   }
@@ -348,11 +349,12 @@ Format your response as: [area/pattern] — [one-line observation tied to projec
 
     const result = await this._runAgent(systemPrompt, `Reflect on this idea:\n\n${entry.content}`, workingDir);
     if (result && result.trim()) {
-      if (source === "mind") await this._writePunkThread(entry.id, result.trim(), "reflection");
       if (replyToPostId) {
+        // User posted this to Lens directly — reply in the comment thread
         await this._writeLensComment(replyToPostId, result.trim());
       } else {
-        await this._writeLensPost("reflection", result.trim(), projectId, entry.id);
+        // Originated from Mind — post finding to Lens, linked back to the entry
+        await this._writeLensPost("reflection", result.trim(), projectId, source === "mind" ? entry.id : null);
       }
     }
   }

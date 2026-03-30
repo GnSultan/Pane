@@ -10,11 +10,27 @@ import readline from "node:readline";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const Database = require("better-sqlite3");
+
 const execAsync = promisify(exec);
 
 const PANE_DIR = process.env.PANE_DATA_DIR || path.join(os.homedir(), ".pane");
 const PROJECT_ID = process.env.PANE_PROJECT_ID || "";
 const PROJECT_ROOT = process.env.PANE_PROJECT_ROOT || "";
+const DB_PATH = path.join(PANE_DIR, "pane.db");
+
+// Database instance — opened lazily
+let _db = null;
+function getDb() {
+  if (!_db) {
+    _db = new Database(DB_PATH);
+    _db.pragma("journal_mode = WAL");
+    _db.pragma("synchronous = NORMAL");
+  }
+  return _db;
+}
 
 // --- JSON-RPC helpers ---
 
@@ -537,82 +553,85 @@ async function handleToolCall(name, args) {
     }
 
     case "pane_change_history": {
-      const changeHistoryDir = path.join(PANE_DIR, "change-history", PROJECT_ID);
-      const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
-      let changes = [];
-      try { changes = await readJson(changeHistoryFile); }
-      catch { return text("No change history yet. Changes will be recorded as you edit files."); }
+      const db = getDb();
+      let rows = [];
+      try {
+        rows = db.prepare("SELECT * FROM change_history WHERE project_id = ? ORDER BY timestamp DESC LIMIT 500").all(PROJECT_ID);
+      } catch (err) {
+        return text(`Error: Failed to query change history from SQLite: ${err.message}`);
+      }
 
-      if (!changes || changes.length === 0) return text("No change history yet. Changes will be recorded as you edit files.");
+      if (rows.length === 0) return text("No change history yet. Changes will be recorded as you edit files.");
 
-      const out = changes.map(c => {
+      const out = rows.map(c => {
         const date = new Date(c.timestamp).toLocaleString();
-        const shortOld = c.oldString.length > 50 ? c.oldString.slice(0, 50) + "..." : c.oldString;
-        const shortNew = c.newString.length > 50 ? c.newString.slice(0, 50) + "..." : c.newString;
-        return `${c.id} — ${c.file}\n  ${date}\n  "${shortOld}" → "${shortNew}"`;
+        const oldStr = c.old_string || "";
+        const newStr = c.new_string || "";
+        const shortOld = oldStr.length > 50 ? oldStr.slice(0, 50) + "..." : oldStr;
+        const shortNew = newStr.length > 50 ? newStr.slice(0, 50) + "..." : newStr;
+        return `${c.id} — ${c.file_path}\n  ${date}\n  "${shortOld}" → "${shortNew}"`;
       }).join("\n\n");
-      return text(`${changes.length} changes:\n\n${out}`);
+      return text(`${rows.length} changes:\n\n${out}`);
     }
 
     case "pane_search_changes": {
       const query = args?.query;
       const filePath = args?.file_path;
-      const changeHistoryDir = path.join(PANE_DIR, "change-history", PROJECT_ID);
-      const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
-      let changes = [];
-      try { changes = await readJson(changeHistoryFile); }
-      catch { return text("No change history to search."); }
+      const db = getDb();
+      let rows = [];
 
-      let filtered = changes;
-      if (filePath) {
-        filtered = filtered.filter(c => c.file === filePath);
-      }
-      if (query) {
-        const lowerQuery = query.toLowerCase();
-        filtered = filtered.filter(c => 
-          c.description?.toLowerCase().includes(lowerQuery) ||
-          c.oldString?.toLowerCase().includes(lowerQuery) ||
-          c.newString?.toLowerCase().includes(lowerQuery) ||
-          c.file.toLowerCase().includes(lowerQuery)
-        );
+      try {
+        if (filePath) {
+          rows = db.prepare("SELECT * FROM change_history WHERE project_id = ? AND file_path = ? ORDER BY timestamp DESC LIMIT 200").all(PROJECT_ID, filePath);
+        } else if (query) {
+          const like = `%${query}%`;
+          rows = db.prepare("SELECT * FROM change_history WHERE project_id = ? AND (file_path LIKE ? OR description LIKE ? OR new_string LIKE ? OR old_string LIKE ?) ORDER BY timestamp DESC LIMIT 200")
+            .all(PROJECT_ID, like, like, like, like);
+        } else {
+          rows = db.prepare("SELECT * FROM change_history WHERE project_id = ? ORDER BY timestamp DESC LIMIT 500").all(PROJECT_ID);
+        }
+      } catch (err) {
+        return text(`Error: Failed to query change history from SQLite: ${err.message}`);
       }
 
-      if (filtered.length === 0) return text("No matching changes found.");
+      if (rows.length === 0) return text("No matching changes found.");
 
-      const out = filtered.map(c => {
+      const out = rows.map(c => {
         const date = new Date(c.timestamp).toLocaleString();
-        return `${c.id} — ${c.file}\n  ${date}\n  "${c.oldString}" → "${c.newString}"`;
+        return `${c.id} — ${c.file_path}\n  ${date}\n  "${c.old_string || ""}" → "${c.new_string || ""}"`;
       }).join("\n\n");
-      return text(`${filtered.length} matching changes:\n\n${out}`);
+      return text(`${rows.length} matching changes:\n\n${out}`);
     }
 
     case "pane_revert_change": {
       const changeId = args?.change_id;
-      const changeHistoryDir = path.join(PANE_DIR, "change-history", PROJECT_ID);
-      const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
-      let changes = [];
-      try { changes = await readJson(changeHistoryFile); }
-      catch { return text("Error: No change history found."); }
+      const db = getDb();
+      let change = null;
+      try {
+        change = db.prepare("SELECT * FROM change_history WHERE id = ?").get(changeId);
+      } catch (err) {
+        return text(`Error: Failed to query SQLite: ${err.message}`);
+      }
 
-      const changeIndex = changes.findIndex(c => c.id === changeId);
-      if (changeIndex === -1) return text(`Error: Change ${changeId} not found.`);
+      if (!change) return text(`Error: Change ${changeId} not found.`);
 
-      const change = changes[changeIndex];
-      const resolvedPath = path.isAbsolute(change.file) ? change.file : path.join(PROJECT_ROOT, change.file);
+      const resolvedPath = path.isAbsolute(change.file_path) ? change.file_path : path.join(PROJECT_ROOT, change.file_path);
 
       try {
         const currentContent = await fs.promises.readFile(resolvedPath, "utf-8");
-        if (!currentContent.includes(change.newString)) {
+        const oldStr = change.old_string || "";
+        const newStr = change.new_string || "";
+
+        if (!currentContent.includes(newStr)) {
           return text("Error: File content doesn't match expected change. The file may have been modified since this change was made.");
         }
 
-        const revertedContent = currentContent.replace(change.newString, change.oldString);
+        const revertedContent = currentContent.replace(newStr, oldStr);
         await fs.promises.writeFile(resolvedPath, revertedContent, "utf-8");
 
-        changes.splice(changeIndex, 1);
-        await fs.promises.writeFile(changeHistoryFile, JSON.stringify(changes, null, 2), "utf-8");
+        db.prepare("DELETE FROM change_history WHERE id = ?").run(changeId);
 
-        return text(`Successfully reverted change in ${change.file}`);
+        return text(`Successfully reverted change in ${change.file_path}`);
       } catch (error) {
         return text(`Error: ${error.message}`);
       }

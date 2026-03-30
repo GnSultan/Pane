@@ -671,11 +671,16 @@ function extractSessionDelta(
             "";
           if (filePath) {
             workingSet.push({ path: filePath });
-            recentActions.push({
-              type: tool.name.toLowerCase(),
-              content: filePath,
-              timestamp: now,
-            });
+            
+            // Only push to recentActions if it's a read action (not recorded in SQLite change_history)
+            // or if it's an action we want to track ephemerally in the turn.
+            if (tool.name === "Read" || tool.name === "read_file") {
+              recentActions.push({
+                type: tool.name.toLowerCase(),
+                content: filePath,
+                timestamp: now,
+              });
+            }
           }
         }
         // CLI tools: Bash | HTTP tools: run_shell_command

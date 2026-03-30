@@ -137,7 +137,7 @@ const EMBEDDED_PRIORS = [
   },
   // Gemini CLI auto-routing alias
   {
-    model: "auto-gemini-3",      provider: "gemini",
+    model: "gemini-3-flash-preview",      provider: "gemini",
     codingScore: 0.82, reasoningScore: 0.85, generalScore: 0.83,
     costInputMtok: 0,    costOutputMtok: 0,    arenaRank: 12,
   },

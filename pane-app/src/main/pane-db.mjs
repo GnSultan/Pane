@@ -13,9 +13,9 @@
  * SQLite connection safely.
  */
 
-import __cjs_mod__ from "node:module";
-const require2 = __cjs_mod__.createRequire(import.meta.url);
-const Database = require2("better-sqlite3");
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const Database = require("better-sqlite3");
 
 import fs from "node:fs";
 import path from "node:path";
@@ -126,6 +126,22 @@ function _createSchema(db) {
       updated_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS token_usage (
+      id                          TEXT    PRIMARY KEY,
+      project_id                  TEXT    NOT NULL,
+      provider                    TEXT    NOT NULL,
+      activity_type               TEXT    NOT NULL,
+      model                       TEXT    NOT NULL,
+      input_tokens                INTEGER NOT NULL,
+      output_tokens               INTEGER NOT NULL,
+      cache_creation_input_tokens INTEGER DEFAULT 0,
+      cache_read_input_tokens     INTEGER DEFAULT 0,
+      cost_usd                    REAL    NOT NULL,
+      duration_ms                 INTEGER DEFAULT 0,
+      timestamp                   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_token_usage_project ON token_usage(project_id, timestamp);
+
     -- FTS5 full-text search across all conversation messages.
     -- Stores extracted plain text from message content blocks.
     -- porter unicode61 tokenizer handles stemming (search "running" finds "run").
@@ -227,6 +243,50 @@ function _prepareStatements(db) {
     `),
     getAllScrolls: db.prepare("SELECT project_id, position FROM scroll_positions"),
 
+    // token_usage
+    insertTokenUsage: db.prepare(`
+      INSERT INTO token_usage
+        (id, project_id, provider, activity_type, model,
+         input_tokens, output_tokens, cache_creation_input_tokens,
+         cache_read_input_tokens, cost_usd, duration_ms, timestamp)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    getTokenAnalytics: db.prepare(`
+      SELECT 
+        model,
+        provider,
+        activity_type,
+        SUM(input_tokens) as total_input_tokens,
+        SUM(output_tokens) as total_output_tokens,
+        SUM(cache_creation_input_tokens) as total_cache_creation,
+        SUM(cache_read_input_tokens) as total_cache_read,
+        SUM(cost_usd) as total_cost_usd,
+        AVG(duration_ms) as avg_duration_ms,
+        COUNT(*) as call_count
+      FROM token_usage
+      WHERE project_id = ? AND timestamp >= ?
+      GROUP BY model, activity_type
+      ORDER BY total_cost_usd DESC
+    `),
+    getGlobalTokenAnalytics: db.prepare(`
+      SELECT 
+        model,
+        provider,
+        activity_type,
+        SUM(input_tokens) as total_input_tokens,
+        SUM(output_tokens) as total_output_tokens,
+        SUM(cache_creation_input_tokens) as total_cache_creation,
+        SUM(cache_read_input_tokens) as total_cache_read,
+        SUM(cost_usd) as total_cost_usd,
+        AVG(duration_ms) as avg_duration_ms,
+        COUNT(*) as call_count
+      FROM token_usage
+      WHERE timestamp >= ?
+      GROUP BY model, activity_type
+      ORDER BY total_cost_usd DESC
+    `),
+
     // FTS5 — full-text search across messages
     // Delete + re-insert pattern handles both new inserts and updates cleanly.
     deleteFts: db.prepare("DELETE FROM messages_fts WHERE message_id = ?"),
@@ -275,15 +335,18 @@ export async function runMigrationIfNeeded(db) {
   const row = db.stmts.getMigrationVersion.get();
   const version = row?.version ?? 0;
 
-  if (version < 1) {
-    console.log("[pane-db] Running one-time migration from JSON files...");
+  // Always check for legacy files even if version is >= 1, 
+  // to clean up any stragglers or ensure completion.
+  const hasLegacyChanges = fs.existsSync(path.join(PANE_DIR, "change-history"));
+  
+  if (version < 1 || hasLegacyChanges) {
+    console.log("[pane-db] Checking for one-time migration from JSON files...");
     try { await _migrateConversations(db); } catch (e) { console.error("[pane-db] conv migration error:", e.message); }
     try { await _migrateChangeHistory(db); } catch (e) { console.error("[pane-db] change migration error:", e.message); }
     try { await _migrateCheckpoints(db); }  catch (e) { console.error("[pane-db] checkpoint migration error:", e.message); }
     try { await _migrateStateBlobs(db); }   catch (e) { console.error("[pane-db] state migration error:", e.message); }
     try { await _migrateScrollPositions(db); } catch (e) { console.error("[pane-db] scroll migration error:", e.message); }
-    db.stmts.setMigrationVersion.run(1);
-    console.log("[pane-db] Migration v1 complete.");
+    if (version < 1) db.stmts.setMigrationVersion.run(1);
   }
 
   if (version < 3) {
@@ -417,12 +480,15 @@ async function _migrateArchivedConversations(db) {
 
 async function _migrateChangeHistory(db) {
   const historyDir = path.join(PANE_DIR, "change-history");
+  const archivedHistoryDir = path.join(historyDir, "archived");
   let projects;
-  try { projects = fs.readdirSync(historyDir); }
+  try { projects = fs.readdirSync(historyDir).filter(p => p !== "archived"); }
   catch { return; }
 
   for (const projectId of projects) {
     const file = path.join(historyDir, projectId, "changes.json");
+    if (!fs.existsSync(file)) continue;
+
     try {
       const raw = fs.readFileSync(file, "utf-8");
       const changes = JSON.parse(raw.trim());
@@ -430,7 +496,6 @@ async function _migrateChangeHistory(db) {
 
       const insertAll = db.transaction((items) => {
         for (const c of items) {
-          // Existing records use `file` field; new schema uses `file_path`
           db.stmts.insertChange.run(
             c.id ?? `ch-migrated-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
             projectId,
@@ -445,6 +510,15 @@ async function _migrateChangeHistory(db) {
       });
       insertAll(changes);
       console.log(`[pane-db] migrated ${changes.length} changes for project ${projectId}`);
+
+      // Archive the migrated file
+      try {
+        const destDir = path.join(archivedHistoryDir, projectId);
+        fs.mkdirSync(destDir, { recursive: true });
+        fs.renameSync(file, path.join(destDir, "changes.json.bak"));
+      } catch (e) {
+        console.warn(`[pane-db] failed to archive change history for ${projectId}:`, e.message);
+      }
     } catch (e) {
       console.error(`[pane-db] failed to migrate change history for ${projectId}:`, e.message);
     }

@@ -296,7 +296,7 @@ function normalizeHandoffItem(item) {
   return null;
 }
 
-export function compileContext(projectId, intent = "other", historyLength = 0, backend = "claude-code") {
+export function compileContext(projectId, intent = "other", historyLength = 0, backend = "claude-code", sqliteChanges = null) {
   const stableParts  = [];
   const dynamicParts = [];
 
@@ -701,10 +701,31 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     dynamicParts.push("");
   }
 
-  if (state.recentActions.length > 0) {
-    const actions = state.recentActions.slice(0, 5);
+  // Unified "What has been done" — prefers provided SQLite changes for file edits,
+  // falls back to state.recentActions for commands/decisions.
+  const hasSqliteChanges = Array.isArray(sqliteChanges) && sqliteChanges.length > 0;
+  if (hasSqliteChanges || (state.recentActions && state.recentActions.length > 0)) {
     dynamicParts.push("What has been done:");
-    for (const a of actions) dynamicParts.push(`- [${a.type}] ${a.content}`);
+    
+    // 1. Show SQLite changes if provided (file_edit source of truth)
+    if (hasSqliteChanges) {
+      for (const c of sqliteChanges.slice(0, 10)) {
+        const type = (c.old_string || c.oldString) ? "edit" : "write";
+        dynamicParts.push(`- [${type}] ${c.file_path || c.file}`);
+      }
+    }
+    
+    // 2. Show non-file actions from recentActions (commands, decisions, etc.)
+    // Filter out file edits from recentActions if we have SQLite changes to avoid duplication.
+    // Also include "Read" / "read_file" if they are in recentActions since they aren't in SQLite.
+    const fileTypes = ["file_edit", "write", "edit", "Write", "Edit"];
+    const nonFileActions = (state.recentActions || []).filter(a => 
+      !hasSqliteChanges || !fileTypes.includes(a.type)
+    ).slice(0, 8);
+    
+    for (const a of nonFileActions) {
+      dynamicParts.push(`- [${a.type}] ${a.content}`);
+    }
     dynamicParts.push("");
   }
 

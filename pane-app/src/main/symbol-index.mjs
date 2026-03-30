@@ -166,6 +166,78 @@ function parseFile(content, filePath) {
   return [];
 }
 
+/**
+ * Extract file relationships (imports / dependencies) from a file.
+ * Returns { target: string, type: string }[] where target is a relative path.
+ */
+function extractRelationships(content, filePath, projectRoot) {
+  const ext = path.extname(filePath).toLowerCase();
+  const rels = [];
+  const dir = path.dirname(filePath);
+
+  if ([".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx"].includes(ext)) {
+    // import { foo } from "./path"
+    const importFromRe = /from\s+["']([^"']+)["']/g;
+    // import "./path"
+    const importOnlyRe = /import\s+["']([^"']+)["']/g;
+    // require("./path")
+    const requireRe = /require\s*\(\s*["']([^"']+)["']\s*\)/g;
+    // export * from "./path"
+    const exportFromRe = /export\s+.*\s+from\s+["']([^"']+)["']/g;
+
+    const matches = [
+      ...content.matchAll(importFromRe),
+      ...content.matchAll(importOnlyRe),
+      ...content.matchAll(requireRe),
+      ...content.matchAll(exportFromRe),
+    ];
+
+    for (const m of matches) {
+      let target = m[1];
+      if (!target.startsWith(".")) continue; // skip node_modules/internal
+
+      // Resolve relative path
+      try {
+        let abs = path.resolve(dir, target);
+        // Try to add extensions if missing
+        if (!fs.existsSync(abs)) {
+          for (const e of [".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx"]) {
+            if (fs.existsSync(abs + e)) { abs += e; break; }
+            if (fs.existsSync(path.join(abs, "index" + e))) { abs = path.join(abs, "index" + e); break; }
+          }
+        }
+        
+        if (fs.existsSync(abs)) {
+          const rel = path.relative(projectRoot, abs);
+          rels.push({ target: rel, type: m[0].startsWith("export") ? "export_from" : "import" });
+        }
+      } catch { /* skip invalid paths */ }
+    }
+  } else if (ext === ".py") {
+    // from .path import foo
+    const pyFromRe = /^from\s+\.([\w.]+)\s+import/gm;
+    // import .path
+    const pyImportRe = /^import\s+\.([\w.]+)/gm;
+
+    for (const m of content.matchAll(pyFromRe)) {
+      const target = m[1].replace(/\./g, "/") + ".py";
+      rels.push({ target, type: "import" });
+    }
+    for (const m of content.matchAll(pyImportRe)) {
+      const target = m[1].replace(/\./g, "/") + ".py";
+      rels.push({ target, type: "import" });
+    }
+  }
+
+  // Deduplicate by target
+  const seen = new Set();
+  return rels.filter(r => {
+    if (seen.has(r.target)) return false;
+    seen.add(r.target);
+    return true;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Hash — fast file-change detection
 // ---------------------------------------------------------------------------
@@ -204,6 +276,19 @@ export function initSymbolTables(db) {
     CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(project_id, name COLLATE NOCASE);
     CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(project_id, file_path);
     CREATE INDEX IF NOT EXISTS idx_sym_kind ON symbols(project_id, kind);
+
+    CREATE TABLE IF NOT EXISTS file_relationships (
+      id           TEXT PRIMARY KEY,
+      project_id   TEXT NOT NULL,
+      source_file  TEXT NOT NULL,
+      target_file  TEXT NOT NULL,
+      type         TEXT NOT NULL, -- 'import', 'export_from', 'reference'
+      metadata     TEXT DEFAULT '{}',
+      UNIQUE(project_id, source_file, target_file, type)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_rel_source ON file_relationships(project_id, source_file);
+    CREATE INDEX IF NOT EXISTS idx_rel_target ON file_relationships(project_id, target_file);
 
     CREATE TABLE IF NOT EXISTS syntheses (
       id           TEXT PRIMARY KEY,
@@ -258,25 +343,41 @@ export function indexFileSymbols(db, projectId, filePath, projectRoot) {
 
   if (existing?.file_hash === hash) return { added: 0, removed: 0, skipped: true };
 
-  // Delete old symbols for this file
+  // Delete old symbols and relationships for this file
   const removed = db.prepare(
     `DELETE FROM symbols WHERE project_id = ? AND file_path = ?`
   ).run(projectId, relPath).changes;
 
+  db.prepare(
+    `DELETE FROM file_relationships WHERE project_id = ? AND source_file = ?`
+  ).run(projectId, relPath);
+
   const parsed = parseFile(content, filePath);
-  if (parsed.length === 0) return { added: 0, removed, skipped: false };
+  const rels = extractRelationships(content, filePath, projectRoot);
 
   const insert = getInsert(db);
-  const insertMany = db.transaction((syms) => {
+  const insertRel = db.prepare(`
+    INSERT OR REPLACE INTO file_relationships
+      (id, project_id, source_file, target_file, type, metadata)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  const insertMany = db.transaction((syms, relationships) => {
     for (const s of syms) {
       const id = `sym-${crypto.createHash("md5")
         .update(`${projectId}:${relPath}:${s.name}:${s.line}`)
         .digest("hex").slice(0, 16)}`;
       insert.run(id, projectId, relPath, s.name, s.kind, s.signature, s.line, s.doc || null, hash);
     }
+    for (const r of relationships) {
+      const id = `rel-${crypto.createHash("md5")
+        .update(`${projectId}:${relPath}:${r.target}:${r.type}`)
+        .digest("hex").slice(0, 16)}`;
+      insertRel.run(id, projectId, relPath, r.target, r.type, "{}");
+    }
   });
 
-  insertMany(parsed);
+  insertMany(parsed, rels);
   return { added: parsed.length, removed, skipped: false };
 }
 

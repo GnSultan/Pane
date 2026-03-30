@@ -15,6 +15,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { compileContext, mergeState, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, readHandoff, writeHandoffWithHistory, updateLatestHandoff } from "./session-context.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
+import { calculateCost } from "./pricing.mjs";
 
 // Resolve the SDK's cli.js — works in both dev and production (asar).
 // In production, cli-worker.mjs is inside app.asar/out/main/, so node_modules
@@ -119,7 +120,7 @@ function handleGeminiLine(projectId, line, requestId) {
               type: "system",
               subtype: "init",
               session_id: sessionId,
-              model: parsed.model || "auto-gemini-3",
+              model: parsed.model || "gemini-3-flash-preview",
               tools: [],
             },
           },
@@ -392,6 +393,36 @@ function handleGeminiLine(projectId, line, requestId) {
         outputTokens = parsed.stats.output_tokens || 0;
         cachedTokens = parsed.stats.cached || 0;
       }
+
+      // Emit token_usage event
+      const cost = calculateCost({
+        model: parsed.model || "gemini-3-flash-preview",
+        provider: "gemini",
+        inputTokens,
+        outputTokens,
+        cacheReadTokens: cachedTokens,
+      });
+
+      sendToMain({
+        type: "event",
+        projectId,
+        requestId,
+        event: {
+          event: "token_usage",
+          data: {
+            provider: "gemini",
+            activity_type: "conversation",
+            model: parsed.model || "gemini-3-flash-preview",
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cachedTokens,
+            cost_usd: cost,
+            duration_ms: parsed.stats?.duration_ms || 0,
+          },
+        },
+      });
+
       sendToMain({
         type: "event",
         projectId,
@@ -576,6 +607,38 @@ async function handleClaudeSpawn({
               sessionText += (sessionText ? "\n\n" : "") + block.text;
             }
           }
+
+          if (msg.message?.usage) {
+            const usage = msg.message.usage;
+            const cost = calculateCost({
+              model: "claude-3-5-sonnet",
+              provider: "anthropic",
+              inputTokens: usage.input_tokens || 0,
+              outputTokens: usage.output_tokens || 0,
+              cacheReadTokens: usage.cache_read_input_tokens || 0,
+              cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+            });
+            sendToMain({
+              type: "event",
+              projectId,
+              requestId,
+              event: {
+                event: "token_usage",
+                data: {
+                  provider: "anthropic",
+                  activity_type: "conversation",
+                  model: "claude-3-5-sonnet",
+                  input_tokens: usage.input_tokens || 0,
+                  output_tokens: usage.output_tokens || 0,
+                  cache_creation_input_tokens:
+                    usage.cache_creation_input_tokens || 0,
+                  cache_read_input_tokens: usage.cache_read_input_tokens || 0,
+                  cost_usd: cost,
+                  duration_ms: 0,
+                },
+              },
+            });
+          }
         }
 
         if (RENDERER_MSG_TYPES.has(msg.type)) {
@@ -732,6 +795,7 @@ async function handleGeminiSpawn({
                 PANE_PROJECT_ID: projectId,
                 PANE_PROJECT_ROOT: workingDir,
               },
+              trust: true,
             },
           },
         },
@@ -781,7 +845,14 @@ async function handleGeminiSpawn({
 
   // Prompt is passed via stdin (not -p flag) to avoid shell arg length limits and
   // quoting fragility with large prompts containing code, JSON, or special characters.
-  const cmdParts = ["gemini", "--output-format", "stream-json", "--yolo"];
+  const cmdParts = [
+    "gemini",
+    "--output-format",
+    "stream-json",
+    "--yolo",
+    "--allowed-mcp-server-names",
+    "pane",
+  ];
   if (model && /gemini/i.test(model)) cmdParts.push("--model", model);
 
   const shellCmd = cmdParts.map((arg) => shellEscape(arg)).join(" ");
@@ -966,6 +1037,7 @@ async function handleSpawn({
   systemPromptOverride,
   escalationHint,
   noExec,
+  sqliteChanges,
 }) {
   const command =
     messageCommand || (process.serviceData && process.serviceData.command);
@@ -996,7 +1068,7 @@ async function handleSpawn({
   });
 
   const backend = command === "claude" ? "claude-code" : "gemini";
-  const context = compileContext(projectId, intent, historyLength, backend);
+  const context = compileContext(projectId, intent, historyLength, backend, sqliteChanges);
   const basePrompt = systemPromptOverride || context.full;
   const systemPrompt = escalationHint ? `${basePrompt}\n\n${escalationHint}` : basePrompt;
 

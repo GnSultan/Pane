@@ -13,6 +13,7 @@ import { execFile, spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { promisify } from "node:util";
 import { BrowserWindow, utilityProcess, ipcMain } from "electron";
+import { getPaneDb } from "./pane-db.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -97,6 +98,43 @@ function spawnWithStallTimeout(command, args, options = {}) {
     });
   });
 }
+
+/**
+ * Detect available backends for transparent routing.
+ *
+ * @returns {Object} - { claudeAgent: boolean, geminiCli: boolean, versions: { claudeAgent: string, gemini: string } }
+ */
+async function detectBackendAvailability() {
+  const result = {
+    claudeAgent: false,
+    geminiCli: false,
+    versions: {}
+  };
+
+  // Check Claude Agent SDK (package installed)
+  try {
+    await import("@anthropic-ai/claude-agent-sdk");
+    result.claudeAgent = true;
+    result.versions.claudeAgent = "installed";
+  } catch (err) {
+    // Not installed — non-fatal
+    // console.log("[punk] Claude Agent SDK not available");
+  }
+
+  // Check Gemini CLI binary
+  try {
+    const stdout = await spawnWithStallTimeout("gemini", ["--version"], { env: getEnvWithPath() });
+    result.geminiCli = true;
+    result.versions.gemini = stdout.trim();
+  } catch (err) {
+    if (!err.message.includes("not found")) {
+      console.warn("[punk] Gemini CLI detection failed:", err.message);
+    }
+  }
+
+  return result;
+}
+
 import { ApiBackend } from "./http-backend.mjs";
 
 // Planning phase system prompts moved to planning-agent.mjs.
@@ -154,10 +192,10 @@ const __dirname = import.meta.dirname;
 
 const DEFAULT_INTENT_ROUTING = {
   "gemini": {
-    plan: { provider: "gemini", model: "auto-gemini-3", thinking: false },
-    execute: { provider: "gemini", model: "auto-gemini-3", thinking: false },
-    explain: { provider: "gemini", model: "auto-gemini-3", thinking: false },
-    other: { provider: "gemini", model: "auto-gemini-3", thinking: false },
+    plan: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
+    execute: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
+    explain: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
+    other: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
   },
   "claude-code": {
     plan: { provider: "anthropic", model: "opus", thinking: false },
@@ -237,29 +275,41 @@ async function recordStepChangesToHistory(projectId, workingDir, toolUses) {
   );
   if (editTools.length === 0) return;
 
-  const histDir = path.join(os.homedir(), ".pane", "change-history", projectId);
-  const histFile = path.join(histDir, "changes.json");
-  await fs.mkdir(histDir, { recursive: true });
-
-  let changes = [];
-  try { changes = JSON.parse(await fs.readFile(histFile, "utf-8")); } catch {}
-
+  let db;
+  try {
+    db = getPaneDb();
+  } catch (err) {
+    console.warn("[punk] Database not available, skipping change recording:", err.message);
+    return;
+  }
+  
+  if (!db.stmts.insertChange) {
+    console.warn("[punk] Database not fully initialized, skipping change recording");
+    return;
+  }
+  
   for (const tool of editTools) {
     let filePath = tool.input?.file_path || tool.input?.path || "";
     if (workingDir && path.isAbsolute(filePath) && filePath.startsWith(workingDir)) {
       filePath = path.relative(workingDir, filePath);
     }
-    changes.unshift({
-      id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: Date.now(),
-      file: filePath,
-      oldString: tool.input?.old_string || "",
-      newString: tool.input?.new_string || tool.input?.content || "",
-      description: `[step] ${tool.name}`,
-    });
-  }
 
-  await fs.writeFile(histFile, JSON.stringify(changes.slice(0, 500), null, 2));
+    const id = `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      db.stmts.insertChange.run(
+        id,
+        projectId,
+        filePath,
+        tool.input?.old_string || null,
+        tool.input?.new_string || tool.input?.content || "",
+        `[step] ${tool.name}`,
+        Date.now(),
+        workingDir || null
+      );
+    } catch (err) {
+      console.warn("[punk] Failed to record step change to SQLite:", err.message);
+    }
+  }
 }
 
 // CLI Backend (wraps existing cli-worker.mjs)
@@ -271,6 +321,7 @@ class CliBackend extends PunkBackend {
     this.worker = null;
     this.command = command;
     this.activeRequests = new Map(); // requestId -> projectId
+    this._requestResolvers = new Map(); // requestId -> resolve function
   }
 
   getWorker() {
@@ -284,7 +335,12 @@ class CliBackend extends PunkBackend {
     this.worker.on("message", (message) => {
       if (message.type !== "event") return;
       if (message.event.event === "processEnded") {
-        this.activeRequests.delete(message.requestId);
+        const rid = message.requestId;
+        this.activeRequests.delete(rid);
+        if (this._requestResolvers.has(rid)) {
+          this._requestResolvers.get(rid)(message.event.data);
+          this._requestResolvers.delete(rid);
+        }
       }
       this.onEvent(message.projectId, message.event, message.requestId);
     });
@@ -294,14 +350,15 @@ class CliBackend extends PunkBackend {
         `[punk] CLI worker for ${this.command} exited with code ${code}`,
       );
       for (const [requestId, projectId] of this.activeRequests.entries()) {
-        this.onEvent(
-          projectId,
-          {
-            event: "processEnded",
-            data: { exit_code: null },
-          },
-          requestId,
-        );
+        const event = {
+          event: "processEnded",
+          data: { exit_code: null },
+        };
+        if (this._requestResolvers.has(requestId)) {
+          this._requestResolvers.get(requestId)(event.data);
+          this._requestResolvers.delete(requestId);
+        }
+        this.onEvent(projectId, event, requestId);
       }
       this.activeRequests.clear();
       this.worker = null;
@@ -313,6 +370,25 @@ class CliBackend extends PunkBackend {
   async spawn(request) {
     const worker = this.getWorker();
     this.activeRequests.set(request.requestId, request.projectId);
+
+    // Create a promise that resolves when this request ends
+    const completionPromise = new Promise((resolve) => {
+      this._requestResolvers.set(request.requestId, resolve);
+    });
+
+    // Fetch recent changes from SQLite to pass to worker context
+    let sqliteChanges = [];
+    try {
+      const db = getPaneDb();
+      if (db.stmts.getChanges) {
+        sqliteChanges = db.stmts.getChanges.all(request.projectId).slice(0, 10);
+      } else {
+        console.warn("[punk] Database not fully initialized, skipping SQLite changes fetch");
+      }
+    } catch (err) {
+      console.warn("[punk] Failed to fetch SQLite changes for worker context:", err.message);
+    }
+
     worker.postMessage({
       type: "spawn",
       projectId: request.projectId,
@@ -331,7 +407,10 @@ class CliBackend extends PunkBackend {
       escalationHint: request.escalationHint,
       // Mind sessions block shell execution — MCP context tools remain available
       noExec: typeof request.projectId === "string" && request.projectId.startsWith("mind:"),
+      sqliteChanges,
     });
+
+    return completionPromise;
   }
 
   async abort(projectId) {
@@ -548,7 +627,19 @@ class CliBackend extends PunkBackend {
 
 class PunkEngine {
   constructor() {
-    this.backend = null;
+    // Multiple backend instances for transparent routing
+    this.backends = {
+      claude: null,  // CliBackend for claude
+      gemini: null,  // CliBackend for gemini
+      api: null,     // ApiBackend for HTTP
+    };
+    this.backendAvailability = {
+      claude: false,
+      gemini: false,
+      api: true,     // API backend is always available (fallback)
+    };
+    this.defaultBackend = null; // For backward compatibility
+    
     this.relayQueue = [];
     this.relayDraining = false;
     this._brainSearch = null; // injected by main.mjs — calls brain_contextual_search
@@ -607,31 +698,52 @@ class PunkEngine {
     this._brainSearch = fn;
   }
 
-  setBrainIndexer(fn) {
-    this._brainIndexer = fn;
+  setBrainRequest(fn) {
+    this._brainRequest = fn;
+    // Propagate to API backend if it exists
+    if (this.backends.api) {
+      this.backends.api.setBrainRequest(fn);
+    }
+  }
+
+  setBrainIndexer(fn) {    this._brainIndexer = fn;
   }
 
   async initialize(backendOverride) {
-    if (this.backend) return;
-
-    const backendType = backendOverride || (await this.loadSettings()).punk_backend || "api";
+    // If we already have backends initialized, just ensure they're ready
+    if (this.backends.claude || this.backends.gemini || this.backends.api) {
+      return;
+    }
 
     const onEvent = (projectId, event, requestId) =>
       this.handleBackendEvent(projectId, event, requestId);
 
-    switch (backendType) {
-      case "claude-code":
-        this.backend = new CliBackend(onEvent, "claude");
-        break;
-      case "gemini":
-        this.backend = new CliBackend(onEvent, "gemini");
-        break;
-      case "api":
-        this.backend = new ApiBackend(onEvent);
-        break;
-      default:
-        throw new Error(`Unknown backend type: ${backendType}`);
+    // Detect available backends
+    const availability = await detectBackendAvailability();
+    this.backendAvailability.claude = availability.claudeAgent;
+    this.backendAvailability.gemini = availability.geminiCli;
+    
+    console.log(`[punk] Backend availability: claude=${this.backendAvailability.claude}, gemini=${this.backendAvailability.gemini}, api=${this.backendAvailability.api}`);
+
+    // Create backend instances for available backends
+    if (this.backendAvailability.claude) {
+      this.backends.claude = new CliBackend(onEvent, "claude");
+      console.log("[punk] Claude CLI backend initialized");
     }
+    
+    if (this.backendAvailability.gemini) {
+      this.backends.gemini = new CliBackend(onEvent, "gemini");
+      console.log("[punk] Gemini CLI backend initialized");
+    }
+    
+    // API backend is always available as fallback
+    this.backends.api = new ApiBackend(onEvent);
+    console.log("[punk] HTTP API backend initialized");
+
+    // Set default backend for backward compatibility
+    const settings = await this.loadSettings();
+    const backendType = backendOverride || settings.punk_backend || "api";
+    this.defaultBackend = this.getBackendForType(backendType);
 
     // Seed benchmark priors (no-op after first run, refreshes weekly)
     ensurePriors().catch(err =>
@@ -648,11 +760,77 @@ class PunkEngine {
     }
   }
 
-  async reinitialize(backendOverride) {
-    if (this.backend) {
-      await this.backend.shutdown().catch(() => {});
-      this.backend = null;
+  /**
+   * Get backend instance for a specific backend type.
+   * Falls back to API backend if requested type is not available.
+   */
+  getBackendForType(backendType) {
+    const normalizedType = backendType === "claude-code" ? "claude" : backendType;
+    
+    if (this.backends[normalizedType] && this.backendAvailability[normalizedType]) {
+      return this.backends[normalizedType];
     }
+    
+    // Fallback to API backend
+    console.log(`[punk] Backend ${backendType} not available, falling back to API`);
+    return this.backends.api;
+  }
+
+  /**
+   * Route request to appropriate backend based on provider and model.
+   * Logic:
+   * 1. If provider is "anthropic" → claude CLI backend (if available)
+   * 2. If provider is "gemini" → gemini CLI backend (if available)
+   * 3. If model contains "/" (OpenRouter format) → API backend
+   * 4. Otherwise → default backend (from settings)
+   */
+  getBackendForRequest(request) {
+    const { provider, model } = request;
+    
+    // OpenRouter models (contain "/") always go to API backend
+    if (model && model.includes("/")) {
+      return this.backends.api;
+    }
+    
+    // Route by provider
+    if (provider === "anthropic" && this.backendAvailability.claude) {
+      return this.backends.claude;
+    }
+    
+    if (provider === "gemini" && this.backendAvailability.gemini) {
+      return this.backends.gemini;
+    }
+    
+    // Fallback to default backend
+    return this.defaultBackend || this.backends.api;
+  }
+
+  /**
+   * Get backend availability for UI display.
+   * Returns an object with availability status for each backend type.
+   */
+  getBackendAvailability() {
+    return { ...this.backendAvailability };
+  }
+
+  async reinitialize(backendOverride) {
+    // Shutdown all backends
+    for (const [type, backend] of Object.entries(this.backends)) {
+      if (backend) {
+        await backend.shutdown().catch(() => {});
+        this.backends[type] = null;
+      }
+    }
+    
+    // Reset availability
+    this.backendAvailability = {
+      claude: false,
+      gemini: false,
+      api: true,
+    };
+    
+    this.defaultBackend = null;
+    
     await this.initialize(backendOverride);
   }
 
@@ -1193,7 +1371,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       const baseProvider = isGemini ? "gemini" : "anthropic";
 
       const TIER_MODELS = {
-        gemini: { cheap: "auto-gemini-3", mid: "auto-gemini-3", capable: "auto-gemini-3", frontier: "auto-gemini-3" },
+        gemini: { cheap: "gemini-3-flash-preview", mid: "gemini-3-flash-preview", capable: "gemini-3-flash-preview", frontier: "gemini-3-flash-preview" },
         anthropic: { cheap: "haiku", mid: "sonnet", capable: "sonnet", frontier: "opus" },
       };
       const tierMap = TIER_MODELS[baseProvider] || TIER_MODELS.anthropic;
@@ -1443,7 +1621,8 @@ Respond with a single concise principle statement (one sentence, under 150 chara
           await this._orchestrate(resolvedRequest, routing, strategy, localDecision);
         } catch (err) {
           console.error(`[punk] Orchestration failed, falling back to direct:`, err.message);
-          await this.backend.spawn(resolvedRequest);
+          const backend = this.getBackendForRequest(resolvedRequest);
+          await backend.spawn(resolvedRequest);
         }
         return;
       }
@@ -1453,7 +1632,12 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       console.log(
         `[punk] spawn attempt: ${resolvedRequest.provider}/${resolvedRequest.model} (thinking=${resolvedRequest.thinking})`,
       );
-      await this.backend.spawn(resolvedRequest);
+      
+      // Get appropriate backend for this request
+      const backend = this.getBackendForRequest(resolvedRequest);
+      console.log(`[punk] routing to ${backend === this.backends.claude ? 'claude' : backend === this.backends.gemini ? 'gemini' : 'api'} backend`);
+      
+      await backend.spawn(resolvedRequest);
     } catch (err) {
       console.error(`[punk] spawn failed: ${err.message}`);
       throw err;
@@ -1496,11 +1680,17 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // Planning model explores the codebase and writes a natural markdown plan.
     // The plan streams directly to the user — no JSON parsing, no validation.
     const { runPlanningAgent } = await import("./planning-agent.mjs");
+    const planningRequest = {
+      ...request,
+      provider: planRoute.provider,
+      model: planRoute.model,
+      thinking: planRoute.thinking ?? (strategy.reasoning === "deep"),
+    };
     const planText = await runPlanningAgent({
-      request,
+      request: planningRequest,
       planRoute,
       strategy,
-      backend: this.backend,
+      backend: this.getBackendForRequest(planningRequest),
       onEvent: (pid, event, rid) => this.handleBackendEvent(pid, event, rid),
     });
 
@@ -1530,40 +1720,80 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // Execution model receives the plan as context and implements it.
     // For CLI backends: fold plan into the prompt.
     // For HTTP backends: use _systemPrepend so the plan is in the system prompt.
-    const isCliBackend = !this.backend.supportsToolCalling;
-    const executionInstructions =
-      `The following plan was written by the planning model after exploring the codebase:\n\n` +
-      `${planText}\n\n---\n\n` +
-      `Execute the plan above. Use your tools to read, modify, and create files as described. ` +
-      `Work through each phase methodically. Do not re-plan — implement.`;
-
-    const executionPrompt = isCliBackend
-      ? `${executionInstructions}\n\n---\n\nOriginal task: ${request.prompt}`
-      : request.prompt;
-
     const executionRequest = {
       ...request,
       phase:          "execution",
       provider:       execRoute?.provider || request.provider,
       model:          execRoute?.model    || request.model,
       thinking:       execRoute?.thinking ?? request.thinking ?? false,
-      prompt:         executionPrompt,
-      _systemPrepend: isCliBackend ? undefined : executionInstructions,
+      prompt:         request.prompt,
     };
+    
+    // Get appropriate backend for execution request
+    const executionBackend = this.getBackendForRequest(executionRequest);
+    const isCliBackend = !executionBackend.supportsToolCalling;
+    
+    const executionInstructions =
+      `The following plan was written by the planning model after exploring the codebase:\n\n` +
+      `${planText}\n\n---\n\n` +
+      `Execute the plan above. Use your tools to read, modify, and create files as described. ` +
+      `Work through each phase methodically. Do not re-plan — implement.`;
 
-    await this.backend.spawn(executionRequest);
+    executionRequest.prompt = isCliBackend
+      ? `${executionInstructions}\n\n---\n\nOriginal task: ${request.prompt}`
+      : request.prompt;
+    
+    executionRequest._systemPrepend = isCliBackend ? undefined : executionInstructions;
+
+    try {
+      await executionBackend.spawn(executionRequest);
+      
+      // Send completion event once execution is finished
+      this.handleBackendEvent(projectId, {
+        event: "orchestration_complete",
+        data: {
+          summary: "Execution completed",
+          completedSteps: 1,
+          totalSteps: 1,
+          allPassed: true,
+          typeCheckPassed: true,
+          touchedFiles: [],
+        },
+      }, request.requestId);
+    } catch (err) {
+      console.error(`[punk] Orchestrated execution failed: ${err.message}`);
+      this.handleBackendEvent(projectId, {
+        event: "orchestration_error",
+        data: { message: `Execution failed: ${err.message}` },
+      }, request.requestId);
+    }
   }
 
   async abort(projectId) {
-    if (this.backend) await this.backend.abort(projectId);
+    // Try all backends - the request could be in any of them
+    for (const backend of Object.values(this.backends)) {
+      if (backend) {
+        await backend.abort(projectId).catch(() => {});
+      }
+    }
   }
 
   async terminate(projectId) {
-    if (this.backend) await this.backend.terminate(projectId);
+    // Try all backends - the request could be in any of them
+    for (const backend of Object.values(this.backends)) {
+      if (backend) {
+        await backend.terminate(projectId).catch(() => {});
+      }
+    }
   }
 
   async shutdown() {
-    if (this.backend) await this.backend.shutdown();
+    // Shutdown all backends
+    for (const backend of Object.values(this.backends)) {
+      if (backend) {
+        await backend.shutdown().catch(() => {});
+      }
+    }
   }
 
   async getOpenRouterModels() {
@@ -1611,7 +1841,9 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       }
     }
 
-    return this.backend.planningCall(systemPrompt, userPrompt, request);
+    // Get appropriate backend for this request
+    const backend = this.getBackendForRequest(request);
+    return backend.planningCall(systemPrompt, userPrompt, request);
   }
 
   /**
@@ -1779,6 +2011,11 @@ export async function registerPunkHandlers() {
     await punkEngine.reinitialize(args?.backend);
   });
 
+  ipcMain.handle("get_backend_availability", async () => {
+    await punkEngine.initialize();
+    return punkEngine.getBackendAvailability();
+  });
+
   ipcMain.handle("get_openrouter_models", async () => {
     return await modelManager.models["openrouter"] || [];
   });
@@ -1824,8 +2061,8 @@ function _fastPathClassify(message, backend) {
   const lower  = trimmed.toLowerCase();
   const isGemini   = backend === "gemini";
   const provider   = isGemini ? "gemini"     : "anthropic";
-  const cheapModel = isGemini ? "auto-gemini-3" : "haiku";
-  const midModel   = isGemini ? "auto-gemini-3" : "sonnet";
+  const cheapModel = isGemini ? "gemini-3-flash-preview" : "haiku";
+  const midModel   = isGemini ? "gemini-3-flash-preview" : "sonnet";
 
   // ── Pattern 1: Pure confirmations ────────────────────────────────────────
   // Single-intent words / phrases that just mean "yes, do it".

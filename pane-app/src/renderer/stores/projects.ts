@@ -39,7 +39,7 @@ export interface Project {
   selectedPath: string | null;
   activeFilePath: string | null;
   activeFileContent: string | null;
-  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens";
+  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "fuzzy" | "search";
   conversation: ConversationState;
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
@@ -133,7 +133,7 @@ interface ProjectsState {
   // Per-project mode
   setMode: (
     projectId: string,
-    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens",
+    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "fuzzy" | "search",
   ) => void;
   toggleMode: (projectId: string) => void;
 
@@ -313,7 +313,7 @@ function createProjectsStore() {
           ? state.projects.get(state.activeProjectId)
           : undefined;
         const carryMode = currentProject?.mode;
-        const isTransientMode = carryMode === "mind" || carryMode === "profile" || carryMode === "history" || carryMode === "lens";
+        const isTransientMode = carryMode === "mind" || carryMode === "profile" || carryMode === "history" || carryMode === "lens" || carryMode === "fuzzy" || carryMode === "search";
 
         const updatedProjects = new Map(state.projects);
         const updatedProject = {
@@ -436,11 +436,11 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => {
           // Toggle between Chat and Viewer (file explorer / directory browser)
-          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens";
+          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "fuzzy" | "search";
           if (p.mode === "conversation") {
             nextMode = "viewer";
           } else {
-            // From git, terminal, viewer, mind, profile, history, or lens — always go back to conversation
+            // From git, terminal, viewer, mind, profile, history, lens, fuzzy, or search — always go back to conversation
             nextMode = "conversation";
           }
           return { mode: nextMode };

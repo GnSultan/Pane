@@ -18,10 +18,10 @@ export interface IntentRouting {
 export type BackendRouting = Record<string, IntentRouting>;
 
 export const DEFAULT_GEMINI_ROUTING: IntentRouting = {
-  plan: { provider: "gemini", model: "auto-gemini-3", thinking: false },
-  execute: { provider: "gemini", model: "auto-gemini-3", thinking: false },
-  explain: { provider: "gemini", model: "auto-gemini-3", thinking: false },
-  other: { provider: "gemini", model: "auto-gemini-3", thinking: false },
+  plan: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
+  execute: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
+  explain: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
+  other: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
 };
 
 // Default HTTP routing prefers DeepSeek since it's the most common
@@ -78,7 +78,7 @@ export const THINKING_ENGINES: EngineOption[] = [
   {
     label: "Gemini 3 Flash",
     provider: "gemini",
-    model: "auto-gemini-3",
+    model: "gemini-3-flash-preview",
     thinking: false,
     requiresKey: "gemini",
     contextWindow: 1000000,
@@ -187,6 +187,14 @@ export const THINKING_ENGINES: EngineOption[] = [
     requiresKey: "openrouter",
     contextWindow: 204800,
   },
+  {
+    label: "MiniMax M2.5 (Free, via OpenRouter)",
+    provider: "openrouter",
+    model: "minimax/minimax-m2.5:free",
+    thinking: false,
+    requiresKey: "openrouter",
+    contextWindow: 204800,
+  },
 ];
 
 export const BUILDING_ENGINES: EngineOption[] = [
@@ -201,7 +209,7 @@ export const BUILDING_ENGINES: EngineOption[] = [
   {
     label: "Gemini 3 Flash",
     provider: "gemini",
-    model: "auto-gemini-3",
+    model: "gemini-3-flash-preview",
     thinking: false,
     requiresKey: "gemini",
     contextWindow: 1000000,
@@ -310,6 +318,14 @@ export const BUILDING_ENGINES: EngineOption[] = [
     requiresKey: "openrouter",
     contextWindow: 204800,
   },
+  {
+    label: "MiniMax M2.5 (Free, via OpenRouter)",
+    provider: "openrouter",
+    model: "minimax/minimax-m2.5:free",
+    thinking: false,
+    requiresKey: "openrouter",
+    contextWindow: 204800,
+  },
 ];
 
 export const PROVIDER_MODELS: Record<
@@ -334,8 +350,8 @@ export const PROVIDER_MODELS: Record<
     { value: "step-2-mini", label: "Step 2 Mini" },
   ],
   gemini: [
-    { value: "auto-gemini-3", label: "Gemini 3 Flash" },
-    { value: "auto-gemini-3.1", label: "Gemini 3.1" },
+    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash" },
+    { value: "gemini-3.1-pro-preview", label: "Gemini 3.1" },
     {
       value: "gemini-3.1-pro-preview-customtools",
       label: "Gemini 3.1 Pro (Tools)",
@@ -355,6 +371,7 @@ export const PROVIDER_MODELS: Record<
     { value: "qwen/qwen3-coder-next", label: "Qwen3 Coder Next" },
     { value: "qwen/qwen3-coder:free", label: "Qwen3 Coder 480B (Free)" },
     { value: "minimax/minimax-m2.7", label: "MiniMax M2.7" },
+    { value: "minimax/minimax-m2.5:free", label: "MiniMax M2.5 (Free)" },
   ],
 };
 
@@ -430,6 +447,7 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "qwen/qwen3-coder-next": 262144,
   "qwen/qwen3-coder:free": 262144,
   "minimax/minimax-m2.7": 204800,
+  "minimax/minimax-m2.5:free": 204800,
   "google/gemini-2.0-flash-001": 1000000,
 };
 

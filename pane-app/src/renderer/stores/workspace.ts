@@ -34,8 +34,6 @@ function resolveTheme(theme: Theme): "dark" | "light" | "pure" {
 interface WorkspaceState {
   controlPanelVisible: boolean;
   controlPanelWidth: number;
-  fuzzyFinderOpen: boolean;
-  fileSearchOpen: boolean;
   fontSize: number;
   panelFontSize: number;
   editorFontSize: number;
@@ -46,7 +44,7 @@ interface WorkspaceState {
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
   selectedModelProvider: string; // The provider for the current model
   selectedModelThinking: boolean;
-  punkBackend: string; // "api" | "claude-code" | "gemini"
+  punkBackend: string; // "api" | "claude-code" | "gemini" - kept for backward compatibility
   httpProvider: string; // "deepseek" | "kimi" | "anthropic" | etc.
   httpApiKeys: Record<string, string>;
   httpBaseUrls: Record<string, string>;
@@ -54,9 +52,22 @@ interface WorkspaceState {
   intentAutoRoute: boolean;
   openRouterModels: OpenRouterModel[];
   allModels: Record<string, OpenRouterModel[]>;
+  fuzzyFinderOpen: boolean;
+  fileSearchOpen: boolean;
   fetchOpenRouterModels: () => Promise<void>;
   fetchAllModels: () => Promise<void>;
   refreshAllModels: () => Promise<void>;
+  toggleFuzzyFinder: () => void;
+  closeFuzzyFinder: () => void;
+  toggleFileSearch: () => void;
+  closeFileSearch: () => void;
+  // Backend availability for transparent routing
+  backendAvailability: {
+    claudeCode: boolean;
+    geminiCli: boolean;
+    api: boolean; // Always true
+  };
+  setBackendAvailability: (availability: { claudeCode: boolean; geminiCli: boolean }) => void;
   // SDK metadata — populated after first backend session init
   sdkModels: import("../lib/punk-types").SdkModel[] | null;
   sdkAccount: import("../lib/punk-types").SdkAccount | null;
@@ -79,10 +90,6 @@ interface WorkspaceState {
   setProfileAvatarDataUrl: (url: string | null) => void;
   toggleControlPanel: () => void;
   setControlPanelWidth: (width: number) => void;
-  toggleFuzzyFinder: () => void;
-  closeFuzzyFinder: () => void;
-  toggleFileSearch: () => void;
-  closeFileSearch: () => void;
   increaseFontSize: () => void;
   decreaseFontSize: () => void;
   resetFontSize: () => void;
@@ -218,6 +225,19 @@ function createWorkspaceStore() {
         console.error("Failed to refresh all models:", err);
       }
     },
+    // Backend availability for transparent routing
+    backendAvailability: {
+      claudeCode: false,
+      geminiCli: false,
+      api: true, // Always available
+    },
+    setBackendAvailability: (availability) => 
+      set({ 
+        backendAvailability: { 
+          ...get().backendAvailability, 
+          ...availability 
+        } 
+      }),
     // SDK metadata
     sdkModels: null,
     sdkAccount: null,
@@ -412,25 +432,23 @@ function createWorkspaceStore() {
     setHttpBaseUrls: (urls: Record<string, string>) =>
       set({ httpBaseUrls: urls }),
     getEffectiveRouting: () => {
-      const { punkBackend, intentRouting } = get();
-      // Ensure we always have a valid routing object for the current backend
+      const { intentRouting } = get();
+      // For transparent routing, use API routing as the default unified configuration
       return (
-        intentRouting[punkBackend] ||
-        DEFAULT_BACKEND_ROUTING[punkBackend] ||
+        intentRouting["api"] ||
         DEFAULT_BACKEND_ROUTING["api"]
       );
     },
     setIntentRouting: (routing) => {
       if (!routing) return;
-      const { punkBackend, intentRouting } = get();
-      const defaultForBackend =
-        DEFAULT_BACKEND_ROUTING[punkBackend] || DEFAULT_BACKEND_ROUTING["api"];
+      const { intentRouting } = get();
+      const defaultRouting = DEFAULT_BACKEND_ROUTING["api"];
 
       set({
         intentRouting: {
           ...intentRouting,
-          [punkBackend]: {
-            ...defaultForBackend,
+          "api": {
+            ...defaultRouting,
             ...routing,
           },
         },

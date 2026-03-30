@@ -28,6 +28,7 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { compileContext, readState, mergeState } from "./session-context.mjs";
 import { createPlan, updatePlanStep, completePlan } from "./plan-store.mjs";
+import { getPaneDb } from "./pane-db.mjs";
 
 const execAsync = promisify(exec);
 const PANE_DIR = path.join(os.homedir(), ".pane");
@@ -117,10 +118,19 @@ function buildConversationContext(history) {
  * @returns {Promise<ChangeRecord[]>} Most recent first.
  */
 async function readChangeHistory(projectId) {
-  const file = path.join(PANE_DIR, "change-history", projectId, "changes.json");
+  const db = getPaneDb();
   try {
-    return JSON.parse(await fsPromises.readFile(file, "utf-8"));
-  } catch {
+    const rows = db.stmts.getChanges.all(projectId);
+    return rows.map(r => ({
+      id: r.id,
+      timestamp: r.timestamp,
+      file: r.file_path,
+      oldString: r.old_string,
+      newString: r.new_string,
+      description: r.description,
+    }));
+  } catch (err) {
+    console.error("[task-runner] Failed to read change history from SQLite:", err.message);
     return [];
   }
 }
@@ -158,8 +168,8 @@ async function getChangesSince(projectId, sinceTimestamp) {
  * @param {string} projectRoot
  */
 async function revertChanges(projectId, changeIds, projectRoot) {
-  const file = path.join(PANE_DIR, "change-history", projectId, "changes.json");
-  let changes = await readChangeHistory(projectId);
+  const db = getPaneDb();
+  const changes = await readChangeHistory(projectId);
 
   const toRevert = changeIds
     .map(id => changes.find(c => c.id === id))
@@ -177,15 +187,14 @@ async function revertChanges(projectId, changeIds, projectRoot) {
         const restored = current.replace(change.newString, change.oldString);
         await fsPromises.writeFile(resolved, restored, "utf-8");
         reverted.push(change.id);
+        
+        // Remove from SQLite
+        db.stmts.deleteChangeById.run(change.id);
       }
     } catch (err) {
       console.warn(`[task-runner] revertChanges: failed to revert ${change.file}: ${err.message}`);
     }
   }
-
-  // Remove reverted entries from history
-  changes = changes.filter(c => !reverted.includes(c.id));
-  await fsPromises.writeFile(file, JSON.stringify(changes, null, 2), "utf-8");
 
   return reverted;
 }

@@ -48,6 +48,26 @@ export async function saveConversationToMain(
   return electronAPI.invoke("save_conversation", { projectId, conversation });
 }
 
+export interface TokenAnalyticsRow {
+  model: string;
+  provider: string;
+  activity_type: string;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_creation: number;
+  total_cache_read: number;
+  total_cost_usd: number;
+  avg_duration_ms: number;
+  call_count: number;
+}
+
+export async function getTokenAnalytics(
+  projectId: string | null,
+  sinceMs: number = 0,
+): Promise<TokenAnalyticsRow[]> {
+  return electronAPI.invoke("get_token_analytics", { projectId, sinceMs });
+}
+
 export async function getConversationSlice(
   projectId: string,
   count: number,
@@ -291,7 +311,11 @@ export async function sendToPunk(
 
       // Track orchestration lifecycle so we know which processEnded is truly terminal.
       if (event.event === "orchestration_start") orchestrationActive = true;
-      if (event.event === "orchestration_complete" || event.event === "orchestration_error") {
+      if (
+        event.event === "orchestration_complete" ||
+        event.event === "orchestration_error" ||
+        (event.event === "orchestration_phase" && event.data?.phase === "executing")
+      ) {
         orchestrationActive = false;
       }
 
@@ -373,6 +397,14 @@ export async function terminatePunkSession(projectId: string): Promise<void> {
 
 export async function reinitializePunkBackend(backend?: string): Promise<void> {
   return electronAPI.invoke("reinitialize_punk_backend", { backend });
+}
+
+export async function getBackendAvailability(): Promise<{
+  claude: boolean;
+  gemini: boolean;
+  api: boolean;
+}> {
+  return electronAPI.invoke("get_backend_availability");
 }
 
 export interface OpenRouterModel {

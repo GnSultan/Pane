@@ -2,9 +2,9 @@
 // Isolated V8 — if the brain crashes, Pane and Claude keep working.
 // Same pattern as claude-worker.mjs and pty-worker.mjs.
 
-import __cjs_mod__ from "node:module";
-const require2 = __cjs_mod__.createRequire(import.meta.url);
-const Database = require2("better-sqlite3");
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const Database = require("better-sqlite3");
 
 import fs from "node:fs";
 import path from "node:path";
@@ -111,6 +111,91 @@ function walkProjectFiles(rootDir, maxFiles = 200) {
       } else if (entry.isFile()) {
         if (shouldIndexFile(fullPath)) results.push(fullPath);
       }
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Codebase Compass — the structural and semantic guide for Pane.
+ * 
+ * Combines Layer 1 (symbols), Layer 2 (embeddings), and Layer 1.5 (file relationships)
+ * to return a "neighborhood" of code relevant to the user's intent.
+ */
+async function findCodebaseCompass(query, projectId, projectRoot, limit = 8) {
+  if (!db) return [];
+
+  // 1. Semantic Hits (Layer 2)
+  const semanticHits = await findRelevantFiles(query, projectId, 10);
+  
+  // 2. Structural Hits (Layer 1)
+  const symbolHits = findRelevantSymbols(db, projectId, query);
+  
+  // 3. Spatial Expansion (Layer 1.5)
+  // Find files that are direct neighbors of our semantic/structural hits
+  const coreFiles = new Set([
+    ...semanticHits.map(h => h.path),
+    ...symbolHits.map(s => s.file_path || s.file)
+  ]);
+
+  const neighborhood = new Map(); // path -> { score, reasons }
+  
+  // Initialize neighborhood with core hits
+  for (const h of semanticHits) {
+    neighborhood.set(h.path, { score: h.score * 0.8, reasons: ["semantic match"] });
+  }
+  for (const s of symbolHits) {
+    const p = s.file_path || s.file;
+    const existing = neighborhood.get(p) || { score: 0, reasons: [] };
+    existing.score += 0.4;
+    existing.reasons.push(`contains symbol "${s.name}"`);
+    neighborhood.set(p, existing);
+  }
+
+  // Expand to neighbors (1 level deep)
+  const allCore = Array.from(coreFiles);
+  for (const file of allCore) {
+    const rels = db.prepare(`
+      SELECT target_file, type FROM file_relationships 
+      WHERE project_id = ? AND source_file = ?
+      UNION
+      SELECT source_file, type FROM file_relationships
+      WHERE project_id = ? AND target_file = ?
+    `).all(projectId, file, projectId, file);
+
+    for (const rel of rels) {
+      const neighbor = rel.target_file || rel.source_file;
+      if (neighborhood.has(neighbor)) {
+        neighborhood.get(neighbor).score += 0.15;
+        neighborhood.get(neighbor).reasons.push(`connected to core hit "${file}"`);
+      } else {
+        neighborhood.set(neighbor, { 
+          score: 0.25, 
+          reasons: [`neighbor of core hit "${file}"`] 
+        });
+      }
+    }
+  }
+
+  // Final ranking
+  const results = Array.from(neighborhood.entries())
+    .map(([path, data]) => ({
+      path,
+      score: data.score,
+      reasons: Array.from(new Set(data.reasons)).slice(0, 3)
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  // Add descriptions from DB
+  for (const res of results) {
+    const node = db.prepare(`SELECT content FROM nodes WHERE entity_type = 'file' AND name = ? AND project_id = ?`).get(res.path, projectId);
+    if (node) {
+      try {
+        const content = JSON.parse(node.content);
+        res.description = content.text?.split(".")[0] || "";
+      } catch {}
     }
   }
 
@@ -2181,6 +2266,12 @@ process.parentPort.on("message", async ({ data }) => {
       case "contextual_search": {
         const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null, data.taskType || null, data.atomHints || [], data.projectWhy || "");
         sendToMain({ type: "contextual_result", requestId: data.requestId, ...result });
+        break;
+      }
+
+      case "codebase_compass": {
+        const result = await findCodebaseCompass(data.query, data.projectId, data.projectRoot, data.limit || 8);
+        sendToMain({ type: "codebase_compass_result", requestId: data.requestId, result });
         break;
       }
 

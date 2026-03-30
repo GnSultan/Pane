@@ -14,6 +14,7 @@ import { ToolExecutor } from "./tool-executor.mjs";
 import { compileContext, mergeState, readState, getContextLimit, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, writeHandoffWithHistory, updateLatestHandoff, readHandoff } from "./session-context.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
 import contextManager from "./context-manager.mjs";
+import { calculateCost } from "./pricing.mjs";
 
 // ============================================================================
 // HTTP Backend (Kimi/DeepSeek/Anthropic/etc.)
@@ -428,6 +429,70 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "pane_codebase_compass",
+      description: "Get a 'neighborhood' of code relevant to your intent. Combines semantic search, structural symbols, and spatial dependency mapping to surface files you should look at. Use this when you are entering a new area of the codebase or need to understand the 'blast radius' of a change.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "What you are looking for or trying to do" },
+          limit: { type: "number", description: "Maximum number of files to return (default 8)" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_find_symbol",
+      description:
+        "Find any exported symbol — function, class, type, interface, constant — by name. Returns exact file and line number instantly from the index. Always call this FIRST when you know the name of something you're looking for. Do not use Grep to find a symbol by name when this tool exists.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Symbol name to find (partial match supported)",
+          },
+          kind: {
+            type: "string",
+            enum: [
+              "function",
+              "class",
+              "const",
+              "let",
+              "var",
+              "type",
+              "interface",
+              "enum",
+              "default",
+              "namespace",
+              "reexport",
+              "async_fn",
+            ],
+            description: "Narrow by symbol kind (optional)",
+          },
+          file: {
+            type: "string",
+            description: "Narrow by file path (partial match, optional)",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_synthesize",
+      description:
+        "Get the project's architectural DNA — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "pane_profile",
       description:
         "View the user's profile — learned preferences, explicit rules, design philosophy, and known anti-patterns.",
@@ -804,6 +869,7 @@ const CODING_FAMILIES = [
   ["qwen/qwen3-coder",                "Qwen",     2],
   // MiniMax — multi-agent autonomous
   ["minimax/minimax-m2.7",            "MiniMax",  2],
+  ["minimax/minimax-m2.5",            "MiniMax",  2],
 ];
 
 function _familyFor(modelId) {
@@ -903,6 +969,15 @@ export class ApiBackend extends PunkBackend {
     this.requestStates = new Map(); // projectId -> { accumulated: string, toolUses: Map }
     this.paneDir = path.join(os.homedir(), ".pane");
     this.toolExecutors = new Map(); // projectId -> ToolExecutor
+    this._brainRequest = null;
+  }
+
+  setBrainRequest(fn) {
+    this._brainRequest = fn;
+    // Update existing executors
+    for (const executor of this.toolExecutors.values()) {
+      if (executor.setBrainRequest) executor.setBrainRequest(fn);
+    }
   }
 
   getToolExecutor(projectId, projectRoot) {
@@ -911,6 +986,9 @@ export class ApiBackend extends PunkBackend {
       executor = new ToolExecutor(projectId, projectRoot, (ev) =>
         this.onEvent(projectId, ev),
       );
+      if (this._brainRequest && executor.setBrainRequest) {
+        executor.setBrainRequest(this._brainRequest);
+      }
       this.toolExecutors.set(projectId, executor);
     }
     return executor;
@@ -1184,10 +1262,25 @@ export class ApiBackend extends PunkBackend {
       }
       mergeState(request.projectId, stateUpdate);
 
+      // Fetch recent changes from SQLite to include in context
+      let sqliteChanges = [];
+      try {
+        const db = getPaneDb();
+        if (db.stmts.getChanges) {
+          sqliteChanges = db.stmts.getChanges.all(request.projectId).slice(0, 10);
+        } else {
+          console.warn("[http] Database not fully initialized, skipping SQLite changes fetch");
+        }
+      } catch (err) {
+        console.warn("[http] Failed to fetch SQLite changes for context:", err.message);
+      }
+
       const context = compileContext(
         request.projectId,
         request.intent,
         historyLength,
+        "http",
+        sqliteChanges
       );
       let systemPrompt = request.systemPromptOverride
         || (request._systemPrepend ? request._systemPrepend + "\n\n" + context.full : context.full);
@@ -1298,6 +1391,7 @@ export class ApiBackend extends PunkBackend {
           toolUses: new Map(),
           finishReason: null,
           model: resolvedModel,
+          usage: null,
         };
         this.requestStates.set(request.projectId, state);
 
@@ -1370,6 +1464,7 @@ export class ApiBackend extends PunkBackend {
           request,
         );
 
+        const turnStartTime = Date.now();
         // ============================================================================
         // ENDURANCE RETRY LOGIC — Pane's resilience layer
         // ============================================================================
@@ -1410,8 +1505,17 @@ export class ApiBackend extends PunkBackend {
             if (!response.ok) {
               const status = response.status;
               
-              // 400-series client errors: NOT retryable (except 429)
-              if (status >= 400 && status < 500 && status !== 429) {
+              // 429 Rate Limit: 7+ retries with adaptive backoff
+              const isRateLimit = status === 429 || status === 430; // 430 is sometimes used by specialized providers
+              
+              // Transient 4xx errors that SHOULD be retried:
+              // 408: Request Timeout (upstream provider timed out)
+              // 409: Conflict (transient state conflict)
+              // 401: Unauthorized (ONLY for OpenRouter, occasionally transient sync issue)
+              const isTransientClientError = status === 408 || status === 409 || (status === 401 && apiConfig.provider === "openrouter");
+
+              // 400-series client errors: NOT retryable (except 429/408/409/OR-401)
+              if (status >= 400 && status < 500 && !isRateLimit && !isTransientClientError) {
                 // Explicitly categorize common client errors
                 if (status === 400) {
                   lastErrorType = "bad_request";
@@ -1429,12 +1533,12 @@ export class ApiBackend extends PunkBackend {
                   lastErrorType = `client_error_${status}`;
                   console.error(`[http] Client error (${status}): ${response.statusText}`);
                 }
-                break; // Don't retry client errors
+                break; // Don't retry fatal client errors
               }
 
-              // 429 Rate Limit: 7+ retries with adaptive backoff
-              if (status === 429 && attempt < MAX_RETRIES) {
-                lastErrorType = "rate_limit";
+              // Retryable 4xx (Rate Limit or Transient): 7+ retries with adaptive backoff
+              if ((isRateLimit || isTransientClientError) && attempt < MAX_RETRIES) {
+                lastErrorType = isRateLimit ? "rate_limit" : `transient_error_${status}`;
                 const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
                 
                 // Adaptive backoff: respect provider's recommended delay or exponential with jitter
@@ -1450,14 +1554,15 @@ export class ApiBackend extends PunkBackend {
                 }
                 
                 const delaySec = Math.round(delay / 1000);
-                retryHistory.push({ status: 429, attempt: attempt + 1, delay: delaySec });
+                retryHistory.push({ status, attempt: attempt + 1, delay: delaySec });
                 
-                console.warn(`[http] Rate limited (429). Waiting ${delaySec}s before retry ${attempt + 1}/${MAX_RETRIES}...`);
+                const errorMsg = isRateLimit ? "rate limited" : `transient error ${status}`;
+                console.warn(`[http] ${errorMsg}. Waiting ${delaySec}s before retry ${attempt + 1}/${MAX_RETRIES}...`);
                 
                 // Surface the wait to the user so they know Pane is handling it
                 this.onEvent(request.projectId, {
                   event: "status",
-                  data: { message: `rate limited — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})` },
+                  data: { message: `${errorMsg} — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})` },
                 }, request.requestId);
                 
                 await new Promise((resolve) => setTimeout(resolve, delay));
@@ -1621,6 +1726,37 @@ export class ApiBackend extends PunkBackend {
           }
         }
         turnRetryCount = 0; // reset on a successful turn
+
+        // ─── Analytics Capture ─────────────────────────────────────────────
+        const turnCost = calculateCost({
+          model: state.model,
+          provider: apiConfig.provider,
+          inputTokens: state.usage?.input_tokens || 0,
+          outputTokens: state.usage?.output_tokens || 0,
+          cacheReadTokens: state.usage?.cache_read_input_tokens || 0,
+          cacheWriteTokens: state.usage?.cache_creation_input_tokens || 0,
+          apiReportedCost: state.usage?.cost,
+        });
+
+        this.onEvent(
+          request.projectId,
+          {
+            event: "token_usage",
+            data: {
+              provider: apiConfig.provider,
+              activity_type: request.activity_type || "conversation",
+              model: state.model,
+              input_tokens: state.usage?.input_tokens || 0,
+              output_tokens: state.usage?.output_tokens || 0,
+              cache_creation_input_tokens:
+                state.usage?.cache_creation_input_tokens || 0,
+              cache_read_input_tokens: state.usage?.cache_read_input_tokens || 0,
+              cost_usd: turnCost,
+              duration_ms: Date.now() - turnStartTime,
+            },
+          },
+          request.requestId,
+        );
 
         const finalContent = [];
         if (state.accumulated) {
@@ -1838,11 +1974,26 @@ export class ApiBackend extends PunkBackend {
         const gitStatus = await this.getGitStatus(request.workingDir);
         mergeState(request.projectId, { gitStatus });
 
+        // Fetch fresh SQLite changes
+        let loopSqliteChanges = [];
+        try {
+          const db = getPaneDb();
+          if (db.stmts.getChanges) {
+            loopSqliteChanges = db.stmts.getChanges.all(request.projectId).slice(0, 10);
+          } else {
+            console.warn("[http] Database not fully initialized, skipping SQLite changes fetch in loop");
+          }
+        } catch (err) {
+          console.warn("[http] Failed to fetch SQLite changes in loop:", err.message);
+        }
+
         // Re-compile context to get updated system prompt for the next turn
         const context = compileContext(
           request.projectId,
           request.intent,
           messages.length, // use current length (now includes assistant response + tool results)
+          "http",
+          loopSqliteChanges
         );
         if (messages.length > 0 && messages[0].role === "system") {
           messages[0].content = context.full;
@@ -1973,9 +2124,10 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
-  prepareRequest(apiConfig, body) {
+  prepareRequest(apiConfig, body, request = null) {
     let url, headers;
     let finalBody = body;
+    const userTag = `pane-project-${request?.projectId?.slice(0, 8) || "unknown"}`;
 
     switch (apiConfig.provider) {
       case "openrouter":
@@ -1994,6 +2146,7 @@ export class ApiBackend extends PunkBackend {
           transforms: [],
           data_collection: "allow",
           zdr: false,
+          user: userTag,
         };
         break;
 
@@ -2004,6 +2157,7 @@ export class ApiBackend extends PunkBackend {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
         };
+        finalBody = { ...body, user: userTag };
         break;
 
       case "stepfun":
@@ -2015,6 +2169,7 @@ export class ApiBackend extends PunkBackend {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
         };
+        finalBody = { ...body, user: userTag };
         break;
 
       case "kimi":
@@ -2024,6 +2179,7 @@ export class ApiBackend extends PunkBackend {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
         };
+        finalBody = { ...body, user: userTag };
         break;
 
       case "anthropic": {
@@ -2034,7 +2190,10 @@ export class ApiBackend extends PunkBackend {
           "anthropic-version": "2023-06-01",
         };
         const sysMsg = body.messages.find((m) => m.role === "system");
-        const anthropicBody = { ...body };
+        const anthropicBody = { 
+          ...body,
+          metadata: { user_id: userTag }
+        };
         anthropicBody.messages = body.messages.filter(
           (m) => m.role !== "system",
         );
@@ -2165,7 +2324,7 @@ export class ApiBackend extends PunkBackend {
 
     if (provider === "gemini") {
       const map = {
-        "auto-gemini-3": "gemini-3-flash-preview",
+        "gemini-3-flash-preview": "gemini-3-flash-preview",
         gemini_flash: "gemini-flash-latest",
         gemini_pro: "gemini-pro-latest",
       };
@@ -2206,6 +2365,42 @@ export class ApiBackend extends PunkBackend {
     let finishReason = null;
     let toolDelta = null;
     let emitted = false;
+
+    // Capture usage info if present in any provider's chunk
+    if (event.usage) {
+      state.usage = {
+        input_tokens: event.usage.prompt_tokens || event.usage.input_tokens || 0,
+        output_tokens: event.usage.completion_tokens || event.usage.output_tokens || 0,
+        cache_creation_input_tokens: event.usage.cache_creation_input_tokens || 0,
+        cache_read_input_tokens: event.usage.cache_read_input_tokens || event.usage.prompt_cache_hit_tokens || 0,
+        cost: event.usage.cost || null,
+      };
+    }
+
+    // Anthropic specific usage in message_start or message_delta
+    if (provider === "anthropic") {
+      if (event.type === "message_start" && event.message?.usage) {
+        state.usage = {
+          input_tokens: event.message.usage.input_tokens || 0,
+          output_tokens: event.message.usage.output_tokens || 0,
+          cache_creation_input_tokens: event.message.usage.cache_creation_input_tokens || 0,
+          cache_read_input_tokens: event.message.usage.cache_read_input_tokens || 0,
+        };
+      } else if (event.type === "message_delta" && event.usage) {
+        if (!state.usage) state.usage = { input_tokens: 0, output_tokens: 0 };
+        state.usage.output_tokens = event.usage.output_tokens;
+      }
+    }
+
+    // Gemini specific usage in usageMetadata
+    if (provider === "gemini" && event.usageMetadata) {
+      state.usage = {
+        input_tokens: event.usageMetadata.promptTokenCount || 0,
+        output_tokens: event.usageMetadata.candidatesTokenCount || 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      };
+    }
 
     switch (provider) {
       case "openrouter": {
@@ -2696,6 +2891,8 @@ export class ApiBackend extends PunkBackend {
         const decoder = new TextDecoder();
         let fullText = "";
         let buffer = "";
+        let usage = null;
+        const callStartTime = Date.now();
 
         while (true) {
           const { done, value } = await reader.read();
@@ -2711,13 +2908,36 @@ export class ApiBackend extends PunkBackend {
             if (data === "[DONE]") continue;
 
             let parsed;
-            try { parsed = JSON.parse(data); } catch { continue; }
+            try {
+              parsed = JSON.parse(data);
+            } catch {
+              continue;
+            }
+
+            // Capture usage
+            if (parsed.usage) usage = parsed.usage;
+            if (apiConfig.provider === "anthropic") {
+              if (parsed.type === "message_start") usage = parsed.message.usage;
+              if (parsed.type === "message_delta") usage = parsed.usage;
+            } else if (apiConfig.provider === "gemini" && parsed.usageMetadata) {
+              usage = {
+                prompt_tokens: parsed.usageMetadata.promptTokenCount,
+                completion_tokens: parsed.usageMetadata.candidatesTokenCount,
+              };
+            }
 
             let delta = "";
             if (apiConfig.provider === "anthropic") {
               // Anthropic: content_block_delta with text_delta
-              if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta") {
+              if (
+                parsed.type === "content_block_delta" &&
+                parsed.delta?.type === "text_delta"
+              ) {
                 delta = parsed.delta.text || "";
+              }
+            } else if (apiConfig.provider === "gemini") {
+              if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) {
+                delta = parsed.candidates[0].content.parts[0].text;
               }
             } else {
               // OpenAI-compatible (DeepSeek, OpenRouter, Kimi, etc.)
@@ -2730,6 +2950,43 @@ export class ApiBackend extends PunkBackend {
             }
           }
         }
+
+        // Emit token_usage for the planning call
+        const totalInput = usage?.prompt_tokens || usage?.input_tokens || 0;
+        const totalOutput =
+          usage?.completion_tokens || usage?.output_tokens || 0;
+        const cacheRead =
+          usage?.cache_read_input_tokens || usage?.prompt_cache_hit_tokens || 0;
+        const cacheWrite = usage?.cache_creation_input_tokens || 0;
+
+        const callCost = calculateCost({
+          model,
+          provider: apiConfig.provider,
+          inputTokens: totalInput,
+          outputTokens: totalOutput,
+          cacheReadTokens: cacheRead,
+          cacheWriteTokens: cacheWrite,
+          apiReportedCost: usage?.cost,
+        });
+
+        this.onEvent(
+          request.projectId,
+          {
+            event: "token_usage",
+            data: {
+              provider: apiConfig.provider,
+              activity_type: request.activity_type || "planning",
+              model,
+              input_tokens: totalInput,
+              output_tokens: totalOutput,
+              cache_creation_input_tokens: cacheWrite,
+              cache_read_input_tokens: cacheRead,
+              cost_usd: callCost,
+              duration_ms: Date.now() - callStartTime,
+            },
+          },
+          request.requestId,
+        );
 
         return fullText;
 

@@ -20,6 +20,8 @@ import { promisify } from "node:util";
 import os from "node:os";
 import crypto from "node:crypto";
 
+import { getPaneDb } from "./pane-db.mjs";
+
 const execAsync = promisify(exec);
 
 // ============================================================================
@@ -143,24 +145,6 @@ function validateCommand(command, projectRoot) {
 }
 
 // ============================================================================
-// Change history write queue — shared across all ToolExecutor instances.
-// Serializes writes per project so concurrent tool calls never race on the file.
-// ============================================================================
-
-const changeHistoryQueues = new Map(); // projectId -> Promise tail
-
-function enqueueChangeWrite(projectId, fn) {
-  const prev = changeHistoryQueues.get(projectId) ?? Promise.resolve();
-  const next = prev.then(fn).catch(err =>
-    console.error("[tool-executor] change-history write failed:", err.message)
-  );
-  changeHistoryQueues.set(projectId, next.then(() => {
-    if (changeHistoryQueues.get(projectId) === next) changeHistoryQueues.delete(projectId);
-  }));
-  return next;
-}
-
-// ============================================================================
 // Tool Executor Class
 // ============================================================================
 
@@ -175,6 +159,7 @@ export class ToolExecutor {
     this.projectRoot = projectRoot;
     this.onEvent = onEvent;
     this.activeProcesses = new Map(); // toolId -> child process
+    this._brainRequest = null;
     this.executionContext = {
       cwd: projectRoot,
       env: this.getSafeEnvironment(),
@@ -185,40 +170,34 @@ export class ToolExecutor {
     };
   }
 
+  setBrainRequest(fn) {
+    this._brainRequest = fn;
+  }
+
   /**
    * Record a change in the change history.
-   * Writes are serialized per project via a queue and use atomic temp→rename.
    */
   async recordChange(change) {
-    const paneDir = path.join(os.homedir(), ".pane");
-    const histDir = path.join(paneDir, "change-history", this.projectId);
-    const histFile = path.join(histDir, "changes.json");
+    const id = `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const timestamp = change.timestamp || Date.now();
+    
+    try {
+      const db = getPaneDb();
+      db.stmts.insertChange.run(
+        id, 
+        this.projectId, 
+        change.filePath,
+        change.oldString ?? null, 
+        change.newString ?? "",
+        change.description || "", 
+        timestamp,
+        this.projectRoot
+      );
+    } catch (err) {
+      console.error("[tool-executor] Failed to record change to SQLite:", err.message);
+    }
 
-    const newChange = {
-      id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: change.timestamp || Date.now(),
-      file: change.filePath,
-      oldString: change.oldString,
-      newString: change.newString,
-      description: change.description || "",
-    };
-
-    await enqueueChangeWrite(this.projectId, async () => {
-      let changes = [];
-      try {
-        changes = JSON.parse(await fsPromises.readFile(histFile, "utf-8"));
-      } catch {
-        // Missing or corrupt — start fresh
-      }
-      changes.unshift(newChange);
-      await fsPromises.mkdir(histDir, { recursive: true });
-      // Atomic: write to .tmp then rename — no partial-write corruption
-      const tmp = histFile + ".tmp";
-      await fsPromises.writeFile(tmp, JSON.stringify(changes.slice(0, 500), null, 2), "utf-8");
-      await fsPromises.rename(tmp, histFile);
-    });
-
-    return { id: newChange.id, success: true };
+    return { id, success: true };
   }
 
   /**
@@ -843,6 +822,35 @@ export class ToolExecutor {
 
     try {
       switch (toolName) {
+        case "pane_codebase_compass": {
+          if (!this._brainRequest) return { success: false, error: "Brain worker not available for codebase compass.", toolId };
+          const query = input?.query || "";
+          const limit = input?.limit || 8;
+          
+          try {
+            const resp = await this._brainRequest("codebase_compass", {
+              projectId: this.projectId,
+              query,
+              projectRoot: this.projectRoot,
+              limit
+            });
+            
+            if (resp.error) return { success: false, error: resp.error, toolId };
+            
+            const results = resp.result || [];
+            if (results.length === 0) return { success: true, output: "Codebase compass found no relevant neighborhood for this query.", toolId };
+
+            const out = results.map(r => {
+              const reasons = r.reasons.join(", ");
+              return `- ${r.path}\n    ${r.description || ""}\n    (Context: ${reasons})`;
+            }).join("\n");
+
+            return { success: true, output: `Codebase Compass - Relevant neighborhood for "${query}":\n\n${out}`, toolId };
+          } catch (err) {
+            return { success: false, error: `Codebase compass failed: ${err.message}`, toolId };
+          }
+        }
+
         case "run_shell_command":
         case "bash":
           return await this.executeBash(toolId, input.command, input.is_background || input.background || false, input.dir_path || null);
@@ -1118,81 +1126,70 @@ export class ToolExecutor {
         }
 
         case "pane_change_history": {
-          const changeHistoryDir = path.join(paneDir, "change-history", this.projectId);
-          const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
-          let changes = [];
-          try { changes = JSON.parse(await fsPromises.readFile(changeHistoryFile, "utf-8")); }
-          catch { return { success: true, output: "No change history yet. Changes will be recorded as you edit files.", toolId }; }
+          const db = getPaneDb();
+          const rows = db.stmts.getChanges.all(this.projectId);
+          if (rows.length === 0) return { success: true, output: "No change history yet. Changes will be recorded as you edit files.", toolId };
 
-          if (!changes || changes.length === 0) return { success: true, output: "No change history yet. Changes will be recorded as you edit files.", toolId };
-
-          const out = changes.map(c => {
+          const out = rows.map(c => {
             const date = new Date(c.timestamp).toLocaleString();
-            const shortOld = c.oldString.length > 50 ? c.oldString.slice(0, 50) + "..." : c.oldString;
-            const shortNew = c.newString.length > 50 ? c.newString.slice(0, 50) + "..." : c.newString;
-            return `${c.id} — ${c.file}\n  ${date}\n  "${shortOld}" → "${shortNew}"`;
+            const oldStr = c.old_string || "";
+            const newStr = c.new_string || "";
+            const shortOld = oldStr.length > 50 ? oldStr.slice(0, 50) + "..." : oldStr;
+            const shortNew = newStr.length > 50 ? newStr.slice(0, 50) + "..." : newStr;
+            return `${c.id} — ${c.file_path}\n  ${date}\n  "${shortOld}" → "${shortNew}"`;
           }).join("\n\n");
-          return { success: true, output: `${changes.length} changes:\n\n${out}`, toolId };
+          return { success: true, output: `${rows.length} changes:\n\n${out}`, toolId };
         }
 
         case "pane_search_changes": {
           const { query, file_path: filePath } = input;
-          const changeHistoryDir = path.join(paneDir, "change-history", this.projectId);
-          const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
-          let changes = [];
-          try { changes = JSON.parse(await fsPromises.readFile(changeHistoryFile, "utf-8")); }
-          catch { return { success: true, output: "No change history to search.", toolId }; }
+          const db = getPaneDb();
+          let rows = [];
 
-          let filtered = changes;
           if (filePath) {
-            filtered = filtered.filter(c => c.file === filePath);
-          }
-          if (query) {
-            const lowerQuery = query.toLowerCase();
-            filtered = filtered.filter(c => 
-              c.description?.toLowerCase().includes(lowerQuery) ||
-              c.oldString?.toLowerCase().includes(lowerQuery) ||
-              c.newString?.toLowerCase().includes(lowerQuery) ||
-              c.file.toLowerCase().includes(lowerQuery)
-            );
+            rows = db.stmts.searchChangesByFile.all(this.projectId, filePath);
+          } else if (query) {
+            const like = `%${query}%`;
+            rows = db.stmts.searchChanges.all(this.projectId, like, like, like, like);
+          } else {
+            rows = db.stmts.getChanges.all(this.projectId);
           }
 
-          if (filtered.length === 0) return { success: true, output: "No matching changes found.", toolId };
+          if (rows.length === 0) return { success: true, output: "No matching changes found.", toolId };
 
-          const out = filtered.map(c => {
+          const out = rows.map(c => {
             const date = new Date(c.timestamp).toLocaleString();
-            return `${c.id} — ${c.file}\n  ${date}\n  "${c.oldString}" → "${c.newString}"`;
+            return `${c.id} — ${c.file_path}\n  ${date}\n  "${c.old_string || ""}" → "${c.new_string || ""}"`;
           }).join("\n\n");
-          return { success: true, output: `${filtered.length} matching changes:\n\n${out}`, toolId };
+          return { success: true, output: `${rows.length} matching changes:\n\n${out}`, toolId };
         }
 
         case "pane_revert_change": {
           const { change_id: changeId } = input;
-          const changeHistoryDir = path.join(paneDir, "change-history", this.projectId);
-          const changeHistoryFile = path.join(changeHistoryDir, "changes.json");
-          let changes = [];
-          try { changes = JSON.parse(await fsPromises.readFile(changeHistoryFile, "utf-8")); }
-          catch { return { success: false, error: "No change history found.", toolId }; }
+          const db = getPaneDb();
+          const change = db.stmts.getChangeById.get(changeId);
 
-          const changeIndex = changes.findIndex(c => c.id === changeId);
-          if (changeIndex === -1) return { success: false, error: `Change ${changeId} not found.`, toolId };
+          if (!change) return { success: false, error: `Change ${changeId} not found.`, toolId };
 
-          const change = changes[changeIndex];
-          const resolvedPath = path.isAbsolute(change.file) ? change.file : path.join(this.projectRoot, change.file);
+          const resolvedPath = path.isAbsolute(change.file_path) 
+            ? change.file_path 
+            : path.join(this.projectRoot, change.file_path);
 
           try {
             const currentContent = await fsPromises.readFile(resolvedPath, "utf-8");
-            if (!currentContent.includes(change.newString)) {
+            const oldStr = change.old_string || "";
+            const newStr = change.new_string || "";
+
+            if (!currentContent.includes(newStr)) {
               return { success: false, error: "File content doesn't match expected change. The file may have been modified since this change was made.", toolId };
             }
 
-            const revertedContent = currentContent.replace(change.newString, change.oldString);
+            const revertedContent = currentContent.replace(newStr, oldStr);
             await fsPromises.writeFile(resolvedPath, revertedContent, "utf-8");
 
-            changes.splice(changeIndex, 1);
-            await fsPromises.writeFile(changeHistoryFile, JSON.stringify(changes, null, 2), "utf-8");
+            db.stmts.deleteChangeById.run(changeId);
 
-            return { success: true, output: `Reverted change in ${change.file}`, toolId };
+            return { success: true, output: `Reverted change in ${change.file_path}`, toolId };
           } catch (error) {
             return { success: false, error: error.message, toolId };
           }
@@ -1267,6 +1264,100 @@ export class ToolExecutor {
 
           const out = top.map(r => `[${r.project}] [${r.type}] (match: ${(r.score * 100).toFixed(0)}%)\n${r.content}`).join("\n\n");
           return { success: true, output: out, toolId };
+        }
+
+        case "pane_find_symbol": {
+          const query = (input?.query || "").trim();
+          if (!query) return { success: false, error: "Query is required.", toolId };
+
+          const symbolsPath = path.join(paneDir, "brain", "symbols", `${this.projectId}.json`);
+          let exported = null;
+          try { exported = JSON.parse(await fsPromises.readFile(symbolsPath, "utf-8")); }
+          catch { return { success: true, output: "Symbol index not available yet — it builds automatically when you open a project in Pane.", toolId }; }
+
+          if (!exported?.symbols?.length) return { success: true, output: "No symbols indexed for this project.", toolId };
+
+          const q = query.toLowerCase();
+          const kindFilter = input?.kind;
+          const fileFilter = input?.file?.toLowerCase();
+
+          // Fuzzy score: exact > prefix > contains > file/doc
+          const scored = exported.symbols
+            .filter(s => !kindFilter || s.kind === kindFilter)
+            .filter(s => !fileFilter || s.file.toLowerCase().includes(fileFilter))
+            .map(s => {
+              const n = s.name.toLowerCase();
+              let score = 0;
+              if (n === q)              score = 1.0;
+              else if (n.startsWith(q)) score = 0.8;
+              else if (n.includes(q))   score = 0.6;
+              else if (s.file.toLowerCase().includes(q)) score = 0.3;
+              else if (s.doc?.toLowerCase().includes(q)) score = 0.2;
+              return score > 0 ? { ...s, score } : null;
+            })
+            .filter(Boolean)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 20);
+
+          if (scored.length === 0) {
+            return { success: true, output: `No symbols matching "${query}" found.${kindFilter ? ` (kind: ${kindFilter})` : ""}`, toolId };
+          }
+
+          const out = scored.map(s => {
+            const doc = s.doc ? `\n    ${s.doc}` : "";
+            return `${s.name} (${s.kind}) → ${s.file}:${s.line}${doc}`;
+          }).join("\n");
+
+          return { success: true, output: `${scored.length} symbol${scored.length > 1 ? "s" : ""} matching "${query}":\n\n${out}`, toolId };
+        }
+
+        case "pane_synthesize": {
+          // Read synthesis from contextual export (written by brain-engine)
+          const contextPath = path.join(paneDir, "brain", "context", `${this.projectId}.json`);
+          let ctx = null;
+          try { ctx = JSON.parse(await fsPromises.readFile(contextPath, "utf-8")); } catch {}
+
+          if (ctx?.synthesis) {
+            return { success: true, output: `## Project DNA\n\n${ctx.synthesis}`, toolId };
+          }
+
+          // Fallback: check if brain export has enough nodes to build one
+          const brainExportPath = path.join(paneDir, "brain", "exports", `${this.projectId}.json`);
+          let exported = null;
+          try { exported = JSON.parse(await fsPromises.readFile(brainExportPath, "utf-8")); } catch {}
+
+          if (!exported || exported.length === 0) {
+            return { success: true, output: "Project DNA not available yet — it builds as decisions and lessons accumulate through your work.", toolId };
+          }
+
+          const decisions = exported.filter(n => n.type === "decision" && (n.confidence || 0) >= 0.70).slice(0, 12);
+          const patterns  = exported.filter(n => n.type === "pattern"  && (n.confidence || 0) >= 0.70).slice(0, 8);
+          const lessons   = exported.filter(n => n.type === "lesson"   && (n.confidence || 0) >= 0.72).slice(0, 8);
+          const fixes     = exported.filter(n => n.type === "error_fix"&& (n.confidence || 0) >= 0.70).slice(0, 6);
+
+          if (decisions.length + patterns.length + lessons.length + fixes.length === 0) {
+            return { success: true, output: "Project DNA not available yet — memory confidence is still building.", toolId };
+          }
+
+          const parts = ["## Project DNA\n"];
+          if (decisions.length > 0) {
+            parts.push("Architectural decisions:");
+            for (const d of decisions) parts.push(`- ${d.content}`);
+          }
+          if (patterns.length > 0) {
+            parts.push("\nEstablished patterns:");
+            for (const p of patterns) parts.push(`- ${p.content}`);
+          }
+          if (lessons.length > 0) {
+            parts.push("\nLessons learned:");
+            for (const l of lessons) parts.push(`- ${l.content}`);
+          }
+          if (fixes.length > 0) {
+            parts.push("\nKnown anti-patterns:");
+            for (const f of fixes) parts.push(`- ${f.content}`);
+          }
+
+          return { success: true, output: parts.join("\n"), toolId };
         }
 
         case "pane_profile": {

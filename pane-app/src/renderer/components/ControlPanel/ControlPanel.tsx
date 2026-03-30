@@ -251,27 +251,25 @@ export function ControlPanel() {
           onClick={() => handleSetMode("history")}
           tooltip="History"
         />
-        <div className="ml-auto flex items-center gap-0.5">
-          <ToolbarButton
-            icon={<LensIcon />}
-            active={mode === "lens"}
-            onClick={() => handleSetMode("lens")}
-            tooltip="Lens"
-            badge={hasUnreadLens}
-          />
-          <ToolbarButton
-            icon={<MindIcon />}
-            active={mode === "mind"}
-            onClick={() => handleSetMode("mind")}
-            tooltip="Mind"
-          />
-          <ToolbarButton
-            icon={<ProfileIcon />}
-            active={mode === "profile"}
-            onClick={() => handleSetMode("profile")}
-            tooltip="Profile"
-          />
-        </div>
+        <ToolbarButton
+          icon={<LensIcon />}
+          active={mode === "lens"}
+          onClick={() => handleSetMode("lens")}
+          tooltip="Lens"
+          badge={hasUnreadLens}
+        />
+        <ToolbarButton
+          icon={<MindIcon />}
+          active={mode === "mind"}
+          onClick={() => handleSetMode("mind")}
+          tooltip="Mind"
+        />
+        <ToolbarButton
+          icon={<ProfileIcon />}
+          active={mode === "profile"}
+          onClick={() => handleSetMode("profile")}
+          tooltip="Profile"
+        />
       </div>
     </div>
   );

@@ -5,13 +5,13 @@
 //
 // See: https://github.com/microsoft/vscode/issues/243952
 
-import __cjs_mod__ from "node:module";
+import { createRequire } from "node:module";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 
-const require2 = __cjs_mod__.createRequire(import.meta.url);
-const nodePty = require2("node-pty");
+const require = createRequire(import.meta.url);
+const nodePty = require("node-pty");
 
 const activePtys = new Map();
 
