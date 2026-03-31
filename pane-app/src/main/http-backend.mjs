@@ -1056,6 +1056,8 @@ const CODING_FAMILIES = [
   // Qwen3 Coder (more specific first to avoid prefix collision)
   ["qwen/qwen3-coder-next",           "Qwen",     1],
   ["qwen/qwen3-coder",                "Qwen",     2],
+  // Qwen3 catch-all for any other Qwen3 variants
+  ["qwen/qwen3",                      "Qwen",     3],
   // MiniMax — multi-agent autonomous
   ["minimax/minimax-m2.7",            "MiniMax",  2],
   ["minimax/minimax-m2.5",            "MiniMax",  2],
