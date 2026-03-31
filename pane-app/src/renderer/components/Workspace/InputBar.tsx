@@ -1,10 +1,9 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
-import { useMindStore } from "../../stores/mind";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
-import { SlashMenu } from "../shared";
+import ReferencePicker, { type ReferenceItem } from "../shared/ReferencePicker";
 import type { Todo } from "../../lib/punk-types";
 import {
   isThinkingModel,
@@ -470,11 +469,10 @@ export function InputBar({
   } | null>(null);
   const [textareaFocused, setTextareaFocused] = useState(false);
 
-  // Slash-menu state
-  const [slashOpen, setSlashOpen] = useState(false);
-  const [slashQuery, setSlashQuery] = useState("");
-  const slashStartRef = useRef<number>(-1); // cursor position of the triggering /
-  const mindEntries = useMindStore((s) => s.entries);
+  // @-reference picker state (replaces old / slash system)
+  const [refOpen, setRefOpen] = useState(false);
+  const [refQuery, setRefQuery] = useState("");
+  const refStartRef = useRef<number>(-1); // cursor position right after @
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
@@ -612,60 +610,55 @@ export function InputBar({
     applyTextareaHeight();
   }, [value, applyTextareaHeight]);
 
-  // Detect `/` trigger and track query for slash-menu
+  // Detect `@` trigger and track query for reference-picker
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
     const pos = e.target.selectionStart ?? next.length;
     setValue(next);
 
-    if (slashOpen) {
-      const slashIdx = slashStartRef.current - 1; // index of the triggering /
-      // Close if the slash was deleted or cursor moved before it
-      if (next[slashIdx] !== "/" || pos < slashStartRef.current) {
-        setSlashOpen(false);
+    // If picker was open, check if @ was deleted or cursor moved before it
+    if (refOpen) {
+      const atIdx = refStartRef.current - 1; // index of the triggering @
+      if (next[atIdx] !== "@" || pos < refStartRef.current || next[pos - 1] === "\n") {
+        setRefOpen(false);
       } else {
-        // Update query: everything between the / and current cursor
-        setSlashQuery(next.slice(slashStartRef.current, pos));
+        setRefQuery(next.slice(refStartRef.current, pos));
       }
     } else {
-      // Look for a fresh / trigger: must be at start or preceded by whitespace
-      if (next[pos - 1] === "/") {
+      // Look for a fresh @ trigger: must be at start or preceded by whitespace
+      if (next[pos - 1] === "@") {
         const charBefore = next[pos - 2];
         if (!charBefore || charBefore === " " || charBefore === "\n") {
-          slashStartRef.current = pos; // query starts right after the /
-          setSlashQuery("");
-          setSlashOpen(true);
+          refStartRef.current = pos;
+          setRefQuery("");
+          setRefOpen(true);
         }
       }
     }
-  }, [slashOpen]);
+  }, [refOpen]);
 
-  const handleSlashSelect = useCallback((content: string) => {
+  const handleRefSelect = useCallback((item: ReferenceItem) => {
     const ta = textareaRef.current;
     if (!ta) return;
-    const start = slashStartRef.current;
-    const slashPos = start - 1; // position of the / itself
+    const start = refStartRef.current;
+    const atPos = start - 1; // position of the @ itself
     const cursorPos = ta.selectionStart ?? value.length;
-    // Replace from the / up to the current cursor with the entry content
-    const before = value.slice(0, slashPos);
+    const before = value.slice(0, atPos);
     const after = value.slice(cursorPos);
-    const next = before + content + after;
+    const tag = `@${item.namespace}:${item.label}`;
+    const next = before + tag + (after.startsWith(" ") ? after : " " + after);
     setValue(next);
-    setSlashOpen(false);
-    // Restore focus and move cursor to end of inserted content
+    setRefOpen(false);
+    // Restore focus and move cursor to end of inserted tag
     requestAnimationFrame(() => {
       ta.focus();
-      const newPos = before.length + content.length;
+      const newPos = before.length + tag.length;
       ta.setSelectionRange(newPos, newPos);
     });
   }, [value]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      // When slash menu is open, Enter/Tab/Escape/Arrows are handled by SlashMenu's window listener
-      if (slashOpen && (e.key === "Enter" || e.key === "Tab" || e.key === "Escape" || e.key === "ArrowDown" || e.key === "ArrowUp")) {
-        return; // Let SlashMenu's capture listener handle it
-      }
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         const trimmed = value.trim();
@@ -675,11 +668,29 @@ export function InputBar({
         }
       }
       if (e.key === "Escape" && isProcessing) {
+        // Close the reference picker before aborting
+        if (refOpen && refStartRef.current !== -1) {
+          e.preventDefault();
+          const ta = textareaRef.current;
+          if (ta) {
+            const before = value.slice(0, refStartRef.current - 1);
+            const after = value.slice(ta.selectionStart ?? value.length);
+            setValue(before + after);
+            setRefOpen(false);
+            refStartRef.current = -1;
+            requestAnimationFrame(() => {
+              ta.focus();
+              const newPos = before.length;
+              ta.setSelectionRange(newPos, newPos);
+            });
+          }
+          return;
+        }
         e.preventDefault();
         onAbort();
       }
     },
-    [value, isProcessing, slashOpen, projectId, onSend, onAbort],
+    [value, isProcessing, refOpen, onSend, onAbort],
   );
 
   return (
@@ -765,12 +776,11 @@ export function InputBar({
 
       {/* One card. Textarea owns the whole surface. Buttons float inside it. */}
       <div className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative">
-        {slashOpen && (
-          <SlashMenu
-            entries={mindEntries}
-            query={slashQuery}
-            onSelect={handleSlashSelect}
-            onDismiss={() => setSlashOpen(false)}
+        {refOpen && (
+          <ReferencePicker
+            query={refQuery}
+            onSelect={handleRefSelect}
+            onDismiss={() => { setRefOpen(false); refStartRef.current = -1; }}
           />
         )}
           <div ref={caretContainerRef} className="relative overflow-hidden">
