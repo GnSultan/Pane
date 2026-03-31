@@ -58,6 +58,77 @@ function text(s) {
   return { content: [{ type: "text", text: s }] };
 }
 
+// --- Contextual augmentation ---
+// When tool output contains stack traces or file:line references, auto-attach
+// the referenced code. Eliminates 1-3 Read round-trips per error investigation.
+
+const FILE_LINE_PATTERN = /(?:at\s+(?:\S+\s+\()?)?((?:\/[^\s:()]+|src\/[^\s:()]+|[a-zA-Z][a-zA-Z0-9._/-]+\.[a-z]{1,4})):(\d+)/g;
+const MAX_AUGMENT_FILES = 3;
+const AUGMENT_CONTEXT_LINES = 10; // lines above and below the referenced line
+
+async function augmentWithReferencedFiles(output, projectRoot) {
+  if (!output || output.length < 20) return "";
+
+  // Extract unique file:line references
+  const refs = new Map(); // path → Set<lineNumbers>
+  let match;
+  const regex = new RegExp(FILE_LINE_PATTERN.source, "g");
+  while ((match = regex.exec(output)) !== null) {
+    const [, filePath, lineStr] = match;
+    const line = parseInt(lineStr, 10);
+    if (isNaN(line) || line < 1) continue;
+
+    // Skip node_modules and internal Node paths
+    if (filePath.includes("node_modules") || filePath.startsWith("node:")) continue;
+
+    // Resolve relative to project root
+    const resolved = path.isAbsolute(filePath)
+      ? filePath
+      : path.join(projectRoot, filePath);
+
+    if (!refs.has(resolved)) refs.set(resolved, new Set());
+    refs.get(resolved).add(line);
+  }
+
+  if (refs.size === 0) return "";
+
+  // Read and attach context for top references (max 3 files)
+  const augmented = [];
+  let count = 0;
+  for (const [resolved, lines] of refs) {
+    if (count >= MAX_AUGMENT_FILES) break;
+    try {
+      const content = await fs.promises.readFile(resolved, "utf-8");
+      const allLines = content.split("\n");
+      const relativePath = path.relative(projectRoot, resolved);
+
+      // For each referenced line, extract surrounding context
+      const snippets = [];
+      for (const lineNum of [...lines].sort((a, b) => a - b).slice(0, 3)) {
+        const start = Math.max(0, lineNum - 1 - AUGMENT_CONTEXT_LINES);
+        const end = Math.min(allLines.length, lineNum + AUGMENT_CONTEXT_LINES);
+        const snippet = allLines.slice(start, end)
+          .map((l, i) => {
+            const num = start + i + 1;
+            const marker = num === lineNum ? "→" : " ";
+            return `${marker}${String(num).padStart(4)} ${l}`;
+          })
+          .join("\n");
+        snippets.push(snippet);
+      }
+
+      augmented.push(`\n--- auto-attached: ${relativePath} (around line${lines.size > 1 ? "s" : ""} ${[...lines].join(", ")}) ---\n${snippets.join("\n...\n")}`);
+      count++;
+    } catch {
+      // File doesn't exist or not readable — skip
+    }
+  }
+
+  return augmented.length > 0
+    ? `\n\n[Pane auto-attached ${augmented.length} referenced file${augmented.length > 1 ? "s" : ""}]${augmented.join("")}`
+    : "";
+}
+
 // --- Shell execution helpers ---
 
 function getEnvWithPath() {
@@ -341,6 +412,21 @@ const TOOLS = [
     description: "Get the project's architectural DNA — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "pane_read_files",
+    description: "Read multiple files at once and return all contents in a single response. Use this instead of sequential Read calls when you need several files — batching saves significant round-trip overhead. Max 15 files per call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        paths: {
+          type: "array",
+          items: { type: "string" },
+          description: "Array of file paths to read (relative to project root or absolute)",
+        },
+      },
+      required: ["paths"],
+    },
+  },
 ];
 
 // --- Tool implementations ---
@@ -388,7 +474,12 @@ async function handleToolCall(name, args) {
           : c.output || "(no output)";
         return `$ ${c.cmd}\n${output}`;
       }).join("\n\n");
-      return text(out);
+
+      // Contextual augmentation: if terminal has errors with file references,
+      // auto-attach the relevant code so the model doesn't need extra Read calls.
+      const lastOutput = cmds[cmds.length - 1]?.output || "";
+      const augmentation = await augmentWithReferencedFiles(lastOutput, PROJECT_ROOT);
+      return text(out + augmentation);
     }
 
     case "pane_run_in_terminal": {
@@ -415,7 +506,13 @@ async function handleToolCall(name, args) {
       }
       await appendTerminalHistory(stateDir, command, output);
       const result = output || "(no output)";
-      return text(exitCode === 0 ? result : `Exit ${exitCode}\n${result}`);
+
+      // Contextual augmentation: if command output has errors with file references,
+      // auto-attach the code so the model can fix without extra Read calls.
+      const augmentation = exitCode !== 0
+        ? await augmentWithReferencedFiles(output, PROJECT_ROOT)
+        : "";
+      return text((exitCode === 0 ? result : `Exit ${exitCode}\n${result}`) + augmentation);
     }
 
     case "pane_recall": {
@@ -862,6 +959,25 @@ async function handleToolCall(name, args) {
       }
 
       return text(parts.join("\n"));
+    }
+
+    case "pane_read_files": {
+      const paths = args?.paths || [];
+      if (paths.length === 0) return text("No paths provided.");
+      if (paths.length > 15) return text("Maximum 15 files per batch read.");
+
+      const results = [];
+      for (const p of paths) {
+        try {
+          const resolved = path.isAbsolute(p) ? p : path.join(PROJECT_ROOT, p);
+          const content = await fs.promises.readFile(resolved, "utf-8");
+          const lines = content.split("\n").length;
+          results.push(`### ${p} (${lines} lines)\n\`\`\`\n${content}\n\`\`\``);
+        } catch (err) {
+          results.push(`### ${p}\n[Error: ${err.message}]`);
+        }
+      }
+      return text(`Read ${paths.length} files:\n\n${results.join("\n\n")}`);
     }
 
     default:

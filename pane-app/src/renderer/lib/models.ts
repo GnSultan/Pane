@@ -4,7 +4,9 @@ export interface EngineOption {
   model: string;
   thinking: boolean;
   requiresKey: string;
-  contextWindow?: number; // Token context window limit for this model
+  contextWindow?: number;
+  inputCost?: number | null;  // $/Mtok input
+  outputCost?: number | null; // $/Mtok output
 }
 
 export interface IntentRouting {
@@ -24,11 +26,6 @@ export const DEFAULT_GEMINI_ROUTING: IntentRouting = {
   other: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
 };
 
-// Default HTTP routing prefers DeepSeek since it's the most common
-// standalone API provider. OpenRouter-specific defaults are avoided here
-// because a user without an OpenRouter key would get immediate call failures.
-// The auto-heal effect in AiEnginesSection will reroute to whatever keys
-// the user actually has when the Profile panel is first opened.
 export const DEFAULT_HTTP_ROUTING: IntentRouting = {
   plan: {
     provider: "deepseek",
@@ -65,316 +62,6 @@ export const DEFAULT_BACKEND_ROUTING: BackendRouting = {
   "gemini": DEFAULT_GEMINI_ROUTING,
 };
 
-
-export const THINKING_ENGINES: EngineOption[] = [
-  {
-    label: "DeepSeek Reasoner (R1)",
-    provider: "deepseek",
-    model: "deepseek-r1",
-    thinking: true,
-    requiresKey: "deepseek",
-    contextWindow: 128000,
-  },
-  {
-    label: "Gemini 3 Flash",
-    provider: "gemini",
-    model: "gemini-3-flash-preview",
-    thinking: false,
-    requiresKey: "gemini",
-    contextWindow: 1000000,
-  },
-  {
-    label: "Gemini 3.1 Pro",
-    provider: "gemini",
-    model: "gemini-3.1-pro-preview-customtools",
-    thinking: false,
-    requiresKey: "gemini",
-    contextWindow: 2000000,
-  },
-  {
-    label: "Gemini 1.5 Pro",
-    provider: "gemini",
-    model: "gemini-1.5-pro-latest",
-    thinking: false,
-    requiresKey: "gemini",
-    contextWindow: 1000000,
-  },
-  {
-    label: "Claude Opus 4.6",
-    provider: "anthropic",
-    model: "claude-opus-4-6",
-    thinking: false,
-    requiresKey: "anthropic",
-    contextWindow: 200000,
-  },
-  {
-    label: "MiMo V2 Flash (via OpenRouter)",
-    provider: "openrouter",
-    model: "xiaomi/mimo-v2-flash",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 128000,
-  },
-  {
-    label: "MiMo V2 Omni (via OpenRouter)",
-    provider: "openrouter",
-    model: "xiaomi/mimo-v2-omni",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 256000,
-  },
-  {
-    label: "MiMo V2 Pro (via OpenRouter)",
-    provider: "openrouter",
-    model: "xiaomi/mimo-v2-pro",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 1000000,
-  },
-  {
-    label: "Step 3.5 Flash (via OpenRouter)",
-    provider: "openrouter",
-    model: "stepfun/step-3.5-flash:free",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 128000,
-  },
-  {
-    label: "Kimi K2.5 (via OpenRouter)",
-    provider: "openrouter",
-    model: "moonshot/moonshot-v1-128k",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 128000,
-  },
-  {
-    label: "GLM 4.7 (via OpenRouter)",
-    provider: "openrouter",
-    model: "z-ai/glm-4.7",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 202752,
-  },
-  {
-    label: "GLM 4.7 Flash (via OpenRouter)",
-    provider: "openrouter",
-    model: "z-ai/glm-4.7-flash",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 202752,
-  },
-  {
-    label: "Qwen3 Coder Next (via OpenRouter)",
-    provider: "openrouter",
-    model: "qwen/qwen3-coder-next",
-    thinking: false,
-    requiresKey: "openrouter",
-    contextWindow: 262144,
-  },
-  {
-    label: "Qwen3 Coder 480B (Free, via OpenRouter)",
-    provider: "openrouter",
-    model: "qwen/qwen3-coder:free",
-    thinking: false,
-    requiresKey: "openrouter",
-    contextWindow: 262144,
-  },
-  {
-    label: "MiniMax M2.7 (via OpenRouter)",
-    provider: "openrouter",
-    model: "minimax/minimax-m2.7",
-    thinking: false,
-    requiresKey: "openrouter",
-    contextWindow: 204800,
-  },
-  {
-    label: "MiniMax M2.5 (Free, via OpenRouter)",
-    provider: "openrouter",
-    model: "minimax/minimax-m2.5:free",
-    thinking: false,
-    requiresKey: "openrouter",
-    contextWindow: 204800,
-  },
-];
-
-export const BUILDING_ENGINES: EngineOption[] = [
-  {
-    label: "DeepSeek Chat (V3.2)",
-    provider: "deepseek",
-    model: "deepseek-v3",
-    thinking: false,
-    requiresKey: "deepseek",
-    contextWindow: 128000,
-  },
-  {
-    label: "Gemini 3 Flash",
-    provider: "gemini",
-    model: "gemini-3-flash-preview",
-    thinking: false,
-    requiresKey: "gemini",
-    contextWindow: 1000000,
-  },
-  {
-    label: "Gemini 3.1 Pro",
-    provider: "gemini",
-    model: "gemini-3.1-pro-preview",
-    thinking: false,
-    requiresKey: "gemini",
-    contextWindow: 2000000,
-  },
-  {
-    label: "Gemini 3 Flash (Preview)",
-    provider: "gemini",
-    model: "gemini-3-flash-preview",
-    thinking: false,
-    requiresKey: "gemini",
-    contextWindow: 1000000,
-  },
-  {
-    label: "Claude Sonnet 4.6",
-    provider: "anthropic",
-    model: "claude-sonnet-4-6",
-    thinking: false,
-    requiresKey: "anthropic",
-    contextWindow: 200000,
-  },
-  {
-    label: "MiMo V2 Flash (via OpenRouter)",
-    provider: "openrouter",
-    model: "xiaomi/mimo-v2-flash",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 128000,
-  },
-  {
-    label: "MiMo V2 Omni (via OpenRouter)",
-    provider: "openrouter",
-    model: "xiaomi/mimo-v2-omni",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 256000,
-  },
-  {
-    label: "MiMo V2 Pro (via OpenRouter)",
-    provider: "openrouter",
-    model: "xiaomi/mimo-v2-pro",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 1000000,
-  },
-  {
-    label: "Step 3.5 Flash (via OpenRouter)",
-    provider: "openrouter",
-    model: "stepfun/step-3.5-flash:free",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 128000,
-  },
-  {
-    label: "Kimi K2.5 (via OpenRouter)",
-    provider: "openrouter",
-    model: "moonshot/moonshot-v1-128k",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 128000,
-  },
-  {
-    label: "GLM 4.7 (via OpenRouter)",
-    provider: "openrouter",
-    model: "z-ai/glm-4.7",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 202752,
-  },
-  {
-    label: "GLM 4.7 Flash (via OpenRouter)",
-    provider: "openrouter",
-    model: "z-ai/glm-4.7-flash",
-    thinking: true,
-    requiresKey: "openrouter",
-    contextWindow: 202752,
-  },
-  {
-    label: "Qwen3 Coder Next (via OpenRouter)",
-    provider: "openrouter",
-    model: "qwen/qwen3-coder-next",
-    thinking: false,
-    requiresKey: "openrouter",
-    contextWindow: 262144,
-  },
-  {
-    label: "Qwen3 Coder 480B (Free, via OpenRouter)",
-    provider: "openrouter",
-    model: "qwen/qwen3-coder:free",
-    thinking: false,
-    requiresKey: "openrouter",
-    contextWindow: 262144,
-  },
-  {
-    label: "MiniMax M2.7 (via OpenRouter)",
-    provider: "openrouter",
-    model: "minimax/minimax-m2.7",
-    thinking: false,
-    requiresKey: "openrouter",
-    contextWindow: 204800,
-  },
-  {
-    label: "MiniMax M2.5 (Free, via OpenRouter)",
-    provider: "openrouter",
-    model: "minimax/minimax-m2.5:free",
-    thinking: false,
-    requiresKey: "openrouter",
-    contextWindow: 204800,
-  },
-];
-
-export const PROVIDER_MODELS: Record<
-  string,
-  Array<{ value: string; label: string }>
-> = {
-  anthropic: [
-    { value: "claude-opus-4-6", label: "Claude Opus 4.6" },
-    { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-    { value: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
-  ],
-  deepseek: [
-    { value: "deepseek-v3", label: "DeepSeek Chat (V3.2)" },
-    { value: "deepseek-r1", label: "DeepSeek Reasoner (R1)" },
-  ],
-  kimi: [
-    { value: "moonshot-v1-8k", label: "Kimi K2.5 (Fast)" },
-    { value: "moonshot-v1-128k", label: "Kimi K2.5 (Thinking)" },
-  ],
-  stepfun: [
-    { value: "step-3.5-flash", label: "Step 3.5 Flash" },
-    { value: "step-2-mini", label: "Step 2 Mini" },
-  ],
-  gemini: [
-    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash" },
-    { value: "gemini-3.1-pro-preview", label: "Gemini 3.1" },
-    {
-      value: "gemini-3.1-pro-preview-customtools",
-      label: "Gemini 3.1 Pro (Tools)",
-    },
-    { value: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro" },
-    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash (Preview)" },
-    { value: "gemini-1.5-pro-latest", label: "Gemini 1.5 Pro" },
-  ],
-  openrouter: [
-    { value: "xiaomi/mimo-v2-flash", label: "MiMo V2 Flash" },
-    { value: "xiaomi/mimo-v2-omni", label: "MiMo V2 Omni" },
-    { value: "xiaomi/mimo-v2-pro", label: "MiMo V2 Pro" },
-    { value: "stepfun/step-3.5-flash:free", label: "Step 3.5 Flash (Free)" },
-    { value: "moonshot/moonshot-v1-128k", label: "Kimi K2.5" },
-    { value: "z-ai/glm-4.7", label: "GLM 4.7" },
-    { value: "z-ai/glm-4.7-flash", label: "GLM 4.7 Flash" },
-    { value: "qwen/qwen3-coder-next", label: "Qwen3 Coder Next" },
-    { value: "qwen/qwen3-coder:free", label: "Qwen3 Coder 480B (Free)" },
-    { value: "minimax/minimax-m2.7", label: "MiniMax M2.7" },
-    { value: "minimax/minimax-m2.5:free", label: "MiniMax M2.5 (Free)" },
-  ],
-};
-
 export function isThinkingModel(model: string): boolean {
   if (!model) return false;
   const lower = model.toLowerCase();
@@ -389,8 +76,8 @@ export function isThinkingModel(model: string): boolean {
     lower.includes("pro-thinking") ||
     lower.includes("next") || // Many reasoning models use "next" (e.g. Qwen Next)
     lower.includes("step-") ||
-    lower.includes("flash-lite") || // Some lite models are thinking-ready
-    lower.includes("trinity") // User specifically added trinity for agentic workflows
+    lower.includes("flash-lite") ||
+    lower.includes("trinity")
   );
 }
 
@@ -406,124 +93,41 @@ export function keyFromRoute(
 }
 
 export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
-  // Provider/model-specific context windows
-  "anthropic/claude-3-opus-latest": 200000,
-  "anthropic/claude-3-5-sonnet-latest": 200000,
-  "claude-3-opus-latest": 200000,
-  "claude-3-5-sonnet-latest": 200000,
-  "opus": 200000,
-  "sonnet": 200000,
+  // Claude 4.6 models with 1M context beta
+  "claude-opus-4-6": 1000000,
+  "claude-sonnet-4-6": 1000000,
+  "claude-haiku-4-5-20251001": 200000,
+  "opus": 1000000,
+  "sonnet": 1000000,
   "haiku": 200000,
-  "gemini-3": 2000000,
-  "gemini-2": 1000000,
-  "gemini-1.5": 1000000,
-  "deepseek-v3": 128000,
-  "deepseek-chat": 128000,
-  "deepseek-reasoner": 128000,
-  "qwen3": 262144,
-  "moonshot": 128000,
-  "openrouter": 128000,
-  // Specific OpenRouter model context windows
-  "anthropic/claude-3.5-sonnet": 200000,
-  "deepseek/deepseek-r1": 128000,
-  "deepseek/deepseek-chat": 128000,
-  "qwen/qwen3-coder": 262144,
-  // Native StepFun model IDs
-  "step-3.5-flash": 256000,
-  "step-2-mini": 32000,
-  // OpenRouter-wrapped StepFun (free tier may have reduced limits)
-  "stepfun/step-3.5-flash:free": 128000,
-  "meta-llama/llama-3.3-70b-instruct:free": 128000,
-  "nousresearch/hermes-3-llama-3.1-405b:free": 128000,
-  "arcee-ai/trinity-mini:free": 131072,
-  "qwen/qwen3-next-80b-a3b-instruct:free": 262144,
-  "openai/gpt-oss-120b:free": 131072,
-  "z-ai/glm-4.5-air:free": 131072,
-  "xiaomi/mimo-v2-flash": 128000,
-  "xiaomi/mimo-v2-omni": 256000,
-  "xiaomi/mimo-v2-pro": 1000000,
-  "z-ai/glm-4.7": 202752,
-  "z-ai/glm-4.7-flash": 202752,
-  "qwen/qwen3-coder-next": 262144,
-  "qwen/qwen3-coder:free": 262144,
-  "minimax/minimax-m2.7": 204800,
-  "minimax/minimax-m2.5:free": 204800,
-  "google/gemini-2.0-flash-001": 1000000,
 };
 
-// Helper to find the best matching context window for a model
+/**
+ * Get context window for a model. Returns the API-reported context_length when
+ * available (passed through allModels), falling back to MODEL_CONTEXT_LIMITS
+ * for SDK-alias resolution (opus/sonnet/haiku) and a 128k default.
+ */
 export function getContextLimit(model: string | null): number {
-  if (!model) return 200000;
-  
+  if (!model) return 128000;
+
+  // Exact match
+  if (MODEL_CONTEXT_LIMITS[model]) return MODEL_CONTEXT_LIMITS[model];
+
+  // Partial match for aliases
   const lower = model.toLowerCase();
-  
-  // First, try exact match for the full model string
-  if (MODEL_CONTEXT_LIMITS[lower]) {
-    return MODEL_CONTEXT_LIMITS[lower];
+  for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
+    if (lower.includes(key)) return limit;
   }
-  
-  // Try exact match with the model as-is (case-sensitive)
-  if (MODEL_CONTEXT_LIMITS[model]) {
-    return MODEL_CONTEXT_LIMITS[model];
-  }
-  
-  // Try partial matches from most specific to least specific
-  // This handles cases like "anthropic/claude-3.5-sonnet" matching "sonnet"
-  const partialMatches = [
-    "anthropic/claude-3.5-sonnet",
-    "deepseek/deepseek-r1",
-    "deepseek/deepseek-chat",
-    "qwen/qwen3-coder",
-    "qwen/qwen3-next",
-    "arcee-ai/trinity-mini",
-    "openai/gpt-oss-120b",
-    "z-ai/glm-4.5-air",
-    "stepfun/step-3.5-flash",
-    "meta-llama/llama-3.3",
-    "nousresearch/hermes-3",
-    "xiaomi/mimo-v2",
-    "google/gemini-2.0",
-    "gemini-3",
-    "gemini-1.5",
-    "opus",
-    "sonnet",
-    "haiku",
-    "deepseek",
-    "qwen3",
-    "moonshot",
-    "openrouter",
-  ];
-  
-  for (const pattern of partialMatches) {
-    if (lower.includes(pattern)) {
-      const result = MODEL_CONTEXT_LIMITS[pattern];
-      if (result !== undefined) return result;
-    }
-  }
-  
-  // Fallback: check for provider-level defaults
-  if (lower.includes("openrouter")) return MODEL_CONTEXT_LIMITS["openrouter"] ?? 200000;
-  if (lower.includes("anthropic")) return MODEL_CONTEXT_LIMITS["sonnet"] ?? 200000; // Default to sonnet
-  if (lower.includes("gemini")) return MODEL_CONTEXT_LIMITS["gemini-1.5"] ?? 200000; // Default to 1.5
-  if (lower.includes("deepseek")) return MODEL_CONTEXT_LIMITS["deepseek-chat"] ?? 200000;
-  
-  return 200000; // Final fallback
+
+  return 128000;
 }
 
 /**
  * Get context window limit for a specific provider and model combination.
- * This is useful for UI display and model selection.
  */
 export function getContextWindowForModel(provider: string, model: string): number {
-  // Build the full model identifier that might be used in getContextLimit
   const fullModelId = `${provider}/${model}`;
-  
-  // Try the full model ID first
   const fullResult = getContextLimit(fullModelId);
-  if (fullResult !== 200000) { // If we got a specific result
-    return fullResult;
-  }
-  
-  // Try just the model name
+  if (fullResult !== 128000) return fullResult;
   return getContextLimit(model);
 }

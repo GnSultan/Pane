@@ -9,10 +9,26 @@
  * State lives at: ~/.pane/session/{projectId}/state.json
  * Context exports from brain live at: ~/.pane/brain/context/{projectId}.json
  *
- * compileContext() → { stable, dynamic, full }
- *   stable  — identity + profile + brief + files (cacheable in Anthropic/DeepSeek)
- *   dynamic — session state + memories + intent (changes every turn)
- *   full    — stable + dynamic (for providers that take a single system string)
+ * compileContext() → { frozen, session, turn, stable, dynamic, full }
+ *
+ * Three-tier context model for provider-agnostic caching:
+ *
+ *   frozen  — identity, rules, guide, brief, purpose, DNA, profile atoms, global memory.
+ *             Set once per session, never changes between turns.
+ *             MUST come first in the prompt to enable prefix caching on all providers.
+ *             Anthropic: explicit cache_control breakpoint.
+ *             DeepSeek/Kimi/Qwen: automatic prefix caching (prefix must be stable).
+ *             Gemini: cachedContents API candidate.
+ *
+ *   session — codebase map, relevant files, approach order.
+ *             Changes when files or task scope change, NOT every turn.
+ *             Second in prompt — extends the cacheable prefix when unchanged.
+ *
+ *   turn    — git status, todos, working set, pre-reads, recent actions, memories,
+ *             symbols, intent directive, escalation, handoff, pins, fence.
+ *             Changes every turn — never cached, always charged full price.
+ *
+ * Backward compat: stable = frozen + session, dynamic = turn, full = all three.
  */
 
 import fs from "node:fs";
@@ -65,8 +81,12 @@ function defaultState() {
 }
 
 export const MODEL_CONTEXT_LIMITS = {
-  opus: 200000,
-  sonnet: 200000,
+  // Claude 4.6 models with 1M context beta
+  "claude-opus-4-6": 1000000,
+  "claude-sonnet-4-6": 1000000,
+  "claude-haiku-4-5-20251001": 200000,
+  opus: 1000000,
+  sonnet: 1000000,
   haiku: 200000,
   "gemini-3": 2000000,
   "gemini-2": 1000000,
@@ -297,8 +317,14 @@ function normalizeHandoffItem(item) {
 }
 
 export function compileContext(projectId, intent = "other", historyLength = 0, backend = "claude-code", sqliteChanges = null) {
-  const stableParts  = [];
-  const dynamicParts = [];
+  const frozenParts  = [];   // Tier 1: never changes within session — cacheable prefix
+  const sessionParts = [];   // Tier 2: changes when files/scope change — extends cache when stable
+  const turnParts    = [];   // Tier 3: changes every turn — never cached
+
+  // Backward compat aliases — existing code pushes to stableParts/dynamicParts.
+  // After the refactor, frozen+session = stable, turn = dynamic.
+  const stableParts  = frozenParts;
+  const dynamicParts = turnParts;
 
   // ── LOCAL INTELLIGENCE CONTEXT SHAPE ─────────────────────────────────────
   // Read early — drives core instruction selection, atom weighting, brief
@@ -334,94 +360,16 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   );
   stableParts.unshift(coreInstructions, "");
 
-  // ── PANE INTELLIGENCE GUIDE ──────────────────────────────────────────────
-  // This is the canonical operating model for working in Pane.
-  // It encodes context-first thinking, task playbooks, and the closed loop.
+  // ── PANE OPERATING PRINCIPLES ───────────────────────────────────────────
+  // Compressed from the former ~1,276-token Pane Intelligence Guide.
+  // Tool-specific behavioral guidance now lives in tool descriptions
+  // (http-backend.mjs / pane-mcp-server.mjs) where it has maximum impact.
   stableParts.push(
     "## Working in Pane",
     "",
-    "Pane pre-compiles everything relevant before you see the user's message. Your system prompt already contains: project purpose, architectural DNA, codebase map (every file described), relevant symbols, working set file contents, high-confidence memories, active principles, session state, recent actions, and the project brief.",
+    "Pane pre-compiles project context before you see the message — purpose, DNA, codebase map, working set contents, memories, symbols, session state. Start from what you already have. Tools extend context, they don't bootstrap it.",
     "",
-    "Start from what you already have. Tools extend context — they are not how you bootstrap.",
-    "",
-    "---",
-    "",
-    "**What is already in your context (do not call tools to fetch these)**",
-    "- Project purpose and DNA synthesis: the why and the architectural narrative",
-    "- Codebase map: one-line description of every file in the project",
-    "- Working set: content of the most-touched files, pre-read",
-    "- Symbol map: symbols most relevant to this query, already resolved",
-    "- Memories: high-confidence (≥0.75) past decisions, lessons, and error fixes",
-    "- Active principles: standing standards that must not be violated",
-    "- Session state: current task, locked decisions, recent actions, git status",
-    "- User profile: explicit rules and preferences, always applied",
-    "",
-    "**When to reach for tools (going beyond what is loaded)**",
-    "→ pane_find_symbol — a specific symbol not in the pre-queried symbol map",
-    "→ pane_recall — deeper history on a topic than the injected memories show",
-    "→ pane_knowledge_graph — structural connections between decisions: what depends on what",
-    "→ pane_cross_project — has this exact problem been solved in another project?",
-    "→ pane_open_files — full content of the file currently open (not just the working set preview)",
-    "→ pane_recent_terminal — the user's terminal is shared; read it first whenever they mention an error, server output, logs, or any running process — before asking them for anything",
-    "→ pane_synthesize — deeper architectural narrative than the DNA section already injected",
-    "→ pane_run_in_terminal — execute: builds, tests, git, verification",
-    "→ pane_remember / pane_set_rule / pane_set_why — persist discoveries (mandatory, not optional)",
-    "",
-    "---",
-    "",
-    "**Task playbooks**",
-    "",
-    "Bug investigation:",
-    "1. pane_recent_terminal — read the terminal first; errors, stack traces, and server output are already there",
-    "2. Check injected memories and working set — has this been seen before?",
-    "3. pane_recall if not in context — prior encounters, known fixes",
-    "4. pane_find_symbol — locate the exact function or component, do not grep by name",
-    "5. Read — only the specific section, not the whole file",
-    "6. pane_run_in_terminal — reproduce it; confirm the fix",
-    "7. pane_remember(error_fix) — root cause and fix; future sessions must not re-investigate",
-    "",
-    "Feature work:",
-    "1. Read injected DNA and principles — understand constraints before designing",
-    "2. pane_recall — prior art, constraints, or abandoned attempts in this area",
-    "3. pane_cross_project — has this been built elsewhere? Use proven patterns.",
-    "4. pane_knowledge_graph — which existing decisions and patterns apply",
-    "5. pane_find_symbol — locate integration points",
-    "6. Build → pane_run_in_terminal — verify",
-    "7. pane_remember(decision) — what was built and why; anchors future sessions",
-    "",
-    "Refactor or architectural change:",
-    "1. pane_knowledge_graph — blast radius: what connects to what you are changing",
-    "2. pane_recall — why was this built this way? were there constraints that shaped it?",
-    "3. pane_synthesize — if the DNA in context is insufficient for the scope of the change",
-    "4. pane_find_symbol — all instances that need to change",
-    "5. Change → pane_run_in_terminal — verify nothing broke",
-    "6. pane_remember(pattern) — the new pattern and why it replaces the old one",
-    "",
-    "Understanding the codebase:",
-    "1. Read the DNA synthesis and brief already in context — they are the answer",
-    "2. pane_knowledge_graph — see how the decisions connect structurally",
-    "3. pane_find_symbol — drill into any specific area",
-    "4. pane_cross_project — how does this compare to patterns across projects?",
-    "",
-    "---",
-    "",
-    "**The closed loop — mandatory**",
-    "Pane's brain improves only when you write back to it. After every session with significant findings:",
-    "→ pane_remember — any root cause, constraint, pattern, or decision that took investigation to find",
-    "→ pane_set_rule — immediately when the user states a firm preference; do not wait",
-    "→ pane_set_why — once you understand the project's purpose deeply enough to articulate it",
-    "",
-    "A session that discovers and does not record forces the next session to re-discover. Record as you go.",
-    "",
-    "---",
-    "",
-    "**Hard rules**",
-    "- Never use Grep to find a named symbol. pane_find_symbol is instant from the index.",
-    "- Never use Glob to explore file structure. The codebase map is already in your context.",
-    "- Never read a file from the working set — it is already pre-loaded.",
-    "- Never speculate about whether a build or test passes. Run it.",
-    "- Never ask the user to paste logs, copy terminal output, open the browser console, or run a command for you. The terminal is shared — use pane_recent_terminal to read what is already there, then pane_run_in_terminal if you need to run something new.",
-    "- Never end a session where root causes, decisions, or new patterns were found without persisting them.",
+    "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_why when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
     "",
   );
 
@@ -449,21 +397,32 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     stableParts.push("");
   }
 
-  // Profile atoms: semantically relevant preferences, anti-patterns, and guidelines.
-  // Rules are already injected above unconditionally — filter them out so they
-  // don't appear twice. System atoms (method/rule/guideline) are already in
-  // coreInstructions — filter those too.
+  // ── Profile digest: compiled behavioral fingerprint ─────────────────────
+  // Pre-computed from 584 preferences + 311 anti-patterns + rules + philosophy
+  // into a dense ~300-token summary. Stored at ~/.pane/profile/digest.txt.
+  // Replaces raw profile atom injection (0-8 atoms) with BETTER coverage
+  // of the developer's working style in fewer tokens.
   //
-  // When the brain has run a contextual search, brainCtx.atoms contains the
-  // unified atom pool already scored by cosine × FACET_WEIGHTS × priority +
-  // hint boost. We use that directly. Falls back to legacy profileAtoms.
-  const profileAtoms = (brainCtx.atoms || brainCtx.profileAtoms || [])
-    .filter(a => a.entityType !== "system_atom" && a.facet !== "rule");
+  // Falls back to legacy profile atoms if no digest exists.
+  let profileDigest = "";
+  try {
+    profileDigest = fs.readFileSync(path.join(PROFILE_DIR, "digest.txt"), "utf-8").trim();
+  } catch {}
 
-  if (profileAtoms.length > 0) {
-    stableParts.push("Relevant preferences:");
-    for (const atom of profileAtoms.slice(0, 8)) stableParts.push(`- ${atom.content}`);
+  if (profileDigest) {
+    stableParts.push("Developer profile:");
+    stableParts.push(profileDigest);
     stableParts.push("");
+  } else {
+    // Fallback: inject raw scored profile atoms (legacy path)
+    const profileAtoms = (brainCtx.atoms || brainCtx.profileAtoms || [])
+      .filter(a => a.entityType !== "system_atom" && a.facet !== "rule");
+
+    if (profileAtoms.length > 0) {
+      stableParts.push("Relevant preferences:");
+      for (const atom of profileAtoms.slice(0, 8)) stableParts.push(`- ${atom.content}`);
+      stableParts.push("");
+    }
   }
 
   // Project brief: accumulated cross-session wisdom.
@@ -532,24 +491,34 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     }
   }
 
+  // ── Project DNA — accumulated decisions, patterns, lessons synthesized into a narrative.
+  // Compact (<400 tokens). Changes rarely (only when new decisions/lessons reach confidence threshold).
+  // Lives in FROZEN tier — truly stable across turns.
+  const synthesis = brainCtx.synthesis || "";
+  if (synthesis) {
+    frozenParts.push("## Project DNA");
+    frozenParts.push(synthesis);
+    frozenParts.push("");
+  }
+
   // ── Codebase map: every indexed file with a one-line description ──────────
   // This is the model's primary navigation tool. It sees the ENTIRE project
   // structure, not a 5-file sample. ~2-4k tokens for a 100-file project.
-  // Lives in stable → cached across turns (files don't change that fast).
+  // Lives in SESSION tier — changes when files are added/removed, not every turn.
   const codebaseMap = (brainCtx.codebaseMap || []);
   if (codebaseMap.length > 0) {
-    stableParts.push("## Codebase map");
-    stableParts.push("Every file in this project and what it does. Use this to navigate — do not grep for files.");
-    stableParts.push("");
+    sessionParts.push("## Codebase map");
+    sessionParts.push("Every file in this project and what it does. Use this to navigate — do not grep for files.");
+    sessionParts.push("");
     for (const f of codebaseMap) {
-      stableParts.push(`${f.path} — ${f.desc}`);
+      sessionParts.push(`${f.path} — ${f.desc}`);
     }
-    stableParts.push("");
+    sessionParts.push("");
   }
 
   // Relevant files from brain index — the top semantic matches for THIS query.
-  // These are the files most likely to need changes. Approach order is heuristic:
-  // config/types → core logic → API/handlers → hooks/stores → UI → tests
+  // These are the files most likely to need changes. Approach order is heuristic.
+  // Lives in SESSION tier — changes when query/scope change, stable within same task.
   const relevantFiles = (brainCtx.relevantFiles || []).slice(0, 5);
   if (relevantFiles.length >= 3) {
     const ordered = [...relevantFiles].sort((a, b) => {
@@ -566,25 +535,15 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
       return rank(a.path) - rank(b.path);
     });
 
-    stableParts.push("Suggested approach order for this task:");
+    sessionParts.push("Suggested approach order for this task:");
     ordered.forEach((f, i) => {
-      stableParts.push(`${i + 1}. ${f.path} — ${f.description}`);
+      sessionParts.push(`${i + 1}. ${f.path} — ${f.description}`);
     });
-    stableParts.push("");
+    sessionParts.push("");
   } else if (relevantFiles.length > 0) {
-    stableParts.push("Files most likely to need changes:");
-    for (const f of relevantFiles) stableParts.push(`- ${f.path} — ${f.description}`);
-    stableParts.push("");
-  }
-
-  // Layer 3: Project DNA — accumulated decisions, patterns, lessons synthesized into a narrative.
-  // Compact (<400 tokens). Changes rarely (only when new decisions/lessons reach confidence threshold).
-  // Lives in stable → safe for Anthropic prompt caching. Does NOT change per-query.
-  const synthesis = brainCtx.synthesis || "";
-  if (synthesis) {
-    stableParts.push("## Project DNA");
-    stableParts.push(synthesis);
-    stableParts.push("");
+    sessionParts.push("Files most likely to need changes:");
+    for (const f of relevantFiles) sessionParts.push(`- ${f.path} — ${f.description}`);
+    sessionParts.push("");
   }
 
   // Global Memory (Gemini CLI parity)
@@ -625,23 +584,31 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   // Session state: what Pane knows is happening right now
   const state = readState(projectId);
 
-  if (state.activeTask) {
-    dynamicParts.push(`Current objective: ${state.activeTask.description}`);
-    if (state.activeTask.goal) dynamicParts.push(`Goal: ${state.activeTask.goal}`);
-    dynamicParts.push("");
-  }
+  // ── Task state injection: ONLY on first turn ──────────────────────────
+  // On turn 0-1: inject activeTask and todos for cross-session continuity.
+  // On turn 2+: skip them. The conversation history already contains the
+  // plan, the work, and the user's instructions. Injecting stale session
+  // state ON TOP of a live conversation creates conflicts — the model sees
+  // "Current objective: [old task]" in the system prompt but a completely
+  // different task in the conversation, and follows the system prompt.
+  // This is the root cause of the "continue picks up wrong task" bug.
+  if (historyLength < 2) {
+    const activeTodos = (state.todos || []).filter(t => t.status !== "completed");
 
-  // NEW: Filter completed todos from current task list display
-  // Completed todos are already done — they don't need to be shown in the active task list
-  const activeTodos = (state.todos || []).filter(t => t.status !== "completed");
-
-  if (activeTodos.length > 0) {
-    dynamicParts.push("Task list:");
-    for (const t of activeTodos) {
-      const mark = t.status === "in_progress" ? "[→]" : "[ ]";
-      dynamicParts.push(`${mark} ${t.content}`);
+    if (state.activeTask && activeTodos.length > 0) {
+      dynamicParts.push(`Current objective: ${state.activeTask.description}`);
+      if (state.activeTask.goal) dynamicParts.push(`Goal: ${state.activeTask.goal}`);
+      dynamicParts.push("");
     }
-    dynamicParts.push("");
+
+    if (activeTodos.length > 0) {
+      dynamicParts.push("Task list:");
+      for (const t of activeTodos) {
+        const mark = t.status === "in_progress" ? "[→]" : "[ ]";
+        dynamicParts.push(`${mark} ${t.content}`);
+      }
+      dynamicParts.push("");
+    }
   }
 
   if (state.gitStatus) {
@@ -812,11 +779,22 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     }
   }
 
-  // Mind entries: active thoughts from the user's Mind
+  // Mind reference: instead of dumping all mind entries into context (costly),
+  // provide a count and summary so the model knows to use pane_recall if needed.
+  // The orchestrator handles full injection when budget allows; this path is the
+  // legacy compileContext() fallback.
   const mindEntries = (brainCtx.mindEntries || []);
   if (mindEntries.length > 0) {
-    dynamicParts.push("Active thoughts from Mind (user-authored, treat as high-priority context):");
-    for (const m of mindEntries) dynamicParts.push(`- ${m.content}`);
+    if (mindEntries.length <= 2) {
+      // Few entries — inline them (small cost)
+      dynamicParts.push("Active thoughts from Mind (user-authored, treat as high-priority context):");
+      for (const m of mindEntries) dynamicParts.push(`- ${m.content}`);
+    } else {
+      // Many entries — provide reference, let model pull via tool
+      const preview = mindEntries.slice(0, 2).map(m => m.content).join("; ");
+      dynamicParts.push(`Mind has ${mindEntries.length} active thoughts. Preview: ${preview}`);
+      dynamicParts.push("Use pane_recall to access full Mind entries if relevant to this task.");
+    }
     dynamicParts.push("");
   }
 
@@ -969,8 +947,11 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     dynamicParts.push("For non-trivial tasks, present a brief plan and end with: \"Ready to proceed — send 'go' to start.\" Wait for confirmation before making changes. For simple tasks, just do them.");
   }
 
-  // Behavioral fence — scope enforcement, fires whenever there's an active task or working set
-  if (state.activeTask || state.workingSet.length > 0) {
+  // Behavioral fence — scope enforcement, ONLY on first turn.
+  // On turn 2+, the conversation defines the scope. Injecting a stale
+  // "Objective: [old task]" and "In scope: [old files]" mid-conversation
+  // constrains the model to the wrong task.
+  if (historyLength < 2 && (state.activeTask || state.workingSet.length > 0)) {
     const fence = ["Behavioral constraints:"];
 
     if (state.activeTask) {
@@ -1003,11 +984,22 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     dynamicParts.push("");
   }
 
-  const stable  = stableParts.filter(Boolean).join("\n");
-  const dynamic = dynamicParts.filter(Boolean).join("\n");
-  const full = [stable, dynamic].filter(Boolean).join("\n") || coreInstructions;
+  // ── Assemble tiers ──────────────────────────────────────────────────────
+  const frozen  = frozenParts.filter(Boolean).join("\n");
+  const session = sessionParts.filter(Boolean).join("\n");
+  const turn    = turnParts.filter(Boolean).join("\n");
+
+  // Backward compat: stable = frozen + session, dynamic = turn
+  const stable  = [frozen, session].filter(Boolean).join("\n");
+  const dynamic = turn;
+  const full    = [frozen, session, turn].filter(Boolean).join("\n") || coreInstructions;
 
   return {
+    // New tiered API — used by cache-aware backends
+    frozen,    // Tier 1: never changes within session (cacheable prefix)
+    session,   // Tier 2: changes when files/scope change (extends cache when stable)
+    turn,      // Tier 3: changes every turn (never cached)
+    // Backward compat — used by CLI backends and existing callers
     stable,
     dynamic,
     full,

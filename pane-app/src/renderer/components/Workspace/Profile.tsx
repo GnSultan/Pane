@@ -3,9 +3,6 @@ import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  THINKING_ENGINES,
-  BUILDING_ENGINES,
-  PROVIDER_MODELS,
   engineKey,
   DEFAULT_BACKEND_ROUTING,
   type EngineOption,
@@ -372,90 +369,130 @@ function KeybindingsSection() {
 // ─── AI Engines Section ───────────────────────────────────────────────────────
 
 function EngineSelect({
-  options,
   value,
   onChange,
-  openRouterModels = [],
+  allModels = {},
+  sdkModels = null,
   httpApiKeys = {},
+  disabledProviders = [],
 }: {
-  options: EngineOption[];
   value: string;
   onChange: (opt: EngineOption) => void;
-  openRouterModels?: Array<{ id: string; name: string; context_length: number }>;
+  allModels?: Record<string, Array<{ id: string; name: string; context_length: number; input_cost?: number | null; output_cost?: number | null }>>;
+  sdkModels?: import("../../lib/punk-types").SdkModel[] | null;
   httpApiKeys?: Record<string, string>;
+  disabledProviders?: string[];
 }) {
-  // Determine backend source for an engine
-  const getBackendSource = useCallback((engine: EngineOption): string => {
-    // Claude Code CLI models
-    if (engine.provider === "anthropic") {
-      return "claude-code";
-    }
-    // Gemini CLI models
-    if (engine.provider === "gemini") {
-      return "gemini-cli";
-    }
-    // All other models go to HTTP API
-    return "http-api";
+  // Provider display labels
+  const providerLabel = useCallback((provider: string): string => {
+    const labels: Record<string, string> = {
+      anthropic: "Claude Code",
+      "anthropic-api": "Anthropic API",
+      gemini: "Gemini CLI",
+      "gemini-api": "Gemini API",
+      deepseek: "DeepSeek",
+      openrouter: "OpenRouter",
+      kimi: "Kimi",
+      stepfun: "StepFun",
+    };
+    return labels[provider] || provider;
   }, []);
 
   const groupedOptions = useMemo(() => {
     const groups: Record<string, EngineOption[]> = {};
+    const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini";
+    const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-code";
 
-    // 1. Filter and group hardcoded options
-    options.forEach((opt) => {
-      // Check if provider has a key.
-      // Special-case: gemini provider is only shown if there's a key in httpApiKeys
-      // OR if we're on the gemini backend (where keys are managed by the CLI environment).
-      const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini";
-      const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-code";
-      
-      const isCoreProvider = ["deepseek", "anthropic", "gemini"].includes(opt.provider);
-      
-      if (!isCoreProvider && !httpApiKeys?.[opt.provider] && !(isGeminiBackend && opt.provider === "gemini") && !(isClaudeBackend && opt.provider === "anthropic")) return;
+    const isDisabled = (p: string) => disabledProviders.includes(p);
 
-      if (!groups[opt.provider]) groups[opt.provider] = [];
-      groups[opt.provider]!.push(opt);
-    });
+    // Track native provider model IDs so OpenRouter can deduplicate
+    const nativeModelIds = new Set<string>();
 
-    // 2. Add OpenRouter if key exists
-    if (httpApiKeys["openrouter"]) {
-      const orGroup: EngineOption[] = [];
-      const hardcodedOr = PROVIDER_MODELS["openrouter"] || [];
-      
-      // If we have fetched models, use them as the source of truth for availability
-      if (openRouterModels.length > 0) {
-        // Map fetched models, merging with hardcoded ones if they match
-        openRouterModels.forEach((m) => {
-          const hardcoded = hardcodedOr.find((h) => h.value === m.id);
-          orGroup.push({
-            label: hardcoded ? hardcoded.label : m.name,
-            provider: "openrouter",
-            model: m.id,
-            // Use specialized thinking flag from hardcoded if it exists, otherwise guess
-            thinking: isThinkingModel(m.id),
-            requiresKey: "openrouter",
-            contextWindow: m.context_length || getContextWindowForModel("openrouter", m.id),
-          });
-        });
-      } else {
-        // Fallback to hardcoded list if fetch failed or hasn't run
-        hardcodedOr.forEach((m) => {
-          orGroup.push({
-            label: m.label,
-            provider: "openrouter",
-            model: m.value,
-            thinking: isThinkingModel(m.value),
-            requiresKey: "openrouter",
-            contextWindow: getContextWindowForModel("openrouter", m.value),
-          });
-        });
+    // Helper: look up pricing from allModels for a provider+id
+    const pricingFor = (provider: string, id: string) => {
+      const pm = allModels[provider]?.find((m) => m.id === id);
+      return { inputCost: pm?.input_cost ?? null, outputCost: pm?.output_cost ?? null };
+    };
+
+    // 1. Build anthropic group from SDK models (Claude Code backend) when available
+    if (sdkModels && sdkModels.length > 0 && !isDisabled("anthropic")) {
+      groups["anthropic"] = sdkModels.map((m) => {
+        nativeModelIds.add(m.value);
+        const pricing = pricingFor("anthropic", m.value);
+        return {
+          label: m.displayName || m.value,
+          provider: "anthropic",
+          model: m.value,
+          thinking: false,
+          requiresKey: "anthropic",
+          contextWindow: getContextWindowForModel("anthropic", m.value),
+          inputCost: pricing.inputCost,
+          outputCost: pricing.outputCost,
+        };
+      });
+    }
+
+    // 2. Build groups from dynamically fetched allModels (non-OpenRouter first)
+    for (const [provider, models] of Object.entries(allModels)) {
+      if (!models || models.length === 0) continue;
+      if (provider === "openrouter") continue;
+      if (groups[provider]) continue;
+      if (isDisabled(provider)) continue;
+
+      // Base provider for key lookup: "anthropic-api" → "anthropic"
+      const baseProvider = provider.replace(/-api$/, "");
+      const isUsable =
+        provider === "anthropic" ? isClaudeBackend :
+        provider === "gemini" ? isGeminiBackend :
+        !!httpApiKeys?.[baseProvider];
+      if (!isUsable) continue;
+
+      groups[provider] = models.map((m) => {
+        nativeModelIds.add(m.id);
+        return {
+          label: m.name || m.id,
+          provider,
+          model: m.id,
+          thinking: isThinkingModel(m.id),
+          requiresKey: provider,
+          contextWindow: m.context_length || getContextWindowForModel(provider, m.id),
+          inputCost: m.input_cost ?? null,
+          outputCost: m.output_cost ?? null,
+        };
+      });
+    }
+
+    // 3. OpenRouter — only show models NOT already available from native providers
+    const orModels = allModels["openrouter"];
+    if (orModels && orModels.length > 0 && !!httpApiKeys?.["openrouter"] && !isDisabled("openrouter")) {
+      const nativeProviderPrefixes = new Set<string>();
+      if (groups["anthropic"] || groups["anthropic-api"]) nativeProviderPrefixes.add("anthropic/");
+      if (groups["deepseek"]) nativeProviderPrefixes.add("deepseek/");
+      if (groups["gemini"] || groups["gemini-api"]) { nativeProviderPrefixes.add("google/"); nativeProviderPrefixes.add("gemini/"); }
+
+      const filtered = orModels.filter((m) => {
+        for (const prefix of nativeProviderPrefixes) {
+          if (m.id.startsWith(prefix)) return false;
+        }
+        return true;
+      });
+
+      if (filtered.length > 0) {
+        groups["openrouter"] = filtered.map((m) => ({
+          label: m.name || m.id,
+          provider: "openrouter",
+          model: m.id,
+          thinking: isThinkingModel(m.id),
+          requiresKey: "openrouter",
+          contextWindow: m.context_length || getContextWindowForModel("openrouter", m.id),
+          inputCost: m.input_cost ?? null,
+          outputCost: m.output_cost ?? null,
+        }));
       }
-      
-      groups["openrouter"] = orGroup;
     }
 
     return groups;
-  }, [options, openRouterModels, httpApiKeys]);
+  }, [allModels, sdkModels, httpApiKeys, disabledProviders]);
 
   return (
     <select
@@ -478,13 +515,12 @@ function EngineSelect({
       {Object.entries(groupedOptions).map(([provider, opts]) => (
         <optgroup key={provider} label={provider} className="bg-pane-bg">
           {opts.map((opt: EngineOption) => {
-            const backendSource = getBackendSource(opt);
-            const backendIndicator = backendSource === "claude-code" ? "[Claude Code] "
-              : backendSource === "gemini-cli" ? "[Gemini CLI] "
-              : "[HTTP API] ";
+            const pricing = opt.inputCost != null && opt.outputCost != null
+              ? ` · $${opt.inputCost}/$${opt.outputCost}/M`
+              : "";
             return (
               <option key={engineKey(opt)} value={engineKey(opt)}>
-                {backendIndicator}{opt.label}
+                [{providerLabel(opt.provider)}] {opt.label}{pricing}
               </option>
             );
           })}
@@ -500,7 +536,9 @@ function AiEnginesSection({
   httpApiKeys: Record<string, string>;
 }) {
   const routing = useWorkspaceStore(useShallow((s) => s.getEffectiveRouting()));
-  const openRouterModels = useWorkspaceStore((s) => s.openRouterModels);
+  const allModels = useWorkspaceStore((s) => s.allModels);
+  const sdkModels = useWorkspaceStore((s) => s.sdkModels);
+  const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
 
   // For transparent routing, we show all engines but need to know which are usable
@@ -521,29 +559,41 @@ function AiEnginesSection({
       });
   }, []);
 
-  const filterEngines = useCallback(
-    (engines: EngineOption[]) =>
-      engines.filter((o) => {
-        // Filter out auto-* models as they're CLI routing hints
-        if (o.model.startsWith("auto-")) return false;
-        
-        // Check if engine is usable
-        const isUsable = (() => {
-          // Claude Code CLI handles anthropic provider authentication
-          if (o.provider === "anthropic") return claudeCodeAvailable;
-          // Gemini CLI handles gemini provider authentication
-          if (o.provider === "gemini") return geminiAvailable;
-          // HTTP providers need API keys
-          return !!httpApiKeys?.[o.provider];
-        })();
-        
-        return isUsable;
-      }),
-    [claudeCodeAvailable, geminiAvailable, httpApiKeys],
-  );
-
-  const filteredThinking = useMemo(() => filterEngines(THINKING_ENGINES), [filterEngines]);
-  const filteredBuilding = useMemo(() => filterEngines(BUILDING_ENGINES), [filterEngines]);
+  // Build a flat list of all usable engines from dynamic data for auto-heal
+  const usableEngines = useMemo(() => {
+    const engines: EngineOption[] = [];
+    // SDK models for anthropic
+    if (sdkModels && sdkModels.length > 0 && claudeCodeAvailable && !disabledProviders.includes("anthropic")) {
+      sdkModels.forEach((m) => engines.push({
+        label: m.displayName || m.value,
+        provider: "anthropic",
+        model: m.value,
+        thinking: false,
+        requiresKey: "anthropic",
+      }));
+    }
+    // allModels for everything else
+    for (const [provider, models] of Object.entries(allModels)) {
+      if (!models || models.length === 0) continue;
+      if (provider === "anthropic" && engines.some((e) => e.provider === "anthropic")) continue;
+      const baseProvider = provider.replace(/-api$/, "");
+      const isUsable =
+        provider === "anthropic" ? claudeCodeAvailable :
+        provider === "gemini" ? geminiAvailable :
+        !!httpApiKeys?.[baseProvider];
+      if (!isUsable) continue;
+      if (disabledProviders.includes(provider)) continue;
+      models.forEach((m) => engines.push({
+        label: m.name || m.id,
+        provider,
+        model: m.id,
+        thinking: isThinkingModel(m.id),
+        requiresKey: provider,
+        contextWindow: m.context_length,
+      }));
+    }
+    return engines;
+  }, [allModels, sdkModels, claudeCodeAvailable, geminiAvailable, httpApiKeys, disabledProviders]);
 
   const autoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
   const setIntentRouting = useWorkspaceStore((s) => s.setIntentRouting);
@@ -560,28 +610,25 @@ function AiEnginesSection({
       return !!httpApiKeys?.[provider];
     };
 
-    const firstThinking = filteredThinking[0];
-    const firstBuilding = filteredBuilding[0];
+    const firstUsable = usableEngines[0];
 
     // Nothing we can do if there are no usable engines at all
-    if (!firstThinking && !firstBuilding) return;
+    if (!firstUsable) return;
 
     const current = routing;
     const updates: Partial<IntentRouting> = {};
 
-    if (current?.plan && !isProviderUsable(current.plan.provider) && firstThinking) {
-      updates.plan = { provider: firstThinking.provider, model: firstThinking.model, thinking: firstThinking.thinking };
+    if (current?.plan && !isProviderUsable(current.plan.provider)) {
+      updates.plan = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
     }
-    if (current?.execute && !isProviderUsable(current.execute.provider) && (firstBuilding || firstThinking)) {
-      const fallback = firstBuilding ?? firstThinking!;
-      updates.execute = { provider: fallback.provider, model: fallback.model, thinking: fallback.thinking };
+    if (current?.execute && !isProviderUsable(current.execute.provider)) {
+      updates.execute = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
     }
-    if (current?.explain && !isProviderUsable(current.explain.provider) && firstThinking) {
-      updates.explain = { provider: firstThinking.provider, model: firstThinking.model, thinking: firstThinking.thinking };
+    if (current?.explain && !isProviderUsable(current.explain.provider)) {
+      updates.explain = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
     }
-    if (current?.other && !isProviderUsable(current.other.provider) && (firstBuilding || firstThinking)) {
-      const fallback = firstBuilding ?? firstThinking!;
-      updates.other = { provider: fallback.provider, model: fallback.model, thinking: fallback.thinking };
+    if (current?.other && !isProviderUsable(current.other.provider)) {
+      updates.other = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
     }
 
     if (Object.keys(updates).length > 0) {
@@ -667,53 +714,51 @@ function AiEnginesSection({
     reinitializePunkBackend("api").catch(() => {});
   };
 
-  const getActiveOption = (
+  const resolveEngine = (
     current: { provider: string; model: string; thinking: boolean } | undefined,
-    baseOptions: EngineOption[],
-  ) => {
+  ): EngineOption => {
     const routingDefault = DEFAULT_BACKEND_ROUTING["api"];
-    const target = current || routingDefault?.plan || baseOptions[0]!;
+    const target = current || routingDefault?.plan;
+    if (!target) return usableEngines[0] || { label: "none", provider: "", model: "", thinking: false, requiresKey: "" };
 
-    // 1. Try to find in hardcoded options first
-    const found = baseOptions.find(
+    // Try usableEngines (already built from allModels + sdkModels)
+    const found = usableEngines.find(
       (o) => o.provider === target.provider && o.model === target.model,
     );
     if (found) return found;
 
-    // 2. If it's OpenRouter, try to find in fetched models
-    if (target.provider === "openrouter") {
-      const orModel = openRouterModels.find((m) => m.id === target.model);
-      if (orModel) {
+    // Try allModels directly (provider may be usable but model just not in usableEngines list)
+    const providerModels = allModels[target.provider];
+    if (providerModels) {
+      const m = providerModels.find((m) => m.id === target.model);
+      if (m) {
         return {
-          label: orModel.name,
-          provider: "openrouter",
-          model: orModel.id,
+          label: m.name || m.id,
+          provider: target.provider,
+          model: m.id,
           thinking: target.thinking || false,
-          requiresKey: "openrouter",
-        };
-      }
-      // Fallback for defaults in PROVIDER_MODELS
-      const orDefault = PROVIDER_MODELS["openrouter"]?.find(
-        (m) => m.value === target.model,
-      );
-      if (orDefault) {
-        return {
-          label: orDefault.label,
-          provider: "openrouter",
-          model: orDefault.value,
-          thinking: target.thinking || false,
-          requiresKey: "openrouter",
+          requiresKey: target.provider,
+          contextWindow: m.context_length,
+          inputCost: m.input_cost ?? null,
+          outputCost: m.output_cost ?? null,
         };
       }
     }
 
-    return baseOptions[0]!;
+    // Model not found in any fetched data — show it anyway with its raw ID
+    return {
+      label: target.model,
+      provider: target.provider,
+      model: target.model,
+      thinking: target.thinking || false,
+      requiresKey: target.provider,
+    };
   };
 
-  const thinkingEngine = getActiveOption(routing?.plan, filteredThinking);
-  const buildingEngine = getActiveOption(routing?.execute, filteredBuilding);
-  const explainingEngine = getActiveOption(routing?.explain, filteredThinking);
-  const otherEngine = getActiveOption(routing?.other, filteredBuilding);
+  const thinkingEngine = resolveEngine(routing?.plan);
+  const buildingEngine = resolveEngine(routing?.execute);
+  const explainingEngine = resolveEngine(routing?.explain);
+  const otherEngine = resolveEngine(routing?.other);
 
   // Check if each engine's provider is usable
   const isProviderUsable = (provider: string) => {
@@ -784,9 +829,10 @@ function AiEnginesSection({
                 </div>
                 <div className="flex items-center gap-2">
                   <EngineSelect
-                    options={filteredThinking}
-                    openRouterModels={openRouterModels}
+                    allModels={allModels}
+                    sdkModels={sdkModels}
                     httpApiKeys={httpApiKeys}
+                    disabledProviders={disabledProviders}
                     value={engineKey(thinkingEngine)}
                     onChange={handleThinkingChange}
                   />
@@ -841,9 +887,10 @@ function AiEnginesSection({
                   </span>
                 </div>
                 <EngineSelect
-                  options={filteredBuilding}
-                  openRouterModels={openRouterModels}
+                  allModels={allModels}
+                  sdkModels={sdkModels}
                   httpApiKeys={httpApiKeys}
+                  disabledProviders={disabledProviders}
                   value={engineKey(buildingEngine)}
                   onChange={handleBuildingChange}
                 />
@@ -875,9 +922,10 @@ function AiEnginesSection({
                   </span>
                 </div>
                 <EngineSelect
-                  options={filteredThinking}
-                  openRouterModels={openRouterModels}
+                  allModels={allModels}
+                  sdkModels={sdkModels}
                   httpApiKeys={httpApiKeys}
+                  disabledProviders={disabledProviders}
                   value={engineKey(explainingEngine)}
                   onChange={handleExplainChange}
                 />
@@ -909,9 +957,10 @@ function AiEnginesSection({
                   </span>
                 </div>
                 <EngineSelect
-                  options={filteredBuilding}
-                  openRouterModels={openRouterModels}
+                  allModels={allModels}
+                  sdkModels={sdkModels}
                   httpApiKeys={httpApiKeys}
+                  disabledProviders={disabledProviders}
                   value={engineKey(otherEngine)}
                   onChange={handleOtherChange}
                 />
@@ -942,62 +991,140 @@ function AiEnginesSection({
 
 // ─── API Keys Section ─────────────────────────────────────────────────────────
 
-const PROVIDERS = [
-  {
-    key: "gemini",
-    label: "Google Gemini",
-    placeholder: "AI...",
-    docsUrl: "https://aistudio.google.com/app/apikey",
-  },
-  {
-    key: "deepseek",
-    label: "DeepSeek",
-    placeholder: "sk-...",
-    docsUrl: "https://platform.deepseek.com/api_keys",
-  },
-  {
-    key: "anthropic",
-    label: "Anthropic",
-    placeholder: "sk-ant-...",
-    docsUrl: "https://console.anthropic.com/settings/keys",
-  },
-  {
-    key: "openrouter",
-    label: "OpenRouter",
-    placeholder: "sk-or-...",
-    docsUrl: "https://openrouter.ai/keys",
-  },
+// API key providers — each has a key input field
+const API_KEY_PROVIDERS = [
+  { key: "gemini", label: "Google Gemini", placeholder: "AI...", docsUrl: "https://aistudio.google.com/app/apikey" },
+  { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys" },
+  { key: "anthropic", label: "Anthropic", placeholder: "sk-ant-...", docsUrl: "https://console.anthropic.com/settings/keys" },
+  { key: "openrouter", label: "OpenRouter", placeholder: "sk-or-...", docsUrl: "https://openrouter.ai/keys" },
+] as const;
+
+// Gemini CLI — external, needs install
+const CLI_PROVIDERS = [
+  { key: "gemini", label: "Gemini CLI", description: "gemini cli" },
 ] as const;
 
 function ApiKeysSection({
   httpApiKeys,
   onKeyChange,
+  claudeCodeAvailable = false,
+  geminiAvailable = false,
 }: {
   httpApiKeys: Record<string, string>;
   onKeyChange: (provider: string, key: string) => void;
+  claudeCodeAvailable?: boolean;
+  geminiAvailable?: boolean;
 }) {
+  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
+  const isClaudeAuthenticated = claudeCodeAvailable && sdkAccount != null;
   const [visible, setVisible] = useState<Record<string, boolean>>({});
+  const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
+  const toggleProvider = useWorkspaceStore((s) => s.toggleProvider);
+
+  const ProviderToggle = ({ toggleKey, label }: { toggleKey: string; label: string }) => {
+    const off = disabledProviders.includes(toggleKey);
+    return (
+      <button
+        onClick={() => toggleProvider(toggleKey)}
+        className={`w-6 h-3.5 rounded-full relative transition-colors ${off ? "bg-pane-text-secondary/20" : "bg-pane-status-added/60"}`}
+        title={off ? `enable ${label}` : `disable ${label}`}
+      >
+        <div className={`absolute top-0.5 w-2.5 h-2.5 rounded-full bg-white transition-all ${off ? "left-0.5" : "left-[11px]"}`} />
+      </button>
+    );
+  };
 
   return (
     <div className="flex flex-col gap-3">
+      {/* Claude Code — built-in SDK */}
       <div className="flex items-center justify-between mb-1">
         <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-          provider keys
+          claude code
+        </span>
+      </div>
+      <div className={`py-1.5 flex items-center justify-between ${disabledProviders.includes("anthropic") ? "opacity-40" : ""}`}>
+        <div className="flex items-center gap-2">
+          {isClaudeAuthenticated && <ProviderToggle toggleKey="anthropic" label="Claude Code" />}
+          <span className="text-pane-text font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+            Claude Code
+          </span>
+          {isClaudeAuthenticated ? (
+            <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              {sdkAccount?.email || sdkAccount?.organization || "authenticated"}
+            </span>
+          ) : (
+            <span className="text-pane-text-secondary/50 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              not signed in
+            </span>
+          )}
+        </div>
+        {!isClaudeAuthenticated && (
+          <button
+            onClick={() => {
+              // Trigger a prefetch which starts the SDK and prompts auth
+              reinitializePunkBackend("claude-code").catch(() => {});
+            }}
+            className="text-pane-text-secondary/60 hover:text-pane-text font-mono transition-colors"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            sign in
+          </button>
+        )}
+      </div>
+
+      <div className="h-px bg-pane-border/20 my-1" />
+
+      {/* Gemini CLI — only show when installed */}
+      {geminiAvailable && (<>
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+            gemini cli
+          </span>
+        </div>
+        <div className="flex flex-col gap-2">
+          {CLI_PROVIDERS.map(({ key, label, description }) => (
+            <div key={key} className={`py-1.5 flex items-center justify-between ${disabledProviders.includes(key) ? "opacity-40" : ""}`}>
+              <div className="flex items-center gap-2">
+                <ProviderToggle toggleKey={key} label={label} />
+                <span className="text-pane-text font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                  {label}
+                </span>
+                <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                  {description}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="h-px bg-pane-border/20 my-1" />
+      </>)}
+
+      {/* API key providers — toggle + key input */}
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+          api keys
         </span>
       </div>
       <div className="flex flex-col gap-2">
-        {PROVIDERS.map(({ key, label, placeholder, docsUrl }) => {
+        {API_KEY_PROVIDERS.map(({ key, label, placeholder, docsUrl }) => {
+          const toggleKey = (key === "anthropic" || key === "gemini") ? `${key}-api` : key;
           const val = httpApiKeys[key] || "";
+          const hasKey = !!val;
           const isVisible = visible[key] ?? false;
+          const isOff = hasKey && disabledProviders.includes(toggleKey);
           return (
-            <div key={key} className="py-2 flex flex-col gap-1">
+            <div key={key} className={`py-2 flex flex-col gap-1 ${isOff ? "opacity-40" : ""}`}>
               <div className="flex items-center justify-between">
-                <span
-                  className="text-pane-text font-mono"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  {label}
-                </span>
+                <div className="flex items-center gap-2">
+                  {hasKey && <ProviderToggle toggleKey={toggleKey} label={label} />}
+                  <span
+                    className="text-pane-text font-mono"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {label}
+                  </span>
+                </div>
                 <a
                   href={docsUrl}
                   target="_blank"
@@ -1869,6 +1996,8 @@ export function Profile() {
             <ApiKeysSection
               httpApiKeys={httpApiKeys}
               onKeyChange={handleApiKeyChange}
+              claudeCodeAvailable={claudeCodeAvailable}
+              geminiAvailable={geminiAvailable}
             />
           </AccordionSection>
         )}

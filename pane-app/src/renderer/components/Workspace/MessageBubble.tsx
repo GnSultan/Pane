@@ -7,7 +7,6 @@ import type {
   ServerToolUseBlock,
   WebSearchToolResultBlock,
   JsonBlock,
-  StrategyBlock,
 } from "../../lib/punk-types";
 import { restoreCheckpoint, getCheckpointDiff } from "../../lib/tauri-commands";
 import type { CheckpointDiffFile } from "../../lib/tauri-commands";
@@ -16,7 +15,6 @@ import { setRestoreInProgress } from "../../hooks/useFileWatcher";
 import { ToolActivity, ServerToolActivity } from "./ToolActivity";
 import { MarkdownText } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
-import { StrategyBlockDisplay } from "./StrategyBlock";
 
 // No CSS containment — content-visibility: auto causes visible pop-in stutter
 // when messages scroll into view, which is worse than the layout cost it saves.
@@ -419,12 +417,10 @@ export function MessageBubble({
           }
 
           if (group.type === "strategy") {
-            const block = group.blocks[0] as StrategyBlock;
-            return (
-              <div key={gi} className="my-0.5">
-                <StrategyBlockDisplay block={block} />
-              </div>
-            );
+            // Route preview is now shown in the InputBar as the user types.
+            // The strategy block in the conversation was redundant — it repeated
+            // what the user already saw before sending.
+            return null;
           }
 
           if (group.type === "text") {

@@ -329,7 +329,7 @@ class CliBackend extends PunkBackend {
 
     const workerPath = path.join(__dirname, "cli-worker.mjs");
     this.worker = utilityProcess.fork(workerPath, [], {
-      serviceData: { command: this.command },
+      env: { ...getEnvWithPath(), PANE_CLI_COMMAND: this.command },
     });
 
     this.worker.on("message", (message) => {
@@ -729,11 +729,13 @@ class PunkEngine {
     if (this.backendAvailability.claude) {
       this.backends.claude = new CliBackend(onEvent, "claude");
       console.log("[punk] Claude CLI backend initialized");
+      this.prefetchClaudeModels();
     }
-    
+
     if (this.backendAvailability.gemini) {
       this.backends.gemini = new CliBackend(onEvent, "gemini");
       console.log("[punk] Gemini CLI backend initialized");
+      this.prefetchGeminiModels();
     }
     
     // API backend is always available as fallback
@@ -744,6 +746,9 @@ class PunkEngine {
     const settings = await this.loadSettings();
     const backendType = backendOverride || settings.punk_backend || "api";
     this.defaultBackend = this.getBackendForType(backendType);
+
+    // Refresh CLI-backed models on the same hourly cadence as model-manager
+    setInterval(() => this.refreshCliModels(), 1000 * 60 * 60);
 
     // Seed benchmark priors (no-op after first run, refreshes weekly)
     ensurePriors().catch(err =>
@@ -758,6 +763,35 @@ class PunkEngine {
     } else {
       console.log("[punk] learned classifier initialized");
     }
+  }
+
+  prefetchClaudeModels() {
+    if (!this.backends.claude) return;
+    try {
+      const worker = this.backends.claude.getWorker();
+      worker.postMessage({ type: "prefetch_models" });
+    } catch (err) {
+      console.warn("[punk] Failed to prefetch Claude SDK models:", err.message);
+    }
+  }
+
+  prefetchGeminiModels() {
+    if (!this.backends.gemini) return;
+    try {
+      const worker = this.backends.gemini.getWorker();
+      worker.postMessage({ type: "prefetch_gemini_models" });
+    } catch (err) {
+      console.warn("[punk] Failed to prefetch Gemini models:", err.message);
+    }
+  }
+
+  /**
+   * Refresh CLI-backed model lists. Called on the same hourly cycle as
+   * model-manager's HTTP refresh so cached CLI models stay current.
+   */
+  refreshCliModels() {
+    this.prefetchClaudeModels();
+    this.prefetchGeminiModels();
   }
 
   /**
@@ -786,21 +820,28 @@ class PunkEngine {
    */
   getBackendForRequest(request) {
     const { provider, model } = request;
-    
+
     // OpenRouter models (contain "/") always go to API backend
     if (model && model.includes("/")) {
       return this.backends.api;
     }
-    
-    // Route by provider
+
+    // "-api" suffixed providers always go to HTTP API backend.
+    // The provider is normalized to the base name before the API call
+    // (handled in prepareRequest/mapModelName via http-backend).
+    if (provider === "anthropic-api" || provider === "gemini-api") {
+      return this.backends.api;
+    }
+
+    // CLI-backed providers
     if (provider === "anthropic" && this.backendAvailability.claude) {
       return this.backends.claude;
     }
-    
+
     if (provider === "gemini" && this.backendAvailability.gemini) {
       return this.backends.gemini;
     }
-    
+
     // Fallback to default backend
     return this.defaultBackend || this.backends.api;
   }
@@ -853,14 +894,29 @@ class PunkEngine {
         "utf-8",
       );
       const settings = JSON.parse(content);
-      const backend = settings.punk_backend || "api";
-      const routing = settings.intent_routing?.[backend];
+
+      // Unified model selection: route based on the user's active provider,
+      // not the legacy punk_backend setting. If user selected anthropic in
+      // the model picker, use the claude-code routing table so all LLM calls
+      // (orchestration planning, execution, commit drafts, indexing) go
+      // through the same provider the conversation uses.
+      const activeProvider = settings.selected_model_provider || null;
+      const providerToRoutingKey = { anthropic: "claude-code", gemini: "gemini" };
+      const routingKey = providerToRoutingKey[activeProvider]
+        || settings.punk_backend || "api";
+
+      const routing = settings.intent_routing?.[routingKey];
       if (routing) return routing;
+
+      return DEFAULT_INTENT_ROUTING[routingKey] || DEFAULT_INTENT_ROUTING["api"];
     } catch {}
 
     const settings = await this.loadSettings();
-    const backend = settings.punk_backend || "api";
-    return DEFAULT_INTENT_ROUTING[backend] || DEFAULT_INTENT_ROUTING["api"];
+    const activeProvider = settings.selected_model_provider || null;
+    const providerToRoutingKey = { anthropic: "claude-code", gemini: "gemini" };
+    const routingKey = providerToRoutingKey[activeProvider]
+      || settings.punk_backend || "api";
+    return DEFAULT_INTENT_ROUTING[routingKey] || DEFAULT_INTENT_ROUTING["api"];
   }
 
   async loadIntentAutoRoute() {
@@ -912,6 +968,54 @@ class PunkEngine {
       }
 
       return; // do not relay to renderer
+    }
+
+    // ── Persist SDK model info to model-manager cache ─────────────────────
+    if (event.event === "sdk_init_info" && event.data?.models) {
+      const sdkModels = event.data.models;
+      const normalized = sdkModels.map((m) => {
+          const id = m.value || m.id || "";
+          const has1m = id.includes("[1m]") || id.includes("1m");
+          const isOpus = id.includes("opus");
+          const isSonnet = id.includes("sonnet");
+          const isHaiku = id.includes("haiku");
+          const isDefault = id === "default";
+          const context = (has1m || isOpus || isDefault) ? 1000000 : 200000;
+          const tier = (isOpus || isDefault) ? 1 : isSonnet ? 2 : 3;
+
+          // Build a clear display name
+          let name = m.displayName || m.name || id;
+          if (name === "Sonnet") name = "Sonnet 4.6";
+          if (name === "Haiku") name = "Haiku 4.5";
+          // "Default (recommended)" → show the actual model name + (default)
+          if (isDefault || name.toLowerCase().includes("default")) {
+            name = "Opus 4.6 (default)";
+          }
+          if (has1m && !name.includes("1M") && !name.includes("1m")) name += " (1M)";
+
+          return {
+            id,
+            name,
+            context_length: context,
+            provider: "Anthropic",
+            tier,
+            input_cost: null,
+            output_cost: null,
+          };
+        });
+      if (normalized.length > 0 && modelManager.updateModels("anthropic", normalized)) {
+        modelManager.saveCache();
+        modelManager.notifyRenderer();
+      }
+    }
+
+    // ── Persist Gemini models from CLI package prefetch ──────────────────
+    if (event.event === "gemini_models" && event.data?.models) {
+      if (modelManager.updateModels("gemini", event.data.models)) {
+        modelManager.saveCache();
+        modelManager.notifyRenderer();
+      }
+      return; // Don't forward to renderer — this is an internal event
     }
 
     const channel = `punk-stream:${projectId}`;
@@ -1245,8 +1349,16 @@ Respond with a single concise principle statement (one sentence, under 150 chara
 
       const settings = await this.loadSettings();
       try {
+        // Determine effective backend from the user's active provider.
+        // If they selected anthropic → "claude-code", gemini → "gemini",
+        // otherwise use punk_backend (legacy) or "api".
+        const _activeProvider = settings.selected_model_provider || null;
+        const _providerBackendMap = { anthropic: "claude-code", gemini: "gemini" };
+        const _effectiveBackend = _providerBackendMap[_activeProvider]
+          || settings.punk_backend || "api";
+
         catalogData = {
-          backend:  settings.punk_backend || "api",
+          backend:  _effectiveBackend,
           apiKeys:  settings.http_api_keys || {},
           priors:   routingStore.getAllPriors(),
           profiles: routingStore.getAllProfiles(),
@@ -1660,10 +1772,15 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     }, request.requestId);
 
     // ── PLANNING MODEL SELECTION ──────────────────────────────────────────
+    // When smart routing is off, use the user's pinned model for everything.
+    // When on, use the routing table's plan slot (or classifier override).
+    const autoRoute = request.autoRoute ?? (await this.loadIntentAutoRoute());
     const classifierPlan = classifierDecision?.planningModel;
-    const planRoute = classifierPlan
-      ? { provider: classifierPlan.provider, model: classifierPlan.model, thinking: strategy.reasoning === "deep" }
-      : (routing["plan"] || routing["execute"]);
+    const planRoute = !autoRoute
+      ? { provider: request.provider, model: request.model, thinking: request.thinking ?? false }
+      : classifierPlan
+        ? { provider: classifierPlan.provider, model: classifierPlan.model, thinking: strategy.reasoning === "deep" }
+        : (routing["plan"] || routing["execute"]);
 
     const phase = strategy.discovery ? "discovery" : "planning";
     this.handleBackendEvent(projectId, {
@@ -1705,9 +1822,11 @@ Respond with a single concise principle statement (one sentence, under 150 chara
 
     // ── EXECUTION MODEL SELECTION ─────────────────────────────────────────
     const classifierExec = classifierDecision?.executionModel;
-    const execRoute = classifierExec
-      ? { provider: classifierExec.provider, model: classifierExec.model, thinking: false }
-      : routing["execute"];
+    const execRoute = !autoRoute
+      ? { provider: request.provider, model: request.model, thinking: request.thinking ?? false }
+      : classifierExec
+        ? { provider: classifierExec.provider, model: classifierExec.model, thinking: false }
+        : routing["execute"];
 
     this.handleBackendEvent(projectId, {
       event: "orchestration_phase",
@@ -1787,6 +1906,67 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     }
   }
 
+  /**
+   * Preview what model the router would pick for a given message.
+   * Lightweight — no API calls, no state changes. Used by the UI to show
+   * the predicted model as the user types.
+   *
+   * CRITICAL: Only picks from models in the user's configured routing table.
+   * No surprise models, no providers the user hasn't set up.
+   */
+  async previewRoute(message, projectId) {
+    const autoRoute = await this.loadIntentAutoRoute();
+    if (!autoRoute) return null; // User has pinned a model — no preview needed
+
+    const settings = await this.loadSettings();
+    const routing = await this.loadIntentRouting();
+
+    try {
+      const { routeIntegrated } = await import("./integrated-router.mjs");
+      const state = readState(projectId);
+      const threadState = readThreadState(projectId);
+
+      const decision = await routeIntegrated({
+        message:        message || "",
+        turnCount:      0,
+        workingSetSize: state?.workingSet?.length || 0,
+        pendingTodos:   (state?.todos || []).filter(t => t.status !== "completed").length,
+        phase:          state?.phase || "idle",
+        threadState: {
+          consecutiveFailures: threadState?.consecutiveFailures || 0,
+          lastFailureType:     threadState?.lastFailureType || null,
+          approachesTried:     threadState?.approachesTried?.length || 0,
+          lastResponseSummary: null,
+          lastUserPromptHash:  null,
+        },
+        backend: settings.punk_backend || "api",
+      });
+
+      if (!decision?.modelTier) return null;
+
+      // Map tier to concrete model from the user's routing table.
+      // ONLY returns models the user has configured — never invents models.
+      const tier = decision.modelTier;
+      const tierToSlot = { cheap: "other", mid: "explain", capable: "execute", frontier: "plan" };
+      const slot = tierToSlot[tier] || "execute";
+      const route = routing[slot] || routing["execute"];
+
+      if (!route) return null;
+
+      return {
+        model:      route.model,
+        provider:   route.provider,
+        tier,
+        mode:       decision.mode,
+        taskType:   decision.taskType,
+        confidence: decision.confidence,
+        reason:     decision.reason,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   async shutdown() {
     // Shutdown all backends
     for (const backend of Object.values(this.backends)) {
@@ -1810,39 +1990,48 @@ Respond with a single concise principle statement (one sentence, under 150 chara
    */
   async quickCall(systemPrompt, userPrompt) {
     await this.initialize();
-    // Use the routing table's explain slot — lightest model the user has
-    // configured for their active backend. Never hardcode a provider here.
     const settings = await this.loadSettings();
-    const routing = await this.loadIntentRouting();
-    const explainRoute = routing["explain"] || routing["execute"] || {};
+    const autoRoute = await this.loadIntentAutoRoute();
 
-    const request = {
-      provider: explainRoute.provider || null,
-      model: explainRoute.model || null,
-      thinking: false,
-    };
+    let request;
 
-    // If using API backend, ensure we have a key for the chosen provider.
-    // If not, try to find ANY provider that HAS a key.
-    if (settings.punk_backend === "api" || !settings.punk_backend) {
+    if (!autoRoute) {
+      // Smart routing OFF — use the exact model the user pinned.
+      request = {
+        provider: settings.selected_model_provider || null,
+        model: settings.selected_model || null,
+        thinking: false,
+      };
+    } else {
+      // Smart routing ON — use the routing table's explain slot
+      // (lightest model the user configured for their provider).
+      const routing = await this.loadIntentRouting();
+      const explainRoute = routing["explain"] || routing["execute"] || {};
+      request = {
+        provider: explainRoute.provider || settings.selected_model_provider || null,
+        model: explainRoute.model || settings.selected_model || null,
+        thinking: false,
+      };
+    }
+
+    // For API-routed providers, ensure we have a key.
+    const isCliProvider = request.provider === "anthropic" || request.provider === "gemini";
+    if (!isCliProvider) {
       const keys = settings.http_api_keys || {};
-      const currentProvider = request.provider || settings.http_provider || "deepseek";
+      const currentProvider = request.provider || "deepseek";
 
       if (!keys[currentProvider]) {
-        // Current choice has no key — pick the first provider that DOES.
         const firstWithKey = Object.entries(keys).find(([_, k]) => !!k)?.[0];
         if (firstWithKey) {
           request.provider = firstWithKey;
-          // When switching provider, we MUST use a model that exists for it.
-          // mapModelName with null model will return the default for that provider.
           request.model = null;
           console.log(`[punk] quickCall: ${currentProvider} has no key, switching to ${firstWithKey}`);
         }
       }
     }
 
-    // Get appropriate backend for this request
     const backend = this.getBackendForRequest(request);
+    console.log(`[punk] quickCall → ${request.provider}/${request.model} (autoRoute=${autoRoute})`);
     return backend.planningCall(systemPrompt, userPrompt, request);
   }
 
@@ -1951,6 +2140,12 @@ export async function registerPunkHandlers() {
 
   ipcMain.handle("abort_punk", async (_event, args) => {
     await punkEngine.abort(args.projectId);
+  });
+
+  // Preview what model the router would pick — used by InputBar to show
+  // the predicted model as the user types. Lightweight, no side effects.
+  ipcMain.handle("preview_route", async (_event, args) => {
+    return punkEngine.previewRoute(args.message, args.projectId);
   });
 
   ipcMain.handle("send_to_mind", async (_event, args) => {

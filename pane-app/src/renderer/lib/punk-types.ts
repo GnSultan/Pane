@@ -357,8 +357,16 @@ export interface OrchestrationPhaseEvent {
 }
 
 export interface SdkModel {
-  id: string;
-  name?: string;
+  /** Model identifier (SDK field: "value") */
+  value: string;
+  /** Human-readable display name */
+  displayName: string;
+  /** Description of capabilities */
+  description?: string;
+  supportsEffort?: boolean;
+  supportsFastMode?: boolean;
+  supportsAutoMode?: boolean;
+  supportsAdaptiveThinking?: boolean;
   [key: string]: unknown;
 }
 
@@ -373,6 +381,20 @@ export interface SdkAccount {
 export interface PunkEventSdkInitInfo {
   event: "sdk_init_info";
   data: { models: SdkModel[] | null; account: SdkAccount | null };
+}
+
+export interface RateLimitInfo {
+  status: "allowed" | "allowed_warning" | "rejected";
+  utilization?: number;
+  resetsAt?: number;
+  rateLimitType?: string;
+  isUsingOverage?: boolean;
+  overageStatus?: "allowed" | "allowed_warning" | "rejected";
+}
+
+export interface PunkEventRateLimit {
+  event: "rate_limit";
+  data: RateLimitInfo;
 }
 
 export type PunkStreamEvent = (
@@ -398,6 +420,7 @@ export type PunkStreamEvent = (
   | OrchestrationErrorEvent
   | OrchestrationPhaseEvent
   | PunkEventSdkInitInfo
+  | PunkEventRateLimit
 ) & { requestId?: string };
 
 // Plan message types — the blueprint Pane produces before execution

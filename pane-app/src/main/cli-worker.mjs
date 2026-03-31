@@ -13,7 +13,9 @@ import os from "node:os";
 import readline from "node:readline";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { compileContext, mergeState, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, readHandoff, writeHandoffWithHistory, updateLatestHandoff } from "./session-context.mjs";
+import { compileContext, mergeState, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, readHandoff, writeHandoffWithHistory, updateLatestHandoff, MODEL_CONTEXT_LIMITS } from "./session-context.mjs";
+import { orchestrateContext } from "./context-orchestrator.mjs";
+import { estimateConversationTokens, getModelLimit } from "./token-budget.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
 import { calculateCost } from "./pricing.mjs";
 
@@ -94,7 +96,18 @@ function handleGeminiLine(projectId, line, requestId) {
   try {
     parsed = JSON.parse(line);
   } catch {
-    return;
+    // Robustness: gemini CLI might print status messages (non-JSON) on the same line
+    // as a JSON event. Try to find the start of the JSON object.
+    const braceIdx = line.indexOf('{');
+    if (braceIdx !== -1) {
+      try {
+        parsed = JSON.parse(line.slice(braceIdx));
+      } catch {
+        return;
+      }
+    } else {
+      return;
+    }
   }
 
   if (!requestStates.has(requestId)) {
@@ -106,8 +119,9 @@ function handleGeminiLine(projectId, line, requestId) {
   }
   const state = requestStates.get(requestId);
 
-  switch (parsed.type) {
-    case "init": {
+  try {
+    switch (parsed.type) {
+      case "init": {
       const sessionId = parsed.session_id || `gemini-${Date.now()}`;
       sendToMain({
         type: "event",
@@ -155,9 +169,9 @@ function handleGeminiLine(projectId, line, requestId) {
                 type: "stream_event",
                 event: {
                   type: "content_block_delta",
+                  index: 0,
                   delta: { type: "text_delta", text: increment },
-                },
-              },
+                },              },
             },
           },
         });
@@ -204,9 +218,9 @@ function handleGeminiLine(projectId, line, requestId) {
                 type: "stream_event",
                 event: {
                   type: "content_block_delta",
+                  index: 0,
                   delta: { type: "thinking_delta", thinking: increment },
-                },
-              },
+                },              },
             },
           },
         });
@@ -222,12 +236,12 @@ function handleGeminiLine(projectId, line, requestId) {
                 type: "stream_event",
                 event: {
                   type: "content_block_start",
+                  index: 0,
                   content_block: {
                     type: "thinking",
                     thinking: currentFullThinking,
                   },
-                },
-              },
+                },              },
             },
           },
         });
@@ -252,6 +266,7 @@ function handleGeminiLine(projectId, line, requestId) {
               type: "stream_event",
               event: {
                 type: "content_block_start",
+                index: 0,
                 content_block: {
                   type: "tool_use",
                   id: toolId,
@@ -275,6 +290,7 @@ function handleGeminiLine(projectId, line, requestId) {
               type: "stream_event",
               event: {
                 type: "content_block_delta",
+                index: 0,
                 delta: {
                   type: "partial_json_delta",
                   partial_json: toolInputJson,
@@ -296,7 +312,7 @@ function handleGeminiLine(projectId, line, requestId) {
           data: {
             parsed: {
               type: "stream_event",
-              event: { type: "content_block_stop" },
+              event: { type: "content_block_stop", index: 0 },
             },
           },
         },
@@ -469,8 +485,18 @@ function handleGeminiLine(projectId, line, requestId) {
       break;
     }
 
-    default:
-      break;
+    }
+  } catch (err) {
+    console.error(`[cli-worker] Error processing Gemini line: ${err.message}`, line);
+    sendToMain({
+      type: "event",
+      projectId,
+      requestId,
+      event: {
+        event: "error",
+        data: { message: `Gemini parsing error: ${err.message}` },
+      },
+    });
   }
 }
 
@@ -548,6 +574,11 @@ async function handleClaudeSpawn({
   // Accumulate full assistant text for handoff pattern extraction at session end
   let sessionText = "";
 
+  // Track tool calls for state hygiene — when the session ends (or resumes),
+  // Pane updates session state to reflect what actually happened.
+  let hadFileEdits = false;
+  let hadVerification = false;
+
   // Auto-resume across error_max_turns: if the model hits its turn limit mid-task,
   // silently continue rather than surfacing an error. Capped at MAX_AUTO_RESUMES
   // to prevent infinite loops on genuinely stuck sessions.
@@ -592,6 +623,19 @@ async function handleClaudeSpawn({
           });
         }
 
+        // Surface rate limit warnings to the UI
+        if (msg.type === "rate_limit_event" && msg.rate_limit_info) {
+          sendToMain({
+            type: "event",
+            projectId,
+            requestId,
+            event: {
+              event: "rate_limit",
+              data: msg.rate_limit_info,
+            },
+          });
+        }
+
         // Transparent max_turns resume — swallow the error, loop back with "continue"
         if (msg.type === "result" && msg.subtype === "error_max_turns") {
           hitMaxTurns = true;
@@ -611,7 +655,7 @@ async function handleClaudeSpawn({
           if (msg.message?.usage) {
             const usage = msg.message.usage;
             const cost = calculateCost({
-              model: "claude-3-5-sonnet",
+              model: model || "claude-sonnet-4-6",
               provider: "anthropic",
               inputTokens: usage.input_tokens || 0,
               outputTokens: usage.output_tokens || 0,
@@ -627,7 +671,7 @@ async function handleClaudeSpawn({
                 data: {
                   provider: "anthropic",
                   activity_type: "conversation",
-                  model: "claude-3-5-sonnet",
+                  model: model || "claude-sonnet-4-6",
                   input_tokens: usage.input_tokens || 0,
                   output_tokens: usage.output_tokens || 0,
                   cache_creation_input_tokens:
@@ -638,6 +682,31 @@ async function handleClaudeSpawn({
                 },
               },
             });
+          }
+        }
+
+        // Track tool calls for session state hygiene
+        if (msg.type === "assistant" && msg.message?.content) {
+          for (const block of msg.message.content) {
+            if (block.type === "tool_use") {
+              const name = block.name || "";
+              if (name === "Write" || name === "Edit" || name === "write_file" || name === "edit_file"
+                  || name === "pane_run_in_terminal") {
+                hadFileEdits = true;
+              }
+            }
+          }
+        }
+        if (msg.type === "user" && msg.message?.content) {
+          for (const block of msg.message.content) {
+            if (block.type === "tool_result" && !block.is_error) {
+              // Check if a test/build command succeeded (crude but effective)
+              const output = typeof block.content === "string" ? block.content : "";
+              if (output.includes("passed") || output.includes("✓") || output.includes("success")
+                  || output.includes("Build complete") || output.includes("0 errors")) {
+                hadVerification = true;
+              }
+            }
           }
         }
 
@@ -707,6 +776,56 @@ async function handleClaudeSpawn({
   } finally {
     if (activeControllers.get(projectId) === ac) {
       activeControllers.delete(projectId);
+    }
+
+    // ── State hygiene: update session state from what actually happened ───
+    // Without this, the "continue" problem occurs: session state says todos
+    // are pending when the model already completed them, causing the next
+    // prompt to re-inject stale objectives.
+    try {
+      const currentState = readState(projectId);
+      const todos = currentState.todos || [];
+      if (todos.length > 0 && (hadFileEdits || hadVerification)) {
+        let updated = todos.map(t => ({ ...t }));
+        let changed = false;
+
+        // Mark in_progress items as completed if the model did real work
+        if (hadFileEdits) {
+          updated = updated.map(t => {
+            if (t.status === "in_progress") {
+              changed = true;
+              return { ...t, status: "completed" };
+            }
+            return t;
+          });
+        }
+
+        // If verification passed, advance: complete current, start next
+        if (hadVerification) {
+          const inProgress = updated.findIndex(t => t.status === "in_progress");
+          if (inProgress !== -1) {
+            updated[inProgress] = { ...updated[inProgress], status: "completed" };
+            changed = true;
+          }
+          const nextPending = updated.findIndex(t => t.status === "pending");
+          if (nextPending !== -1) {
+            updated[nextPending] = { ...updated[nextPending], status: "in_progress" };
+            changed = true;
+          }
+        }
+
+        // If all todos completed, clear activeTask too
+        if (updated.every(t => t.status === "completed")) {
+          mergeState(projectId, { todos: updated, activeTask: null });
+          changed = false; // already written
+        }
+
+        if (changed) {
+          mergeState(projectId, { todos: updated });
+        }
+      }
+    } catch (err) {
+      console.warn("[cli-worker] State hygiene failed (non-fatal):", err.message);
     }
 
     // Refresh git status then write handoff — enables seamless model swaps FROM Claude Code
@@ -1040,7 +1159,7 @@ async function handleSpawn({
   sqliteChanges,
 }) {
   const command =
-    messageCommand || (process.serviceData && process.serviceData.command);
+    messageCommand || process.env.PANE_CLI_COMMAND;
   if (!command) {
     sendToMain({
       type: "event",
@@ -1049,7 +1168,7 @@ async function handleSpawn({
       event: {
         event: "error",
         data: {
-          message: `No CLI command specified. Service data: ${JSON.stringify(process.serviceData)}`,
+          message: `No CLI command specified. Environment: ${process.env.PANE_CLI_COMMAND}`,
         },
       },
     });
@@ -1068,7 +1187,35 @@ async function handleSpawn({
   });
 
   const backend = command === "claude" ? "claude-code" : "gemini";
-  const context = compileContext(projectId, intent, historyLength, backend, sqliteChanges);
+
+  // Use the Context Orchestrator for budget-aware assembly.
+  // The orchestrator drops low-priority layers when the model has limited context,
+  // ensuring the system prompt never overflows. Falls back to legacy compileContext()
+  // if the orchestrator fails.
+  let context;
+  let budgetInfo = null;
+  try {
+    const conversationTokens = estimateConversationTokens(history || []);
+    const result = orchestrateContext(projectId, {
+      intent,
+      historyLength,
+      backend,
+      model,
+      sqliteChanges,
+      conversationTokens,
+    });
+    context = result;
+    budgetInfo = result.budget;
+
+    // Log budget diagnostics
+    if (budgetInfo.layersDropped > 0) {
+      console.log(`[cli-worker] Context budget: ${budgetInfo.systemUsed}/${budgetInfo.systemBudget} tokens (${budgetInfo.layersIncluded} layers, dropped: ${budgetInfo.droppedNames.join(", ")})`);
+    }
+  } catch (err) {
+    console.warn(`[cli-worker] Orchestrator failed, falling back to compileContext: ${err.message}`);
+    context = compileContext(projectId, intent, historyLength, backend, sqliteChanges);
+  }
+
   const basePrompt = systemPromptOverride || context.full;
   const systemPrompt = escalationHint ? `${basePrompt}\n\n${escalationHint}` : basePrompt;
 
@@ -1194,5 +1341,147 @@ process.parentPort.on("message", ({ data }) => {
     case "shutdown":
       handleShutdown();
       break;
+    case "prefetch_models":
+      handlePrefetchModels().catch((err) => {
+        console.error("[cli-worker] prefetch_models error:", err.message);
+      });
+      break;
+    case "prefetch_gemini_models":
+      handlePrefetchGeminiModels().catch((err) => {
+        console.error("[cli-worker] prefetch_gemini_models error:", err.message);
+      });
+      break;
   }
 });
+
+/**
+ * Prefetch Gemini models by reading the Gemini CLI's own model configuration.
+ * No auth needed — reads from @google/gemini-cli-core's installed models.js.
+ */
+/**
+ * Find the @google/gemini-cli-core package by resolving the `gemini` binary.
+ * Returns the package directory path, or null if not found.
+ */
+async function findGeminiCliCore() {
+  try {
+    const { stdout } = await execAsync("which gemini");
+    const binPath = stdout.trim();
+    if (!binPath) return null;
+    // Resolve symlink: gemini -> ../lib/node_modules/@google/gemini-cli/dist/index.js
+    const realBin = fs.realpathSync(binPath);
+    // Walk up to the gemini-cli package root, then into node_modules/@google/gemini-cli-core
+    const geminiCliRoot = realBin.replace(/\/dist\/.*$/, "");
+    const corePath = path.join(geminiCliRoot, "node_modules/@google/gemini-cli-core");
+    if (fs.existsSync(corePath)) return corePath;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function handlePrefetchGeminiModels() {
+  try {
+    // Resolve the Gemini CLI's core package from its global install location.
+    // The CLI worker knows the gemini binary path — resolve its node_modules.
+    const geminiCliDir = await findGeminiCliCore();
+    if (!geminiCliDir) return;
+    const modelsModule = await import(path.join(geminiCliDir, "dist/src/config/models.js"));
+
+    // Read VALID_GEMINI_MODELS set and model constants
+    const validModels = modelsModule.VALID_GEMINI_MODELS;
+    if (!validModels || validModels.size === 0) return;
+
+    // Context windows for Gemini model families
+    const contextFor = (id) => {
+      if (id.includes("3.1") || id.includes("3-pro") || id.includes("3-flash")) return 2000000;
+      if (id.includes("2.5")) return 1000000;
+      return 1000000;
+    };
+
+    const displayName = (id) => {
+      return id.replace(/^gemini-/, "Gemini ").replace(/-/g, " ")
+        .replace(/\b\w/g, c => c.toUpperCase())
+        .replace("Preview", "(Preview)")
+        .replace("Customtools", "(Custom Tools)");
+    };
+
+    const models = [...validModels]
+      .filter((id) => !id.startsWith("auto-")) // Skip auto-routing aliases
+      .map((id) => ({
+        id,
+        name: displayName(id),
+        context_length: contextFor(id),
+        provider: "Google",
+        tier: id.includes("pro") ? 1 : id.includes("flash-lite") ? 3 : 2,
+        input_cost: null,
+        output_cost: null,
+      }))
+      .sort((a, b) => {
+        if (a.tier !== b.tier) return a.tier - b.tier;
+        return (b.context_length || 0) - (a.context_length || 0);
+      });
+
+    if (models.length > 0) {
+      sendToMain({
+        type: "event",
+        projectId: "__prefetch__",
+        requestId: "__prefetch__",
+        event: { event: "gemini_models", data: { models } },
+      });
+    }
+  } catch (err) {
+    console.warn("[cli-worker] prefetch gemini models error:", err.message);
+  }
+}
+
+/**
+ * Prefetch SDK supported models without starting a real conversation.
+ * Starts a minimal query, grabs supportedModels() + accountInfo(), aborts immediately.
+ */
+async function handlePrefetchModels() {
+  const ac = new AbortController();
+  const tmpDir = os.tmpdir();
+
+  const q = query({
+    prompt: "hi",
+    options: {
+      cwd: tmpDir,
+      maxTurns: 1,
+      pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
+      executable: process.execPath,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      permissionMode: "bypassPermissions",
+      dangerouslySkipPermissions: true,
+      abortController: ac,
+    },
+  });
+
+  try {
+    // Wait for init message then immediately fetch models and abort
+    for await (const msg of q) {
+      if (msg.type === "system" && msg.subtype === "init") {
+        const [models, account] = await Promise.all([
+          q.supportedModels?.().catch(() => null),
+          q.accountInfo?.().catch(() => null),
+        ]);
+        ac.abort();
+        if (models || account) {
+          sendToMain({
+            type: "event",
+            projectId: "__prefetch__",
+            requestId: "__prefetch__",
+            event: { event: "sdk_init_info", data: { models, account } },
+          });
+        }
+        break;
+      }
+      // Abort on any non-init message (shouldn't happen with maxTurns:1)
+      if (msg.type === "result") break;
+    }
+  } catch (err) {
+    // AbortError is expected — we intentionally abort after getting models
+    if (err.name !== "AbortError") {
+      console.error("[cli-worker] prefetch_models query error:", err.message);
+    }
+  }
+}

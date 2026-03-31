@@ -90,10 +90,11 @@ export function useSettingsPersistence() {
 
         if (settings.http_provider) ws.setHttpProvider(settings.http_provider);
 
-        // API keys & Base URLs
+        // API keys, Base URLs, disabled providers
         const apiKeys: Record<string, string> = settings.http_api_keys || {};
         ws.setHttpApiKeys(apiKeys);
         ws.setHttpBaseUrls(settings.http_base_urls || {});
+        if (settings.disabled_providers) ws.setDisabledProviders(settings.disabled_providers);
 
         // Model restoration
         if (settings.selected_model) {
@@ -267,6 +268,7 @@ export function useSettingsPersistence() {
         http_provider: ws.httpProvider,
         http_api_keys: ws.httpApiKeys,
         http_base_urls: ws.httpBaseUrls,
+        disabled_providers: ws.disabledProviders,
         intent_routing: ws.intentRouting as BackendRouting,
         intent_auto_route: ws.intentAutoRoute,
       }).catch((err) => console.error("[persistence] Save failed:", err));

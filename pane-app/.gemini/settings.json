@@ -1,1 +1,15 @@
-{"mcpServers": {"test6": {"command": "echo", "args": ["hi"], "trust": true}}}
+{
+  "mcpServers": {
+    "pane": {
+      "command": "node",
+      "args": [
+        "/Users/macbook/.pane/pane-mcp-server.mjs"
+      ],
+      "env": {
+        "PANE_PROJECT_ID": "test-project",
+        "PANE_PROJECT_ROOT": "/Users/macbook/Pane/pane-app"
+      },
+      "trust": true
+    }
+  }
+}

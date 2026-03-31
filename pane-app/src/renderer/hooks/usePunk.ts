@@ -961,6 +961,11 @@ export function usePunk(projectId: string) {
             break;
           }
 
+          case "rate_limit": {
+            useWorkspaceStore.getState().setRateLimitInfo(event.data);
+            break;
+          }
+
           case "routing": {
             // Legacy routing event — still handled for backwards compat
             const { model, thinking, intent } = event.data;

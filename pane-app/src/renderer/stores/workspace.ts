@@ -48,6 +48,10 @@ interface WorkspaceState {
   httpProvider: string; // "deepseek" | "kimi" | "anthropic" | etc.
   httpApiKeys: Record<string, string>;
   httpBaseUrls: Record<string, string>;
+  disabledProviders: string[];
+  setDisabledProviders: (providers: string[]) => void;
+  toggleProvider: (provider: string) => void;
+  isProviderEnabled: (provider: string) => boolean;
   intentRouting: BackendRouting;
   intentAutoRoute: boolean;
   openRouterModels: OpenRouterModel[];
@@ -72,6 +76,8 @@ interface WorkspaceState {
   sdkModels: import("../lib/punk-types").SdkModel[] | null;
   sdkAccount: import("../lib/punk-types").SdkAccount | null;
   setSdkInfo: (models: import("../lib/punk-types").SdkModel[] | null, account: import("../lib/punk-types").SdkAccount | null) => void;
+  rateLimitInfo: import("../lib/punk-types").RateLimitInfo | null;
+  setRateLimitInfo: (info: import("../lib/punk-types").RateLimitInfo | null) => void;
   // Profile data
   profileName: string;
   profileBio: string;
@@ -188,6 +194,16 @@ function createWorkspaceStore() {
     httpProvider: "openrouter",
     httpApiKeys: {},
     httpBaseUrls: {},
+    disabledProviders: [],
+    setDisabledProviders: (providers) => set({ disabledProviders: providers }),
+    toggleProvider: (provider) => {
+      const current = get().disabledProviders;
+      const next = current.includes(provider)
+        ? current.filter((p) => p !== provider)
+        : [...current, provider];
+      set({ disabledProviders: next });
+    },
+    isProviderEnabled: (provider) => !get().disabledProviders.includes(provider),
     intentRouting: DEFAULT_BACKEND_ROUTING,
     intentAutoRoute: true,
     openRouterModels: [],
@@ -242,6 +258,8 @@ function createWorkspaceStore() {
     sdkModels: null,
     sdkAccount: null,
     setSdkInfo: (models, account) => set({ sdkModels: models, sdkAccount: account }),
+    rateLimitInfo: null,
+    setRateLimitInfo: (info) => set({ rateLimitInfo: info }),
     // Profile data
     profileName: "",
     profileBio: "",

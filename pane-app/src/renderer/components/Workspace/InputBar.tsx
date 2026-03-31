@@ -7,13 +7,30 @@ import { TodoPanel } from "./TodoPanel";
 import { SlashMenu } from "../shared";
 import type { Todo } from "../../lib/punk-types";
 import {
-  PROVIDER_MODELS,
-  THINKING_ENGINES,
-  BUILDING_ENGINES,
   isThinkingModel,
 } from "../../lib/models";
+import { previewRoute, type RoutePreview } from "../../lib/tauri-commands";
 
 const EMPTY_TODOS: Todo[] = [];
+
+function RateLimitIndicator() {
+  const info = useWorkspaceStore((s) => s.rateLimitInfo);
+  if (!info) return null;
+  const isWarning = info.status === "allowed_warning";
+  const isRejected = info.status === "rejected";
+  if (!isWarning && !isRejected) return null;
+
+  const pct = info.utilization != null ? Math.round(info.utilization * 100) : null;
+  const resetTime = info.resetsAt
+    ? new Date(info.resetsAt * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : null;
+
+  return (
+    <span className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-pane-status-modified/70"}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
+      {pct != null && <>{pct}% </>}{isRejected ? "limit reached" : "limit"}{resetTime && <> · resets {resetTime}</>}
+    </span>
+  );
+}
 
 // ─── Static caret (no-blink) ─────────────────────────────────────────────────
 //
@@ -104,56 +121,47 @@ function ModelPicker({
   const [open, setOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const ref = useRef<HTMLDivElement>(null);
-  const openRouterModels = useWorkspaceStore((s) => s.openRouterModels);
+  const fetchedModels = useWorkspaceStore((s) => s.allModels);
+  const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
 
   const filteredProviderModels = useMemo(() => {
-    const providers = Object.fromEntries(
-      Object.entries(PROVIDER_MODELS)
-        .map(([provider, models]) => {
-          // Special case for OpenRouter: use enriched dynamic models with real provider grouping
-          if (provider === "openrouter") {
-            if (openRouterModels.length > 0) {
-              const dynamicModels = openRouterModels.map((m) => {
-                const hardcoded = models.find((h) => h.value === m.id);
-                return {
-                  value: m.id,
-                  label: hardcoded ? hardcoded.label : m.name,
-                  // Pass through enriched metadata from the backend filter
-                  realProvider: m.provider,   // "Anthropic", "Google", etc. — used for grouping
-                  inputCost:    m.input_cost,
-                  outputCost:   m.output_cost,
-                  tier:         m.tier,
-                };
-              });
-              return [provider, dynamicModels];
-            }
-          }
-
-          // Filter out any model starting with "auto-" as those are CLI-only routing hints
-          const filtered = models.filter((m) => !m.value.startsWith("auto-"));
-          return [provider, filtered];
-        })
-        .filter(([_, models]) => models && models.length > 0),
-    );
+    const providers: Record<string, Array<{
+      value: string;
+      label: string;
+      realProvider?: string;
+      inputCost?: number | null;
+      outputCost?: number | null;
+      tier?: number;
+      contextLength?: number;
+    }>> = {};
+    for (const [provider, models] of Object.entries(fetchedModels)) {
+      if (!models || models.length === 0) continue;
+      if (disabledProviders.includes(provider)) continue;
+      providers[provider] = models.map((m: any) => ({
+        value: m.id,
+        label: m.name || m.id,
+        realProvider: m.provider,
+        inputCost: m.input_cost,
+        outputCost: m.output_cost,
+        tier: m.tier,
+        contextLength: m.context_length,
+      }));
+    }
     return providers;
-  }, [openRouterModels]);
+  }, [fetchedModels, disabledProviders]);
 
-  // Determine backend source for a model based on provider
-  const getBackendSource = useCallback((providerKey: string, modelValue: string): string => {
-    // Claude Code CLI models
-    if (providerKey === "anthropic") {
-      return "claude-code";
-    }
-    // Gemini CLI models
-    if (providerKey === "gemini") {
-      return "gemini-cli";
-    }
-    // OpenRouter models (contain "/") go to HTTP API
-    if (modelValue.includes("/")) {
-      return "http-api";
-    }
-    // All other models go to HTTP API
-    return "http-api";
+  const providerDisplayName = useCallback((providerKey: string): string => {
+    const names: Record<string, string> = {
+      anthropic: "Claude Code",
+      "anthropic-api": "Anthropic API",
+      gemini: "Gemini CLI",
+      "gemini-api": "Gemini API",
+      deepseek: "DeepSeek",
+      openrouter: "OpenRouter",
+      kimi: "Kimi",
+      stepfun: "StepFun",
+    };
+    return names[providerKey] || providerKey;
   }, []);
 
   const allModels = useMemo(() => {
@@ -162,7 +170,6 @@ function ModelPicker({
       label: string;
       provider: string;
       providerKey: string;
-      backendSource: string;
       thinking?: boolean;
       inputCost?: number | null;
       outputCost?: number | null;
@@ -177,25 +184,13 @@ function ModelPicker({
           outputCost?: number | null;
           tier?: number;
         }) => {
-          // Use realProvider for grouping when available (OpenRouter models expose the upstream provider)
           const displayProvider = m.realProvider || providerKey;
-          const engineEntry =
-            THINKING_ENGINES.find(
-              (e) => e.provider === providerKey && e.model === m.value,
-            ) ||
-            BUILDING_ENGINES.find(
-              (e) => e.provider === providerKey && e.model === m.value,
-            );
-          const isThinking = engineEntry
-            ? engineEntry.thinking
-            : isThinkingModel(m.value);
           models.push({
             value:      m.value,
             label:      m.label,
             provider:   displayProvider,
             providerKey: providerKey,
-            backendSource: getBackendSource(providerKey, m.value),
-            thinking:   isThinking,
+            thinking:   isThinkingModel(m.value),
             inputCost:  m.inputCost,
             outputCost: m.outputCost,
           });
@@ -203,7 +198,7 @@ function ModelPicker({
       }
     });
     return models;
-  }, [filteredProviderModels, getBackendSource]);
+  }, [filteredProviderModels]);
 
   // Fuzzy search - matches characters in order but not necessarily consecutively
   // Also calculates a relevance score for sorting results
@@ -256,13 +251,8 @@ function ModelPicker({
         const labelScore = fuzzyScore(m.label, query);
         const valueScore = fuzzyScore(m.value, query);
         const providerScore = fuzzyScore(m.provider, query);
-        const backendSourceScore = fuzzyScore(
-          m.backendSource === "claude-code" ? "claude code cli" 
-            : m.backendSource === "gemini-cli" ? "gemini cli"
-            : "http api",
-          query
-        );
-        const maxScore = Math.max(labelScore, valueScore, providerScore, backendSourceScore);
+        const providerNameScore = fuzzyScore(providerDisplayName(m.providerKey), query);
+        const maxScore = Math.max(labelScore, valueScore, providerScore, providerNameScore);
         return { model: m, score: maxScore };
       })
       .filter(({ score }) => score >= 0)
@@ -310,15 +300,7 @@ function ModelPicker({
             showSpecificModel ? (
               <span className="hidden sm:inline-block transition-all duration-300 flex items-center gap-1">
                 {current!.label.toLowerCase()}
-                {current!.backendSource === "claude-code" && (
-                  <span className="w-1 h-1 rounded-full bg-pane-status-added/60" title="Claude Code CLI" />
-                )}
-                {current!.backendSource === "gemini-cli" && (
-                  <span className="w-1 h-1 rounded-full bg-pane-terminal/60" title="Gemini CLI" />
-                )}
-                {current!.backendSource === "http-api" && (
-                  <span className="w-1 h-1 rounded-full bg-pane-text-secondary/40" title="HTTP API" />
-                )}
+                <span className={`w-1 h-1 rounded-full ${current!.providerKey === "anthropic" ? "bg-pane-status-added/60" : current!.providerKey === "gemini" ? "bg-pane-terminal/60" : "bg-pane-text-secondary/40"}`} title={providerDisplayName(current!.providerKey)} />
               </span>
             ) : (
               <span className="text-pane-text-secondary/60">smart routing</span>
@@ -326,14 +308,8 @@ function ModelPicker({
           ) : (
             <span className="flex items-center gap-1">
               {currentDisplay.label.toLowerCase()}
-              {current && current.backendSource === "claude-code" && (
-                <span className="w-1 h-1 rounded-full bg-pane-status-added/60" title="Claude Code CLI" />
-              )}
-              {current && current.backendSource === "gemini-cli" && (
-                <span className="w-1 h-1 rounded-full bg-pane-terminal/60" title="Gemini CLI" />
-              )}
-              {current && current.backendSource === "http-api" && (
-                <span className="w-1 h-1 rounded-full bg-pane-text-secondary/40" title="HTTP API" />
+              {current && (
+                <span className={`w-1 h-1 rounded-full ${current.providerKey === "anthropic" ? "bg-pane-status-added/60" : current.providerKey === "gemini" ? "bg-pane-terminal/60" : "bg-pane-text-secondary/40"}`} title={providerDisplayName(current.providerKey)} />
               )}
             </span>
           )}
@@ -370,29 +346,27 @@ function ModelPicker({
 
             <div className="h-px bg-pane-border/30 my-1 mx-2" />
 
-            {/* Individual Models grouped by backend source */}
+            {/* Individual Models grouped by provider */}
             <div className="max-h-[300px] overflow-y-auto custom-scrollbar">
               {Object.entries(
                 filteredModels.reduce((acc, model) => {
-                  if (!acc[model.backendSource]) acc[model.backendSource] = [];
-                  acc[model.backendSource]?.push(model);
+                  if (!acc[model.providerKey]) acc[model.providerKey] = [];
+                  acc[model.providerKey]?.push(model);
                   return acc;
                 }, {} as Record<string, typeof filteredModels>),
-              ).map(([backendSource, models]) => (
-                <div key={backendSource} className="flex flex-col mb-2">
+              ).map(([providerKey, models]) => (
+                <div key={providerKey} className="flex flex-col mb-2">
                   <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-pane-text-secondary/40 font-mono flex items-center gap-1.5">
-                    {backendSource === "claude-code" && (
+                    {providerKey === "anthropic" && (
                       <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added/60" />
                     )}
-                    {backendSource === "gemini-cli" && (
+                    {providerKey === "gemini" && (
                       <span className="w-1.5 h-1.5 rounded-full bg-pane-terminal/60" />
                     )}
-                    {backendSource === "http-api" && (
+                    {providerKey !== "anthropic" && providerKey !== "gemini" && (
                       <span className="w-1.5 h-1.5 rounded-full bg-pane-text-secondary/40" />
                     )}
-                    {backendSource === "claude-code" ? "Claude Code CLI"
-                      : backendSource === "gemini-cli" ? "Gemini CLI"
-                      : "HTTP API"}
+                    {providerDisplayName(providerKey)}
                   </div>
                   {models?.map((model) => (
                     <button
@@ -413,15 +387,7 @@ function ModelPicker({
                           <span className="font-mono text-[12px]">
                             {model.label.toLowerCase()}
                           </span>
-                          {model.backendSource === "claude-code" && (
-                            <span className="w-1 h-1 rounded-full bg-pane-status-added/60" title="Claude Code CLI" />
-                          )}
-                          {model.backendSource === "gemini-cli" && (
-                            <span className="w-1 h-1 rounded-full bg-pane-terminal/60" title="Gemini CLI" />
-                          )}
-                          {model.backendSource === "http-api" && (
-                            <span className="w-1 h-1 rounded-full bg-pane-text-secondary/40" title="HTTP API" />
-                          )}
+                          <span className={`w-1 h-1 rounded-full ${model.providerKey === "anthropic" ? "bg-pane-status-added/60" : model.providerKey === "gemini" ? "bg-pane-terminal/60" : "bg-pane-text-secondary/40"}`} title={providerDisplayName(model.providerKey)} />
                         </div>
                         <div className="flex items-center gap-2">
                           {model.thinking && (
@@ -537,6 +503,29 @@ export function InputBar({
     },
     [setSelectedModel, setHttpProvider],
   );
+
+  // ── Route preview: show predicted model as user types ──────────────────
+  // Only active when smart routing is on. Debounced 300ms.
+  const [routePreview, setRoutePreview] = useState<RoutePreview | null>(null);
+  const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!intentAutoRoute || isProcessing || value.trim().length < 3) {
+      setRoutePreview(null);
+      return;
+    }
+
+    if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = setTimeout(() => {
+      previewRoute(value.trim(), projectId)
+        .then(setRoutePreview)
+        .catch(() => setRoutePreview(null));
+    }, 300);
+
+    return () => {
+      if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
+    };
+  }, [value, intentAutoRoute, isProcessing, projectId]);
 
   // Handle graceful fadeout of processing indicator.
   // Only fade out after real processing happened — not on initial mount.
@@ -889,6 +878,16 @@ export function InputBar({
 
             <div className="flex-1" />
 
+            {/* Route preview — shows predicted model when smart routing is on */}
+            {routePreview && !isProcessing && (
+              <div className="pointer-events-none flex items-center gap-1.5 text-[10px] text-[var(--pane-text-secondary)] font-mono opacity-60">
+                <span>{routePreview.model}</span>
+                <span className="opacity-40">·</span>
+                <span className="opacity-60">{routePreview.taskType}</span>
+              </div>
+            )}
+
+            <RateLimitIndicator />
             <div className="pointer-events-auto">
               <ModelPicker
                 value={selectedModel}

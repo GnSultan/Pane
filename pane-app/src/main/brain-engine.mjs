@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { runMemoryLifecycle, touchMemory, reinforceMemory } from "./memory-lifecycle.mjs";
 
 import {
   initSymbolTables,
@@ -1478,6 +1479,17 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
     result.codebaseMap = [];
   }
 
+  // Touch all memories that made it into the context — prevents decay,
+  // records that these memories are actively used. Over time, frequently
+  // accessed memories get reinforced while unused ones fade.
+  if (db && result.memories?.length > 0) {
+    for (const mem of result.memories) {
+      if (mem.id) {
+        try { touchMemory(db, mem.id); } catch {}
+      }
+    }
+  }
+
   try {
     fs.mkdirSync(path.join(BRAIN_DIR, "context"), { recursive: true });
     fs.writeFileSync(
@@ -2612,6 +2624,38 @@ process.parentPort.on("message", async ({ data }) => {
         db.prepare(`DELETE FROM mind_turns WHERE thread_id = ?`).run(data.id);
         db.prepare(`DELETE FROM mind_threads WHERE id = ?`).run(data.id);
         sendToMain({ type: "mind_thread_deleted", requestId: data.requestId, id: data.id });
+        break;
+      }
+
+      case "memory_lifecycle": {
+        // Run the full memory lifecycle: decay → consolidate → graduate
+        if (!db) { sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId }); break; }
+        try {
+          // Use the existing llmCall relay for consolidation (when enabled)
+          const quickCallRelay = data.enableConsolidation ? llmCall : null;
+
+          const result = await runMemoryLifecycle(db, data.projectId, quickCallRelay);
+          sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId, result });
+        } catch (err) {
+          console.error("[brain] memory lifecycle error:", err.message);
+          sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId, error: err.message });
+        }
+        break;
+      }
+
+      case "memory_touch": {
+        // Record that memories were accessed (prevents decay)
+        if (!db) break;
+        for (const nodeId of (data.nodeIds || [])) {
+          touchMemory(db, nodeId);
+        }
+        break;
+      }
+
+      case "memory_reinforce": {
+        // Boost a memory that proved useful
+        if (!db) break;
+        reinforceMemory(db, data.nodeId);
         break;
       }
 

@@ -2259,6 +2259,14 @@ app.whenReady().then(async () => {
     if (projectRoot) {
       brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
     }
+    // Memory lifecycle: decay unused memories, consolidate patterns, graduate principles.
+    // Fire-and-forget — runs in the brain worker, doesn't block the context search.
+    // enableConsolidation: true only 10% of the time (LLM calls are expensive).
+    brainRequest("memory_lifecycle", {
+      projectId,
+      enableConsolidation: Math.random() < 0.1,
+    }).catch(() => {});
+
     return brainRequest("contextual_search", {
       projectId,
       query,

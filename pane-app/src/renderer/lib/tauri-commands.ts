@@ -206,6 +206,7 @@ export interface UserSettings {
   http_provider?: string;
   http_api_keys?: Record<string, string>;
   http_base_urls?: Record<string, string>;
+  disabled_providers?: string[];
   intent_routing?: BackendRouting;
   intent_auto_route?: boolean;
 }
@@ -389,6 +390,20 @@ export async function sendToPunk(
 
 export async function abortPunk(projectId: string): Promise<void> {
   return electronAPI.invoke("abort_punk", { projectId });
+}
+
+export interface RoutePreview {
+  model: string;
+  provider: string;
+  tier: string;
+  mode: string;
+  taskType: string;
+  confidence: number;
+  reason: string;
+}
+
+export async function previewRoute(message: string, projectId: string): Promise<RoutePreview | null> {
+  return electronAPI.invoke("preview_route", { message, projectId });
 }
 
 export async function terminatePunkSession(projectId: string): Promise<void> {

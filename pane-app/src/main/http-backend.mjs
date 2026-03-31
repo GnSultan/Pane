@@ -12,9 +12,179 @@ const { AbortController, fetch, TextDecoder, console } = globalThis;
 import { PunkBackend } from "./punk-backend.mjs";
 import { ToolExecutor } from "./tool-executor.mjs";
 import { compileContext, mergeState, readState, getContextLimit, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, writeHandoffWithHistory, updateLatestHandoff, readHandoff } from "./session-context.mjs";
+import { orchestrateContext } from "./context-orchestrator.mjs";
+import { estimateConversationTokens } from "./token-budget.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
 import contextManager from "./context-manager.mjs";
 import { calculateCost } from "./pricing.mjs";
+
+// ============================================================================
+// Context Window Manager — Pane-owned conversation lifecycle
+// ============================================================================
+//
+// Pane maintains a 128k context window as a living document:
+//   - System prompt: ~4k, always current (managed by compileContext/orchestrator)
+//   - Conversation: up to ~108k, actively pruned
+//   - Output reserve: ~8k
+//
+// Instead of emergency compaction when full, the window is continuously
+// managed: old tool results are pruned, oldest turns summarized, stale
+// content dropped. The model always has room to work.
+
+const CONTEXT_WINDOW_CAP = 128000;  // Universal cap — works for any model
+const OUTPUT_RESERVE     = 8192;
+const PRUNE_TOOL_AGE     = 6;       // Prune tool results older than N messages back
+
+/**
+ * Prune old tool results in conversation history to compact outcome summaries.
+ * A file read from 8 turns ago doesn't need 3,000 tokens of content —
+ * just "Read punk-engine.mjs (1,847 lines)".
+ *
+ * @param {Array} messages - the messages array (mutated in place)
+ * @param {number} recentCount - number of recent messages to leave untouched
+ * @returns {{ pruned: number, tokensSaved: number }}
+ */
+function pruneOldToolResults(messages, recentCount = PRUNE_TOOL_AGE) {
+  if (messages.length <= recentCount + 1) return { pruned: 0, tokensSaved: 0 };
+
+  let pruned = 0;
+  let charsSaved = 0;
+  const cutoff = messages.length - recentCount;
+
+  for (let i = 1; i < cutoff; i++) {  // skip index 0 (system message)
+    const msg = messages[i];
+
+    // Prune tool result content (role: "tool" in Pane history)
+    if (msg.role === "tool" || msg.role === "user") {
+      const content = msg.content;
+
+      if (typeof content === "string" && content.length > 500) {
+        // Simple string tool result — summarize
+        const summary = _summarizeToolOutput(content);
+        charsSaved += content.length - summary.length;
+        msg.content = summary;
+        pruned++;
+      } else if (Array.isArray(content)) {
+        // Content blocks — prune tool_result blocks
+        for (let j = 0; j < content.length; j++) {
+          const block = content[j];
+          if (block.type === "tool_result" && typeof block.content === "string" && block.content.length > 500) {
+            const summary = _summarizeToolOutput(block.content);
+            charsSaved += block.content.length - summary.length;
+            content[j] = { ...block, content: summary };
+            pruned++;
+          }
+        }
+      }
+    }
+
+    // Prune assistant messages with large tool_use input blocks
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      for (let j = 0; j < msg.content.length; j++) {
+        const block = msg.content[j];
+        if (block.type === "tool_use" && block.input) {
+          const inputStr = typeof block.input === "string" ? block.input : JSON.stringify(block.input);
+          if (inputStr.length > 1000) {
+            // Keep tool name and a summary, drop the full input
+            const name = block.name || "tool";
+            const truncated = inputStr.slice(0, 100) + "...";
+            charsSaved += inputStr.length - truncated.length;
+            msg.content[j] = { ...block, input: { _pruned: true, summary: `${name}: ${truncated}` } };
+            pruned++;
+          }
+        }
+      }
+    }
+  }
+
+  const tokensSaved = Math.round(charsSaved / 4);
+  return { pruned, tokensSaved };
+}
+
+/**
+ * Summarize a tool output to a compact one-liner.
+ * Extracts key information: file paths, line counts, error status.
+ */
+function _summarizeToolOutput(output) {
+  const lines = output.split("\n");
+  const lineCount = lines.length;
+
+  // File content (common pattern: starts with line numbers or code)
+  if (lineCount > 10) {
+    const firstLine = lines[0].trim();
+    const lastLine = lines[lineCount - 1].trim();
+    return `[${lineCount} lines] ${firstLine.slice(0, 120)}... → ...${lastLine.slice(0, 80)}`;
+  }
+
+  // Short output — keep as-is if under threshold
+  if (output.length <= 500) return output;
+
+  // Long single block — truncate with marker
+  return output.slice(0, 300) + `\n...[${lineCount} lines, ${output.length} chars truncated]`;
+}
+
+/**
+ * Manage the context window: prune tool results, check size, summarize if needed.
+ * Called after building the messages array, before sending to the API.
+ *
+ * @param {Array} messages - the full messages array
+ * @param {number} systemTokens - estimated tokens in the system prompt
+ * @returns {{ action: string, tokensBefore: number, tokensAfter: number }}
+ */
+function manageContextWindow(messages, systemTokens = 0) {
+  const estimateTokens = (msgs) => {
+    let chars = 0;
+    for (const m of msgs) {
+      if (typeof m.content === "string") chars += m.content.length;
+      else if (Array.isArray(m.content)) {
+        for (const b of m.content) {
+          if (typeof b === "string") chars += b.length;
+          else if (b.text) chars += b.text.length;
+          else if (b.content) chars += (typeof b.content === "string" ? b.content.length : JSON.stringify(b.content).length);
+          else if (b.input) chars += JSON.stringify(b.input).length;
+        }
+      }
+    }
+    return Math.round(chars / 4);
+  };
+
+  const budget = CONTEXT_WINDOW_CAP - OUTPUT_RESERVE - systemTokens;
+  const tokensBefore = estimateTokens(messages);
+
+  // Phase 1: ALWAYS prune old tool results — this is a cost optimization,
+  // not just overflow prevention. A 3,000-token file read from 6 turns ago
+  // is waste regardless of window pressure.
+  const pruneResult = pruneOldToolResults(messages);
+  let tokensAfter = estimateTokens(messages);
+
+  if (pruneResult.pruned > 0) {
+    console.log(`[http] Window: pruned ${pruneResult.pruned} tool results, saved ~${pruneResult.tokensSaved} tokens`);
+  }
+
+  if (tokensAfter <= budget * 0.9) {
+    return {
+      action: pruneResult.pruned > 0 ? "pruned" : "none",
+      tokensBefore,
+      tokensAfter,
+    };
+  }
+
+  // Phase 2: Drop oldest conversation turns (keep system + last N)
+  // Keep at least 8 recent messages (4 turns) for coherence
+  const MIN_RECENT = 8;
+  while (messages.length > MIN_RECENT + 1 && tokensAfter > budget * 0.85) {
+    // Remove the message right after system (index 1)
+    messages.splice(1, 1);
+    tokensAfter = estimateTokens(messages);
+  }
+
+  console.log(
+    `[http] Window managed: ${tokensBefore} → ${tokensAfter} tokens ` +
+    `(pruned ${pruneResult.pruned} tools, ${messages.length} messages remaining)`
+  );
+
+  return { action: "trimmed", tokensBefore, tokensAfter };
+}
 
 // ============================================================================
 // HTTP Backend (Kimi/DeepSeek/Anthropic/etc.)
@@ -245,7 +415,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_open_files",
       description:
-        "Get the file currently open in Pane's editor, including its full content and recent file history.",
+        "Get the file currently open in Pane's editor, including its full content and recent file history. Working set pre-reads show partial content — use this for the complete file when you need more than what's pre-loaded.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -263,7 +433,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_run_in_terminal",
       description:
-        "Run a shell command and return its output. Use this for builds, tests, git operations, installing packages, or any shell task. Commands run in the project directory with the user's full shell environment including nvm, homebrew, and local tools.",
+        "Run a shell command and return its output. Use this for builds, tests, git operations, installing packages, or any shell task. Commands run in the project directory with the user's full shell environment. Never speculate whether a build or test passes — run it and verify.",
       parameters: {
         type: "object",
         properties: {
@@ -279,7 +449,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_recall",
       description:
-        "Search project memory for past decisions, lessons, patterns, errors, and file edits from previous sessions.",
+        "Search project memory for past decisions, lessons, patterns, errors, and file edits from previous sessions. Check this before investigating a bug or making an architectural decision — the answer may already exist from a prior session.",
       parameters: {
         type: "object",
         properties: {
@@ -297,7 +467,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_remember",
       description:
-        "Save something to project memory for future sessions — a decision, lesson, pattern, or important observation.",
+        "Save something to project memory for future sessions — a decision, lesson, pattern, or important observation. Mandatory: call this whenever you discover a root cause, make an architectural decision, or find a non-obvious pattern. Not recording forces the next session to re-discover.",
       parameters: {
         type: "object",
         properties: {
@@ -404,7 +574,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_knowledge_graph",
       description:
-        "View the project's knowledge graph — nodes (decisions, patterns, lessons, errors) and their connections, including cross-project pattern links.",
+        "View the project's knowledge graph — nodes (decisions, patterns, lessons, errors) and their connections. Use this to understand blast radius before refactoring: what connects to what you're changing.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -413,7 +583,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_cross_project",
       description:
-        "Find patterns, decisions, and lessons from OTHER projects that are relevant to the current work.",
+        "Find patterns, decisions, and lessons from OTHER projects that are relevant to the current work. Use proven patterns from existing projects rather than inventing new approaches.",
       parameters: {
         type: "object",
         properties: {
@@ -504,7 +674,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_set_rule",
       description:
-        "Add an explicit rule to the user's profile. Rules override observed preferences.",
+        "Add an explicit rule to the user's profile. Rules override observed preferences. Call immediately when the user states a firm preference — do not wait until session end.",
       parameters: {
         type: "object",
         properties: {
@@ -695,6 +865,25 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ["question"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_read_files",
+      description:
+        "Read multiple files at once and return all their contents in a single response. Use this instead of sequential Read calls when you know you need several files — each sequential read resends the entire conversation, so batching 3 reads into 1 call saves significant overhead. Accepts an array of file paths.",
+      parameters: {
+        type: "object",
+        properties: {
+          paths: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of file paths to read (relative to project root or absolute)",
+          },
+        },
+        required: ["paths"],
       },
     },
   },
@@ -921,6 +1110,39 @@ function _byRelevance(a, b) {
   return (b.context_length ?? 0) - (a.context_length ?? 0);
 }
 
+// ─── DeepSeek model helpers ──────────────────────────────────────────────────
+
+function _deepSeekDisplayName(id) {
+  // Format model IDs: deepseek-xxx-yyy → DeepSeek Xxx Yyy
+  // No manual mapping — always reflect what the API serves
+  return id.replace(/^deepseek-/, "DeepSeek ").replace(/-/g, " ")
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function _deepSeekContextLength(id) {
+  if (id.includes("reasoner") || id.includes("r1")) return 128000;
+  return 128000; // DeepSeek default
+}
+
+// ─── Anthropic model helpers ─────────────────────────────────────────────────
+
+function _anthropicDisplayName(id) {
+  // claude-opus-4-6 → Claude Opus 4.6
+  return id
+    .replace(/^claude-/, "Claude ")
+    .replace(/-(\d+)-(\d+)/, " $1.$2")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function _anthropicContextLength(id) {
+  // Opus 4.6 and Sonnet 4.6 support 1M with beta flag
+  if (id.includes("opus-4-6") || id.includes("sonnet-4-6")) return 1000000;
+  if (id.includes("opus-4-5") || id.includes("sonnet-4-5")) return 200000;
+  if (id.includes("haiku")) return 200000;
+  return 200000;
+}
+
 // ─── Model Streaming Personality Registry ────────────────────────────────────
 // Maps model-ID prefixes (more specific first) to their known streaming
 // behavior. Used by handleStreamEvent when provider="openrouter" to know
@@ -1005,7 +1227,10 @@ export class ApiBackend extends PunkBackend {
       );
       const settings = JSON.parse(content);
 
-      const provider = providerOverride || settings.http_provider || "deepseek";
+      // Normalize "-api" suffixed providers to base name for key lookup and API calls.
+      // "anthropic-api" → "anthropic", "gemini-api" → "gemini"
+      const rawProvider = providerOverride || settings.http_provider || "deepseek";
+      const provider = rawProvider.replace(/-api$/, "");
 
       let apiKey = settings.http_api_keys?.[provider] || "";
 
@@ -1068,6 +1293,9 @@ export class ApiBackend extends PunkBackend {
       const { role, content } = msg;
 
       if (role === "system") {
+        // Preserve _tiers metadata through normalization — prepareRequest()
+        // needs it for Anthropic cache breakpoints. It's stripped there before
+        // the request body is serialized.
         normalized.push(msg);
         continue;
       }
@@ -1275,16 +1503,53 @@ export class ApiBackend extends PunkBackend {
         console.warn("[http] Failed to fetch SQLite changes for context:", err.message);
       }
 
-      const context = compileContext(
-        request.projectId,
-        request.intent,
-        historyLength,
-        "http",
-        sqliteChanges
-      );
-      let systemPrompt = request.systemPromptOverride
-        || (request._systemPrepend ? request._systemPrepend + "\n\n" + context.full : context.full);
-      if (request.escalationHint) systemPrompt += `\n\n${request.escalationHint}`;
+      // Budget-aware context assembly via orchestrator (falls back to legacy)
+      let context;
+      try {
+        const conversationTokens = estimateConversationTokens(request.history || []);
+        context = orchestrateContext(request.projectId, {
+          intent: request.intent,
+          historyLength,
+          backend: "http",
+          model: request.model,
+          sqliteChanges,
+          conversationTokens,
+        });
+        if (context.budget?.layersDropped > 0) {
+          console.log(`[http] Context budget: ${context.budget.systemUsed}/${context.budget.systemBudget} tokens (dropped: ${context.budget.droppedNames.join(", ")})`);
+        }
+      } catch (err) {
+        console.warn(`[http] Orchestrator failed, falling back: ${err.message}`);
+        context = compileContext(request.projectId, request.intent, historyLength, "http", sqliteChanges);
+      }
+
+      // ── Build system prompt with tier metadata for cache-aware providers ──
+      // The context object has three tiers: frozen (never changes), session
+      // (changes when scope changes), turn (changes every turn). Providers
+      // that support caching (Anthropic, Gemini) get structured content blocks
+      // with cache breakpoints. Others get a flat string — prefix stability
+      // still helps automatic cachers (DeepSeek, Kimi, Qwen).
+      let systemPrompt;
+      let systemTiers = null; // { frozen, session, turn } — set when tiers available
+
+      if (request.systemPromptOverride) {
+        systemPrompt = request.systemPromptOverride;
+      } else {
+        const prepend = request._systemPrepend ? request._systemPrepend + "\n\n" : "";
+        systemPrompt = prepend + context.full;
+        // Expose tiers if the context produced them (orchestrator and compileContext both do)
+        if (context.frozen !== undefined) {
+          systemTiers = {
+            frozen:  prepend + context.frozen,
+            session: context.session || "",
+            turn:    context.turn || "",
+          };
+        }
+      }
+      if (request.escalationHint) {
+        systemPrompt += `\n\n${request.escalationHint}`;
+        if (systemTiers) systemTiers.turn += `\n\n${request.escalationHint}`;
+      }
 
       // Emit synthetic init event after config is validated
       this.onEvent(
@@ -1304,7 +1569,8 @@ export class ApiBackend extends PunkBackend {
         request.requestId,
       );
 
-      const messages = [{ role: "system", content: systemPrompt }];
+      // Attach tier metadata to the system message for prepareRequest() to consume
+      const messages = [{ role: "system", content: systemPrompt, _tiers: systemTiers }];
 
       if (request.history) {
         for (const msg of request.history) {
@@ -1326,47 +1592,24 @@ export class ApiBackend extends PunkBackend {
         `[http] Loaded ${messages.length} messages from history (roles: ${messages.map((m) => m.role).join(", ")})`,
       );
 
-      // Auto-compact conversation if context pressure is high
-      const compactionCheck = contextManager.shouldAutoCompact(messages, request.model);
-      if (compactionCheck.shouldCompact) {
-        console.log(
-          `[http] Auto-compacting conversation: ${compactionCheck.reason}, strategy: ${compactionCheck.strategy}`
-        );
-        
-        // Notify frontend that compaction is starting
+      // ── Context window management ────────────────────────────────────────
+      // Pane owns the context window. Instead of emergency compaction when
+      // full, the window is continuously managed:
+      //   Phase 1: Prune old tool results (3k file reads → 30-token summaries)
+      //   Phase 2: Drop oldest turns if still over budget
+      // This replaces the old contextManager.shouldAutoCompact approach.
+      const systemTokens = context.budget?.systemUsed || Math.round((systemPrompt?.length || 0) / 4);
+      const windowResult = manageContextWindow(messages, systemTokens);
+      if (windowResult.action !== "none") {
         this.onEvent(request.projectId, {
-          event: "compaction_start",
+          event: "window_managed",
           data: {
-            reason: compactionCheck.reason,
-            strategy: compactionCheck.strategy,
+            action: windowResult.action,
+            tokensBefore: windowResult.tokensBefore,
+            tokensAfter: windowResult.tokensAfter,
+            messagesRemaining: messages.length,
           },
-        });
-        
-        const compactedMessages = await contextManager.compactConversation(
-          messages,
-          request.model,
-          compactionCheck.strategy
-        );
-        
-        const stats = contextManager.getStats();
-        console.log(
-          `[http] Compaction result: ${messages.length} → ${compactedMessages.length} messages ` +
-          `(saved ~${stats.tokensSaved} tokens, total compactions: ${stats.totalCompactions})`
-        );
-        
-        // Send compaction completion event
-        this.onEvent(request.projectId, {
-          event: "compaction_complete",
-          data: {
-            originalCount: messages.length,
-            compactedCount: compactedMessages.length,
-            tokensSaved: stats.tokensSaved,
-            totalCompactions: stats.totalCompactions,
-          },
-        });
-        
-        // Replace messages with compacted version
-        messages.splice(0, messages.length, ...compactedMessages);
+        }, request.requestId);
       }
 
       messages.push({
@@ -1988,16 +2231,36 @@ export class ApiBackend extends PunkBackend {
         }
 
         // Re-compile context to get updated system prompt for the next turn
-        const context = compileContext(
-          request.projectId,
-          request.intent,
-          messages.length, // use current length (now includes assistant response + tool results)
-          "http",
-          loopSqliteChanges
-        );
-        if (messages.length > 0 && messages[0].role === "system") {
-          messages[0].content = context.full;
+        let loopContext;
+        try {
+          const loopConvTokens = estimateConversationTokens(messages);
+          loopContext = orchestrateContext(request.projectId, {
+            intent: request.intent,
+            historyLength: messages.length,
+            backend: "http",
+            model: request.model,
+            sqliteChanges: loopSqliteChanges,
+            conversationTokens: loopConvTokens,
+          });
+        } catch {
+          loopContext = compileContext(request.projectId, request.intent, messages.length, "http", loopSqliteChanges);
         }
+        if (messages.length > 0 && messages[0].role === "system") {
+          messages[0].content = loopContext.full;
+          // Refresh tier metadata for cache-aware providers
+          if (loopContext.frozen !== undefined) {
+            const prepend = request._systemPrepend ? request._systemPrepend + "\n\n" : "";
+            messages[0]._tiers = {
+              frozen:  prepend + loopContext.frozen,
+              session: loopContext.session || "",
+              turn:    loopContext.turn || "",
+            };
+          }
+        }
+
+        // Continuous window management on each tool-use turn
+        const loopSystemTokens = loopContext.budget?.systemUsed || Math.round((messages[0]?.content?.length || 0) / 4);
+        manageContextWindow(messages, loopSystemTokens);
       }
 
       // Turn completed cleanly — mark all in_progress todos as done
@@ -2129,6 +2392,19 @@ export class ApiBackend extends PunkBackend {
     let finalBody = body;
     const userTag = `pane-project-${request?.projectId?.slice(0, 8) || "unknown"}`;
 
+    // Extract and strip _tiers metadata from system messages before serialization.
+    // _tiers is an internal property used for Anthropic cache breakpoints.
+    let systemTiers = null;
+    if (body.messages) {
+      for (const msg of body.messages) {
+        if (msg.role === "system" && msg._tiers) {
+          systemTiers = msg._tiers;
+          delete msg._tiers;
+          break;
+        }
+      }
+    }
+
     switch (apiConfig.provider) {
       case "openrouter":
         url =
@@ -2188,9 +2464,10 @@ export class ApiBackend extends PunkBackend {
           "Content-Type": "application/json",
           "x-api-key": apiConfig.apiKey,
           "anthropic-version": "2023-06-01",
+          "anthropic-beta": "prompt-caching-2024-07-31",
         };
         const sysMsg = body.messages.find((m) => m.role === "system");
-        const anthropicBody = { 
+        const anthropicBody = {
           ...body,
           metadata: { user_id: userTag }
         };
@@ -2198,8 +2475,66 @@ export class ApiBackend extends PunkBackend {
           (m) => m.role !== "system",
         );
         if (sysMsg) {
-          anthropicBody.system = sysMsg.content;
+          // ── Cache-aware system prompt for Anthropic ──
+          // When tier metadata is available, structure the system prompt as
+          // content blocks with cache_control breakpoints:
+          //   Block 1: frozen context → cache_control: ephemeral (biggest win)
+          //   Block 2: session context (extends cache when unchanged)
+          //   Block 3: turn context (never cached)
+          // This gives ~90% savings on the frozen prefix (~13-17k tokens).
+          if (systemTiers && systemTiers.frozen) {
+            const tiers = systemTiers;
+            const blocks = [];
+            // Frozen tier — always cached (biggest, most stable)
+            if (tiers.frozen) {
+              blocks.push({
+                type: "text",
+                text: tiers.frozen,
+                cache_control: { type: "ephemeral" },
+              });
+            }
+            // Session tier — cached when scope hasn't changed
+            if (tiers.session) {
+              blocks.push({
+                type: "text",
+                text: tiers.session,
+                cache_control: { type: "ephemeral" },
+              });
+            }
+            // Turn tier — never cached, changes every turn
+            if (tiers.turn) {
+              blocks.push({ type: "text", text: tiers.turn });
+            }
+            anthropicBody.system = blocks;
+            console.log(
+              `[http] Anthropic cache: frozen=${tiers.frozen.length}c session=${tiers.session.length}c turn=${tiers.turn.length}c`
+            );
+          } else {
+            // Fallback: single string, no explicit caching
+            anthropicBody.system = sysMsg.content;
+          }
         }
+
+        // Add cache breakpoint to conversation prefix (older turns)
+        // Breakpoint 3: cache all but the last 2 user/assistant pairs
+        if (anthropicBody.messages.length > 4) {
+          const cutoff = anthropicBody.messages.length - 4;
+          const target = anthropicBody.messages[cutoff - 1];
+          if (target && typeof target.content === "string") {
+            anthropicBody.messages[cutoff - 1] = {
+              ...target,
+              content: [{ type: "text", text: target.content, cache_control: { type: "ephemeral" } }],
+            };
+          } else if (target && Array.isArray(target.content) && target.content.length > 0) {
+            const lastBlock = { ...target.content[target.content.length - 1] };
+            lastBlock.cache_control = { type: "ephemeral" };
+            anthropicBody.messages[cutoff - 1] = {
+              ...target,
+              content: [...target.content.slice(0, -1), lastBlock],
+            };
+          }
+        }
+
         finalBody = anthropicBody;
         break;
       }
@@ -2814,6 +3149,128 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
+  /**
+   * Fetch available DeepSeek models via their OpenAI-compatible /models endpoint.
+   */
+  async getDeepSeekModels() {
+    const apiConfig = await this.getApiConfig("deepseek");
+    if (!apiConfig.apiKey) return [];
+
+    try {
+      const url = apiConfig.baseUrl
+        ? apiConfig.baseUrl.replace(/\/chat\/completions\/?$/, "/models")
+        : "https://api.deepseek.com/v1/models";
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!response.ok) return [];
+
+      const json = await response.json();
+      if (!json.data) return [];
+
+      return json.data
+        .filter((m) => m.id && !m.id.includes("embed") && !m.id.includes("whisper"))
+        .map((m) => ({
+          id: m.id,
+          name: _deepSeekDisplayName(m.id),
+          context_length: m.context_length || _deepSeekContextLength(m.id),
+          provider: "DeepSeek",
+          tier: m.id.includes("reasoner") || m.id.includes("r1") ? 1 : 2,
+          input_cost: null,
+          output_cost: null,
+        }))
+        .sort(_byRelevance);
+    } catch (err) {
+      console.error("[http] Failed to fetch DeepSeek models:", err);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch available Anthropic models via their /v1/models endpoint.
+   */
+  async getAnthropicModels() {
+    const apiConfig = await this.getApiConfig("anthropic");
+    if (!apiConfig.apiKey) return [];
+
+    try {
+      const url = apiConfig.baseUrl
+        ? apiConfig.baseUrl.replace(/\/messages\/?$/, "/models")
+        : "https://api.anthropic.com/v1/models";
+      const response = await fetch(url, {
+        headers: {
+          "x-api-key": apiConfig.apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!response.ok) return [];
+
+      const json = await response.json();
+      const models = json.data || [];
+
+      return models
+        .filter((m) => m.id && m.type === "model")
+        .map((m) => ({
+          id: m.id,
+          name: m.display_name || _anthropicDisplayName(m.id),
+          context_length: _anthropicContextLength(m.id),
+          provider: "Anthropic",
+          tier: m.id.includes("opus") ? 1 : m.id.includes("sonnet") ? 2 : 3,
+          input_cost: null,
+          output_cost: null,
+        }))
+        .sort(_byRelevance);
+    } catch (err) {
+      console.error("[http] Failed to fetch Anthropic models:", err);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch available Gemini models via the generativelanguage API.
+   */
+  async getGeminiModels() {
+    const apiConfig = await this.getApiConfig("gemini");
+    if (!apiConfig.apiKey) return [];
+
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiConfig.apiKey}`;
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!response.ok) return [];
+
+      const json = await response.json();
+      const models = json.models || [];
+
+      return models
+        .filter((m) => {
+          const methods = m.supportedGenerationMethods || [];
+          if (!methods.includes("generateContent")) return false;
+          if ((m.inputTokenLimit || 0) < 16384) return false;
+          return true;
+        })
+        .map((m) => {
+          const id = (m.name || "").replace(/^models\//, "");
+          return {
+            id,
+            name: m.displayName || id,
+            context_length: m.inputTokenLimit || 128000,
+            provider: "Google",
+            tier: id.includes("pro") ? 1 : id.includes("flash") ? 2 : 3,
+            input_cost: null,
+            output_cost: null,
+          };
+        })
+        .sort(_byRelevance);
+    } catch (err) {
+      console.error("[http] Failed to fetch Gemini models:", err);
+      return [];
+    }
+  }
+
 // ==========================================================================
 // Task Runner Support — Planning Call & Step Execution (class methods)
 // ==========================================================================
@@ -2862,10 +3319,12 @@ export class ApiBackend extends PunkBackend {
         if (!response.ok) {
           const status = response.status;
           
-          // Client errors (4xx except 429) are not retryable
+          // Client errors (4xx except 429) are not retryable — propagate immediately
           if (status >= 400 && status < 500 && status !== 429) {
             const errorText = await response.text().catch(() => response.statusText);
-            throw new Error(`Planning call failed: HTTP ${status}: ${errorText}`);
+            const fatal = new Error(`Planning call failed: HTTP ${status}: ${errorText}`);
+            fatal._noRetry = true;
+            throw fatal;
           }
 
           // Rate limit or server error: retry with backoff
@@ -2991,18 +3450,18 @@ export class ApiBackend extends PunkBackend {
         return fullText;
 
       } catch (err) {
-        if (err.name === "AbortError") throw err;
-        
+        if (err.name === "AbortError" || err._noRetry) throw err;
+
         if (attempt < MAX_RETRIES) {
           const jitter = Math.random() * 500;
           const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
-          
+
           console.warn(`[http] Planning call network error: ${err.message}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
           await new Promise((resolve) => setTimeout(resolve, delay));
           attempt++;
           continue;
         }
-        
+
         throw new Error(`Planning call failed after ${MAX_RETRIES} attempts: ${err.message}`);
       }
     }
@@ -3056,10 +3515,12 @@ export class ApiBackend extends PunkBackend {
         if (!response.ok) {
           const status = response.status;
           
-          // Client errors (4xx except 429) are not retryable
+          // Client errors (4xx except 429) are not retryable — propagate immediately
           if (status >= 400 && status < 500 && status !== 429) {
             const errorText = await response.text().catch(() => response.statusText);
-            throw new Error(`Conversation call failed: HTTP ${status}: ${errorText}`);
+            const fatal = new Error(`Conversation call failed: HTTP ${status}: ${errorText}`);
+            fatal._noRetry = true;
+            throw fatal;
           }
 
           // Rate limit or server error: retry with backoff
@@ -3093,18 +3554,18 @@ export class ApiBackend extends PunkBackend {
         return json.choices?.[0]?.message?.content || "";
 
       } catch (err) {
-        if (err.name === "AbortError") throw err;
-        
+        if (err.name === "AbortError" || err._noRetry) throw err;
+
         if (attempt < MAX_RETRIES) {
           const jitter = Math.random() * 500;
           const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
-          
+
           console.warn(`[http] Conversation call network error: ${err.message}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
           await new Promise((resolve) => setTimeout(resolve, delay));
           attempt++;
           continue;
         }
-        
+
         throw new Error(`Conversation call failed after ${MAX_RETRIES} attempts: ${err.message}`);
       }
     }

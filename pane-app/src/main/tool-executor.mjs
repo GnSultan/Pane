@@ -145,6 +145,247 @@ function validateCommand(command, projectRoot) {
 }
 
 // ============================================================================
+// File Read Cache — eliminates redundant disk reads across turns and sessions.
+//
+// The model reads the same files repeatedly: once to understand, again to edit,
+// again to verify. Each read returns the same content if the file hasn't changed.
+// At ~3,000 tokens per file read × 15 reads/session × 50 sessions/day, redundant
+// reads cost ~2.25M tokens/day. This cache eliminates them.
+//
+// Cache key: resolved absolute path
+// Validation: mtime — if the file's mtime changed, the cache entry is stale.
+// Eviction: LRU with max 200 entries, auto-clear entries older than 30 minutes.
+// ============================================================================
+
+const FILE_CACHE_MAX_ENTRIES = 200;
+const FILE_CACHE_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+
+class FileReadCache {
+  constructor() {
+    this._cache = new Map(); // resolvedPath → { content, mtime, cachedAt, hits }
+    this._stats = { hits: 0, misses: 0, evictions: 0, bytesServed: 0 };
+  }
+
+  /**
+   * Get cached file content if valid (same mtime, not expired).
+   * @param {string} resolvedPath - absolute file path
+   * @param {number} currentMtimeMs - file's current mtime in ms
+   * @returns {string|null} cached content or null
+   */
+  get(resolvedPath, currentMtimeMs) {
+    const entry = this._cache.get(resolvedPath);
+    if (!entry) {
+      this._stats.misses++;
+      return null;
+    }
+
+    // Stale: file changed on disk
+    if (entry.mtime !== currentMtimeMs) {
+      this._cache.delete(resolvedPath);
+      this._stats.misses++;
+      return null;
+    }
+
+    // Expired: too old
+    if (Date.now() - entry.cachedAt > FILE_CACHE_MAX_AGE_MS) {
+      this._cache.delete(resolvedPath);
+      this._stats.evictions++;
+      this._stats.misses++;
+      return null;
+    }
+
+    entry.hits++;
+    this._stats.hits++;
+    this._stats.bytesServed += entry.content.length;
+    return entry.content;
+  }
+
+  /**
+   * Store file content in cache.
+   * @param {string} resolvedPath - absolute file path
+   * @param {string} content - file content
+   * @param {number} mtimeMs - file's mtime in ms
+   */
+  set(resolvedPath, content, mtimeMs) {
+    // LRU eviction: if at capacity, remove oldest entry
+    if (this._cache.size >= FILE_CACHE_MAX_ENTRIES) {
+      let oldestKey = null;
+      let oldestTime = Infinity;
+      for (const [key, entry] of this._cache) {
+        if (entry.cachedAt < oldestTime) {
+          oldestTime = entry.cachedAt;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey) {
+        this._cache.delete(oldestKey);
+        this._stats.evictions++;
+      }
+    }
+
+    this._cache.set(resolvedPath, {
+      content,
+      mtime: mtimeMs,
+      cachedAt: Date.now(),
+      hits: 0,
+    });
+  }
+
+  /**
+   * Invalidate a specific path (e.g., after a write/edit).
+   */
+  invalidate(resolvedPath) {
+    this._cache.delete(resolvedPath);
+  }
+
+  /**
+   * Invalidate all entries for a project root.
+   */
+  invalidateProject(projectRoot) {
+    for (const key of this._cache.keys()) {
+      if (key.startsWith(projectRoot)) this._cache.delete(key);
+    }
+  }
+
+  /**
+   * Get cache statistics for diagnostics.
+   */
+  getStats() {
+    const hitRate = this._stats.hits + this._stats.misses > 0
+      ? Math.round((this._stats.hits / (this._stats.hits + this._stats.misses)) * 100)
+      : 0;
+    return {
+      ...this._stats,
+      hitRate,
+      entries: this._cache.size,
+      tokensSaved: Math.round(this._stats.bytesServed / 4), // ~4 chars/token
+    };
+  }
+}
+
+// Singleton — shared across all ToolExecutor instances in this process.
+// Exported for diagnostics and external invalidation (e.g., file watcher).
+const fileReadCache = new FileReadCache();
+export { fileReadCache };
+
+// ============================================================================
+// Contextual Memory Triggering — memories that activate when files are touched
+// ============================================================================
+// When a file is read, check if any memories reference it.
+// This is the "behavioral wiring" path — memories fire at the moment they're
+// relevant, not through semantic search or manual recall.
+
+const MEMORY_CACHE_TTL = 5 * 60 * 1000; // 5 min cache for file→memory index
+let _memoryIndex = null;       // Map<normalizedPath, string[]> — path → memory texts
+let _memoryIndexBuiltAt = 0;
+let _memoryIndexProjectId = null;
+
+function getMemoriesForFile(filePath, projectId) {
+  // Rebuild index if stale or wrong project
+  if (!_memoryIndex || Date.now() - _memoryIndexBuiltAt > MEMORY_CACHE_TTL
+      || _memoryIndexProjectId !== projectId) {
+    _memoryIndex = new Map();
+    _memoryIndexProjectId = projectId;
+    _memoryIndexBuiltAt = Date.now();
+
+    try {
+      const eventsPath = path.join(os.homedir(), ".pane", "memory", projectId, "events.jsonl");
+      const raw = fs.readFileSync(eventsPath, "utf-8");
+      for (const line of raw.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          // Only index meaningful memory types
+          if (!["decision", "lesson", "pattern", "error_fix"].includes(event.type)) continue;
+          const content = event.content || "";
+          if (content.length < 10) continue;
+
+          // Extract file paths mentioned in the memory
+          const fileRefs = content.match(/[\w/.-]+\.(ts|tsx|js|mjs|jsx|css|json|md)/g) || [];
+          for (const ref of fileRefs) {
+            const normalized = ref.toLowerCase();
+            if (!_memoryIndex.has(normalized)) _memoryIndex.set(normalized, []);
+            const existing = _memoryIndex.get(normalized);
+            if (existing.length < 5) { // Max 5 memories per file
+              existing.push(`[${event.type}] ${content.slice(0, 200)}`);
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  // Look up by filename (not full path — memories often use relative paths)
+  const fileName = path.basename(filePath).toLowerCase();
+  const dirAndFile = filePath.split("/").slice(-2).join("/").toLowerCase();
+
+  const matches = [];
+  for (const [key, mems] of _memoryIndex) {
+    if (key.includes(fileName) || key.includes(dirAndFile)) {
+      matches.push(...mems);
+    }
+  }
+
+  return [...new Set(matches)].slice(0, 3); // Dedupe, max 3
+}
+
+// ============================================================================
+// Contextual Augmentation — auto-attach referenced files from error output
+// ============================================================================
+// When terminal output contains stack traces (file:line), auto-attach the
+// referenced code so the model doesn't need extra Read round-trips.
+
+const FILE_LINE_RE = /(?:at\s+(?:\S+\s+\()?)?((?:\/[^\s:()]+|src\/[^\s:()]+|[a-zA-Z][a-zA-Z0-9._/-]+\.[a-z]{1,4})):(\d+)/g;
+const MAX_AUGMENT = 3;
+const AUGMENT_LINES = 10;
+
+async function augmentWithReferencedFiles(output, projectRoot) {
+  if (!output || output.length < 20) return "";
+
+  const refs = new Map();
+  let m;
+  const re = new RegExp(FILE_LINE_RE.source, "g");
+  while ((m = re.exec(output)) !== null) {
+    const [, fp, ln] = m;
+    const line = parseInt(ln, 10);
+    if (isNaN(line) || line < 1) continue;
+    if (fp.includes("node_modules") || fp.startsWith("node:")) continue;
+    const resolved = path.isAbsolute(fp) ? fp : path.join(projectRoot, fp);
+    if (!refs.has(resolved)) refs.set(resolved, new Set());
+    refs.get(resolved).add(line);
+  }
+
+  if (refs.size === 0) return "";
+
+  const parts = [];
+  let count = 0;
+  for (const [resolved, lines] of refs) {
+    if (count >= MAX_AUGMENT) break;
+    try {
+      const content = await fsPromises.readFile(resolved, "utf-8");
+      const allLines = content.split("\n");
+      const rel = path.relative(projectRoot, resolved);
+
+      for (const lineNum of [...lines].sort((a, b) => a - b).slice(0, 2)) {
+        const start = Math.max(0, lineNum - 1 - AUGMENT_LINES);
+        const end = Math.min(allLines.length, lineNum + AUGMENT_LINES);
+        const snippet = allLines.slice(start, end)
+          .map((l, i) => {
+            const num = start + i + 1;
+            return `${num === lineNum ? "→" : " "}${String(num).padStart(4)} ${l}`;
+          }).join("\n");
+        parts.push(`\n--- auto-attached: ${rel}:${lineNum} ---\n${snippet}`);
+      }
+      count++;
+    } catch {}
+  }
+
+  return parts.length > 0
+    ? `\n\n[Pane auto-attached ${parts.length} referenced location${parts.length > 1 ? "s" : ""}]${parts.join("")}`
+    : "";
+}
+
+// ============================================================================
 // Tool Executor Class
 // ============================================================================
 
@@ -381,8 +622,31 @@ export class ToolExecutor {
         };
       }
 
-      // Read file
-      const content = await fsPromises.readFile(resolvedPath, DEFAULT_ENCODING);
+      // Check cache first — same file + same mtime = no disk read needed.
+      // Full-file reads (no line range) are the common case and cache perfectly.
+      const mtimeMs = stats.mtimeMs;
+      let content;
+      const isFullRead = startLine === null && endLine === null;
+
+      if (isFullRead) {
+        const cached = fileReadCache.get(resolvedPath, mtimeMs);
+        if (cached !== null) {
+          content = cached;
+        } else {
+          content = await fsPromises.readFile(resolvedPath, DEFAULT_ENCODING);
+          fileReadCache.set(resolvedPath, content, mtimeMs);
+        }
+      } else {
+        // Partial reads: check cache for full content, slice from it
+        const cached = fileReadCache.get(resolvedPath, mtimeMs);
+        if (cached !== null) {
+          content = cached;
+        } else {
+          content = await fsPromises.readFile(resolvedPath, DEFAULT_ENCODING);
+          fileReadCache.set(resolvedPath, content, mtimeMs);
+        }
+      }
+
       let output = content;
 
       // Apply line limits if provided
@@ -401,6 +665,13 @@ export class ToolExecutor {
           error: `Content too large (${Math.round(output.length / 1024 / 1024)}MB). Max size is 10MB.`,
           toolId,
         };
+      }
+
+      // Contextual memory triggering: if memories reference this file,
+      // append them so the model has relevant context without needing pane_recall.
+      const fileMemories = getMemoriesForFile(filePath, this.projectId);
+      if (fileMemories.length > 0) {
+        output += `\n\n[Pane memory for this file]\n${fileMemories.join("\n")}`;
       }
 
       return {
@@ -499,6 +770,9 @@ export class ToolExecutor {
       // Write file
       await fsPromises.writeFile(resolvedPath, content, DEFAULT_ENCODING);
 
+      // Invalidate cache — file content changed
+      fileReadCache.invalidate(resolvedPath);
+
       // Record the change in change history
       try {
         const relativePath = path.relative(this.projectRoot, resolvedPath);
@@ -592,6 +866,9 @@ export class ToolExecutor {
       // Replace
       const newContent = currentContent.replace(oldString, newString);
       await fsPromises.writeFile(resolvedPath, newContent, DEFAULT_ENCODING);
+
+      // Invalidate cache — file content changed
+      fileReadCache.invalidate(resolvedPath);
 
       // Record the change in change history
       try {
@@ -859,6 +1136,29 @@ export class ToolExecutor {
         case "read_file":
           return await this.executeReadFile(toolId, input.file_path || input.path, input.start_line || null, input.end_line || null);
 
+        case "pane_read_files": {
+          // Batch read: read multiple files in one tool call.
+          // Eliminates sequential round-trips where each resends full history.
+          const paths = input.paths || [];
+          if (paths.length === 0) return { success: false, error: "No paths provided", toolId };
+          if (paths.length > 15) return { success: false, error: "Maximum 15 files per batch read", toolId };
+
+          const results = [];
+          for (const p of paths) {
+            const result = await this.executeReadFile(toolId, p);
+            if (result.success) {
+              results.push(`### ${p}\n\`\`\`\n${result.output}\n\`\`\``);
+            } else {
+              results.push(`### ${p}\n[Error: ${result.error}]`);
+            }
+          }
+          return {
+            success: true,
+            output: `Read ${paths.length} files:\n\n${results.join("\n\n")}`,
+            toolId,
+          };
+        }
+
         case "list_directory":
           return await this.executeListDirectory(toolId, input.dir_path || input.path);
 
@@ -943,7 +1243,10 @@ export class ToolExecutor {
             return `${prefix}$ ${c.cmd}${runningMark}\n${output}`;
           }).join("\n\n");
 
-          return { success: true, output: out, toolId };
+          // Contextual augmentation: auto-attach referenced files from errors
+          const lastOutput = cmds[cmds.length - 1]?.output || "";
+          const augmentation = await augmentWithReferencedFiles(lastOutput, this.projectRoot);
+          return { success: true, output: out + augmentation, toolId };
         }
 
         case "pane_run_in_terminal": {
@@ -967,6 +1270,12 @@ export class ToolExecutor {
             await fsPromises.mkdir(stateDir, { recursive: true });
             await fsPromises.writeFile(termPath, JSON.stringify({ commands: commands.slice(-50) }));
           } catch {}
+
+          // Contextual augmentation: if command failed, auto-attach error-referenced files
+          if (!result.success && result.output) {
+            const aug = await augmentWithReferencedFiles(result.output || result.error || "", this.projectRoot);
+            if (aug) result.output = (result.output || result.error || "") + aug;
+          }
           return result;
         }
 
