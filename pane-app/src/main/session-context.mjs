@@ -593,6 +593,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   // different task in the conversation, and follows the system prompt.
   // This is the root cause of the "continue picks up wrong task" bug.
   if (historyLength < 2) {
+    // ALWAYS filter out completed todos to save tokens and avoid confusion.
     const activeTodos = (state.todos || []).filter(t => t.status !== "completed");
 
     if (state.activeTask && activeTodos.length > 0) {

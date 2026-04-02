@@ -228,6 +228,7 @@ export interface SendToPunkOptions {
   provider?: string;
   todos?: Todo[];
   autoRoute?: boolean;
+  minds?: Array<{ id: string }>;
   // Mind chat overrides — when projectId starts with "mind:", these control behavior
   systemPromptOverride?: string;
   _systemOverride?: boolean;
@@ -374,6 +375,7 @@ export async function sendToPunk(
       provider: opts.provider,
       todos: opts.todos,
       autoRoute: opts.autoRoute,
+      minds: opts.minds,
       // Mind chat overrides — forwarded when present
       ...(opts.systemPromptOverride ? { systemPromptOverride: opts.systemPromptOverride } : {}),
       ...(opts._systemOverride ? { _systemOverride: opts._systemOverride } : {}),
@@ -767,6 +769,13 @@ export async function appendTerminalCommand(
   entry: TerminalCommandEntry,
 ): Promise<void> {
   return electronAPI.invoke("append_terminal_command", { projectId, entry });
+}
+
+/** Reads the persisted terminal command history for a project (last 50 completed commands). */
+export async function getTerminalHistory(
+  projectId: string,
+): Promise<{ commands: Array<{ cmd: string; output: string; cwd: string; timestamp: number; tabId: string }> }> {
+  return electronAPI.invoke("get_terminal_history", { projectId });
 }
 
 /** Upserts a live "partial" snapshot for a long-running command (replaces previous partial for this tab). */
@@ -1392,4 +1401,9 @@ export async function cloudRestore(): Promise<{ backup_id: string; created_at: s
 
 export async function cloudListBackups(): Promise<{ backups: CloudBackupEntry[] }> {
   return electronAPI.invoke("cloud_list_backups");
+}
+
+// Theme-aware dock icon — switches between default/glass/dark variants
+export function setAppTheme(theme: string): void {
+  electronAPI.invoke("set_app_theme", { theme }).catch(() => {});
 }

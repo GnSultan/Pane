@@ -194,8 +194,25 @@ function renderHighlightedCode(code: string, language: string): React.JSX.Elemen
   const tokens = highlightSyntax(code, language);
   
   return tokens.map((token, index) => {
+    // String tokens that contain a file path: keep quotes in string color, highlight the path in pane-error
+    if (token.type === "string" && token.content.length >= 3) {
+      const first = token.content[0];
+      const last = token.content[token.content.length - 1];
+      if ((first === '"' || first === "'" || first === "`") && last === first) {
+        const inner = token.content.slice(1, -1);
+        if (SPECIAL_REGEX.test(inner)) {
+          return (
+            <span key={index}>
+              <span className="text-pane-syn-string">{first}</span>
+              <span className="text-pane-error">{inner}</span>
+              <span className="text-pane-syn-string">{last}</span>
+            </span>
+          );
+        }
+      }
+    }
+
     let className = "";
-    
     switch (token.type) {
       case "keyword":
         className = "text-pane-syn-keyword font-semibold";
@@ -221,7 +238,7 @@ function renderHighlightedCode(code: string, language: string): React.JSX.Elemen
       default:
         className = "text-pane-text/85";
     }
-    
+
     return (
       <span key={index} className={className}>
         {token.content}
@@ -561,7 +578,7 @@ function parseBlocks(text: string): Block[] {
 // conversations doesn't block the main thread. Code blocks appear as plain text
 // first, then get colored after mount. Uses requestIdleCallback so each block
 // is spread across idle frames rather than all firing in one effect flush.
-const LazyHighlightedCode = memo(function LazyHighlightedCode({
+export const LazyHighlightedCode = memo(function LazyHighlightedCode({
   code,
   lang,
 }: {
@@ -583,7 +600,7 @@ const LazyHighlightedCode = memo(function LazyHighlightedCode({
 // --- Block rendering ---
 
 const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|codebase_investigator|cli_help|generalist|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
-const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|${TOOL_NAMES})(?::)?)`, "g");
+const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|[\\w.@-]+\\.[a-zA-Z0-9]{2,10}|${TOOL_NAMES})(?::)?)`, "g");
 const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^(?:${TOOL_NAMES})(?::)?$`);
 
 function renderBlock(block: Block, key: number, isThinking?: boolean, projectId?: string) {
@@ -915,11 +932,11 @@ function renderIncrementalBlock(
 
 // --- Inline parsing ---
 
-function renderInline(text: string, isThinking?: boolean, projectId?: string): (string | React.JSX.Element)[] {
+export function renderInline(text: string, isThinking?: boolean, projectId?: string): (string | React.JSX.Element)[] {
   const cleaned = stripEmojis(text);
   const parts: (string | React.JSX.Element)[] = [];
-  // Match: [link](url), `code`, **bold**, *italic*
-  const regex = /(\[[^\]]+\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+  // Match: @mind:id, [link](url), `code`, **bold**, *italic*, [@thought]
+  const regex = /(@mind:[^\s]+|\[[^\]]+\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[@thought\])/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -981,8 +998,36 @@ function renderInline(text: string, isThinking?: boolean, projectId?: string): (
 
     const token = match[0];
     const key = `inline-${match.index}`;
+    const fontMono = "ui-monospace, 'Cascadia Code', 'Cascadia Mono', 'Fira Code', Consolas, monospace";
 
-    if (token.startsWith("[")) {
+    if (token.startsWith("@mind:")) {
+      parts.push(
+        <span
+          key={key}
+          style={{
+            color: "var(--pane-status-modified)",
+            fontFamily: fontMono,
+            fontWeight: 500,
+          }}
+        >
+          thought
+        </span>
+      );
+    } else if (token === "[@thought]") {
+      parts.push(
+        <span
+          key={key}
+          style={{
+            color: "var(--pane-status-modified)",
+            fontFamily: fontMono,
+            fontWeight: 500,
+            textTransform: "lowercase",
+          }}
+        >
+          @thought
+        </span>
+      );
+    } else if (token.startsWith("[")) {
       const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       if (linkMatch) {
         parts.push(

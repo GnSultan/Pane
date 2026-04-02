@@ -171,12 +171,12 @@
 
 :root {
   /*
-   * Dark — "Ink"
-   * A desk at night. Warm enough to stay, quiet enough to think.
-   * Slight amber undertone throughout — never blue, never sterile.
+   * Default — "Dusk"
+   * System theme. Softer dark — not the full ink, just enough to disappear into.
+   * One shade above the explicit dark, so there's room to go deeper on demand.
    */
-  --pane-bg: #1C1B1A;
-  --pane-surface: #242320;
+  --pane-bg: #242322;
+  --pane-surface: #2C2A28;
   --pane-border: #4A4742;
   --pane-text: #D8D5CE;
   --pane-text-secondary: #A8A59E;
@@ -206,11 +206,11 @@
   --pane-overlay: rgba(20, 19, 18, 0.7);
 
   /* Editor syntax — dark: quiet instruments, not a neon sign */
-  --pane-editor-bg: #1C1B1A;
-  --pane-editor-gutter: #1C1B1A;
+  --pane-editor-bg: #242322;
+  --pane-editor-gutter: #242322;
   --pane-editor-gutter-text: #4A4742;
   --pane-editor-gutter-border: #33312E;
-  --pane-editor-active-line: #242320;
+  --pane-editor-active-line: #2C2A28;
   --pane-editor-selection: rgba(140, 130, 110, 0.25);
   --pane-editor-cursor: #C8C5BE;
   --pane-editor-search-match: rgba(184, 165, 106, 0.15);
@@ -246,7 +246,20 @@
   --pane-syn-attribute: #B8A56A;
 
   /* Border softness - theme-specific */
-  --pane-border-soft: rgba(74, 71, 66, 0.4);  /* In dark theme, this is 40% of the dark border */
+  --pane-border-soft: rgba(74, 71, 66, 0.4);
+}
+
+[data-theme="dark"] {
+  /*
+   * Dark — "Ink"
+   * Full depth. The hard dark you choose deliberately.
+   * Explicit selection only — system theme lands on Dusk (:root), not here.
+   */
+  --pane-bg: #1C1B1A;
+  --pane-surface: #242320;
+  --pane-editor-bg: #1C1B1A;
+  --pane-editor-gutter: #1C1B1A;
+  --pane-editor-active-line: #242320;
 }
 
 [data-theme="light"] {
@@ -392,6 +405,73 @@
 
   /* Border softness - theme-specific */
   --pane-border-soft: rgba(192, 192, 192, 0.5);  /* In pure theme, this is 50% of the pure border */
+}
+
+[data-theme="glass"] {
+  /*
+   * Glass — "Liquid Glass"
+   * macOS 26 translucency. Dark palette, transparent backgrounds.
+   * The OS compositor provides the blur — we just let it through.
+   */
+  --pane-bg: transparent;
+  --pane-surface: rgba(28, 27, 26, 0.45);
+  --pane-border: rgba(255, 255, 255, 0.12);
+  --pane-text: #D8D5CE;
+  --pane-text-secondary: #A8A59E;
+
+  /* Semantic — same as dark */
+  --pane-status-added: #8A9A6C;
+  --pane-status-added-bg: rgba(138, 154, 108, 0.1);
+  --pane-status-modified: #B8A56A;
+  --pane-status-deleted: #A67272;
+  --pane-status-renamed: #7E97AA;
+  --pane-status-untracked: #6D6A63;
+  --pane-error: #A67272;
+  --pane-error-bg: rgba(166, 114, 114, 0.08);
+  --pane-error-border: rgba(166, 114, 114, 0.2);
+
+  /* Terminal accent */
+  --pane-terminal: #8AACCA;
+
+  /* Overlay — lighter since background already blurred */
+  --pane-overlay: rgba(0, 0, 0, 0.3);
+
+  /* Editor — semi-transparent so glass shows through */
+  --pane-editor-bg: rgba(28, 27, 26, 0.35);
+  --pane-editor-gutter: rgba(28, 27, 26, 0.35);
+  --pane-editor-gutter-text: rgba(74, 71, 66, 0.8);
+  --pane-editor-gutter-border: rgba(51, 49, 46, 0.5);
+  --pane-editor-active-line: rgba(36, 35, 32, 0.4);
+  --pane-editor-selection: rgba(140, 130, 110, 0.2);
+  --pane-editor-cursor: #C8C5BE;
+  --pane-editor-search-match: rgba(184, 165, 106, 0.12);
+  --pane-editor-search-match-border: rgba(184, 165, 106, 0.25);
+  --pane-editor-search-match-active: rgba(184, 165, 106, 0.2);
+  --pane-editor-search-match-active-border: rgba(184, 165, 106, 0.4);
+
+  /* Syntax — same as dark */
+  --pane-syn-structure: #7A8B9C;
+  --pane-syn-keyword: #7A8B9C;
+  --pane-syn-operator: #7A8B9C;
+  --pane-syn-data: #C9AE6E;
+  --pane-syn-data-number: #B8A56A;
+  --pane-syn-identity: var(--pane-status-deleted);
+  --pane-syn-property: var(--pane-status-deleted);
+  --pane-syn-variable: var(--pane-status-deleted);
+  --pane-syn-function: #9BA8B8;
+  --pane-syn-type: #8A95A5;
+  --pane-syn-comment: #5A5752;
+  --pane-syn-tag: var(--pane-status-deleted);
+  --pane-syn-attribute: #B8A56A;
+
+  /* Border softness — frosted glass edges */
+  --pane-border-soft: rgba(255, 255, 255, 0.06);
+}
+
+html[data-theme="glass"],
+html[data-theme="glass"] body,
+html[data-theme="glass"] #root {
+  background-color: transparent !important;
 }
 
 /* Workspace page routing — single data-mode attribute drives all page visibility.

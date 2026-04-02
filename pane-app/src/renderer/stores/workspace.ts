@@ -12,6 +12,7 @@ import {
   refreshAllModels,
   checkGeminiUpdate,
   updateGemini,
+  setAppTheme,
 } from "../lib/tauri-commands";
 
 const DEFAULT_FONT_SIZE = 15;
@@ -19,7 +20,7 @@ const DEFAULT_PANEL_FONT_SIZE = 13;
 const DEFAULT_EDITOR_FONT_SIZE = 14;
 const DEFAULT_FONT_WEIGHT = 400;
 
-export type Theme = "dark" | "light" | "pure" | "system";
+export type Theme = "dark" | "light" | "pure" | "glass" | "system";
 
 function getSystemTheme(): "dark" | "light" {
   return window.matchMedia("(prefers-color-scheme: dark)").matches
@@ -27,7 +28,7 @@ function getSystemTheme(): "dark" | "light" {
     : "light";
 }
 
-function resolveTheme(theme: Theme): "dark" | "light" | "pure" {
+function resolveTheme(theme: Theme): "dark" | "light" | "pure" | "glass" {
   return theme === "system" ? getSystemTheme() : theme;
 }
 
@@ -167,11 +168,20 @@ function applyFontWeight(weight: number) {
 
 function applyTheme(theme: Theme) {
   const resolved = resolveTheme(theme);
-  if (resolved === "dark") {
+  // system+dark → :root (Dusk — softer default, no attribute)
+  // explicit dark → data-theme="dark" (Ink — the hard choice)
+  if (theme === "system" && resolved === "dark") {
     document.documentElement.removeAttribute("data-theme");
+  } else if (resolved === "dark") {
+    document.documentElement.setAttribute("data-theme", "dark");
   } else {
     document.documentElement.setAttribute("data-theme", resolved);
   }
+  // Toggle native vibrancy for Liquid Glass
+  const vibrancy = resolved === "glass" ? "under-window" : null;
+  (window as any).electronAPI?.invoke("set_vibrancy", { vibrancy }).catch(() => {});
+  // Switch dock icon variant — glass=clear/transparent, dark=solid ink, default=semi-transparent dusk
+  setAppTheme(resolved);
 }
 
 function createWorkspaceStore() {
@@ -410,7 +420,8 @@ function createWorkspaceStore() {
           system: "dark",
           dark: "light",
           light: "pure",
-          pure: "system",
+          pure: "glass",
+          glass: "system",
         };
         const next = cycle[state.theme];
         applyTheme(next);

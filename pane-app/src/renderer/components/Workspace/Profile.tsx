@@ -2015,7 +2015,7 @@ export function Profile() {
                 theme
               </span>
               <div className="flex gap-1">
-                {(["system", "dark", "light", "pure"] as const).map((t) => (
+                {(["system", "dark", "light", "pure", "glass"] as const).map((t) => (
                   <button
                     key={t}
                     onClick={() => setTheme(t)}

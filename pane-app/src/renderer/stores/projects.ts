@@ -39,7 +39,7 @@ export interface Project {
   selectedPath: string | null;
   activeFilePath: string | null;
   activeFileContent: string | null;
-  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "fuzzy" | "search";
+  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens";
   conversation: ConversationState;
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
@@ -133,7 +133,7 @@ interface ProjectsState {
   // Per-project mode
   setMode: (
     projectId: string,
-    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "fuzzy" | "search",
+    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens",
   ) => void;
   toggleMode: (projectId: string) => void;
 
@@ -191,6 +191,7 @@ interface ProjectsState {
     numTurns?: number,
   ) => void;
   clearConversation: (projectId: string) => void;
+  clearSessionContext: (projectId: string) => void;
   setHasUnreadCompletion: (projectId: string, hasUnread: boolean) => void;
   setHasUnreadLens: (projectId: string, hasUnread: boolean) => void;
   restoreConversation: (
@@ -313,7 +314,7 @@ function createProjectsStore() {
           ? state.projects.get(state.activeProjectId)
           : undefined;
         const carryMode = currentProject?.mode;
-        const isTransientMode = carryMode === "mind" || carryMode === "profile" || carryMode === "history" || carryMode === "lens" || carryMode === "fuzzy" || carryMode === "search";
+        const isTransientMode = carryMode === "mind" || carryMode === "profile" || carryMode === "history" || carryMode === "lens";
 
         const updatedProjects = new Map(state.projects);
         const updatedProject = {
@@ -436,7 +437,7 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => {
           // Toggle between Chat and Viewer (file explorer / directory browser)
-          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "fuzzy" | "search";
+          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens";
           if (p.mode === "conversation") {
             nextMode = "viewer";
           } else {
@@ -710,6 +711,19 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, () => ({
           conversation: createEmptyConversation(),
+        })),
+      ),
+
+    clearSessionContext: (projectId) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: {
+            ...p.conversation,
+            todos: [],
+            isPlanning: false,
+            phase: "idle",
+            isProcessing: false,
+          },
         })),
       ),
 

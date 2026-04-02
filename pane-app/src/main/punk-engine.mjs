@@ -401,6 +401,7 @@ class CliBackend extends PunkBackend {
       command: this.command,
       requestId: request.requestId,
       todos: request.todos,
+      minds: request.minds,
       tools: request.tools,
       maxTurns: request.maxTurns,
       systemPromptOverride: request.systemPromptOverride,
@@ -2113,6 +2114,7 @@ export async function registerPunkHandlers() {
       provider,
       todos,
       autoRoute,
+      minds,
       // Mind chat fields — when projectId starts with "mind:", these override defaults
       systemPromptOverride,
       _systemOverride,
@@ -2131,6 +2133,7 @@ export async function registerPunkHandlers() {
       provider,
       todos,
       autoRoute,
+      minds,
       ...(systemPromptOverride ? { systemPromptOverride } : {}),
       ...(_systemOverride ? { _systemOverride } : {}),
       ...(tools ? { tools } : {}),

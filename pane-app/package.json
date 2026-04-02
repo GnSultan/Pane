@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.4.29",
+  "version": "0.4.44",
   "description": "The lightest IDE ever built",
   "type": "module",
   "main": "./out/main/index.js",
@@ -16,6 +16,7 @@
     "version:minor": "npm version minor --no-git-tag-version",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/renderer/",
+    "build:icon": "node scripts/build-icon.mjs",
     "download-models": "node scripts/download-models.mjs",
     "postinstall": "electron-rebuild -f --only node-pty,better-sqlite3"
   },
@@ -24,6 +25,9 @@
     "productName": "Pane",
     "mac": {
       "category": "public.app-category.developer-tools",
+      "extendInfo": {
+        "CFBundleIconName": "AppIcon"
+      },
       "target": [
         {
           "target": "dmg",
@@ -42,6 +46,10 @@
       ]
     },
     "extraResources": [
+      {
+        "from": "build/Assets.car",
+        "to": "Assets.car"
+      },
       {
         "from": "models/",
         "to": "models",

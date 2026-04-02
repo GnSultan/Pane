@@ -1271,11 +1271,17 @@ export class ApiBackend extends PunkBackend {
       provider === "deepseek" ||
       provider === "kimi" ||
       provider === "openrouter" ||
-      provider === "stepfun";
+      provider === "stepfun" ||
+      provider === "alibaba" ||
+      provider === "dashscope";
 
     // deepseek-reasoner does not support tools or reasoning_content in history.
     // Strip both from any assistant messages so we don't get 400s on multi-turn R1.
-    const isReasoner = provider === "deepseek" && model === "deepseek-reasoner";
+    const isReasoner =
+      (provider === "deepseek" && model === "deepseek-reasoner") ||
+      (provider === "openrouter" &&
+        (model?.includes("deepseek-reasoner") ||
+          model?.includes("deepseek/deepseek-r1")));
 
     const preFiltered = [];
     // COLLAPSE CONSECUTIVE USER MESSAGES (Retry inflation fix)
@@ -1325,19 +1331,53 @@ export class ApiBackend extends PunkBackend {
 
             // deepseek-reasoner does not support tool_calls — omit entirely
             if (!isReasoner && (toolUses.length > 0 || msg.tool_calls)) {
-              const calls =
+              const rawCalls =
                 msg.tool_calls ||
                 toolUses.map((tu) => ({
                   id: tu.id,
                   type: "function",
                   function: {
                     name: tu.name,
-                    arguments:
-                      typeof tu.input === "string"
-                        ? tu.input
-                        : JSON.stringify(tu.input),
+                    arguments: tu.input,
                   },
                 }));
+
+              const calls = rawCalls.map((tc) => {
+                let args = tc.function?.arguments || "";
+                if (typeof args === "string") {
+                  try {
+                    const trimmed = args.trim();
+                    if (!trimmed) {
+                      args = "{}";
+                    } else {
+                      const parsed = JSON.parse(trimmed);
+                      if (parsed === null || typeof parsed !== "object") {
+                        args = "{}";
+                      } else {
+                        args = trimmed;
+                      }
+                    }
+                  } catch {
+                    // Malformed JSON (cutoff or hallucination)
+                    args = "{}";
+                  }
+                } else if (args === null || typeof args !== "object") {
+                  args = "{}";
+                } else {
+                  // If it's an object, stringify it
+                  args = JSON.stringify(args);
+                }
+
+                return {
+                  id: tc.id,
+                  type: "function",
+                  function: {
+                    name: tc.function?.name,
+                    arguments: args,
+                  },
+                };
+              });
+
               assistantMsg.tool_calls = calls;
               calls.forEach((tc) => pendingToolCallIds.add(tc.id));
             }

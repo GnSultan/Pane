@@ -9,6 +9,7 @@ import {
   getHomeDir,
   appendTerminalCommand,
   updateTerminalRunning,
+  getTerminalHistory,
 } from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";
 import type { TerminalTab } from "../../stores/projects";
@@ -263,17 +264,18 @@ function TerminalTabBar({
 function TerminalTabContent({
   tabId,
   projectId,
-  workingDir,
+  initialCwd,
   homeDir,
   isVisible,
 }: {
   tabId: string;
   projectId: string;
-  workingDir: string;
+  initialCwd: string;
   homeDir: string;
   isVisible: boolean;
 }) {
-  const state = getTabState(tabId, workingDir);
+  const isNewSessionRef = useRef(!tabStates.has(tabId)); // captured once at mount before getTabState creates the entry
+  const state = getTabState(tabId, initialCwd);
 
   const [lines, setLines] = useState<TerminalLine[]>(state.lines);
   const [liveOutput, setLiveOutput] = useState("");
@@ -310,7 +312,23 @@ function TerminalTabContent({
   useEffect(() => {
     const ts = stateRef.current;
 
-    createPty(tabId, projectId, workingDir).catch((err) => {
+    // If this is a resumed session, load history from DB before PTY starts
+    if (isNewSessionRef.current) {
+      getTerminalHistory(projectId).then(({ commands }) => {
+        if (commands.length === 0) return;
+        const restored: TerminalLine[] = [
+          { type: "output", content: "── previous session ──────────────────", timestamp: 0 },
+          ...commands.flatMap((c) => [
+            { type: "command" as const, content: c.cmd, timestamp: c.timestamp },
+            ...(c.output.trim() ? [{ type: "output" as const, content: c.output, timestamp: c.timestamp }] : []),
+          ]),
+          { type: "output", content: "── restored ──────────────────────────", timestamp: 0 },
+        ];
+        setLines((prev) => (prev.length === 0 ? restored : prev));
+      }).catch(() => {});
+    }
+
+    createPty(tabId, projectId, initialCwd).catch((err) => {
       console.error("[pane] Failed to create PTY:", err);
     });
 
@@ -445,7 +463,7 @@ function TerminalTabContent({
       destroyPty(tabId).catch(() => {});
       tabStates.delete(tabId);
     };
-  }, [tabId, projectId, workingDir]);
+  }, [tabId, projectId]); // initialCwd intentionally omitted — used once at mount, must not retrigger on cd
 
   // Update static caret position
   const updateCaret = useCallback(() => {
@@ -849,12 +867,15 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
 
   const handleNewTab = useCallback(() => {
     const store = useProjectsStore.getState();
+    const project = store.projects.get(projectId);
+    const activeTab = project?.terminalTabs.find((t) => t.id === project.activeTerminalTabId);
+    const startCwd = activeTab?.cwd ?? workingDir;
     const id = nextTabId(projectId);
     store.addTerminalTab(projectId, {
       id,
-      title: workingDir,
+      title: startCwd,
       isAlive: true,
-      cwd: workingDir,
+      cwd: startCwd,
     });
   }, [projectId, workingDir]);
 
@@ -876,22 +897,20 @@ export function Terminal({ projectId, workingDir }: TerminalProps) {
 
   return (
     <div className="flex flex-col h-full w-full">
-      {tabs.length > 1 && (
-        <TerminalTabBar
-          tabs={tabs}
-          activeTabId={activeTabId}
-          homeDir={homeDir}
-          onSelect={handleSelectTab}
-          onClose={handleCloseTab}
-          onNew={handleNewTab}
-        />
-      )}
+      <TerminalTabBar
+        tabs={tabs}
+        activeTabId={activeTabId}
+        homeDir={homeDir}
+        onSelect={handleSelectTab}
+        onClose={handleCloseTab}
+        onNew={handleNewTab}
+      />
       {tabs.map((tab) => (
         <TerminalTabContent
           key={tab.id}
           tabId={tab.id}
           projectId={projectId}
-          workingDir={workingDir}
+          initialCwd={tab.cwd ?? workingDir}
           homeDir={homeDir}
           isVisible={tab.id === activeTabId}
         />

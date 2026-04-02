@@ -90,7 +90,7 @@ function measureCaretPos(
 
 interface InputBarProps {
   projectId: string;
-  onSend: (message: string) => void;
+  onSend: (message: string, minds?: Array<{ id: string }>) => void;
   onAbort: () => void;
   isProcessing: boolean;
 }
@@ -472,10 +472,12 @@ export function InputBar({
   // @-reference picker state (replaces old / slash system)
   const [refOpen, setRefOpen] = useState(false);
   const [refQuery, setRefQuery] = useState("");
+  const [attachedMinds, setAttachedMinds] = useState<Array<{ id: string }>>([]);
   const refStartRef = useRef<number>(-1); // cursor position right after @
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
 
   const todos = useProjectsStore(
     useShallow(
@@ -610,27 +612,40 @@ export function InputBar({
     applyTextareaHeight();
   }, [value, applyTextareaHeight]);
 
-  // Detect `@` trigger and track query for reference-picker
+  // Detect `@m…` trigger for mind reference-picker
+  // Opens as soon as typed chars after @ are a prefix of "mind" (e.g. @m, @mi, @min, @mind)
+  // Once @mind is fully typed, additional chars become the filter query
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
     const pos = e.target.selectionStart ?? next.length;
     setValue(next);
+    const thoughtCount = (next.match(/@thought/g) ?? []).length;
+    setAttachedMinds((prev) => thoughtCount < prev.length ? prev.slice(0, thoughtCount) : prev);
 
-    // If picker was open, check if @ was deleted or cursor moved before it
     if (refOpen) {
-      const atIdx = refStartRef.current - 1; // index of the triggering @
-      if (next[atIdx] !== "@" || pos < refStartRef.current || next[pos - 1] === "\n") {
+      // Picker is open — verify @<prefix-of-mind> is still intact behind cursor
+      const atIdx = refStartRef.current;
+      const typed = next.slice(atIdx + 1, pos); // chars after '@'
+      const isMindPrefix = "mind".startsWith(typed) || typed.startsWith("mind");
+      if (next[atIdx] !== "@" || !isMindPrefix || next[pos - 1] === "\n") {
         setRefOpen(false);
       } else {
-        setRefQuery(next.slice(refStartRef.current, pos));
+        // Query starts after the "mind" portion is fully typed
+        setRefQuery(typed.length > 4 ? typed.slice(4) : "");
       }
     } else {
-      // Look for a fresh @ trigger: must be at start or preceded by whitespace
-      if (next[pos - 1] === "@") {
-        const charBefore = next[pos - 2];
-        if (!charBefore || charBefore === " " || charBefore === "\n") {
-          refStartRef.current = pos;
-          setRefQuery("");
+      // Scan backwards from cursor to find word start
+      let wordStart = pos;
+      while (wordStart > 0 && next[wordStart - 1] !== " " && next[wordStart - 1] !== "\n") {
+        wordStart--;
+      }
+      const word = next.slice(wordStart, pos);
+      if (word.length >= 2 && word[0] === "@") {
+        const typed = word.slice(1); // chars after '@'
+        // Open if typed chars are a prefix of "mind" or extend beyond it
+        if ("mind".startsWith(typed) || typed.startsWith("mind")) {
+          refStartRef.current = wordStart;
+          setRefQuery(typed.length > 4 ? typed.slice(4) : "");
           setRefOpen(true);
         }
       }
@@ -640,16 +655,15 @@ export function InputBar({
   const handleRefSelect = useCallback((item: ReferenceItem) => {
     const ta = textareaRef.current;
     if (!ta) return;
-    const start = refStartRef.current;
-    const atPos = start - 1; // position of the @ itself
+    const atPos = refStartRef.current; // index of '@'
     const cursorPos = ta.selectionStart ?? value.length;
     const before = value.slice(0, atPos);
     const after = value.slice(cursorPos);
-    const tag = `@${item.namespace}:${item.label}`;
+    const tag = "@thought";
     const next = before + tag + (after.startsWith(" ") ? after : " " + after);
     setValue(next);
+    setAttachedMinds((prev) => [...prev, { id: item.label }]);
     setRefOpen(false);
-    // Restore focus and move cursor to end of inserted tag
     requestAnimationFrame(() => {
       ta.focus();
       const newPos = before.length + tag.length;
@@ -663,8 +677,9 @@ export function InputBar({
         e.preventDefault();
         const trimmed = value.trim();
         if (trimmed) {
-          onSend(trimmed);
+          onSend(trimmed, attachedMinds.length > 0 ? attachedMinds : undefined);
           setValue("");
+          setAttachedMinds([]);
         }
       }
       if (e.key === "Escape" && isProcessing) {
@@ -673,7 +688,7 @@ export function InputBar({
           e.preventDefault();
           const ta = textareaRef.current;
           if (ta) {
-            const before = value.slice(0, refStartRef.current - 1);
+            const before = value.slice(0, refStartRef.current);
             const after = value.slice(ta.selectionStart ?? value.length);
             setValue(before + after);
             setRefOpen(false);
@@ -690,7 +705,7 @@ export function InputBar({
         onAbort();
       }
     },
-    [value, isProcessing, refOpen, onSend, onAbort],
+    [value, isProcessing, refOpen, attachedMinds, onSend, onAbort],
   );
 
   return (
@@ -791,6 +806,7 @@ export function InputBar({
               onKeyDown={handleKeyDown}
               onFocus={() => { setTextareaFocused(true); updateCaret(); }}
               onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
+              onScroll={() => { if (overlayRef.current && textareaRef.current) overlayRef.current.scrollTop = textareaRef.current.scrollTop; }}
               placeholder={isProcessing ? "" : "let's build..."}
               className="w-full bg-transparent text-pane-text font-mono
                          resize-none outline-none placeholder:text-pane-text-secondary
@@ -798,12 +814,44 @@ export function InputBar({
               style={{
                 fontSize: "var(--pane-font-size)",
                 caretColor: "transparent",
+                color: "transparent",
                 minHeight: "120px",
                 maxHeight: "40vh",
                 height: "120px",
                 paddingBottom: "44px",
               }}
             />
+            {/* Highlight overlay — mirrors textarea text, colors @thought tokens */}
+            <div
+              ref={overlayRef}
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                right: 0,
+                bottom: 0,
+                overflow: "hidden",
+                pointerEvents: "none",
+                fontSize: "var(--pane-font-size)",
+                lineHeight: "1.75",
+                paddingTop: "1rem",
+                paddingBottom: "44px",
+                paddingLeft: "1.25rem",
+                paddingRight: "1.25rem",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                fontFamily: "ui-monospace, 'Cascadia Code', 'Cascadia Mono', 'Fira Code', Consolas, monospace",
+              }}
+            >
+              {value.split(/(@thought)/g).map((part, i) =>
+                part === "@thought" ? (
+                  <span key={i} style={{ color: "var(--pane-status-modified)", fontWeight: 500 }}>@thought</span>
+                ) : (
+                  <span key={i} style={{ color: "var(--pane-text)" }}>{part}</span>
+                )
+              )}
+            </div>
             {textareaFocused && caretPos && (
               <div
                 aria-hidden
@@ -826,7 +874,9 @@ export function InputBar({
               onClick={() => {
                 const trimmed = value.trim();
                 if (!trimmed) return;
-                onSend(trimmed); setValue("");
+                onSend(trimmed, attachedMinds.length > 0 ? attachedMinds : undefined);
+                setValue("");
+                setAttachedMinds([]);
               }}
               className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
               title="Send (Enter)"

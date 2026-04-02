@@ -81,16 +81,16 @@ export function SlashMenu({ entries, query, onSelect, onDismiss }: SlashMenuProp
                  bg-pane-bg ring-1 ring-pane-border/40 rounded-xl
                  overflow-hidden animate-fadeSlideUp"
     >
-      <div className="max-h-[240px] overflow-y-auto">
+      <div className="max-h-[240px] overflow-y-auto p-1.5">
         {filtered.map((entry, i) => (
           <button
             key={entry.id}
             ref={i === activeIdx ? activeRef : undefined}
             onClick={() => onSelect(entry.content)}
             onMouseEnter={() => setActiveIdx(i)}
-            className={`w-full text-left px-4 py-2.5 font-mono truncate transition-colors
+            className={`w-full text-left px-3 py-2 font-mono truncate rounded-md transition-colors
               ${i === activeIdx
-                ? "bg-pane-text/[0.06] text-pane-text"
+                ? "bg-pane-text/[0.08] text-pane-text"
                 : "text-pane-text-secondary hover:bg-pane-text/[0.03]"
               }`}
             style={{ fontSize: "var(--pane-font-size-sm)" }}

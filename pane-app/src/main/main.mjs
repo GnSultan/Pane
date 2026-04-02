@@ -6,6 +6,7 @@ import {
   dialog,
   app,
   utilityProcess,
+  nativeImage,
 } from "electron";
 import windowStateKeeper from "electron-window-state";
 import { execFile } from "node:child_process";
@@ -774,6 +775,10 @@ Improvements
     const win = BrowserWindow.getFocusedWindow();
     if (win) win.setTitle(args.title);
   });
+  ipcMain.handle("set_vibrancy", (_event, args) => {
+    if (!mainWindow) return;
+    mainWindow.setVibrancy(args.vibrancy ?? null);
+  });
   ipcMain.handle("open-directory-dialog", async () => {
     const win = BrowserWindow.getFocusedWindow();
     if (!win) return null;
@@ -872,6 +877,17 @@ function registerSettingsHandlers() {
     const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
     await fs.promises.writeFile(tmpPath, json, "utf-8");
     await fs.promises.rename(tmpPath, filePath);
+  });
+
+  // Dock icon switches with theme — clear (glass) = no bg, default = semi-transparent dark, dark = solid dark.
+  ipcMain.handle("set_app_theme", (_event, { theme }) => {
+    if (!app.dock) return; // non-macOS no-op
+    const iconName =
+      theme === "glass" ? "icon-glass.png" :
+      theme === "dark"  ? "icon-dark.png"  :
+                          "icon.png";
+    const iconPath = getAssetPath(iconName);
+    app.dock.setIcon(nativeImage.createFromPath(iconPath));
   });
 }
 // PTY runs in a UtilityProcess to isolate node-pty crashes from the main process.
@@ -1447,6 +1463,12 @@ function registerStateHandlers(db) {
     upsertBlob(projectId, "terminal", data);
   });
 
+  // Returns the stored terminal history for a project (last 50 commands).
+  ipcMain.handle("get_terminal_history", (_event, { projectId }) => {
+    const data = readBlob(projectId, "terminal") ?? { commands: [] };
+    return { commands: Array.isArray(data.commands) ? data.commands.filter((c) => !c.partial) : [] };
+  });
+
   // Upserts a live snapshot for a long-running command.
   ipcMain.handle("update_terminal_running", (_event, { projectId, entry }) => {
     let data = readBlob(projectId, "terminal") ?? { commands: [] };
@@ -1856,6 +1878,7 @@ function registerSessionHandlers(db) {
     if (delta.lastProvider) current.lastProvider = delta.lastProvider;
     if (delta.lastIntent)   current.lastIntent = delta.lastIntent;
     if (delta.gitStatus !== undefined) current.gitStatus = delta.gitStatus;
+    if (delta.todos !== undefined)     current.todos = delta.todos;
 
     db.stmts.upsertBlob.run(projectId, "session", JSON.stringify(current), Date.now());
     writeSessionFile(projectId, current); // keep file in sync for UtilityProcess readers
@@ -1864,7 +1887,7 @@ function registerSessionHandlers(db) {
 
   ipcMain.handle("session_clear_state", (_event, args) => {
     const { projectId } = args;
-    const blank = { activeTask: null, workingSet: [], decisions: [], recentActions: [],
+    const blank = { activeTask: null, todos: [], workingSet: [], decisions: [], recentActions: [],
       turnCount: 0, lastProvider: null, lastIntent: null, startedAt: Date.now() };
     db.stmts.upsertBlob.run(projectId, "session", JSON.stringify(blank), Date.now());
     writeSessionFile(projectId, blank);
@@ -2192,6 +2215,8 @@ function createWindow() {
     minHeight: 500,
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 16, y: 18 },
+    transparent: true,
+    backgroundColor: "#00000000",
     title: "Pane",
     icon: iconPath,
     show: false,

@@ -13,7 +13,7 @@ import type { CheckpointDiffFile } from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";
 import { setRestoreInProgress } from "../../hooks/useFileWatcher";
 import { ToolActivity, ServerToolActivity } from "./ToolActivity";
-import { MarkdownText } from "./MarkdownText";
+import { MarkdownText, LazyHighlightedCode, renderInline } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
 
 // No CSS containment — content-visibility: auto causes visible pop-in stutter
@@ -233,16 +233,20 @@ function JsonBlockDisplay({ block }: { block: JsonBlock }) {
   const jsonStr = block.json ? JSON.stringify(block.json, null, 2) : block.raw;
   return (
     <div className="my-6">
-      <div className="text-[10px] font-mono text-pane-text-secondary/40 mb-2 uppercase tracking-[0.1em]">
+      <div className="flex items-center gap-2 text-[10px] font-mono text-pane-text-secondary/60 mb-2 uppercase tracking-[0.1em]">
+        <span className="w-2 h-2 rounded-full bg-pane-terminal/60" />
         json
       </div>
-      <pre
-        className="font-mono text-pane-text/85 bg-pane-bg/40
-                   px-5 py-4 overflow-x-auto leading-[1.75] rounded-sm"
+      <div
+        className="font-mono overflow-x-auto leading-[1.75]"
         style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
       >
-        {jsonStr}
-      </pre>
+        <pre className="whitespace-pre-wrap break-words m-0">
+          <code>
+            <LazyHighlightedCode code={jsonStr} lang="json" />
+          </code>
+        </pre>
+      </div>
     </div>
   );
 }
@@ -303,7 +307,7 @@ export function MessageBubble({
               paddingBottom: showExpand ? '32px' : undefined,
             }}
           >
-            {truncatedText}
+            {renderInline(truncatedText)}
           </p>
           {showExpand && (
             <div className="absolute bottom-0 left-0 right-0 p-1.5 pointer-events-none">

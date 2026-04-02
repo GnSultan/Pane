@@ -846,7 +846,7 @@ export function usePunk(projectId: string) {
   const intentionalAbortRef = useRef(false);
 
   const sendMessage = useCallback(
-    async (prompt: string) => {
+    async (prompt: string, minds?: Array<{ id: string }>) => {
       const store = useProjectsStore.getState();
       const project = store.projects.get(projectId);
       if (!project) return;
@@ -1412,12 +1412,15 @@ export function usePunk(projectId: string) {
           project.root,
           routedModel,
           handleEvent,
-          intent,
-          truncatedHistory,
-          selectedModelThinking,
-          selectedModelProvider,
-          todos,
-          intentAutoRoute,
+          {
+            intent,
+            history: truncatedHistory,
+            thinking: selectedModelThinking,
+            provider: selectedModelProvider,
+            todos,
+            autoRoute: intentAutoRoute,
+            minds,
+          }
         );
       } catch (err) {
         console.error("[pane] sendToPunk error:", err);
