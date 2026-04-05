@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
@@ -271,353 +271,396 @@ function isConversationVisible(): boolean {
   return project?.mode === "conversation";
 }
 
-function ModelPicker({
+function fuzzyScore(text: string, query: string): number {
+  const lowerText = text.toLowerCase();
+  const lowerQuery = query.toLowerCase().trim();
+  if (!lowerQuery) return 0;
+  let score = 0, queryIndex = 0, lastMatchIndex = -1;
+  for (let i = 0; i < lowerText.length && queryIndex < lowerQuery.length; i++) {
+    if (lowerText[i] === lowerQuery[queryIndex]) {
+      if (lastMatchIndex !== -1 && i === lastMatchIndex + 1) score += 5;
+      if (i === 0 && queryIndex === 0) score += 10;
+      if (lowerText[i - 1] === '-' || lowerText[i - 1] === ' ') score += 8;
+      score += 1;
+      lastMatchIndex = i;
+      queryIndex++;
+    }
+  }
+  if (lowerText === lowerQuery) score += 20;
+  return queryIndex === lowerQuery.length ? score : -1;
+}
+
+// ─── Model picker — inline carousel ──────────────────────────────────────────
+//
+// Resting state: compact trigger button showing current model name.
+// Expanded state: the entire button bar transforms into a full-width inline
+// carousel — no floating surface, no background/passthrough issue.
+
+const PROVIDER_NAMES: Record<string, string> = {
+  anthropic: "Claude",
+  "anthropic-api": "Anthropic API",
+  gemini: "Gemini CLI",
+  "gemini-api": "Gemini API",
+  deepseek: "DeepSeek",
+  openrouter: "OpenRouter",
+  kimi: "Kimi",
+  stepfun: "StepFun",
+};
+function resolveProviderName(key: string): string {
+  return PROVIDER_NAMES[key] ?? key;
+}
+
+type ModelItem =
+  | { kind: "auto" }
+  | {
+      kind: "model";
+      value: string;
+      label: string;
+      providerLabel: string;
+      providerKey: string;
+      thinking?: boolean;
+    };
+
+
+// Collapsed trigger — just the current model name, click to expand
+function ModelPickerTrigger({
   value,
-  routedModel,
-  onChange,
   autoRoute,
-  onToggleAutoRoute,
+  routedModel,
   isProcessing,
+  onClick,
 }: {
   value: string;
-  routedModel?: string | null;
-  onChange: (v: string, thinking?: boolean, provider?: string) => void;
   autoRoute: boolean;
-  onToggleAutoRoute: (v: boolean) => void;
+  routedModel?: string | null;
   isProcessing?: boolean;
+  onClick: () => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const fetchedModels = useWorkspaceStore((s) => s.allModels);
+  const label = useMemo(() => {
+    if (autoRoute) {
+      if (isProcessing && routedModel) {
+        for (const models of Object.values(fetchedModels)) {
+          const found = (models as any[])?.find((m: any) => m.id === routedModel);
+          if (found) return (found.name || found.id).toLowerCase();
+        }
+      }
+      return "pane auto";
+    }
+    for (const models of Object.values(fetchedModels)) {
+      const found = (models as any[])?.find((m: any) => m.id === value);
+      if (found) return (found.name || found.id).toLowerCase();
+    }
+    return value.toLowerCase() || "model";
+  }, [value, autoRoute, routedModel, isProcessing, fetchedModels]);
+
+  return (
+    <button
+      onClick={onClick}
+      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md
+        bg-pane-bg ring-1 ring-pane-border/25
+        text-pane-text-secondary btn-press select-none"
+      style={{ fontSize: "var(--pane-font-size-xs)" }}
+    >
+      <div className={`w-1.5 h-1.5 rounded-full transition-colors shrink-0 ${autoRoute ? "bg-pane-status-added" : "bg-pane-text-secondary"}`} />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+// ─── Mode picker — inline carousel ───────────────────────────────────────────
+
+function ModePickerExpanded({
+  activeMode,
+  onSelect,
+  onClose,
+}: {
+  activeMode: string;
+  onSelect: (mode: string) => void;
+  onClose: () => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const modes = MODE_CYCLE as unknown as string[];
+
+  // Click outside to close
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) onClose();
+    };
+    requestAnimationFrame(() => document.addEventListener("mousedown", handler));
+    return () => document.removeEventListener("mousedown", handler);
+  }, [onClose]);
+
+  return (
+    <div ref={containerRef} className="flex-1 min-w-0 flex items-center gap-1 pointer-events-auto">
+      <div className="flex-1" />
+      {modes.map((mode) => {
+        const config = MODE_CONFIG[mode];
+        const active = mode === activeMode;
+        return (
+          <button
+            key={mode}
+            onClick={() => { onSelect(mode); onClose(); }}
+            className={`shrink-0 flex items-center px-3 py-0.5 transition-opacity hover:opacity-100 ${active ? "opacity-100" : "opacity-35"}`}
+          >
+            <span
+              className="font-mono whitespace-nowrap"
+              style={{
+                fontSize: "var(--pane-font-size-xs)",
+                color: active ? config?.color : "var(--pane-text)",
+                lineHeight: 1.5,
+              }}
+            >
+              {mode}
+            </span>
+          </button>
+        );
+      })}
+      <button
+        onClick={onClose}
+        className="shrink-0 text-pane-text-secondary/30 hover:text-pane-text-secondary/60 transition-colors ml-1"
+        style={{ fontSize: "14px", lineHeight: 1 }}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+// Expanded full-bar picker — carousel + search
+function ModelPickerExpanded({
+  value,
+  autoRoute,
+  onChange,
+  onToggleAutoRoute,
+  onClose,
+}: {
+  value: string;
+  autoRoute: boolean;
+  onChange: (v: string, thinking?: boolean, provider?: string) => void;
+  onToggleAutoRoute: (v: boolean) => void;
+  onClose: () => void;
+}) {
+  const [searchMode, setSearchMode] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const ref = useRef<HTMLDivElement>(null);
+  const [scrollIndex, setScrollIndex] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const carouselRef = useRef<HTMLDivElement>(null);
+  const trackRef = useRef<HTMLDivElement>(null);
+
   const fetchedModels = useWorkspaceStore((s) => s.allModels);
   const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
 
-  const filteredProviderModels = useMemo(() => {
-    const providers: Record<string, Array<{
-      value: string;
-      label: string;
-      realProvider?: string;
-      inputCost?: number | null;
-      outputCost?: number | null;
-      tier?: number;
-      contextLength?: number;
-    }>> = {};
-    for (const [provider, models] of Object.entries(fetchedModels)) {
-      if (!models || models.length === 0) continue;
-      if (disabledProviders.includes(provider)) continue;
-      providers[provider] = models.map((m: any) => ({
-        value: m.id,
-        label: m.name || m.id,
-        realProvider: m.provider,
-        inputCost: m.input_cost,
-        outputCost: m.output_cost,
-        tier: m.tier,
-        contextLength: m.context_length,
-      }));
-    }
-    return providers;
-  }, [fetchedModels, disabledProviders]);
-
-  const providerDisplayName = useCallback((providerKey: string): string => {
-    const names: Record<string, string> = {
-      anthropic: "Claude",
-      "anthropic-api": "Anthropic API",
-      gemini: "Gemini CLI",
-      "gemini-api": "Gemini API",
-      deepseek: "DeepSeek",
-      openrouter: "OpenRouter",
-      kimi: "Kimi",
-      stepfun: "StepFun",
-    };
-    return names[providerKey] || providerKey;
-  }, []);
-
-  const allModels = useMemo(() => {
-    const models: Array<{
-      value: string;
-      label: string;
-      provider: string;
-      providerKey: string;
-      thinking?: boolean;
-      inputCost?: number | null;
-      outputCost?: number | null;
-    }> = [];
-    Object.entries(filteredProviderModels).forEach(([providerKey, list]) => {
-      if (Array.isArray(list)) {
-        list.forEach((m: {
-          value: string;
-          label: string;
-          realProvider?: string;
-          inputCost?: number | null;
-          outputCost?: number | null;
-          tier?: number;
-        }) => {
-          const displayProvider = m.realProvider || providerKey;
-          models.push({
-            value:      m.value,
-            label:      m.label,
-            provider:   displayProvider,
-            providerKey: providerKey,
-            thinking:   isThinkingModel(m.value),
-            inputCost:  m.inputCost,
-            outputCost: m.outputCost,
-          });
+  const allItems = useMemo<ModelItem[]>(() => {
+    // Group by provider, Claude first, then alphabetical
+    const grouped = new Map<string, ModelItem[]>();
+    for (const [providerKey, models] of Object.entries(fetchedModels)) {
+      if (!models || (models as any[]).length === 0) continue;
+      if (disabledProviders.includes(providerKey)) continue;
+      const group: ModelItem[] = [];
+      for (const m of models as any[]) {
+        group.push({
+          kind: "model",
+          value: m.id,
+          label: (m.name || m.id).toLowerCase(),
+          providerLabel: resolveProviderName(providerKey),
+          providerKey,
+          thinking: isThinkingModel(m.id),
         });
       }
+      grouped.set(providerKey, group);
+    }
+    const sortedKeys = Array.from(grouped.keys()).sort((a, b) => {
+      if (a === "anthropic") return -1;
+      if (b === "anthropic") return 1;
+      return resolveProviderName(a).localeCompare(resolveProviderName(b));
     });
-    return models;
-  }, [filteredProviderModels]);
+    const items: ModelItem[] = [{ kind: "auto" }];
+    for (const key of sortedKeys) items.push(...(grouped.get(key) ?? []));
+    return items;
+  }, [fetchedModels, disabledProviders]);
 
-  // Fuzzy search - matches characters in order but not necessarily consecutively
-  // Also calculates a relevance score for sorting results
-  const fuzzyScore = (text: string, query: string): number => {
-    const lowerText = text.toLowerCase();
-    const lowerQuery = query.toLowerCase().trim();
-    
-    if (!lowerQuery) return 0;
-    
-    let score = 0;
-    let queryIndex = 0;
-    let lastMatchIndex = -1;
-    
-    for (let i = 0; i < lowerText.length && queryIndex < lowerQuery.length; i++) {
-      if (lowerText[i] === lowerQuery[queryIndex]) {
-        // Bonus for consecutive matches
-        if (lastMatchIndex !== -1 && i === lastMatchIndex + 1) {
-          score += 5;
-        }
-        // Bonus for matching at start
-        if (i === 0 && queryIndex === 0) {
-          score += 10;
-        }
-        // Bonus for matching after separator (e.g., "claude" in "claude-3.5-sonnet")
-        if (lowerText[i - 1] === '-' || lowerText[i - 1] === ' ') {
-          score += 8;
-        }
-        score += 1;
-        lastMatchIndex = i;
-        queryIndex++;
-      }
-    }
-    
-    // Bonus for exact match
-    if (lowerText === lowerQuery) {
-      score += 20;
-    }
-    
-    return queryIndex === lowerQuery.length ? score : -1;
-  };
-
-  // Filter models based on search query
-  const filteredModels = useMemo(() => {
-    if (!searchQuery.trim()) return allModels;
-    const query = searchQuery.toLowerCase().trim();
-    
-    // Score and filter models
-    const scoredModels = allModels
-      .map((m) => {
-        const labelScore = fuzzyScore(m.label, query);
-        const valueScore = fuzzyScore(m.value, query);
-        const providerScore = fuzzyScore(m.provider, query);
-        const providerNameScore = fuzzyScore(providerDisplayName(m.providerKey), query);
-        const maxScore = Math.max(labelScore, valueScore, providerScore, providerNameScore);
-        return { model: m, score: maxScore };
-      })
+  const displayItems = useMemo<ModelItem[]>(() => {
+    if (!searchQuery.trim()) return allItems;
+    return (allItems.filter((i) => i.kind === "model") as Extract<ModelItem, { kind: "model" }>[])
+      .map((item) => ({
+        item,
+        score: Math.max(
+          fuzzyScore(item.label, searchQuery),
+          fuzzyScore(item.value, searchQuery),
+          fuzzyScore(item.providerLabel, searchQuery),
+        ),
+      }))
       .filter(({ score }) => score >= 0)
-      .sort((a, b) => b.score - a.score) // Higher scores first
-      .map(({ model }) => model);
-    
-    return scoredModels;
-  }, [allModels, searchQuery]);
+      .sort((a, b) => b.score - a.score)
+      .map(({ item }) => item);
+  }, [allItems, searchQuery]);
 
-  const current = allModels.find((m) => m.value === value);
-  const currentDisplay = current || { value: value, label: value || "Select" };
+  // Scroll to current selection on open (instant)
+  useLayoutEffect(() => {
+    const idx = autoRoute
+      ? 0
+      : Math.max(0, allItems.findIndex((i) => i.kind === "model" && i.value === value));
+    setScrollIndex(idx);
+    requestAnimationFrame(() => {
+      const child = trackRef.current?.children[idx] as HTMLElement | undefined;
+      // offsetLeft is within the track; carousel padding-left shifts viewport by 96px
+      // so scrollLeft 0 shows auto, scrollLeft = child.offsetLeft centers that model under pill
+      if (carouselRef.current) {
+        carouselRef.current.scrollLeft = (child?.offsetLeft ?? 0);
+      }
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Collapse on click outside
+  // Reset to start when search changes
   useEffect(() => {
-    if (!open) return;
+    setScrollIndex(0);
+    if (carouselRef.current) carouselRef.current.scrollLeft = 0;
+  }, [searchQuery]);
+
+  const currentProvider = useMemo(() => {
+    const item = displayItems[scrollIndex];
+    if (!item) return "";
+    return item.kind === "auto" ? "pane" : item.providerLabel;
+  }, [displayItems, scrollIndex]);
+
+  // Track active index from scroll position
+  const handleScroll = useCallback(() => {
+    const el = carouselRef.current;
+    const track = trackRef.current;
+    if (!el || !track) return;
+    const slots = Array.from(track.children) as HTMLElement[];
+    const scrollLeft = el.scrollLeft;
+    let closest = 0;
+    let minDist = Infinity;
+    slots.forEach((slot, i) => {
+      const dist = Math.abs(slot.offsetLeft - scrollLeft);
+      if (dist < minDist) { minDist = dist; closest = i; }
+    });
+    setScrollIndex(closest);
+  }, []);
+
+  // Click outside to close
+  useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        onClose();
       }
     };
-    document.addEventListener("mousedown", handler);
+    requestAnimationFrame(() => document.addEventListener("mousedown", handler));
     return () => document.removeEventListener("mousedown", handler);
-  }, [open]);
+  }, [onClose]);
 
+  const handleSelect = (item: ModelItem) => {
+    if (item.kind === "auto") {
+      onToggleAutoRoute(true);
+    } else {
+      if (autoRoute) onToggleAutoRoute(false);
+      onChange(item.value, item.thinking, item.providerKey);
+    }
+    onClose();
+  };
 
-  // When smart routing is active and the router has chosen a model for this turn, show it.
-  // Requires routedModel to be explicitly set — don't show selectedModel as a pre-routing guess.
-  const showSpecificModel =
-    autoRoute && isProcessing && !!routedModel && current && !current.value.startsWith("auto-");
+  const isActive = (item: ModelItem) =>
+    item.kind === "auto" ? autoRoute : !autoRoute && item.value === value;
 
   return (
-    <div ref={ref} className="relative flex items-center">
-      <button
-        onClick={() => setOpen(!open)}
-        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md
-          bg-pane-bg ring-1 ring-pane-border/25
-          text-pane-text-secondary btn-press select-none"
+    <div ref={containerRef} className="flex items-center gap-2 w-full pointer-events-auto">
+      {/* Search zone */}
+      <div className="shrink-0 flex items-center">
+        {searchMode ? (
+          <input
+            autoFocus
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                if (searchQuery) setSearchQuery("");
+                else setSearchMode(false);
+              }
+            }}
+            placeholder="search..."
+            className="bg-transparent font-mono text-pane-text outline-none
+                       placeholder:text-pane-text-secondary/40 w-28"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          />
+        ) : (
+          <button
+            onClick={() => setSearchMode(true)}
+            className="flex items-center justify-center p-1.5
+                       text-pane-text-secondary/40 hover:text-pane-text-secondary/70 transition-colors"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="2" y="2" width="10" height="10" rx="2" />
+              <path d="M12 12l2.5 2.5" />
+            </svg>
+          </button>
+        )}
+      </div>
+
+      {/* Divider */}
+      <div className="w-px h-3 bg-pane-border/30 shrink-0" />
+
+      {/* Provider label */}
+      <span
+        className="shrink-0 font-mono text-pane-text-secondary/40 select-none whitespace-nowrap transition-all duration-200"
         style={{ fontSize: "var(--pane-font-size-xs)" }}
       >
+        {currentProvider}
+      </span>
+
+      {/* Divider */}
+      <div className="w-px h-3 bg-pane-border/30 shrink-0" />
+
+      {/* Carousel */}
+      <div className="flex-1 min-w-0 relative">
         <div
-          className={`w-1.5 h-1.5 rounded-full transition-colors ${autoRoute ? "bg-pane-status-added" : "bg-pane-text-secondary"}`}
-        />
-        <span className="flex items-center gap-1.5 transition-colors group-hover:text-pane-text-secondary">
-          {autoRoute ? (
-            showSpecificModel ? (
-              <span className="hidden sm:inline-block transition-all duration-300 flex items-center gap-1">
-                {current!.label.toLowerCase()}
-                <span className={`w-1 h-1 rounded-full ${current!.providerKey === "anthropic" ? "bg-pane-status-added/60" : current!.providerKey === "gemini" ? "bg-pane-terminal/60" : "bg-pane-text-secondary/40"}`} title={providerDisplayName(current!.providerKey)} />
-              </span>
-            ) : (
-              <span className="text-pane-text-secondary/60">smart routing</span>
-            )
-          ) : (
-            <span className="flex items-center gap-1">
-              {currentDisplay.label.toLowerCase()}
-              {current && (
-                <span className={`w-1 h-1 rounded-full ${current.providerKey === "anthropic" ? "bg-pane-status-added/60" : current.providerKey === "gemini" ? "bg-pane-terminal/60" : "bg-pane-text-secondary/40"}`} title={providerDisplayName(current.providerKey)} />
-              )}
-            </span>
-          )}
-        </span>
-      </button>
+          ref={carouselRef}
+          onScroll={handleScroll}
+          className="w-full overflow-x-scroll [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        >
+          {/* Right fade */}
+          <div
+            className="absolute right-0 top-0 bottom-0 w-8 pointer-events-none z-10"
+            style={{ background: "linear-gradient(to left, var(--pane-bg), transparent)" }}
+          />
+          <div ref={trackRef} className="flex items-center">
+            {displayItems.map((item) => {
+            const active = isActive(item);
+            const label = item.kind === "auto" ? "auto" : item.label;
 
-      {open && (
-        <div className="absolute bottom-full right-0 mb-2 w-64 bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 rounded-xl z-50 animate-fadeSlideUp">
-          <div className="p-1.5 flex flex-col gap-0.5">
-            {/* Smart Routing Toggle */}
-            <button
-              onClick={() => {
-                onToggleAutoRoute(!autoRoute);
-                setOpen(false);
-              }}
-              className={`flex items-center justify-between w-full px-3 py-2 rounded-lg text-left transition-colors ${
-                autoRoute
-                  ? "text-pane-text ring-1 ring-pane-border/50"
-                  : "text-pane-text-secondary hover:text-pane-text hover:ring-1 hover:ring-pane-border/35"
-              }`}
-            >
-              <div className="flex flex-col gap-0.5">
-                <span className="font-mono text-[13px] font-medium">
-                  Smart Routing
-                </span>
-                <span className="text-[10px] text-pane-text-secondary/60">
-                  Auto-pick best model
-                </span>
-              </div>
-              {autoRoute && (
-                <div className="w-1.5 h-1.5 rounded-full bg-pane-status-added" />
-              )}
-            </button>
-
-            <div className="h-px bg-pane-border/30 my-1 mx-2" />
-
-            {/* Individual Models grouped by provider */}
-            <div className="max-h-[300px] overflow-y-auto custom-scrollbar">
-              {Object.entries(
-                filteredModels.reduce((acc, model) => {
-                  if (!acc[model.providerKey]) acc[model.providerKey] = [];
-                  acc[model.providerKey]?.push(model);
-                  return acc;
-                }, {} as Record<string, typeof filteredModels>),
-              ).map(([providerKey, models]) => (
-                <div key={providerKey} className="flex flex-col mb-2">
-                  <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-pane-text-secondary/40 font-mono flex items-center gap-1.5">
-                    {providerKey === "anthropic" && (
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added/60" />
-                    )}
-                    {providerKey === "gemini" && (
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-terminal/60" />
-                    )}
-                    {providerKey !== "anthropic" && providerKey !== "gemini" && (
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-text-secondary/40" />
-                    )}
-                    {providerDisplayName(providerKey)}
-                  </div>
-                  {models?.map((model) => (
-                    <button
-                      key={model.value}
-                      onClick={() => {
-                        if (autoRoute) onToggleAutoRoute(false);
-                        onChange(model.value, model.thinking, model.providerKey);
-                        setOpen(false);
-                      }}
-                      className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-mono text-left transition-colors ${
-                        !autoRoute && model.value === value
-                          ? "text-pane-text ring-1 ring-pane-border/50"
-                          : "text-pane-text-secondary hover:text-pane-text hover:ring-1 hover:ring-pane-border/35"
-                      }`}
-                    >
-                      <div className="flex flex-col">
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-mono text-[12px]">
-                            {model.label.toLowerCase()}
-                          </span>
-                          <span className={`w-1 h-1 rounded-full ${model.providerKey === "anthropic" ? "bg-pane-status-added/60" : model.providerKey === "gemini" ? "bg-pane-terminal/60" : "bg-pane-text-secondary/40"}`} title={providerDisplayName(model.providerKey)} />
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {model.thinking && (
-                            <span className="text-[9px] text-pane-status-added/60 uppercase tracking-tighter">
-                              thinking
-                            </span>
-                          )}
-                          {model.inputCost != null && (
-                            <span className="text-[9px] text-pane-terminal/50 font-mono tabular-nums">
-                              ${model.inputCost} · ${model.outputCost}/m
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      {!autoRoute && model.value === value && (
-                        <div className="w-1.5 h-1.5 rounded-full bg-pane-text" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              ))}
-            </div>
-
-            {/* Search bar at bottom - fixed like InputBar */}
-            <div className="sticky bottom-0 bg-pane-bg border-t border-pane-border/25">
-              <div className="flex items-center gap-2 px-3 py-2.5">
-                <svg
-                  className="w-3.5 h-3.5 text-pane-text-secondary/35 shrink-0"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
+            return (
+              <button
+                key={item.kind === "auto" ? "__auto__" : item.value}
+                onClick={() => handleSelect(item)}
+                className={`shrink-0 flex items-center px-3 py-0.5 text-left transition-opacity hover:opacity-100 ${active ? "opacity-100" : "opacity-35"}`}
+              >
+                <span
+                  className="font-mono block whitespace-nowrap"
+                  style={{
+                    fontSize: "var(--pane-font-size-xs)",
+                    color: active ? "var(--pane-status-added)" : "var(--pane-text)",
+                    lineHeight: 1.5,
+                  }}
                 >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
-                  />
-                </svg>
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="search models..."
-                  className="flex-1 bg-transparent text-pane-text text-[11px] font-mono outline-none placeholder:text-pane-text-secondary/35"
-                  autoFocus
-                />
-                {searchQuery && (
-                  <button
-                    onClick={() => setSearchQuery("")}
-                    className="text-pane-text-secondary/35 hover:text-pane-text-secondary/55 transition-colors"
-                  >
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                  </button>
-                )}
-              </div>
-            </div>
+                  {label}
+                </span>
+              </button>
+            );
+          })}
           </div>
         </div>
-      )}
+      </div>
+
+      {/* Dismiss */}
+
+      <button
+        onClick={onClose}
+        className="shrink-0 text-pane-text-secondary/30 hover:text-pane-text-secondary/60 transition-colors"
+        style={{ fontSize: "14px", lineHeight: 1 }}
+      >
+        ×
+      </button>
     </div>
   );
 }
@@ -631,6 +674,8 @@ export function InputBar({
 }: InputBarProps) {
   const [value, setValue] = useState("");
   const [todoPanelOpen, setTodoPanelOpen] = useState(false);
+  const [modelPickerExpanded, setModelPickerExpanded] = useState(false);
+  const [modePickerExpanded, setModePickerExpanded] = useState(false);
   const [isFadingOut, setIsFadingOut] = useState(false);
   const [caretPos, setCaretPos] = useState<{
     top: number;
@@ -715,6 +760,7 @@ export function InputBar({
   const setHttpProvider = useWorkspaceStore((s) => s.setHttpProvider);
   const intentAutoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
   const setIntentAutoRoute = useWorkspaceStore((s) => s.setIntentAutoRoute);
+
   // const intentRouting = useWorkspaceStore((s) => s.getEffectiveRouting());
 
   const routedModel = useProjectsStore(
@@ -1265,64 +1311,83 @@ export function InputBar({
             className="absolute bottom-0 left-0 right-0 flex items-center gap-2 p-1.5 font-mono pointer-events-none"
             style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
-            <button
-              onClick={async () => {
-                try {
-                  const paths = await showFilePicker(projectRoot, projectRoot);
-                  if (!paths || paths.length === 0) return;
-                  const insertion = paths.map(p => `\`${p}\``).join(" ");
-                  setValue(prev => prev ? `${prev} ${insertion}` : insertion);
-                } catch (err) { console.error('Failed to open file picker:', err); }
-              }}
-              className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
-                bg-pane-bg ring-1 ring-pane-border/25
-                text-pane-text-secondary/50 hover:text-pane-text-secondary btn-press transition-colors"
-              title="Add file or folder path"
-            >
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 5v14M5 12h14" />
-              </svg>
-              <span>add path</span>
-            </button>
-
-            <div className="flex-1" />
-
-            {/* Mode pill — always visible, shows current orchestration mode */}
-            {!isProcessing && !activeModeCmd && (() => {
-              const mode = modeOverride || detectedMode?.mode || lastSentMode || "execute";
-              const config = MODE_CONFIG[mode];
-              const color = config?.color || "var(--pane-text-secondary)";
-              return (
+            {modelPickerExpanded ? (
+              <ModelPickerExpanded
+                value={selectedModel}
+                autoRoute={intentAutoRoute}
+                onChange={handleModelChange}
+                onToggleAutoRoute={setIntentAutoRoute}
+                onClose={() => setModelPickerExpanded(false)}
+              />
+            ) : (
+              <>
                 <button
-                  onClick={handleModeTap}
+                  onClick={async () => {
+                    try {
+                      const paths = await showFilePicker(projectRoot, projectRoot);
+                      if (!paths || paths.length === 0) return;
+                      const insertion = paths.map(p => `\`${p}\``).join(" ");
+                      setValue(prev => prev ? `${prev} ${insertion}` : insertion);
+                    } catch (err) { console.error('Failed to open file picker:', err); }
+                  }}
                   className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
                     bg-pane-bg ring-1 ring-pane-border/25
-                    hover:text-pane-text btn-press transition-colors"
-                  style={{ color }}
-                  title={`${mode} mode — tap to cycle`}
+                    text-pane-text-secondary/50 hover:text-pane-text-secondary btn-press transition-colors"
+                  title="Add file or folder path"
                 >
-                  <span>{mode}</span>
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 5v14M5 12h14" />
+                  </svg>
+                  <span>add path</span>
                 </button>
-              );
-            })()}
-            {routePreview && !isProcessing && !activeModeCmd && (
-              <span className="pointer-events-none text-[10px] text-[var(--pane-text-secondary)] font-mono opacity-40">
-                {routePreview.model}
-              </span>
-            )}
 
-            <ContextUsageIndicator projectId={projectId} />
-            <RateLimitIndicator />
-            <div className="pointer-events-auto">
-              <ModelPicker
-                value={selectedModel}
-                routedModel={routedModel}
-                onChange={handleModelChange}
-                autoRoute={intentAutoRoute}
-                onToggleAutoRoute={setIntentAutoRoute}
-                isProcessing={isProcessing}
-              />
-            </div>
+                {!isProcessing && !activeModeCmd && (() => {
+                  const mode = modeOverride || detectedMode?.mode || lastSentMode || "execute";
+                  const config = MODE_CONFIG[mode];
+                  const color = config?.color || "var(--pane-text-secondary)";
+                  if (modePickerExpanded) {
+                    return (
+                      <ModePickerExpanded
+                        activeMode={mode}
+                        onSelect={(m) => setModeOverride(m)}
+                        onClose={() => setModePickerExpanded(false)}
+                      />
+                    );
+                  }
+                  return (
+                    <>
+                      <div className="flex-1" />
+                      <button
+                        onClick={() => setModePickerExpanded(true)}
+                        className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
+                          bg-pane-bg ring-1 ring-pane-border/25
+                          hover:text-pane-text btn-press transition-colors"
+                        style={{ color }}
+                      >
+                        <span>{mode}</span>
+                      </button>
+                    </>
+                  );
+                })()}
+                {routePreview && !isProcessing && !activeModeCmd && (
+                  <span className="pointer-events-none text-[10px] text-[var(--pane-text-secondary)] font-mono opacity-40">
+                    {routePreview.model}
+                  </span>
+                )}
+
+                <ContextUsageIndicator projectId={projectId} />
+                <RateLimitIndicator />
+                <div className="pointer-events-auto">
+                  <ModelPickerTrigger
+                    value={selectedModel}
+                    autoRoute={intentAutoRoute}
+                    routedModel={routedModel}
+                    isProcessing={isProcessing}
+                    onClick={() => setModelPickerExpanded(true)}
+                  />
+                </div>
+              </>
+            )}
           </div>
         </div>
     </div>
