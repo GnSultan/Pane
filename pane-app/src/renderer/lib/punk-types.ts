@@ -255,6 +255,11 @@ export interface PunkEventActiveTaskUpdated {
   };
 }
 
+export interface PunkEventArbiterVerdict {
+  event: "arbiter_verdict";
+  data: ArbiterVerdict;
+}
+
 // ── Orchestration Events (Control Inversion) ────────────────────────────
 
 export interface OrchestrationStartEvent {
@@ -387,9 +392,22 @@ export interface RateLimitInfo {
   status: "allowed" | "allowed_warning" | "rejected";
   utilization?: number;
   resetsAt?: number;
-  rateLimitType?: string;
+  rateLimitType?: "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet" | "overage" | string;
   isUsingOverage?: boolean;
   overageStatus?: "allowed" | "allowed_warning" | "rejected";
+  overageResetsAt?: number;
+  overageDisabledReason?: string;
+  surpassedThreshold?: number;
+}
+
+export interface PunkEventTokenUsage {
+  event: "token_usage";
+  data: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
 }
 
 export interface PunkEventRateLimit {
@@ -409,6 +427,7 @@ export type PunkStreamEvent = (
   | PunkEventCompactionComplete
   | PunkEventTodosUpdated
   | PunkEventActiveTaskUpdated
+  | PunkEventArbiterVerdict
   | OrchestrationStartEvent
   | OrchestrationPlanningStartEvent
   | OrchestrationPlanningChunkEvent
@@ -421,6 +440,7 @@ export type PunkStreamEvent = (
   | OrchestrationPhaseEvent
   | PunkEventSdkInitInfo
   | PunkEventRateLimit
+  | PunkEventTokenUsage
 ) & { requestId?: string };
 
 // Plan message types — the blueprint Pane produces before execution
@@ -451,6 +471,27 @@ export interface PlanData {
 
 // Parsed conversation message for the UI
 
+export interface ArbiterVerdict {
+  pass: boolean;
+  score: number;
+  findings: Array<{
+    source: string;
+    severity: "error" | "warning";
+    file: string;
+    line: number;
+    code: string;
+    raw: string;
+    plain: string;
+  }>;
+  guidance?: Array<{
+    id: string;
+    file: string;
+    plain: string;
+  }>;
+  changedFiles: string[];
+  timestamp: number;
+}
+
 export interface ConversationMessage {
   id: string;
   type: "user" | "assistant" | "system" | "result" | "plan";
@@ -469,6 +510,8 @@ export interface ConversationMessage {
   punkType?: string;
   // True for messages restored from history — tools start collapsed
   isHistorical?: boolean;
+  // Quality verdict from the Turn Sentinel
+  verdict?: ArbiterVerdict;
 }
 
 // File checkpoint types

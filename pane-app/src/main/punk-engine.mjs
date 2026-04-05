@@ -145,9 +145,11 @@ import { readState } from "./session-context.mjs";
 import { routingStore } from "./routing-store.mjs";
 import { classifyDomain } from "./routing-oracle.mjs";
 import { ensurePriors } from "./benchmark-scout.mjs";
-import { classify as localClassify } from "./intent-classifier.mjs";
+// intent-classifier.mjs removed — LLM-based classifier was dead code (never called)
 import { routeHeuristic, detectFailureSignals, detectSuccessSignals, djb2Hash } from "./heuristic-router.mjs";
 import { routeIntegrated, recordOutcome, getClassifierStats } from "./integrated-router.mjs";
+import { contextStore } from "./context-store.mjs";
+import { propagateCompletion } from "./completion-propagator.mjs";
 import { readThreadState, incrementFailure, recordSuccess, updateLastPrompt, updateLastResponse, recordApproach } from "./thread-state.mjs";
 
 // Node.js globals for utility process
@@ -333,6 +335,19 @@ class CliBackend extends PunkBackend {
     });
 
     this.worker.on("message", (message) => {
+      // Persist CLI session IDs to SQLite (survives app restarts)
+      if (message.type === "persist_session_id") {
+        try {
+          const db = getPaneDb();
+          db.stmts.upsertConvMeta.run(
+            message.projectId,
+            message.sessionId,
+            message.backend || null,
+            Date.now(),
+          );
+        } catch {}
+        return;
+      }
       if (message.type !== "event") return;
       if (message.event.event === "processEnded") {
         const rid = message.requestId;
@@ -363,6 +378,21 @@ class CliBackend extends PunkBackend {
       this.activeRequests.clear();
       this.worker = null;
     });
+
+    // Restore persisted session IDs so resume works after app restart
+    try {
+      const db = getPaneDb();
+      const allMeta = db.prepare(
+        "SELECT project_id, session_id FROM conversation_meta WHERE session_id IS NOT NULL"
+      ).all();
+      for (const row of allMeta) {
+        this.worker.postMessage({
+          type: "restore_session_id",
+          projectId: row.project_id,
+          sessionId: row.session_id,
+        });
+      }
+    } catch {}
 
     return this.worker;
   }
@@ -1019,6 +1049,21 @@ class PunkEngine {
       return; // Don't forward to renderer — this is an internal event
     }
 
+    // ── Broadcast SDK account info to ALL windows ─────────────────────────
+    // The prefetch sends sdk_init_info with projectId "__prefetch__" which
+    // no renderer listens to. Broadcast on a dedicated channel so the
+    // Profile settings UI can show auth status immediately.
+    if (event.event === "sdk_init_info" && event.data?.account) {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) {
+          win.webContents.send("pane-sdk-auth", {
+            models: event.data.models,
+            account: event.data.account,
+          });
+        }
+      }
+    }
+
     const channel = `punk-stream:${projectId}`;
 
     // Attach requestId to the event so the renderer can filter it
@@ -1041,6 +1086,52 @@ class PunkEngine {
       // Track tool errors
       if (event.event === "message" && event.data?.parsed?.type === "tool_error") {
         tracked.hadToolErrors = true;
+      }
+
+      // ── Quality-based routing adjustment + behavioral fingerprinting ────
+      // When the arbiter verdict arrives, adjust the routing score so models
+      // that produce low-quality code get deprioritized in future routing.
+      // Also record quality metrics to SQLite (main process has DB access;
+      // cli-worker UtilityProcess does not).
+      if (event.event === "arbiter_verdict" && event.data) {
+        try {
+          const v = event.data;
+          let delta = 0;
+          if (v.pass && v.score >= 90) delta = +0.05;       // Clean work → small boost
+          else if (!v.pass && v.score < 50) delta = -0.20;   // Serious quality failures
+          else if (!v.pass && v.score < 70) delta = -0.10;   // Moderate quality issues
+          else if (!v.pass) delta = -0.05;                    // Minor issues
+
+          // Suppression attempts are especially bad — intentional evasion
+          const suppressions = (v.findings || []).filter(f =>
+            f.code === "ts-nocheck" || f.code === "ts-ignore" ||
+            f.code === "eslint-disable-file" || f.code === "eslint-disable-line"
+          ).length;
+          if (suppressions > 0) delta -= 0.10;
+
+          if (delta !== 0) {
+            routingStore.adjustOutcomeScore(tracked.outcomeId, delta);
+          }
+
+          // Record behavioral fingerprint + correction events (main process has SQLite access).
+          // Fire-and-forget — handleBackendEvent is sync, so use .then().
+          Promise.all([
+            import("./code-arbiter.mjs"),
+            import("./pane-db.mjs"),
+          ]).then(([{ recordQualityMetric, recordArbiterCorrections }, { getPaneDb }]) => {
+            const db = getPaneDb();
+            recordQualityMetric(db, {
+              projectId: tracked.projectId,
+              model: v.model || tracked.model,
+              provider: v.provider || tracked.provider,
+              verdict: v,
+            });
+            // Record individual correction events for pattern detection
+            if (!v.pass) {
+              recordArbiterCorrections(db, tracked.projectId, v);
+            }
+          }).catch(() => {});
+        } catch {}
       }
 
       // Close the outcome on processEnded
@@ -1103,6 +1194,26 @@ class PunkEngine {
             const summary = (tracked.responseText || "").slice(0, 200);
             updateLastResponse(tracked.projectId, summary);
           } catch {}
+
+          // ── Completion Propagation ──────────────────────────────────────
+          // If todos were pending at spawn time but fewer are pending now,
+          // tasks completed during this turn. Propagate the signal so brain
+          // nodes, pins, and mind entries about finished work get decayed.
+          if (tracked.pendingTodoCount > 0 && this._brainRequest) {
+            try {
+              const currentState = readState(tracked.projectId);
+              const currentPending = (currentState?.todos || []).filter(t => t.status !== "completed").length;
+              const completed = (currentState?.todos || []).filter(t => t.status === "completed");
+              if (currentPending < tracked.pendingTodoCount && completed.length > 0) {
+                const taskDesc = currentState?.activeTask?.description || tracked.userPrompt?.slice(0, 200) || "";
+                propagateCompletion(tracked.projectId, {
+                  taskDescription: taskDesc,
+                  completedTodos: completed.map(t => t.content),
+                  brainRequest: this._brainRequest,
+                }).catch(err => console.warn("[punk] completion propagation failed:", err.message));
+              }
+            } catch {}
+          }
         }
         this._activeOutcomes.delete(requestId);
       }
@@ -1303,6 +1414,26 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       resolvedRequest.todos,
     );
 
+    // ── Correction detection: track user negation patterns ──────────────
+    // If the user's message starts with "no", "don't", "wrong", "revert",
+    // etc., record it as a correction event for pattern detection.
+    if (resolvedRequest.prompt && resolvedRequest.history?.length > 0) {
+      import("./code-arbiter.mjs").then(({ isUserCorrection, recordUserCorrection }) => {
+        if (isUserCorrection(resolvedRequest.prompt)) {
+          try {
+            const db = getPaneDb();
+            recordUserCorrection(
+              db,
+              resolvedRequest.projectId,
+              "user-negation",
+              resolvedRequest.prompt.slice(0, 200),
+              resolvedRequest.model,
+            );
+          } catch {}
+        }
+      }).catch(() => {});
+    }
+
     // ── INTELLIGENCE ──────────────────────────────────────────────────────
     // Qwen local model is the sole classifier — strategy + task type + context
     // shape in a single ~50-100ms inference pass. No heuristic fallback.
@@ -1311,7 +1442,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // bypass classification — they're user overrides, resolved inline.
     const sessionState = readState(resolvedRequest.projectId);
     const promptText = (resolvedRequest.prompt || "").trim().toLowerCase();
-    const hasSlashOverride = /^\/(?:plan|direct|raw|discuss|chat|orchestrate|steps|exec)\b/.test(promptText);
+    const hasSlashOverride = /^\/(?:plan|direct|raw|discuss|chat|orchestrate|steps|exec|analyze)\b/.test(promptText);
 
     const pendingTodos = (resolvedRequest.todos || []).filter(t => t.status !== "completed").length;
 
@@ -1327,6 +1458,27 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       // No quickCall, no routing oracle, just go straight to backend.
       strategy = { mode: "direct", discovery: false, reasoning: "shallow", verification: "none", confidence: 1.0, reason: "system override", signals: [] };
       console.log("[punk] system override — skipping classification");
+    } else if (resolvedRequest.effectiveMode) {
+      // ── Mode pill / carry-forward — single source of truth ──
+      // The renderer resolved the mode (auto-detected or user-tapped).
+      // Skip all re-classification — use this directly so the system prompt
+      // stays consistent across turns in the same conversation flow.
+      const modeStrategies = {
+        plan:    { mode: "analyze",     discovery: true,  reasoning: "deep",    verification: "none" },
+        analyze: { mode: "analyze",     discovery: true,  reasoning: "deep",    verification: "none" },
+        execute: { mode: "direct",      discovery: false, reasoning: "shallow", verification: "diff" },
+        discuss: { mode: "discuss",     discovery: false, reasoning: "deep",    verification: "none" },
+      };
+      const modeStrat = modeStrategies[resolvedRequest.effectiveMode] || modeStrategies.execute;
+      strategy = { ...modeStrat, confidence: 1.0, reason: `mode: ${resolvedRequest.effectiveMode}`, signals: [] };
+      // Map to intent so context assembly gets a consistent directive
+      const modeToIntent = { plan: "plan", analyze: "plan", execute: "execute", discuss: "explain" };
+      resolvedRequest.intent = modeToIntent[resolvedRequest.effectiveMode] || resolvedRequest.intent;
+      // Strip any leading slash directive the renderer may have prepended (e.g. /discuss, /analyze).
+      // effectiveMode is the authoritative routing signal; CLI backends treat leading / as their
+      // own internal commands and will terminate or fail when they see an unknown one.
+      resolvedRequest.prompt = (resolvedRequest.prompt || "").replace(/^\/[\w]+\s*/, "").trim();
+      console.log(`[punk] effectiveMode → ${resolvedRequest.effectiveMode} (strategy: ${strategy.mode}, intent: ${resolvedRequest.intent})`);
     } else if (hasSlashOverride) {
       // ── Slash overrides — user knows what they want ──
       const slashStrategies = {
@@ -1338,10 +1490,14 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         orchestrate: { mode: "orchestrate", discovery: true,  reasoning: "deep",    verification: "diff" },
         steps:       { mode: "orchestrate", discovery: true,  reasoning: "deep",    verification: "diff" },
         plan:        { mode: "orchestrate", discovery: false, reasoning: "deep",    verification: "diff" },
+        analyze:     { mode: "analyze",     discovery: true,  reasoning: "deep",    verification: "none" },
       };
       const cmd = promptText.match(/^\/([\w]+)/)?.[1] || "direct";
       const override = slashStrategies[cmd] || slashStrategies.direct;
       strategy = { ...override, confidence: 1.0, reason: `/${cmd}`, signals: [] };
+      // Strip the slash directive from the prompt — CLI backends (claude, gemini)
+      // interpret leading / as their own internal commands and will terminate.
+      resolvedRequest.prompt = (resolvedRequest.prompt || "").replace(/^\/[\w]+\s*/, "").trim();
       console.log(`[punk] slash override → ${strategy.mode} (/${cmd})`);
     } else {
       // ── Heuristic routing — zero-latency deterministic classification ──
@@ -1623,21 +1779,11 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       `discovery=${strategy.discovery} → ${resolvedRequest.provider}/${resolvedRequest.model} | ${strategy.reason}`,
     );
 
-    // Write local decision to context dir so session-context.mjs can read it.
-    // Drives: system prompt directive, atom boosting, file pre-read depth,
-    // brief inclusion, and verification instructions.
+    // Write local decision to ContextStore (in-memory) so context-orchestrator
+    // reads it immediately — no stale JSON file. Disk write happens via
+    // debounced serialization for crash recovery.
     if (localDecision && resolvedRequest.projectId) {
-      try {
-        const contextDir = path.join(os.homedir(), ".pane", "brain", "context");
-        await fs.mkdir(contextDir, { recursive: true }).catch(() => {});
-        await fs.writeFile(
-          path.join(contextDir, `${resolvedRequest.projectId}-shape.json`),
-          JSON.stringify(localDecision),
-          "utf-8",
-        );
-      } catch {
-        // Non-fatal — context shaping falls back to defaults
-      }
+      contextStore.updateContextShape(resolvedRequest.projectId, localDecision);
     }
 
     // ── BRAIN CONTEXTUAL SEARCH ───────────────────────────────────────────
@@ -1676,6 +1822,59 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         ]);
       } catch (err) {
         console.warn("[punk] brain contextual search failed (non-fatal):", err.message);
+      }
+    }
+
+    // ── PINNED MIND INJECTION ──────────────────────────────────────────────
+    // If the user explicitly selected @thought references, guarantee those
+    // mind entries appear first in the brain context — before any semantic
+    // results — regardless of their embedding similarity score.
+    //
+    // The brain search has already written {projectId}.json; we patch it here
+    // so cli-worker / compileContext picks up the pinned entries automatically.
+    if (resolvedRequest.minds?.length && resolvedRequest.projectId) {
+      try {
+        const db = getPaneDb()
+        const mindStmt = db.prepare("SELECT id, content FROM mind_entries WHERE id = ?")
+        const pinnedMinds = resolvedRequest.minds
+          .map(m => {
+            const row = mindStmt.get(m.id)
+            return row ? { id: row.id, content: row.content, score: 1.0 } : null
+          })
+          .filter(Boolean)
+
+        if (pinnedMinds.length > 0) {
+          const contextPath = path.join(os.homedir(), ".pane", "brain", "context", `${resolvedRequest.projectId}.json`)
+          try {
+            const raw = await fs.readFile(contextPath, "utf-8")
+            const brainCtx = JSON.parse(raw)
+            const existing = brainCtx.mindEntries || []
+            const pinnedIds = new Set(pinnedMinds.map(m => m.id))
+            // Prepend pinned first, then semantic results not already pinned
+            brainCtx.mindEntries = [
+              ...pinnedMinds,
+              ...existing.filter(m => !pinnedIds.has(m.id)),
+            ]
+            await fs.writeFile(contextPath, JSON.stringify(brainCtx))
+            console.log(`[punk] pinned ${pinnedMinds.length} @thought reference(s) into brain context`)
+          } catch (err) {
+            // Context file may not exist if brain search timed out or is unavailable.
+            // In that case, write a minimal context with just the pinned minds.
+            if (err.code === "ENOENT") {
+              try {
+                await fs.mkdir(path.join(os.homedir(), ".pane", "brain", "context"), { recursive: true })
+                await fs.writeFile(contextPath, JSON.stringify({ mindEntries: pinnedMinds }))
+                console.log(`[punk] wrote minimal brain context with ${pinnedMinds.length} pinned @thought reference(s)`)
+              } catch (writeErr) {
+                console.warn("[punk] Failed to write pinned mind context:", writeErr.message)
+              }
+            } else {
+              console.warn("[punk] Failed to patch brain context with pinned minds:", err.message)
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[punk] Failed to resolve pinned @thought references:", err.message)
       }
     }
 
@@ -1724,6 +1923,23 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         const settings = await this.loadSettings();
         orchestrationEnabled = settings.orchestration_enabled ?? true;
       } catch {}
+
+      // ── ANALYZE MODE ───────────────────────────────────────────────────
+      // Deep investigation with read-only tools. Bypasses orchestration
+      // (no plan→execute cycle). The model explores broadly, traces
+      // connections, and reports findings without modifying any files.
+      if (strategy.mode === "analyze") {
+        console.log("[punk] ANALYZE mode — deep reading, no execution");
+        resolvedRequest._systemPrepend =
+          "ANALYZE: You are in analysis mode. Read broadly, trace connections across the codebase, " +
+          "and report findings with structured implications and recommendations. " +
+          "Do NOT modify any files. Do NOT use write_file, replace, or bash to make changes. " +
+          "Use read_file, glob, search, and grep to investigate. " +
+          "Structure your response with clear sections: findings, root causes, implications, and next steps.";
+        const backend = this.getBackendForRequest(resolvedRequest);
+        await backend.spawn(resolvedRequest);
+        return;
+      }
 
       if (strategy.mode === "orchestrate" && orchestrationEnabled) {
         console.log(
@@ -2071,11 +2287,32 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       history: [],
       requestId,
       todos: null,
-      tools: ['Read', 'Glob', 'Grep'],  // built-in tools: read-only analysis
-      maxTurns: 25,                      // enough for real multi-step investigation
+      // Full read-only toolkit for punk analysis.
+      // For HTTP backends: phase="planning" gives all tools except writes — this
+      // list is decorative. For CLI backends: this list filters SDK built-in tools,
+      // and pane_ tools come via MCP server regardless.
+      tools: [
+        // Navigation
+        'Read', 'read_file', 'pane_read_files', 'list_directory',
+        'Glob', 'glob', 'Grep', 'grep_search',
+        // Code intelligence
+        'pane_find_symbol', 'pane_find_references', 'pane_codebase_compass',
+        'pane_codebase_navigator', 'explore',
+        // Project context & memory
+        'pane_project_context', 'pane_brief', 'pane_synthesize',
+        'pane_recall', 'pane_knowledge_graph', 'pane_profile',
+        // Architecture & design constraints
+        'pane_architecture_brief', 'pane_ui_constraints',
+        // History
+        'pane_change_history', 'pane_search_changes', 'pane_recent_terminal',
+        // Verification
+        'pane_run_in_terminal',
+      ],
+      phase: 'planning',              // read-only: blocks write_file, replace, run_shell_command
+      maxTurns: 50,
       systemPromptOverride: systemPrompt,
       _systemOverride: true,
-      noExec: false,                     // MCP pane_run_in_terminal available — workers can run tests
+      noExec: false,
     });
 
     // 8-minute ceiling — deep analysis should finish well within this
@@ -2115,6 +2352,7 @@ export async function registerPunkHandlers() {
       todos,
       autoRoute,
       minds,
+      effectiveMode,
       // Mind chat fields — when projectId starts with "mind:", these override defaults
       systemPromptOverride,
       _systemOverride,
@@ -2134,6 +2372,7 @@ export async function registerPunkHandlers() {
       todos,
       autoRoute,
       minds,
+      effectiveMode,
       ...(systemPromptOverride ? { systemPromptOverride } : {}),
       ...(_systemOverride ? { _systemOverride } : {}),
       ...(tools ? { tools } : {}),

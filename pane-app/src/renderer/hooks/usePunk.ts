@@ -41,12 +41,13 @@ import type {
   WebSearchToolResultBlock,
   MemoryEvent,
 } from "../lib/punk-types";
-import {
-  inferAgentIntent,
-  chooseModelForIntent,
-  type AgentIntent,
-} from "../lib/agent-routing";
 import { getContextLimit } from "../lib/models";
+
+// Mode-to-intent mapping: the mode pill is the single classification authority.
+// This replaces the three independent classifiers that could disagree.
+const MODE_TO_INTENT: Record<string, string> = {
+  plan: "plan", analyze: "plan", execute: "execute", discuss: "explain",
+};
 
 // Active tool input animations keyed by `${projectId}:${toolId}`.
 // Used to cancel a previous animation if the same tool is re-animated.
@@ -846,7 +847,7 @@ export function usePunk(projectId: string) {
   const intentionalAbortRef = useRef(false);
 
   const sendMessage = useCallback(
-    async (prompt: string, minds?: Array<{ id: string }>) => {
+    async (prompt: string, minds?: Array<{ id: string }>, effectiveMode?: string) => {
       const store = useProjectsStore.getState();
       const project = store.projects.get(projectId);
       if (!project) return;
@@ -867,10 +868,14 @@ export function usePunk(projectId: string) {
       }
 
       const messageId = nextMessageId();
+      // Strip any leading slash directive (e.g. /discuss, /analyze) — these are system
+      // routing signals, not user-visible text. The backend strips them too before sending
+      // to the model, so the display text should match what the model actually sees.
+      const displayPrompt = prompt.replace(/^\/[\w]+\s*/, "").trim();
       const userMessage: ConversationMessage = {
         id: messageId,
         type: "user",
-        content: [{ type: "text", text: prompt }],
+        content: [{ type: "text", text: displayPrompt }],
         timestamp: Date.now(),
         isStreaming: false,
       };
@@ -963,6 +968,23 @@ export function usePunk(projectId: string) {
 
           case "rate_limit": {
             useWorkspaceStore.getState().setRateLimitInfo(event.data);
+            break;
+          }
+
+          case "token_usage": {
+            // Live context usage — update on every turn, not just end-of-response.
+            // Shows ctx% in the InputBar so the user always knows how much window is left.
+            const usage = event.data;
+            if (usage?.input_tokens) {
+              const model = store.projects.get(projectId)?.conversation.model ?? null;
+              const limit = getContextLimit(model);
+              const ratio = usage.input_tokens / limit;
+              const pressure =
+                ratio >= 0.85 ? "high" : ratio >= 0.7 ? "building" : "none";
+              store.setContextPressure(projectId, usage.input_tokens, pressure);
+            }
+            // Signal analytics to refresh
+            useWorkspaceStore.setState({ lastTokenUsageAt: Date.now() });
             break;
           }
 
@@ -1217,6 +1239,12 @@ export function usePunk(projectId: string) {
             break;
           }
 
+          case "arbiter_verdict": {
+            const s = useProjectsStore.getState();
+            s.setLastAssistantVerdict(projectId, event.data);
+            break;
+          }
+
           // ── Orchestration Events (Control Inversion) ──────────────────
           case "orchestration_phase": {
             const { phase, model, provider } = event.data;
@@ -1383,7 +1411,9 @@ export function usePunk(projectId: string) {
 
       try {
         const conversation = project.conversation;
-        const intent: AgentIntent = inferAgentIntent({ prompt, conversation });
+        // Intent derived from mode pill — single source of truth.
+        // No re-classification from keywords.
+        const intent = MODE_TO_INTENT[effectiveMode || ""] || "other";
 
         const activeFile = project.activeFilePath || undefined;
         await Promise.race([
@@ -1394,14 +1424,13 @@ export function usePunk(projectId: string) {
             intent,
             project.root,
           ).catch(() => {}),
-          new Promise((resolve) => setTimeout(resolve, 1000)), // Increased from 500ms to 1 second
+          new Promise((resolve) => setTimeout(resolve, 1000)),
         ]);
         const ws = useWorkspaceStore.getState();
         const selectedModel = ws.selectedModel;
         const selectedModelThinking = ws.selectedModelThinking;
         const selectedModelProvider = ws.selectedModelProvider;
         const intentAutoRoute = ws.intentAutoRoute;
-        const routedModel = chooseModelForIntent(selectedModel, intent);
 
         const truncatedHistory = conversation.messages.slice(-20);
         const todos = conversation.todos;
@@ -1410,7 +1439,7 @@ export function usePunk(projectId: string) {
           projectId,
           prompt,
           project.root,
-          routedModel,
+          selectedModel,
           handleEvent,
           {
             intent,
@@ -1420,6 +1449,7 @@ export function usePunk(projectId: string) {
             todos,
             autoRoute: intentAutoRoute,
             minds,
+            effectiveMode,
           }
         );
       } catch (err) {

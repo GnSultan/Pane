@@ -59,6 +59,16 @@ export interface TokenAnalyticsRow {
   total_cost_usd: number;
   avg_duration_ms: number;
   call_count: number;
+  last_used: number;
+}
+
+export interface TokenTimeSeriesRow {
+  day: string;
+  daily_cost: number;
+  daily_input: number;
+  daily_output: number;
+  daily_cache_read: number;
+  daily_calls: number;
 }
 
 export async function getTokenAnalytics(
@@ -66,6 +76,17 @@ export async function getTokenAnalytics(
   sinceMs: number = 0,
 ): Promise<TokenAnalyticsRow[]> {
   return electronAPI.invoke("get_token_analytics", { projectId, sinceMs });
+}
+
+export async function getTokenTimeSeries(
+  projectId: string | null,
+  sinceMs: number = 0,
+): Promise<TokenTimeSeriesRow[]> {
+  return electronAPI.invoke("get_token_timeseries", { projectId, sinceMs });
+}
+
+export async function getModelRates(models: string[]): Promise<Record<string, { input: number; output: number } | null>> {
+  return electronAPI.invoke("get_model_rates", { models });
 }
 
 export async function getConversationSlice(
@@ -99,6 +120,15 @@ export async function getCwd(): Promise<string> {
 
 export async function detectProjectRoot(startPath: string): Promise<string> {
   return electronAPI.invoke("detect_project_root", { startPath });
+}
+
+/** Opens a native file/folder picker (files + dirs, multi-select).
+ *  Paths inside projectRoot are returned relative; others are absolute. */
+export async function showFilePicker(
+  defaultPath: string,
+  projectRoot: string,
+): Promise<string[] | null> {
+  return electronAPI.invoke("show-file-picker", { defaultPath, projectRoot });
 }
 
 export async function watchDirectory(path: string): Promise<void> {
@@ -229,6 +259,10 @@ export interface SendToPunkOptions {
   todos?: Todo[];
   autoRoute?: boolean;
   minds?: Array<{ id: string }>;
+  /** Effective mode from the mode pill — single source of truth for orchestration.
+   *  When set, overrides the heuristic router so the system prompt stays
+   *  consistent across turns. */
+  effectiveMode?: string;
   // Mind chat overrides — when projectId starts with "mind:", these control behavior
   systemPromptOverride?: string;
   _systemOverride?: boolean;
@@ -376,6 +410,7 @@ export async function sendToPunk(
       todos: opts.todos,
       autoRoute: opts.autoRoute,
       minds: opts.minds,
+      effectiveMode: opts.effectiveMode,
       // Mind chat overrides — forwarded when present
       ...(opts.systemPromptOverride ? { systemPromptOverride: opts.systemPromptOverride } : {}),
       ...(opts._systemOverride ? { _systemOverride: opts._systemOverride } : {}),
@@ -1102,11 +1137,6 @@ export async function lensPostDelete(postId: string): Promise<{ deleted: boolean
   return electronAPI.invoke("lens_post_delete", { postId });
 }
 
-// Notify punks that the user has opened or switched to a project.
-// Fire-and-forget — punks schedule proactive work with a delay.
-export async function punkProjectActive(projectId: string, projectRoot: string | null = null): Promise<void> {
-  return electronAPI.invoke("punk_project_active", { projectId, projectRoot });
-}
 
 export interface LensComment {
   id: string;
@@ -1406,4 +1436,47 @@ export async function cloudListBackups(): Promise<{ backups: CloudBackupEntry[] 
 // Theme-aware dock icon — switches between default/glass/dark variants
 export function setAppTheme(theme: string): void {
   electronAPI.invoke("set_app_theme", { theme }).catch(() => {});
+}
+
+// ── Punk Review System ──────────────────────────────────────────────────────
+
+export interface ReviewFinding {
+  id: string;
+  session_id: string;
+  project_id: string;
+  punk: string;
+  severity: "critical" | "warning" | "note";
+  finding: string;
+  structured: string;
+  location: string | null;
+  remediation: string | null;
+  created_at: string;
+}
+
+export interface ReviewSession {
+  id: string;
+  project_id: string;
+  status: "running" | "completed" | "failed";
+  diff_summary: string | null;
+  base_ref: string | null;
+  punk_count: number;
+  finding_count: number;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export async function runReview(projectId: string, workingDir: string): Promise<{ started: boolean }> {
+  return electronAPI.invoke("run_review", { projectId, workingDir });
+}
+
+export async function reviewFindingsList(sessionId: string): Promise<{ findings: ReviewFinding[] }> {
+  return electronAPI.invoke("review_findings_list", { sessionId });
+}
+
+export async function reviewSessionsList(projectId: string): Promise<{ sessions: ReviewSession[] }> {
+  return electronAPI.invoke("review_sessions_list", { projectId });
+}
+
+export async function reviewSessionLatest(projectId: string): Promise<{ session: ReviewSession | null; findings: ReviewFinding[] }> {
+  return electronAPI.invoke("review_session_latest", { projectId });
 }

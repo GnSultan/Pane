@@ -36,6 +36,13 @@ export const METHOD_ATOMS = [
     sortOrder: 2,
   },
   {
+    id: "method-continue",
+    text: "You have full project context from previous turns. Do not re-orient or re-read files you already know. Proceed directly with the task. If anything changed since your last turn, Pane has injected a [context update] block.",
+    facet: "method",
+    priority: 0.9,
+    sortOrder: 2, // Same slot as ORIENT — replaces it on continuation turns
+  },
+  {
     id: "method-scope",
     text: "SCOPE: Identify exactly which files need to change. Use the codebase map below to locate files by purpose. For symbol lookups, use pane_find_symbol (exact file:line in <1ms). State your scope before touching anything. If you need to touch a file not in scope, explain why first.",
     facet: "method",
@@ -76,6 +83,13 @@ export const METHOD_ATOMS = [
     facet: "method",
     priority: 0.7,
     sortOrder: 8,
+  },
+  {
+    id: "method-analyze",
+    text: "ANALYZE: Read broadly across the codebase. Trace data flows and connections between modules. Report findings with structured sections: what you found, root causes, implications, and concrete recommendations. Do not modify files — investigation only.",
+    facet: "method",
+    priority: 0.85,
+    sortOrder: 9,
   },
 ];
 
@@ -147,6 +161,13 @@ export const RULE_ATOMS = [
     priority: 0.7,
     sortOrder: 0,
   },
+  {
+    id: "rule-no-suppressions",
+    text: "Never add @ts-nocheck, @ts-ignore, eslint-disable, or 'as any' to suppress errors. Pane's quality gates scan every write and will reject these. Fix the root cause of type errors and lint violations instead of hiding them.",
+    facet: "rule",
+    priority: 0.95,
+    sortOrder: 0,
+  },
 ];
 
 // ── Guideline atoms ──────────────────────────────────────────────────────────
@@ -162,9 +183,15 @@ export const GUIDELINE_ATOMS = [
   },
   {
     id: "guide-pane-tools",
-    text: "Pane Tools: The codebase map below is your primary navigation tool. Use pane_find_symbol for exact symbol→file:line lookups. Use pane_recall to orient yourself. Use pane_remember to preserve discoveries.",
-    facet: "guideline",
-    priority: 0.6,
+    text: `Pane provides intelligent tools that are faster than manual exploration. Follow this priority:
+1. Start with explore for any new area — one natural language query returns files, functions, relationships. Replaces grep→read→grep→read cycles.
+2. Use pane_find_symbol to locate functions, types, components by name — never grep for a symbol name.
+3. Use pane_read_files to batch-read multiple files — never read files one at a time when you need several.
+4. Use pane_codebase_navigator to understand what imports what — never trace imports manually.
+5. Fall back to grep_search only for content pattern matching (regex), not for finding definitions.
+6. Use pane_recall for project memory and pane_remember to preserve discoveries.`,
+    facet: "rule",
+    priority: 0.85,
     sortOrder: 0,
   },
   {

@@ -112,6 +112,8 @@ const IMPLEMENT_KEYWORDS =
   /\b(implement|build|create|add|make|write|set ?up|scaffold|generate|develop|integrate|connect|wire ?up|hook ?up|new feature)\b/i;
 const REVIEW_KEYWORDS =
   /\b(review|check|audit|inspect|look at|examine|evaluate|assess|verify|validate)\b/i;
+const ANALYZE_KEYWORDS =
+  /\b(analyze|audit|investigate|trace|explain how|walk me through|deep dive|review the|inspect the|examine the|assess the|evaluate the|where are we failing|what'?s wrong with|how does.*work|how do.*work|go deep into)\b/i;
 
 // Technology complexity tiers
 const TECH_SECURITY =
@@ -310,6 +312,17 @@ export function classifyTaskType(message) {
 export function classifyMode(message, signals) {
   const { workingSetSize = 0, pendingTodos = 0, taskType } = signals;
   const trimmed = message.trim();
+
+  // Analyze: deep investigation / architecture audit — no code execution.
+  // Must match analyze keywords AND be an explanatory/review/architect task type.
+  // This catches "analyze the routing pipeline", "where are we failing in X",
+  // "go deep into the codebase" — messages that would otherwise trigger orchestrate.
+  if (
+    ANALYZE_KEYWORDS.test(trimmed) &&
+    (taskType === "explain" || taskType === "architect" || taskType === "review")
+  ) {
+    return "analyze";
+  }
 
   // Discuss: explanation + no code + question
   if (
@@ -591,8 +604,16 @@ export function routeHeuristic(input) {
     reasoning = "deep";
   }
 
+  // Analyze mode: deep reading, no code execution
+  if (mode === "analyze") {
+    discovery = true;
+    reasoning = "deep";
+    verification = "none";
+    fileDepth = "deep";
+  }
+
   // Verification strategy
-  if (mode === "discuss" || taskType === "conversation" || taskType === "quick-answer" || taskType === "explain") {
+  if (mode === "discuss" || mode === "analyze" || taskType === "conversation" || taskType === "quick-answer" || taskType === "explain") {
     verification = "none";
   } else if (complexity === "high" || taskType === "refactor") {
     verification = "test";
@@ -603,6 +624,8 @@ export function routeHeuristic(input) {
   // File depth
   if (mode === "discuss") {
     fileDepth = "none";
+  } else if (mode === "analyze") {
+    fileDepth = "deep";
   } else if (discovery) {
     fileDepth = "deep";
   } else if (mode === "orchestrate") {
@@ -634,7 +657,8 @@ export function routeHeuristic(input) {
   // ── Apply escalation overrides ──────────────────────────────────────────
 
   // Stage 2+ forces orchestrate, discovery, deep reasoning
-  if (escalationStage >= 2) {
+  // (but don't override analyze — it's already deep + read-only)
+  if (escalationStage >= 2 && mode !== "analyze") {
     mode = "orchestrate";
     discovery = true;
     reasoning = "deep";

@@ -27,6 +27,8 @@ import { startBackupSchedule } from "./backup-engine.mjs";
 import { initCloudAuth } from "./cloud-auth.mjs";
 import { registerCloudSyncHandlers } from "./cloud-sync.mjs";
 import { MindPunks } from "./mind-punks.mjs";
+import { getModelRates } from "./pricing.mjs";
+import { contextStore } from "./context-store.mjs";
 import { getPaneDb, extractMessageText } from "./pane-db.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
@@ -106,6 +108,27 @@ async function registerClaudeHandlers() {
       return [];
     }
   });
+  ipcMain.handle("get_token_timeseries", async (_event, { projectId, sinceMs }) => {
+    try {
+      const db = getPaneDb();
+      if (projectId) {
+        return db.stmts.getTokenTimeSeries?.all(projectId, sinceMs || 0) || [];
+      }
+      return db.stmts.getGlobalTokenTimeSeries?.all(sinceMs || 0) || [];
+    } catch (err) {
+      console.error("[main] get_token_timeseries error:", err.message);
+      return [];
+    }
+  });
+
+  ipcMain.handle("get_model_rates", async (_event, { models }) => {
+    const rates = {};
+    for (const m of models) {
+      rates[m] = getModelRates(m);
+    }
+    return rates;
+  });
+
   ipcMain.handle("check_claude_version", async () => {
     try {
       const { stdout } = await execFileAsync("claude", ["--version"], {
@@ -788,6 +811,25 @@ Improvements
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
   });
+
+  // Generic file/folder picker used by the InputBar "add path" button.
+  // Returns an array of display strings — relative to projectRoot when the
+  // selection is inside it, absolute otherwise.
+  ipcMain.handle("show-file-picker", async (_event, { defaultPath, projectRoot } = {}) => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      defaultPath: defaultPath || undefined,
+      properties: ["openFile", "openDirectory", "multiSelections"],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths.map((p) => {
+      if (projectRoot && p.startsWith(projectRoot + path.sep)) {
+        return path.relative(projectRoot, p);
+      }
+      return p;
+    });
+  });
   ipcMain.handle("create-directory", async (_event, dirPath) => {
     const resolved = dirPath.startsWith("~/")
       ? path.join(os.homedir(), dirPath.slice(2))
@@ -1010,7 +1052,6 @@ function registerWatcherHandlers() {
       if (pendingPaths.size > 0) {
         const paths = Array.from(pendingPaths);
         sendToRenderer("pane://file-changed", paths);
-        if (mindPunks) mindPunks.onFilesChanged(paths);
         pendingPaths = /* @__PURE__ */ new Set();
       }
       debounceTimer = null;
@@ -2089,10 +2130,6 @@ function registerBrainHandlers() {
 
   ipcMain.handle("brain_mind_add", async (_event, args) => {
     const result = await brainRequest("mind_add", { content: args.content, projectId: args.projectId || null });
-    // Fire-and-forget: punks analyze new entries asynchronously
-    if (result?.entry && mindPunks) {
-      setTimeout(() => mindPunks.onMindEntryAdded(result.entry, args.projectId).catch(() => {}), 2000);
-    }
     return result;
   });
 
@@ -2115,20 +2152,32 @@ function registerBrainHandlers() {
   ipcMain.handle('brain_mind_thread_set_session', async (_event, args) => brainRequest('mind_thread_set_session', {thread_id: args.threadId, session_id: args.sessionId}));
   ipcMain.handle('brain_mind_thread_delete', async (_event, args) => brainRequest('mind_thread_delete', {id: args.id}));
 
-  // Punk proactive trigger: fired by renderer when user opens or switches to a project
-  ipcMain.handle('punk_project_active', (_event, args) => {
-    if (mindPunks && args.projectId) {
-      mindPunks.onProjectActive(args.projectId, args.projectRoot ?? null);
-    }
-    return null;
+  // On-demand punk review: user triggers from Lens UI
+  ipcMain.handle('run_review', async (_event, args) => {
+    if (!mindPunks || !args.projectId) return { started: false };
+    // Fire-and-forget — results come via pane://review-complete event
+    mindPunks.runReview(args.projectId, args.workingDir).catch(err => {
+      console.error("[review] failed:", err.message);
+      sendToRenderer("pane://review-complete", {
+        projectId: args.projectId, sessionId: null, error: err.message, findings: [],
+      });
+    });
+    return { started: true };
+  });
+
+  // Review data queries
+  ipcMain.handle('review_findings_list', async (_event, args) => {
+    return brainRequest('review_findings_list', { sessionId: args.sessionId });
+  });
+  ipcMain.handle('review_sessions_list', async (_event, args) => {
+    return brainRequest('review_sessions_list', { projectId: args.projectId });
+  });
+  ipcMain.handle('review_session_latest', async (_event, args) => {
+    return brainRequest('review_session_latest', { projectId: args.projectId });
   });
 
   ipcMain.handle('lens_post_add', async (_event, args) => {
     const result = await brainRequest('lens_post_add', { contributor: args.contributor, content: args.content, projectId: args.projectId ?? null, entryId: args.entryId ?? null });
-    // Fire-and-forget: punks react to user posts
-    if (result?.post && result.post.contributor === "user" && mindPunks) {
-      setTimeout(() => mindPunks.onLensPostAdded(result.post, args.projectId ?? null).catch(() => {}), 2000);
-    }
     return result?.post ?? null;
   });
 
@@ -2149,15 +2198,6 @@ function registerBrainHandlers() {
 
   ipcMain.handle('lens_comment_add', async (_event, args) => {
     const result = await brainRequest('lens_comment_add', { postId: args.postId, role: args.role, content: args.content });
-    // Fire-and-forget: owning punk replies when user comments on a punk post
-    if (result?.comment && args.role === "user" && mindPunks) {
-      brainRequest('lens_post_get', { postId: args.postId }).then((postResult) => {
-        const post = postResult?.post;
-        if (post && post.contributor !== "user") {
-          setTimeout(() => mindPunks.onLensCommentAdded(result.comment, post, post.project_id).catch(() => {}), 1000);
-        }
-      }).catch(() => {});
-    }
     return result?.comment ?? null;
   });
 
@@ -2279,7 +2319,7 @@ app.whenReady().then(async () => {
   // Wire brain contextual search into punk-engine so it fires every turn.
   // This is the critical link: brain searches the knowledge graph for query-
   // relevant context and writes it to disk BEFORE compileContext() reads it.
-  punkEngine.setBrainSearch(args => {
+  punkEngine.setBrainSearch(async args => {
     const { projectId, query, taskType, atomHints, projectRoot, intent, projectWhy } = args;
     if (projectRoot) {
       brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
@@ -2292,7 +2332,7 @@ app.whenReady().then(async () => {
       enableConsolidation: Math.random() < 0.1,
     }).catch(() => {});
 
-    return brainRequest("contextual_search", {
+    const result = await brainRequest("contextual_search", {
       projectId,
       query,
       fileContext: null,
@@ -2302,6 +2342,13 @@ app.whenReady().then(async () => {
       atomHints:   atomHints || [],
       projectWhy:  projectWhy || "",
     });
+    // Update in-memory ContextStore — context-orchestrator reads from here
+    // instead of the stale JSON file. Disk write still happens in brain-engine
+    // as crash recovery backup.
+    if (result && result.type !== "error") {
+      contextStore.updateBrainExport(projectId, result);
+    }
+    return result;
   });
 
   punkEngine.setBrainRequest((type, data) => brainRequest(type, data));
@@ -2320,7 +2367,6 @@ app.whenReady().then(async () => {
     agentCall: (sys, prompt, workingDir) => punkEngine.agentCall(sys, prompt, workingDir),
     sendToRenderer,
   });
-  mindPunks.start();
 
   // Daily backup at midnight — silent, automatic, 7-day rotation + cloud push
   startBackupSchedule();

@@ -8,29 +8,12 @@ interface Notification {
   timestamp: number;
 }
 
-interface PunkNotification {
-  id: string;
-  entryId?: string;
-  punkType: string;
-  preview: string;
-  timestamp: number;
-}
-
-const PUNK_LABELS: Record<string, string> = {
-  bug: "bug analysis",
-  reflection: "reflection",
-  sentinel: "sentinel finding",
-};
 
 export function TaskNotification() {
   const [notifications, setNotifications] = useState<Notification[]>([]);
-  const [punkNotifications, setPunkNotifications] = useState<PunkNotification[]>([]);
-  const punkTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const notifTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const setActiveProject = useProjectsStore((s) => s.setActiveProject);
   const setHasUnreadCompletion = useProjectsStore((s) => s.setHasUnreadCompletion);
-  const setMode = useProjectsStore((s) => s.setMode);
-  const activeProjectId = useProjectsStore((s) => s.activeProjectId);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -60,45 +43,23 @@ export function TaskNotification() {
     };
   }, []);
 
-  // Listen for punk findings from mind-punks
+  // Listen for review completion — mark Lens as having unread findings
   useEffect(() => {
     const electronAPI = (window as any).electronAPI;
     const unlisten = electronAPI.on(
-      "pane://punk-finding",
-      (data: { entryId?: string; punkType?: string; preview?: string }) => {
-        if (!data?.punkType) return;
-        const pn: PunkNotification = {
-          id: `punk-${Date.now()}-${Math.random()}`,
-          entryId: data.entryId,
-          punkType: data.punkType,
-          preview: data.preview || "",
-          timestamp: Date.now(),
-        };
-        setPunkNotifications((prev) => [...prev.slice(-4), pn]); // keep max 5
-
-        // Mark lens as having unread activity — unless user is already on Lens
+      "pane://review-complete",
+      (data: { projectId?: string; findings?: unknown[] }) => {
+        if (!data?.projectId || !data?.findings?.length) return;
         const s = useProjectsStore.getState();
-        if (s.activeProjectId) {
-          const currentMode = s.projects.get(s.activeProjectId)?.mode;
-          if (currentMode !== "lens") {
-            s.setHasUnreadLens(s.activeProjectId, true);
-          }
+        const isViewingLens =
+          s.activeProjectId === data.projectId &&
+          s.projects.get(data.projectId)?.mode === "lens";
+        if (!isViewingLens) {
+          s.setHasUnreadLens(data.projectId, true);
         }
-
-        // Auto-dismiss after 3 seconds — conversation strip provides persistence
-        const timer = setTimeout(() => {
-          setPunkNotifications((prev) => prev.filter((n) => n.id !== pn.id));
-          punkTimers.current.delete(pn.id);
-        }, 3000);
-        punkTimers.current.set(pn.id, timer);
       }
     );
-    return () => {
-      unlisten();
-      // Clear all pending auto-dismiss timers on unmount
-      for (const timer of punkTimers.current.values()) clearTimeout(timer);
-      punkTimers.current.clear();
-    };
+    return () => unlisten();
   }, []);
 
   // Listen for new Lens posts — set badge if user isn't already on Lens
@@ -135,13 +96,7 @@ export function TaskNotification() {
     setNotifications((prev) => prev.filter((n) => n.id !== notificationId));
   };
 
-  const dismissPunkNotification = (id: string) => {
-    setPunkNotifications((prev) => prev.filter((n) => n.id !== id));
-    const timer = punkTimers.current.get(id);
-    if (timer) { clearTimeout(timer); punkTimers.current.delete(id); }
-  };
-
-  if (notifications.length === 0 && punkNotifications.length === 0) return null;
+  if (notifications.length === 0) return null;
 
   return (
     <div className="fixed top-3.5 right-3.5 flex flex-col gap-2 z-50 pointer-events-none">
@@ -174,51 +129,6 @@ export function TaskNotification() {
         </div>
       ))}
 
-      {punkNotifications.map((pn) => (
-        <div
-          key={pn.id}
-          onClick={() => {
-            dismissPunkNotification(pn.id);
-            if (activeProjectId) setMode(activeProjectId, "lens");
-          }}
-          className="bg-pane-bg/90 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 px-4 py-3
-                     animate-fadeSlideUp pointer-events-auto cursor-pointer
-                     hover:bg-pane-surface/90 btn-press
-                     flex items-start gap-3 min-w-[280px] max-w-[360px]"
-        >
-          <span
-            className="w-1.5 h-1.5 rounded-full mt-[5px] shrink-0"
-            style={{ background: "var(--pane-terminal)" }}
-          />
-          <div className="flex-1 min-w-0">
-            <p
-              className="font-mono"
-              style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)" }}
-            >
-              {PUNK_LABELS[pn.punkType] ?? pn.punkType}
-            </p>
-            {pn.preview && (
-              <p
-                className="text-pane-text-secondary truncate"
-                style={{ fontSize: "var(--pane-panel-font-size-sm)" }}
-              >
-                {pn.preview}
-              </p>
-            )}
-          </div>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              dismissPunkNotification(pn.id);
-            }}
-            className="text-pane-text-secondary/40 hover:text-pane-text-secondary
-                       w-5 h-5 flex items-center justify-center btn-press shrink-0"
-            style={{ fontSize: "var(--pane-panel-font-size)" }}
-          >
-            ×
-          </button>
-        </div>
-      ))}
     </div>
   );
 }

@@ -40,8 +40,9 @@ const __dirname = import.meta.dirname;
 
 // Claude: projectId -> AbortController (for graceful cancellation)
 const activeControllers = new Map();
-// Claude: projectId -> sessionId (for within-conversation continuity)
-const activeClaudeSessionIds = new Map();
+// CLI session IDs: projectId -> sessionId (for within-conversation continuity)
+// Populated from init events, persisted to SQLite via main process.
+const activeSessionIds = new Map(); // unified for both Claude and Gemini
 // Gemini: projectId -> child process
 const activeProcesses = new Map();
 // Per-request state (used by Gemini normalizer)
@@ -123,6 +124,11 @@ function handleGeminiLine(projectId, line, requestId) {
     switch (parsed.type) {
       case "init": {
       const sessionId = parsed.session_id || `gemini-${Date.now()}`;
+      // Track session ID for resume (mirrors Claude's pattern)
+      if (parsed.session_id) {
+        activeSessionIds.set(projectId, parsed.session_id);
+        sendToMain({ type: "persist_session_id", projectId, sessionId: parsed.session_id, backend: "gemini" });
+      }
       sendToMain({
         type: "event",
         projectId,
@@ -517,12 +523,27 @@ const RENDERER_MSG_TYPES = new Set([
   "result",
 ]);
 
+// Resolve SDK model aliases to actual model names for analytics
+// Resolve SDK model aliases to canonical names for analytics.
+// The SDK and CLI use short names; analytics should show one consistent name per model.
+const SDK_MODEL_ALIASES = {
+  "default": "claude-opus-4-6",
+  "opusplan": "claude-opus-4-6",
+  "opus": "claude-opus-4-6",
+  "sonnet": "claude-sonnet-4-6",
+  "sonnet[1m]": "claude-sonnet-4-6",
+  "haiku": "claude-haiku-4-5",
+  "claude-3-5-sonnet": "claude-sonnet-4-6",
+  "claude-3-5-haiku": "claude-haiku-4-5",
+  "claude-3-opus": "claude-opus-4-6",
+};
+
 async function handleClaudeSpawn({
   projectId,
   requestId,
   prompt,
   workingDir,
-  model,
+  model: rawModel,
   systemPrompt,
   historyLength,
   mcpServerDest,
@@ -530,6 +551,10 @@ async function handleClaudeSpawn({
   maxTurns,
   noExec,
 }) {
+  // Resolve aliases: "default" → "claude-opus-4-6", "opusplan" → "claude-opus-4-6"
+  // The SDK accepts aliases but analytics should show the real model name.
+  const model = SDK_MODEL_ALIASES[rawModel?.toLowerCase()] || rawModel;
+
   const ac = new AbortController();
   const oldAc = activeControllers.get(projectId);
   if (oldAc) oldAc.abort();
@@ -542,9 +567,66 @@ async function handleClaudeSpawn({
     event: { event: "processStarted", data: null },
   });
 
+  // ── Write Pane section to CLAUDE.md so Claude SDK uses MCP tools effectively ──
+  // Marked with delimiters so user content is never touched.
+  try {
+    const claudeMdPath = path.join(workingDir, "CLAUDE.md");
+    const PANE_START = "<!-- PANE:START -->";
+    const PANE_END = "<!-- PANE:END -->";
+
+    const paneSection = `${PANE_START}
+# Pane Workspace
+
+This project is managed by Pane. You have pane_ MCP tools that are faster than manual exploration.
+
+## Tool Priority (follow this order)
+
+1. **explore** — start here for any new area. One query returns files, functions, relationships. Replaces grep→read cycles.
+2. **pane_find_symbol** — find any function, class, type by name. Instant. Never use Grep for symbol names.
+3. **pane_read_files** — batch read multiple files at once. Never read one at a time when you need several.
+4. **pane_codebase_navigator** — dependency map for a file. Never trace imports manually.
+5. **pane_find_references** — every usage of a symbol across the codebase.
+6. Use Grep only for content pattern matching (regex), not for locating definitions.
+
+## Project Intelligence
+
+- **pane_project_context** — project name, branch, file structure
+- **pane_brief** — project decisions, lessons, session history
+- **pane_synthesize** — architectural DNA, why things are the way they are
+- **pane_recall** — search project memory for past decisions and context
+- **pane_architecture_brief** — locked decisions and patterns for a subsystem
+- **pane_ui_constraints** — design rules for component types
+- **pane_run_in_terminal** — run tests to verify, don't guess
+
+## Quality Standards
+
+- Never add @ts-nocheck, @ts-ignore, eslint-disable, or 'as any' to suppress errors. Fix root causes.
+- Pane's quality gates scan every write and will flag violations.
+- Follow existing patterns in the codebase. Don't invent abstractions for one-time operations.
+${PANE_END}`;
+
+    let existing = "";
+    try { existing = await fsp.readFile(claudeMdPath, "utf-8"); } catch {}
+
+    if (existing.includes(PANE_START)) {
+      // Replace existing Pane section, preserve user content
+      const before = existing.slice(0, existing.indexOf(PANE_START));
+      const after = existing.slice(existing.indexOf(PANE_END) + PANE_END.length);
+      await fsp.writeFile(claudeMdPath, before + paneSection + after, "utf-8");
+    } else if (existing) {
+      // Append Pane section to existing user CLAUDE.md
+      await fsp.writeFile(claudeMdPath, existing + "\n\n" + paneSection, "utf-8");
+    } else {
+      // No CLAUDE.md exists — create with Pane section only
+      await fsp.writeFile(claudeMdPath, paneSection + "\n", "utf-8");
+    }
+  } catch (err) {
+    console.warn("[cli-worker] Failed to write CLAUDE.md:", err.message);
+  }
+
   const options = {
     cwd: workingDir,
-    model: model || undefined,
+    model: rawModel || undefined,  // Pass original to SDK (accepts aliases like "default")
     appendSystemPrompt: systemPrompt || undefined,
     pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
     executable: process.execPath,
@@ -585,7 +667,7 @@ async function handleClaudeSpawn({
   const MAX_AUTO_RESUMES = 10;
   // Resume within-conversation continuity if history exists; new conversations (historyLength=0) start fresh.
   // Pane context infrastructure handles project-level context; session resume handles conversation-level history.
-  let resumeSessionId = historyLength > 0 ? (activeClaudeSessionIds.get(projectId) || null) : null;
+  let resumeSessionId = historyLength > 0 ? (activeSessionIds.get(projectId) || null) : null;
   let autoResumes = 0;
   let sdkInfoEmitted = false;
 
@@ -605,7 +687,9 @@ async function handleClaudeSpawn({
           sdkInfoEmitted = true;
           if (msg.session_id) {
             resumeSessionId = msg.session_id;
-            activeClaudeSessionIds.set(projectId, msg.session_id);
+            activeSessionIds.set(projectId, msg.session_id);
+            // Persist to SQLite via main process (survives app restarts)
+            sendToMain({ type: "persist_session_id", projectId, sessionId: msg.session_id, backend: "claude" });
           }
           // Fire-and-forget: fetch SDK metadata (models + account) once per session
           Promise.all([
@@ -828,6 +912,37 @@ async function handleClaudeSpawn({
       console.warn("[cli-worker] State hygiene failed (non-fatal):", err.message);
     }
 
+    // ── Turn Sentinel: independently verify the SDK's work ─────────────
+    // Runs tsc + eslint on changed files. Quality metric recording happens
+    // in punk-engine (main process) when it receives the arbiter_verdict event,
+    // because UtilityProcess workers cannot access pane-db.mjs (SQLite).
+    if (hadFileEdits) {
+      try {
+        const { runTurnSentinel } = await import("./code-arbiter.mjs");
+        // git diff --name-only (no HEAD) catches both staged and unstaged changes
+        const { stdout } = await execAsync(
+          'git diff --name-only 2>/dev/null || echo ""',
+          { cwd: workingDir, timeout: 5000 },
+        );
+        const changedFiles = stdout.trim().split("\n").filter(Boolean);
+        if (changedFiles.length > 0) {
+          const verdict = await runTurnSentinel(projectId, workingDir, changedFiles);
+
+          sendToMain({
+            type: "event",
+            projectId,
+            requestId,
+            event: {
+              event: "arbiter_verdict",
+              data: { ...verdict, model, provider: command === "claude" ? "anthropic" : "gemini" },
+            },
+          });
+        }
+      } catch (err) {
+        console.warn("[cli-worker] Turn sentinel failed:", err.message);
+      }
+    }
+
     // Refresh git status then write handoff — enables seamless model swaps FROM Claude Code
     try {
       const gitStatus = await getGitStatus(workingDir);
@@ -924,10 +1039,67 @@ async function handleGeminiSpawn({
     );
   } catch {}
 
+  // ── Write Pane section to GEMINI.md so Gemini CLI uses MCP tools effectively ──
+  try {
+    const geminiMdPath = path.join(workingDir, "GEMINI.md");
+    const PANE_START = "<!-- PANE:START -->";
+    const PANE_END = "<!-- PANE:END -->";
+
+    const paneSection = `${PANE_START}
+# Pane Workspace
+
+This project is managed by Pane. You have pane_ MCP tools that are faster than manual exploration.
+
+## Tool Priority (follow this order)
+
+1. **explore** — start here for any new area. One query returns files, functions, relationships. Replaces grep→read cycles.
+2. **pane_find_symbol** — find any function, class, type by name. Instant. Never grep for symbol names.
+3. **pane_read_files** — batch read multiple files at once. Never read one at a time when you need several.
+4. **pane_codebase_navigator** — dependency map for a file. Never trace imports manually.
+5. **pane_find_references** — every usage of a symbol across the codebase.
+6. Use grep only for content pattern matching (regex), not for locating definitions.
+
+## Project Intelligence
+
+- **pane_project_context** — project name, branch, file structure
+- **pane_brief** — project decisions, lessons, session history
+- **pane_synthesize** — architectural DNA, why things are the way they are
+- **pane_recall** — search project memory for past decisions and context
+- **pane_architecture_brief** — locked decisions and patterns for a subsystem
+- **pane_ui_constraints** — design rules for component types
+- **pane_run_in_terminal** — run tests to verify, don't guess
+
+## Quality Standards
+
+- Never add @ts-nocheck, @ts-ignore, eslint-disable, or 'as any' to suppress errors. Fix root causes.
+- Pane's quality gates scan every write and will flag violations.
+- Follow existing patterns in the codebase. Don't invent abstractions for one-time operations.
+${PANE_END}`;
+
+    let existing = "";
+    try { existing = await fsp.readFile(geminiMdPath, "utf-8"); } catch {}
+
+    if (existing.includes(PANE_START)) {
+      const before = existing.slice(0, existing.indexOf(PANE_START));
+      const after = existing.slice(existing.indexOf(PANE_END) + PANE_END.length);
+      await fsp.writeFile(geminiMdPath, before + paneSection + after, "utf-8");
+    } else if (existing) {
+      await fsp.writeFile(geminiMdPath, existing + "\n\n" + paneSection, "utf-8");
+    } else {
+      await fsp.writeFile(geminiMdPath, paneSection + "\n", "utf-8");
+    }
+  } catch (err) {
+    console.warn("[cli-worker] Failed to write GEMINI.md:", err.message);
+  }
+
+  // ── Session resume: use Gemini's native --resume when session exists ──
+  // When resuming, Gemini loads full history from its session file — no
+  // preamble needed, just the new prompt. Saves tokens and avoids stale history.
+  const geminiResumeId = historyLength > 0 ? (activeSessionIds.get(projectId) || null) : null;
+
   let historyPreamble = "";
-  if (history && history.length > 0) {
-    // History preamble is only needed on first-turn or when session cannot be resumed.
-    // When resuming, Gemini loads full history from its session file — no limit, no preamble.
+  if (!geminiResumeId && history && history.length > 0) {
+    // No session to resume — manually reconstruct history as preamble (fallback)
     const turns = history
       .filter((m) => m.type === "user" || m.type === "assistant")
       .slice(-20);
@@ -958,9 +1130,10 @@ async function handleGeminiSpawn({
     }
   }
 
-  const fullPrompt = systemPrompt
-    ? `${systemPrompt}\n\n---\n\n${historyPreamble}${prompt}`
-    : `${historyPreamble}${prompt}`;
+  // When resuming, send just the prompt — Gemini already has the conversation
+  const fullPrompt = geminiResumeId
+    ? (systemPrompt ? `${systemPrompt}\n\n---\n\n${prompt}` : prompt)
+    : (systemPrompt ? `${systemPrompt}\n\n---\n\n${historyPreamble}${prompt}` : `${historyPreamble}${prompt}`);
 
   // Prompt is passed via stdin (not -p flag) to avoid shell arg length limits and
   // quoting fragility with large prompts containing code, JSON, or special characters.
@@ -972,6 +1145,7 @@ async function handleGeminiSpawn({
     "--allowed-mcp-server-names",
     "pane",
   ];
+  if (geminiResumeId) cmdParts.push("--resume", geminiResumeId);
   if (model && /gemini/i.test(model)) cmdParts.push("--model", model);
 
   const shellCmd = cmdParts.map((arg) => shellEscape(arg)).join(" ");
@@ -1070,19 +1244,44 @@ async function handleGeminiSpawn({
         }
       }
     }
-    sendToMain({
-      type: "event",
-      projectId,
-      requestId,
-      event: { event: "processEnded", data: { exit_code: code } },
-    });
-    if (activeProcesses.get(projectId) === child) {
-      activeProcesses.delete(projectId);
-    }
-    requestStates.delete(requestId);
-
-    // Write handoff after cleanup — enables seamless model swaps FROM Gemini CLI
+    // ── Turn Sentinel for Gemini (before processEnded so routing can adjust) ──
     ;(async () => {
+      try {
+        const { runTurnSentinel } = await import("./code-arbiter.mjs");
+        const { stdout } = await execAsync(
+          'git diff --name-only 2>/dev/null || echo ""',
+          { cwd: workingDir, timeout: 5000 },
+        );
+        const changedFiles = stdout.trim().split("\n").filter(Boolean);
+        if (changedFiles.length > 0) {
+          const verdict = await runTurnSentinel(projectId, workingDir, changedFiles);
+          sendToMain({
+            type: "event",
+            projectId,
+            requestId,
+            event: {
+              event: "arbiter_verdict",
+              data: { ...verdict, model, provider: "gemini" },
+            },
+          });
+        }
+      } catch (err) {
+        console.warn("[cli-worker] Gemini turn sentinel failed:", err.message);
+      }
+
+      // Signal completion after sentinel so routing can use the verdict
+      sendToMain({
+        type: "event",
+        projectId,
+        requestId,
+        event: { event: "processEnded", data: { exit_code: code } },
+      });
+      if (activeProcesses.get(projectId) === child) {
+        activeProcesses.delete(projectId);
+      }
+      requestStates.delete(requestId);
+
+      // Write handoff — enables seamless model swaps FROM Gemini CLI
       try {
         const gitStatus = await getGitStatus(workingDir);
         if (gitStatus) mergeState(projectId, { gitStatus });
@@ -1188,32 +1387,54 @@ async function handleSpawn({
 
   const backend = command === "claude" ? "claude-code" : "gemini";
 
-  // Use the Context Orchestrator for budget-aware assembly.
-  // The orchestrator drops low-priority layers when the model has limited context,
-  // ensuring the system prompt never overflows. Falls back to legacy compileContext()
-  // if the orchestrator fails.
+  // ── Context assembly: lean for CLI backends, full for HTTP ──────────────
+  // CLI backends (Claude SDK, Gemini CLI) are complete agents with their own
+  // tools, context management, and session resumption. They get minimal context
+  // (rules + identity + arbiter) and pull project intelligence via MCP tools.
+  // HTTP backends need Pane to manage everything — they get the full assembly.
   let context;
   let budgetInfo = null;
-  try {
-    const conversationTokens = estimateConversationTokens(history || []);
-    const result = orchestrateContext(projectId, {
-      intent,
-      historyLength,
-      backend,
-      model,
-      sqliteChanges,
-      conversationTokens,
-    });
-    context = result;
-    budgetInfo = result.budget;
 
-    // Log budget diagnostics
-    if (budgetInfo.layersDropped > 0) {
-      console.log(`[cli-worker] Context budget: ${budgetInfo.systemUsed}/${budgetInfo.systemBudget} tokens (${budgetInfo.layersIncluded} layers, dropped: ${budgetInfo.droppedNames.join(", ")})`);
+  const isCli = command === "claude" || command === "gemini";
+
+  if (isCli) {
+    // Lean mode: ~500 tokens instead of 5000. MCP tools provide the rest.
+    const isResume = historyLength > 0 && activeSessionIds.has(projectId);
+    try {
+      context = orchestrateContext(projectId, {
+        mode: "lean",
+        isResume,
+        intent,
+        backend,
+      });
+      budgetInfo = context.budget;
+      console.log(`[cli-worker] Lean context: ${budgetInfo.systemUsed} tokens (resume=${isResume})`);
+    } catch (err) {
+      console.warn(`[cli-worker] Lean context failed, falling back to full: ${err.message}`);
+      context = compileContext(projectId, intent, historyLength, backend, sqliteChanges);
     }
-  } catch (err) {
-    console.warn(`[cli-worker] Orchestrator failed, falling back to compileContext: ${err.message}`);
-    context = compileContext(projectId, intent, historyLength, backend, sqliteChanges);
+  } else {
+    // Full mode: budget-aware assembly for HTTP-style backends
+    try {
+      const conversationTokens = estimateConversationTokens(history || []);
+      const result = orchestrateContext(projectId, {
+        intent,
+        historyLength,
+        backend,
+        model,
+        sqliteChanges,
+        conversationTokens,
+      });
+      context = result;
+      budgetInfo = result.budget;
+
+      if (budgetInfo.layersDropped > 0) {
+        console.log(`[cli-worker] Context budget: ${budgetInfo.systemUsed}/${budgetInfo.systemBudget} tokens (${budgetInfo.layersIncluded} layers, dropped: ${budgetInfo.droppedNames.join(", ")})`);
+      }
+    } catch (err) {
+      console.warn(`[cli-worker] Orchestrator failed, falling back to compileContext: ${err.message}`);
+      context = compileContext(projectId, intent, historyLength, backend, sqliteChanges);
+    }
   }
 
   const basePrompt = systemPromptOverride || context.full;
@@ -1331,6 +1552,12 @@ process.parentPort.on("message", ({ data }) => {
           },
         });
       });
+      break;
+    case "restore_session_id":
+      // Main process sends stored session IDs on worker startup
+      if (data.projectId && data.sessionId) {
+        activeSessionIds.set(data.projectId, data.sessionId);
+      }
       break;
     case "abort":
       handleAbort(data);

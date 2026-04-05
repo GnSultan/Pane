@@ -490,6 +490,7 @@ html[data-theme="glass"] #root {
   z-index: 0;
   content-visibility: hidden;
 }
+[data-mode="conversation"] > [data-page="conversation"],
 [data-mode="viewer"] > [data-page="viewer"],
 [data-mode="terminal"] > [data-page="terminal"],
 [data-mode="git"] > [data-page="git"],

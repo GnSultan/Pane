@@ -1,37 +1,138 @@
-import { useEffect, useState, useMemo } from "react";
-import { getTokenAnalytics, type TokenAnalyticsRow } from "../../lib/tauri-commands";
-import { motion } from "framer-motion";
+import { useEffect, useState, useMemo, useCallback } from "react";
+import { getTokenAnalytics, getTokenTimeSeries, getModelRates, type TokenAnalyticsRow, type TokenTimeSeriesRow } from "../../lib/tauri-commands";
+import { useWorkspaceStore } from "../../stores/workspace";
 
 type TimeRange = "today" | "week" | "month" | "all";
 
+const RANGES: Record<TimeRange, number> = {
+  today: 24 * 60 * 60 * 1000,
+  week: 7 * 24 * 60 * 60 * 1000,
+  month: 30 * 24 * 60 * 60 * 1000,
+  all: 0,
+};
+
+const PROVIDER_LINKS: Record<string, { label: string; url: string }> = {
+  openrouter: { label: "OpenRouter", url: "https://openrouter.ai/activity" },
+  deepseek: { label: "DeepSeek", url: "https://platform.deepseek.com/usage" },
+  anthropic: { label: "Anthropic", url: "https://console.anthropic.com/settings/billing" },
+  gemini: { label: "Google AI", url: "https://aistudio.google.com/" },
+  kimi: { label: "Kimi", url: "https://platform.moonshot.cn/" },
+  xiaomi: { label: "Xiaomi", url: "https://platform.xiaomimimo.com/" },
+};
+
+function formatCost(val: number) {
+  if (val === 0) return "$0.00";
+  // Show actual cents — don't hide real spend behind "< $0.01"
+  if (val < 0.01) return `$${val.toFixed(4)}`;
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2 }).format(val);
+}
+
+function formatTokens(val: number) {
+  if (val >= 1_000_000) return (val / 1_000_000).toFixed(1) + "M";
+  if (val >= 1_000) return (val / 1_000).toFixed(1) + "k";
+  return val.toString();
+}
+
+function timeAgo(ts: number) {
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+function DailyCostChart({ data }: { data: TokenTimeSeriesRow[] }) {
+  if (data.length === 0) return null;
+  // Cap to last 30 entries — enough to see trends, not a wall
+  const capped = data.slice(-30);
+  const maxCost = Math.max(...capped.map(d => d.daily_cost), 0.001);
+  const [hovered, setHovered] = useState<TokenTimeSeriesRow | null>(null);
+  const height = 48;
+  const barWidth = Math.max(4, Math.min(12, 280 / capped.length));
+  const gap = 2;
+  const width = capped.length * (barWidth + gap);
+
+  return (
+    <div>
+      <div className="relative">
+        <svg
+          width="100%"
+          height={height}
+          viewBox={`0 0 ${width} ${height}`}
+          preserveAspectRatio="none"
+          onMouseLeave={() => setHovered(null)}
+        >
+          {capped.map((d, i) => {
+            const barHeight = Math.max(1, (d.daily_cost / maxCost) * (height - 2));
+            const isHovered = hovered === d;
+            return (
+              <rect
+                key={d.day}
+                x={i * (barWidth + gap)}
+                y={height - barHeight}
+                width={barWidth}
+                height={barHeight}
+                rx={1}
+                fill="currentColor"
+                className={isHovered ? "text-pane-text" : "text-pane-text-secondary/30"}
+                style={{ transition: "fill 0.1s" }}
+                onMouseEnter={() => setHovered(d)}
+              />
+            );
+          })}
+        </svg>
+      </div>
+      <div className="flex items-center gap-3 mt-1">
+        <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+          {(hovered || capped[capped.length - 1])?.day}
+        </span>
+        <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+          {formatCost((hovered || capped[capped.length - 1])?.daily_cost ?? 0)} · {(hovered || capped[capped.length - 1])?.daily_calls ?? 0} calls · {formatTokens(((hovered || capped[capped.length - 1])?.daily_input ?? 0) + ((hovered || capped[capped.length - 1])?.daily_output ?? 0))} tokens
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export function TokenAnalytics({ projectId }: { projectId: string | null }) {
   const [data, setData] = useState<TokenAnalyticsRow[]>([]);
+  const [timeSeries, setTimeSeries] = useState<TokenTimeSeriesRow[]>([]);
+  const [rates, setRates] = useState<Record<string, { input: number; output: number } | null>>({});
   const [range, setRange] = useState<TimeRange>("month");
   const [loading, setLoading] = useState(true);
+  const lastTokenUsageAt = useWorkspaceStore((s) => (s as any).lastTokenUsageAt ?? 0);
 
-  const ranges: Record<TimeRange, number> = {
-    today: 24 * 60 * 60 * 1000,
-    week: 7 * 24 * 60 * 60 * 1000,
-    month: 30 * 24 * 60 * 60 * 1000,
-    all: 0,
-  };
-
-  const fetchAnalytics = async () => {
+  const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
-      const sinceMs = ranges[range] === 0 ? 0 : Date.now() - ranges[range];
-      const rows = await getTokenAnalytics(projectId, sinceMs);
+      const sinceMs = RANGES[range] === 0 ? 0 : Date.now() - RANGES[range];
+      const [rows, series] = await Promise.all([
+        getTokenAnalytics(projectId, sinceMs),
+        getTokenTimeSeries(projectId, sinceMs),
+      ]);
       setData(rows);
+      setTimeSeries(series);
+      // Fetch list prices for all models in the results
+      const models = [...new Set(rows.map(r => r.model))];
+      if (models.length > 0) {
+        getModelRates(models).then(r => { console.log("[analytics] rates:", r); setRates(r); }).catch(err => console.warn("[analytics] rates fetch failed:", err));
+      }
     } catch (err) {
-      console.error("[analytics] failed to fetch:", err);
+      console.error("[analytics] fetch failed:", err);
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    fetchAnalytics();
   }, [projectId, range]);
+
+  // Fetch on mount and range change
+  useEffect(() => { fetchAll(); }, [fetchAll]);
+
+  // Live updates — refetch 2s after each token_usage event
+  useEffect(() => {
+    if (!lastTokenUsageAt) return;
+    const timer = setTimeout(fetchAll, 2000);
+    return () => clearTimeout(timer);
+  }, [lastTokenUsageAt, fetchAll]);
 
   const totals = useMemo(() => {
     return data.reduce(
@@ -40,170 +141,170 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
         input: acc.input + row.total_input_tokens,
         output: acc.output + row.total_output_tokens,
         cached: acc.cached + row.total_cache_read,
+        cacheCreation: acc.cacheCreation + row.total_cache_creation,
         calls: acc.calls + row.call_count,
       }),
-      { cost: 0, input: 0, output: 0, cached: 0, calls: 0 }
+      { cost: 0, input: 0, output: 0, cached: 0, cacheCreation: 0, calls: 0 }
     );
   }, [data]);
 
-  const formatCost = (val: number) => {
-    if (val === 0) return "$0.00";
-    if (val < 0.01) return `< $0.01`;
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 2,
-    }).format(val);
-  };
+  // Estimate cache savings: (cached_tokens * full_input_rate - cached_tokens * cache_rate)
+  // Simplified: cached tokens saved ~90% of their input cost on average
+  const cacheSavings = useMemo(() => {
+    if (totals.cached === 0 || totals.input === 0) return 0;
+    const avgInputCostPerToken = totals.cost > 0 ? totals.cost / (totals.input + totals.output) : 0;
+    return totals.cached * avgInputCostPerToken * 0.8; // ~80% average savings across providers
+  }, [totals]);
 
-  const formatTokens = (val: number) => {
-    if (val >= 1_000_000) return (val / 1_000_000).toFixed(1) + "M";
-    if (val >= 1_000) return (val / 1_000).toFixed(1) + "k";
-    return val.toString();
-  };
+  // Unique providers in the data — for dynamic links
+  const activeProviders = useMemo(() => {
+    const providers = new Set(data.map(r => r.provider));
+    return [...providers].filter(p => PROVIDER_LINKS[p]);
+  }, [data]);
 
-  const maxCost = Math.max(...data.map((r) => r.total_cost_usd), 0.000001);
+  const maxCost = Math.max(...data.map(r => r.total_cost_usd), 0.000001);
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Range Selector */}
-      <div className="flex items-center justify-between">
-        <div className="flex gap-1">
-          {(["today", "week", "month", "all"] as const).map((r) => (
-            <button
-              key={r}
-              onClick={() => setRange(r)}
-              className={`px-2 py-1 rounded-lg font-mono transition-all ${
-                range === r
-                  ? "bg-pane-text/[0.08] text-pane-text"
-                  : "text-pane-text-secondary/40 hover:text-pane-text-secondary"
-              }`}
-              style={{ fontSize: "10px" }}
-            >
-              {r}
-            </button>
-          ))}
-        </div>
-        <button
-          onClick={fetchAnalytics}
-          className="text-pane-text-secondary/30 hover:text-pane-text-secondary"
-        >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
-          </svg>
-        </button>
+      {/* Range selector */}
+      <div className="flex items-center gap-1">
+        {(["today", "week", "month", "all"] as const).map((r) => (
+          <button
+            key={r}
+            onClick={() => setRange(r)}
+            className={`px-2 py-1 rounded-lg font-mono transition-all ${
+              range === r
+                ? "bg-pane-text/[0.08] text-pane-text"
+                : "text-pane-text-secondary hover:text-pane-text-secondary"
+            }`}
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {r}
+          </button>
+        ))}
       </div>
 
-      {/* Summary Cards */}
-      <div className="grid grid-cols-2 gap-3">
-        <div className="p-4 rounded-xl bg-pane-surface/50 border border-pane-border/20 flex flex-col gap-1">
-          <span className="text-pane-text-secondary/40 font-mono text-[10px] uppercase tracking-wider">total spend</span>
-          <span className="text-xl font-mono text-pane-text font-medium">{formatCost(totals.cost)}</span>
+      {/* Summary cards */}
+      <div className="grid grid-cols-3 gap-3">
+        <div className="p-3 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-1">
+          <span className="text-pane-text-secondary font-mono text-xs uppercase tracking-wider">spend</span>
+          <span className="text-lg font-mono text-pane-text font-medium tabular-nums">{formatCost(totals.cost)}</span>
+          <span className="text-xs font-mono text-pane-text-secondary">{totals.calls} calls</span>
         </div>
-        <div className="p-4 rounded-xl bg-pane-surface/50 border border-pane-border/20 flex flex-col gap-1">
-          <span className="text-pane-text-secondary/40 font-mono text-[10px] uppercase tracking-wider">total tokens</span>
-          <div className="flex items-baseline gap-2">
-            <span className="text-xl font-mono text-pane-text font-medium">{formatTokens(totals.input + totals.output)}</span>
-            <span className="text-[10px] font-mono text-pane-text-secondary/50">
-              {formatTokens(totals.cached)} cached
-            </span>
-          </div>
+        <div className="p-3 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-1">
+          <span className="text-pane-text-secondary font-mono text-xs uppercase tracking-wider">tokens</span>
+          <span className="text-lg font-mono text-pane-text font-medium tabular-nums">{formatTokens(totals.input + totals.output)}</span>
+          <span className="text-xs font-mono text-pane-text-secondary">
+            {formatTokens(totals.input)} in · {formatTokens(totals.output)} out
+          </span>
+        </div>
+        <div className="p-3 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-1">
+          <span className="text-pane-text-secondary font-mono text-xs uppercase tracking-wider">cache savings</span>
+          <span className="text-lg font-mono text-pane-status-added font-medium tabular-nums">
+            {cacheSavings > 0 ? formatCost(cacheSavings) : "—"}
+          </span>
+          <span className="text-xs font-mono text-pane-text-secondary">
+            {totals.cached > 0 && (totals.input + totals.cached) > 0
+              ? `${Math.round((totals.cached / (totals.input + totals.cached)) * 100)}% hit rate`
+              : "no cache data"}
+          </span>
         </div>
       </div>
 
-      {/* Breakdown List */}
-      <div className="flex flex-col gap-2">
-        <span className="text-pane-text-secondary/30 font-mono text-[10px] uppercase tracking-wider mb-1">breakdown by model</span>
+      {/* Daily sparkline */}
+      {timeSeries.length > 1 && (
+        <DailyCostChart data={timeSeries} />
+      )}
+
+      {/* Model breakdown */}
+      <div className="flex flex-col gap-1">
         {loading ? (
           <div className="py-8 flex justify-center">
             <div className="w-4 h-4 rounded-full border-2 border-pane-text/10 border-t-pane-text/40 animate-spin" />
           </div>
         ) : data.length === 0 ? (
           <div className="py-8 text-center">
-            <span className="text-pane-text-secondary/40 font-mono text-xs italic">no usage data for this period</span>
+            <span className="text-pane-text-secondary font-mono text-xs">no usage data for this period</span>
           </div>
         ) : (
-          <div className="space-y-4">
-            {data.map((row) => (
-              <div key={`${row.model}-${row.activity_type}`} className="group">
-                <div className="flex items-center justify-between mb-1.5">
-                  <div className="flex flex-col gap-0.5">
-                    <span className="text-pane-text font-mono text-xs">
-                      {row.model.split('/').pop()}
+          <div className="space-y-3">
+            {data.map((row) => {
+              // Cache hit = cached / (cached + non-cached input). They're additive, not overlapping.
+              const totalInput = row.total_input_tokens + row.total_cache_read;
+              const cacheHit = totalInput > 0
+                ? Math.round((row.total_cache_read / totalInput) * 100)
+                : 0;
+              return (
+                <div key={`${row.model}-${row.provider}-${row.activity_type}`}
+                  className="p-3 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-pane-text font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      {row.model.split("/").pop()}
+                      <span className="text-pane-text-secondary"> · {row.provider}</span>
                     </span>
-                    <span className="text-[9px] font-mono text-pane-text-secondary/40 uppercase tracking-tighter">
-                      {row.provider} • {row.activity_type}
+                    <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      {row.call_count} calls{(() => {
+                        const r = rates[row.model];
+                        if (r && (r.input > 0 || r.output > 0)) return ` · $${r.input}/${r.output}M`;
+                        return "";
+                      })()}
                     </span>
                   </div>
-                  <div className="text-right flex flex-col items-end">
-                    <span className="text-pane-text font-mono text-xs">{formatCost(row.total_cost_usd)}</span>
-                    <span className="text-[9px] font-mono text-pane-text-secondary/40 uppercase">
-                      {row.call_count} calls
+
+                  {/* Cost bar */}
+                  <div className="h-1.5 w-full bg-pane-text/[0.04] rounded-full overflow-hidden flex mb-2">
+                    {row.total_cache_read > 0 && (
+                      <div
+                        className="h-full bg-pane-status-added/40 rounded-l-full"
+                        style={{ width: `${(row.total_cache_read / (row.total_input_tokens + row.total_output_tokens)) * (row.total_cost_usd / maxCost) * 100}%` }}
+                      />
+                    )}
+                    <div
+                      className="h-full bg-pane-text/25"
+                      style={{ width: `${((row.total_cost_usd / maxCost) * 100) - (row.total_cache_read > 0 ? (row.total_cache_read / (row.total_input_tokens + row.total_output_tokens)) * (row.total_cost_usd / maxCost) * 100 : 0)}%` }}
+                    />
+                  </div>
+
+                  {/* Stats */}
+                  <div className="flex items-center gap-3">
+                    <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      {formatTokens(row.total_input_tokens)} in / {formatTokens(row.total_output_tokens)} out
                     </span>
+                    <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      {formatCost(row.total_cost_usd)}
+                    </span>
+                    {cacheHit > 0 && (
+                      <span className="font-mono text-pane-status-added tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                        {cacheHit}% cached
+                      </span>
+                    )}
                   </div>
                 </div>
-                {/* Visual Bar */}
-                <div className="h-1.5 w-full bg-pane-text/[0.04] rounded-full overflow-hidden relative">
-                  <motion.div
-                    initial={{ width: 0 }}
-                    animate={{ width: `${(row.total_cost_usd / maxCost) * 100}%` }}
-                    className="h-full bg-pane-text/30 group-hover:bg-pane-text/50 transition-colors rounded-full"
-                  />
-                  {/* Token Mix Bar (Subtle overlay for input/output/cache) */}
-                  <div className="absolute inset-0 flex">
-                     {/* We could add colors here for input/output/cache if desired */}
-                  </div>
-                </div>
-                {/* Secondary Stats (Hidden by default, shown on hover?) */}
-                <div className="flex items-center gap-3 mt-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <span className="text-[9px] font-mono text-pane-text-secondary/50">
-                    {formatTokens(row.total_input_tokens)} in / {formatTokens(row.total_output_tokens)} out
-                  </span>
-                  {row.total_cache_read > 0 && (
-                    <span className="text-[9px] font-mono text-pane-status-added/60">
-                      {Math.round((row.total_cache_read / row.total_input_tokens) * 100)}% cache hit
-                    </span>
-                  )}
-                  <span className="text-[9px] font-mono text-pane-text-secondary/50 ml-auto">
-                    avg {Math.round(row.avg_duration_ms)}ms
-                  </span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
 
-      {/* Deep Links */}
-      <div className="mt-4 pt-4 border-t border-pane-border/10 flex flex-col gap-3">
-        <span className="text-pane-text-secondary/30 font-mono text-[9px] uppercase tracking-wider">provider dashboards</span>
+      {/* Provider links — only show providers in the data */}
+      {activeProviders.length > 0 && (
         <div className="flex flex-wrap gap-2">
-          <a
-            href="https://openrouter.ai/activity"
-            target="_blank"
-            rel="noreferrer"
-            className="px-2 py-1 rounded bg-pane-text/[0.04] hover:bg-pane-text/[0.08] text-pane-text-secondary font-mono text-[10px] transition-colors"
-          >
-            OpenRouter ↗
-          </a>
-          <a
-            href="https://platform.deepseek.com/usage"
-            target="_blank"
-            rel="noreferrer"
-            className="px-2 py-1 rounded bg-pane-text/[0.04] hover:bg-pane-text/[0.08] text-pane-text-secondary font-mono text-[10px] transition-colors"
-          >
-            DeepSeek ↗
-          </a>
-          <a
-            href="https://console.anthropic.com/settings/billing"
-            target="_blank"
-            rel="noreferrer"
-            className="px-2 py-1 rounded bg-pane-text/[0.04] hover:bg-pane-text/[0.08] text-pane-text-secondary font-mono text-[10px] transition-colors"
-          >
-            Anthropic ↗
-          </a>
+          {activeProviders.map((provider) => {
+            const link = PROVIDER_LINKS[provider];
+            return (
+              <a
+                key={provider}
+                href={link.url}
+                target="_blank"
+                rel="noreferrer"
+                className="px-2 py-1 rounded bg-pane-text/[0.04] hover:bg-pane-text/[0.08] text-pane-text-secondary font-mono text-xs transition-colors"
+              >
+                {link.label} ↗
+              </a>
+            );
+          })}
         </div>
-      </div>
+      )}
     </div>
   );
 }

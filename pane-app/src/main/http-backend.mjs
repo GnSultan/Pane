@@ -654,6 +654,32 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "pane_find_references",
+      description:
+        "Find every place a symbol is used across the codebase — imports, call sites, JSX usage, and type references. Use after pane_find_symbol to go from declaration to all usages. Grouped by file with surrounding context.",
+      parameters: {
+        type: "object",
+        properties: {
+          symbol: {
+            type: "string",
+            description: "Exact symbol name to find usages of",
+          },
+          projectRoot: {
+            type: "string",
+            description: "Absolute path to the project root",
+          },
+          projectId: {
+            type: "string",
+            description: "Optional project ID for declaration tagging",
+          },
+        },
+        required: ["symbol", "projectRoot"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "pane_synthesize",
       description:
         "Get the project's architectural DNA — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
@@ -887,6 +913,67 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "explore",
+      description:
+        "Semantic codebase exploration — search by meaning, get the full picture. Returns relevant files, key functions with code excerpts, module relationships, and project constraints. One call replaces multiple grep + read cycles. Use this when you need to understand how something works, find where something is implemented, or get context before making changes.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Natural language description of what you're looking for" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_codebase_navigator",
+      description:
+        "Build a structural dependency map for a component or symbol — what it imports, what imports it, relevant types, and the suggested read order. Traverses the actual import graph, not semantic search. Use before making changes to understand blast radius.",
+      parameters: {
+        type: "object",
+        properties: {
+          target: { type: "string", description: "Component name, file path, or symbol to map (e.g. 'InputBar', 'useProjectsStore')" },
+          depth: { type: "number", description: "Traversal depth (1 or 2, default 1)" },
+        },
+        required: ["target"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_ui_constraints",
+      description:
+        "Get the hard design constraints for a specific component type before writing any UI code. Returns forbidden Tailwind patterns, design tokens, a reference implementation, and active anti-patterns.",
+      parameters: {
+        type: "object",
+        properties: {
+          component: { type: "string", description: "Component type or description, e.g. 'search input', 'floating panel', 'terminal output'" },
+        },
+        required: ["component"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_architecture_brief",
+      description:
+        "Get the architectural decisions, locked patterns, and gotchas for a specific subsystem before making changes. Returns the pattern in effect, locked decisions, known tensions, and specific failure modes.",
+      parameters: {
+        type: "object",
+        properties: {
+          subsystem: { type: "string", description: "Subsystem name or file path (e.g. 'terminal', 'ipc', 'auth')" },
+        },
+        required: ["subsystem"],
+      },
+    },
+  },
 ];
 
 // ── Phase-based tool lists ─────────────────────────────────────────────────
@@ -1053,11 +1140,9 @@ const CODING_FAMILIES = [
   // GLM — Z.ai, thinks before tool calls (more specific first)
   ["z-ai/glm-4.7-flash",              "Z.ai",     3],
   ["z-ai/glm-4.7",                    "Z.ai",     2],
-  // Qwen3 Coder (more specific first to avoid prefix collision)
+  // Qwen3 Coder — only coding-focused models, no catch-all
   ["qwen/qwen3-coder-next",           "Qwen",     1],
   ["qwen/qwen3-coder",                "Qwen",     2],
-  // Qwen3 catch-all for any other Qwen3 variants
-  ["qwen/qwen3",                      "Qwen",     3],
   // MiniMax — multi-agent autonomous
   ["minimax/minimax-m2.7",            "MiniMax",  2],
   ["minimax/minimax-m2.5",            "MiniMax",  2],
@@ -1089,6 +1174,9 @@ function _normalizeModel(m) {
     .replace(/\s*\(preview\)/gi, " preview")
     .replace(/:\w+$/,             "")   // :nitro, :free, :floor
     .replace(/\s+\d{4}-\d{2}$/,  "")   // trailing " 2024-11" date stamps
+    // Strip provider prefix from name: "Qwen: Qwen 3.6 Plus" → "Qwen 3.6 Plus"
+    // "StepFun: Step 3.5 Flash" → "Step 3.5 Flash"
+    .replace(/^[\w.-]+:\s*/,      "")
     .trim();
 
   // Pricing in $/Mtok (OpenRouter uses per-token strings like "0.000003")
@@ -1272,6 +1360,7 @@ export class ApiBackend extends PunkBackend {
       provider === "kimi" ||
       provider === "openrouter" ||
       provider === "stepfun" ||
+      provider === "xiaomi" ||
       provider === "alibaba" ||
       provider === "dashscope";
 
@@ -1634,6 +1723,12 @@ export class ApiBackend extends PunkBackend {
         `[http] Loaded ${messages.length} messages from history (roles: ${messages.map((m) => m.role).join(", ")})`,
       );
 
+      // Prefix-caching optimization is applied in prepareRequest() per-provider,
+      // NOT here in the shared messages array. This keeps history clean across
+      // provider switches — no [Pane context] preambles baked into stored messages.
+      // The _tiers metadata on messages[0] carries frozen/session/turn separately
+      // for prepareRequest to restructure as needed per provider.
+
       // ── Context window management ────────────────────────────────────────
       // Pane owns the context window. Instead of emergency compaction when
       // full, the window is continuously managed:
@@ -1663,6 +1758,7 @@ export class ApiBackend extends PunkBackend {
       const maxTurns = 100;
       let sessionOutput = ""; // Accumulate all model text for pattern extraction
       let turnRetryCount = 0;  // Retries for insufficient_system_resource
+      const arbiterChangedFiles = new Set(); // Track files modified for Turn Sentinel
 
       while (turn < maxTurns) {
         turn++;
@@ -1743,7 +1839,7 @@ export class ApiBackend extends PunkBackend {
           body.include_reasoning = true;
         }
 
-        const { url, headers, finalBody } = this.prepareRequest(
+        const { url, headers, finalBody } = await this.prepareRequest(
           apiConfig,
           body,
           request,
@@ -2043,6 +2139,14 @@ export class ApiBackend extends PunkBackend {
           request.requestId,
         );
 
+        // Log cache efficiency per provider — visibility into cost savings
+        const cacheRead = state.usage?.cache_read_input_tokens || 0;
+        const totalInput = state.usage?.input_tokens || 0;
+        if (cacheRead > 0 && totalInput > 0) {
+          const hitRate = ((cacheRead / totalInput) * 100).toFixed(0);
+          console.log(`[cache] ${apiConfig.provider}/${state.model}: ${hitRate}% hit (${cacheRead} cached / ${totalInput} total input tokens)`);
+        }
+
         const finalContent = [];
         if (state.accumulated) {
           finalContent.push({ type: "text", text: state.accumulated });
@@ -2141,7 +2245,23 @@ export class ApiBackend extends PunkBackend {
             );
           }
           const isError = !result.success;
-          const content = result.output || result.error || "";
+          let content = result.output || result.error || "";
+
+          // ── Tool Result Enrichment ─────────────────────────────────────
+          // When the model uses exploration tools (read_file, grep, glob),
+          // enrich the result with project intelligence: design constraints,
+          // architecture briefs, memories, symbols. The model gets smarter
+          // results without calling special tools.
+          const ENRICHABLE_TOOLS = new Set(["read_file", "pane_read_files", "grep_search", "glob"]);
+          if (!isError && ENRICHABLE_TOOLS.has(tool.name)) {
+            try {
+              const { enrichToolResult } = await import("./tool-enrichment.mjs");
+              content = await enrichToolResult(
+                tool.name, parsedInput, content, request.projectId,
+                { brainRequest: this._brainRequest, projectRoot: request.workingDir },
+              );
+            } catch {} // enrichment failure is silent — raw result still works
+          }
 
           if (
             !isError &&
@@ -2208,6 +2328,9 @@ export class ApiBackend extends PunkBackend {
             // write_file / replace: real work happened → advance first pending
             if (!isError && (tool.name === "write_file" || tool.name === "replace")) {
               autoAdvanceTodos(request.projectId, "write", this.onEvent.bind(this), request.requestId);
+              // Track changed file for Turn Sentinel
+              const changedPath = parsedInput.file_path || parsedInput.path || "";
+              if (changedPath) arbiterChangedFiles.add(changedPath);
             }
 
             // run_shell_command: if it's a verify command and it passed → complete current step
@@ -2272,41 +2395,133 @@ export class ApiBackend extends PunkBackend {
           console.warn("[http] Failed to fetch SQLite changes in loop:", err.message);
         }
 
-        // Re-compile context to get updated system prompt for the next turn
-        let loopContext;
-        try {
-          const loopConvTokens = estimateConversationTokens(messages);
-          loopContext = orchestrateContext(request.projectId, {
-            intent: request.intent,
-            historyLength: messages.length,
-            backend: "http",
-            model: request.model,
-            sqliteChanges: loopSqliteChanges,
-            conversationTokens: loopConvTokens,
-          });
-        } catch {
-          loopContext = compileContext(request.projectId, request.intent, messages.length, "http", loopSqliteChanges);
-        }
-        if (messages.length > 0 && messages[0].role === "system") {
-          messages[0].content = loopContext.full;
-          // Refresh tier metadata for cache-aware providers
-          if (loopContext.frozen !== undefined) {
-            const prepend = request._systemPrepend ? request._systemPrepend + "\n\n" : "";
-            messages[0]._tiers = {
-              frozen:  prepend + loopContext.frozen,
-              session: loopContext.session || "",
-              turn:    loopContext.turn || "",
-            };
+        // ── Frozen system prompt: DO NOT rebuild ──────────────────────────
+        // The system prompt was assembled at spawn time and is frozen for the
+        // duration of this conversation. Rebuilding it in the tool loop caused:
+        // - Intent directive flipping mid-conversation (DISCUSSION → EXECUTION)
+        // - Re-scored memories changing between tool calls
+        // - Prompt cache misses on every iteration (wasting tokens)
+        //
+        // Instead, inject tool-execution deltas as a context-update block.
+        // The model sees stable instructions + fresh operational context.
+        if (loopSqliteChanges.length > 0 || gitStatus) {
+          const deltaLines = ["[context update]"];
+          for (const c of loopSqliteChanges.slice(0, 5)) {
+            const type = (c.old_string || c.oldString) ? "edited" : "created";
+            deltaLines.push(`- ${type}: ${c.file_path || c.file}`);
+          }
+          if (gitStatus?.summary) {
+            deltaLines.push(`- git: ${gitStatus.branch} — ${gitStatus.summary.split("\n")[0]}`);
+          }
+          deltaLines.push("[end context update]");
+
+          // Inject as a system-role message before the next user turn, or
+          // append to the last tool_result message so the model sees it.
+          const lastMsg = messages[messages.length - 1];
+          if (lastMsg && lastMsg.role === "user") {
+            // Prepend to the user message content
+            const deltaText = deltaLines.join("\n");
+            if (Array.isArray(lastMsg.content)) {
+              lastMsg.content = [{ type: "text", text: deltaText }, ...lastMsg.content];
+            } else {
+              lastMsg.content = deltaText + "\n\n" + (lastMsg.content || "");
+            }
           }
         }
 
-        // Continuous window management on each tool-use turn
-        const loopSystemTokens = loopContext.budget?.systemUsed || Math.round((messages[0]?.content?.length || 0) / 4);
+        // Window management with stable system prompt
+        const loopSystemTokens = Math.round((messages[0]?.content?.length || 0) / 4);
         manageContextWindow(messages, loopSystemTokens);
       }
 
       // Turn completed cleanly — mark all in_progress todos as done
       autoAdvanceTodos(request.projectId, "turn_end", this.onEvent.bind(this), request.requestId);
+
+      // ── Turn Sentinel: independently verify the LLM's work ─────────────
+      // Runs tsc + eslint on changed files. Verdict persisted for the context
+      // orchestrator to inject as CRITICAL on the next turn.
+      if (arbiterChangedFiles.size > 0) {
+        try {
+          const { runTurnSentinel, recordQualityMetric, runDeepReview, saveDeepReview } = await import("./code-arbiter.mjs");
+          // Pass DB for architecture sentinel (circular deps, broken imports)
+          let arbiterDb = null;
+          try { arbiterDb = getPaneDb(); } catch {}
+          const verdict = await runTurnSentinel(
+            request.projectId,
+            request.workingDir,
+            [...arbiterChangedFiles],
+            { db: arbiterDb },
+          );
+
+          // Record behavioral fingerprint
+          if (arbiterDb) {
+            // Check if previous verdict had issues that are now resolved (self-correction)
+            let selfCorrected = undefined;
+            try {
+              const prev = arbiterDb.stmts.getRecentVerdicts?.get(request.projectId, 1);
+              if (prev && prev.verdict_pass === 0 && verdict.pass) {
+                selfCorrected = true; // LLM fixed previous issues
+              } else if (prev && prev.verdict_pass === 0 && !verdict.pass) {
+                selfCorrected = false; // LLM didn't fix previous issues
+              }
+            } catch {}
+            recordQualityMetric(arbiterDb, {
+              projectId: request.projectId,
+              model: request.model,
+              provider: request.provider,
+              verdict,
+              selfCorrected,
+            });
+          }
+
+          // Emit verdict to renderer so UI can show quality indicator
+          this.onEvent(
+            request.projectId,
+            {
+              event: "arbiter_verdict",
+              data: verdict,
+            },
+            request.requestId,
+          );
+
+          // Deep Review: fire-and-forget on milestones or repeated failures
+          if (arbiterDb) {
+            const recent = arbiterDb.stmts.getRecentVerdicts?.all(request.projectId, 5) || [];
+            const recentFailures = recent.filter(r => r.verdict_pass === 0).length;
+            const isMilestone = arbiterChangedFiles.size >= 5;
+
+            if (recentFailures >= 3 || isMilestone) {
+              // Generate diff for review
+              const diffCmd = `cd "${request.workingDir}" && git diff HEAD --no-color 2>/dev/null || echo "(no git diff available)"`;
+              import("node:child_process").then(({ exec: execCb }) => {
+                execCb(diffCmd, { maxBuffer: 256 * 1024, timeout: 5000 }, (err, stdout) => {
+                  const diff = stdout || "";
+                  if (diff.length < 50) return; // No meaningful diff
+                  const quickCallFn = (sys, usr) => {
+                    const cheapReq = { provider: null, model: null, thinking: false };
+                    return this.planningCall(sys, usr, cheapReq);
+                  };
+                  runDeepReview({
+                    diff,
+                    intent: request.prompt?.slice(0, 500) || "",
+                    callFn: quickCallFn,
+                  }).then(review => {
+                    if (review && review.findings.length > 0) {
+                      saveDeepReview(request.projectId, review);
+                      this.onEvent(request.projectId, {
+                        event: "arbiter_verdict",
+                        data: { ...verdict, deepReview: review },
+                      }, request.requestId);
+                    }
+                  }).catch(() => {});
+                });
+              });
+            }
+          }
+        } catch (err) {
+          console.warn(`[http] Turn Sentinel failed: ${err.message}`);
+        }
+      }
 
       // Build handoff document then enrich with pattern extraction — single write at the end.
       // Layer 3: extracted items carry confidence scores.
@@ -2429,23 +2644,65 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
-  prepareRequest(apiConfig, body, request = null) {
+  async prepareRequest(apiConfig, body, request = null) {
     let url, headers;
     let finalBody = body;
     const userTag = `pane-project-${request?.projectId?.slice(0, 8) || "unknown"}`;
 
-    // Extract and strip _tiers metadata from system messages before serialization.
-    // _tiers is an internal property used for Anthropic cache breakpoints.
+    // Extract _tiers metadata from system messages. Used by Anthropic for
+    // cache breakpoints and prefix-cache providers for frozen/session split.
+    // NOT deleted from the original message — persists across tool loop
+    // iterations so caching works on every turn, not just the first.
+    // Stripped from finalBody before return to prevent serialization.
     let systemTiers = null;
     if (body.messages) {
       for (const msg of body.messages) {
         if (msg.role === "system" && msg._tiers) {
           systemTiers = msg._tiers;
-          delete msg._tiers;
           break;
         }
       }
     }
+
+    // ── Prefix-cache restructuring for automatic cachers ────────────────
+    // DeepSeek, Kimi, Xiaomi, StepFun cache from token 0 of the messages.
+    // The system message must be IDENTICAL across turns for cache hits.
+    // This function: (1) replaces the system message with frozen-only content
+    // (padded to 64-token boundary), (2) injects session+turn as a preamble
+    // on the last user message. Applied per-request in prepareRequest, NOT
+    // in the shared messages array — keeps history clean across provider switches.
+    const applyPrefixCacheOptimization = (msgs, tiers) => {
+      if (!tiers?.frozen) return msgs;
+      const result = [...msgs];
+
+      // System message = frozen tier only (guaranteed stable)
+      let frozenPrompt = tiers.frozen.trim();
+      const aligned = Math.ceil(frozenPrompt.length / 256) * 256;
+      if (aligned > frozenPrompt.length) frozenPrompt += " ".repeat(aligned - frozenPrompt.length);
+      result[0] = { role: "system", content: frozenPrompt };
+
+      // Session + turn tiers go as preamble on the last user message
+      const dynamicParts = [];
+      if (tiers.session) dynamicParts.push(tiers.session);
+      if (tiers.turn) dynamicParts.push(tiers.turn);
+
+      if (dynamicParts.length > 0) {
+        const preamble = `[Pane context]\n${dynamicParts.join("\n\n")}\n[End context]\n\n`;
+        let inserted = false;
+        for (let i = result.length - 1; i >= 0; i--) {
+          if (result[i].role === "user") {
+            const orig = typeof result[i].content === "string" ? result[i].content : "";
+            result[i] = { ...result[i], content: preamble + orig };
+            inserted = true;
+            break;
+          }
+        }
+        if (!inserted) {
+          result.push({ role: "user", content: preamble.trim() });
+        }
+      }
+      return result;
+    };
 
     switch (apiConfig.provider) {
       case "openrouter":
@@ -2457,10 +2714,16 @@ export class ApiBackend extends PunkBackend {
           "HTTP-Referer": "https://pane.app",
           "X-Title": "Pane IDE",
         };
-        // Disable default OpenRouter transforms (like middle-out) to avoid prompt manipulation
-        // and explicitly allow data collection to bypass restrictive 404 guardrails on free models.
+        // Disable default transforms. OpenRouter's provider sticky routing
+        // activates automatically when caching is detected — no config needed.
+        // Do NOT set provider.order as it disables automatic sticky routing.
+        // Apply prefix-cache optimization — most OpenRouter models are served
+        // by prefix-caching providers. Anthropic models via OpenRouter support
+        // explicit breakpoints, but auto-caching from the smaller system prompt
+        // still works.
         finalBody = {
           ...body,
+          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
           transforms: [],
           data_collection: "allow",
           zdr: false,
@@ -2475,29 +2738,61 @@ export class ApiBackend extends PunkBackend {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
         };
-        finalBody = { ...body, user: userTag };
+        // Prefix-cache: frozen-only system message + dynamic preamble on user message
+        finalBody = {
+          ...body,
+          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
+          user: userTag,
+        };
         break;
 
       case "stepfun":
         // StepFun is fully OpenAI-compatible. Native API is at api.stepfun.com/v1.
-        // Using native avoids OpenRouter latency and `:free` quota limits.
         url =
           apiConfig.baseUrl || "https://api.stepfun.com/v1/chat/completions";
         headers = {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
         };
-        finalBody = { ...body, user: userTag };
+        finalBody = {
+          ...body,
+          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
+          user: userTag,
+        };
         break;
 
-      case "kimi":
+      case "kimi": {
         url =
           apiConfig.baseUrl || "https://api.moonshot.cn/v1/chat/completions";
+        // Session affinity: route to same model instance within a project
+        // for maximum prefix cache hit rates on multi-turn conversations.
+        const kimiSessionId = request?.projectId ? `pane-${request.projectId.slice(0, 16)}` : undefined;
+        headers = {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiConfig.apiKey}`,
+          ...(kimiSessionId ? { "x-session-affinity": kimiSessionId } : {}),
+        };
+        finalBody = {
+          ...body,
+          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
+          user: userTag,
+        };
+        break;
+      }
+
+      case "xiaomi":
+        url =
+          apiConfig.baseUrl || "https://api.xiaomimimo.com/v1/chat/completions";
         headers = {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
         };
-        finalBody = { ...body, user: userTag };
+        // Prefix-cache: free writes → every token cached is pure savings
+        finalBody = {
+          ...body,
+          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
+          user: userTag,
+        };
         break;
 
       case "anthropic": {
@@ -2511,31 +2806,45 @@ export class ApiBackend extends PunkBackend {
         const sysMsg = body.messages.find((m) => m.role === "system");
         const anthropicBody = {
           ...body,
-          metadata: { user_id: userTag }
+          metadata: { user_id: userTag },
+          // Top-level auto-caching: automatically caches the last block of
+          // the last message, handling conversation prefix caching without
+          // manual breakpoints. Simpler and handles long conversations better
+          // than the old sliding-cutoff approach.
+          cache_control: { type: "ephemeral" },
         };
         anthropicBody.messages = body.messages.filter(
           (m) => m.role !== "system",
         );
+
+        // ── Breakpoint 1: Cache tool definitions (most static content) ──
+        // Tools never change within a session — ~5k tokens saved per turn.
+        if (anthropicBody.tools?.length > 0) {
+          const lastTool = anthropicBody.tools[anthropicBody.tools.length - 1];
+          if (typeof lastTool === "object") {
+            lastTool.cache_control = { type: "ephemeral" };
+          }
+        }
+
         if (sysMsg) {
           // ── Cache-aware system prompt for Anthropic ──
-          // When tier metadata is available, structure the system prompt as
-          // content blocks with cache_control breakpoints:
-          //   Block 1: frozen context → cache_control: ephemeral (biggest win)
-          //   Block 2: session context (extends cache when unchanged)
-          //   Block 3: turn context (never cached)
-          // This gives ~90% savings on the frozen prefix (~13-17k tokens).
+          // Breakpoint layout (up to 4 total, 1 used on tools above):
+          //   Breakpoint 2: frozen tier → 1-hour TTL (survives breaks between turns)
+          //   Breakpoint 3: session tier → 5-min TTL (changes on scope change)
+          //   Turn tier: no breakpoint (changes every turn)
+          // Auto-caching (top-level): handles conversation prefix incrementally.
           if (systemTiers && systemTiers.frozen) {
             const tiers = systemTiers;
             const blocks = [];
-            // Frozen tier — always cached (biggest, most stable)
+            // Frozen tier — 1-hour cache (biggest win, survives user breaks)
             if (tiers.frozen) {
               blocks.push({
                 type: "text",
                 text: tiers.frozen,
-                cache_control: { type: "ephemeral" },
+                cache_control: { type: "ephemeral", ttl: "1h" },
               });
             }
-            // Session tier — cached when scope hasn't changed
+            // Session tier — 5-min cache (changes on scope change)
             if (tiers.session) {
               blocks.push({
                 type: "text",
@@ -2549,33 +2858,17 @@ export class ApiBackend extends PunkBackend {
             }
             anthropicBody.system = blocks;
             console.log(
-              `[http] Anthropic cache: frozen=${tiers.frozen.length}c session=${tiers.session.length}c turn=${tiers.turn.length}c`
+              `[http] Anthropic cache: tools=cached frozen=${tiers.frozen.length}c(1h) session=${tiers.session.length}c(5m) turn=${tiers.turn.length}c`
             );
           } else {
-            // Fallback: single string, no explicit caching
             anthropicBody.system = sysMsg.content;
           }
         }
 
-        // Add cache breakpoint to conversation prefix (older turns)
-        // Breakpoint 3: cache all but the last 2 user/assistant pairs
-        if (anthropicBody.messages.length > 4) {
-          const cutoff = anthropicBody.messages.length - 4;
-          const target = anthropicBody.messages[cutoff - 1];
-          if (target && typeof target.content === "string") {
-            anthropicBody.messages[cutoff - 1] = {
-              ...target,
-              content: [{ type: "text", text: target.content, cache_control: { type: "ephemeral" } }],
-            };
-          } else if (target && Array.isArray(target.content) && target.content.length > 0) {
-            const lastBlock = { ...target.content[target.content.length - 1] };
-            lastBlock.cache_control = { type: "ephemeral" };
-            anthropicBody.messages[cutoff - 1] = {
-              ...target,
-              content: [...target.content.slice(0, -1), lastBlock],
-            };
-          }
-        }
+        // Conversation caching handled by top-level cache_control (auto-caching).
+        // No manual cutoff breakpoint needed — the API incrementally caches
+        // the growing conversation prefix and handles the 20-block lookback
+        // automatically.
 
         finalBody = anthropicBody;
         break;
@@ -2622,8 +2915,86 @@ export class ApiBackend extends PunkBackend {
           }
         }
 
+        // ── Gemini explicit context caching ──────────────────────────────
+        // Cache frozen+session tiers via cachedContents API. When using
+        // cachedContent, its systemInstruction replaces any live one, so we
+        // cache the stable parts and send the turn tier as a context preamble
+        // in the first user message instead.
+        // Gemini 2.5+: 90% discount on cached tokens.
+        let geminiCachedContent = null;
+        const stableSysContent = systemTiers ? (systemTiers.frozen + "\n\n" + (systemTiers.session || "")).trim() : null;
+
+        if (stableSysContent && stableSysContent.length > 4000 && apiConfig.apiKey) {
+          // Cache key uses a hash of the actual content — not just length.
+          // Session tier changes re-score relevant files/memories, producing
+          // different content at similar lengths. A hash catches real changes.
+          const { createHash } = await import("node:crypto");
+          const contentHash = createHash("md5").update(stableSysContent).digest("hex").slice(0, 12);
+          const cacheKey = `gemini:${body.model}:${contentHash}`;
+          if (!this._geminiCacheRefs) this._geminiCacheRefs = new Map();
+
+          // Evict stale entries (prevent memory leak from scope changes)
+          for (const [k, v] of this._geminiCacheRefs) {
+            if (Date.now() > v.expiresAt) this._geminiCacheRefs.delete(k);
+          }
+          const cached = this._geminiCacheRefs.get(cacheKey);
+
+          if (cached && Date.now() < cached.expiresAt) {
+            geminiCachedContent = cached.name;
+          } else {
+            try {
+              const cacheResponse = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/cachedContents?key=${apiConfig.apiKey}`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    model: `models/${body.model}`,
+                    systemInstruction: { parts: [{ text: stableSysContent }] },
+                    ttl: "1800s",
+                  }),
+                  signal: AbortSignal.timeout(10000),
+                },
+              );
+              if (cacheResponse.ok) {
+                const cacheData = await cacheResponse.json();
+                this._geminiCacheRefs.set(cacheKey, {
+                  name: cacheData.name,
+                  expiresAt: Date.now() + 1800 * 1000,
+                });
+                geminiCachedContent = cacheData.name;
+                console.log(`[http] Gemini cache created: ${cacheData.name} (stable=${stableSysContent.length}c, 30min TTL)`);
+              }
+            } catch (err) {
+              console.warn(`[http] Gemini cache creation failed: ${err.message}`);
+            }
+          }
+        }
+
+        // When using cachedContent, systemInstruction comes from the cache.
+        // Turn tier is prepended to the first user message as context.
+        // When NOT using cache, full system prompt goes in systemInstruction.
+        const sysInstructionParts = [];
+        if (geminiCachedContent) {
+          // Stable tiers are in the cache. Prepend turn tier to the first user message.
+          if (systemTiers?.turn) {
+            const turnPreamble = `[Context update]\n${systemTiers.turn}\n[End context update]\n\n`;
+            const firstUser = contents.find(c => c.role === "user");
+            if (firstUser?.parts?.[0]?.text) {
+              firstUser.parts[0] = { text: turnPreamble + firstUser.parts[0].text };
+            } else {
+              // No user message yet — insert one with the turn context
+              contents.unshift({ role: "user", parts: [{ text: turnPreamble.trim() }] });
+            }
+          }
+        } else {
+          const sysMsgs = body.messages.filter((m) => m.role === "system");
+          for (const m of sysMsgs) sysInstructionParts.push({ text: m.content });
+        }
+
         finalBody = {
           contents,
+          ...(geminiCachedContent ? { cachedContent: geminiCachedContent } : {}),
           tools: [
             {
               functionDeclarations: TOOL_DEFINITIONS.map((td) => ({
@@ -2633,11 +3004,8 @@ export class ApiBackend extends PunkBackend {
               })),
             },
           ],
-          systemInstruction: {
-            parts: body.messages
-              .filter((m) => m.role === "system")
-              .map((m) => ({ text: m.content })),
-          },
+          // When using cachedContent, systemInstruction is in the cache — don't send it again.
+          ...(sysInstructionParts.length > 0 ? { systemInstruction: { parts: sysInstructionParts } } : {}),
           safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
             { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -2667,6 +3035,14 @@ export class ApiBackend extends PunkBackend {
 
       default:
         throw new Error(`Unsupported provider: ${apiConfig.provider}`);
+    }
+
+    // Strip _tiers from finalBody before serialization — internal metadata
+    // that providers would reject or ignore as unknown fields.
+    if (finalBody.messages) {
+      for (const msg of finalBody.messages) {
+        if (msg._tiers) delete msg._tiers;
+      }
     }
 
     return { url, headers, finalBody };
@@ -2743,13 +3119,26 @@ export class ApiBackend extends PunkBackend {
     let toolDelta = null;
     let emitted = false;
 
-    // Capture usage info if present in any provider's chunk
+    // Capture usage info if present in any provider's chunk.
+    // Provider-specific cache field mapping:
+    //   Anthropic:  cache_read_input_tokens, cache_creation_input_tokens
+    //   DeepSeek:   prompt_cache_hit_tokens, prompt_cache_miss_tokens
+    //   Kimi:       cached_tokens
+    //   StepFun:    cached_token (singular)
+    //   Xiaomi/OpenAI: prompt_tokens_details.cached_tokens
+    //   Gemini:     cachedContentTokenCount (in usageMetadata, handled below)
     if (event.usage) {
       state.usage = {
         input_tokens: event.usage.prompt_tokens || event.usage.input_tokens || 0,
         output_tokens: event.usage.completion_tokens || event.usage.output_tokens || 0,
         cache_creation_input_tokens: event.usage.cache_creation_input_tokens || 0,
-        cache_read_input_tokens: event.usage.cache_read_input_tokens || event.usage.prompt_cache_hit_tokens || 0,
+        cache_read_input_tokens:
+          event.usage.cache_read_input_tokens ||                    // Anthropic
+          event.usage.prompt_cache_hit_tokens ||                     // DeepSeek
+          event.usage.cached_tokens ||                               // Kimi
+          event.usage.cached_token ||                                // StepFun (singular)
+          event.usage.prompt_tokens_details?.cached_tokens ||        // Xiaomi / OpenAI-compatible
+          0,
         cost: event.usage.cost || null,
       };
     }
@@ -2775,7 +3164,7 @@ export class ApiBackend extends PunkBackend {
         input_tokens: event.usageMetadata.promptTokenCount || 0,
         output_tokens: event.usageMetadata.candidatesTokenCount || 0,
         cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: event.usageMetadata.cachedContentTokenCount || 0,
       };
     }
 
@@ -3230,6 +3619,56 @@ export class ApiBackend extends PunkBackend {
   }
 
   /**
+   * Fetch available Xiaomi MiMo models via their OpenAI-compatible /models endpoint.
+   */
+  async getXiaomiModels() {
+    const apiConfig = await this.getApiConfig("xiaomi");
+    if (!apiConfig.apiKey) return [];
+
+    try {
+      const url = apiConfig.baseUrl
+        ? apiConfig.baseUrl.replace(/\/chat\/completions\/?$/, "/models")
+        : "https://api.xiaomimimo.com/v1/models";
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!response.ok) return [];
+
+      const json = await response.json();
+      if (!json.data) return [];
+
+      const MIMO_CONTEXT = {
+        "mimo-v2-flash": 262144,
+        "mimo-v2-pro": 1000000,
+        "mimo-v2-omni": 1000000,
+      };
+
+      return json.data
+        .filter((m) => m.id && m.id.includes("mimo"))
+        .map((m) => {
+          const id = m.id;
+          const name = id.replace(/^mimo-/, "MiMo ").replace(/-/g, " ")
+            .replace(/\b\w/g, (c) => c.toUpperCase());
+          const ctxKey = Object.keys(MIMO_CONTEXT).find((k) => id.includes(k));
+          return {
+            id,
+            name,
+            context_length: MIMO_CONTEXT[ctxKey] || 262144,
+            provider: "Xiaomi",
+            tier: id.includes("pro") ? 1 : id.includes("omni") ? 1 : 2,
+            input_cost: null,
+            output_cost: null,
+          };
+        })
+        .sort(_byRelevance);
+    } catch (err) {
+      console.error("[http] Failed to fetch Xiaomi models:", err);
+      return [];
+    }
+  }
+
+  /**
    * Fetch available Anthropic models via their /v1/models endpoint.
    */
   async getAnthropicModels() {
@@ -3337,7 +3776,7 @@ export class ApiBackend extends PunkBackend {
       // No tools — pure text generation for planning
     };
 
-    const { url, headers, finalBody } = this.prepareRequest(apiConfig, body, request);
+    const { url, headers, finalBody } = await this.prepareRequest(apiConfig, body, request);
 
     const cleanBody = { ...(finalBody || body), stream: true };
     delete cleanBody.tools;
@@ -3533,7 +3972,7 @@ export class ApiBackend extends PunkBackend {
       // No tools — pure conversation for discovery
     };
 
-    const { url, headers, finalBody } = this.prepareRequest(apiConfig, body, request);
+    const { url, headers, finalBody } = await this.prepareRequest(apiConfig, body, request);
 
     // Strip tools from finalBody if prepareRequest added them
     const cleanBody = { ...(finalBody || body) };

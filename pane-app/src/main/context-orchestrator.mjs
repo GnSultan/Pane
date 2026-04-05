@@ -29,9 +29,14 @@ import path from "node:path";
 import os from "node:os";
 import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
 import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
-import { MODEL_CONTEXT_LIMITS } from "./session-context.mjs";
+import { MODEL_CONTEXT_LIMITS, readState } from "./session-context.mjs";
 import { estimateTokens, getModelLimit, getDefaultOutputBudget, createRequestBudget } from "./token-budget.mjs";
 import { saveContextCheckpoint } from "./context-checkpoints.mjs";
+import { contextStore } from "./context-store.mjs";
+import { detectPhase, filterAtomsForPhase } from "./conversation-phase.mjs";
+import { readVerdict, formatVerdictForContext, formatQualityStatsForContext, formatGuidanceForContext } from "./code-arbiter.mjs";
+import { getPaneDb } from "./pane-db.mjs";
+import { getDNA } from "./developer-dna.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -111,6 +116,17 @@ function computeRelevanceAdjustments(contextShape, brainCtx, intent, historyLeng
     adjustments.set("symbol_map", -1);        // useful → important
     adjustments.set("working_set", -1);       // reinforce
     adjustments.set("relevant_files", -1);    // useful → important
+  }
+
+  // Analyze mode: boost everything the model needs for deep investigation
+  const mode = contextShape?.mode || null;
+  if (mode === "analyze") {
+    adjustments.set("codebase_map", (adjustments.get("codebase_map") || 0) - 1);  // promote
+    adjustments.set("brain_memories", (adjustments.get("brain_memories") || 0) - 1);
+    adjustments.set("symbol_map", (adjustments.get("symbol_map") || 0) - 1);
+    adjustments.set("project_dna", (adjustments.get("project_dna") || 0) - 1);
+    adjustments.set("principles", (adjustments.get("principles") || 0) - 1);
+    adjustments.set("pre_read_files", (adjustments.get("pre_read_files") || 0) + 1);  // model reads its own
   }
 
   // ── Complexity-driven adjustments ──────────────────────────────────────
@@ -200,6 +216,78 @@ function applyRelevanceAdjustments(layers, adjustments) {
 // priority order, stopping when the budget is exhausted.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Lean context — for CLI backends (Claude SDK, Gemini CLI) that manage
+// their own context, tools, and conversation history. Pane provides only
+// identity + rules + arbiter findings + MCP orientation.
+// ---------------------------------------------------------------------------
+
+function _buildLeanContext(projectId, isResume) {
+  const parts = [];
+
+  // ── Developer DNA: condensed behavioral identity (~120 tokens) ──────
+  // Replaces separate rules/philosophy/identity/anti-patterns injections.
+  // The DNA is compiled from the user's profile files and cached to disk.
+  const dna = getDNA();
+  if (dna) parts.push(dna);
+
+  // On resume, the SDK already has full context — just DNA + arbiter
+  if (!isResume) {
+    // MCP orientation — tell the model where to find context
+    parts.push(
+      "Project context, memory, symbols, codebase structure, and intelligence are available via pane_ MCP tools. " +
+      "Call pane_project_context to orient yourself. Use pane_find_symbol for code navigation, pane_recall for project memory, " +
+      "pane_brief for the project brief, and pane_synthesize for architectural overview."
+    );
+  }
+
+  // Arbiter findings — if unresolved errors exist, the model must see them immediately
+  const verdict = readVerdict(projectId);
+  const arbiterText = formatVerdictForContext(verdict);
+  if (arbiterText) {
+    parts.push("", arbiterText);
+  }
+
+  // Quality trend — if concerning, nudge the model
+  try {
+    const qdb = getPaneDb();
+    const qualityText = formatQualityStatsForContext(qdb, projectId);
+    if (qualityText) parts.push("", qualityText);
+  } catch {}
+
+  // Proactive guidance from last verdict
+  if (verdict?.guidance) {
+    const guidanceText = formatGuidanceForContext(verdict.guidance);
+    if (guidanceText) parts.push("", guidanceText);
+  }
+
+  const full = parts.join("\n");
+  const tokens = estimateTokens(full);
+
+  // Return same shape as full orchestrateContext for compatibility
+  return {
+    frozen: full,
+    session: "",
+    turn: "",
+    stable: full,
+    dynamic: "",
+    full,
+    budget: {
+      limit: 0,
+      systemBudget: tokens,
+      systemUsed: tokens,
+      conversationTokens: 0,
+      outputBudget: 0,
+      remaining: 0,
+      pressure: "low",
+      layersIncluded: isResume ? 2 : 3,
+      layersDropped: 0,
+      droppedNames: [],
+    },
+    layers: [],
+  };
+}
+
 /**
  * Build all context layers independently so the orchestrator can measure
  * and prioritize them. Returns an array of { name, priority, placement, tier, text }.
@@ -210,23 +298,31 @@ function applyRelevanceAdjustments(layers, adjustments) {
  *   session — changes when files/scope change (codebase map, relevant files)
  *   turn    — changes every turn (git, todos, actions, memories, symbols)
  */
-function buildLayers(projectId, intent, historyLength, backend, sqliteChanges) {
+function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected = null) {
   const layers = [];
 
   // ── Read shared data sources once ──────────────────────────────────────
-  let contextShape = null;
-  try {
-    contextShape = JSON.parse(fs.readFileSync(
-      path.join(BRAIN_DIR, "context", `${projectId}-shape.json`), "utf-8"
-    ));
-  } catch {}
+  // Prefer in-memory ContextStore (updated by brain-engine via main.mjs).
+  // Fall back to disk for cold start (app launch before first brain search).
+  const storeCtx = contextStore.getContext(projectId);
+  let contextShape = storeCtx?.contextShape || null;
+  if (!contextShape) {
+    try {
+      contextShape = JSON.parse(fs.readFileSync(
+        path.join(BRAIN_DIR, "context", `${projectId}-shape.json`), "utf-8"
+      ));
+    } catch {}
+  }
 
-  let brainCtx = { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [] };
-  try {
-    brainCtx = JSON.parse(fs.readFileSync(
-      path.join(BRAIN_DIR, "context", `${projectId}.json`), "utf-8"
-    ));
-  } catch {}
+  let brainCtx = storeCtx?.brainExport || null;
+  if (!brainCtx) {
+    try {
+      brainCtx = JSON.parse(fs.readFileSync(
+        path.join(BRAIN_DIR, "context", `${projectId}.json`), "utf-8"
+      ));
+    } catch {}
+  }
+  if (!brainCtx) brainCtx = { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [] };
 
   let state;
   try {
@@ -242,12 +338,33 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges) {
     };
   }
 
+  // ── Detect conversation phase for atom filtering ───────────────────────
+  const activeTodos = (state.todos || []).filter(t => t.status !== "completed");
+  const completedTodos = (state.todos || []).filter(t => t.status === "completed");
+  const lastActions = (state.recentActions || []).slice(0, 3).map(a => a.type || "");
+  const conversationPhase = detectPhase({
+    turnCount: historyLength,
+    lastToolActions: lastActions,
+    taskType: contextShape?.taskType || "other",
+    mode: contextShape?.mode || intent || "direct",
+    pendingTodos: activeTodos.length,
+    completedTodos: completedTodos.length,
+    hasNewFiles: false, // TODO: track working set changes between turns
+  });
+
+  // ── Delta mode: on turn 2+, skip session-stable layers that the model ──
+  // already has in its context window. Only inject genuine deltas.
+  // The model's context IS the memory — we don't need to re-tell it.
+  const isFullAssembly = !lastInjected || lastInjected.turnNumber === 0;
+
   // ── 0. CORE INSTRUCTIONS (critical) ────────────────────────────────────
   const coreInstructions = _buildSystemPromptFromAtoms(
     brainCtx.atoms || null,
     contextShape?.taskType || null,
     contextShape?.complexity || null,
     backend,
+    conversationPhase,
+    historyLength,
   );
   layers.push({
     name: "core_instructions",
@@ -278,37 +395,20 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges) {
     });
   }
 
-  // ── PROFILE DIGEST or PROFILE ATOMS ─────────────────────────────────
-  // Prefer pre-computed digest (~300 tokens) over raw atoms (0-8 × ~80 tokens).
-  // Digest covers all 584 preferences + 311 anti-patterns in dense prose.
-  // Falls back to legacy atoms if no digest exists.
-  let profileDigest = "";
-  try {
-    profileDigest = fs.readFileSync(path.join(PROFILE_DIR, "digest.txt"), "utf-8").trim();
-  } catch {}
-
-  if (profileDigest) {
+  // ── DEVELOPER DNA (~120 tokens) ──────────────────────────────────────
+  // Replaces the old profile_digest (~300 tokens) and profile_atoms layers.
+  // Condensed behavioral identity compiled from rules.md + philosophy.md +
+  // identity.json. Written as identity ("you are"), not rules ("don't do").
+  // The arbiter enforces compliance — the DNA sets the standard.
+  const dna = getDNA();
+  if (dna) {
     layers.push({
-      name: "profile_digest",
-      priority: PRIORITY.IMPORTANT,  // Promoted from EXPENDABLE — digest is compact and high-value
+      name: "developer_dna",
+      priority: PRIORITY.CRITICAL,
       placement: "stable",
       tier: "frozen",
-      text: `Developer profile:\n${profileDigest}`,
+      text: dna,
     });
-  } else {
-    const profileAtoms = (brainCtx.atoms || brainCtx.profileAtoms || [])
-      .filter(a => a.entityType !== "system_atom" && a.facet !== "rule");
-    if (profileAtoms.length > 0) {
-      const lines = ["Relevant preferences:"];
-      for (const atom of profileAtoms.slice(0, 8)) lines.push(`- ${atom.content}`);
-      layers.push({
-        name: "profile_atoms",
-        priority: PRIORITY.EXPENDABLE,
-        placement: "stable",
-        tier: "frozen",
-        text: lines.join("\n"),
-      });
-    }
   }
 
   // ── 1. PROJECT BRIEF (high) ───────────────────────────────────────────
@@ -501,10 +601,29 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges) {
     }
   }
 
-  if (state.gitStatus) {
-    sessionLines.push(`Git status (branch: ${state.gitStatus.branch}):`);
-    sessionLines.push(state.gitStatus.summary);
-    sessionLines.push("");
+  if (isFullAssembly) {
+    // Turn 1: inject full git status
+    if (state.gitStatus) {
+      sessionLines.push(`Git status (branch: ${state.gitStatus.branch}):`);
+      sessionLines.push(state.gitStatus.summary);
+      sessionLines.push("");
+    }
+  } else {
+    // Turn 2+: only inject git delta if it changed
+    const currentGit = state.gitStatus?.summary || "";
+    if (currentGit && currentGit !== lastInjected.gitSummary) {
+      sessionLines.push(`[Git update]: ${state.gitStatus.branch} — ${currentGit}`);
+      sessionLines.push("");
+    }
+    // Inject todo delta if changed
+    const currentTodos = JSON.stringify((state.todos || []).filter(t => t.status !== "completed").map(t => t.content));
+    if (currentTodos !== lastInjected.todoSnapshot) {
+      const completed = (state.todos || []).filter(t => t.status === "completed");
+      const pending = (state.todos || []).filter(t => t.status !== "completed");
+      if (completed.length > 0) sessionLines.push(`[Completed]: ${completed.map(t => t.content).join(", ")}`);
+      if (pending.length > 0) sessionLines.push(`[Still pending]: ${pending.map(t => t.content).join(", ")}`);
+      sessionLines.push("");
+    }
   }
 
   if (sessionLines.length > 0) {
@@ -611,49 +730,52 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges) {
     });
   }
 
-  // ── 3. SYMBOL MAP (useful) ────────────────────────────────────────────
+  // ── 3. SYMBOLS, MEMORIES, PRINCIPLES ──────────────────────────────────
+  // Session-stable: injected fully on turn 1, skipped on turn 2+ (model
+  // already has them in context window). Only inject DELTAS — new symbols
+  // or memories that appeared since last assembly.
   const relevantSymbols = (brainCtx.relevantSymbols || []).slice(0, 15);
-  if (relevantSymbols.length > 0) {
-    const lines = ["Symbol map (Pane resolved — use directly, do not search for these):"];
-    for (const s of relevantSymbols) {
-      const doc = s.doc ? ` — ${s.doc}` : "";
-      lines.push(`- \`${s.name}\` (${s.kind}) → ${s.file_path || s.file}:${s.line}${doc}`);
-    }
-    layers.push({
-      name: "symbol_map",
-      priority: PRIORITY.USEFUL,
-      placement: "dynamic",
-      tier: "turn",
-      text: lines.join("\n"),
-    });
-  }
-
-  // ── 3. BRAIN MEMORIES (useful) ────────────────────────────────────────
   const memories = (brainCtx.memories || []).filter(m => (m.confidence || 0) >= 0.75);
-  if (memories.length > 0) {
-    const lines = ["Relevant context from prior work:"];
-    for (const mem of memories) lines.push(`- ${mem.content}`);
-    layers.push({
-      name: "brain_memories",
-      priority: PRIORITY.USEFUL,
-      placement: "dynamic",
-      tier: "turn",
-      text: lines.join("\n"),
-    });
-  }
-
-  // ── 3. PRINCIPLES (useful) ────────────────────────────────────────────
   const principles = brainCtx.principles || [];
-  if (principles.length > 0) {
-    const lines = ["Active project standards (extracted from how you work on this project — apply when relevant):"];
-    for (const p of principles) lines.push(`- ${p.content}`);
-    layers.push({
-      name: "principles",
-      priority: PRIORITY.USEFUL,
-      placement: "dynamic",
-      tier: "turn",
-      text: lines.join("\n"),
-    });
+
+  if (isFullAssembly) {
+    // Turn 1: full injection
+    if (relevantSymbols.length > 0) {
+      const lines = ["Symbol map (Pane resolved — use directly, do not search for these):"];
+      for (const s of relevantSymbols) {
+        const doc = s.doc ? ` — ${s.doc}` : "";
+        lines.push(`- \`${s.name}\` (${s.kind}) → ${s.file_path || s.file}:${s.line}${doc}`);
+      }
+      layers.push({ name: "symbol_map", priority: PRIORITY.USEFUL, placement: "dynamic", tier: "session", text: lines.join("\n") });
+    }
+    if (memories.length > 0) {
+      const lines = ["Relevant context from prior work:"];
+      for (const mem of memories) lines.push(`- ${mem.content}`);
+      layers.push({ name: "brain_memories", priority: PRIORITY.USEFUL, placement: "dynamic", tier: "session", text: lines.join("\n") });
+    }
+    if (principles.length > 0) {
+      const lines = ["Active project standards (extracted from how you work on this project — apply when relevant):"];
+      for (const p of principles) lines.push(`- ${p.content}`);
+      layers.push({ name: "principles", priority: PRIORITY.USEFUL, placement: "dynamic", tier: "session", text: lines.join("\n") });
+    }
+  } else {
+    // Turn 2+: only inject new symbols/memories not in the previous snapshot
+    const newSymbols = relevantSymbols.filter(s => !lastInjected.symbolNames?.has(s.name));
+    if (newSymbols.length > 0) {
+      const lines = ["[New symbols since last turn]:"];
+      for (const s of newSymbols) {
+        const doc = s.doc ? ` — ${s.doc}` : "";
+        lines.push(`- \`${s.name}\` (${s.kind}) → ${s.file_path || s.file}:${s.line}${doc}`);
+      }
+      layers.push({ name: "symbol_delta", priority: PRIORITY.USEFUL, placement: "dynamic", tier: "turn", text: lines.join("\n") });
+    }
+    const newMemories = memories.filter(m => !lastInjected.memoryIds?.has(m.id));
+    if (newMemories.length > 0) {
+      const lines = ["[New context since last turn]:"];
+      for (const mem of newMemories) lines.push(`- ${mem.content}`);
+      layers.push({ name: "memory_delta", priority: PRIORITY.USEFUL, placement: "dynamic", tier: "turn", text: lines.join("\n") });
+    }
+    // Principles don't change mid-conversation — skip entirely on turn 2+
   }
 
   // ── 2. ESCALATION (important when active) ─────────────────────────────
@@ -667,21 +789,9 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges) {
     });
   }
 
-  // ── 3. MIND ENTRIES (useful) ──────────────────────────────────────────
+  // ── 3. MIND ENTRIES + SESSION PINS (session-stable) ──────────────────
+  // Injected on turn 1, skipped on turn 2+ (model has them in context).
   const mindEntries = brainCtx.mindEntries || [];
-  if (mindEntries.length > 0) {
-    const lines = ["Active thoughts from Mind (user-authored, treat as high-priority context):"];
-    for (const m of mindEntries) lines.push(`- ${m.content}`);
-    layers.push({
-      name: "mind_entries",
-      priority: PRIORITY.USEFUL,
-      placement: "dynamic",
-      tier: "turn",
-      text: lines.join("\n"),
-    });
-  }
-
-  // ── 3. SESSION PINS (useful) ──────────────────────────────────────────
   let sessionPins = [];
   try {
     sessionPins = JSON.parse(fs.readFileSync(
@@ -689,20 +799,22 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges) {
     ));
   } catch {}
 
-  if (sessionPins.length > 0) {
-    const lines = ["Active commitments:"];
-    for (const pin of sessionPins.slice(0, 6)) {
-      const label = pin.type === "error_fix" ? "Fix" : pin.type === "lesson" ? "Lesson" : "Decision";
-      lines.push(`- [${label}] ${pin.content}`);
+  if (isFullAssembly) {
+    if (mindEntries.length > 0) {
+      const lines = ["Active thoughts from Mind (user-authored, treat as high-priority context):"];
+      for (const m of mindEntries) lines.push(`- ${m.content}`);
+      layers.push({ name: "mind_entries", priority: PRIORITY.USEFUL, placement: "dynamic", tier: "session", text: lines.join("\n") });
     }
-    layers.push({
-      name: "session_pins",
-      priority: PRIORITY.USEFUL,
-      placement: "dynamic",
-      tier: "turn",
-      text: lines.join("\n"),
-    });
+    if (sessionPins.length > 0) {
+      const lines = ["Active commitments:"];
+      for (const pin of sessionPins.slice(0, 6)) {
+        const label = pin.type === "error_fix" ? "Fix" : pin.type === "lesson" ? "Lesson" : "Decision";
+        lines.push(`- [${label}] ${pin.content}`);
+      }
+      layers.push({ name: "session_pins", priority: PRIORITY.USEFUL, placement: "dynamic", tier: "session", text: lines.join("\n") });
+    }
   }
+  // Turn 2+: mind entries and pins already in context — skip
 
   // ── 3. HANDOFF (useful — session start only) ──────────────────────────
   if (historyLength < 2) {
@@ -743,27 +855,35 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges) {
   const reasoning   = contextShape?.reasoning || null;
   const verification = contextShape?.verification || null;
 
-  let directiveText;
-  if (contextShape && taskType) {
-    directiveText = _buildDirective(intent, taskType, complexity, reasoning, verification);
-  } else if (intent === "execute") {
-    directiveText = "EXECUTION mode. Do what's asked directly and efficiently. Skip planning unless absolutely necessary.";
-  } else if (intent === "plan") {
-    directiveText = "PLANNING mode. Think deeply, explore architecture space, consider tradeoffs, surface tensions with past decisions. End with a clear recommendation and wait for confirmation before making changes.";
-  } else if (intent === "explain") {
-    directiveText = "EXPLANATION mode. Clear, detailed, accurate explanations with code examples where appropriate.";
-  } else {
-    directiveText = "For non-trivial tasks, present a brief plan and end with: \"Ready to proceed — send 'go' to start.\" Wait for confirmation before making changes. For simple tasks, just do them.";
+  // ── INTENT DIRECTIVE (session-stable) ────────────────────────────────
+  // Set once from the mode pill on turn 1, frozen after. This is the
+  // "DISCUSSION mode" / "EXECUTION mode" label. When effectiveMode carries
+  // forward, this never changes — the model gets consistent instructions.
+  if (isFullAssembly) {
+    let directiveText;
+    if (contextShape && taskType) {
+      directiveText = _buildDirective(intent, taskType, complexity, reasoning, verification);
+    } else if (intent === "execute") {
+      directiveText = "EXECUTION mode. Do what's asked directly and efficiently. Skip planning unless absolutely necessary.";
+    } else if (intent === "plan") {
+      directiveText = "PLANNING mode. Think deeply, explore architecture space, consider tradeoffs, surface tensions with past decisions. End with a clear recommendation and wait for confirmation before making changes.";
+    } else if (intent === "explain") {
+      directiveText = "DISCUSSION mode. Clear, detailed, accurate explanations with code examples where appropriate.";
+    } else {
+      directiveText = "For non-trivial tasks, present a brief plan and end with: \"Ready to proceed — send 'go' to start.\" Wait for confirmation before making changes. For simple tasks, just do them.";
+    }
+    layers.push({
+      name: "intent_directive",
+      priority: PRIORITY.IMPORTANT,
+      placement: "dynamic",
+      tier: "session",
+      text: directiveText,
+    });
   }
-  layers.push({
-    name: "intent_directive",
-    priority: PRIORITY.IMPORTANT,
-    placement: "dynamic",
-    text: directiveText,
-  });
+  // Turn 2+: directive already in context — skip
 
-  // ── 4. BEHAVIORAL FENCE (optional) ────────────────────────────────────
-  if (state.activeTask || state.workingSet.length > 0) {
+  // ── 4. BEHAVIORAL FENCE (session-stable) ─────────────────────────────
+  if (isFullAssembly && (state.activeTask || state.workingSet.length > 0)) {
     const fence = ["Behavioral constraints:"];
     if (state.activeTask) fence.push(`- Objective: ${state.activeTask.description}`);
     if (state.workingSet.length > 0) {
@@ -796,6 +916,55 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges) {
     });
   }
 
+  // ── 5. ARBITER FINDINGS (critical) ──────────────────────────────────
+  // Turn Sentinel writes a verdict after each turn. If unresolved errors
+  // exist, inject them at CRITICAL priority so the LLM must fix them
+  // before taking on new work.
+  const verdict = readVerdict(projectId);
+  const arbiterText = formatVerdictForContext(verdict);
+  if (arbiterText) {
+    layers.push({
+      name: "arbiter_findings",
+      priority: PRIORITY.CRITICAL,
+      placement: "dynamic",
+      tier: "turn",
+      text: arbiterText,
+    });
+  }
+
+  // ── 6. QUALITY TREND (important, only when concerning) ─────────────
+  // Behavioral fingerprinting: inject quality stats when metrics degrade.
+  // Not CRITICAL — doesn't block work, but nudges the LLM to improve.
+  try {
+    const qdb = getPaneDb();
+    const qualityText = formatQualityStatsForContext(qdb, projectId);
+    if (qualityText) {
+      layers.push({
+        name: "quality_trend",
+        priority: PRIORITY.IMPORTANT,
+        placement: "dynamic",
+        tier: "turn",
+        text: qualityText,
+      });
+    }
+  } catch {}
+
+  // ── 7. PROACTIVE GUIDANCE (useful) ──────────────────────────────────
+  // Senior-dev suggestions from the Turn Sentinel. Not errors — the code
+  // works. But a senior developer would flag these patterns.
+  if (verdict?.guidance) {
+    const guidanceText = formatGuidanceForContext(verdict.guidance);
+    if (guidanceText) {
+      layers.push({
+        name: "proactive_guidance",
+        priority: PRIORITY.USEFUL,
+        placement: "dynamic",
+        tier: "turn",
+        text: guidanceText,
+      });
+    }
+  }
+
   return layers;
 }
 
@@ -826,7 +995,15 @@ export function orchestrateContext(projectId, options = {}) {
     sqliteChanges = null,
     conversationTokens = 0,
     outputBudget = 8192,
+    mode = "full",       // "full" (HTTP backends) or "lean" (CLI backends)
+    isResume = false,     // true when resuming an existing CLI session
   } = options;
+
+  // ── Lean mode: minimal context for CLI backends that manage their own context.
+  // Identity + rules + arbiter findings + MCP orientation. ~500 tokens.
+  if (mode === "lean") {
+    return _buildLeanContext(projectId, isResume);
+  }
 
   const contextLimit = getModelLimit(model);
   const effectiveOutputBudget = outputBudget || getDefaultOutputBudget(model);
@@ -840,22 +1017,31 @@ export function orchestrateContext(projectId, options = {}) {
     contextLimit - conversationTokens - effectiveOutputBudget
   );
 
-  // Build all layers
-  const allLayers = buildLayers(projectId, intent, historyLength, backend, sqliteChanges);
+  // Build all layers — pass lastInjected for delta-aware assembly on turn 2+
+  const lastInjected = contextStore.getLastInjected(projectId);
+  const allLayers = buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected);
 
   // ── Relevance Engine: adjust priorities based on intent, complexity, brain data ──
-  let contextShape = null;
-  let brainCtx = { memories: [], tensions: [], atoms: [], relevantSymbols: [], principles: [] };
-  try {
-    contextShape = JSON.parse(fs.readFileSync(
-      path.join(BRAIN_DIR, "context", `${projectId}-shape.json`), "utf-8"
-    ));
-  } catch {}
-  try {
-    brainCtx = JSON.parse(fs.readFileSync(
-      path.join(BRAIN_DIR, "context", `${projectId}.json`), "utf-8"
-    ));
-  } catch {}
+  // Read from in-memory ContextStore (updated by brain-engine via main.mjs).
+  // Fall back to disk for cold start.
+  const orchStoreCtx = contextStore.getContext(projectId);
+  let contextShape = orchStoreCtx?.contextShape || null;
+  if (!contextShape) {
+    try {
+      contextShape = JSON.parse(fs.readFileSync(
+        path.join(BRAIN_DIR, "context", `${projectId}-shape.json`), "utf-8"
+      ));
+    } catch {}
+  }
+  let brainCtx = orchStoreCtx?.brainExport || null;
+  if (!brainCtx) {
+    try {
+      brainCtx = JSON.parse(fs.readFileSync(
+        path.join(BRAIN_DIR, "context", `${projectId}.json`), "utf-8"
+      ));
+    } catch {}
+  }
+  if (!brainCtx) brainCtx = { memories: [], tensions: [], atoms: [], relevantSymbols: [], principles: [] };
 
   const relevanceAdjustments = computeRelevanceAdjustments(contextShape, brainCtx, intent, historyLength);
   applyRelevanceAdjustments(allLayers, relevanceAdjustments);
@@ -949,6 +1135,24 @@ export function orchestrateContext(projectId, options = {}) {
   if (result.budget.pressure === "low" || result.budget.pressure === "medium") {
     try {
       saveContextCheckpoint(projectId, result, { model, intent });
+    } catch {}
+  }
+
+  // Save snapshot for delta tracking on subsequent turns.
+  // On the FIRST full assembly, record what was injected so turn 2+ can diff.
+  if (!lastInjected || lastInjected.turnNumber === 0) {
+    try {
+      const state = readState(projectId);
+      const memories = (brainCtx?.memories || []).filter(m => (m.confidence || 0) >= 0.75);
+      const symbols = (brainCtx?.relevantSymbols || []).slice(0, 15);
+      contextStore.updateLastInjected(projectId, {
+        memoryIds: new Set(memories.map(m => m.id).filter(Boolean)),
+        symbolNames: new Set(symbols.map(s => s.name).filter(Boolean)),
+        gitSummary: state?.gitStatus?.summary || "",
+        todoSnapshot: JSON.stringify((state?.todos || []).filter(t => t.status !== "completed").map(t => t.content)),
+        directiveText: result.turn?.slice(0, 100) || "",
+        turnNumber: historyLength || 1,
+      });
     } catch {}
   }
 
@@ -1165,15 +1369,34 @@ const _GEMINI_SUBAGENTS = [
   "</available_subagents>",
 ].join("\n");
 
-function _buildSystemPromptFromAtoms(unifiedAtoms, taskType, complexity, backend) {
+function _buildSystemPromptFromAtoms(unifiedAtoms, taskType, complexity, backend, conversationPhase = null, historyLength = 0) {
   const parts = [];
+
+  // On continuation turns (historyLength >= 2), swap ORIENT for CONTINUE.
+  // The model already has project context — don't tell it to re-orient.
+  const isContinuation = historyLength >= 2;
 
   const systemAtoms = (unifiedAtoms || []).filter(a => a.entityType === "system_atom");
 
   if (systemAtoms.length > 0) {
-    const methodAtoms = systemAtoms.filter(a => a.facet === "method").sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
+    let methodAtoms = systemAtoms.filter(a => a.facet === "method").sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
     const ruleAtoms = systemAtoms.filter(a => a.facet === "rule").sort((a, b) => (b.score || 0) - (a.score || 0));
     const guideAtoms = systemAtoms.filter(a => a.facet === "guideline").sort((a, b) => (b.score || 0) - (a.score || 0));
+
+    // Phase-aware filtering: drop irrelevant method atoms based on conversation phase
+    if (conversationPhase) {
+      methodAtoms = filterAtomsForPhase(conversationPhase, methodAtoms);
+    }
+
+    // Continuation: replace orient with continue
+    if (isContinuation) {
+      const continueAtom = METHOD_ATOMS.find(a => a.id === "method-continue");
+      if (continueAtom) {
+        methodAtoms = methodAtoms.filter(a => (a.id || a.name) !== "method-orient");
+        methodAtoms.push({ ...continueAtom, content: continueAtom.text, sortOrder: continueAtom.sortOrder });
+        methodAtoms.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
+      }
+    }
 
     if (methodAtoms.length > 0) parts.push(methodAtoms.map(a => a.content).join("\n\n"));
     if (ruleAtoms.length > 0) {
@@ -1185,7 +1408,19 @@ function _buildSystemPromptFromAtoms(unifiedAtoms, taskType, complexity, backend
       for (const g of guideAtoms) parts.push(`- ${g.content}`);
     }
   } else {
-    const methodAtoms = [...METHOD_ATOMS].sort((a, b) => a.sortOrder - b.sortOrder);
+    let methodAtoms = [...METHOD_ATOMS].sort((a, b) => a.sortOrder - b.sortOrder);
+    if (conversationPhase) {
+      methodAtoms = filterAtomsForPhase(conversationPhase, methodAtoms);
+    }
+
+    // Continuation: replace orient with continue
+    if (isContinuation) {
+      methodAtoms = methodAtoms.filter(a => a.id !== "method-orient");
+      const continueAtom = METHOD_ATOMS.find(a => a.id === "method-continue");
+      if (continueAtom) methodAtoms.push(continueAtom);
+      methodAtoms.sort((a, b) => a.sortOrder - b.sortOrder);
+    }
+
     if (methodAtoms.length > 0) parts.push(methodAtoms.map(a => a.text).join("\n\n"));
     if (RULE_ATOMS.length > 0) {
       parts.push("", "Constraints:");
@@ -1233,6 +1468,11 @@ const TASK_DIRECTIVES = {
     deep: "Check logic flow, error handling, security implications, and performance. Verify test coverage.",
     shallow: "Quick scan for obvious issues.",
   },
+  analyze: {
+    focus: "Deep investigation. Trace connections across modules. Report findings with root causes, implications, and recommendations.",
+    deep: "Map the full architecture. Identify systemic issues, hidden dependencies, and design tensions. Surface what the code does vs what it should do.",
+    shallow: "Focused investigation. Identify the specific issue and its immediate context.",
+  },
   conversation: {
     focus: "Discussion. Think with the developer, not at them.",
     deep: "Engage deeply with the question. Surface assumptions, explore alternatives, provide reasoned opinions.",
@@ -1253,7 +1493,8 @@ const VERIFICATION_DIRECTIVES = {
 
 function _buildDirective(intent, taskType, complexity, reasoning, verification) {
   const parts = [];
-  const modeLabel = intent === "plan" ? "PLANNING" : intent === "explain" ? "EXPLANATION" : "EXECUTION";
+  const MODE_LABELS = { plan: "PLANNING", explain: "DISCUSSION", analyze: "ANALYSIS", other: "EXECUTION", execute: "EXECUTION" };
+  const modeLabel = MODE_LABELS[intent] || "EXECUTION";
   parts.push(`${modeLabel} mode.`);
 
   const task = TASK_DIRECTIVES[taskType] || TASK_DIRECTIVES["implement"];
@@ -1264,6 +1505,32 @@ function _buildDirective(intent, taskType, complexity, reasoning, verification) 
 
   if (complexity === "high") {
     parts.push("This is a complex task. Take your time, plan carefully, and verify each step.");
+  }
+
+  const isStructural = taskType === "refactor" || taskType === "architect";
+  if (isStructural || taskType === "implement") {
+    if (isStructural) {
+      parts.push(
+        "PREFLIGHT (required before structural changes):\n" +
+        "1. Call pane_architecture_brief with the subsystem name — get locked decisions, known gotchas, and scope boundaries.\n" +
+        "2. Call pane_codebase_navigator with the target — understand what will break if this changes."
+      );
+    } else {
+      parts.push(
+        "GUIDANCE TOOLS AVAILABLE:\n" +
+        "- pane_ui_constraints: get hard design rules before writing UI. Call before any component work.\n" +
+        "- pane_architecture_brief: get locked architectural decisions before structural changes.\n" +
+        "- pane_codebase_navigator: map the import graph before modifying shared code."
+      );
+    }
+  }
+
+  if (taskType === "ui" || taskType === "design") {
+    parts.push(
+      "PREFLIGHT (required before writing any component):\n" +
+      "1. Call pane_ui_constraints with the component type — get forbidden patterns, design tokens, and a reference implementation before writing Tailwind classes.\n" +
+      "2. Call pane_codebase_navigator with the target component — understand the import graph and blast radius before modifying files."
+    );
   }
 
   const verif = VERIFICATION_DIRECTIVES[verification || "none"];

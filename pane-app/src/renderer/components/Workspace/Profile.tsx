@@ -386,7 +386,7 @@ function EngineSelect({
   // Provider display labels
   const providerLabel = useCallback((provider: string): string => {
     const labels: Record<string, string> = {
-      anthropic: "Claude Code",
+      anthropic: "Claude",
       "anthropic-api": "Anthropic API",
       gemini: "Gemini CLI",
       "gemini-api": "Gemini API",
@@ -394,6 +394,7 @@ function EngineSelect({
       openrouter: "OpenRouter",
       kimi: "Kimi",
       stepfun: "StepFun",
+      xiaomi: "Xiaomi MiMo",
     };
     return labels[provider] || provider;
   }, []);
@@ -468,6 +469,7 @@ function EngineSelect({
       const nativeProviderPrefixes = new Set<string>();
       if (groups["anthropic"] || groups["anthropic-api"]) nativeProviderPrefixes.add("anthropic/");
       if (groups["deepseek"]) nativeProviderPrefixes.add("deepseek/");
+      if (groups["xiaomi"]) nativeProviderPrefixes.add("xiaomi/");
       if (groups["gemini"] || groups["gemini-api"]) { nativeProviderPrefixes.add("google/"); nativeProviderPrefixes.add("gemini/"); }
 
       const filtered = orModels.filter((m) => {
@@ -643,6 +645,7 @@ function AiEnginesSection({
     const isReasoningProvider =
       opt.provider === "openrouter" ||
       opt.provider === "kimi" ||
+      opt.provider === "xiaomi" ||
       opt.provider === "deepseek";
 
     const next = {
@@ -865,7 +868,7 @@ function AiEnginesSection({
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ {thinkingEngine.provider === "anthropic" ? "Claude Code not installed" : thinkingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${thinkingEngine.requiresKey}`} — {thinkingEngine.provider === "anthropic" || thinkingEngine.provider === "gemini" ? "install CLI" : "add key below"}
+                  ⚠ {thinkingEngine.provider === "anthropic" ? "Claude not connected" : thinkingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${thinkingEngine.requiresKey}`} — {thinkingEngine.provider === "anthropic" ? "sign in below" : thinkingEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
@@ -900,7 +903,7 @@ function AiEnginesSection({
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ {buildingEngine.provider === "anthropic" ? "Claude Code not installed" : buildingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${buildingEngine.requiresKey}`} — {buildingEngine.provider === "anthropic" || buildingEngine.provider === "gemini" ? "install CLI" : "add key below"}
+                  ⚠ {buildingEngine.provider === "anthropic" ? "Claude not connected" : buildingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${buildingEngine.requiresKey}`} — {buildingEngine.provider === "anthropic" ? "sign in below" : buildingEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
@@ -935,7 +938,7 @@ function AiEnginesSection({
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ {explainingEngine.provider === "anthropic" ? "Claude Code not installed" : explainingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${explainingEngine.requiresKey}`} — {explainingEngine.provider === "anthropic" || explainingEngine.provider === "gemini" ? "install CLI" : "add key below"}
+                  ⚠ {explainingEngine.provider === "anthropic" ? "Claude not connected" : explainingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${explainingEngine.requiresKey}`} — {explainingEngine.provider === "anthropic" ? "sign in below" : explainingEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
@@ -970,7 +973,7 @@ function AiEnginesSection({
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ {otherEngine.provider === "anthropic" ? "Claude Code not installed" : otherEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${otherEngine.requiresKey}`} — {otherEngine.provider === "anthropic" || otherEngine.provider === "gemini" ? "install CLI" : "add key below"}
+                  ⚠ {otherEngine.provider === "anthropic" ? "Claude not connected" : otherEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${otherEngine.requiresKey}`} — {otherEngine.provider === "anthropic" ? "sign in below" : otherEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
@@ -997,6 +1000,7 @@ const API_KEY_PROVIDERS = [
   { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys" },
   { key: "anthropic", label: "Anthropic", placeholder: "sk-ant-...", docsUrl: "https://console.anthropic.com/settings/keys" },
   { key: "openrouter", label: "OpenRouter", placeholder: "sk-or-...", docsUrl: "https://openrouter.ai/keys" },
+  { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/" },
 ] as const;
 
 // Gemini CLI — external, needs install
@@ -1036,76 +1040,6 @@ function ApiKeysSection({
 
   return (
     <div className="flex flex-col gap-3">
-      {/* Claude Code — built-in SDK */}
-      <div className="flex items-center justify-between mb-1">
-        <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-          claude code
-        </span>
-      </div>
-      <div className={`py-1.5 flex items-center justify-between ${disabledProviders.includes("anthropic") ? "opacity-40" : ""}`}>
-        <div className="flex items-center gap-2">
-          {isClaudeAuthenticated && <ProviderToggle toggleKey="anthropic" label="Claude Code" />}
-          <span className="text-pane-text font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-            Claude Code
-          </span>
-          {isClaudeAuthenticated ? (
-            <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-              {sdkAccount?.email || sdkAccount?.organization || "authenticated"}
-            </span>
-          ) : (
-            <span className="text-pane-text-secondary/50 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-              not signed in
-            </span>
-          )}
-        </div>
-        {!isClaudeAuthenticated && (
-          <button
-            onClick={() => {
-              // Trigger a prefetch which starts the SDK and prompts auth
-              reinitializePunkBackend("claude-code").catch(() => {});
-            }}
-            className="text-pane-text-secondary/60 hover:text-pane-text font-mono transition-colors"
-            style={{ fontSize: "var(--pane-font-size-xs)" }}
-          >
-            sign in
-          </button>
-        )}
-      </div>
-
-      <div className="h-px bg-pane-border/20 my-1" />
-
-      {/* Gemini CLI — only show when installed */}
-      {geminiAvailable && (<>
-        <div className="flex items-center justify-between mb-1">
-          <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-            gemini cli
-          </span>
-        </div>
-        <div className="flex flex-col gap-2">
-          {CLI_PROVIDERS.map(({ key, label, description }) => (
-            <div key={key} className={`py-1.5 flex items-center justify-between ${disabledProviders.includes(key) ? "opacity-40" : ""}`}>
-              <div className="flex items-center gap-2">
-                <ProviderToggle toggleKey={key} label={label} />
-                <span className="text-pane-text font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  {label}
-                </span>
-                <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  {description}
-                </span>
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div className="h-px bg-pane-border/20 my-1" />
-      </>)}
-
-      {/* API key providers — toggle + key input */}
-      <div className="flex items-center justify-between mb-1">
-        <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-          api keys
-        </span>
-      </div>
       <div className="flex flex-col gap-2">
         {API_KEY_PROVIDERS.map(({ key, label, placeholder, docsUrl }) => {
           const toggleKey = (key === "anthropic" || key === "gemini") ? `${key}-api` : key;
@@ -1528,6 +1462,16 @@ function AccordionSection({
   );
 }
 
+function formatResetTime(unixSeconds: number): string {
+  const date = new Date(unixSeconds * 1000);
+  const diff = date.getTime() - Date.now();
+  if (diff <= 0) return "now";
+  // Show full date + time for the profile (e.g., "Apr 9 · 11:00 AM")
+  const dateStr = date.toLocaleDateString([], { month: "short", day: "numeric" });
+  const timeStr = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return `${dateStr} · ${timeStr}`;
+}
+
 export function Profile() {
   const profileName = useWorkspaceStore((s) => s.profileName);
   const profileBio = useWorkspaceStore((s) => s.profileBio);
@@ -1559,6 +1503,11 @@ export function Profile() {
   // Detect which CLI backends are available in PATH
   const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
   const [geminiAvailable, setGeminiAvailable] = useState(false);
+  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
+  const rateLimitInfo = useWorkspaceStore((s) => s.rateLimitInfo);
+  const isClaudeAuthenticated = claudeCodeAvailable && sdkAccount != null;
+  const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
+  const toggleProvider = useWorkspaceStore((s) => s.toggleProvider);
 
   useEffect(() => {
     getBackendAvailability()
@@ -1710,11 +1659,26 @@ export function Profile() {
         <path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z" />
       </svg>
     ),
+    claude: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 2L2 7l10 5 10-5-10-5z" />
+        <path d="M2 17l10 5 10-5" />
+        <path d="M2 12l10 5 10-5" />
+      </svg>
+    ),
     usage: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 20V10" />
         <path d="M18 20V4" />
         <path d="M6 20v-4" />
+      </svg>
+    ),
+    integrations: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M4 11a9 9 0 0118 0" />
+        <path d="M12 11V2" />
+        <path d="M8 22h8" />
+        <path d="M12 22v-6" />
       </svg>
     ),
   };
@@ -1825,6 +1789,79 @@ export function Profile() {
           </div>
         </AccordionSection>
 
+        {/* Claude Section */}
+        <AccordionSection
+          title="claude"
+          icon={icons.claude}
+          isExpanded={expandedSection === "claude"}
+          onToggle={() => setExpandedSection(expandedSection === "claude" ? null : "claude")}
+        >
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className={`w-2 h-2 rounded-full ${isClaudeAuthenticated ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
+                <span className="font-mono text-[var(--pane-status-added)]" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                  {isClaudeAuthenticated
+                    ? (sdkAccount?.email || sdkAccount?.organization || "connected")
+                    : "not signed in"}
+                </span>
+              </div>
+              {!isClaudeAuthenticated && (
+                <button
+                  onClick={() => reinitializePunkBackend("claude-code").catch(() => {})}
+                  className="font-mono text-pane-text-secondary hover:text-pane-text transition-colors"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  sign in
+                </button>
+              )}
+            </div>
+
+            {isClaudeAuthenticated && (() => {
+              const plan = sdkAccount?.subscription || sdkAccount?.subscriptionType || (sdkAccount as any)?.planType || null;
+              return plan ? (
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>plan</span>
+                  <span className="font-mono text-[var(--pane-status-added)]" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                    {plan}
+                  </span>
+                </div>
+              ) : null;
+            })()}
+
+            {isClaudeAuthenticated && (
+              <>
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>usage</span>
+                  <span className="font-mono text-[var(--pane-status-added)] tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                    {rateLimitInfo?.utilization != null ? `${Math.round(rateLimitInfo.utilization * 100)}%` : "waiting for session"}
+                  </span>
+                </div>
+                {rateLimitInfo?.utilization != null && (
+                  <div className="h-1.5 w-full bg-pane-text/[0.06] rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all ${
+                        rateLimitInfo.utilization >= 0.85 ? "bg-pane-error" :
+                        rateLimitInfo.utilization >= 0.7 ? "bg-pane-status-modified" :
+                        "bg-pane-status-added"
+                      }`}
+                      style={{ width: `${Math.min(100, Math.round(rateLimitInfo.utilization * 100))}%` }}
+                    />
+                  </div>
+                )}
+                {rateLimitInfo?.resetsAt != null && (
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>resets</span>
+                    <span className="font-mono text-[var(--pane-status-added)] tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      {formatResetTime(rateLimitInfo.resetsAt)}
+                    </span>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </AccordionSection>
+
         {/* Usage Section */}
         <AccordionSection
           title="usage & spend"
@@ -1877,104 +1914,6 @@ export function Profile() {
           </span>
         </AccordionSection>
 
-        {/* Backend Availability Section */}
-        <AccordionSection
-          title="backend availability"
-          icon={icons.aiBackend}
-          isExpanded={expandedSection === "aiBackend"}
-          onToggle={() => setExpandedSection(expandedSection === "aiBackend" ? null : "aiBackend")}
-        >
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <span className="text-pane-text-secondary/60 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                transparent routing
-              </span>
-              <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-pane-status-added animate-pulse" />
-                <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  all backends available
-                </span>
-              </div>
-            </div>
-
-            {/* Backend availability cards */}
-            <div className="space-y-2">
-              <div className="p-3 bg-pane-surface/50 rounded-lg">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className={`w-2 h-2 rounded-full ${claudeCodeAvailable ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
-                    <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-sm)" }}>
-                      Claude Code
-                    </span>
-                  </div>
-                  <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    {claudeCodeAvailable ? "available" : "not installed"}
-                  </span>
-                </div>
-                {claudeCodeAvailable && (
-                  <div className="mt-2 pl-4">
-                    <span className="font-mono text-pane-text-secondary/50" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      Claude models route locally via CLI
-                    </span>
-                  </div>
-                )}
-              </div>
-
-              <div className="p-3 bg-pane-surface/50 rounded-lg">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className={`w-2 h-2 rounded-full ${geminiAvailable ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
-                    <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-sm)" }}>
-                      Gemini CLI
-                    </span>
-                  </div>
-                  <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    {geminiAvailable ? "available" : "not installed"}
-                  </span>
-                </div>
-                {geminiAvailable && (
-                  <div className="mt-2 pl-4">
-                    <span className="font-mono text-pane-text-secondary/50" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      Gemini models route locally via CLI
-                    </span>
-                  </div>
-                )}
-              </div>
-
-              <div className="p-3 bg-pane-surface/50 rounded-lg">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-pane-status-added" />
-                    <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-sm)" }}>
-                      HTTP API
-                    </span>
-                  </div>
-                  <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    always available
-                  </span>
-                </div>
-                <div className="mt-2 pl-4">
-                  <span className="font-mono text-pane-text-secondary/50" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    OpenRouter & direct API models
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-2 p-3 bg-pane-surface/30 rounded-lg border border-pane-border/20">
-              <div className="flex items-center gap-2">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M12 16v-4M12 8h.01" />
-                </svg>
-                <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  Models are automatically routed to the appropriate backend
-                </span>
-              </div>
-            </div>
-          </div>
-        </AccordionSection>
-
         {/* AI Engines Section */}
         <AccordionSection
           title="ai engines"
@@ -1988,7 +1927,7 @@ export function Profile() {
         {/* API Keys Section */}
         {punkBackend === "api" && (
           <AccordionSection
-            title="api keys"
+            title="providers"
             icon={icons.apiKeys}
             isExpanded={expandedSection === "apiKeys"}
             onToggle={() => setExpandedSection(expandedSection === "apiKeys" ? null : "apiKeys")}
@@ -2136,6 +2075,34 @@ export function Profile() {
         >
           <CloudSection />
         </AccordionSection>
+
+        {/* Integrations — external CLIs, only when available */}
+        {geminiAvailable && (
+          <AccordionSection
+            title="integrations"
+            icon={icons.integrations}
+            isExpanded={expandedSection === "integrations"}
+            onToggle={() => setExpandedSection(expandedSection === "integrations" ? null : "integrations")}
+          >
+            <div className="flex flex-col gap-2">
+              {CLI_PROVIDERS.map(({ key, label }) => (
+                <div key={key} className={`flex items-center justify-between ${disabledProviders.includes(key) ? "opacity-40" : ""}`}>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => toggleProvider(key)}
+                      className={`w-3 h-3 rounded-full ring-1 transition-colors ${
+                        disabledProviders.includes(key) ? "bg-transparent ring-pane-text-secondary/30" : "bg-pane-status-added ring-pane-status-added"
+                      }`}
+                      title={disabledProviders.includes(key) ? `enable ${label}` : `disable ${label}`}
+                    />
+                    <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-xs)" }}>{label}</span>
+                  </div>
+                  <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>available</span>
+                </div>
+              ))}
+            </div>
+          </AccordionSection>
+        )}
       </div>
     </div>
   );

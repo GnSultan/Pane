@@ -1,13 +1,12 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useLensStore } from "../../stores/lens";
+import { useReviewStore } from "../../stores/review";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useMindStore } from "../../stores/mind";
-import { lensPostAdd, lensPostsList, lensPostDelete, type LensPost } from "../../lib/tauri-commands";
-import { useLensChat } from "../../hooks/useLensChat";
+import { lensPostAdd, lensPostsList, lensPostDelete, runReview, reviewSessionLatest, type LensPost, type ReviewFinding } from "../../lib/tauri-commands";
 import { SlashMenu } from "../shared";
-import type { TextBlock } from "../../lib/punk-types";
 
 // Delete confirmation helper — matches Mind pattern (1-click "confirm?", 2-click delete with auto-revert)
 
@@ -17,164 +16,6 @@ const PUNK_PERSONAS: Record<string, { name: string; role: string }> = {
   sentinel:   { name: "zara", role: "the auditor" },
 };
 
-// ─── PostComments ──────────────────────────────────────────────────────────
-
-function PostComments({
-  postId,
-  workingDir,
-  postContent,
-  isVisible,
-}: {
-  postId: string;
-  workingDir: string;
-  postContent: string;
-  isVisible: boolean;
-}) {
-  const { messages, isProcessing, error, sendMessage, appendMessage } = useLensChat(
-    postId,
-    workingDir,
-    postContent
-  );
-
-  const [input, setInput] = useState("");
-  const [expandedMsgId, setExpandedMsgId] = useState<string | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const electronAPI = (window as any).electronAPI;
-    const unlisten = electronAPI.on("pane://lens-comment", (data: { postId: string; comment: any }) => {
-      if (data.postId !== postId) return;
-      try {
-        const msg = JSON.parse(data.comment.content);
-        if (msg?.id && msg?.type) appendMessage(msg);
-      } catch {}
-    });
-    return () => unlisten();
-  }, [postId, appendMessage]);
-
-  useEffect(() => {
-    if (isVisible) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    }
-  }, [messages.length, isVisible]);
-
-  const handleSend = async () => {
-    const text = input.trim();
-    if (!text || isProcessing) return;
-    setInput("");
-    if (textareaRef.current) textareaRef.current.style.height = "auto";
-    await sendMessage(text);
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
-  if (!isVisible) return null;
-
-  return (
-    <div className="pl-5 mt-1.5 mb-1">
-      {/* Comment thread — each comment truncated, tap to expand */}
-      {messages.length > 0 && (
-        <div className="flex flex-col gap-1 mb-2">
-          {messages.map((msg) => {
-            const isAssistant = msg.type === "assistant";
-            const text = msg.content
-              .filter((b): b is TextBlock => b.type === "text")
-              .map((b) => b.text)
-              .join("");
-            if (!text) return null;
-            const isExpanded = expandedMsgId === msg.id;
-            const isLong = text.length > 80;
-            return (
-              <div key={msg.id} className="flex gap-2 items-baseline min-w-0">
-                <span
-                  className="font-mono shrink-0"
-                  style={{
-                    fontSize: "var(--pane-font-size-xs)",
-                    color: isAssistant ? "var(--pane-terminal)" : "var(--pane-text-secondary)",
-                    opacity: isAssistant ? 0.7 : 0.4,
-                  }}
-                >
-                  {isAssistant ? "pane" : "you"}
-                </span>
-                <span
-                  className={`text-pane-text/60 leading-snug whitespace-pre-wrap min-w-0 flex-1 ${!isExpanded && isLong ? "line-clamp-1" : ""} ${isLong ? "cursor-pointer" : ""}`}
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  onClick={() => isLong && setExpandedMsgId(isExpanded ? null : msg.id)}
-                >
-                  {text}
-                  {msg.isStreaming && (
-                    <span className="inline-block ml-1 animate-pulse" style={{ color: "var(--pane-terminal)" }}>▋</span>
-                  )}
-                </span>
-              </div>
-            );
-          })}
-
-          {isProcessing && messages[messages.length - 1]?.type === "user" && (
-            <div className="flex items-center gap-2">
-              <span className="font-mono shrink-0" style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)", opacity: 0.7 }}>pane</span>
-              <span className="animate-pulse font-mono" style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)", opacity: 0.5 }}>...</span>
-            </div>
-          )}
-
-          <div ref={bottomRef} />
-        </div>
-      )}
-
-      {isProcessing && messages.length === 0 && (
-        <div className="flex items-center gap-2 mb-2">
-          <span className="font-mono shrink-0" style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)", opacity: 0.7 }}>pane</span>
-          <span className="animate-pulse font-mono" style={{ fontSize: "var(--pane-font-size-xs)", color: "var(--pane-terminal)", opacity: 0.5 }}>...</span>
-        </div>
-      )}
-
-      {error && (
-        <p className="text-pane-error mb-2 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>{error}</p>
-      )}
-
-      {/* Reply input — no border, bg-pane-surface defines the container */}
-      <div className="bg-pane-surface rounded-md relative">
-        <textarea
-          ref={textareaRef}
-          value={input}
-          onChange={(e) => {
-            setInput(e.target.value);
-            e.target.style.height = "auto";
-            e.target.style.height = `${e.target.scrollHeight}px`;
-          }}
-          onKeyDown={handleKeyDown}
-          placeholder="reply"
-          rows={1}
-          disabled={isProcessing}
-          className="w-full bg-transparent text-pane-text font-mono resize-none outline-none placeholder:text-pane-text-secondary/30 leading-[1.75] px-3 pt-1.5 overflow-hidden"
-          style={{
-            fontSize: "var(--pane-font-size-xs)",
-            minHeight: "2rem",
-            maxHeight: "6rem",
-            paddingBottom: input.trim() ? "1.75rem" : "0.375rem",
-          }}
-        />
-        {input.trim() && (
-          <button
-            onMouseDown={(e) => { e.preventDefault(); handleSend(); }}
-            className="absolute bottom-1 right-1 w-6 h-6 flex items-center justify-center rounded text-pane-text-secondary/50 hover:text-pane-text hover:bg-pane-text/[0.06] transition-all btn-press"
-          >
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
-            </svg>
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
 // ─── PostItem ──────────────────────────────────────────────────────────────
 
 const POST_CLAMP_THRESHOLD = 220;
@@ -183,14 +24,12 @@ function PostItem({
   post,
   showComments,
   onToggleComments,
-  workingDir,
   userName,
   onDelete,
 }: {
   post: LensPost;
   showComments: boolean;
   onToggleComments: () => void;
-  workingDir: string;
   userName: string;
   onDelete: () => void;
 }) {
@@ -303,20 +142,181 @@ function PostItem({
         </div>
       </div>
 
-      {/* Comments — outside post, indented to align with content */}
-      {showComments && (
-        <PostComments
-          postId={post.id}
-          workingDir={workingDir}
-          postContent={post.content}
-          isVisible={showComments}
-        />
-      )}
     </div>
   );
 }
 
 // ─── Lens ──────────────────────────────────────────────────────────────────
+
+// ─── Review Section ──────────────────────────────────────────────────────────
+
+const SEVERITY_ORDER: Record<string, number> = { critical: 0, warning: 1, note: 2 };
+const SEVERITY_COLOR: Record<string, string> = {
+  critical: "text-red-400/70",
+  warning: "text-amber-400/70",
+  note: "text-pane-text-secondary/50",
+};
+
+function ReviewSection({ projectId, workingDir }: { projectId: string; workingDir: string }) {
+  const { session, findings, running, progress, setSession, setFindings, setRunning, setAllProgress, setProgress } = useReviewStore();
+
+  // Load latest review on mount
+  useEffect(() => {
+    reviewSessionLatest(projectId).then((result) => {
+      if (result?.session) {
+        setSession(result.session);
+        setFindings(result.findings || []);
+      }
+    }).catch(() => {});
+  }, [projectId]);
+
+  // Listen for review progress events
+  useEffect(() => {
+    const electronAPI = (window as unknown as { electronAPI: { on: (ch: string, fn: (data: unknown) => void) => () => void } }).electronAPI;
+
+    const unlistenProgress = electronAPI.on("pane://review-progress", (data: any) => {
+      if (data.projectId !== projectId) return;
+      if (data.status === "running" && data.punks) {
+        setAllProgress(data.punks);
+      } else if (data.punk) {
+        setProgress(data.punk, data.status);
+      }
+    });
+
+    const unlistenComplete = electronAPI.on("pane://review-complete", (data: any) => {
+      if (data.projectId !== projectId) return;
+      setRunning(false);
+      if (data.findings) setFindings(data.findings);
+      if (data.sessionId) {
+        setSession({
+          id: data.sessionId,
+          project_id: projectId,
+          status: "completed",
+          diff_summary: null,
+          base_ref: null,
+          punk_count: 3,
+          finding_count: data.findings?.length || 0,
+          created_at: new Date().toISOString(),
+          completed_at: new Date().toISOString(),
+        });
+      }
+    });
+
+    return () => { unlistenProgress(); unlistenComplete(); };
+  }, [projectId]);
+
+  const handleReview = async () => {
+    setRunning(true);
+    setFindings([]);
+    try {
+      await runReview(projectId, workingDir);
+    } catch {
+      setRunning(false);
+    }
+  };
+
+  // Group findings by punk
+  const grouped = new Map<string, ReviewFinding[]>();
+  for (const f of findings) {
+    if (!grouped.has(f.punk)) grouped.set(f.punk, []);
+    grouped.get(f.punk)!.push(f);
+  }
+  // Sort within each group by severity
+  for (const [, arr] of grouped) {
+    arr.sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 2) - (SEVERITY_ORDER[b.severity] ?? 2));
+  }
+
+  return (
+    <div className="mb-6">
+      {/* Review button + progress */}
+      <div className="flex items-center gap-3 mb-4">
+        <button
+          onClick={handleReview}
+          disabled={running}
+          className={`font-mono text-[11px] tracking-wider transition-colors btn-press ${
+            running
+              ? "text-pane-text-secondary/30 cursor-default"
+              : "text-[var(--pane-terminal)]/60 hover:text-[var(--pane-terminal)]"
+          }`}
+        >
+          {running ? "reviewing" : "review"}
+        </button>
+        {running && Object.entries(progress).map(([punk, status]) => (
+          <span
+            key={punk}
+            className={`font-mono text-[10px] tracking-wider ${
+              status === "done" ? "text-emerald-500/60"
+              : status === "running" ? "text-[var(--pane-terminal)]/60"
+              : status === "failed" ? "text-red-400/60"
+              : "text-pane-text-secondary/20"
+            }`}
+          >
+            {punk} {status === "done" ? "●" : status === "running" ? "..." : status === "failed" ? "x" : "·"}
+          </span>
+        ))}
+        {!running && session && (
+          <span className="font-mono text-[10px] text-pane-text-secondary/30 tracking-wider">
+            {findings.length} finding{findings.length !== 1 ? "s" : ""}
+          </span>
+        )}
+      </div>
+
+      {/* Findings */}
+      {findings.length > 0 && (
+        <div className="space-y-4">
+          {[...grouped.entries()].map(([punk, punkFindings]) => (
+            <div key={punk}>
+              {punkFindings.map((f) => (
+                <div key={f.id} className="mb-3 pl-3 border-l border-pane-text/5">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="font-mono text-[10px] text-[var(--pane-terminal)]/50 tracking-wider">{punk}</span>
+                    <span className={`font-mono text-[10px] tracking-wider ${SEVERITY_COLOR[f.severity] || "text-pane-text-secondary/50"}`}>
+                      {f.severity}
+                    </span>
+                    {f.location && (
+                      <span className="font-mono text-[10px] text-pane-text-secondary/30 tracking-wider">
+                        {f.location}
+                      </span>
+                    )}
+                    {f.remediation && (
+                      <button
+                        onClick={() => {
+                          const prompt = `${punk} found an issue that needs fixing:\n\n**Issue:** ${f.finding}\n\n**Location:** ${f.location || "see details"}\n\n**Recommended fix:** ${f.remediation}\n\nImplement this fix.`;
+                          // Switch to conversation and prefill the prompt
+                          const store = useProjectsStore.getState();
+                          store.setMode(projectId, "conversation");
+                          // Dispatch event for InputBar to pick up
+                          window.dispatchEvent(new CustomEvent("pane:prefill-prompt", { detail: { prompt } }));
+                        }}
+                        className="font-mono text-[10px] tracking-wider text-[var(--pane-terminal)]/40 hover:text-[var(--pane-terminal)] transition-colors btn-press"
+                      >
+                        fix
+                      </button>
+                    )}
+                  </div>
+                  <p
+                    className="text-pane-text-secondary/70 leading-relaxed m-0"
+                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                  >
+                    {f.finding}
+                  </p>
+                  {f.remediation && (
+                    <p
+                      className="text-pane-text-secondary/40 leading-relaxed m-0 mt-1"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {f.remediation}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function Lens({ projectId }: { projectId: string }) {
   const posts = useLensStore(useShallow((s) => s.posts.filter((p) => p.project_id === projectId)));
@@ -324,7 +324,6 @@ export function Lens({ projectId }: { projectId: string }) {
   const setPosts = useLensStore((s) => s.setPosts);
   const deletePost = useLensStore((s) => s.deletePost);
   const setLoaded = useLensStore((s) => s.setLoaded);
-  const clearUnreadPunkPosts = useLensStore((s) => s.clearUnreadPunkPosts);
   const expandedCommentsId = useLensStore((s) => s.expandedCommentsId);
   const setExpandedCommentsId = useLensStore((s) => s.setExpandedCommentsId);
 
@@ -351,11 +350,6 @@ export function Lens({ projectId }: { projectId: string }) {
       setPosts(fetched);
       setLoaded(projectId, true);
     });
-  }, [projectId]);
-
-  // Clear unread punk posts when user navigates to Lens
-  useEffect(() => {
-    clearUnreadPunkPosts(projectId);
   }, [projectId]);
 
   // Listen for new posts from workers via IPC
@@ -488,6 +482,9 @@ export function Lens({ projectId }: { projectId: string }) {
         className="flex-1 overflow-y-auto overflow-x-hidden custom-scrollbar py-4"
       >
         <div className="max-w-2xl mx-auto w-full px-4">
+        {/* Review section — on-demand punk analysis */}
+        <ReviewSection projectId={projectId} workingDir={workingDir} />
+
         {posts.length === 0 && !composing ? (
           <div className="flex items-center justify-center h-full py-20">
             <button
@@ -507,7 +504,6 @@ export function Lens({ projectId }: { projectId: string }) {
               onToggleComments={() =>
                 setExpandedCommentsId(expandedCommentsId === post.id ? null : post.id)
               }
-              workingDir={workingDir}
               userName={userName}
               onDelete={() => handleDelete(post.id)}
             />

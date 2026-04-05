@@ -174,6 +174,9 @@ class ModelManager {
         case "deepseek":
           newModels = await this.backend.getDeepSeekModels();
           break;
+        case "xiaomi":
+          newModels = await this.backend.getXiaomiModels();
+          break;
         default:
           return false;
       }

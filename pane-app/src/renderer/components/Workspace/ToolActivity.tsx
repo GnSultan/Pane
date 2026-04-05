@@ -77,8 +77,32 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       case "pane_open_files": return "open files";
       case "pane_profile": return "profile";
       case "pane_project_context": return "project context";
+      case "pane_read_files": {
+        const paths = input.paths as string[] | undefined;
+        return paths?.length ? `read ${paths.length} files` : "read files";
+      }
+      case "pane_find_references": {
+        const sym = (input.symbol as string) || "";
+        return sym ? `references ${sym}` : "references";
+      }
+      case "pane_codebase_compass": {
+        const q = (input.query as string) || "";
+        return q ? `compass ${q.slice(0, 50)}` : "compass";
+      }
+      case "pane_codebase_navigator": {
+        const t = (input.target as string) || "";
+        return t ? `navigate ${t}` : "navigate";
+      }
+      case "pane_ui_constraints": {
+        const c = (input.component as string) || "";
+        return c ? `ui ${c}` : "ui";
+      }
+      case "pane_architecture_brief": {
+        const s = (input.subsystem as string) || "";
+        return s ? `architecture ${s}` : "architecture brief";
+      }
+      case "pane_revert_change": return "revert";
       default:
-        // generic: strip "pane_" prefix, replace underscores with spaces
         return name.slice(5).replace(/_/g, " ");
     }
   }
@@ -127,6 +151,16 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
     case "WebSearch":
     case "google_web_search":
       return (input.query as string) || "";
+    case "explore": {
+      const q = (input.query as string) || "";
+      return q ? `explore ${q.slice(0, 50)}` : "explore";
+    }
+    case "evaluate_js":
+      return "evaluate";
+    case "list_directory":
+      return (input.dir_path as string) || "list directory";
+    case "web_fetch":
+      return "fetch";
     case "EnterPlanMode":
       return "entering plan mode";
     case "ExitPlanMode":

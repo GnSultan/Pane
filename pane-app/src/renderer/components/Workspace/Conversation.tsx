@@ -4,7 +4,6 @@ import { usePunk } from "../../hooks/usePunk";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
-import { PunkActivityStrip } from "./PunkActivityStrip";
 import { getConversationSlice, listCheckpoints, readFile } from "../../lib/tauri-commands";
 import { restoringProjects } from "../../hooks/useSettingsPersistence";
 import type {
@@ -142,7 +141,7 @@ export const Conversation = memo(function Conversation({
     return map;
   }, [messages, systemMessageCount]);
 
-  const { sendMessage, abortMessage } = usePunk(projectId);
+  const { sendMessage, abortMessage, clearConversation } = usePunk(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
   const streamingRef = useRef(false);
@@ -259,8 +258,8 @@ export const Conversation = memo(function Conversation({
   }, []);
 
   const handleSend = useCallback(
-    (msg: string, minds?: Array<{ id: string }>) => {
-      sendMessage(msg, minds);
+    (msg: string, minds?: Array<{ id: string }>, effectiveMode?: string) => {
+      sendMessage(msg, minds, effectiveMode);
       scrollToBottom();
     },
     [sendMessage, scrollToBottom],
@@ -299,10 +298,10 @@ export const Conversation = memo(function Conversation({
   }, [projectId]);
 
   return (
-    <div className="relative h-full w-full">
+    <div className="relative flex flex-col h-full w-full">
       <div
         ref={scrollRef}
-        className="absolute inset-0 overflow-x-hidden overflow-y-auto px-10 pb-48 pt-8 z-20 [overflow-anchor:none] bg-pane-bg will-change-transform [contain:layout_paint]"
+        className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto px-10 pb-8 pt-8 [overflow-anchor:none] bg-pane-bg will-change-transform [contain:layout_paint]"
         data-conv-scroll
         data-no-drag
       >
@@ -317,8 +316,6 @@ export const Conversation = memo(function Conversation({
             </button>
           </div>
         )}
-
-        <PunkActivityStrip projectId={projectId} />
 
         {messages.length === 0 && !hasOlderMessages && (
           <div className="flex items-center justify-center h-full select-none">
@@ -350,7 +347,7 @@ export const Conversation = memo(function Conversation({
         </div>
       )}
 
-      <div className="absolute bottom-0 left-0 right-0 z-30 flex flex-col">
+      <div className="relative z-10 shrink-0 flex flex-col">
         {visibleError && (
           <div className="px-4 pb-2">
             <div className="flex items-start gap-3 font-mono text-[11px] text-pane-error bg-pane-bg ring-1 ring-pane-error/25 px-4 py-3 rounded-xl animate-fade-in leading-[1.6]">
@@ -373,6 +370,7 @@ export const Conversation = memo(function Conversation({
           projectId={projectId}
           onSend={handleSend}
           onAbort={abortMessage}
+          onClearConversation={clearConversation}
           isProcessing={isProcessing}
         />
       </div>

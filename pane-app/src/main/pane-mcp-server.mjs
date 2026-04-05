@@ -9,6 +9,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
+import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
@@ -47,6 +48,11 @@ function respondError(id, code, message) {
 async function readJson(filePath) {
   try { return JSON.parse(await fs.promises.readFile(filePath, "utf-8")); }
   catch { return null; }
+}
+
+async function writeJson(filePath, data) {
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.promises.writeFile(filePath, JSON.stringify(data, null, 2));
 }
 
 async function readText(filePath) {
@@ -408,6 +414,96 @@ const TOOLS = [
     },
   },
   {
+    name: "pane_find_references",
+    description: "Find every place a symbol is used across the codebase — imports, call sites, JSX usage, and type references. Use after pane_find_symbol to go from declaration to all usages. Grouped by file with surrounding context. Does not require the symbol to be indexed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        symbol: {
+          type: "string",
+          description: "Exact symbol name to find usages of (e.g. 'useAuth', 'ProjectList', 'MAX_RETRIES')",
+        },
+        projectRoot: {
+          type: "string",
+          description: "Absolute path to the project root to search within",
+        },
+        projectId: {
+          type: "string",
+          description: "Optional project ID — used to tag the declaration site in results",
+        },
+      },
+      required: ["symbol", "projectRoot"],
+    },
+  },
+  {
+    name: "pane_ui_constraints",
+    description: "Get the hard design constraints for a specific component type before writing any UI code. Returns forbidden Tailwind patterns, design tokens, a reference implementation, and active anti-patterns. Call this before writing any React component or Tailwind classes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        component: { type: "string", description: "Component type or description, e.g. 'search input', 'floating panel', 'terminal output'" },
+        projectId: { type: "string" },
+      },
+      required: ["component"],
+    },
+  },
+  {
+    name: "pane_record_ui_decision",
+    description: "Record a confirmed UI design decision into the constraint registry. Call this after the developer confirms a design choice so it persists for future sessions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        rule: { type: "string", description: "The design rule to record" },
+        categories: { type: "string", description: "Comma-separated categories (e.g. 'input,search,floating')" },
+        forbiddenPatterns: { type: "string", description: "Comma-separated forbidden Tailwind patterns" },
+        positiveExample: { type: "string", description: "Example of the correct approach" },
+        negativeExample: { type: "string", description: "Example of what NOT to do" },
+        hardness: { type: "string", description: "'firm' or 'prefer'" },
+        projectId: { type: "string" },
+      },
+      required: ["rule", "categories"],
+    },
+  },
+  {
+    name: "pane_codebase_navigator",
+    description: "Build a structural dependency map for a component or symbol — what it imports, what imports it, relevant types, and the suggested read order. Use this before making changes to understand the blast radius. Unlike pane_codebase_compass (semantic), this traverses the actual import graph.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: { type: "string", description: "Component name, file path, or symbol to map (e.g. 'InputBar', 'src/renderer/components/Workspace/InputBar.tsx', 'useProjectsStore')" },
+        projectRoot: { type: "string" },
+        depth: { type: "number", description: "Traversal depth (1 or 2, default 1)" },
+      },
+      required: ["target"],
+    },
+  },
+  {
+    name: "pane_architecture_brief",
+    description: "Get the architectural decisions, locked patterns, and gotchas for a specific subsystem before making changes. Call this before touching files in an unfamiliar subsystem. Returns the pattern in effect, locked decisions not open for reconsideration, known tensions resolved, and specific failure modes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subsystem: { type: "string", description: "Subsystem name or file path (e.g. 'terminal', 'ipc', 'src/main/pty-worker.mjs')" },
+        projectId: { type: "string" },
+      },
+      required: ["subsystem"],
+    },
+  },
+  {
+    name: "pane_record_architecture_decision",
+    description: "Record a confirmed architectural decision into the subsystem registry. Call this after the developer confirms an architectural choice.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subsystem: { type: "string", description: "The subsystem name or id to record the decision for" },
+        decision: { type: "string", description: "The architectural decision" },
+        rationale: { type: "string", description: "Why this decision was made" },
+        projectId: { type: "string" },
+      },
+      required: ["subsystem", "decision", "rationale"],
+    },
+  },
+  {
     name: "pane_synthesize",
     description: "Get the project's architectural DNA — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
     inputSchema: { type: "object", properties: {} },
@@ -425,6 +521,20 @@ const TOOLS = [
         },
       },
       required: ["paths"],
+    },
+  },
+  {
+    name: "explore",
+    description: "Semantic codebase exploration — search by meaning, get the full picture. Returns relevant files, key functions with code excerpts, module relationships, and project constraints. One call replaces multiple grep + read cycles. Use this when you need to understand how something works, find where something is implemented, or get context before making changes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Natural language question about the codebase. Examples: 'how does routing work', 'where is auth handled', 'what calls orchestrateContext'",
+        },
+      },
+      required: ["query"],
     },
   },
 ];
@@ -810,7 +920,7 @@ async function handleToolCall(name, args) {
       const profileDir = path.join(PANE_DIR, "profile");
       const parts = [];
 
-      // Read profile export (combined view)
+      // Read profile export (combined narrative view)
       try {
         const exported = await fs.promises.readFile(path.join(profileDir, "profile-export.md"), "utf-8");
         if (exported.trim().length > 10) {
@@ -818,14 +928,64 @@ async function handleToolCall(name, args) {
         }
       } catch {}
 
-      // Also show raw stats
+      // Rules — the actual rules, not just a count
+      try {
+        const rules = await fs.promises.readFile(path.join(profileDir, "rules.md"), "utf-8");
+        if (rules.trim().length > 5) {
+          parts.push("\n## Rules");
+          parts.push(rules.trim());
+        }
+      } catch {}
+
+      // Philosophy
+      try {
+        const phil = await fs.promises.readFile(path.join(profileDir, "philosophy.md"), "utf-8");
+        if (phil.trim().length > 5) {
+          parts.push("\n## Design Philosophy");
+          parts.push(phil.trim());
+        }
+      } catch {}
+
+      // Preferences — actual content, not just counts
       try {
         const prefs = JSON.parse(await fs.promises.readFile(path.join(profileDir, "preferences.json"), "utf-8"));
-        const toolCount = Object.keys(prefs.tools || {}).length;
-        const codingCount = Object.keys(prefs.coding || {}).length;
-        parts.push(`\n---\nProfile stats: ${toolCount} tool preferences, ${codingCount} coding patterns observed`);
-        if (prefs._meta?.lastUpdated) {
-          parts.push(`Last updated: ${prefs._meta.lastUpdated}`);
+        const tools = prefs.tools || {};
+        const coding = prefs.coding || {};
+
+        if (Object.keys(tools).length > 0) {
+          parts.push("\n## Tool Preferences");
+          for (const [key, val] of Object.entries(tools)) {
+            const content = typeof val === "object" ? val.content || key : val;
+            parts.push(`- ${content}`);
+          }
+        }
+
+        if (Object.keys(coding).length > 0) {
+          parts.push("\n## Coding Patterns");
+          for (const [key, val] of Object.entries(coding)) {
+            const content = typeof val === "object" ? val.content || key : val;
+            parts.push(`- ${content}`);
+          }
+        }
+      } catch {}
+
+      // Anti-patterns
+      try {
+        const ap = JSON.parse(await fs.promises.readFile(path.join(profileDir, "anti-patterns.json"), "utf-8"));
+        if (ap.patterns && ap.patterns.length > 0) {
+          parts.push("\n## Anti-Patterns (things to avoid)");
+          for (const p of ap.patterns) {
+            parts.push(`- ${p.error || p.pattern || JSON.stringify(p)}`);
+          }
+        }
+      } catch {}
+
+      // Digest (graduated behavioral wiring)
+      try {
+        const digest = await fs.promises.readFile(path.join(profileDir, "digest.txt"), "utf-8");
+        if (digest.trim().length > 5) {
+          parts.push("\n## Behavioral Wiring (graduated from experience)");
+          parts.push(digest.trim());
         }
       } catch {}
 
@@ -916,6 +1076,15 @@ async function handleToolCall(name, args) {
       return text(`${scored.length} symbol${scored.length > 1 ? "s" : ""} matching "${query}":\n\n${out}`);
     }
 
+    case "pane_find_references": {
+      const symbol = (args?.symbol || "").trim();
+      if (!symbol) return text("Symbol is required.");
+      const projectRoot = args?.projectRoot || PROJECT_ROOT;
+      const projectId = args?.projectId || PROJECT_ID;
+      const { byFile, totalMatches, filesSearched } = await findReferences(symbol, projectRoot, { projectId });
+      return text(formatReferencesOutput(symbol, byFile, totalMatches, filesSearched));
+    }
+
     case "pane_synthesize": {
       // Read synthesis from contextual export (written by brain-engine)
       const contextPath = path.join(PANE_DIR, "brain", "context", `${PROJECT_ID}.json`);
@@ -978,6 +1147,511 @@ async function handleToolCall(name, args) {
         }
       }
       return text(`Read ${paths.length} files:\n\n${results.join("\n\n")}`);
+    }
+
+    case "pane_ui_constraints": {
+      const projectId = args?.projectId || PROJECT_ID;
+      const componentKey = (args?.component || "").toLowerCase();
+      const constraintsPath = path.join(PANE_DIR, "memory", projectId, "ui-constraints.json");
+      const data = await readJson(constraintsPath);
+      if (!data) {
+        return text("No UI constraints registered yet for this project. Use pane_record_ui_decision to add them.");
+      }
+
+      // Infer categories from component string
+      const inferredCategories = new Set();
+      if (componentKey.includes("input") || componentKey.includes("textarea")) inferredCategories.add("input");
+      if (componentKey.includes("search")) inferredCategories.add("search");
+      if (componentKey.includes("float") || componentKey.includes("panel") || componentKey.includes("picker")) inferredCategories.add("floating");
+      if (componentKey.includes("terminal")) inferredCategories.add("terminal");
+
+      const constraints = Array.isArray(data.constraints) ? data.constraints : [];
+      const filtered = inferredCategories.size > 0
+        ? constraints.filter(c => Array.isArray(c.categories) && c.categories.some(cat => inferredCategories.has(cat)))
+        : constraints;
+
+      const parts = [`UI Constraints for: ${args.component}\n`];
+
+      parts.push(`HARD CONSTRAINTS (${filtered.length}):`);
+      for (const c of filtered) {
+        parts.push(`• ${c.rule}`);
+        if (c.forbiddenPatterns?.length) parts.push(`  ✗ Forbidden: ${c.forbiddenPatterns.join(", ")}`);
+        if (c.positiveExample) parts.push(`  ✓ Do: ${c.positiveExample}`);
+        if (c.negativeExample) parts.push(`  ✗ Don't: ${c.negativeExample}`);
+        if (c.referenceComponents?.[0]) parts.push(`  → Reference: ${c.referenceComponents[0]}`);
+        if (c.establishedReason) parts.push(`  Reason: ${c.establishedReason}`);
+        parts.push("");
+      }
+
+      const tokens = Array.isArray(data.designTokens) ? data.designTokens : [];
+      if (tokens.length > 0) {
+        parts.push("DESIGN TOKENS:");
+        for (const t of tokens) {
+          parts.push(`• ${t.token} = ${t.value}`);
+          if (t.semanticMeaning) parts.push(`  Use for: ${t.semanticMeaning}`);
+          if (t.neverUseFor?.length) parts.push(`  Never use for: ${Array.isArray(t.neverUseFor) ? t.neverUseFor.join(", ") : t.neverUseFor}`);
+          parts.push("");
+        }
+      }
+
+      const antiPatterns = Array.isArray(data.antiPatterns) ? data.antiPatterns : [];
+      if (antiPatterns.length > 0) {
+        parts.push("ANTI-PATTERNS TO AVOID:");
+        for (const ap of antiPatterns) {
+          parts.push(`• ${ap.name}: ${ap.description} — rejected because: ${ap.rejectedBecause}`);
+        }
+        parts.push("");
+      }
+
+      // ── Reference components — find real code that follows these rules ──
+      // The model gets "no borders on inputs" as a rule AND a working example
+      // to copy from. This is the difference between knowing the rule and
+      // knowing how to apply it.
+      try {
+        const componentsDir = path.join(PROJECT_ROOT, "src", "renderer", "components");
+        const componentFiles = [];
+        async function walkComponents(dir, depth = 0) {
+          if (depth > 4) return;
+          let entries;
+          try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+          for (const entry of entries) {
+            if (entry.isDirectory() && !entry.name.startsWith(".")) {
+              await walkComponents(path.join(dir, entry.name), depth + 1);
+            } else if (entry.name.endsWith(".tsx")) {
+              componentFiles.push(path.join(dir, entry.name));
+            }
+          }
+        }
+        await walkComponents(componentsDir);
+
+        // Find components matching the query by filename or content keywords
+        const queryWords = componentKey.split(/[\s-_]+/).filter(w => w.length >= 3);
+        const matches = [];
+        for (const file of componentFiles.slice(0, 50)) {
+          const baseName = path.basename(file, ".tsx").toLowerCase();
+          const nameMatch = queryWords.some(w => baseName.includes(w));
+          if (nameMatch || (componentKey === "general" && matches.length < 2)) {
+            try {
+              const content = await fs.promises.readFile(file, "utf-8");
+              const lines = content.split("\n");
+              // Find the main component function/export
+              let startLine = 0;
+              for (let i = 0; i < lines.length; i++) {
+                if (/^export\s+(default\s+)?function\s|^(const|function)\s+\w+.*=.*=>|^export\s+const\s+\w+.*memo\(/.test(lines[i])) {
+                  startLine = i;
+                  break;
+                }
+              }
+              const excerpt = lines.slice(startLine, startLine + 30).join("\n");
+              const relPath = path.relative(PROJECT_ROOT, file);
+              matches.push({ file: relPath, excerpt });
+            } catch {}
+          }
+          if (matches.length >= 2) break;
+        }
+
+        if (matches.length > 0) {
+          parts.push("REFERENCE COMPONENTS (real code that follows these rules):");
+          for (const m of matches) {
+            parts.push(`\n### ${m.file}`);
+            parts.push("```tsx");
+            parts.push(m.excerpt);
+            parts.push("```");
+          }
+        }
+      } catch {}
+
+      return text(parts.join("\n"));
+    }
+
+    case "pane_record_ui_decision": {
+      const projectId = args?.projectId || PROJECT_ID;
+      const rule = (args?.rule || "").trim();
+      if (!rule) return text("Rule text is required.");
+      const categories = (args?.categories || "").trim();
+      if (!categories) return text("Categories are required.");
+
+      const constraintsPath = path.join(PANE_DIR, "memory", projectId, "ui-constraints.json");
+      let data = await readJson(constraintsPath);
+      if (!data) {
+        data = { version: 1, projectId, constraints: [], designTokens: [], antiPatterns: [] };
+      }
+      if (!Array.isArray(data.constraints)) data.constraints = [];
+
+      const id = rule.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
+      const newConstraint = {
+        id,
+        categories: categories.split(",").map(s => s.trim()).filter(Boolean),
+        rule,
+        forbiddenPatterns: args?.forbiddenPatterns ? args.forbiddenPatterns.split(",").map(s => s.trim()).filter(Boolean) : [],
+        positiveExample: args?.positiveExample || "",
+        negativeExample: args?.negativeExample || "",
+        referenceComponents: [],
+        establishedReason: "user-recorded",
+        hardness: args?.hardness || "firm",
+      };
+
+      data.constraints.push(newConstraint);
+      await writeJson(constraintsPath, data);
+      return text(`Recorded UI decision: "${rule}"`);
+    }
+
+    case "pane_codebase_navigator": {
+      const rootDir = args?.projectRoot || PROJECT_ROOT;
+      const target = (args?.target || "").trim();
+      const depth = Math.min(Math.max(Number(args?.depth) || 1, 1), 2);
+      if (!target) return text("Target is required.");
+
+      // Resolve target to a file path
+      let primaryFile = null;
+      if (target.includes("/") || target.endsWith(".tsx") || target.endsWith(".ts") || target.endsWith(".mjs") || target.endsWith(".js")) {
+        // Looks like a path — resolve it
+        const resolved = path.isAbsolute(target) ? target : path.join(rootDir, target);
+        try { await fs.promises.access(resolved); primaryFile = resolved; } catch {}
+        // Try with extensions if no extension given
+        if (!primaryFile) {
+          for (const ext of [".tsx", ".ts", ".js", ".mjs"]) {
+            try { await fs.promises.access(resolved + ext); primaryFile = resolved + ext; break; } catch {}
+          }
+        }
+      } else {
+        // Search src/ for a file matching the name
+        const srcDir = path.join(rootDir, "src");
+        const searchName = target;
+        async function walkForFile(dir, name, exclude = null) {
+          let found = null;
+          let entries;
+          try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return null; }
+          for (const entry of entries) {
+            if (entry.isDirectory()) {
+              if (entry.name === "node_modules" || entry.name === ".git") continue;
+              const subDir = path.join(dir, entry.name);
+              if (exclude?.has(subDir)) continue;
+              found = await walkForFile(subDir, name, exclude);
+              if (found) return found;
+            } else {
+              const base = entry.name.replace(/\.(tsx|ts|js|mjs)$/, "");
+              if (base === name) { found = path.join(dir, entry.name); return found; }
+            }
+          }
+          return null;
+        }
+        primaryFile = await walkForFile(srcDir, searchName);
+        if (!primaryFile) primaryFile = await walkForFile(rootDir, searchName, new Set([srcDir]));
+      }
+
+      if (!primaryFile) {
+        return text(`No file found matching "${target}". Try providing a file path directly.`);
+      }
+
+      const primaryRelPath = path.relative(rootDir, primaryFile);
+
+      // Read the primary file and extract imports
+      let primaryContent = "";
+      try { primaryContent = await fs.promises.readFile(primaryFile, "utf-8"); } catch {
+        return text(`Could not read file: ${primaryRelPath}`);
+      }
+
+      const importRegex = /from\s+['"]([^'"]+)['"]/g;
+      const relativeImports = [];
+      let m;
+      while ((m = importRegex.exec(primaryContent)) !== null) {
+        if (m[1].startsWith(".")) relativeImports.push(m[1]);
+      }
+
+      // Resolve each relative import to an absolute path
+      const resolveImport = async (imp) => {
+        const base = path.resolve(path.dirname(primaryFile), imp);
+        for (const ext of ["", ".tsx", ".ts", ".js", ".mjs", "/index.tsx", "/index.ts", "/index.js"]) {
+          try { await fs.promises.access(base + ext); return { specifier: imp, resolved: base + ext }; } catch {}
+        }
+        return null;
+      };
+      const resolvedImports = (await Promise.all(relativeImports.map(resolveImport))).filter(Boolean);
+
+      // Extract named imports for each resolved import
+      const namedImportRegex = /import\s+(?:type\s+)?(?:\{([^}]+)\}|(\w+)|\*\s+as\s+(\w+))\s+from\s+['"](\.\.?\/[^'"]+)['"]/g;
+      const importDetails = new Map();
+      let nm;
+      while ((nm = namedImportRegex.exec(primaryContent)) !== null) {
+        const specifier = nm[4];
+        const namedGroup = nm[1];
+        const defaultImport = nm[2];
+        const namespaceImport = nm[3];
+        const label = namedGroup
+          ? namedGroup.split(",").map(s => s.trim().split(/\s+as\s+/)[0].trim()).filter(Boolean).join(", ")
+          : defaultImport || (namespaceImport ? `* as ${namespaceImport}` : "");
+        importDetails.set(specifier, label || "default");
+      }
+
+      // Reverse lookup: find files in src/ that import the primary file
+      const primaryFileName = path.basename(primaryFile).replace(/\.(tsx|ts|js|mjs)$/, "");
+      const importedBy = [];
+      const MAX_REVERSE_FILES = 30;
+      let filesRead = 0;
+      async function searchForImporters(dir) {
+        if (filesRead >= MAX_REVERSE_FILES) return;
+        let entries;
+        try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+        for (const entry of entries) {
+          if (filesRead >= MAX_REVERSE_FILES) return;
+          if (entry.isDirectory()) {
+            if (entry.name === "node_modules" || entry.name === ".git") continue;
+            await searchForImporters(path.join(dir, entry.name));
+          } else if (/\.(tsx|ts|js|mjs)$/.test(entry.name)) {
+            const filePath = path.join(dir, entry.name);
+            if (filePath === primaryFile) continue;
+            filesRead++;
+            try {
+              const content = await fs.promises.readFile(filePath, "utf-8");
+              const importRe = new RegExp(`from\\s+['"][^'"]*(?:/|^)${primaryFileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`);
+              if (importRe.test(content)) {
+                importedBy.push(filePath);
+              }
+            } catch {}
+          }
+        }
+      }
+      await searchForImporters(path.join(rootDir, "src"));
+
+      // Store dependencies: imports matching stores/
+      const storeDeps = new Map();
+      for (const { specifier, resolved } of resolvedImports) {
+        if (specifier.includes("store") || specifier.includes("Store")) {
+          // Extract named imports from the main import regex result
+          const detail = importDetails.get(specifier) || "";
+          const storeName = path.basename(resolved).replace(/\.(tsx|ts|js|mjs)$/, "");
+          storeDeps.set(storeName, detail);
+        }
+      }
+
+      // Type dependencies: import type lines or paths containing "types"
+      const typeDeps = [];
+      const typeImportRegex = /import\s+type\s+[^;]+from\s+['"]([^'"]+)['"]/g;
+      let tm;
+      while ((tm = typeImportRegex.exec(primaryContent)) !== null) {
+        if (tm[1].startsWith(".")) {
+          const resolved = path.resolve(path.dirname(primaryFile), tm[1]);
+          typeDeps.push(path.relative(rootDir, resolved));
+        }
+      }
+      for (const { specifier, resolved } of resolvedImports) {
+        if (specifier.includes("type") || specifier.includes("types")) {
+          const rel = path.relative(rootDir, resolved);
+          if (!typeDeps.includes(rel)) typeDeps.push(rel);
+        }
+      }
+
+      // Depth 2: trace imports of imports
+      const depth2Imports = [];
+      if (depth >= 2) {
+        await Promise.all(resolvedImports.slice(0, 5).map(async ({ resolved }) => {
+          try {
+            const content = await fs.promises.readFile(resolved, "utf-8");
+            const d2regex = /from\s+['"]([^'"]+)['"]/g;
+            let d2m;
+            while ((d2m = d2regex.exec(content)) !== null) {
+              if (d2m[1].startsWith(".")) {
+                const d2base = path.resolve(path.dirname(resolved), d2m[1]);
+                for (const ext of ["", ".tsx", ".ts", ".js", ".mjs"]) {
+                  try {
+                    await fs.promises.access(d2base + ext);
+                    const rel = path.relative(rootDir, d2base + ext);
+                    if (!depth2Imports.includes(rel)) depth2Imports.push(rel);
+                    break;
+                  } catch {}
+                }
+              }
+            }
+          } catch {}
+        }));
+      }
+
+      // Suggest read order: types → stores → primary → importedBy
+      const readOrder = [];
+      for (const t of typeDeps.slice(0, 3)) readOrder.push({ file: t, reason: "type contracts first" });
+      for (const [storeName] of storeDeps) readOrder.push({ file: `(store) ${storeName}`, reason: "state shape" });
+      readOrder.push({ file: primaryRelPath, reason: "primary target" });
+      for (const f of importedBy.slice(0, 3)) readOrder.push({ file: path.relative(rootDir, f), reason: "consumers — understand blast radius" });
+
+      // Format output
+      const out = [];
+      out.push(`Task Map: ${target}\n`);
+      out.push(`Primary file:\n  ${primaryRelPath}\n`);
+
+      if (resolvedImports.length > 0) {
+        out.push("Imports (reads from):");
+        for (const { specifier, resolved } of resolvedImports) {
+          const rel = path.relative(rootDir, resolved);
+          const detail = importDetails.get(specifier) || "default";
+          out.push(`  ${rel} — ${detail}`);
+        }
+        out.push("");
+      } else {
+        out.push("Imports (reads from):\n  (none — no relative imports)\n");
+      }
+
+      if (importedBy.length > 0) {
+        out.push("Imported by (changes here affect):");
+        for (const f of importedBy) out.push(`  ${path.relative(rootDir, f)}`);
+        out.push("");
+      } else {
+        out.push("Imported by (changes here affect):\n  (none found in src/)\n");
+      }
+
+      if (storeDeps.size > 0) {
+        out.push("Store dependencies:");
+        for (const [storeName, slices] of storeDeps) {
+          out.push(`  ${storeName}: ${slices || "(default import)"}`);
+        }
+        out.push("");
+      }
+
+      if (typeDeps.length > 0) {
+        out.push("Type dependencies:");
+        for (const t of typeDeps) out.push(`  ${t}`);
+        out.push("");
+      }
+
+      if (readOrder.length > 0) {
+        out.push("Suggested read order:");
+        readOrder.forEach((r, i) => out.push(`  ${i + 1}. ${r.file} — ${r.reason}`));
+        out.push("");
+      }
+
+      if (depth >= 2 && depth2Imports.length > 0) {
+        out.push(`Depth 2: also traced imports of imports (${depth2Imports.length} additional):`);
+        for (const d of depth2Imports.slice(0, 10)) out.push(`  ${d}`);
+      }
+
+      return text(out.join("\n"));
+    }
+
+    case "pane_architecture_brief": {
+      const projectId = args?.projectId || PROJECT_ID;
+      const subsystemArg = (args?.subsystem || "").trim();
+      if (!subsystemArg) return text("Subsystem is required.");
+
+      const subsystemsPath = path.join(PANE_DIR, "memory", projectId, "subsystems.json");
+      const data = await readJson(subsystemsPath);
+      if (!data) {
+        return text("No subsystem registry found. Create one at ~/.pane/memory/{projectId}/subsystems.json or use pane_record_architecture_decision to start one.");
+      }
+
+      const subsystems = Array.isArray(data.subsystems) ? data.subsystems : [];
+      const subsystemArgLower = subsystemArg.toLowerCase();
+
+      const matched = subsystems.find(s => {
+        if ((s.id || "").toLowerCase() === subsystemArgLower) return true;
+        if ((s.name || "").toLowerCase() === subsystemArgLower) return true;
+        if (Array.isArray(s.filePatterns) && s.filePatterns.some(p => subsystemArgLower.includes(p.toLowerCase()) || p.toLowerCase().includes(subsystemArgLower))) return true;
+        return false;
+      });
+
+      if (!matched) {
+        const available = subsystems.map(s => `  • ${s.id} — ${s.name}`).join("\n");
+        return text(`No subsystem matched "${subsystemArg}".\n\nAvailable subsystems:\n${available}`);
+      }
+
+      const out = [];
+      out.push(`Architecture Brief: ${matched.name}\n`);
+
+      if (matched.patternInEffect) {
+        out.push("Pattern in effect:");
+        out.push(`  ${matched.patternInEffect}`);
+        out.push("");
+      }
+
+      const locked = Array.isArray(matched.lockedDecisions) ? matched.lockedDecisions : [];
+      out.push(`Locked decisions (${locked.length} — not open for reconsideration):`);
+      for (const d of locked) {
+        out.push(`  • ${d.decision}`);
+        if (d.rationale) out.push(`    Rationale: ${d.rationale}`);
+        if (d.date) out.push(`    Date: ${d.date}`);
+      }
+      out.push("");
+
+      const tensions = Array.isArray(matched.tensionsResolved) ? matched.tensionsResolved : [];
+      if (tensions.length > 0) {
+        out.push("Tensions resolved:");
+        for (const t of tensions) {
+          out.push(`  • ${t.tension}`);
+          if (t.resolution) out.push(`    → ${t.resolution}`);
+        }
+        out.push("");
+      }
+
+      const scopeFiles = Array.isArray(matched.scopeFiles) ? matched.scopeFiles : [];
+      if (scopeFiles.length > 0) {
+        out.push("Scope files:");
+        for (const f of scopeFiles) out.push(`  ${f}`);
+        out.push("");
+      }
+
+      const gotchas = Array.isArray(matched.gotchas) ? matched.gotchas : [];
+      if (gotchas.length > 0) {
+        out.push("Gotchas:");
+        for (const g of gotchas) out.push(`  ⚠ ${g}`);
+      }
+
+      return text(out.join("\n"));
+    }
+
+    case "pane_record_architecture_decision": {
+      const projectId = args?.projectId || PROJECT_ID;
+      const subsystemArg = (args?.subsystem || "").trim();
+      const decision = (args?.decision || "").trim();
+      const rationale = (args?.rationale || "").trim();
+      if (!subsystemArg) return text("Subsystem is required.");
+      if (!decision) return text("Decision is required.");
+      if (!rationale) return text("Rationale is required.");
+
+      const subsystemsPath = path.join(PANE_DIR, "memory", projectId, "subsystems.json");
+      let data = await readJson(subsystemsPath);
+      if (!data) {
+        data = { version: 1, projectId, subsystems: [] };
+      }
+      if (!Array.isArray(data.subsystems)) data.subsystems = [];
+
+      const subsystemArgLower = subsystemArg.toLowerCase();
+      let matched = data.subsystems.find(s =>
+        (s.id || "").toLowerCase() === subsystemArgLower || (s.name || "").toLowerCase() === subsystemArgLower
+      );
+
+      if (!matched) {
+        matched = {
+          id: subsystemArg.toLowerCase().replace(/\s+/g, "-"),
+          name: subsystemArg,
+          filePatterns: [],
+          patternInEffect: "",
+          lockedDecisions: [],
+          tensionsResolved: [],
+          scopeFiles: [],
+          gotchas: [],
+        };
+        data.subsystems.push(matched);
+      }
+
+      if (!Array.isArray(matched.lockedDecisions)) matched.lockedDecisions = [];
+      matched.lockedDecisions.push({
+        decision,
+        rationale,
+        date: new Date().toISOString().split("T")[0],
+      });
+
+      await writeJson(subsystemsPath, data);
+      return text(`Recorded architectural decision for "${matched.name}": "${decision}"`);
+    }
+
+    case "explore": {
+      const { explore } = await import("./tool-explore.mjs");
+      const result = await explore(
+        args?.query || "",
+        args?.projectId || PROJECT_ID,
+        PROJECT_ROOT,
+        { brainRequest: null }, // MCP server reads brain exports from disk, no IPC
+      );
+      return text(result || "No relevant results found for this query.");
     }
 
     default:

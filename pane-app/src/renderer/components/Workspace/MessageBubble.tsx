@@ -7,6 +7,7 @@ import type {
   ServerToolUseBlock,
   WebSearchToolResultBlock,
   JsonBlock,
+  ArbiterVerdict,
 } from "../../lib/punk-types";
 import { restoreCheckpoint, getCheckpointDiff } from "../../lib/tauri-commands";
 import type { CheckpointDiffFile } from "../../lib/tauri-commands";
@@ -230,7 +231,7 @@ interface MessageBubbleProps {
 }
 
 function JsonBlockDisplay({ block }: { block: JsonBlock }) {
-  const jsonStr = block.json ? JSON.stringify(block.json, null, 2) : block.raw;
+  const jsonStr = block.json ? JSON.stringify(block.json, null, 2) : block.raw ?? "";
   return (
     <div className="my-6">
       <div className="flex items-center gap-2 text-[10px] font-mono text-pane-text-secondary/60 mb-2 uppercase tracking-[0.1em]">
@@ -247,6 +248,75 @@ function JsonBlockDisplay({ block }: { block: JsonBlock }) {
           </code>
         </pre>
       </div>
+    </div>
+  );
+}
+
+function VerdictBadge({ verdict }: { verdict: ArbiterVerdict }) {
+  const [expanded, setExpanded] = useState(false);
+  const errors = verdict.findings.filter((f) => f.severity === "error");
+  const warnings = verdict.findings.filter((f) => f.severity === "warning");
+  const hasGuidance = (verdict.guidance?.length ?? 0) > 0;
+  const hasExpandable = !verdict.pass || hasGuidance;
+
+  // Green: pass. Yellow: warnings only. Red: errors.
+  const color = verdict.pass
+    ? "text-emerald-500/70"
+    : errors.length > 0
+      ? "text-red-400/70"
+      : "text-amber-400/70";
+
+  const dot = verdict.pass ? "●" : errors.length > 0 ? "▲" : "▲";
+
+  const label = verdict.pass
+    ? "clean"
+    : errors.length > 0
+      ? `${errors.length} error${errors.length > 1 ? "s" : ""}`
+      : `${warnings.length} warning${warnings.length > 1 ? "s" : ""}`;
+
+  return (
+    <div className="flex flex-col">
+      <button
+        onClick={() => hasExpandable && setExpanded(!expanded)}
+        className={`flex items-center gap-1.5 text-[10px] font-mono tracking-wider ${color} ${
+          hasExpandable ? "hover:opacity-80 cursor-pointer" : "cursor-default"
+        }`}
+      >
+        <span className="text-[8px]">{dot}</span>
+        <span>{label}</span>
+        {verdict.score < 100 && (
+          <span className="text-pane-text-secondary/40">{verdict.score}</span>
+        )}
+        {hasGuidance && verdict.pass && (
+          <span className="text-[var(--pane-terminal)]/50">
+            {verdict.guidance!.length} suggestion{verdict.guidance!.length > 1 ? "s" : ""}
+          </span>
+        )}
+      </button>
+      {expanded && (
+        <div className="mt-2 ml-1 text-[10px] font-mono leading-relaxed text-pane-text-secondary/60 max-w-lg">
+          {verdict.findings.slice(0, 5).map((f, i) => (
+            <div key={i} className="flex gap-2 mb-1">
+              <span className={f.severity === "error" ? "text-red-400/70" : "text-amber-400/70"}>
+                {f.severity === "error" ? "err" : "wrn"}
+              </span>
+              <span className="text-pane-text-secondary/40">{f.file}:{f.line}</span>
+              <span>{f.plain}</span>
+            </div>
+          ))}
+          {verdict.guidance && verdict.guidance.length > 0 && (
+            <>
+              {verdict.findings.length > 0 && <div className="mt-2 mb-1 border-t border-pane-text/5" />}
+              {verdict.guidance.map((g, i) => (
+                <div key={`g-${i}`} className="flex gap-2 mb-1">
+                  <span className="text-[var(--pane-terminal)]/50">tip</span>
+                  <span>{g.plain}</span>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -494,13 +564,16 @@ export function MessageBubble({
           return null;
         })}
 
-        {/* Footer: cost/duration/tokens + copy */}
+        {/* Footer: quality verdict + cost/duration/tokens + copy */}
         {!message.isStreaming && (
           <div
             className={`mt-4 flex items-center gap-4 pl-6 transition-opacity duration-500 ${
               justCompleted ? "opacity-0" : "opacity-100"
             }`}
           >
+            {message.verdict && (
+              <VerdictBadge verdict={message.verdict} />
+            )}
             {(message.costUsd !== undefined ||
               message.durationMs !== undefined) && (
               <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary tracking-wider">

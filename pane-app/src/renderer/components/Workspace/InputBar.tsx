@@ -3,30 +3,198 @@ import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
-import ReferencePicker, { type ReferenceItem } from "../shared/ReferencePicker";
+import CommandPicker, { type CommandSelection } from "../shared/CommandPicker";
 import type { Todo } from "../../lib/punk-types";
 import {
   isThinkingModel,
+  getContextLimit,
 } from "../../lib/models";
-import { previewRoute, type RoutePreview } from "../../lib/tauri-commands";
+import { previewRoute, showFilePicker, type RoutePreview } from "../../lib/tauri-commands";
+import { matchCommands, type AtModeCommand } from "../../lib/at-commands";
 
 const EMPTY_TODOS: Todo[] = [];
 
+// ── Reactive mode indicator ─────────────────────────────────────────────
+// Auto-detected from route preview, one-tap override by user.
+
+const MODE_CYCLE = ["plan", "analyze", "execute", "discuss"] as const;
+
+const MODE_CONFIG: Record<string, { directive: string; color: string }> = {
+  plan:    { directive: "/analyze ", color: "var(--pane-status-modified)" },
+  analyze: { directive: "/analyze ", color: "var(--pane-accent)" },
+  execute: { directive: "",          color: "var(--pane-status-added)" },
+  discuss: { directive: "/discuss ", color: "var(--pane-terminal)" },
+};
+
+interface DetectedMode {
+  mode: string;
+  directive: string;
+  color: string;
+}
+
+function mapRouteToMode(preview: RoutePreview): string {
+  if (preview.mode === "analyze") return "analyze";
+  if (preview.mode === "discuss") return "discuss";
+  if (preview.mode === "orchestrate") return "plan";
+  if (preview.taskType === "explain" || preview.taskType === "architect") return "plan";
+  if (preview.taskType === "conversation" || preview.taskType === "quick-answer") return "discuss";
+  return "execute";
+}
+
+/**
+ * Detect if the message is a strong signal to LEAVE the current mode.
+ * Weak references to other modes ("plan it out" inside a discuss session)
+ * are NOT transition signals — the user is talking about planning, not
+ * requesting a mode switch.
+ *
+ * Only explicit action phrases break the current flow.
+ */
+function detectTransition(text: string, currentMode: string): string | null {
+  const t = text.trim().toLowerCase();
+
+  // From discuss/plan/analyze → execute: user wants action NOW
+  if (currentMode !== "execute") {
+    if (/^(do it|go ahead|ship it|let'?s go|build it|execute|make it happen|yes do it|ok do it|start building|let'?s build|implement it|go for it)\s*[.!]?$/i.test(t)) {
+      return "execute";
+    }
+    // Short approvals after the model asked "should I proceed?" — only if very short
+    if (t.length < 20 && /^(yes|yep|yup|ok|okay|sure|proceed|approved|lgtm|go)\s*[.!]?$/i.test(t)) {
+      return "execute";
+    }
+  }
+
+  // From execute → discuss: user wants to stop and talk
+  if (currentMode === "execute") {
+    if (/^(wait|stop|hold on|let'?s (talk|discuss|think)|actually|pause)\b/i.test(t)) {
+      return "discuss";
+    }
+  }
+
+  // No strong signal — stay in current mode
+  return null;
+}
+
+/** Instant client-side intent guess — no IPC, runs on every keystroke. */
+function quickClassify(text: string): string {
+  const t = text.trim().toLowerCase();
+  if (t.length < 5) return "execute";
+  // Discuss: short questions
+  if (t.endsWith("?") && t.length < 120) return "discuss";
+  // Analyze: investigation keywords
+  if (/\b(analyze|audit|investigate|trace|where are we|what's wrong|how does|review the|deep dive|go deep|explain how)\b/i.test(t)) return "analyze";
+  // Plan: architecture / long vision
+  if (/\b(plan|design|architect|rethink|reimagine|strategy|approach|vision|proposal)\b/i.test(t)) return "plan";
+  if (t.split("\n").length >= 6 || t.length > 800) return "plan";
+  // Discuss: general questions
+  if (/^(what|why|how|when|where|who|which|is|are|can|could|would|should|does|do)\b/i.test(t) && t.endsWith("?")) return "discuss";
+  return "execute";
+}
+
+function formatRelativeTime(epochMs: number): string {
+  const diff = epochMs - Date.now();
+  if (diff <= 0) return "now";
+  const d = Math.floor(diff / 86_400_000);
+  const h = Math.floor((diff % 86_400_000) / 3_600_000);
+  const m = Math.floor((diff % 3_600_000) / 60_000);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
 function RateLimitIndicator() {
   const info = useWorkspaceStore((s) => s.rateLimitInfo);
-  if (!info) return null;
+  const provider = useWorkspaceStore((s) => s.selectedModelProvider);
+  const setRateLimitInfo = useWorkspaceStore((s) => s.setRateLimitInfo);
+
+  // Compute before the conditional return so useEffect is always called unconditionally.
+  const resetEpochMs = info?.resetsAt ? info.resetsAt * 1000 : null;
+
+  // Auto-expire: schedule a clear when the reset time passes so the warning
+  // disappears on its own without needing another backend event.
+  useEffect(() => {
+    if (!resetEpochMs) return;
+    const delay = resetEpochMs - Date.now();
+    if (delay <= 0) {
+      setRateLimitInfo(null);
+      return;
+    }
+    const t = setTimeout(() => setRateLimitInfo(null), delay);
+    return () => clearTimeout(t);
+  }, [resetEpochMs, setRateLimitInfo]);
+
+  // Only show for Claude (anthropic) provider — rate limits are Claude-specific.
+  // Keeping the stored value across model switches lets it reappear immediately
+  // when switching back to Claude, without waiting for the next backend event.
+  if (!info || provider !== "anthropic") return null;
+
+  const isOverage = info.isUsingOverage === true;
   const isWarning = info.status === "allowed_warning";
   const isRejected = info.status === "rejected";
+  const overageRejected = info.overageStatus === "rejected";
+
+  // Show overage indicator when using extra usage
+  if (isOverage && !overageRejected) {
+    const overageResets = info.overageResetsAt
+      ? formatRelativeTime(info.overageResetsAt * 1000)
+      : null;
+    return (
+      <span className="font-mono tabular-nums text-[var(--pane-status-modified)]" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        extra usage{overageResets ? ` · resets ${overageResets}` : ""}
+      </span>
+    );
+  }
+
+  if (overageRejected) {
+    const reason = info.overageDisabledReason;
+    return (
+      <span className="font-mono tabular-nums text-pane-error" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        {reason === "out_of_credits" ? "extra usage · out of credits" : "extra usage exhausted"}
+      </span>
+    );
+  }
+
   if (!isWarning && !isRejected) return null;
 
   const pct = info.utilization != null ? Math.round(info.utilization * 100) : null;
-  const resetTime = info.resetsAt
-    ? new Date(info.resetsAt * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+  const resetTime = resetEpochMs
+    ? formatRelativeTime(resetEpochMs)
     : null;
 
   return (
-    <span className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-pane-status-modified/70"}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
+    <span className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-[var(--pane-status-modified)]"}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
       {pct != null && <>{pct}% </>}{isRejected ? "limit reached" : "limit"}{resetTime && <> · resets {resetTime}</>}
+    </span>
+  );
+}
+
+function ContextUsageIndicator({ projectId }: { projectId: string }) {
+  const contextTokens = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.contextTokens ?? 0,
+  );
+  const model = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.model ?? null,
+  );
+
+  if (!contextTokens || contextTokens === 0) return null;
+
+  const limit = getContextLimit(model);
+  const pct = Math.round((contextTokens / limit) * 100);
+
+  // Only show when it carries signal — sub-50% is noise, warnings start at 70%.
+  if (pct < 50) return null;
+
+  const color =
+    pct >= 85 ? "text-pane-error" :
+    pct >= 70 ? "text-pane-status-modified" :
+    "text-pane-text-secondary/50";
+
+  return (
+    <span
+      className={`font-mono tabular-nums ${color}`}
+      style={{ fontSize: "var(--pane-font-size-xs)" }}
+      title={`${contextTokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`}
+    >
+      ctx {pct}%
     </span>
   );
 }
@@ -90,8 +258,9 @@ function measureCaretPos(
 
 interface InputBarProps {
   projectId: string;
-  onSend: (message: string, minds?: Array<{ id: string }>) => void;
+  onSend: (message: string, minds?: Array<{ id: string }>, effectiveMode?: string) => void;
   onAbort: () => void;
+  onClearConversation: () => void;
   isProcessing: boolean;
 }
 
@@ -151,7 +320,7 @@ function ModelPicker({
 
   const providerDisplayName = useCallback((providerKey: string): string => {
     const names: Record<string, string> = {
-      anthropic: "Claude Code",
+      anthropic: "Claude",
       "anthropic-api": "Anthropic API",
       gemini: "Gemini CLI",
       "gemini-api": "Gemini API",
@@ -316,7 +485,7 @@ function ModelPicker({
       </button>
 
       {open && (
-        <div className="absolute bottom-full right-0 mb-2 w-64 bg-pane-bg ring-1 ring-pane-border/40 rounded-xl z-50 animate-fadeSlideUp">
+        <div className="absolute bottom-full right-0 mb-2 w-64 bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 rounded-xl z-50 animate-fadeSlideUp">
           <div className="p-1.5 flex flex-col gap-0.5">
             {/* Smart Routing Toggle */}
             <button
@@ -457,6 +626,7 @@ export function InputBar({
   projectId,
   onSend,
   onAbort,
+  onClearConversation,
   isProcessing,
 }: InputBarProps) {
   const [value, setValue] = useState("");
@@ -469,11 +639,67 @@ export function InputBar({
   } | null>(null);
   const [textareaFocused, setTextareaFocused] = useState(false);
 
-  // @-reference picker state (replaces old / slash system)
-  const [refOpen, setRefOpen] = useState(false);
-  const [refQuery, setRefQuery] = useState("");
+  // @ command picker state
+  const [cmdPickerOpen, setCmdPickerOpen] = useState(false);
+  const [cmdQuery, setCmdQuery] = useState("");
   const [attachedMinds, setAttachedMinds] = useState<Array<{ id: string }>>([]);
-  const refStartRef = useRef<number>(-1); // cursor position right after @
+  const cmdStartRef = useRef<number>(-1); // index of the '@' character in textarea
+
+  // Reactive mode indicator — auto-detected from route preview
+  const [detectedMode, setDetectedMode] = useState<DetectedMode | null>(null);
+  const [modeOverride, setModeOverride] = useState<string | null>(null);
+  // Carry-forward: what mode was used on the last sent message.
+  // Stays active until a strong transition signal overrides it.
+  const [lastSentMode, setLastSentMode] = useState<string | null>(null);
+
+  // Sticky mode set by @plan / @discuss / @brainstorm
+  const [activeModeCmd, setActiveModeCmd] = useState<AtModeCommand | null>(null);
+
+  // Prefill from external sources (e.g., Lens "fix" button)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const prompt = (e as CustomEvent).detail?.prompt;
+      if (prompt) {
+        setValue(prompt);
+        // Focus the textarea so the user can review and send
+        requestAnimationFrame(() => {
+          const ta = document.querySelector<HTMLTextAreaElement>("[data-pane-input]");
+          ta?.focus();
+        });
+      }
+    };
+    window.addEventListener("pane:prefill-prompt", handler);
+    return () => window.removeEventListener("pane:prefill-prompt", handler);
+  }, []);
+
+  // Brief action-feedback flash ("todos cleared", etc.)
+  const [actionFlash, setActionFlash] = useState<string | null>(null);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showFlash = useCallback((msg: string) => {
+    setActionFlash(msg);
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = setTimeout(() => setActionFlash(null), 2000);
+  }, []);
+  // Clean up flash timer on unmount
+  useEffect(() => () => { if (flashTimerRef.current) clearTimeout(flashTimerRef.current); }, []);
+
+  // Prepend mode directive: sticky @command > manual pill override > nothing.
+  // Auto-detected mode is informational only — it does NOT prepend a directive
+  // unless the user explicitly taps the pill to pin it.
+  const buildPrompt = useCallback(
+    (trimmed: string) => {
+      // Sticky @command takes highest priority
+      if (activeModeCmd?.serverDirective) return activeModeCmd.serverDirective + trimmed;
+      // Manual override from pill tap — user explicitly chose this mode
+      if (modeOverride) {
+        const config = MODE_CONFIG[modeOverride];
+        if (config?.directive) return config.directive + trimmed;
+      }
+      // Auto-detected: don't prepend anything — let the backend route naturally
+      return trimmed;
+    },
+    [activeModeCmd, modeOverride],
+  );
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
@@ -493,6 +719,10 @@ export function InputBar({
 
   const routedModel = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.routedModel ?? null,
+  );
+
+  const projectRoot = useProjectsStore(
+    (s) => s.projects.get(projectId)?.root ?? "",
   );
 
   // Handle model change and sync provider
@@ -526,6 +756,61 @@ export function InputBar({
       if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
     };
   }, [value, intentAutoRoute, isProcessing, projectId]);
+
+  // Mode classification with conversation carry-forward.
+  // If we sent in a mode last turn, stay in it unless there's a strong transition signal.
+  // This prevents "yeah plan it out" in a discuss session from switching to plan mode.
+  useEffect(() => {
+    if (modeOverride) return; // user tapped the pill — don't auto-update
+    const trimmed = value.trim();
+    if (trimmed.length < 5) {
+      // Short text: show carry-forward mode if we have one, otherwise nothing
+      if (lastSentMode) {
+        const config = MODE_CONFIG[lastSentMode];
+        if (config) setDetectedMode({ mode: lastSentMode, directive: config.directive, color: config.color });
+      } else {
+        setDetectedMode(null);
+      }
+      return;
+    }
+
+    // If we have a carry-forward mode, only break out on strong transition signals
+    if (lastSentMode) {
+      const transition = detectTransition(trimmed, lastSentMode);
+      if (transition) {
+        const config = MODE_CONFIG[transition];
+        if (config) setDetectedMode({ mode: transition, directive: config.directive, color: config.color });
+      } else {
+        // Stay in the carry-forward mode
+        const config = MODE_CONFIG[lastSentMode];
+        if (config) setDetectedMode({ mode: lastSentMode, directive: config.directive, color: config.color });
+      }
+      return;
+    }
+
+    // No carry-forward — fresh classification
+    const mode = routePreview ? mapRouteToMode(routePreview) : quickClassify(trimmed);
+    const config = MODE_CONFIG[mode];
+    if (config) {
+      setDetectedMode({ mode, directive: config.directive, color: config.color });
+    }
+  }, [value, routePreview, modeOverride, lastSentMode]);
+
+  // Clear override when input empties (but keep lastSentMode for carry-forward)
+  useEffect(() => {
+    if (value.trim().length < 3 && !lastSentMode) {
+      setDetectedMode(null);
+      setModeOverride(null);
+    }
+  }, [value, lastSentMode]);
+
+  // Cycle mode on pill tap
+  const handleModeTap = useCallback(() => {
+    const current = modeOverride || detectedMode?.mode || "execute";
+    const idx = MODE_CYCLE.indexOf(current as typeof MODE_CYCLE[number]);
+    const next = MODE_CYCLE[(idx + 1) % MODE_CYCLE.length]!;
+    setModeOverride(next as string);
+  }, [modeOverride, detectedMode]);
 
   // Handle graceful fadeout of processing indicator.
   // Only fade out after real processing happened — not on initial mount.
@@ -612,26 +897,24 @@ export function InputBar({
     applyTextareaHeight();
   }, [value, applyTextareaHeight]);
 
-  // Detect `@m…` trigger for mind reference-picker
-  // Opens as soon as typed chars after @ are a prefix of "mind" (e.g. @m, @mi, @min, @mind)
-  // Once @mind is fully typed, additional chars become the filter query
+  // Generalized @ command picker — opens for any registered command prefix.
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
     const pos = e.target.selectionStart ?? next.length;
     setValue(next);
+
+    // Keep attachedMinds count in sync with @thought tokens in the text
     const thoughtCount = (next.match(/@thought/g) ?? []).length;
     setAttachedMinds((prev) => thoughtCount < prev.length ? prev.slice(0, thoughtCount) : prev);
 
-    if (refOpen) {
-      // Picker is open — verify @<prefix-of-mind> is still intact behind cursor
-      const atIdx = refStartRef.current;
+    if (cmdPickerOpen) {
+      // Picker open — verify the @word is still intact behind the cursor
+      const atIdx = cmdStartRef.current;
       const typed = next.slice(atIdx + 1, pos); // chars after '@'
-      const isMindPrefix = "mind".startsWith(typed) || typed.startsWith("mind");
-      if (next[atIdx] !== "@" || !isMindPrefix || next[pos - 1] === "\n") {
-        setRefOpen(false);
+      if (next[atIdx] !== "@" || next[pos - 1] === "\n" || !matchCommands(typed).length) {
+        setCmdPickerOpen(false);
       } else {
-        // Query starts after the "mind" portion is fully typed
-        setRefQuery(typed.length > 4 ? typed.slice(4) : "");
+        setCmdQuery(typed);
       }
     } else {
       // Scan backwards from cursor to find word start
@@ -640,36 +923,85 @@ export function InputBar({
         wordStart--;
       }
       const word = next.slice(wordStart, pos);
-      if (word.length >= 2 && word[0] === "@") {
+      if (word.length >= 1 && word[0] === "@") {
         const typed = word.slice(1); // chars after '@'
-        // Open if typed chars are a prefix of "mind" or extend beyond it
-        if ("mind".startsWith(typed) || typed.startsWith("mind")) {
-          refStartRef.current = wordStart;
-          setRefQuery(typed.length > 4 ? typed.slice(4) : "");
-          setRefOpen(true);
+        if (matchCommands(typed).length > 0) {
+          cmdStartRef.current = wordStart;
+          setCmdQuery(typed);
+          setCmdPickerOpen(true);
         }
       }
     }
-  }, [refOpen]);
+  }, [cmdPickerOpen]);
 
-  const handleRefSelect = useCallback((item: ReferenceItem) => {
+  const handleCommandSelect = useCallback((sel: CommandSelection) => {
     const ta = textareaRef.current;
-    if (!ta) return;
-    const atPos = refStartRef.current; // index of '@'
-    const cursorPos = ta.selectionStart ?? value.length;
-    const before = value.slice(0, atPos);
-    const after = value.slice(cursorPos);
-    const tag = "@thought";
-    const next = before + tag + (after.startsWith(" ") ? after : " " + after);
-    setValue(next);
-    setAttachedMinds((prev) => [...prev, { id: item.label }]);
-    setRefOpen(false);
-    requestAnimationFrame(() => {
-      ta.focus();
-      const newPos = before.length + tag.length;
-      ta.setSelectionRange(newPos, newPos);
-    });
-  }, [value]);
+    const atPos = cmdStartRef.current; // index of '@'
+
+    // Helper: remove the @command fragment from the textarea
+    const removeAtFragment = () => {
+      if (!ta) return;
+      const cursorPos = ta.selectionStart ?? value.length;
+      const before = value.slice(0, atPos);
+      const after = value.slice(cursorPos);
+      const next = before + (after.startsWith(" ") ? after : after ? " " + after : "");
+      setValue(next);
+      requestAnimationFrame(() => {
+        ta.focus();
+        ta.setSelectionRange(before.length, before.length);
+      });
+    };
+
+    if (sel.kind === "reference") {
+      // @thought — replace @word with chip, track mind id
+      if (!ta) return;
+      const cursorPos = ta.selectionStart ?? value.length;
+      const before = value.slice(0, atPos);
+      const after = value.slice(cursorPos);
+      const tag = "@thought";
+      const next = before + tag + (after.startsWith(" ") ? after : " " + after);
+      setValue(next);
+      if (sel.label) setAttachedMinds((prev) => [...prev, { id: sel.label }]);
+      setCmdPickerOpen(false);
+      requestAnimationFrame(() => {
+        ta.focus();
+        const newPos = before.length + tag.length;
+        ta.setSelectionRange(newPos, newPos);
+      });
+      return;
+    }
+
+    if (sel.kind === "mode") {
+      // Set sticky mode, remove @command from input
+      setActiveModeCmd(sel.command as AtModeCommand);
+      removeAtFragment();
+      setCmdPickerOpen(false);
+      return;
+    }
+
+    if (sel.kind === "action") {
+      setCmdPickerOpen(false);
+      removeAtFragment();
+
+      const { command, subcommand } = sel;
+
+      if (command.name === "todo" && subcommand.name === "clear") {
+        useProjectsStore.getState().clearSessionContext(projectId);
+        showFlash("todos cleared");
+        return;
+      }
+      if (command.name === "todo" && subcommand.name === "show") {
+        setTodoPanelOpen(true);
+        return;
+      }
+      if (command.name === "session" && subcommand.name === "clear") {
+        onClearConversation();
+        setLastSentMode(null);
+        showFlash("session cleared");
+        return;
+      }
+    }
+  }, [value, projectId, onClearConversation, showFlash]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -677,26 +1009,30 @@ export function InputBar({
         e.preventDefault();
         const trimmed = value.trim();
         if (trimmed) {
-          onSend(trimmed, attachedMinds.length > 0 ? attachedMinds : undefined);
+          const sentMode = activeModeCmd?.mode || modeOverride || detectedMode?.mode || null;
+          onSend(buildPrompt(trimmed), attachedMinds.length > 0 ? attachedMinds : undefined, sentMode || undefined);
+          // Carry mode forward to next turn — conversation is continuous
+          setLastSentMode(sentMode);
           setValue("");
           setAttachedMinds([]);
+          setModeOverride(null);
+          setDetectedMode(null);
         }
       }
       if (e.key === "Escape" && isProcessing) {
-        // Close the reference picker before aborting
-        if (refOpen && refStartRef.current !== -1) {
+        // Close the command picker before aborting
+        if (cmdPickerOpen && cmdStartRef.current !== -1) {
           e.preventDefault();
           const ta = textareaRef.current;
           if (ta) {
-            const before = value.slice(0, refStartRef.current);
+            const before = value.slice(0, cmdStartRef.current);
             const after = value.slice(ta.selectionStart ?? value.length);
             setValue(before + after);
-            setRefOpen(false);
-            refStartRef.current = -1;
+            setCmdPickerOpen(false);
+            cmdStartRef.current = -1;
             requestAnimationFrame(() => {
               ta.focus();
-              const newPos = before.length;
-              ta.setSelectionRange(newPos, newPos);
+              ta.setSelectionRange(before.length, before.length);
             });
           }
           return;
@@ -705,7 +1041,7 @@ export function InputBar({
         onAbort();
       }
     },
-    [value, isProcessing, refOpen, attachedMinds, onSend, onAbort],
+    [value, isProcessing, cmdPickerOpen, attachedMinds, onSend, onAbort, buildPrompt],
   );
 
   return (
@@ -791,15 +1127,46 @@ export function InputBar({
 
       {/* One card. Textarea owns the whole surface. Buttons float inside it. */}
       <div className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative">
-        {refOpen && (
-          <ReferencePicker
-            query={refQuery}
-            onSelect={handleRefSelect}
-            onDismiss={() => { setRefOpen(false); refStartRef.current = -1; }}
+        {cmdPickerOpen && (
+          <CommandPicker
+            query={cmdQuery}
+            activeMode={activeModeCmd?.mode ?? null}
+            onSelect={handleCommandSelect}
+            onDismiss={() => { setCmdPickerOpen(false); cmdStartRef.current = -1; }}
           />
+        )}
+
+        {/* Sticky mode badge — floats inside the card, above the textarea */}
+        {activeModeCmd && (
+          <div className="flex items-center gap-2 px-5 pt-3 pb-0">
+            <span
+              className="font-mono text-[10px] font-medium"
+              style={{ color: activeModeCmd.color }}
+            >
+              {activeModeCmd.name} mode
+            </span>
+            <button
+              onClick={() => setActiveModeCmd(null)}
+              className="font-mono text-pane-text-secondary/40 hover:text-pane-text-secondary transition-colors leading-none"
+              style={{ fontSize: "11px" }}
+              title="exit mode"
+            >
+              ×
+            </button>
+          </div>
+        )}
+
+        {/* Brief action flash ("todos cleared") */}
+        {actionFlash && (
+          <div className="px-5 pt-3 pb-0">
+            <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "10px" }}>
+              {actionFlash}
+            </span>
+          </div>
         )}
           <div ref={caretContainerRef} className="relative overflow-hidden">
             <textarea
+              data-pane-input
               ref={textareaRef}
               value={value}
               onChange={handleChange}
@@ -807,7 +1174,7 @@ export function InputBar({
               onFocus={() => { setTextareaFocused(true); updateCaret(); }}
               onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
               onScroll={() => { if (overlayRef.current && textareaRef.current) overlayRef.current.scrollTop = textareaRef.current.scrollTop; }}
-              placeholder={isProcessing ? "" : "let's build..."}
+              placeholder={isProcessing ? "" : (activeModeCmd?.placeholder ?? "let's build...")}
               className="w-full bg-transparent text-pane-text font-mono
                          resize-none outline-none placeholder:text-pane-text-secondary
                          leading-[1.75] px-5 pt-4 overflow-y-auto overflow-x-hidden"
@@ -851,6 +1218,8 @@ export function InputBar({
                   <span key={i} style={{ color: "var(--pane-text)" }}>{part}</span>
                 )
               )}
+              {/* Invisible trailing character keeps scrollHeight stable */}
+              <span aria-hidden> </span>
             </div>
             {textareaFocused && caretPos && (
               <div
@@ -874,9 +1243,13 @@ export function InputBar({
               onClick={() => {
                 const trimmed = value.trim();
                 if (!trimmed) return;
-                onSend(trimmed, attachedMinds.length > 0 ? attachedMinds : undefined);
+                const sentMode = activeModeCmd?.mode || modeOverride || detectedMode?.mode || null;
+                onSend(buildPrompt(trimmed), attachedMinds.length > 0 ? attachedMinds : undefined, sentMode || undefined);
+                setLastSentMode(sentMode);
                 setValue("");
                 setAttachedMinds([]);
+                setModeOverride(null);
+                setDetectedMode(null);
               }}
               className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
               title="Send (Enter)"
@@ -893,36 +1266,12 @@ export function InputBar({
             style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
             <button
-              onClick={() => {
+              onClick={async () => {
                 try {
-                  const input = document.createElement('input');
-                  input.type = 'file';
-                  input.multiple = true;
-                  input.webkitdirectory = true;
-                  input.onchange = (e) => {
-                    const files = (e.target as HTMLInputElement).files;
-                    if (files && files.length > 0) {
-                      const folderNames = new Set<string>();
-                      Array.from(files).forEach(f => {
-                        if (f.webkitRelativePath) {
-                          const parts = f.webkitRelativePath.split('/');
-                          if (parts.length > 0 && parts[0]) folderNames.add(parts[0]);
-                        }
-                      });
-                      if (folderNames.size > 0) {
-                        const pathsText = Array.from(folderNames).map(p => `\`./${p}\``).join('\n');
-                        setValue(prev => prev ? `${prev}\n${pathsText}` : pathsText);
-                      } else {
-                        const pathsText = Array.from(files).map(f => {
-                          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                          return `\`${(f as any).path || f.name}\``;
-                        }).join('\n');
-                        setValue(prev => prev ? `${prev}\n${pathsText}` : pathsText);
-                      }
-                    }
-                  };
-                  input.onerror = () => { input.webkitdirectory = false; input.click(); };
-                  input.click();
+                  const paths = await showFilePicker(projectRoot, projectRoot);
+                  if (!paths || paths.length === 0) return;
+                  const insertion = paths.map(p => `\`${p}\``).join(" ");
+                  setValue(prev => prev ? `${prev} ${insertion}` : insertion);
                 } catch (err) { console.error('Failed to open file picker:', err); }
               }}
               className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
@@ -938,15 +1287,31 @@ export function InputBar({
 
             <div className="flex-1" />
 
-            {/* Route preview — shows predicted model when smart routing is on */}
-            {routePreview && !isProcessing && (
-              <div className="pointer-events-none flex items-center gap-1.5 text-[10px] text-[var(--pane-text-secondary)] font-mono opacity-60">
-                <span>{routePreview.model}</span>
-                <span className="opacity-40">·</span>
-                <span className="opacity-60">{routePreview.taskType}</span>
-              </div>
+            {/* Mode pill — always visible, shows current orchestration mode */}
+            {!isProcessing && !activeModeCmd && (() => {
+              const mode = modeOverride || detectedMode?.mode || lastSentMode || "execute";
+              const config = MODE_CONFIG[mode];
+              const color = config?.color || "var(--pane-text-secondary)";
+              return (
+                <button
+                  onClick={handleModeTap}
+                  className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
+                    bg-pane-bg ring-1 ring-pane-border/25
+                    hover:text-pane-text btn-press transition-colors"
+                  style={{ color }}
+                  title={`${mode} mode — tap to cycle`}
+                >
+                  <span>{mode}</span>
+                </button>
+              );
+            })()}
+            {routePreview && !isProcessing && !activeModeCmd && (
+              <span className="pointer-events-none text-[10px] text-[var(--pane-text-secondary)] font-mono opacity-40">
+                {routePreview.model}
+              </span>
             )}
 
+            <ContextUsageIndicator projectId={projectId} />
             <RateLimitIndicator />
             <div className="pointer-events-auto">
               <ModelPicker

@@ -21,6 +21,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 
 import { getPaneDb } from "./pane-db.mjs";
+import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 
 const execAsync = promisify(exec);
 
@@ -74,6 +75,359 @@ function fuzzyScore(query, text) {
   const lower = text.toLowerCase();
   const matches = queryWords.filter((w) => lower.includes(w)).length;
   return matches / queryWords.length;
+}
+
+// ============================================================================
+// Reflex Gates — catch quality violations at write time
+// ============================================================================
+// Scans file content AFTER write, BEFORE result goes back to the LLM.
+// Deterministic regex — no LLM cost, <5ms. The LLM cannot sneak bad patterns
+// through because Pane inspects every write and augments the tool result with
+// correction directives the user never sees.
+//
+// Only flags NEW violations introduced by this write (compares against previous
+// content). Existing violations in the codebase are not the LLM's fault.
+
+const VIOLATION_PATTERNS = [
+  // ── Suppression directives ──────────────────────────────────────────────
+  {
+    id: "ts-nocheck",
+    pattern: /^\s*\/\/\s*@ts-nocheck/,
+    severity: "error",
+    message: "@ts-nocheck disables ALL type checking for this file. This hides real errors. Remove it and fix the actual type errors.",
+  },
+  {
+    id: "ts-ignore",
+    pattern: /\/\/\s*@ts-ignore(?!\s*\()/,
+    severity: "error",
+    message: "@ts-ignore suppresses a specific TypeScript error without explaining why. Fix the underlying type error instead of hiding it.",
+  },
+  {
+    id: "ts-expect-error-bare",
+    // @ts-expect-error without a description is a lazy suppression
+    pattern: /\/\/\s*@ts-expect-error\s*$/,
+    severity: "warning",
+    message: "@ts-expect-error without an explanation. If this is genuinely needed, add a comment explaining what error is expected and why it can't be fixed.",
+  },
+  {
+    id: "eslint-disable-file",
+    pattern: /\/\*\s*eslint-disable\s*\*\//,
+    severity: "error",
+    message: "eslint-disable disables ALL lint rules for this file. This hides real problems. Remove it and fix the specific lint errors.",
+  },
+  {
+    id: "eslint-disable-line",
+    // Blanket eslint-disable-next-line (no specific rule) is a red flag
+    pattern: /\/\/\s*eslint-disable-next-line\s*$/,
+    severity: "warning",
+    message: "eslint-disable-next-line without specifying which rule. If a rule must be disabled, name it and explain why.",
+  },
+  // ── Type escape hatches ─────────────────────────────────────────────────
+  {
+    id: "as-any",
+    pattern: /\bas\s+any\b/,
+    severity: "warning",
+    message: "'as any' erases type safety. Find the correct type or fix the type mismatch instead of casting to any.",
+    maxPerFile: 2, // Only flag if the file introduces 2+ new instances
+  },
+  {
+    id: "explicit-any-param",
+    // Catches : any in function params and variable declarations, but not in type definitions
+    pattern: /:\s*any\b(?!\s*[|&)\]])/,
+    severity: "warning",
+    message: "Explicit 'any' type removes type safety. Use the specific type, a generic, or 'unknown' if the type is truly unpredictable.",
+    maxPerFile: 3,
+  },
+  // ── Dead error handling ─────────────────────────────────────────────────
+  {
+    id: "empty-catch",
+    pattern: /catch\s*(\([^)]*\))?\s*\{\s*\}/,
+    severity: "warning",
+    message: "Empty catch block silently swallows errors. At minimum, log the error. If it's intentionally ignored, add a comment explaining why.",
+  },
+  // ── Debug residue ───────────────────────────────────────────────────────
+  {
+    id: "console-log",
+    pattern: /\bconsole\.(log|debug|info)\s*\(/,
+    severity: "info",
+    message: "console.log left in code. Remove debug logging before considering the work complete.",
+    maxPerFile: 3,
+    skipFiles: [/\.test\.|\.spec\.|__tests__|test\/|tests\/|\.config\.|vite\.config|jest\.config|eslint/],
+  },
+  {
+    id: "debugger",
+    pattern: /^\s*debugger\s*;?\s*$/,
+    severity: "error",
+    message: "debugger statement left in code. This will pause execution in the browser. Remove it.",
+  },
+];
+
+// ── Structural integrity checks ───────────────────────────────────────────
+// These analyze the file as a whole — brace balance, truncated declarations,
+// unclosed blocks. Common failure mode of junior/small models that truncate
+// output or drop closing braces.
+
+/**
+ * Count delimiter balance while skipping strings, template literals, comments,
+ * and regex literals. Returns the net imbalance and the line where the last
+ * unmatched opener was seen.
+ *
+ * @param {string} content - Full file content
+ * @param {string} open - Opening delimiter character
+ * @param {string} close - Closing delimiter character
+ * @returns {{ balance: number, lastOpenerLine: number }}
+ */
+function countDelimiterBalance(content, open, close) {
+  let balance = 0;
+  let lastOpenerLine = 0;
+  let line = 1;
+  let i = 0;
+
+  while (i < content.length) {
+    const ch = content[i];
+    const next = content[i + 1];
+
+    // Track line numbers
+    if (ch === "\n") { line++; i++; continue; }
+
+    // Skip single-line comments
+    if (ch === "/" && next === "/") {
+      i = content.indexOf("\n", i);
+      if (i === -1) break;
+      continue;
+    }
+
+    // Skip block comments
+    if (ch === "/" && next === "*") {
+      const end = content.indexOf("*/", i + 2);
+      if (end === -1) break;
+      // Count newlines inside the comment
+      for (let j = i; j < end + 2; j++) { if (content[j] === "\n") line++; }
+      i = end + 2;
+      continue;
+    }
+
+    // Skip strings (single/double quotes)
+    if (ch === '"' || ch === "'") {
+      i++;
+      while (i < content.length) {
+        if (content[i] === "\n") { line++; break; } // Unterminated — let it go
+        if (content[i] === "\\" ) { i += 2; continue; }
+        if (content[i] === ch) { i++; break; }
+        i++;
+      }
+      continue;
+    }
+
+    // Skip template literals (backtick) — handle nested ${} by tracking depth
+    if (ch === "`") {
+      i++;
+      let templateDepth = 0;
+      while (i < content.length) {
+        if (content[i] === "\n") line++;
+        if (content[i] === "\\" ) { i += 2; continue; }
+        if (content[i] === "$" && content[i + 1] === "{") { templateDepth++; i += 2; continue; }
+        if (content[i] === "}" && templateDepth > 0) { templateDepth--; i++; continue; }
+        if (content[i] === "`" && templateDepth === 0) { i++; break; }
+        i++;
+      }
+      continue;
+    }
+
+    // Count delimiters
+    if (ch === open) {
+      balance++;
+      lastOpenerLine = line;
+    } else if (ch === close) {
+      balance--;
+    }
+
+    i++;
+  }
+
+  return { balance, lastOpenerLine };
+}
+
+/**
+ * Detect truncated / incomplete file endings.
+ * Junior models often cut off mid-declaration or mid-expression.
+ *
+ * @param {string} content - Full file content
+ * @returns {Array<{id, severity, message, line}>}
+ */
+function checkTruncation(content) {
+  const lines = content.split("\n");
+  const violations = [];
+
+  // Find last non-empty, non-comment line
+  let lastIdx = lines.length - 1;
+  while (lastIdx >= 0 && /^\s*(\/\/.*)?$/.test(lines[lastIdx])) lastIdx--;
+  if (lastIdx < 0) return violations;
+
+  const lastLine = lines[lastIdx].trim();
+
+  // Patterns that indicate truncated output
+  const truncationPatterns = [
+    // Ends with an assignment/arithmetic/logical operator — expression was cut off
+    // Excludes: > (JSX closing), comma (trailing comma style), + in package versions
+    { pattern: /[=\-*/%&|^!<]\s*$/, id: "truncated-expression",
+      message: "File ends with an incomplete expression (trailing operator). The output appears to have been cut off." },
+    // Ends with opening brace/paren — block never started
+    { pattern: /[\{(\[]\s*$/, id: "truncated-block",
+      message: "File ends with an opening brace/bracket that is never closed. The output appears to have been cut off." },
+    // Ends with 'const', 'let', 'var', 'function', 'class', 'interface', 'type', 'export', 'import', 'return'
+    { pattern: /\b(const|let|var|function|class|interface|type|export|import|return|extends|implements|async|await)\s*$/, id: "truncated-declaration",
+      message: "File ends with an incomplete declaration keyword. The output appears to have been cut off mid-statement." },
+    // Ends with arrow — function body never written
+    { pattern: /=>\s*$/, id: "truncated-arrow",
+      message: "File ends with an arrow (=>) but no function body. The output appears to have been cut off." },
+    // Ends with colon (outside ternary/object, likely a type annotation cut off)
+    { pattern: /:\s*$/, id: "truncated-type",
+      message: "File ends with a colon but no type or value after it. The output appears to have been cut off." },
+  ];
+
+  for (const { pattern, id, message } of truncationPatterns) {
+    if (pattern.test(lastLine)) {
+      violations.push({ id, severity: "error", message, line: lastIdx + 1 });
+      break; // One truncation error is enough
+    }
+  }
+
+  return violations;
+}
+
+/**
+ * Scan file content for quality violations introduced by this write.
+ *
+ * @param {string} newContent - The content just written
+ * @param {string} previousContent - The content before the write (empty string for new files)
+ * @param {string} filePath - Relative or absolute path (used for skip rules)
+ * @returns {{ violations: Array<{id, severity, message, line}>, summary: string|null }}
+ */
+function scanForViolations(newContent, previousContent, filePath) {
+  // Skip non-code files
+  const ext = path.extname(filePath).toLowerCase();
+  const codeExts = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+  if (!codeExts.includes(ext)) return { violations: [], summary: null };
+
+  // Skip type declaration files — they legitimately use 'any'
+  if (filePath.endsWith(".d.ts")) return { violations: [], summary: null };
+
+  const newLines = newContent.split("\n");
+  const prevLines = new Set(previousContent.split("\n").map(l => l.trim()));
+
+  const violations = [];
+
+  // ── Pattern-based checks (line-by-line, only NEW lines) ─────────────────
+  for (const rule of VIOLATION_PATTERNS) {
+    // Check file-level skip rules
+    if (rule.skipFiles?.some(re => re.test(filePath))) continue;
+
+    let matchCount = 0;
+
+    for (let i = 0; i < newLines.length; i++) {
+      const line = newLines[i];
+      if (!rule.pattern.test(line)) continue;
+
+      // Only flag NEW violations — skip lines that existed before
+      if (prevLines.has(line.trim())) continue;
+
+      matchCount++;
+
+      // For rules with maxPerFile, only flag when threshold is exceeded
+      if (rule.maxPerFile && matchCount < rule.maxPerFile) continue;
+
+      violations.push({
+        id: rule.id,
+        severity: rule.severity,
+        message: rule.message,
+        line: i + 1,
+      });
+    }
+  }
+
+  // ── Structural integrity checks (whole-file analysis) ───────────────────
+  // These run on the FINAL file content, not diffed — a broken file is broken
+  // regardless of who introduced the imbalance.
+
+  // Brace balance: { vs }
+  const braces = countDelimiterBalance(newContent, "{", "}");
+  if (braces.balance > 0) {
+    violations.push({
+      id: "unclosed-brace",
+      severity: "error",
+      message: `${braces.balance} unclosed brace(s) — opening '{' without matching '}'. Last unmatched opener is near line ${braces.lastOpenerLine}. The file has broken syntax.`,
+      line: braces.lastOpenerLine,
+    });
+  } else if (braces.balance < 0) {
+    violations.push({
+      id: "extra-closing-brace",
+      severity: "error",
+      message: `${Math.abs(braces.balance)} extra closing brace(s) — '}' without matching '{'. The file has broken syntax.`,
+      line: newLines.length,
+    });
+  }
+
+  // Parenthesis balance: ( vs )
+  const parens = countDelimiterBalance(newContent, "(", ")");
+  if (parens.balance > 0) {
+    violations.push({
+      id: "unclosed-paren",
+      severity: "error",
+      message: `${parens.balance} unclosed parenthesis(es) — '(' without matching ')'. Last unmatched opener is near line ${parens.lastOpenerLine}. The file has broken syntax.`,
+      line: parens.lastOpenerLine,
+    });
+  } else if (parens.balance < 0) {
+    violations.push({
+      id: "extra-closing-paren",
+      severity: "error",
+      message: `${Math.abs(parens.balance)} extra closing parenthesis(es) — ')' without matching '('. The file has broken syntax.`,
+      line: newLines.length,
+    });
+  }
+
+  // Bracket balance: [ vs ]
+  const brackets = countDelimiterBalance(newContent, "[", "]");
+  if (brackets.balance > 0) {
+    violations.push({
+      id: "unclosed-bracket",
+      severity: "error",
+      message: `${brackets.balance} unclosed bracket(s) — '[' without matching ']'. Last unmatched opener is near line ${brackets.lastOpenerLine}. The file has broken syntax.`,
+      line: brackets.lastOpenerLine,
+    });
+  } else if (brackets.balance < 0) {
+    violations.push({
+      id: "extra-closing-bracket",
+      severity: "error",
+      message: `${Math.abs(brackets.balance)} extra closing bracket(s) — ']' without matching '['. The file has broken syntax.`,
+      line: newLines.length,
+    });
+  }
+
+  // Truncation detection: file ends mid-statement
+  const truncations = checkTruncation(newContent);
+  violations.push(...truncations);
+
+  // ── Build summary ───────────────────────────────────────────────────────
+  if (violations.length === 0) return { violations: [], summary: null };
+
+  const errors = violations.filter(v => v.severity === "error");
+  const warnings = violations.filter(v => v.severity === "warning");
+
+  let summary = "\n\n⚠ QUALITY GATE — Pane detected violations in this write:";
+
+  for (const v of violations) {
+    const tag = v.severity === "error" ? "ERROR" : v.severity === "warning" ? "WARNING" : "INFO";
+    summary += `\n  [${tag}] Line ${v.line}: ${v.message}`;
+  }
+
+  if (errors.length > 0) {
+    summary += "\n\nYou MUST fix the ERROR violations above. Do not suppress errors — fix the root cause.";
+  } else if (warnings.length > 0) {
+    summary += "\n\nFix the WARNING violations above. Use proper types instead of 'any', handle errors instead of swallowing them.";
+  }
+
+  return { violations, summary };
 }
 
 // ============================================================================
@@ -266,7 +620,7 @@ class FileReadCache {
 // Singleton — shared across all ToolExecutor instances in this process.
 // Exported for diagnostics and external invalidation (e.g., file watcher).
 const fileReadCache = new FileReadCache();
-export { fileReadCache };
+export { fileReadCache, scanForViolations, VIOLATION_PATTERNS };
 
 // ============================================================================
 // Contextual Memory Triggering — memories that activate when files are touched
@@ -789,13 +1143,18 @@ export class ToolExecutor {
       // Get file stats
       const stats = await fsPromises.stat(resolvedPath);
 
+      // ── Reflex Gate: scan for quality violations ──
+      const gate = scanForViolations(content, previousContent, filePath);
+      const baseOutput = `File written successfully: ${filePath} (${stats.size} bytes)`;
+
       return {
         success: true,
-        output: `File written successfully: ${filePath} (${stats.size} bytes)`,
+        output: gate.summary ? baseOutput + gate.summary : baseOutput,
         toolId,
         metadata: {
           path: filePath,
           size: stats.size,
+          violations: gate.violations.length > 0 ? gate.violations : undefined,
         },
       };
     } catch (error) {
@@ -886,10 +1245,15 @@ export class ToolExecutor {
 
       const stats = await fsPromises.stat(resolvedPath);
 
+      // ── Reflex Gate: scan for quality violations ──
+      const gate = scanForViolations(newContent, currentContent, filePath);
+      const baseOutput = `File edited: ${filePath}\nNew size: ${stats.size} bytes`;
+
       return {
         success: true,
-        output: `File edited: ${filePath}\nNew size: ${stats.size} bytes`,
+        output: gate.summary ? baseOutput + gate.summary : baseOutput,
         toolId,
+        metadata: gate.violations.length > 0 ? { violations: gate.violations } : undefined,
       };
     } catch (error) {
       return {
@@ -1041,14 +1405,106 @@ export class ToolExecutor {
   }
 
   /**
-   * Search Google (placeholder implementation)
+   * Web search — returns structured results from the web.
+   * Uses Brave Search API if key is configured, DuckDuckGo HTML fallback otherwise.
    */
   async executeGoogleWebSearch(toolId, query) {
-    return {
-      success: true,
-      output: `Searching for: ${query}\n(Web search results are currently unavailable in this environment. Please provide the information manually if available.)`,
-      toolId
-    };
+    if (!query || !query.trim()) {
+      return { success: false, error: "Empty search query", toolId };
+    }
+
+    // Try Tavily Search API first (if key configured) — AI-native search
+    // that returns extracted page content, not just snippets.
+    try {
+      const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+      const tavilyKey = settings.tavilyApiKey;
+
+      if (tavilyKey) {
+        const response = await fetch("https://api.tavily.com/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            api_key: tavilyKey,
+            query,
+            max_results: 5,
+            include_answer: true,
+            search_depth: "basic",
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (response.ok) {
+          const data = await response.json();
+          const parts = [];
+
+          // Tavily can return a direct answer
+          if (data.answer) {
+            parts.push(`Answer: ${data.answer}\n`);
+          }
+
+          const results = (data.results || []).slice(0, 5);
+          for (let i = 0; i < results.length; i++) {
+            const r = results[i];
+            parts.push(`${i + 1}. ${r.title}\n   ${r.url}\n   ${r.content || ""}`);
+          }
+
+          if (parts.length > 0) {
+            return { success: true, output: `Search results for "${query}":\n\n${parts.join("\n\n")}`, toolId };
+          }
+        }
+      }
+    } catch {}
+
+    // Fallback: DuckDuckGo HTML (no API key needed)
+    try {
+      const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) {
+        return { success: false, error: `Search failed: ${response.status}`, toolId };
+      }
+
+      const html = await response.text();
+
+      // Parse DuckDuckGo HTML results — each result is in a .result class
+      const results = [];
+      const resultRegex = /<a rel="nofollow" class="result__a" href="([^"]*)"[^>]*>([^<]*(?:<[^>]*>[^<]*)*)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+      let match;
+      while ((match = resultRegex.exec(html)) !== null && results.length < 8) {
+        const url = match[1];
+        const title = match[2].replace(/<[^>]+>/g, "").trim();
+        const snippet = match[3].replace(/<[^>]+>/g, "").trim();
+        if (title && url) {
+          results.push({ title, url, snippet });
+        }
+      }
+
+      // Fallback regex if the above didn't match (DDG changes their HTML occasionally)
+      if (results.length === 0) {
+        const linkRegex = /<a[^>]*class="result__url"[^>]*href="([^"]*)"[^>]*>[\s\S]*?<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+        while ((match = linkRegex.exec(html)) !== null && results.length < 8) {
+          const url = match[1].trim();
+          const snippet = match[2].replace(/<[^>]+>/g, "").trim();
+          if (url) results.push({ title: url, url, snippet });
+        }
+      }
+
+      if (results.length === 0) {
+        return { success: true, output: `No results found for "${query}".`, toolId };
+      }
+
+      const formatted = results.map((r, i) =>
+        `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`
+      ).join("\n\n");
+
+      return { success: true, output: `Search results for "${query}":\n\n${formatted}`, toolId };
+    } catch (err) {
+      return { success: false, error: `Search failed: ${err.message}`, toolId };
+    }
   }
 
   /**
@@ -1512,20 +1968,38 @@ export class ToolExecutor {
 
           if (!exported || exported.length === 0) return { success: true, output: "Knowledge graph is empty — it grows as you work.", toolId };
 
+          // Group by type, sort by confidence within each group
           const byType = {};
           for (const node of exported) {
+            if (!node.type) continue;
             if (!byType[node.type]) byType[node.type] = [];
             byType[node.type].push(node);
           }
 
           const parts = [`Knowledge graph: ${exported.length} nodes\n`];
-          for (const [type, nodes] of Object.entries(byType)) {
-            parts.push(`### ${type} (${nodes.length})`);
-            const sorted = nodes.slice(0, 5);
+
+          // Priority order: decisions and lessons first, then patterns, then everything else
+          const typeOrder = ["decision", "lesson", "pattern", "error_fix", "principle", "mind"];
+          const orderedTypes = [
+            ...typeOrder.filter(t => byType[t]),
+            ...Object.keys(byType).filter(t => !typeOrder.includes(t)),
+          ];
+
+          for (const type of orderedTypes) {
+            const nodes = byType[type];
+            if (!nodes || nodes.length === 0) continue;
+            // Sort by confidence descending, show top 8 per type with FULL content
+            const sorted = nodes
+              .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+              .slice(0, 8);
+            parts.push(`## ${type} (${nodes.length} total, showing top ${sorted.length})`);
             for (const n of sorted) {
-              parts.push(`  ${n.content.slice(0, 120)}`);
+              const conf = n.confidence != null ? ` [confidence: ${n.confidence.toFixed(2)}]` : "";
+              parts.push(`- ${n.content}${conf}`);
             }
+            parts.push("");
           }
+
           return { success: true, output: parts.join("\n"), toolId };
         }
 
@@ -1612,12 +2086,42 @@ export class ToolExecutor {
             return { success: true, output: `No symbols matching "${query}" found.${kindFilter ? ` (kind: ${kindFilter})` : ""}`, toolId };
           }
 
-          const out = scored.map(s => {
-            const doc = s.doc ? `\n    ${s.doc}` : "";
-            return `${s.name} (${s.kind}) → ${s.file}:${s.line}${doc}`;
-          }).join("\n");
+          // Return symbols with code excerpts — the model gets location AND
+          // implementation in one call, eliminating the follow-up read_file.
+          const parts = [`${scored.length} symbol${scored.length > 1 ? "s" : ""} matching "${query}":\n`];
+          for (const s of scored) {
+            const doc = s.doc ? ` — ${s.doc}` : "";
+            parts.push(`${s.name} (${s.kind}) → ${s.file}:${s.line}${doc}`);
 
-          return { success: true, output: `${scored.length} symbol${scored.length > 1 ? "s" : ""} matching "${query}":\n\n${out}`, toolId };
+            // Include code excerpt for top 5 results (10 lines around definition)
+            if (scored.indexOf(s) < 5 && s.file && s.line) {
+              try {
+                const filePath = path.isAbsolute(s.file) ? s.file : path.join(this.projectRoot, s.file);
+                const content = await fsPromises.readFile(filePath, "utf-8");
+                const lines = content.split("\n");
+                const start = Math.max(0, s.line - 2);
+                const end = Math.min(lines.length, s.line + 12);
+                const excerpt = lines.slice(start, end)
+                  .map((l, i) => `  ${start + i + 1} │ ${l}`)
+                  .join("\n");
+                parts.push("```");
+                parts.push(excerpt);
+                parts.push("```");
+              } catch {}
+            }
+            parts.push("");
+          }
+
+          return { success: true, output: parts.join("\n"), toolId };
+        }
+
+        case "pane_find_references": {
+          const symbol = (input?.symbol || "").trim();
+          if (!symbol) return { success: false, error: "Symbol is required.", toolId };
+          const projectRoot = input?.projectRoot || this.projectRoot;
+          const projectId = input?.projectId || this.projectId;
+          const { byFile, totalMatches, filesSearched } = await findReferences(symbol, projectRoot, { projectId });
+          return { success: true, output: formatReferencesOutput(symbol, byFile, totalMatches, filesSearched), toolId };
         }
 
         case "pane_synthesize": {
@@ -1752,6 +2256,138 @@ export class ToolExecutor {
         case "cli_help": {
           const question = input.question || "";
           return { success: true, output: `Gemini CLI Help for: ${question}\n(Note: Help system is simulated. Refer to project documentation.)`, toolId };
+        }
+
+        case "explore": {
+          const { explore } = await import("./tool-explore.mjs");
+          const result = await explore(
+            input?.query || "",
+            this.projectId,
+            this.projectRoot,
+            { brainRequest: this._brainRequest },
+          );
+          return { success: true, output: result || "No relevant results found.", toolId };
+        }
+
+        case "pane_codebase_navigator": {
+          const target = (input?.target || "").trim();
+          if (!target) return { success: false, error: "Target is required.", toolId };
+
+          // Resolve target to a file — check direct path, then search src/
+          let primaryFile = null;
+          const rootDir = this.projectRoot;
+          if (target.includes("/") || /\.\w+$/.test(target)) {
+            const resolved = path.isAbsolute(target) ? target : path.join(rootDir, target);
+            if (fs.existsSync(resolved)) primaryFile = resolved;
+            if (!primaryFile) {
+              for (const ext of [".tsx", ".ts", ".js", ".mjs"]) {
+                if (fs.existsSync(resolved + ext)) { primaryFile = resolved + ext; break; }
+              }
+            }
+          } else {
+            // Search for file by name
+            const { execSync } = await import("node:child_process");
+            try {
+              const found = execSync(`find "${rootDir}/src" -name "${target}.*" -not -path "*/node_modules/*" 2>/dev/null | head -1`, { encoding: "utf-8" }).trim();
+              if (found) primaryFile = found;
+            } catch {}
+          }
+          if (!primaryFile) return { success: false, error: `No file found matching "${target}".`, toolId };
+
+          // Read file and extract imports
+          const content = await fsPromises.readFile(primaryFile, "utf-8");
+          const lines = content.split("\n");
+          const relPath = path.relative(rootDir, primaryFile);
+          const imports = [];
+          const importedBy = [];
+
+          // Extract imports from this file
+          for (const line of lines) {
+            const m = line.match(/^import\s+.*from\s+["']([^"']+)["']/);
+            if (m && !m[1].startsWith("node:") && !m[1].includes("node_modules")) {
+              imports.push(m[1]);
+            }
+          }
+
+          // Find files that import this file (via symbol index if available)
+          if (this._brainRequest) {
+            try {
+              const resp = await this._brainRequest("find_importers", { projectId: this.projectId, filePath: relPath });
+              if (resp?.importers) importedBy.push(...resp.importers);
+            } catch {}
+          }
+
+          const out = [`Dependency Map: ${relPath}\n`];
+          out.push(`Imports (${imports.length}):`);
+          for (const imp of imports) out.push(`  → ${imp}`);
+          out.push(`\nImported by (${importedBy.length}):`);
+          for (const imp of importedBy) out.push(`  ← ${imp}`);
+          out.push(`\nFile: ${lines.length} lines`);
+
+          return { success: true, output: out.join("\n"), toolId };
+        }
+
+        case "pane_ui_constraints": {
+          const componentKey = (input?.component || "").toLowerCase();
+          const constraintsPath = path.join(os.homedir(), ".pane", "memory", this.projectId, "ui-constraints.json");
+          try {
+            const data = JSON.parse(await fsPromises.readFile(constraintsPath, "utf-8"));
+            const constraints = Array.isArray(data.constraints) ? data.constraints : [];
+
+            const inferredCategories = new Set();
+            if (componentKey.includes("input") || componentKey.includes("textarea")) inferredCategories.add("input");
+            if (componentKey.includes("search")) inferredCategories.add("search");
+            if (componentKey.includes("float") || componentKey.includes("panel") || componentKey.includes("picker")) inferredCategories.add("floating");
+            if (componentKey.includes("terminal")) inferredCategories.add("terminal");
+
+            const filtered = inferredCategories.size > 0
+              ? constraints.filter(c => Array.isArray(c.categories) && c.categories.some(cat => inferredCategories.has(cat)))
+              : constraints;
+
+            const parts = [`UI Constraints for: ${input.component}\n`];
+            for (const c of filtered) {
+              parts.push(`• ${c.rule}`);
+              if (c.forbiddenPatterns?.length) parts.push(`  Forbidden: ${c.forbiddenPatterns.join(", ")}`);
+              if (c.positiveExample) parts.push(`  Do: ${c.positiveExample}`);
+              if (c.negativeExample) parts.push(`  Don't: ${c.negativeExample}`);
+            }
+            return { success: true, output: parts.join("\n") || "No constraints found for this component type.", toolId };
+          } catch {
+            return { success: true, output: "No UI constraints registered for this project.", toolId };
+          }
+        }
+
+        case "pane_architecture_brief": {
+          const subsystemArg = (input?.subsystem || "").trim().toLowerCase();
+          if (!subsystemArg) return { success: false, error: "Subsystem is required.", toolId };
+
+          const subsystemsPath = path.join(os.homedir(), ".pane", "memory", this.projectId, "subsystems.json");
+          try {
+            const data = JSON.parse(await fsPromises.readFile(subsystemsPath, "utf-8"));
+            const subsystems = Array.isArray(data.subsystems) ? data.subsystems : [];
+
+            const matched = subsystems.find(s =>
+              (s.id || "").toLowerCase() === subsystemArg ||
+              (s.name || "").toLowerCase() === subsystemArg ||
+              (Array.isArray(s.filePatterns) && s.filePatterns.some(p => subsystemArg.includes(p.toLowerCase())))
+            );
+
+            if (!matched) {
+              const available = subsystems.map(s => `  • ${s.id} — ${s.name}`).join("\n");
+              return { success: true, output: `No subsystem matched "${input.subsystem}".\n\nAvailable:\n${available}`, toolId };
+            }
+
+            const out = [`Architecture Brief: ${matched.name}\n`];
+            if (matched.patternInEffect) out.push(`Pattern: ${matched.patternInEffect}\n`);
+            const locked = Array.isArray(matched.lockedDecisions) ? matched.lockedDecisions : [];
+            if (locked.length > 0) {
+              out.push(`Locked decisions (${locked.length}):`);
+              for (const d of locked) out.push(`  • ${d.decision}${d.rationale ? ` — ${d.rationale}` : ""}`);
+            }
+            return { success: true, output: out.join("\n"), toolId };
+          } catch {
+            return { success: true, output: "No subsystem registry found for this project.", toolId };
+          }
         }
 
         default:

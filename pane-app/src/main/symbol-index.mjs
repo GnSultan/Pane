@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { isSignalNoise } from "./signal-filters.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -617,7 +618,7 @@ export function synthesizeProjectDNA(db, projectId) {
     parts.push("Architectural decisions:");
     for (const d of decisions) {
       const text = extract(d);
-      if (text) parts.push(`- ${text}`);
+      if (text && !isSignalNoise(text)) parts.push(`- ${text}`);
     }
   }
 
@@ -625,7 +626,7 @@ export function synthesizeProjectDNA(db, projectId) {
     parts.push("\nEstablished patterns:");
     for (const p of patterns) {
       const text = extract(p);
-      if (text) parts.push(`- ${text}`);
+      if (text && !isSignalNoise(text)) parts.push(`- ${text}`);
     }
   }
 
@@ -633,19 +634,33 @@ export function synthesizeProjectDNA(db, projectId) {
     parts.push("\nLessons learned:");
     for (const l of lessons) {
       const text = extract(l);
-      if (text) parts.push(`- ${text}`);
+      if (text && !isSignalNoise(text)) parts.push(`- ${text}`);
     }
   }
 
   if (fixes.length > 0) {
-    parts.push("\nKnown anti-patterns (do not repeat):");
-    for (const f of fixes) {
-      const text = extract(f);
-      if (text) parts.push(`- ${text}`);
+    // Only emit the anti-patterns section if the majority of fix nodes contain
+    // genuine behavioral signal — not transient tool errors.
+    const fixTexts = fixes.map(f => extract(f)).filter(Boolean);
+    const noiseCount = fixTexts.filter(isSignalNoise).length;
+    const signalRatio = fixTexts.length > 0 ? (fixTexts.length - noiseCount) / fixTexts.length : 0;
+    if (signalRatio > 0.5) {
+      parts.push("\nKnown anti-patterns (do not repeat):");
+      for (const text of fixTexts) {
+        if (!isSignalNoise(text)) parts.push(`- ${text}`);
+      }
     }
   }
 
-  return parts.join("\n");
+  const joined = parts.join("\n");
+  // If the entire synthesis is predominantly noise (>50% of non-header lines match
+  // error/fix patterns), suppress it entirely rather than injecting it.
+  const contentLines = joined.split("\n").filter(l => l.startsWith("- "));
+  if (contentLines.length === 0) return null;
+  const noisy = contentLines.filter(l => isSignalNoise(l.slice(2)));
+  if (noisy.length / contentLines.length > 0.5) return null;
+
+  return joined;
 }
 
 /**

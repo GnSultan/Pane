@@ -6,6 +6,7 @@ import type {
   ContentBlock,
   ToolUseBlock,
   CheckpointMeta,
+  ArbiterVerdict,
 } from "../lib/punk-types";
 import { createEmptyConversation } from "../lib/punk-types";
 
@@ -190,6 +191,7 @@ interface ProjectsState {
     outputTokens?: number,
     numTurns?: number,
   ) => void;
+  setLastAssistantVerdict: (projectId: string, verdict: ArbiterVerdict) => void;
   clearConversation: (projectId: string) => void;
   clearSessionContext: (projectId: string) => void;
   setHasUnreadCompletion: (projectId: string, hasUnread: boolean) => void;
@@ -700,6 +702,20 @@ function createProjectsStore() {
                 outputTokens,
                 numTurns,
               };
+              break;
+            }
+          }
+          return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
+    setLastAssistantVerdict: (projectId, verdict) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const msgs = [...p.conversation.messages];
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i]!.type === "assistant") {
+              msgs[i] = { ...msgs[i]!, verdict };
               break;
             }
           }

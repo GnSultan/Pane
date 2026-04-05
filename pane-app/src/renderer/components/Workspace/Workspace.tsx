@@ -30,34 +30,29 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
   const mountedRef = useRef(false);
   const [, startTransition] = useTransition();
 
+  // Thread switching only — page visibility handled by parent [data-page="conversation"]
+  // container via CSS. This layer only manages which thread is on top.
   useEffect(() => {
     const apply = (state: ReturnType<typeof useProjectsStore.getState>) => {
       if (!ref.current) return;
       const isActive = state.activeProjectId === projectId;
-      const mode = state.projects.get(projectId)?.mode ?? "conversation";
-      const shouldShow = isActive && mode === "conversation";
-      if (shouldShow && !mountedRef.current) {
+      if (isActive && !mountedRef.current) {
         mountedRef.current = true;
         startTransition(() => setMounted(true));
       }
-      ref.current.style.zIndex = shouldShow ? "1" : "0";
-      ref.current.style.pointerEvents = shouldShow ? "auto" : "none";
+      ref.current.style.zIndex = isActive ? "1" : "0";
+      ref.current.style.pointerEvents = isActive ? "auto" : "none";
+      ref.current.style.contentVisibility = isActive ? "visible" : "hidden";
     };
 
     apply(useProjectsStore.getState());
     return useProjectsStore.subscribe((state, prev) => {
-      const activeChanged = state.activeProjectId !== prev.activeProjectId;
-      const modeChanged =
-        state.projects.get(projectId)?.mode !== prev.projects.get(projectId)?.mode;
-      if (activeChanged || modeChanged) apply(state);
+      if (state.activeProjectId !== prev.activeProjectId) apply(state);
     });
   }, [projectId]);
 
-  // Derive initial styles from store without useState to avoid stale closure
   const store = useProjectsStore.getState();
-  const initiallyActive =
-    store.activeProjectId === projectId &&
-    (store.projects.get(projectId)?.mode ?? "conversation") === "conversation";
+  const initiallyActive = store.activeProjectId === projectId;
 
   return (
     <div
@@ -179,15 +174,15 @@ export function Workspace() {
 
   return (
     <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
-      {/* Empty state — no threads yet */}
-      {projectOrder.length === 0 && (
-        <EmptyState />
-      )}
-
-      {/* Conversation layers — self-managing visibility via store subscription */}
-      {projectOrder.map((id) => (
-        <ConversationLayer key={id} projectId={id} />
-      ))}
+      {/* Conversation page — participates in the same [data-page] CSS system as every other page.
+           Page-level visibility (conversation vs mind vs profile) is CSS-driven.
+           Thread switching (project A vs project B) is JS-driven z-index 0/1 inside. */}
+      <div data-page="conversation" className="absolute inset-0 bg-pane-bg">
+        {projectOrder.length === 0 && <EmptyState />}
+        {projectOrder.map((id) => (
+          <ConversationLayer key={id} projectId={id} />
+        ))}
+      </div>
 
       <div data-page="viewer" className="absolute inset-0 flex flex-col bg-pane-bg">
         <FileExplorer />

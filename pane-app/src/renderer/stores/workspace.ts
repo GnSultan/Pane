@@ -168,20 +168,45 @@ function applyFontWeight(weight: number) {
 
 function applyTheme(theme: Theme) {
   const resolved = resolveTheme(theme);
-  // system+dark → :root (Dusk — softer default, no attribute)
-  // explicit dark → data-theme="dark" (Ink — the hard choice)
-  if (theme === "system" && resolved === "dark") {
-    document.documentElement.removeAttribute("data-theme");
-  } else if (resolved === "dark") {
-    document.documentElement.setAttribute("data-theme", "dark");
+
+  const apply = () => {
+    // system+dark → :root (Dusk — softer default, no attribute)
+    // explicit dark → data-theme="dark" (Ink — the hard choice)
+    if (theme === "system" && resolved === "dark") {
+      document.documentElement.removeAttribute("data-theme");
+    } else if (resolved === "dark") {
+      document.documentElement.setAttribute("data-theme", "dark");
+    } else {
+      document.documentElement.setAttribute("data-theme", resolved);
+    }
+    // Toggle native vibrancy for Liquid Glass
+    const vibrancy = resolved === "glass" ? "under-window" : null;
+    (window as any).electronAPI?.invoke("set_vibrancy", { vibrancy }).catch(() => {});
+    // Switch dock icon variant
+    setAppTheme(resolved);
+  };
+
+  // Use View Transitions API for a smooth crossfade between themes.
+  // Falls back to instant apply if the API isn't available.
+  if ((document as any).startViewTransition) {
+    const transition = (document as any).startViewTransition(apply);
+    // Style the transition: soft crossfade, no movement
+    const style = document.createElement("style");
+    style.textContent = `
+      ::view-transition-old(root) {
+        animation: 350ms ease-out both fade-out;
+      }
+      ::view-transition-new(root) {
+        animation: 350ms ease-in both fade-in;
+      }
+      @keyframes fade-out { to { opacity: 0; } }
+      @keyframes fade-in { from { opacity: 0; } }
+    `;
+    document.head.appendChild(style);
+    transition.finished.then(() => style.remove()).catch(() => style.remove());
   } else {
-    document.documentElement.setAttribute("data-theme", resolved);
+    apply();
   }
-  // Toggle native vibrancy for Liquid Glass
-  const vibrancy = resolved === "glass" ? "under-window" : null;
-  (window as any).electronAPI?.invoke("set_vibrancy", { vibrancy }).catch(() => {});
-  // Switch dock icon variant — glass=clear/transparent, dark=solid ink, default=semi-transparent dusk
-  setAppTheme(resolved);
 }
 
 function createWorkspaceStore() {
@@ -270,6 +295,7 @@ function createWorkspaceStore() {
     setSdkInfo: (models, account) => set({ sdkModels: models, sdkAccount: account }),
     rateLimitInfo: null,
     setRateLimitInfo: (info) => set({ rateLimitInfo: info }),
+    lastTokenUsageAt: 0,
     // Profile data
     profileName: "",
     profileBio: "",
@@ -500,10 +526,18 @@ export const useWorkspaceStore: ReturnType<typeof createWorkspaceStore> =
 
 // Listen for background model updates from the main process
 (window as any).electronAPI.on("pane:models-updated", (models: any) => {
-  useWorkspaceStore.setState({ 
+  useWorkspaceStore.setState({
     allModels: models,
     openRouterModels: models.openrouter || []
   });
+});
+
+// Listen for SDK auth info — arrives from prefetch before any project is active.
+// Fixes the bug where Profile shows "not signed in" even when authenticated.
+(window as any).electronAPI.on("pane-sdk-auth", (data: any) => {
+  if (data?.account || data?.models) {
+    useWorkspaceStore.getState().setSdkInfo(data.models || null, data.account || null);
+  }
 });
 
 // Listen for OS theme changes — re-apply when in system mode

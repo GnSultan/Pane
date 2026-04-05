@@ -142,6 +142,45 @@ function _createSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_token_usage_project ON token_usage(project_id, timestamp);
 
+    -- Quality metrics — behavioral fingerprinting per turn.
+    -- Tracks how each model performs on code quality over time.
+    CREATE TABLE IF NOT EXISTS quality_metrics (
+      id                TEXT    PRIMARY KEY,
+      project_id        TEXT    NOT NULL,
+      model             TEXT,
+      provider          TEXT,
+      verdict_pass      INTEGER NOT NULL DEFAULT 1,
+      quality_score     INTEGER NOT NULL DEFAULT 100,
+      type_errors       INTEGER NOT NULL DEFAULT 0,
+      lint_errors       INTEGER NOT NULL DEFAULT 0,
+      suppressions      INTEGER NOT NULL DEFAULT 0,
+      self_corrected    INTEGER,
+      files_changed     INTEGER NOT NULL DEFAULT 0,
+      arch_issues       INTEGER NOT NULL DEFAULT 0,
+      timestamp         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_quality_project
+      ON quality_metrics(project_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_quality_model
+      ON quality_metrics(model, timestamp);
+
+    -- Correction events — tracks individual corrections for pattern detection.
+    -- When the same correction_type hits 3+ times in a week, it graduates
+    -- to a candidate rule. No LLM extraction — just counting events.
+    CREATE TABLE IF NOT EXISTS correction_events (
+      id               TEXT    PRIMARY KEY,
+      project_id       TEXT    NOT NULL,
+      correction_type  TEXT    NOT NULL,
+      model            TEXT,
+      source           TEXT    NOT NULL,
+      detail           TEXT,
+      timestamp        INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_corrections_project
+      ON correction_events(project_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_corrections_type
+      ON correction_events(correction_type, timestamp);
+
     -- FTS5 full-text search across all conversation messages.
     -- Stores extracted plain text from message content blocks.
     -- porter unicode61 tokenizer handles stemming (search "running" finds "run").
@@ -253,38 +292,127 @@ function _prepareStatements(db) {
         (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     getTokenAnalytics: db.prepare(`
-      SELECT 
-        model,
-        provider,
-        activity_type,
+      SELECT
+        model, provider, activity_type,
         SUM(input_tokens) as total_input_tokens,
         SUM(output_tokens) as total_output_tokens,
         SUM(cache_creation_input_tokens) as total_cache_creation,
         SUM(cache_read_input_tokens) as total_cache_read,
         SUM(cost_usd) as total_cost_usd,
         AVG(duration_ms) as avg_duration_ms,
-        COUNT(*) as call_count
+        COUNT(*) as call_count,
+        MAX(timestamp) as last_used
       FROM token_usage
       WHERE project_id = ? AND timestamp >= ?
-      GROUP BY model, activity_type
-      ORDER BY total_cost_usd DESC
+      GROUP BY model, provider, activity_type
+      ORDER BY call_count DESC
     `),
     getGlobalTokenAnalytics: db.prepare(`
-      SELECT 
-        model,
-        provider,
-        activity_type,
+      SELECT
+        model, provider, activity_type,
         SUM(input_tokens) as total_input_tokens,
         SUM(output_tokens) as total_output_tokens,
         SUM(cache_creation_input_tokens) as total_cache_creation,
         SUM(cache_read_input_tokens) as total_cache_read,
         SUM(cost_usd) as total_cost_usd,
         AVG(duration_ms) as avg_duration_ms,
-        COUNT(*) as call_count
+        COUNT(*) as call_count,
+        MAX(timestamp) as last_used
       FROM token_usage
       WHERE timestamp >= ?
-      GROUP BY model, activity_type
-      ORDER BY total_cost_usd DESC
+      GROUP BY model, provider, activity_type
+      ORDER BY call_count DESC
+    `),
+    getTokenTimeSeries: db.prepare(`
+      SELECT
+        DATE(timestamp / 1000, 'unixepoch') as day,
+        SUM(cost_usd) as daily_cost,
+        SUM(input_tokens) as daily_input,
+        SUM(output_tokens) as daily_output,
+        SUM(cache_read_input_tokens) as daily_cache_read,
+        COUNT(*) as daily_calls
+      FROM token_usage
+      WHERE project_id = ? AND timestamp >= ?
+      GROUP BY day
+      ORDER BY day ASC
+    `),
+    getGlobalTokenTimeSeries: db.prepare(`
+      SELECT
+        DATE(timestamp / 1000, 'unixepoch') as day,
+        SUM(cost_usd) as daily_cost,
+        SUM(input_tokens) as daily_input,
+        SUM(output_tokens) as daily_output,
+        SUM(cache_read_input_tokens) as daily_cache_read,
+        COUNT(*) as daily_calls
+      FROM token_usage
+      WHERE timestamp >= ?
+      GROUP BY day
+      ORDER BY day ASC
+    `),
+
+    // quality metrics — behavioral fingerprinting
+    insertQualityMetric: db.prepare(`
+      INSERT INTO quality_metrics
+        (id, project_id, model, provider, verdict_pass, quality_score,
+         type_errors, lint_errors, suppressions, self_corrected,
+         files_changed, arch_issues, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    getQualityStats: db.prepare(`
+      SELECT
+        COUNT(*) as total_turns,
+        SUM(CASE WHEN verdict_pass = 0 THEN 1 ELSE 0 END) as failed_turns,
+        AVG(quality_score) as avg_score,
+        SUM(type_errors) as total_type_errors,
+        SUM(lint_errors) as total_lint_errors,
+        SUM(suppressions) as total_suppressions,
+        SUM(CASE WHEN self_corrected = 1 THEN 1 ELSE 0 END) as corrections,
+        SUM(CASE WHEN self_corrected = 0 THEN 1 ELSE 0 END) as uncorrected,
+        SUM(arch_issues) as total_arch_issues
+      FROM quality_metrics
+      WHERE project_id = ? AND timestamp >= ?
+    `),
+    getModelQualityStats: db.prepare(`
+      SELECT
+        model,
+        COUNT(*) as total_turns,
+        AVG(quality_score) as avg_score,
+        SUM(suppressions) as total_suppressions,
+        SUM(CASE WHEN self_corrected = 1 THEN 1 ELSE 0 END) as corrections,
+        SUM(CASE WHEN self_corrected = 0 THEN 1 ELSE 0 END) as uncorrected
+      FROM quality_metrics
+      WHERE project_id = ? AND timestamp >= ?
+      GROUP BY model
+      ORDER BY avg_score ASC
+    `),
+    getRecentVerdicts: db.prepare(`
+      SELECT verdict_pass, quality_score, type_errors, lint_errors, suppressions, self_corrected, model
+      FROM quality_metrics
+      WHERE project_id = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `),
+
+    // correction events — pattern detection for rule graduation
+    insertCorrection: db.prepare(`
+      INSERT INTO correction_events (id, project_id, correction_type, model, source, detail, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `),
+    getRepeatedCorrections: db.prepare(`
+      SELECT correction_type, COUNT(*) as count, MAX(detail) as last_detail, MAX(timestamp) as last_seen
+      FROM correction_events
+      WHERE timestamp >= ?
+      GROUP BY correction_type
+      HAVING count >= ?
+      ORDER BY count DESC
+    `),
+    getCorrectionsByProject: db.prepare(`
+      SELECT correction_type, COUNT(*) as count, MAX(detail) as last_detail
+      FROM correction_events
+      WHERE project_id = ? AND timestamp >= ?
+      GROUP BY correction_type
+      HAVING count >= 2
+      ORDER BY count DESC
     `),
 
     // FTS5 — full-text search across messages

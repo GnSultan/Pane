@@ -34,6 +34,8 @@ function getIndicatorColor(isReasoning: boolean, provider: string) {
       return "bg-pane-text-secondary";
     case "kimi":
       return "bg-pane-text-secondary/70";
+    case "xiaomi":
+      return "bg-pane-accent";
     default:
       return "bg-pane-text-secondary/50";
   }

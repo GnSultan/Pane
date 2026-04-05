@@ -114,7 +114,12 @@ export const MODEL_CONTEXT_LIMITS = {
   "qwen/qwen3-next-80b-a3b-instruct:free": 262144,
   "openai/gpt-oss-120b:free": 131072,
   "z-ai/glm-4.5-air:free": 131072,
-  "xiaomi/mimo-v2-flash": 128000,
+  "xiaomi/mimo-v2-flash": 262144,
+  "xiaomi/mimo-v2-pro": 1000000,
+  "xiaomi/mimo-v2-omni": 1000000,
+  "mimo-v2-flash": 262144,
+  "mimo-v2-pro": 1000000,
+  "mimo-v2-omni": 1000000,
   "google/gemini-2.0-flash-001": 1000000,
 };
 

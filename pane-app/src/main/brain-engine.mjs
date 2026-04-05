@@ -11,6 +11,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { runMemoryLifecycle, touchMemory, reinforceMemory } from "./memory-lifecycle.mjs";
+import { isSignalNoise } from "./signal-filters.mjs";
 
 import {
   initSymbolTables,
@@ -590,6 +591,40 @@ function initDatabase() {
       timestamp TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_lens_comments_post ON lens_comments(post_id);
+  `);
+
+  // Review sessions — on-demand punk analysis sessions
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS review_sessions (
+      id           TEXT    PRIMARY KEY,
+      project_id   TEXT    NOT NULL,
+      status       TEXT    NOT NULL DEFAULT 'running',
+      diff_summary TEXT,
+      base_ref     TEXT,
+      punk_count   INTEGER NOT NULL DEFAULT 0,
+      finding_count INTEGER NOT NULL DEFAULT 0,
+      created_at   TEXT    NOT NULL,
+      completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_review_sessions_project
+      ON review_sessions(project_id, created_at);
+  `);
+
+  // Punk findings — structured results from each punk per review session
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS punk_findings (
+      id         TEXT    PRIMARY KEY,
+      session_id TEXT    NOT NULL,
+      project_id TEXT    NOT NULL,
+      punk       TEXT    NOT NULL,
+      severity   TEXT    NOT NULL,
+      finding    TEXT    NOT NULL,
+      structured TEXT    NOT NULL,
+      location   TEXT,
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_findings_session ON punk_findings(session_id);
+    CREATE INDEX IF NOT EXISTS idx_findings_project ON punk_findings(project_id, created_at);
   `);
 
   // Migrations for unified atom pool — add priority, sort_order, facet to nodes
@@ -1321,6 +1356,7 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
       const scored = [];
       for (const n of principleNodes) {
         const content = JSON.parse(n.content || "{}").text || n.name;
+        if (isSignalNoise(content)) continue;
         if (n.embedding) {
           const nEmb = new Float32Array(n.embedding.buffer, n.embedding.byteOffset, n.embedding.byteLength / 4);
           const sim = cosineSimilarity(queryEmbedding, nEmb);
@@ -1346,7 +1382,8 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
           content: JSON.parse(n.content || "{}").text || n.name,
           score: 0.5,
           confidence: n.confidence || 0,
-        }));
+        }))
+        .filter(p => !isSignalNoise(p.content));
     }
   } catch (err) {
     console.error("[brain] Principle query failed:", err.message);
@@ -2659,6 +2696,77 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
+      case "decay_completed_task": {
+        // Completion propagation: decay brain nodes related to a finished task
+        // and mark matching mind entries as completed.
+        if (!db) {
+          sendToMain({ type: "decay_completed_task_result", requestId: data.requestId, nodesDecayed: 0, mindMarked: 0 });
+          break;
+        }
+
+        let nodesDecayed = 0;
+        let mindMarked = 0;
+        const decayAmount = data.decayAmount || 0.3;
+        const threshold = data.similarityThreshold || 0.7;
+
+        try {
+          const taskEmbedding = embedderReady ? await embed(data.taskDescription) : null;
+
+          if (taskEmbedding) {
+            // Find and decay matching brain nodes
+            const projectNodes = db.prepare(
+              `SELECT id, embedding, confidence FROM nodes WHERE project_id = ? AND embedding IS NOT NULL AND confidence > 0.2`
+            ).all(data.projectId);
+
+            for (const node of projectNodes) {
+              const nodeEmb = new Float32Array(new Uint8Array(node.embedding).buffer);
+              const similarity = cosineSimilarity(taskEmbedding, nodeEmb);
+              if (similarity >= threshold) {
+                db._stmts.lowerConfidence.run(decayAmount, node.id);
+                nodesDecayed++;
+              }
+            }
+
+            // Also check completed todos for additional matches
+            for (const todo of (data.completedTodos || [])) {
+              const todoEmbedding = await embed(todo);
+              if (!todoEmbedding) continue;
+              for (const node of projectNodes) {
+                const nodeEmb = new Float32Array(new Uint8Array(node.embedding).buffer);
+                const similarity = cosineSimilarity(todoEmbedding, nodeEmb);
+                if (similarity >= threshold) {
+                  // Only decay if not already decayed by task description
+                  const current = db.prepare(`SELECT confidence FROM nodes WHERE id = ?`).get(node.id);
+                  if (current && current.confidence > 0.2) {
+                    db._stmts.lowerConfidence.run(decayAmount * 0.5, node.id);
+                    nodesDecayed++;
+                  }
+                }
+              }
+            }
+
+            // Mark matching mind entries as completed
+            const mindEntries = db.prepare(
+              `SELECT id, content, embedding FROM mind_entries WHERE completed = 0 AND embedding IS NOT NULL`
+            ).all();
+
+            for (const entry of mindEntries) {
+              const entryEmb = new Float32Array(new Uint8Array(entry.embedding).buffer);
+              const similarity = cosineSimilarity(taskEmbedding, entryEmb);
+              if (similarity >= threshold) {
+                db.prepare(`UPDATE mind_entries SET completed = 1, updated_at = datetime('now') WHERE id = ?`).run(entry.id);
+                mindMarked++;
+              }
+            }
+          }
+        } catch (err) {
+          console.warn("[brain] decay_completed_task error (non-fatal):", err.message);
+        }
+
+        sendToMain({ type: "decay_completed_task_result", requestId: data.requestId, nodesDecayed, mindMarked });
+        break;
+      }
+
       case "lens_post_add": {
         if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
         const id = `lp-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -2720,6 +2828,64 @@ process.parentPort.on("message", async ({ data }) => {
         if (!db) { sendToMain({ type: "lens_comment_session_set", requestId: data.requestId }); break; }
         db.prepare(`UPDATE lens_comments SET session_id = ? WHERE post_id = ? AND session_id IS NULL`).run(data.sessionId, data.postId);
         sendToMain({ type: "lens_comment_session_set", requestId: data.requestId });
+        break;
+      }
+
+      // ── Review session handlers ──────────────────────────────────────────
+      case "review_session_create": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const rsId = `rs-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const rsCreated = new Date().toISOString();
+        db.prepare(`INSERT INTO review_sessions (id, project_id, status, diff_summary, base_ref, punk_count, created_at) VALUES (?, ?, 'running', ?, ?, ?, ?)`).run(
+          rsId, data.projectId, data.diffSummary ?? null, data.baseRef ?? null, data.punkCount ?? 0, rsCreated
+        );
+        sendToMain({ type: "review_session", requestId: data.requestId, session: { id: rsId, project_id: data.projectId, status: "running", created_at: rsCreated } });
+        break;
+      }
+
+      case "review_session_complete": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const rsCompleted = new Date().toISOString();
+        db.prepare(`UPDATE review_sessions SET status = ?, completed_at = ?, base_ref = ?, finding_count = ? WHERE id = ?`).run(
+          data.status ?? "completed", rsCompleted, data.baseRef ?? null, data.findingCount ?? 0, data.sessionId
+        );
+        sendToMain({ type: "review_session_updated", requestId: data.requestId });
+        break;
+      }
+
+      case "review_finding_add": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const rfId = `rf-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const rfCreated = new Date().toISOString();
+        db.prepare(`INSERT INTO punk_findings (id, session_id, project_id, punk, severity, finding, structured, location, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          rfId, data.sessionId, data.projectId, data.punk, data.severity, data.finding, data.structured ?? "{}", data.location ?? null, rfCreated
+        );
+        sendToMain({ type: "review_finding", requestId: data.requestId, finding: { id: rfId, session_id: data.sessionId, punk: data.punk, severity: data.severity, finding: data.finding, location: data.location, created_at: rfCreated } });
+        break;
+      }
+
+      case "review_findings_list": {
+        if (!db) { sendToMain({ type: "review_findings", requestId: data.requestId, findings: [] }); break; }
+        const rfFindings = db.prepare(`SELECT * FROM punk_findings WHERE session_id = ? ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, punk, created_at`).all(data.sessionId);
+        sendToMain({ type: "review_findings", requestId: data.requestId, findings: rfFindings });
+        break;
+      }
+
+      case "review_sessions_list": {
+        if (!db) { sendToMain({ type: "review_sessions", requestId: data.requestId, sessions: [] }); break; }
+        const rsSessions = db.prepare(`SELECT * FROM review_sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 20`).all(data.projectId);
+        sendToMain({ type: "review_sessions", requestId: data.requestId, sessions: rsSessions });
+        break;
+      }
+
+      case "review_session_latest": {
+        if (!db) { sendToMain({ type: "review_session_latest", requestId: data.requestId, session: null, findings: [] }); break; }
+        const rsLatest = db.prepare(`SELECT * FROM review_sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 1`).get(data.projectId);
+        let rsFindings = [];
+        if (rsLatest) {
+          rsFindings = db.prepare(`SELECT * FROM punk_findings WHERE session_id = ? ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, punk`).all(rsLatest.id);
+        }
+        sendToMain({ type: "review_session_latest", requestId: data.requestId, session: rsLatest ?? null, findings: rsFindings });
         break;
       }
 
