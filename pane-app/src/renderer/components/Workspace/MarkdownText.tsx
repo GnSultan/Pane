@@ -601,7 +601,7 @@ export const LazyHighlightedCode = memo(function LazyHighlightedCode({
 
 const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|codebase_investigator|cli_help|generalist|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
 const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|[\\w.@-]+\\.[a-zA-Z0-9]{2,10}|${TOOL_NAMES})(?::)?)`, "g");
-const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^(?:${TOOL_NAMES})(?::)?$`);
+const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^\\.[a-zA-Z][a-zA-Z0-9_.-]*$|^(?:${TOOL_NAMES})(?::)?$`);
 
 function renderBlock(block: Block, key: number, isThinking?: boolean, projectId?: string) {
   switch (block.type) {
@@ -935,8 +935,8 @@ function renderIncrementalBlock(
 export function renderInline(text: string, isThinking?: boolean, projectId?: string): (string | React.JSX.Element)[] {
   const cleaned = stripEmojis(text);
   const parts: (string | React.JSX.Element)[] = [];
-  // Match: @mind:id, [link](url), `code`, **bold**, *italic*, [@thought]
-  const regex = /(@mind:[^\s]+|\[[^\]]+\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[@thought\])/g;
+  // Match: @mind:id, [link](url), `code`, 'single-quoted', **bold**, *italic*, [@thought]
+  const regex = /(@mind:[^\s]+|\[[^\]]+\]\([^)]+\)|`[^`]+`|'[^\s'][^\s']*'|\*\*[^*]+\*\*|\*[^*]+\*|\[@thought\])/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -1070,8 +1070,24 @@ export function renderInline(text: string, isThinking?: boolean, projectId?: str
           </code>,
         );
       }
-    }
- else if (token.startsWith("**")) {
+    } else if (token.startsWith("'") && token.endsWith("'")) {
+      const innerContent = token.slice(1, -1);
+      const isSpecial = SPECIAL_REGEX.test(innerContent.trim());
+      if (isSpecial) {
+        parts.push(
+          <code
+            key={key}
+            className="font-mono text-pane-error"
+            style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
+          >
+            {innerContent}
+          </code>,
+        );
+      } else {
+        // Not a filename — preserve as plain text with quotes intact
+        parts.push(token);
+      }
+    } else if (token.startsWith("**")) {
       parts.push(
         <strong key={key} className={`font-semibold ${isThinking ? "" : "text-pane-text"}`}>
           {token.slice(2, -2)}

@@ -3,14 +3,12 @@ import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
-import CommandPicker, { type CommandSelection } from "../shared/CommandPicker";
 import type { Todo } from "../../lib/punk-types";
 import {
   isThinkingModel,
   getContextLimit,
 } from "../../lib/models";
-import { previewRoute, showFilePicker, type RoutePreview } from "../../lib/tauri-commands";
-import { matchCommands, type AtModeCommand } from "../../lib/at-commands";
+import { previewRoute, showFilePicker, brainMindGetAll, type RoutePreview, type MindEntry } from "../../lib/tauri-commands";
 
 const EMPTY_TODOS: Todo[] = [];
 
@@ -260,7 +258,6 @@ interface InputBarProps {
   projectId: string;
   onSend: (message: string, minds?: Array<{ id: string }>, effectiveMode?: string) => void;
   onAbort: () => void;
-  onClearConversation: () => void;
   isProcessing: boolean;
 }
 
@@ -665,11 +662,101 @@ function ModelPickerExpanded({
   );
 }
 
+// ─── Thoughts picker — inline, inside the card ───────────────────────────────
+//
+// Triggered by typing "@m" in the textarea. Shows mind entries filtered by the
+// text after "@m". Clicking an entry pastes its content directly into the textarea
+// and closes the picker. No referencing, no tagging — just paste.
+
+function ThoughtsPicker({
+  query,
+  onSelect,
+  onDismiss,
+}: {
+  query: string;
+  onSelect: (content: string) => void;
+  onDismiss: () => void;
+}) {
+  const [mindEntries, setMindEntries] = useState<MindEntry[]>([]);
+  const [highlighted, setHighlighted] = useState(0);
+  const activeRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    brainMindGetAll()
+      .then((r) => setMindEntries(r.entries ?? []))
+      .catch(() => {});
+  }, []);
+
+  const filtered = useMemo(() => {
+    const q = query.toLowerCase();
+    if (!q) return mindEntries.slice(0, 8);
+    return mindEntries.filter((m) => m.content.toLowerCase().includes(q)).slice(0, 8);
+  }, [mindEntries, query]);
+
+  useEffect(() => { setHighlighted(0); }, [query]);
+  useEffect(() => { activeRef.current?.scrollIntoView({ block: "nearest" }); }, [highlighted]);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!filtered.length) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); e.stopPropagation(); setHighlighted((h) => Math.min(h + 1, filtered.length - 1)); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); e.stopPropagation(); setHighlighted((h) => Math.max(h - 1, 0)); }
+      else if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault(); e.stopPropagation();
+        if (filtered[highlighted]) onSelect(filtered[highlighted].content);
+      } else if (e.key === "Escape") {
+        e.preventDefault(); e.stopPropagation();
+        onDismiss();
+      }
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [filtered, highlighted, onSelect, onDismiss]);
+
+  if (!filtered.length) {
+    return (
+      <div className="px-5 py-2 border-t border-pane-border/20">
+        <span className="font-mono text-pane-text-secondary/40" style={{ fontSize: "10px" }}>no thoughts</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="border-t border-pane-border/20 overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden p-1.5 flex flex-col gap-0.5" style={{ minHeight: "120px", maxHeight: "40vh" }}>
+      {filtered.map((entry, idx) => (
+        <button
+          key={entry.id}
+          ref={idx === highlighted ? activeRef : undefined}
+          onClick={() => onSelect(entry.content)}
+          onMouseEnter={() => setHighlighted(idx)}
+          className={`w-full text-left px-3 py-1.5 rounded-md transition-colors font-mono ${
+            idx === highlighted
+              ? "bg-pane-text/[0.08] text-pane-text"
+              : "text-pane-text-secondary hover:bg-pane-text/[0.03]"
+          }`}
+        >
+          <span
+            style={{
+              display: "-webkit-box",
+              WebkitLineClamp: 2,
+              WebkitBoxOrient: "vertical",
+              overflow: "hidden",
+              fontSize: "var(--pane-font-size-xs)",
+              lineHeight: 1.5,
+            }}
+          >
+            {entry.content}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function InputBar({
   projectId,
   onSend,
   onAbort,
-  onClearConversation,
   isProcessing,
 }: InputBarProps) {
   const [value, setValue] = useState("");
@@ -684,11 +771,8 @@ export function InputBar({
   } | null>(null);
   const [textareaFocused, setTextareaFocused] = useState(false);
 
-  // @ command picker state
-  const [cmdPickerOpen, setCmdPickerOpen] = useState(false);
-  const [cmdQuery, setCmdQuery] = useState("");
-  const [attachedMinds, setAttachedMinds] = useState<Array<{ id: string }>>([]);
-  const cmdStartRef = useRef<number>(-1); // index of the '@' character in textarea
+  // Attach menu: closed → menu → thoughts
+  const [attachMenu, setAttachMenu] = useState<"closed" | "menu" | "thoughts">("closed");
 
   // Reactive mode indicator — auto-detected from route preview
   const [detectedMode, setDetectedMode] = useState<DetectedMode | null>(null);
@@ -696,9 +780,6 @@ export function InputBar({
   // Carry-forward: what mode was used on the last sent message.
   // Stays active until a strong transition signal overrides it.
   const [lastSentMode, setLastSentMode] = useState<string | null>(null);
-
-  // Sticky mode set by @plan / @discuss / @brainstorm
-  const [activeModeCmd, setActiveModeCmd] = useState<AtModeCommand | null>(null);
 
   // Prefill from external sources (e.g., Lens "fix" button)
   useEffect(() => {
@@ -717,24 +798,12 @@ export function InputBar({
     return () => window.removeEventListener("pane:prefill-prompt", handler);
   }, []);
 
-  // Brief action-feedback flash ("todos cleared", etc.)
-  const [actionFlash, setActionFlash] = useState<string | null>(null);
-  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showFlash = useCallback((msg: string) => {
-    setActionFlash(msg);
-    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
-    flashTimerRef.current = setTimeout(() => setActionFlash(null), 2000);
-  }, []);
-  // Clean up flash timer on unmount
-  useEffect(() => () => { if (flashTimerRef.current) clearTimeout(flashTimerRef.current); }, []);
 
-  // Prepend mode directive: sticky @command > manual pill override > nothing.
+  // Prepend mode directive: manual pill override > nothing.
   // Auto-detected mode is informational only — it does NOT prepend a directive
   // unless the user explicitly taps the pill to pin it.
   const buildPrompt = useCallback(
     (trimmed: string) => {
-      // Sticky @command takes highest priority
-      if (activeModeCmd?.serverDirective) return activeModeCmd.serverDirective + trimmed;
       // Manual override from pill tap — user explicitly chose this mode
       if (modeOverride) {
         const config = MODE_CONFIG[modeOverride];
@@ -743,7 +812,7 @@ export function InputBar({
       // Auto-detected: don't prepend anything — let the backend route naturally
       return trimmed;
     },
-    [activeModeCmd, modeOverride],
+    [modeOverride],
   );
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -850,14 +919,6 @@ export function InputBar({
     }
   }, [value, lastSentMode]);
 
-  // Cycle mode on pill tap
-  const handleModeTap = useCallback(() => {
-    const current = modeOverride || detectedMode?.mode || "execute";
-    const idx = MODE_CYCLE.indexOf(current as typeof MODE_CYCLE[number]);
-    const next = MODE_CYCLE[(idx + 1) % MODE_CYCLE.length]!;
-    setModeOverride(next as string);
-  }, [modeOverride, detectedMode]);
-
   // Handle graceful fadeout of processing indicator.
   // Only fade out after real processing happened — not on initial mount.
   const wasProcessingRef = useRef(false);
@@ -923,7 +984,7 @@ export function InputBar({
   const applyTextareaHeight = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
-    const minH = 96;
+    const minH = 56;
     const maxH = window.innerHeight * 0.4;
     // Don't collapse below minH — set to 1px only to measure scrollHeight,
     // then immediately restore to the correct height in the same frame.
@@ -931,9 +992,8 @@ export function InputBar({
     const overflowing = el.scrollHeight > maxH;
     el.style.height = Math.min(Math.max(el.scrollHeight, minH), maxH) + "px";
     // When overflowing, the browser's native caret scroll only guarantees the
-    // caret lands within [scrollTop, scrollTop + clientHeight] — it doesn't
-    // account for the 44px button overlay. Force-scroll to absolute bottom when
-    // typing at the end so paddingBottom actually shows below the last line.
+    // caret lands within [scrollTop, scrollTop + clientHeight]. Force-scroll
+    // to absolute bottom when typing at the end so content stays visible.
     if (overflowing && el.selectionEnd >= el.value.length - 1) {
       el.scrollTop = el.scrollHeight;
     }
@@ -943,111 +1003,34 @@ export function InputBar({
     applyTextareaHeight();
   }, [value, applyTextareaHeight]);
 
-  // Generalized @ command picker — opens for any registered command prefix.
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
     const pos = e.target.selectionStart ?? next.length;
     setValue(next);
-
-    // Keep attachedMinds count in sync with @thought tokens in the text
-    const thoughtCount = (next.match(/@thought/g) ?? []).length;
-    setAttachedMinds((prev) => thoughtCount < prev.length ? prev.slice(0, thoughtCount) : prev);
-
-    if (cmdPickerOpen) {
-      // Picker open — verify the @word is still intact behind the cursor
-      const atIdx = cmdStartRef.current;
-      const typed = next.slice(atIdx + 1, pos); // chars after '@'
-      if (next[atIdx] !== "@" || next[pos - 1] === "\n" || !matchCommands(typed).length) {
-        setCmdPickerOpen(false);
-      } else {
-        setCmdQuery(typed);
-      }
-    } else {
-      // Scan backwards from cursor to find word start
+    // @m shortcut — opens thoughts picker directly
+    if (attachMenu === "closed") {
       let wordStart = pos;
-      while (wordStart > 0 && next[wordStart - 1] !== " " && next[wordStart - 1] !== "\n") {
-        wordStart--;
-      }
-      const word = next.slice(wordStart, pos);
-      if (word.length >= 1 && word[0] === "@") {
-        const typed = word.slice(1); // chars after '@'
-        if (matchCommands(typed).length > 0) {
-          cmdStartRef.current = wordStart;
-          setCmdQuery(typed);
-          setCmdPickerOpen(true);
-        }
+      while (wordStart > 0 && next[wordStart - 1] !== " " && next[wordStart - 1] !== "\n") wordStart--;
+      if (next.slice(wordStart, pos) === "@m") {
+        setValue(next.slice(0, wordStart) + next.slice(pos)); // strip @m
+        setAttachMenu("thoughts");
       }
     }
-  }, [cmdPickerOpen]);
+  }, [attachMenu]);
 
-  const handleCommandSelect = useCallback((sel: CommandSelection) => {
-    const ta = textareaRef.current;
-    const atPos = cmdStartRef.current; // index of '@'
-
-    // Helper: remove the @command fragment from the textarea
-    const removeAtFragment = () => {
+  // Paste selected thought content into the textarea and close the picker.
+  // The textarea is unmounted while thoughts is open, so we update state
+  // directly and focus after remount.
+  const handleThoughtSelect = useCallback((content: string) => {
+    setValue(prev => prev ? `${prev} ${content}` : content);
+    setAttachMenu("closed");
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current;
       if (!ta) return;
-      const cursorPos = ta.selectionStart ?? value.length;
-      const before = value.slice(0, atPos);
-      const after = value.slice(cursorPos);
-      const next = before + (after.startsWith(" ") ? after : after ? " " + after : "");
-      setValue(next);
-      requestAnimationFrame(() => {
-        ta.focus();
-        ta.setSelectionRange(before.length, before.length);
-      });
-    };
-
-    if (sel.kind === "reference") {
-      // @thought — replace @word with chip, track mind id
-      if (!ta) return;
-      const cursorPos = ta.selectionStart ?? value.length;
-      const before = value.slice(0, atPos);
-      const after = value.slice(cursorPos);
-      const tag = "@thought";
-      const next = before + tag + (after.startsWith(" ") ? after : " " + after);
-      setValue(next);
-      if (sel.label) setAttachedMinds((prev) => [...prev, { id: sel.label }]);
-      setCmdPickerOpen(false);
-      requestAnimationFrame(() => {
-        ta.focus();
-        const newPos = before.length + tag.length;
-        ta.setSelectionRange(newPos, newPos);
-      });
-      return;
-    }
-
-    if (sel.kind === "mode") {
-      // Set sticky mode, remove @command from input
-      setActiveModeCmd(sel.command as AtModeCommand);
-      removeAtFragment();
-      setCmdPickerOpen(false);
-      return;
-    }
-
-    if (sel.kind === "action") {
-      setCmdPickerOpen(false);
-      removeAtFragment();
-
-      const { command, subcommand } = sel;
-
-      if (command.name === "todo" && subcommand.name === "clear") {
-        useProjectsStore.getState().clearSessionContext(projectId);
-        showFlash("todos cleared");
-        return;
-      }
-      if (command.name === "todo" && subcommand.name === "show") {
-        setTodoPanelOpen(true);
-        return;
-      }
-      if (command.name === "session" && subcommand.name === "clear") {
-        onClearConversation();
-        setLastSentMode(null);
-        showFlash("session cleared");
-        return;
-      }
-    }
-  }, [value, projectId, onClearConversation, showFlash]);
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    });
+  }, []);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -1055,39 +1038,21 @@ export function InputBar({
         e.preventDefault();
         const trimmed = value.trim();
         if (trimmed) {
-          const sentMode = activeModeCmd?.mode || modeOverride || detectedMode?.mode || null;
-          onSend(buildPrompt(trimmed), attachedMinds.length > 0 ? attachedMinds : undefined, sentMode || undefined);
+          const sentMode = modeOverride || detectedMode?.mode || null;
+          onSend(buildPrompt(trimmed), undefined, sentMode || undefined);
           // Carry mode forward to next turn — conversation is continuous
           setLastSentMode(sentMode);
           setValue("");
-          setAttachedMinds([]);
           setModeOverride(null);
           setDetectedMode(null);
         }
       }
       if (e.key === "Escape" && isProcessing) {
-        // Close the command picker before aborting
-        if (cmdPickerOpen && cmdStartRef.current !== -1) {
-          e.preventDefault();
-          const ta = textareaRef.current;
-          if (ta) {
-            const before = value.slice(0, cmdStartRef.current);
-            const after = value.slice(ta.selectionStart ?? value.length);
-            setValue(before + after);
-            setCmdPickerOpen(false);
-            cmdStartRef.current = -1;
-            requestAnimationFrame(() => {
-              ta.focus();
-              ta.setSelectionRange(before.length, before.length);
-            });
-          }
-          return;
-        }
         e.preventDefault();
         onAbort();
       }
     },
-    [value, isProcessing, cmdPickerOpen, attachedMinds, onSend, onAbort, buildPrompt],
+    [value, isProcessing, onSend, onAbort, buildPrompt, modeOverride, detectedMode],
   );
 
   return (
@@ -1171,225 +1136,218 @@ export function InputBar({
         />
       )}
 
-      {/* One card. Textarea owns the whole surface. Buttons float inside it. */}
-      <div className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative">
-        {cmdPickerOpen && (
-          <CommandPicker
-            query={cmdQuery}
-            activeMode={activeModeCmd?.mode ?? null}
-            onSelect={handleCommandSelect}
-            onDismiss={() => { setCmdPickerOpen(false); cmdStartRef.current = -1; }}
+      {/* One card. Textarea + thoughts picker + button bar in column. */}
+      <div className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative flex flex-col">
+
+        {attachMenu !== "thoughts" && <div ref={caretContainerRef} className="relative overflow-hidden">
+          <textarea
+            data-pane-input
+            ref={textareaRef}
+            value={value}
+            onChange={handleChange}
+            onKeyDown={handleKeyDown}
+            onFocus={() => { setTextareaFocused(true); updateCaret(); if (attachMenu === "menu") setAttachMenu("closed"); }}
+            onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
+            onScroll={() => { if (overlayRef.current && textareaRef.current) overlayRef.current.scrollTop = textareaRef.current.scrollTop; }}
+            placeholder={isProcessing ? "" : "let's build..."}
+            className="w-full bg-transparent text-pane-text font-mono
+                       resize-none outline-none placeholder:text-pane-text-secondary
+                       leading-[1.75] px-5 pt-4 pb-3 overflow-y-auto overflow-x-hidden"
+            style={{
+              fontSize: "var(--pane-font-size)",
+              caretColor: "transparent",
+              color: "transparent",
+              minHeight: "56px",
+              maxHeight: "40vh",
+              height: "56px",
+            }}
+          />
+          {/* Highlight overlay — mirrors textarea text */}
+          <div
+            ref={overlayRef}
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              overflow: "hidden",
+              pointerEvents: "none",
+              fontSize: "var(--pane-font-size)",
+              lineHeight: "1.75",
+              paddingTop: "1rem",
+              paddingBottom: "0.75rem",
+              paddingLeft: "1.25rem",
+              paddingRight: "1.25rem",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              fontFamily: "ui-monospace, 'Cascadia Code', 'Cascadia Mono', 'Fira Code', Consolas, monospace",
+            }}
+          >
+            <span style={{ color: "var(--pane-text)" }}>{value}</span>
+            {/* Invisible trailing character keeps scrollHeight stable */}
+            <span aria-hidden> </span>
+          </div>
+          {textareaFocused && caretPos && (
+            <div
+              aria-hidden
+              style={{
+                position: "absolute",
+                top: caretPos.top,
+                left: caretPos.left,
+                width: 2,
+                height: caretPos.lineHeight,
+                background: "var(--pane-editor-cursor)",
+                pointerEvents: "none",
+              }}
+            />
+          )}
+        </div>}
+
+        {/* Send — top right, only when textarea is visible */}
+        {attachMenu !== "thoughts" && value.trim().length > 0 && (
+          <button
+            onClick={() => {
+              const trimmed = value.trim();
+              if (!trimmed) return;
+              const sentMode = modeOverride || detectedMode?.mode || null;
+              onSend(buildPrompt(trimmed), undefined, sentMode || undefined);
+              setLastSentMode(sentMode);
+              setValue("");
+              setModeOverride(null);
+              setDetectedMode(null);
+            }}
+            className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
+            title="Send (Enter)"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
+            </svg>
+          </button>
+        )}
+
+        {/* Thoughts picker — replaces textarea, fills the same space */}
+        {attachMenu === "thoughts" && (
+          <ThoughtsPicker
+            query=""
+            onSelect={handleThoughtSelect}
+            onDismiss={() => setAttachMenu("closed")}
           />
         )}
 
-        {/* Sticky mode badge — floats inside the card, above the textarea */}
-        {activeModeCmd && (
-          <div className="flex items-center gap-2 px-5 pt-3 pb-0">
-            <span
-              className="font-mono text-[10px] font-medium"
-              style={{ color: activeModeCmd.color }}
-            >
-              {activeModeCmd.name} mode
-            </span>
-            <button
-              onClick={() => setActiveModeCmd(null)}
-              className="font-mono text-pane-text-secondary/40 hover:text-pane-text-secondary transition-colors leading-none"
-              style={{ fontSize: "11px" }}
-              title="exit mode"
-            >
-              ×
-            </button>
-          </div>
-        )}
-
-        {/* Brief action flash ("todos cleared") */}
-        {actionFlash && (
-          <div className="px-5 pt-3 pb-0">
-            <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "10px" }}>
-              {actionFlash}
-            </span>
-          </div>
-        )}
-          <div ref={caretContainerRef} className="relative overflow-hidden">
-            <textarea
-              data-pane-input
-              ref={textareaRef}
-              value={value}
-              onChange={handleChange}
-              onKeyDown={handleKeyDown}
-              onFocus={() => { setTextareaFocused(true); updateCaret(); }}
-              onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
-              onScroll={() => { if (overlayRef.current && textareaRef.current) overlayRef.current.scrollTop = textareaRef.current.scrollTop; }}
-              placeholder={isProcessing ? "" : (activeModeCmd?.placeholder ?? "let's build...")}
-              className="w-full bg-transparent text-pane-text font-mono
-                         resize-none outline-none placeholder:text-pane-text-secondary
-                         leading-[1.75] px-5 pt-4 overflow-y-auto overflow-x-hidden"
-              style={{
-                fontSize: "var(--pane-font-size)",
-                caretColor: "transparent",
-                color: "transparent",
-                minHeight: "120px",
-                maxHeight: "40vh",
-                height: "120px",
-                paddingBottom: "44px",
-              }}
+        {/* Button bar — attach (left) + mode + model (right), all in one row */}
+        <div
+          className="flex items-center gap-2 p-1.5 font-mono pointer-events-none"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          {modelPickerExpanded ? (
+            <ModelPickerExpanded
+              value={selectedModel}
+              autoRoute={intentAutoRoute}
+              onChange={handleModelChange}
+              onToggleAutoRoute={setIntentAutoRoute}
+              onClose={() => setModelPickerExpanded(false)}
             />
-            {/* Highlight overlay — mirrors textarea text, colors @thought tokens */}
-            <div
-              ref={overlayRef}
-              aria-hidden="true"
-              style={{
-                position: "absolute",
-                top: 0,
-                left: 0,
-                right: 0,
-                bottom: 0,
-                overflow: "hidden",
-                pointerEvents: "none",
-                fontSize: "var(--pane-font-size)",
-                lineHeight: "1.75",
-                paddingTop: "1rem",
-                paddingBottom: "44px",
-                paddingLeft: "1.25rem",
-                paddingRight: "1.25rem",
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-word",
-                fontFamily: "ui-monospace, 'Cascadia Code', 'Cascadia Mono', 'Fira Code', Consolas, monospace",
-              }}
-            >
-              {value.split(/(@thought)/g).map((part, i) =>
-                part === "@thought" ? (
-                  <span key={i} style={{ color: "var(--pane-status-modified)", fontWeight: 500 }}>@thought</span>
-                ) : (
-                  <span key={i} style={{ color: "var(--pane-text)" }}>{part}</span>
-                )
-              )}
-              {/* Invisible trailing character keeps scrollHeight stable */}
-              <span aria-hidden> </span>
-            </div>
-            {textareaFocused && caretPos && (
-              <div
-                aria-hidden
-                style={{
-                  position: "absolute",
-                  top: caretPos.top,
-                  left: caretPos.left,
-                  width: 2,
-                  height: caretPos.lineHeight,
-                  background: "var(--pane-editor-cursor)",
-                  pointerEvents: "none",
-                }}
-              />
-            )}
-          </div>
-
-          {/* Send — top right */}
-          {value.trim().length > 0 && (
-            <button
-              onClick={() => {
-                const trimmed = value.trim();
-                if (!trimmed) return;
-                const sentMode = activeModeCmd?.mode || modeOverride || detectedMode?.mode || null;
-                onSend(buildPrompt(trimmed), attachedMinds.length > 0 ? attachedMinds : undefined, sentMode || undefined);
-                setLastSentMode(sentMode);
-                setValue("");
-                setAttachedMinds([]);
-                setModeOverride(null);
-                setDetectedMode(null);
-              }}
-              className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
-              title="Send (Enter)"
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
-              </svg>
-            </button>
-          )}
-
-          {/* Buttons — absolute bottom, floating over the textarea, no background */}
-          <div
-            className="absolute bottom-0 left-0 right-0 flex items-center gap-2 p-1.5 font-mono pointer-events-none"
-            style={{ fontSize: "var(--pane-font-size-xs)" }}
-          >
-            {modelPickerExpanded ? (
-              <ModelPickerExpanded
-                value={selectedModel}
-                autoRoute={intentAutoRoute}
-                onChange={handleModelChange}
-                onToggleAutoRoute={setIntentAutoRoute}
-                onClose={() => setModelPickerExpanded(false)}
-              />
-            ) : (
-              <>
-                <button
-                  onClick={async () => {
-                    try {
-                      const paths = await showFilePicker(projectRoot, projectRoot);
-                      if (!paths || paths.length === 0) return;
-                      const insertion = paths.map(p => `\`${p}\``).join(" ");
-                      setValue(prev => prev ? `${prev} ${insertion}` : insertion);
-                    } catch (err) { console.error('Failed to open file picker:', err); }
-                  }}
-                  className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
-                    bg-pane-bg ring-1 ring-pane-border/25
-                    text-pane-text-secondary/50 hover:text-pane-text-secondary btn-press transition-colors"
-                  title="Add file or folder path"
-                >
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M12 5v14M5 12h14" />
-                  </svg>
-                  <span>add path</span>
-                </button>
-
-                {!isProcessing && !activeModeCmd && (() => {
-                  const mode = modeOverride || detectedMode?.mode || lastSentMode || "execute";
-                  const config = MODE_CONFIG[mode];
-                  const color = config?.color || "var(--pane-text-secondary)";
-                  if (modePickerExpanded) {
-                    return (
-                      <ModePickerExpanded
-                        activeMode={mode}
-                        onSelect={(m) => setModeOverride(m)}
-                        onClose={() => setModePickerExpanded(false)}
-                      />
-                    );
-                  }
-                  return (
-                    <>
-                      <div className="flex-1" />
-                      <button
-                        onClick={() => setModePickerExpanded(true)}
-                        className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
-                          bg-pane-bg ring-1 ring-pane-border/25
-                          hover:text-pane-text btn-press transition-colors"
-                        style={{ color }}
-                      >
-                        <span>{mode}</span>
-                      </button>
-                    </>
-                  );
-                })()}
-                {routePreview && !isProcessing && !activeModeCmd && (
-                  <span className="pointer-events-none text-[10px] text-[var(--pane-text-secondary)] font-mono opacity-40">
-                    {routePreview.model}
-                  </span>
-                )}
-
-                <ContextUsageIndicator projectId={projectId} />
-                <RateLimitIndicator />
-                <div className="pointer-events-auto">
-                  <ModelPickerTrigger
-                    value={selectedModel}
-                    autoRoute={intentAutoRoute}
-                    routedModel={routedModel}
-                    isProcessing={isProcessing}
-                    onClick={() => setModelPickerExpanded(true)}
-                  />
+          ) : (
+            <>
+              {/* Attach — first item, inherits font-mono + font-size-xs from this row */}
+              {attachMenu === "menu" ? (
+                <>
+                  <button
+                    onClick={() => setAttachMenu("thoughts")}
+                    className="pointer-events-auto shrink-0 flex items-center px-3 py-0.5 opacity-35 hover:opacity-100 transition-opacity btn-press"
+                  >
+                    <span className="whitespace-nowrap" style={{ color: "var(--pane-text)", lineHeight: 1.5 }}>thoughts</span>
+                  </button>
+                  <button
+                    onClick={async () => {
+                      setAttachMenu("closed");
+                      try {
+                        const paths = await showFilePicker(projectRoot, projectRoot);
+                        if (!paths || paths.length === 0) return;
+                        const insertion = paths.map(p => `\`${p}\``).join(" ");
+                        setValue(prev => prev ? `${prev} ${insertion}` : insertion);
+                      } catch (err) { console.error('Failed to open file picker:', err); }
+                    }}
+                    className="pointer-events-auto shrink-0 flex items-center px-3 py-0.5 opacity-35 hover:opacity-100 transition-opacity btn-press"
+                  >
+                    <span className="whitespace-nowrap" style={{ color: "var(--pane-text)", lineHeight: 1.5 }}>path</span>
+                  </button>
+                  <button
+                    onClick={() => setAttachMenu("closed")}
+                    className="pointer-events-auto shrink-0 flex items-center px-2 py-0.5 opacity-35 hover:opacity-60 transition-opacity"
+                    style={{ lineHeight: 1 }}
+                  >
+                    ×
+                  </button>
+                </>
+              ) : (
+                <div className="self-stretch shrink-0 flex items-center">
+                  <button
+                    onClick={() => setAttachMenu(attachMenu === "thoughts" ? "closed" : "menu")}
+                    className="pointer-events-auto h-full aspect-square flex items-center justify-center rounded-md
+                      bg-pane-bg ring-1 ring-pane-border/25
+                      text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
+                  >
+                    {attachMenu === "thoughts" ? (
+                      <span style={{ lineHeight: 1 }}>×</span>
+                    ) : (
+                      <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M10 2v16M2 10h16" strokeWidth="2" />
+                      </svg>
+                    )}
+                  </button>
                 </div>
-              </>
-            )}
-          </div>
+              )}
+
+              {/* Spacer — always present except when ModePickerExpanded takes the whole row */}
+              {!modePickerExpanded && <div className="flex-1" />}
+              {!isProcessing && (() => {
+                const mode = modeOverride || detectedMode?.mode || lastSentMode || "execute";
+                const config = MODE_CONFIG[mode];
+                const color = config?.color || "var(--pane-text-secondary)";
+                if (modePickerExpanded) {
+                  return (
+                    <ModePickerExpanded
+                      activeMode={mode}
+                      onSelect={(m) => setModeOverride(m)}
+                      onClose={() => setModePickerExpanded(false)}
+                    />
+                  );
+                }
+                return (
+                  <button
+                    onClick={() => setModePickerExpanded(true)}
+                    className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
+                      bg-pane-bg ring-1 ring-pane-border/25
+                      hover:text-pane-text btn-press transition-colors"
+                    style={{ color }}
+                  >
+                    <span>{mode}</span>
+                  </button>
+                );
+              })()}
+              {routePreview && !isProcessing && (
+                <span className="pointer-events-none opacity-40">
+                  {routePreview.model}
+                </span>
+              )}
+              <ContextUsageIndicator projectId={projectId} />
+              <RateLimitIndicator />
+              <div className="pointer-events-auto">
+                <ModelPickerTrigger
+                  value={selectedModel}
+                  autoRoute={intentAutoRoute}
+                  routedModel={routedModel}
+                  isProcessing={isProcessing}
+                  onClick={() => setModelPickerExpanded(true)}
+                />
+              </div>
+            </>
+          )}
         </div>
+      </div>
     </div>
   );
 }

@@ -141,7 +141,7 @@ export const Conversation = memo(function Conversation({
     return map;
   }, [messages, systemMessageCount]);
 
-  const { sendMessage, abortMessage, clearConversation } = usePunk(projectId);
+  const { sendMessage, abortMessage } = usePunk(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
   const streamingRef = useRef(false);
@@ -370,7 +370,6 @@ export const Conversation = memo(function Conversation({
           projectId={projectId}
           onSend={handleSend}
           onAbort={abortMessage}
-          onClearConversation={clearConversation}
           isProcessing={isProcessing}
         />
       </div>
