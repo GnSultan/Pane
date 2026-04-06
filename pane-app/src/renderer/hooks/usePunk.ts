@@ -1716,6 +1716,11 @@ function handlePunkMessage(
           );
         }
       }
+      // Gemini multi-tool turns leave the tool-use assistant message streaming
+      // because setLastMessageStreamingDone only fires in case "assistant" (which
+      // targets the post-tool text message, not the earlier tool-use message).
+      // Sweep up any lingering isStreaming flags now that the session is done.
+      store.finalizeAllStreaming(projectId);
       return assistantMessageExists;
     }
 

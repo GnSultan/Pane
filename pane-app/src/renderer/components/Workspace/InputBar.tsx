@@ -507,7 +507,7 @@ function ModelPickerExpanded({
         carouselRef.current.scrollLeft = (child?.offsetLeft ?? 0);
       }
     });
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); 
 
   // Reset to start when search changes
   useEffect(() => {

@@ -183,6 +183,7 @@ interface ProjectsState {
   setConversationProcessing: (projectId: string, isProcessing: boolean) => void;
   setConversationError: (projectId: string, error: string | null) => void;
   setLastMessageStreamingDone: (projectId: string) => void;
+  finalizeAllStreaming: (projectId: string) => void;
   setLastAssistantMeta: (
     projectId: string,
     costUsd: number,
@@ -677,6 +678,23 @@ function createProjectsStore() {
           if (last) {
             msgs[msgs.length - 1] = { ...last, isStreaming: false };
           }
+          return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
+    // Stamps isStreaming: false on every message that's still streaming.
+    // Claude finalizes its own messages via setLastMessageStreamingDone in
+    // case "assistant". Gemini may leave earlier tool-use messages streaming
+    // when the final text response creates a new assistant message — this
+    // sweeps those up at session end (case "result").
+    finalizeAllStreaming: (projectId) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const hasAny = p.conversation.messages.some((m) => m.isStreaming);
+          if (!hasAny) return p;
+          const msgs = p.conversation.messages.map((m) =>
+            m.isStreaming ? { ...m, isStreaming: false } : m,
+          );
           return { conversation: { ...p.conversation, messages: msgs } };
         }),
       ),

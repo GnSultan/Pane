@@ -116,6 +116,12 @@ function handleGeminiLine(projectId, line, requestId) {
       lastText: "",
       lastThought: "",
       toolResults: new Map(),
+      // Maps Gemini's tool_id → { id: generatedId, name: toolName }
+      // Ensures tool_result blocks always reference the same ID that was put in
+      // the tool_use block, even when Gemini omits tool_id in one of the events.
+      toolIdMap: new Map(),
+      lastToolId: null,   // fallback for single-tool turns with no tool_id
+      lastToolName: null,
     });
   }
   const state = requestStates.get(requestId);
@@ -260,6 +266,10 @@ function handleGeminiLine(projectId, line, requestId) {
       const toolName = parsed.tool_name || "unknown";
       const toolInput = parsed.parameters || {};
       const toolInputJson = JSON.stringify(toolInput);
+      // Track so tool_result can recover the same ID and name even if tool_id is absent
+      if (parsed.tool_id) state.toolIdMap.set(parsed.tool_id, { id: toolId, name: toolName });
+      state.lastToolId = toolId;
+      state.lastToolName = toolName;
 
       sendToMain({
         type: "event",
@@ -327,7 +337,13 @@ function handleGeminiLine(projectId, line, requestId) {
     }
 
     case "tool_result": {
-      const toolId = parsed.tool_id || "";
+      // Recover the exact ID that was placed in the tool_use block.
+      // Without this, a missing or mismatched tool_id produces an empty string
+      // that never matches the tool_use block's id, so toolResult stays undefined
+      // in the renderer and expanded tool panels show nothing.
+      const toolEntry = parsed.tool_id ? state.toolIdMap.get(parsed.tool_id) : null;
+      const toolId = toolEntry?.id || parsed.tool_id || state.lastToolId || "";
+      const toolName = toolEntry?.name || state.lastToolName || "";
       const isError = parsed.status === "error" || parsed.status === "failure";
       const rawOutput = parsed.output;
       const currentFullOutput =
@@ -360,6 +376,7 @@ function handleGeminiLine(projectId, line, requestId) {
                     {
                       type: "tool_result",
                       tool_use_id: toolId,
+                      name: toolName,
                       content: currentFullOutput,
                       is_error: isError,
                     },
@@ -385,6 +402,7 @@ function handleGeminiLine(projectId, line, requestId) {
                     {
                       type: "tool_result",
                       tool_use_id: toolId,
+                      name: toolName,
                       content: currentFullOutput,
                       is_error: isError,
                     },
@@ -1095,7 +1113,7 @@ ${PANE_END}`;
   // ── Session resume: use Gemini's native --resume when session exists ──
   // When resuming, Gemini loads full history from its session file — no
   // preamble needed, just the new prompt. Saves tokens and avoids stale history.
-  const geminiResumeId = historyLength > 0 ? (activeSessionIds.get(projectId) || null) : null;
+  const geminiResumeId = history && history.length > 0 ? (activeSessionIds.get(projectId) || null) : null;
 
   let historyPreamble = "";
   if (!geminiResumeId && history && history.length > 0) {
