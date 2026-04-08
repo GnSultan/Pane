@@ -13,7 +13,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { compileContext, mergeState, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, readHandoff, writeHandoffWithHistory, updateLatestHandoff, MODEL_CONTEXT_LIMITS } from "./session-context.mjs";
+import { compileContext, mergeState, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, readHandoff, writeHandoffWithHistory, updateLatestHandoff, MODEL_CONTEXT_LIMITS } from "./pane-system-prompt.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
 import { estimateConversationTokens, getModelLimit } from "./token-budget.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
@@ -45,6 +45,8 @@ const activeControllers = new Map();
 const activeSessionIds = new Map(); // unified for both Claude and Gemini
 // Gemini: projectId -> child process
 const activeProcesses = new Map();
+// Intentional aborts: projectId -> boolean
+const abortedProjects = new Set();
 // Per-request state (used by Gemini normalizer)
 const requestStates = new Map();
 
@@ -682,7 +684,7 @@ ${PANE_END}`;
   // Auto-resume across error_max_turns: if the model hits its turn limit mid-task,
   // silently continue rather than surfacing an error. Capped at MAX_AUTO_RESUMES
   // to prevent infinite loops on genuinely stuck sessions.
-  const MAX_AUTO_RESUMES = 10;
+  const MAX_AUTO_RESUMES = 50;
   // Resume within-conversation continuity if history exists; new conversations (historyLength=0) start fresh.
   // Pane context infrastructure handles project-level context; session resume handles conversation-level history.
   let resumeSessionId = historyLength > 0 ? (activeSessionIds.get(projectId) || null) : null;
@@ -714,14 +716,15 @@ ${PANE_END}`;
             q.supportedModels?.().catch(() => null),
             q.accountInfo?.().catch(() => null),
           ]).then(([models, account]) => {
-            if (models || account) {
-              sendToMain({
-                type: "event",
-                projectId,
-                requestId,
-                event: { event: "sdk_init_info", data: { models, account } },
-              });
-            }
+            // Always send sdk_init_info on session start — even if models/account are null.
+            // This signals a new session started so handleEvent can clear stale rate limit state.
+            // The pane-sdk-auth broadcast in handleBackendEvent only fires when account is present.
+            sendToMain({
+              type: "event",
+              projectId,
+              requestId,
+              event: { event: "sdk_init_info", data: { models, account } },
+            });
           });
         }
 
@@ -996,7 +999,13 @@ ${PANE_END}`;
       type: "event",
       projectId,
       requestId,
-      event: { event: "processEnded", data: { exit_code: 0 } },
+      event: {
+        event: "processEnded",
+        data: {
+          exit_code: ac.signal.aborted ? null : 0,
+          aborted: ac.signal.aborted,
+        },
+      },
     });
     requestStates.delete(requestId);
   }
@@ -1287,12 +1296,18 @@ ${PANE_END}`;
         console.warn("[cli-worker] Gemini turn sentinel failed:", err.message);
       }
 
+      const wasAborted = abortedProjects.has(projectId);
+      if (wasAborted) abortedProjects.delete(projectId);
+
       // Signal completion after sentinel so routing can use the verdict
       sendToMain({
         type: "event",
         projectId,
         requestId,
-        event: { event: "processEnded", data: { exit_code: code } },
+        event: {
+          event: "processEnded",
+          data: { exit_code: wasAborted ? null : code, aborted: wasAborted },
+        },
       });
       if (activeProcesses.get(projectId) === child) {
         activeProcesses.delete(projectId);
@@ -1504,6 +1519,7 @@ function handleAbort({ projectId }) {
   // Claude: abort via AbortController
   const ac = activeControllers.get(projectId);
   if (ac) {
+    abortedProjects.add(projectId);
     ac.abort();
     activeControllers.delete(projectId);
     return;
@@ -1511,6 +1527,7 @@ function handleAbort({ projectId }) {
   // Gemini: kill child process
   const child = activeProcesses.get(projectId);
   if (child?.pid) {
+    abortedProjects.add(projectId);
     try {
       process.kill(-child.pid, "SIGTERM");
     } catch (err) {
@@ -1550,7 +1567,9 @@ function handleShutdown() {
   }
   activeControllers.clear();
   for (const [, child] of activeProcesses) {
-    try { process.kill(child.pid, "SIGKILL"); } catch {}
+    // Kill entire process group (negative PID) since Gemini CLI spawns with
+    // detached: true — killing just the shell orphans the actual CLI process.
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
   }
   activeProcesses.clear();
   process.exit(0);
@@ -1585,6 +1604,11 @@ process.parentPort.on("message", ({ data }) => {
       break;
     case "shutdown":
       handleShutdown();
+      break;
+    case "start_login":
+      handleStartLogin().catch((err) => {
+        sendToMain({ type: "login_result", success: false, error: err.message });
+      });
       break;
     case "prefetch_models":
       handlePrefetchModels().catch((err) => {
@@ -1676,6 +1700,78 @@ async function handlePrefetchGeminiModels() {
     }
   } catch (err) {
     console.warn("[cli-worker] prefetch gemini models error:", err.message);
+  }
+}
+
+/**
+ * Initiate Claude OAuth login flow.
+ * Starts a minimal session with forceLoginMethod: "claudeai" so the SDK
+ * triggers its browser-based auth flow. Streams auth_status messages back
+ * to the main process so the renderer can show progress (URL to visit, etc.).
+ * Resolves when auth completes or fails.
+ */
+async function handleStartLogin() {
+  const ac = new AbortController();
+
+  const q = query({
+    prompt: "hi",
+    options: {
+      cwd: os.tmpdir(),
+      maxTurns: 1,
+      pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
+      executable: process.execPath,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      permissionMode: "bypassPermissions",
+      dangerouslySkipPermissions: true,
+      forceLoginMethod: "claudeai",
+      abortController: ac,
+    },
+  });
+
+  try {
+    for await (const msg of q) {
+      // Forward auth_status messages so renderer can show the login URL/progress
+      if (msg.type === "auth_status") {
+        sendToMain({
+          type: "login_status",
+          isAuthenticating: msg.isAuthenticating,
+          output: msg.output || [],
+          error: msg.error || null,
+        });
+
+        // Auth finished (success or failure)
+        if (!msg.isAuthenticating) {
+          if (msg.error) {
+            ac.abort();
+            sendToMain({ type: "login_result", success: false, error: msg.error });
+            return;
+          }
+          // Auth complete — fetch account info and report success
+          const account = await q.accountInfo?.().catch(() => null);
+          ac.abort();
+          sendToMain({ type: "login_result", success: true, account: account || null });
+          return;
+        }
+      }
+
+      // If we get system init without needing auth (already authenticated), done
+      if (msg.type === "system" && msg.subtype === "init") {
+        const account = await q.accountInfo?.().catch(() => null);
+        if (account?.email) {
+          ac.abort();
+          sendToMain({ type: "login_result", success: true, account });
+          return;
+        }
+      }
+
+      if (msg.type === "result") break;
+    }
+    // Fell through without a result — treat as cancelled
+    sendToMain({ type: "login_result", success: false, error: "Login cancelled" });
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      sendToMain({ type: "login_result", success: false, error: err.message });
+    }
   }
 }
 

@@ -33,13 +33,8 @@ function formatTokens(val: number) {
   return val.toString();
 }
 
-function timeAgo(ts: number) {
-  const diff = Date.now() - ts;
-  if (diff < 60_000) return "just now";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
-  return `${Math.floor(diff / 86_400_000)}d ago`;
-}
+// @ts-ignore — timeAgo reserved for upcoming relative-timestamp display
+// function timeAgo(ts: number) { ... }
 
 function DailyCostChart({ data }: { data: TokenTimeSeriesRow[] }) {
   if (data.length === 0) return null;
@@ -291,6 +286,7 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
         <div className="flex flex-wrap gap-2">
           {activeProviders.map((provider) => {
             const link = PROVIDER_LINKS[provider];
+            if (!link) return null;
             return (
               <a
                 key={provider}

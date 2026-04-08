@@ -18,12 +18,16 @@ import {
   brainUpdatePhilosophy,
   reinitializePunkBackend,
   getBackendAvailability,
+  getClaudeAuthState,
+  claudeSignin,
+  claudeSignout,
   cloudLogin,
   cloudLogout,
   cloudGetUser,
   cloudGetStatus,
   cloudTriggerBackup,
   cloudRestore,
+  type ClaudeAuthState,
   type CloudUser,
   type CloudStatus,
 } from "../../lib/tauri-commands";
@@ -1000,7 +1004,7 @@ const API_KEY_PROVIDERS = [
   { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys" },
   { key: "anthropic", label: "Anthropic", placeholder: "sk-ant-...", docsUrl: "https://console.anthropic.com/settings/keys" },
   { key: "openrouter", label: "OpenRouter", placeholder: "sk-or-...", docsUrl: "https://openrouter.ai/keys" },
-  { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/" },
+  { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/", showBaseUrl: true },
 ] as const;
 
 // Gemini CLI — external, needs install
@@ -1011,16 +1015,21 @@ const CLI_PROVIDERS = [
 function ApiKeysSection({
   httpApiKeys,
   onKeyChange,
+  httpBaseUrls = {},
+  onBaseUrlChange,
   claudeCodeAvailable = false,
-  geminiAvailable = false,
+  geminiAvailable: _geminiAvailable = false,
 }: {
   httpApiKeys: Record<string, string>;
   onKeyChange: (provider: string, key: string) => void;
+  httpBaseUrls?: Record<string, string>;
+  onBaseUrlChange?: (provider: string, url: string) => void;
   claudeCodeAvailable?: boolean;
   geminiAvailable?: boolean;
 }) {
+  void _geminiAvailable; // passed through from parent, reserved for future use
   const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
-  const isClaudeAuthenticated = claudeCodeAvailable && sdkAccount != null;
+  void (claudeCodeAvailable && sdkAccount != null); // reserved for per-provider auth gating
   const [visible, setVisible] = useState<Record<string, boolean>>({});
   const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
   const toggleProvider = useWorkspaceStore((s) => s.toggleProvider);
@@ -1041,9 +1050,12 @@ function ApiKeysSection({
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-2">
-        {API_KEY_PROVIDERS.map(({ key, label, placeholder, docsUrl }) => {
+        {API_KEY_PROVIDERS.map((p) => {
+          const { key, label, placeholder, docsUrl } = p;
+          const showBaseUrl = (p as any).showBaseUrl;
           const toggleKey = (key === "anthropic" || key === "gemini") ? `${key}-api` : key;
           const val = httpApiKeys[key] || "";
+          const baseUrl = httpBaseUrls[key] || "";
           const hasKey = !!val;
           const isVisible = visible[key] ?? false;
           const isOff = hasKey && disabledProviders.includes(toggleKey);
@@ -1069,60 +1081,80 @@ function ApiKeysSection({
                   get key ↗
                 </a>
               </div>
-              <div className="flex items-center gap-2">
-                <input
-                  type={isVisible ? "text" : "password"}
-                  value={val}
-                  onChange={(e) => onKeyChange(key, e.target.value)}
-                  placeholder={placeholder}
-                  className="flex-1 px-2 py-1 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                />
-                {val && (
-                  <button
-                    onClick={() =>
-                      setVisible((v) => ({ ...v, [key]: !v[key] }))
-                    }
-                    className="text-pane-text-secondary/40 hover:text-pane-text-secondary shrink-0"
-                    title={isVisible ? "Hide" : "Show"}
-                  >
-                    {isVisible ? (
-                      <svg
-                        width="14"
-                        height="14"
-                        viewBox="0 0 14 14"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.4"
-                        strokeLinecap="round"
-                      >
-                        <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
-                        <circle cx="7" cy="7" r="1.5" />
-                      </svg>
-                    ) : (
-                      <svg
-                        width="14"
-                        height="14"
-                        viewBox="0 0 14 14"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.4"
-                        strokeLinecap="round"
-                      >
-                        <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
-                        <circle cx="7" cy="7" r="1.5" />
-                        <path d="M2 2l10 10" />
-                      </svg>
-                    )}
-                  </button>
-                )}
-                {val && (
-                  <span
-                    className="text-pane-text-secondary/30 font-mono shrink-0"
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  <input
+                    type={isVisible ? "text" : "password"}
+                    value={val}
+                    onChange={(e) => onKeyChange(key, e.target.value)}
+                    placeholder={placeholder}
+                    className="flex-1 px-2 py-1 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
                     style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  >
-                    ••••{val.slice(-4)}
-                  </span>
+                  />
+                  {val && (
+                    <button
+                      onClick={() =>
+                        setVisible((v) => ({ ...v, [key]: !v[key] }))
+                      }
+                      className="text-pane-text-secondary/40 hover:text-pane-text-secondary shrink-0"
+                      title={isVisible ? "Hide" : "Show"}
+                    >
+                      {isVisible ? (
+                        <svg
+                          width="14"
+                          height="14"
+                          viewBox="0 0 14 14"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.4"
+                          strokeLinecap="round"
+                        >
+                          <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
+                          <circle cx="7" cy="7" r="1.5" />
+                        </svg>
+                      ) : (
+                        <svg
+                          width="14"
+                          height="14"
+                          viewBox="0 0 14 14"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.4"
+                          strokeLinecap="round"
+                        >
+                          <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
+                          <circle cx="7" cy="7" r="1.5" />
+                          <path d="M2 2l10 10" />
+                        </svg>
+                      )}
+                    </button>
+                  )}
+                  {val && (
+                    <span
+                      className="text-pane-text-secondary/30 font-mono shrink-0"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      ••••{val.slice(-4)}
+                    </span>
+                  )}
+                </div>
+                {showBaseUrl && (
+                  <div className="flex items-center gap-2 pl-4 border-l border-pane-border/20">
+                    <span
+                      className="text-pane-text-secondary/40 font-mono whitespace-nowrap"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      base url
+                    </span>
+                    <input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => onBaseUrlChange?.(key, e.target.value)}
+                      placeholder="https://api.xiaomimimo.com/v1"
+                      className="flex-1 px-2 py-0.5 rounded-lg font-mono text-pane-text-secondary border border-pane-border/20 hover:border-pane-border/40 outline-none placeholder:text-pane-text-secondary/20 bg-transparent"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    />
+                  </div>
                 )}
               </div>
             </div>
@@ -1489,6 +1521,8 @@ export function Profile() {
   const punkBackend = useWorkspaceStore((s) => s.punkBackend);
   const httpApiKeys = useWorkspaceStore((s) => s.httpApiKeys);
   const setHttpApiKeys = useWorkspaceStore((s) => s.setHttpApiKeys);
+  const httpBaseUrls = useWorkspaceStore((s) => s.httpBaseUrls);
+  const setHttpBaseUrls = useWorkspaceStore((s) => s.setHttpBaseUrls);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const identitySaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1503,18 +1537,24 @@ export function Profile() {
   // Detect which CLI backends are available in PATH
   const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
   const [geminiAvailable, setGeminiAvailable] = useState(false);
+  const [claudeAuthState, setClaudeAuthState] = useState<ClaudeAuthState | null>(null);
+  const [claudeSigningIn, setClaudeSigningIn] = useState(false);
+  const [claudeSigninStatus, setClaudeSigninStatus] = useState<string[]>([]);
   const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
   const rateLimitInfo = useWorkspaceStore((s) => s.rateLimitInfo);
-  const isClaudeAuthenticated = claudeCodeAvailable && sdkAccount != null;
+  // Authenticated if direct auth check says so OR if SDK account arrived via prefetch.
+  // Direct check is the source of truth — SDK account supplements it with extra fields.
+  const isClaudeAuthenticated =
+    claudeAuthState?.authenticated === true || (claudeCodeAvailable && sdkAccount != null);
   const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
   const toggleProvider = useWorkspaceStore((s) => s.toggleProvider);
 
   useEffect(() => {
+    // Check backend availability (is the CLI installed?)
     getBackendAvailability()
       .then((availability) => {
         setClaudeCodeAvailable(availability.claude);
         setGeminiAvailable(availability.gemini);
-        // Update store with backend availability
         useWorkspaceStore.getState().setBackendAvailability({
           claudeCode: availability.claude,
           geminiCli: availability.gemini,
@@ -1524,6 +1564,22 @@ export function Profile() {
         setClaudeCodeAvailable(false);
         setGeminiAvailable(false);
       });
+
+    // Read Claude auth state directly from ~/.claude.json — no session needed.
+    // This gives us the real signed-in/out state immediately, regardless of
+    // whether the SDK prefetch has fired yet.
+    getClaudeAuthState()
+      .then(setClaudeAuthState)
+      .catch(() => setClaudeAuthState({ authenticated: false, account: null }));
+  }, []);
+
+  useEffect(() => {
+    const cleanup = (window as any).electronAPI.on("pane-claude-signin", (data: any) => {
+      if (data.type === "status") {
+        if (data.output?.length) setClaudeSigninStatus(data.output);
+      }
+    });
+    return () => cleanup?.();
   }, []);
 
   useEffect(() => {
@@ -1541,6 +1597,10 @@ export function Profile() {
   // useSettingsPersistence watches the store and saves automatically.
   const handleApiKeyChange = (provider: string, key: string) => {
     setHttpApiKeys({ ...httpApiKeys, [provider]: key });
+  };
+
+  const handleBaseUrlChange = (provider: string, url: string) => {
+    setHttpBaseUrls({ ...httpBaseUrls, [provider]: url });
   };
 
   const saveIdentity = useCallback((field: string, value: string) => {
@@ -1799,26 +1859,92 @@ export function Profile() {
           <div className="flex flex-col gap-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${isClaudeAuthenticated ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
-                <span className="font-mono text-[var(--pane-status-added)]" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                <div className={`w-2 h-2 rounded-full flex-shrink-0 ${isClaudeAuthenticated ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
+                <span
+                  className={`font-mono ${isClaudeAuthenticated ? "text-[var(--pane-status-added)]" : "text-pane-text-secondary"}`}
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
                   {isClaudeAuthenticated
-                    ? (sdkAccount?.email || sdkAccount?.organization || "connected")
+                    ? (
+                        // Priority: direct auth displayName > direct auth email > SDK email > "connected"
+                        claudeAuthState?.account?.displayName ||
+                        claudeAuthState?.account?.email ||
+                        sdkAccount?.email ||
+                        (sdkAccount as any)?.organization ||
+                        "connected"
+                      )
                     : "not signed in"}
                 </span>
               </div>
-              {!isClaudeAuthenticated && (
+              {isClaudeAuthenticated ? (
                 <button
-                  onClick={() => reinitializePunkBackend("claude-code").catch(() => {})}
+                  onClick={() =>
+                    claudeSignout()
+                      .then(() => {
+                        setClaudeAuthState({ authenticated: false, account: null });
+                        useWorkspaceStore.getState().setSdkInfo(null, null);
+                        useWorkspaceStore.getState().setRateLimitInfo(null);
+                      })
+                      .catch(() => {})
+                  }
+                  className="font-mono text-pane-text-secondary/60 hover:text-pane-text-secondary transition-colors"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  sign out
+                </button>
+              ) : (
+                <button
+                  onClick={() => {
+                    if (claudeSigningIn) return;
+                    setClaudeSigningIn(true);
+                    setClaudeSigninStatus([]);
+                    claudeSignin()
+                      .then((result) => {
+                        if (result?.success) {
+                          // Refresh auth state from ~/.claude.json
+                          getClaudeAuthState().then((state) => {
+                            if (state) setClaudeAuthState(state);
+                          }).catch(() => {});
+                          // Also trigger prefetch to update SDK account info
+                          reinitializePunkBackend("claude-code").catch(() => {});
+                        }
+                      })
+                      .catch(() => {})
+                      .finally(() => {
+                        setClaudeSigningIn(false);
+                        setClaudeSigninStatus([]);
+                      });
+                  }}
                   className="font-mono text-pane-text-secondary hover:text-pane-text transition-colors"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  sign in
+                  {claudeSigningIn ? "signing in…" : "sign in"}
                 </button>
               )}
             </div>
 
+            {!isClaudeAuthenticated && claudeSigningIn && claudeSigninStatus.length > 0 && (
+              <div className="flex flex-col gap-1">
+                {claudeSigninStatus.map((line, i) => (
+                  <span key={i} className="font-mono text-pane-text-secondary/60 break-all" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                    {line}
+                  </span>
+                ))}
+              </div>
+            )}
+
             {isClaudeAuthenticated && (() => {
-              const plan = sdkAccount?.subscription || sdkAccount?.subscriptionType || (sdkAccount as any)?.planType || null;
+              // Show billing type from direct auth (most reliable) or SDK account
+              const billing =
+                claudeAuthState?.account?.billingType ||
+                (sdkAccount as any)?.billingType ||
+                null;
+              const plan =
+                sdkAccount?.subscription ||
+                (sdkAccount as any)?.subscriptionType ||
+                (sdkAccount as any)?.planType ||
+                (billing === "stripe_subscription" ? "max" : null) ||
+                null;
               return plan ? (
                 <div className="flex items-center justify-between">
                   <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>plan</span>
@@ -1829,36 +1955,46 @@ export function Profile() {
               ) : null;
             })()}
 
-            {isClaudeAuthenticated && (
-              <>
-                <div className="flex items-center justify-between">
-                  <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>usage</span>
-                  <span className="font-mono text-[var(--pane-status-added)] tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    {rateLimitInfo?.utilization != null ? `${Math.round(rateLimitInfo.utilization * 100)}%` : "waiting for session"}
-                  </span>
-                </div>
-                {rateLimitInfo?.utilization != null && (
-                  <div className="h-1.5 w-full bg-pane-text/[0.06] rounded-full overflow-hidden">
-                    <div
-                      className={`h-full rounded-full transition-all ${
-                        rateLimitInfo.utilization >= 0.85 ? "bg-pane-error" :
-                        rateLimitInfo.utilization >= 0.7 ? "bg-pane-status-modified" :
-                        "bg-pane-status-added"
-                      }`}
-                      style={{ width: `${Math.min(100, Math.round(rateLimitInfo.utilization * 100))}%` }}
-                    />
-                  </div>
-                )}
-                {rateLimitInfo?.resetsAt != null && (
+            {isClaudeAuthenticated && (() => {
+              // Always render the usage bar — 0% baseline when no data has
+              // arrived yet so we can see the moment it starts climbing.
+              const util = rateLimitInfo?.utilization ?? 0;
+              const pct = Math.round(util * 100);
+              const hasData = rateLimitInfo?.utilization != null;
+              const barColor =
+                util >= 0.85 ? "bg-pane-error" :
+                util >= 0.7  ? "bg-pane-status-modified" :
+                "bg-pane-status-added";
+              const textColor =
+                util >= 0.85 ? "text-pane-error" :
+                util >= 0.7  ? "text-[var(--pane-status-modified)]" :
+                hasData      ? "text-[var(--pane-status-added)]" :
+                "text-pane-text-secondary/40";
+              return (
+                <>
                   <div className="flex items-center justify-between">
-                    <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>resets</span>
-                    <span className="font-mono text-[var(--pane-status-added)] tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      {formatResetTime(rateLimitInfo.resetsAt)}
+                    <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>session</span>
+                    <span className={`font-mono tabular-nums ${textColor}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      {pct}%
                     </span>
                   </div>
-                )}
-              </>
-            )}
+                  <div className="h-1.5 w-full bg-pane-text/[0.06] rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all ${barColor}`}
+                      style={{ width: `${Math.min(100, pct)}%` }}
+                    />
+                  </div>
+                  {rateLimitInfo?.resetsAt != null && (
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>resets</span>
+                      <span className="font-mono text-[var(--pane-status-added)] tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                        {formatResetTime(rateLimitInfo.resetsAt)}
+                      </span>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
         </AccordionSection>
 
@@ -1935,6 +2071,8 @@ export function Profile() {
             <ApiKeysSection
               httpApiKeys={httpApiKeys}
               onKeyChange={handleApiKeyChange}
+              httpBaseUrls={httpBaseUrls}
+              onBaseUrlChange={handleBaseUrlChange}
               claudeCodeAvailable={claudeCodeAvailable}
               geminiAvailable={geminiAvailable}
             />

@@ -170,7 +170,7 @@ Write the plan as you would explain it to a senior colleague who will implement 
 
 The execution model will read your plan and implement it immediately. Be thorough.
 
-Do NOT write any code. Do NOT use structured JSON formats. Just plan in plain language.`;
+Do NOT write any code. Just plan in plain language.`;
 
 const PLANNING_PROMPT_DISCOVERY = `${PLANNING_PROMPT}
 

@@ -30,6 +30,7 @@ import { MindPunks } from "./mind-punks.mjs";
 import { getModelRates } from "./pricing.mjs";
 import { contextStore } from "./context-store.mjs";
 import { getPaneDb, extractMessageText } from "./pane-db.mjs";
+import { loadRecentTurns } from "./session-turns.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -1033,6 +1034,22 @@ app.on("before-quit", () => {
       }
     }, 500);
   }
+  // Shut down brain worker — it holds ONNX embedder memory (~200-400MB)
+  // and was previously left to Electron's default cleanup (unreliable).
+  if (brainWorker && !brainWorker.killed) {
+    brainWorker.postMessage({ type: "shutdown" });
+    const brainRef = brainWorker;
+    brainWorker = null;
+    setTimeout(() => {
+      if (!brainRef.killed) brainRef.kill();
+    }, 500);
+  }
+  // Close all chokidar file watchers — persistent watchers keep event loops
+  // alive and each holds fs.stat polling intervals via awaitWriteFinish.
+  for (const [, watcher] of watchers) {
+    watcher.close().catch(() => {});
+  }
+  watchers.clear();
 });
 const watchers = /* @__PURE__ */ new Map();
 function sendToRenderer(channel, data) {
@@ -1301,6 +1318,13 @@ function registerCheckpointHandlers(db) {
     } catch {
       return [];
     }
+  });
+
+  ipcMain.handle("resume_from_checkpoint", async (_event, args) => {
+    const { projectId, sessionId } = args;
+    const turns = loadRecentTurns(projectId, sessionId, 1);
+    if (turns.length === 0) return null;
+    return turns[0];
   });
 
   ipcMain.handle("get_checkpoint_diff", async (_event, args) => {

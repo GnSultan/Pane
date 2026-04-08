@@ -15,7 +15,7 @@
  *   import { estimateTokens, allocateBudget, getModelLimit } from "./token-budget.mjs";
  */
 
-import { MODEL_CONTEXT_LIMITS } from "./session-context.mjs";
+import { MODEL_CONTEXT_LIMITS } from "./pane-system-prompt.mjs";
 
 // ---------------------------------------------------------------------------
 // Token estimation

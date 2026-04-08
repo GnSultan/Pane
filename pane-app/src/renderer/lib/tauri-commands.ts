@@ -459,6 +459,35 @@ export async function getBackendAvailability(): Promise<{
   return electronAPI.invoke("get_backend_availability");
 }
 
+export interface ClaudeAuthAccount {
+  email: string | null;
+  displayName: string | null;
+  organizationName: string | null;
+  billingType: string | null;
+  hasExtraUsageEnabled: boolean;
+  subscriptionCreatedAt: string | null;
+}
+
+export interface ClaudeAuthState {
+  authenticated: boolean;
+  account: ClaudeAuthAccount | null;
+}
+
+/** Read Claude auth state directly from ~/.claude.json — no session needed. */
+export async function getClaudeAuthState(): Promise<ClaudeAuthState> {
+  return electronAPI.invoke("get_claude_auth_state");
+}
+
+/** Initiate Claude OAuth sign-in via the SDK's browser-based auth flow. */
+export async function claudeSignin(): Promise<{ success: boolean; account?: any; error?: string }> {
+  return electronAPI.invoke("claude_signin");
+}
+
+/** Sign out of Claude by removing oauthAccount from ~/.claude.json. */
+export async function claudeSignout(): Promise<{ success: boolean }> {
+  return electronAPI.invoke("claude_signout");
+}
+
 export interface OpenRouterModel {
   id: string;
   name: string;
@@ -656,6 +685,13 @@ export async function deleteProjectCheckpoints(
   projectId: string,
 ): Promise<void> {
   return electronAPI.invoke("delete_project_checkpoints", { projectId });
+}
+
+export async function resumeFromCheckpoint(
+  projectId: string,
+  sessionId: string,
+): Promise<import("./punk-types").CheckpointTurn | null> {
+  return electronAPI.invoke("resume_from_checkpoint", { projectId, sessionId });
 }
 
 // --- Change History ---

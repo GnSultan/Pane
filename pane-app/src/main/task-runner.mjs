@@ -26,7 +26,7 @@ import path from "node:path";
 import os from "node:os";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import { compileContext, readState, mergeState } from "./session-context.mjs";
+import { compileContext, readState, mergeState } from "./pane-system-prompt.mjs";
 import { createPlan, updatePlanStep, completePlan } from "./plan-store.mjs";
 import { getPaneDb } from "./pane-db.mjs";
 
@@ -765,8 +765,14 @@ export class TaskRunner {
         }
 
         // ── Retry on failed write step — surgical rollback first ───────────
-        if (!verification.passed && step.type === "write") {
-          console.warn(`[task-runner] Step ${step.index} failed: ${verification.reason}. Rolling back and retrying...`);
+        let attempts = 1;
+        const MAX_ATTEMPTS = 5;
+        let currentVerification = verification;
+        let currentChangeIds = stepChangeIds;
+
+        while (!currentVerification.passed && step.type === "write" && attempts < MAX_ATTEMPTS) {
+          attempts++;
+          console.warn(`[task-runner] Step ${step.index} failed: ${currentVerification.reason}. Rolling back and retrying (attempt ${attempts}/${MAX_ATTEMPTS})...`);
 
           this.onEvent(projectId, {
             event: "orchestration_step",
@@ -775,16 +781,16 @@ export class TaskRunner {
               stepIndex: step.index,
               totalSteps: plan.steps.length,
               action: step.action,
-              reason: verification.reason,
-              message: `Rolling back step ${step.index} and retrying...`,
+              reason: currentVerification.reason,
+              message: `Rolling back step ${step.index} and retrying (${attempts}/${MAX_ATTEMPTS})...`,
             },
           }, request.requestId);
 
           // Revert this step's changes before retrying
-          if (stepChangeIds.length > 0) {
-            await revertChanges(projectId, stepChangeIds, request.workingDir);
+          if (currentChangeIds.length > 0) {
+            await revertChanges(projectId, currentChangeIds, request.workingDir);
             // Remove reverted IDs from tracking
-            stepChangeIds.forEach(id => {
+            currentChangeIds.forEach(id => {
               const pos = allStepChangeIds.indexOf(id);
               if (pos >= 0) allStepChangeIds.splice(pos, 1);
             });
@@ -794,7 +800,7 @@ export class TaskRunner {
           const retryCursor = await snapshotChangeHead(projectId);
 
           try {
-            const retryPrompt = `${step.action}\n\nPrevious attempt produced no file changes. Make sure to actually edit the file using write_file or replace tools.`;
+            const retryPrompt = `${step.action}\n\nPrevious attempt failed: ${currentVerification.reason}. Make sure to actually edit the file using write_file or replace tools correctly.`;
             const retryResult = await this.spawnStep(
               projectId,
               retryPrompt,
@@ -803,15 +809,15 @@ export class TaskRunner {
             );
 
             let retryChanges = await getChangesSince(projectId, retryCursor);
-            const retryVerification = verifyStepResult(step, retryChanges, retryResult.messages || []);
-            const retryChangeIds = retryChanges.map(c => c.id);
-            allStepChangeIds.push(...retryChangeIds);
+            currentVerification = verifyStepResult(step, retryChanges, retryResult.messages || []);
+            currentChangeIds = retryChanges.map(c => c.id);
+            allStepChangeIds.push(...currentChangeIds);
 
             stepResults[stepResults.length - 1] = {
               step,
-              verification: retryVerification,
+              verification: currentVerification,
               stepChanges: retryChanges,
-              stepChangeIds: retryChangeIds,
+              stepChangeIds: currentChangeIds,
             };
 
             this.onEvent(projectId, {
@@ -819,9 +825,9 @@ export class TaskRunner {
               data: {
                 stepIndex: step.index,
                 totalSteps: plan.steps.length,
-                passed: retryVerification.passed,
-                reason: retryVerification.reason,
-                scopeViolations: retryVerification.scopeViolations,
+                passed: currentVerification.passed,
+                reason: currentVerification.reason,
+                scopeViolations: currentVerification.scopeViolations,
                 changedFiles: [...new Set(retryChanges.map(c => c.file))],
                 action: step.action,
                 retry: true,
@@ -831,22 +837,23 @@ export class TaskRunner {
             // Persist retry result
             if (runState.planId) {
               updatePlanStep(projectId, runState.planId, step.index, {
-                status: retryVerification.passed ? "completed" : "failed",
+                status: currentVerification.passed ? "completed" : "failed",
                 completedAt: Date.now(),
-                paneVerdict: retryVerification.passed ? "passed" : "failed",
-                verdictReason: retryVerification.reason,
+                paneVerdict: currentVerification.passed ? "passed" : "failed",
+                verdictReason: currentVerification.reason,
                 changedFiles: [...new Set(retryChanges.map(c => c.file))],
-                changeIds: retryChangeIds,
+                changeIds: currentChangeIds,
               });
             }
           } catch (err) {
             console.error(`[task-runner] Step ${step.index} retry failed:`, err.message);
+            break;
           }
         }
 
-        // ── Abort plan if verify step failed (broken code, don't continue) ─
-        if (!verification.passed && step.type === "verify") {
-          console.warn(`[task-runner] Verify step ${step.index} failed. Stopping plan.`);
+        // ── Abort plan if step ultimately failed (broken code, don't continue) ─
+        if (!currentVerification.passed && step.type !== "read") {
+          console.warn(`[task-runner] Step ${step.index} failed after ${attempts} attempts. Stopping plan.`);
           break;
         }
       }

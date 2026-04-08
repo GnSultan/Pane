@@ -63,7 +63,15 @@ export function useFileWatcher() {
       watchedRootsRef.current = currentRoots;
     });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      // Unwatch all roots when the component unmounts (window close, reload)
+      // so chokidar instances in the main process don't leak.
+      for (const root of watchedRootsRef.current) {
+        unwatchDirectory(root).catch(() => {});
+      }
+      watchedRootsRef.current = new Set();
+    };
   }, [projectOrder]);
 
   // Listen for file change events and route to correct project

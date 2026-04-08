@@ -188,7 +188,7 @@ export interface PunkEventProcessStarted {
 
 export interface PunkEventProcessEnded {
   event: "processEnded";
-  data: { exit_code: number | null };
+  data: { exit_code: number | null; aborted?: boolean };
 }
 
 export interface PunkEventRouting {
@@ -577,6 +577,13 @@ export interface MemoryEvent {
   timestamp: number;
   source?: "auto" | "claude";
   metadata?: Record<string, string>;
+}
+
+export interface CheckpointTurn {
+  messages: Array<{ role: string; content: any }>;
+  turn: number;
+  timestamp: number;
+  phase?: string;
 }
 
 export function createEmptyConversation(): ConversationState {

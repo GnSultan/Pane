@@ -22,6 +22,8 @@ import crypto from "node:crypto";
 
 import { getPaneDb } from "./pane-db.mjs";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
+import { readState, readHandoff } from "./pane-system-prompt.mjs";
+import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
 
 const execAsync = promisify(exec);
 
@@ -2388,6 +2390,231 @@ export class ToolExecutor {
           } catch {
             return { success: true, output: "No subsystem registry found for this project.", toolId };
           }
+        }
+
+        // ── On-demand context tools ────────────────────────────────────────
+        // These serve context the model explicitly requests instead of Pane
+        // pre-loading it into the system prompt.
+
+        case "pane_get_session_state": {
+          const state = readState(this.projectId);
+          const parts = [];
+
+          // Active task
+          if (state.activeTask) {
+            const age = state.activeTask.timestamp
+              ? Math.round((Date.now() - state.activeTask.timestamp) / (1000 * 60 * 60))
+              : null;
+            parts.push(`Active task${age ? ` (set ${age}h ago)` : ""}: ${state.activeTask.description}`);
+            if (state.activeTask.goal) parts.push(`Goal: ${state.activeTask.goal}`);
+          } else {
+            parts.push("No active task set.");
+          }
+
+          // Todos with age annotation
+          const todos = state.todos || [];
+          if (todos.length > 0) {
+            parts.push("\nTodos:");
+            for (const t of todos) {
+              const mark = t.status === "completed" ? "[✓]" : t.status === "in_progress" ? "[→]" : "[ ]";
+              parts.push(`${mark} ${t.content}`);
+            }
+          }
+
+          // Decisions
+          const decisions = state.decisions || [];
+          if (decisions.length > 0) {
+            parts.push("\nLocked decisions:");
+            for (const d of decisions.slice(0, 8)) {
+              const age = d.timestamp
+                ? `(${Math.round((Date.now() - d.timestamp) / (1000 * 60 * 60))}h ago)`
+                : "";
+              parts.push(`- ${d.content} ${age}`);
+            }
+          }
+
+          // Recent actions
+          const actions = state.recentActions || [];
+          if (actions.length > 0) {
+            parts.push("\nRecent actions:");
+            for (const a of actions.slice(-5)) {
+              parts.push(`- [${a.type}] ${a.content}`);
+            }
+          }
+
+          // Working set
+          if (state.workingSet?.length > 0) {
+            parts.push("\nWorking set:");
+            for (const f of state.workingSet.slice(0, 8)) {
+              parts.push(`- ${f.path}${f.purpose ? ` — ${f.purpose}` : ""}`);
+            }
+          }
+
+          parts.push(`\nSession: turn ${state.turnCount}, phase: ${state.phase}`);
+
+          return { success: true, output: parts.join("\n"), toolId };
+        }
+
+        case "pane_get_project_map": {
+          // Read the codebase map from brain context export
+          const mapPath = path.join(paneDir, "brain", "context", `${this.projectId}.json`);
+          try {
+            const data = JSON.parse(await fsPromises.readFile(mapPath, "utf-8"));
+            if (data.codebaseMap) {
+              return { success: true, output: data.codebaseMap, toolId };
+            }
+            // Fall back to listing files from the export
+            if (Array.isArray(data) && data.length > 0) {
+              const files = data.filter(n => n.type === "file").map(n => n.path || n.content).slice(0, 200);
+              return { success: true, output: `Project files (${files.length}):\n${files.join("\n")}`, toolId };
+            }
+          } catch {}
+
+          // Fallback: list files from working directory
+          try {
+            const { stdout } = await execAsync(
+              `find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' | head -200`,
+              { cwd: this.workingDir, timeout: 5000 }
+            );
+            return { success: true, output: `Project files:\n${stdout}`, toolId };
+          } catch {
+            return { success: true, output: "Could not read project file structure.", toolId };
+          }
+        }
+
+        case "pane_get_recent_changes": {
+          const parts = [];
+
+          // Git status
+          try {
+            const { stdout: status } = await execAsync("git status --short", { cwd: this.workingDir, timeout: 5000 });
+            const { stdout: branch } = await execAsync("git branch --show-current", { cwd: this.workingDir, timeout: 3000 });
+            parts.push(`Branch: ${branch.trim()}`);
+            if (status.trim()) {
+              parts.push(`\nChanged files:\n${status.trim()}`);
+            } else {
+              parts.push("Working tree clean.");
+            }
+          } catch {
+            parts.push("Git status unavailable.");
+          }
+
+          // Recent git log
+          try {
+            const { stdout: log } = await execAsync("git log --oneline -5", { cwd: this.workingDir, timeout: 5000 });
+            if (log.trim()) {
+              parts.push(`\nRecent commits:\n${log.trim()}`);
+            }
+          } catch {}
+
+          // Git diff summary
+          try {
+            const { stdout: diff } = await execAsync("git diff --stat HEAD 2>/dev/null || git diff --stat", { cwd: this.workingDir, timeout: 5000 });
+            if (diff.trim()) {
+              parts.push(`\nDiff summary:\n${diff.trim()}`);
+            }
+          } catch {}
+
+          return { success: true, output: parts.join("\n"), toolId };
+        }
+
+        case "pane_read_journal": {
+          const query = (input?.query || "").trim().toLowerCase();
+          const limit = Math.min(input?.limit || 10, 30);
+
+          const journalData = replayJournal(this.projectId);
+          if (!journalData.messages.length) {
+            return { success: true, output: "No session journal entries found.", toolId };
+          }
+
+          // Get the last progress snapshot
+          const progress = journalData.progress || readLastProgress(this.projectId);
+
+          let entries = journalData.messages;
+
+          // Filter by query if provided
+          if (query) {
+            entries = entries.filter(msg => {
+              const text = typeof msg.content === "string"
+                ? msg.content
+                : JSON.stringify(msg.content);
+              return text.toLowerCase().includes(query);
+            });
+          }
+
+          // Take last N entries
+          entries = entries.slice(-limit);
+
+          const parts = [];
+
+          if (progress) {
+            parts.push("[Last progress snapshot]");
+            if (progress.accomplishments?.length > 0) {
+              parts.push(`Completed: ${progress.accomplishments.join("; ")}`);
+            }
+            if (progress.decisions?.length > 0) {
+              parts.push(`Decisions: ${progress.decisions.join("; ")}`);
+            }
+            if (progress.pendingTodos?.length > 0) {
+              parts.push(`Pending: ${progress.pendingTodos.join("; ")}`);
+            }
+            parts.push("");
+          }
+
+          parts.push(`[Journal entries: ${entries.length}${query ? ` matching "${input.query}"` : ""}]`);
+          for (const msg of entries) {
+            const content = typeof msg.content === "string"
+              ? msg.content.slice(0, 300)
+              : Array.isArray(msg.content)
+                ? msg.content.filter(b => b.type === "text").map(b => b.text).join("\n").slice(0, 300)
+                : JSON.stringify(msg.content).slice(0, 300);
+            parts.push(`[${msg.role}] ${content}${content.length >= 300 ? "..." : ""}`);
+          }
+
+          return { success: true, output: parts.join("\n"), toolId };
+        }
+
+        case "pane_get_handoff": {
+          const handoff = readHandoff(this.projectId);
+          if (!handoff) {
+            return { success: true, output: "No previous session handoff found. This may be the first session for this project.", toolId };
+          }
+
+          const parts = [];
+          const age = handoff.timestamp
+            ? Math.round((Date.now() - handoff.timestamp) / (1000 * 60 * 60))
+            : null;
+
+          parts.push(`Previous session handoff${age ? ` (${age}h ago)` : ""}:`);
+
+          if (handoff._exitReason) {
+            parts.push(`Exit reason: ${handoff._exitReason}${handoff._errorMessage ? ` — ${handoff._errorMessage}` : ""}`);
+          }
+
+          if (handoff.currentObjective) parts.push(`Objective: ${handoff.currentObjective}`);
+          if (handoff.progress) parts.push(`Progress: ${handoff.progress}`);
+
+          const renderItems = (label, items) => {
+            if (!items?.length) return;
+            parts.push(`\n${label}:`);
+            for (const item of items) {
+              const text = typeof item === "string" ? item : item.text || item.content || JSON.stringify(item);
+              parts.push(`- ${text}`);
+            }
+          };
+
+          renderItems("Accomplished", handoff.accomplishment);
+          renderItems("Completed from history", handoff.completed_from_history);
+          renderItems("Blockers", handoff.blockers);
+          renderItems("Next steps", handoff.nextSteps);
+          renderItems("Findings", handoff.findings);
+          renderItems("Decisions", handoff.decisionsLocked);
+
+          if (handoff.workingSet?.length > 0) {
+            parts.push(`\nWorking set: ${handoff.workingSet.map(f => f.path || f).join(", ")}`);
+          }
+
+          return { success: true, output: parts.join("\n"), toolId };
         }
 
         default:

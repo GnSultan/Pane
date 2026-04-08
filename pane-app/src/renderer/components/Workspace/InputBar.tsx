@@ -102,39 +102,60 @@ function formatRelativeTime(epochMs: number): string {
 function RateLimitIndicator() {
   const info = useWorkspaceStore((s) => s.rateLimitInfo);
   const provider = useWorkspaceStore((s) => s.selectedModelProvider);
+  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
   const setRateLimitInfo = useWorkspaceStore((s) => s.setRateLimitInfo);
 
   // Compute before the conditional return so useEffect is always called unconditionally.
   const resetEpochMs = info?.resetsAt ? info.resetsAt * 1000 : null;
+  const overageResetMs = info?.overageResetsAt ? info.overageResetsAt * 1000 : null;
 
   // Auto-expire: schedule a clear when the reset time passes so the warning
   // disappears on its own without needing another backend event.
   useEffect(() => {
-    if (!resetEpochMs) return;
-    const delay = resetEpochMs - Date.now();
+    const epochMs = resetEpochMs ?? overageResetMs;
+    if (!epochMs) return;
+    const delay = epochMs - Date.now();
     if (delay <= 0) {
       setRateLimitInfo(null);
       return;
     }
     const t = setTimeout(() => setRateLimitInfo(null), delay);
     return () => clearTimeout(t);
-  }, [resetEpochMs, setRateLimitInfo]);
+  }, [resetEpochMs, overageResetMs, setRateLimitInfo]);
 
   // Only show for Claude (anthropic) provider — rate limits are Claude-specific.
-  // Keeping the stored value across model switches lets it reappear immediately
-  // when switching back to Claude, without waiting for the next backend event.
   if (!info || provider !== "anthropic") return null;
 
+  const pct = info.utilization != null ? Math.round(info.utilization * 100) : null;
   const isOverage = info.isUsingOverage === true;
-  const isWarning = info.status === "allowed_warning";
   const isRejected = info.status === "rejected";
   const overageRejected = info.overageStatus === "rejected";
 
-  // Show overage indicator when using extra usage
-  if (isOverage && !overageRejected) {
-    const overageResets = info.overageResetsAt
-      ? formatRelativeTime(info.overageResetsAt * 1000)
-      : null;
+  // Subscription users: don't show until 60% utilization — below that is noise.
+  // Credit users (pay-as-you-go): show overage state immediately since it has
+  // direct cost implications.
+  const isSubscription =
+    (sdkAccount as any)?.billingType === "stripe_subscription" ||
+    (sdkAccount as any)?.subscription != null;
+
+  // Overage rejected (exhausted all usage)
+  if (overageRejected) {
+    const resetTime = overageResetMs ? formatRelativeTime(overageResetMs) : null;
+    // "out of credits" only makes sense for credit/pay-as-you-go users.
+    // Subscription users see "limit reached · resets in Xh" instead.
+    const label = isSubscription
+      ? `limit reached${resetTime ? ` · resets ${resetTime}` : ""}`
+      : `extra usage · out of credits${resetTime ? ` · resets ${resetTime}` : ""}`;
+    return (
+      <span className="font-mono tabular-nums text-pane-error" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        {label}
+      </span>
+    );
+  }
+
+  // Using extra usage / overage (subscription exceeded but still allowed)
+  if (isOverage) {
+    const overageResets = overageResetMs ? formatRelativeTime(overageResetMs) : null;
     return (
       <span className="font-mono tabular-nums text-[var(--pane-status-modified)]" style={{ fontSize: "var(--pane-font-size-xs)" }}>
         extra usage{overageResets ? ` · resets ${overageResets}` : ""}
@@ -142,25 +163,18 @@ function RateLimitIndicator() {
     );
   }
 
-  if (overageRejected) {
-    const reason = info.overageDisabledReason;
-    return (
-      <span className="font-mono tabular-nums text-pane-error" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-        {reason === "out_of_credits" ? "extra usage · out of credits" : "extra usage exhausted"}
-      </span>
-    );
-  }
+  // Standard rate limit — only show at ≥60% utilization so the bar is
+  // informational (approaching limit) not alarming (constantly visible).
+  if (pct == null || pct < 60) return null;
 
-  if (!isWarning && !isRejected) return null;
-
-  const pct = info.utilization != null ? Math.round(info.utilization * 100) : null;
-  const resetTime = resetEpochMs
-    ? formatRelativeTime(resetEpochMs)
-    : null;
+  const resetTime = resetEpochMs ? formatRelativeTime(resetEpochMs) : null;
 
   return (
-    <span className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-[var(--pane-status-modified)]"}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
-      {pct != null && <>{pct}% </>}{isRejected ? "limit reached" : "limit"}{resetTime && <> · resets {resetTime}</>}
+    <span
+      className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-[var(--pane-status-modified)]"}`}
+      style={{ fontSize: "var(--pane-font-size-xs)" }}
+    >
+      {pct}%{isRejected ? " · limit reached" : " · limit"}{resetTime && ` · resets ${resetTime}`}
     </span>
   );
 }

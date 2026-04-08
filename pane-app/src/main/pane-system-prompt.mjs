@@ -36,6 +36,7 @@ import path from "node:path";
 import os from "node:os";
 import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
 import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
+import { getActiveJournal, applyMergeDelta } from "./session-journal.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -194,7 +195,16 @@ function statePath(projectId) {
   return path.join(SESSION_DIR, projectId, "state.json");
 }
 
+/**
+ * Read the current session state. When a journal is active for this project,
+ * returns the in-memory state (fast, no disk I/O). Otherwise falls back to
+ * reading state.json from disk (cold start, between sessions).
+ */
 export function readState(projectId) {
+  const journal = getActiveJournal(projectId);
+  if (journal) return journal.getState();
+
+  // Fallback: read from state.json (no active session)
   try {
     return JSON.parse(fs.readFileSync(statePath(projectId), "utf-8"));
   } catch {
@@ -213,65 +223,20 @@ export function clearState(projectId) {
 }
 
 /**
- * Merge a partial update into the current session state.
- * Handles deduplication and size caps internally.
+ * Merge a partial update into the current session state. When a journal is
+ * active, delegates to the journal (in-memory update + journal delta entry +
+ * debounced state.json flush). Otherwise falls back to read-modify-write on
+ * state.json directly.
+ *
+ * All 15+ callers across the codebase continue calling this unchanged.
  */
 export function mergeState(projectId, delta) {
+  const journal = getActiveJournal(projectId);
+  if (journal) return journal.applyDelta(delta);
+
+  // Fallback: read-modify-write state.json (no active session)
   const state = readState(projectId);
-
-  // Active task: shallow merge
-  if (delta.activeTask !== undefined) {
-    state.activeTask = delta.activeTask
-      ? { ...state.activeTask, ...delta.activeTask }
-      : null;
-  }
-
-  // Working set: upsert by path, sort by touches, cap at 10
-  if (delta.workingSet?.length) {
-    for (const file of delta.workingSet) {
-      const idx = state.workingSet.findIndex(f => f.path === file.path);
-      if (idx >= 0) {
-        state.workingSet[idx] = {
-          ...state.workingSet[idx],
-          ...file,
-          touches: (state.workingSet[idx].touches || 0) + 1,
-        };
-      } else {
-        state.workingSet.push({ ...file, touches: 1 });
-      }
-    }
-    state.workingSet.sort((a, b) => (b.touches || 0) - (a.touches || 0));
-    state.workingSet = state.workingSet.slice(0, 10);
-  }
-
-  // Decisions: prepend new, deduplicate by content prefix, cap at 8
-  if (delta.decisions?.length) {
-    for (const d of delta.decisions) {
-      const key = d.content.slice(0, 60).toLowerCase();
-      const dupe = state.decisions.some(x => x.content.slice(0, 60).toLowerCase() === key);
-      if (!dupe) state.decisions.unshift({ content: d.content, timestamp: Date.now() });
-    }
-    state.decisions = state.decisions.slice(0, 8);
-  }
-
-  // Recent actions: prepend, cap at 8
-  if (delta.recentActions?.length) {
-    state.recentActions = [...delta.recentActions, ...state.recentActions].slice(0, 8);
-  }
-
-  // Method notes: replace each turn (not cumulative — only latest turn's violations matter)
-  if (delta.methodNotes?.length) {
-    state.methodNotes = delta.methodNotes;
-  } else if (delta.methodNotes !== undefined) {
-    state.methodNotes = []; // Explicit clear — model complied this turn
-  }
-
-  if (delta.todos)                   state.todos = delta.todos;
-  if (delta.turnCount !== undefined) state.turnCount = delta.turnCount;
-  if (delta.lastProvider)           state.lastProvider = delta.lastProvider;
-  if (delta.lastIntent)             state.lastIntent = delta.lastIntent;
-  if (delta.gitStatus !== undefined) state.gitStatus = delta.gitStatus;
-
+  applyMergeDelta(state, delta);
   writeState(projectId, state);
   return state;
 }
@@ -372,7 +337,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   stableParts.push(
     "## Working in Pane",
     "",
-    "Pane pre-compiles project context before you see the message — purpose, DNA, codebase map, working set contents, memories, symbols, session state. Start from what you already have. Tools extend context, they don't bootstrap it.",
+    "Pane provides project identity (purpose, DNA, brief) in context. All other project state — codebase map, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
     "",
     "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_why when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
     "",
@@ -506,50 +471,9 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     frozenParts.push("");
   }
 
-  // ── Codebase map: every indexed file with a one-line description ──────────
-  // This is the model's primary navigation tool. It sees the ENTIRE project
-  // structure, not a 5-file sample. ~2-4k tokens for a 100-file project.
-  // Lives in SESSION tier — changes when files are added/removed, not every turn.
-  const codebaseMap = (brainCtx.codebaseMap || []);
-  if (codebaseMap.length > 0) {
-    sessionParts.push("## Codebase map");
-    sessionParts.push("Every file in this project and what it does. Use this to navigate — do not grep for files.");
-    sessionParts.push("");
-    for (const f of codebaseMap) {
-      sessionParts.push(`${f.path} — ${f.desc}`);
-    }
-    sessionParts.push("");
-  }
-
-  // Relevant files from brain index — the top semantic matches for THIS query.
-  // These are the files most likely to need changes. Approach order is heuristic.
-  // Lives in SESSION tier — changes when query/scope change, stable within same task.
-  const relevantFiles = (brainCtx.relevantFiles || []).slice(0, 5);
-  if (relevantFiles.length >= 3) {
-    const ordered = [...relevantFiles].sort((a, b) => {
-      const rank = (p) => {
-        const lp = (p || "").toLowerCase();
-        if (lp.includes("config") || lp.includes("types") || lp.includes("schema") || lp.includes("model")) return 0;
-        if (lp.includes("lib/") || lp.includes("util") || lp.includes("core") || lp.includes("engine")) return 1;
-        if (lp.includes("api") || lp.includes("handler") || lp.includes("route") || lp.includes("backend") || lp.includes("worker")) return 2;
-        if (lp.includes("hook") || lp.includes("store") || lp.includes("context")) return 3;
-        if (lp.includes("component") || lp.includes("page") || lp.includes("view") || lp.includes(".tsx") || lp.includes(".jsx")) return 4;
-        if (lp.includes("test") || lp.includes("spec")) return 5;
-        return 3;
-      };
-      return rank(a.path) - rank(b.path);
-    });
-
-    sessionParts.push("Suggested approach order for this task:");
-    ordered.forEach((f, i) => {
-      sessionParts.push(`${i + 1}. ${f.path} — ${f.description}`);
-    });
-    sessionParts.push("");
-  } else if (relevantFiles.length > 0) {
-    sessionParts.push("Files most likely to need changes:");
-    for (const f of relevantFiles) sessionParts.push(`- ${f.path} — ${f.description}`);
-    sessionParts.push("");
-  }
+  // Codebase map and relevant files are now retrieved via pane_get_project_map.
+  // This saves ~2-4k tokens from the session tier and makes the system prompt
+  // nearly static — improving cache hit rates dramatically.
 
   // Global Memory (Gemini CLI parity)
   try {
@@ -589,149 +513,70 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   // Session state: what Pane knows is happening right now
   const state = readState(projectId);
 
-  // ── Task state injection: ONLY on first turn ──────────────────────────
-  // On turn 0-1: inject activeTask and todos for cross-session continuity.
-  // On turn 2+: skip them. The conversation history already contains the
-  // plan, the work, and the user's instructions. Injecting stale session
-  // state ON TOP of a live conversation creates conflicts — the model sees
-  // "Current objective: [old task]" in the system prompt but a completely
-  // different task in the conversation, and follows the system prompt.
-  // This is the root cause of the "continue picks up wrong task" bug.
-  if (historyLength < 2) {
-    // ALWAYS filter out completed todos to save tokens and avoid confusion.
-    const activeTodos = (state.todos || []).filter(t => t.status !== "completed");
+  // ── Task state: retired after 8 hours, never pre-loaded ────────────────
+  // Stale objectives from previous sessions were the root cause of the
+  // "continue picks up wrong task" bug. Now:
+  //   1. Objectives older than 8 hours are retired (cleared from state)
+  //   2. Task state is NEVER injected into the system prompt
+  //   3. The model can call pane_get_session_state to retrieve it on demand
+  // This ensures the model focuses on what the USER just asked, not on
+  // stale session state that Pane guessed might be relevant.
+  const STALE_THRESHOLD_MS = 8 * 60 * 60 * 1000; // 8 hours
+  const nowMs = Date.now();
 
-    if (state.activeTask && activeTodos.length > 0) {
-      dynamicParts.push(`Current objective: ${state.activeTask.description}`);
-      if (state.activeTask.goal) dynamicParts.push(`Goal: ${state.activeTask.goal}`);
-      dynamicParts.push("");
-    }
-
-    if (activeTodos.length > 0) {
-      dynamicParts.push("Task list:");
-      for (const t of activeTodos) {
-        const mark = t.status === "in_progress" ? "[→]" : "[ ]";
-        dynamicParts.push(`${mark} ${t.content}`);
-      }
-      dynamicParts.push("");
+  // Retire stale objectives — clear them from state entirely
+  if (state.activeTask?.timestamp && (nowMs - state.activeTask.timestamp) > STALE_THRESHOLD_MS) {
+    state.activeTask = null;
+    mergeState(projectId, { activeTask: null });
+  }
+  if (state.todos?.length > 0) {
+    const freshTodos = state.todos.filter(t => {
+      if (t.status === "completed") return false; // always drop completed
+      if (t.timestamp && (nowMs - t.timestamp) > STALE_THRESHOLD_MS) return false; // stale
+      return true;
+    });
+    if (freshTodos.length !== state.todos.length) {
+      state.todos = freshTodos;
+      mergeState(projectId, { todos: freshTodos });
     }
   }
-
-  if (state.gitStatus) {
-    dynamicParts.push(`Git status (branch: ${state.gitStatus.branch}):`);
-    dynamicParts.push(state.gitStatus.summary);
-    dynamicParts.push("");
-  }
-
-  if (state.workingSet.length > 0) {
-    dynamicParts.push("Files in scope — do not touch files outside this list unless explicitly asked:");
-    for (const f of state.workingSet.slice(0, 6)) {
-      dynamicParts.push(`- ${f.path}${f.purpose ? ` — ${f.purpose}` : ""}`);
-    }
-    dynamicParts.push("");
-
-    // Pre-read: include actual file content for top working set files.
-    // The model doesn't need to explore — Pane has already read these.
-    // Local intelligence context shaping adjusts depth:
-    //   "none" → skip pre-read entirely, "names" → file list only (already done above),
-    //   "shallow" → default (3 files, 80 lines), "deep" → 5 files, 120 lines
-    const localFileDepth = contextShape?.fileDepth || "shallow";
-    const skipPreRead = localFileDepth === "none" || localFileDepth === "names";
-
-    if (!skipPreRead) {
-      const PRE_READ_MAX_FILES = localFileDepth === "deep" ? 5 : 3;
-      const PRE_READ_MAX_LINES = localFileDepth === "deep" ? 120 : 80;
-      const PRE_READ_MAX_CHARS = localFileDepth === "deep" ? 25000 : 15000;
-      let preReadChars = 0;
-      const preReadParts = [];
-
-      for (const f of state.workingSet.slice(0, PRE_READ_MAX_FILES)) {
-        if (preReadChars >= PRE_READ_MAX_CHARS) break;
-        try {
-          const raw = fs.readFileSync(f.path, "utf-8");
-          const lines = raw.split("\n").slice(0, PRE_READ_MAX_LINES);
-          const content = lines.join("\n");
-          const remaining = PRE_READ_MAX_CHARS - preReadChars;
-          const truncated = content.length > remaining ? content.slice(0, remaining) + "\n[...truncated]" : content;
-          preReadParts.push(`### ${f.path}\n\`\`\`\n${truncated}\n\`\`\``);
-          preReadChars += truncated.length;
-        } catch {
-          // File doesn't exist or isn't readable — skip silently
-        }
-      }
-
-      if (preReadParts.length > 0) {
-        dynamicParts.push("Pre-read file contents (Pane has read these — do not re-read unless they have changed since):");
-        dynamicParts.push(preReadParts.join("\n\n"));
-        dynamicParts.push("");
-      }
+  // Retire stale decisions (older than 8h) — they're still in memory via pane_recall
+  if (state.decisions?.length > 0) {
+    const freshDecisions = state.decisions.filter(d =>
+      !d.timestamp || (nowMs - d.timestamp) <= STALE_THRESHOLD_MS
+    );
+    if (freshDecisions.length !== state.decisions.length) {
+      state.decisions = freshDecisions;
+      mergeState(projectId, { decisions: freshDecisions });
     }
   }
 
-  if (state.decisions.length > 0) {
-    dynamicParts.push("Locked decisions — do not contradict or undo these:");
-    for (const d of state.decisions.slice(0, 6)) dynamicParts.push(`- ${d.content}`);
-    dynamicParts.push("");
-  }
+  // Task state is no longer injected into the system prompt.
+  // The model retrieves it via pane_get_session_state when needed.
 
-  // Unified "What has been done" — prefers provided SQLite changes for file edits,
-  // falls back to state.recentActions for commands/decisions.
-  const hasSqliteChanges = Array.isArray(sqliteChanges) && sqliteChanges.length > 0;
-  if (hasSqliteChanges || (state.recentActions && state.recentActions.length > 0)) {
-    dynamicParts.push("What has been done:");
-    
-    // 1. Show SQLite changes if provided (file_edit source of truth)
-    if (hasSqliteChanges) {
-      for (const c of sqliteChanges.slice(0, 10)) {
-        const type = (c.old_string || c.oldString) ? "edit" : "write";
-        dynamicParts.push(`- [${type}] ${c.file_path || c.file}`);
-      }
-    }
-    
-    // 2. Show non-file actions from recentActions (commands, decisions, etc.)
-    // Filter out file edits from recentActions if we have SQLite changes to avoid duplication.
-    // Also include "Read" / "read_file" if they are in recentActions since they aren't in SQLite.
-    const fileTypes = ["file_edit", "write", "edit", "Write", "Edit"];
-    const nonFileActions = (state.recentActions || []).filter(a => 
-      !hasSqliteChanges || !fileTypes.includes(a.type)
-    ).slice(0, 8);
-    
-    for (const a of nonFileActions) {
-      dynamicParts.push(`- [${a.type}] ${a.content}`);
-    }
-    dynamicParts.push("");
-  }
+  // On-demand context hint — tells the model how to get project context
+  dynamicParts.push("Project context is on-demand. Use these tools to get what you need:");
+  dynamicParts.push("- pane_get_session_state → current todos, decisions, recent actions, working set");
+  dynamicParts.push("- pane_get_recent_changes → git status, diff, recent commits");
+  dynamicParts.push("- pane_get_project_map → codebase file structure");
+  dynamicParts.push("- pane_recall(query) → search project memory for relevant context");
+  dynamicParts.push("- pane_get_handoff → previous session summary (on cold start)");
+  dynamicParts.push("- pane_read_journal → session history and progress snapshots");
+  dynamicParts.push("Do NOT pre-emptively call all of these. Only retrieve context you actually need for the task at hand.");
+  dynamicParts.push("");
 
-  // Layer 1: Symbol map — resolved from the codebase index against this specific query.
-  // Query-dependent → lives in dynamic (not cached). Models stop grepping for these.
-  // Extended: up to 15 symbols — query matches + working set exports so the model
-  // already knows the key interfaces in scope without searching for them.
-  const relevantSymbols = (brainCtx.relevantSymbols || []).slice(0, 15);
-  if (relevantSymbols.length > 0) {
-    dynamicParts.push("Symbol map (Pane resolved — use directly, do not search for these):");
-    for (const s of relevantSymbols) {
-      const doc = s.doc ? ` — ${s.doc}` : "";
-      dynamicParts.push(`- \`${s.name}\` (${s.kind}) → ${s.file_path || s.file}:${s.line}${doc}`);
-    }
-    dynamicParts.push("");
-  }
-
-  // Brain memories: high-confidence context from the knowledge graph
-  const memories = (brainCtx.memories || []).filter(m => (m.confidence || 0) >= 0.75);
-  if (memories.length > 0) {
-    dynamicParts.push("Relevant context from prior work:");
-    for (const mem of memories) dynamicParts.push(`- ${mem.content}`);
-    dynamicParts.push("");
-  }
-
-  // Extracted principles: standing project standards identified from past exchanges.
-  // Separate from general memories — these are active criteria, not historical observations.
-  const principles = (brainCtx.principles || []);
-  if (principles.length > 0) {
-    dynamicParts.push("Active project standards (extracted from how you work on this project — apply when relevant):");
-    for (const p of principles) dynamicParts.push(`- ${p.content}`);
-    dynamicParts.push("");
-  }
+  // ── All project state is now on-demand via tools ──────────────────────
+  // Git status, working set, pre-reads, decisions, recent actions, memories,
+  // symbols, and principles are retrieved by the model when needed:
+  //   pane_get_session_state  → todos, decisions, recent actions, working set
+  //   pane_get_recent_changes → git status, diff, recent commits
+  //   pane_get_project_map    → codebase file structure
+  //   pane_recall(query)      → memories, principles, prior work
+  //   pane_read_journal       → session history and progress
+  //   pane_get_handoff        → previous session summary
+  //
+  // This eliminates ~1500-3000 tokens per turn from the system prompt and
+  // ensures the model only loads context relevant to its actual task.
 
   // ── Escalation behavior contract (heuristic router stages 2-4) ─────────
   // When the heuristic router detected consecutive failures and escalated,
@@ -785,151 +630,9 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     }
   }
 
-  // Mind reference: instead of dumping all mind entries into context (costly),
-  // provide a count and summary so the model knows to use pane_recall if needed.
-  // The orchestrator handles full injection when budget allows; this path is the
-  // legacy compileContext() fallback.
-  const mindEntries = (brainCtx.mindEntries || []);
-  if (mindEntries.length > 0) {
-    if (mindEntries.length <= 2) {
-      // Few entries — inline them (small cost)
-      dynamicParts.push("Active thoughts from Mind (user-authored, treat as high-priority context):");
-      for (const m of mindEntries) dynamicParts.push(`- ${m.content}`);
-    } else {
-      // Many entries — provide reference, let model pull via tool
-      const preview = mindEntries.slice(0, 2).map(m => m.content).join("; ");
-      dynamicParts.push(`Mind has ${mindEntries.length} active thoughts. Preview: ${preview}`);
-      dynamicParts.push("Use pane_recall to access full Mind entries if relevant to this task.");
-    }
-    dynamicParts.push("");
-  }
-
-  // Session pins: live high-confidence commitments
-  let sessionPins = [];
-  try {
-    sessionPins = JSON.parse(fs.readFileSync(
-      path.join(MEMORY_DIR, projectId, "session-pins.json"), "utf-8"
-    ));
-  } catch {}
-
-  if (sessionPins.length > 0) {
-    dynamicParts.push("Active commitments:");
-    for (const pin of sessionPins.slice(0, 6)) {
-      const label = pin.type === "error_fix" ? "Fix" : pin.type === "lesson" ? "Lesson" : "Decision";
-      dynamicParts.push(`- [${label}] ${pin.content}`);
-    }
-    dynamicParts.push("");
-  }
-
-  // Previous session handoff — inject at session start only (historyLength < 2).
-  // Uses rolling history (last 3 sessions): most recent shown in full, older shown
-  // as one-line summaries to give trajectory without bloating context.
-  // Stale handoffs (>24h) are dropped — they're noise, not signal.
-  //
-  // Confidence filtering (Layer 3):
-  //   ≥ 0.80 — shown as-is (high confidence)
-  //   0.60–0.79 — shown with "(uncertain)" suffix, model should verify first
-  //   < 0.60 — omitted (too noisy)
-  // Trajectory summaries only include items with confidence ≥ 0.75.
-  if (historyLength < 2) {
-    const history = readHandoffHistory(projectId) || [];
-    if (history.length > 0) {
-      const now = Date.now();
-
-      // Most recent — full detail if fresh enough
-      const recent = history[0];
-      const recentAgeHours = (now - (recent.timestamp || 0)) / (1000 * 60 * 60);
-
-      // Filter items above the injection threshold, label uncertain ones
-      const visibleItems = (arr) => (arr || []).reduce((out, raw) => {
-        const item = normalizeHandoffItem(raw);
-        if (!item || item.confidence < 0.60) return out;
-        const label = item.confidence < 0.80 ? ` (uncertain)` : "";
-        out.push({ text: item.text, label });
-        return out;
-      }, []);
-
-      const recentAccomplishments = visibleItems(recent.accomplishment);
-
-      if (recentAgeHours < 24 && recentAccomplishments.length > 0) {
-        const ageLabel = recentAgeHours >= 6 ? ` (~${Math.round(recentAgeHours)}h ago)` : "";
-
-        // Show completed work from previous sessions separately
-        // This helps the model distinguish between "already done" and "currently working on"
-        const recentCompleted = (recent.completed_from_history || []).reduce((out, raw) => {
-          const item = normalizeHandoffItem(raw);
-          if (!item || item.confidence < 0.60) return out;
-          const label = item.confidence < 0.80 ? ` (uncertain)` : "";
-          out.push({ text: item.text, label });
-          return out;
-        }, []);
-
-        if (recentCompleted.length > 0) {
-          dynamicParts.push(`Previous session completed${ageLabel} (done — do not repeat):`);
-          for (const { text, label } of recentCompleted) dynamicParts.push(`✓ ${text}${label}`);
-          dynamicParts.push("");
-        }
-
-        // Show outcomes from current session separately from history
-        if (recentAccomplishments.length > 0) {
-          dynamicParts.push(`Current session outcome${ageLabel} (just completed):`);
-          for (const { text, label } of recentAccomplishments) dynamicParts.push(`✓ ${text}${label}`);
-        }
-
-        if (recent.currentObjective) dynamicParts.push(`Still working on: ${recent.currentObjective}`);
-
-        const recentBlockers = visibleItems(recent.blockers);
-        if (recentBlockers.length > 0) {
-          dynamicParts.push("Unresolved blockers:");
-          for (const { text, label } of recentBlockers) dynamicParts.push(`⚠ ${text}${label}`);
-        }
-
-        const recentNextSteps = visibleItems(recent.nextSteps);
-        if (recentNextSteps.length > 0) {
-          dynamicParts.push("Suggested next steps:");
-          for (const { text, label } of recentNextSteps) dynamicParts.push(`→ ${text}${label}`);
-        }
-
-        const recentFindings = visibleItems(recent.findings);
-        if (recentFindings.length > 0) {
-          dynamicParts.push("Discoveries from last session:");
-          for (const { text, label } of recentFindings) dynamicParts.push(`- ${text}${label}`);
-        }
-
-        dynamicParts.push("");
-
-        // Older sessions — one-line trajectory summaries, high-confidence only (≥ 0.75)
-        for (const older of history.slice(1)) {
-          const ageHrs = (now - (older.timestamp || 0)) / (1000 * 60 * 60);
-          if (ageHrs >= 24) continue; // drop stale
-          if (!older.accomplishment?.length) continue;
-          const highItems = (older.accomplishment || [])
-            .map(normalizeHandoffItem)
-            .filter(item => item && item.confidence >= 0.75)
-            .slice(0, 2);
-          if (!highItems.length) continue;
-          const summary = highItems.map(i => i.text).join(", ");
-          dynamicParts.push(`Earlier (~${Math.round(ageHrs)}h ago): ✓ ${summary}`);
-        }
-        if (history.length > 1) dynamicParts.push("");
-      }
-    }
-  }
-
-  // Session orientation marker — fires from turn 4 onwards so the model always knows where it stands
-  if (historyLength >= 4) {
-    const orientationParts = [`[Turn ${historyLength}.`];
-    if (state.activeTask) orientationParts.push(`Working on: ${state.activeTask.description}.`);
-    const activeTodo = (state.todos || []).find(t => t.status === "in_progress");
-    if (activeTodo) orientationParts.push(`Current step: ${activeTodo.content}.`);
-    if (sessionPins.length > 0) {
-      const topPins = sessionPins.slice(0, 2).map(p => p.content).join("; ");
-      orientationParts.push(`Commitments still active: ${topPins}.`);
-    }
-    orientationParts.push("]");
-    dynamicParts.push(orientationParts.join(" "));
-    dynamicParts.push("");
-  }
+  // Mind entries, session pins, handoff, and session orientation are all
+  // now tool-retrieved via pane_get_session_state and pane_recall.
+  // No longer injected into the system prompt.
 
   // Intent directive — shaped by local intelligence when available.
   // The local model's taskType, complexity, reasoning, and verification signals
@@ -953,33 +656,9 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     dynamicParts.push("For non-trivial tasks, present a brief plan and end with: \"Ready to proceed — send 'go' to start.\" Wait for confirmation before making changes. For simple tasks, just do them.");
   }
 
-  // Behavioral fence — scope enforcement, ONLY on first turn.
-  // On turn 2+, the conversation defines the scope. Injecting a stale
-  // "Objective: [old task]" and "In scope: [old files]" mid-conversation
-  // constrains the model to the wrong task.
-  if (historyLength < 2 && (state.activeTask || state.workingSet.length > 0)) {
-    const fence = ["Behavioral constraints:"];
-
-    if (state.activeTask) {
-      fence.push(`- Objective: ${state.activeTask.description}`);
-    }
-
-    if (state.workingSet.length > 0) {
-      const inScope = state.workingSet.slice(0, 6).map(f => f.path).join(", ");
-      fence.push(`- In scope: ${inScope}`);
-      fence.push(`- Do not touch files outside this scope — if you must, state why before proceeding`);
-    }
-
-    if (state.decisions.length > 0) {
-      fence.push(`- Locked decisions must not be contradicted or undone`);
-    }
-
-    fence.push(`- Every action must trace back to the current objective`);
-    fence.push(`- If you find yourself acting outside scope, stop and explain before continuing`);
-
-    dynamicParts.push(fence.join("\n"));
-    dynamicParts.push("");
-  }
+  // Behavioral fence removed — it referenced activeTask and workingSet
+  // which are now tool-retrieved. The model's scope is defined by the
+  // user's message, not by pre-loaded constraints.
 
   // Method compliance notes — corrections from Pane's post-turn verification
   if (state.methodNotes?.length > 0) {

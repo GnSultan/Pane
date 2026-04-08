@@ -6,7 +6,7 @@
  * context while freeing up tokens for continuation.
  */
 
-import { getContextLimit } from "./session-context.mjs";
+import { getContextLimit } from "./pane-system-prompt.mjs";
 
 // Context compaction thresholds
 const COMPACTION_THRESHOLDS = {

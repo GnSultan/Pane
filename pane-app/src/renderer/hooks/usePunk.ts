@@ -28,6 +28,7 @@ import {
   sessionClearState,
   sessionReadState,
   extractPreferencesFromTurn,
+  resumeFromCheckpoint,
 } from "../lib/tauri-commands";
 import type {
   PunkStreamEvent,
@@ -845,6 +846,8 @@ export function usePunk(projectId: string) {
   // Prevents the old processEnded from calling finishProcessing (which would set isProcessing=false)
   // and from nulling the session ID — the new message needs both intact.
   const intentionalAbortRef = useRef(false);
+  const retryAttemptRef = useRef<Record<string, number>>({});
+  const messageQueueRef = useRef<Array<{ prompt: string; minds?: Array<{ id: string }>; effectiveMode?: string }>>([]);
 
   const sendMessage = useCallback(
     async (prompt: string, minds?: Array<{ id: string }>, effectiveMode?: string) => {
@@ -852,20 +855,22 @@ export function usePunk(projectId: string) {
       const project = store.projects.get(projectId);
       if (!project) return;
 
-      // If already processing, abort the current generation and immediately replace it.
-      // Mark intentionalAbort so the old processEnded skips finishProcessing/session-null.
-      // UI stays on isProcessing=true the whole time — user sees no interruption.
+      // If already processing, queue the message instead of aborting.
+      // This prevents the "Hard Kill" where follow-up messages reset the model mid-task.
       if (project.conversation.isProcessing) {
-        intentionalAbortRef.current = true;
-        await abortPunk(projectId).catch(() => {});
-        resetStreamingState(projectId, true); // flush = true to capture partial response
-        const s = useProjectsStore.getState();
-        s.setLastMessageStreamingDone(projectId);
-        s.setIsPlanning(projectId, false);
-      } else {
-        await abortPunk(projectId).catch(() => {});
-        resetStreamingState(projectId);
+        messageQueueRef.current.push({ prompt, minds, effectiveMode });
+        store.setConversationStatusMessage(projectId, "Message queued (agent is busy)");
+        setTimeout(() => {
+          const current = useProjectsStore.getState().projects.get(projectId);
+          if (current && current.conversation.statusMessage === "Message queued (agent is busy)") {
+            useProjectsStore.getState().setConversationStatusMessage(projectId, null);
+          }
+        }, 3000);
+        return;
       }
+
+      await abortPunk(projectId).catch(() => {});
+      resetStreamingState(projectId);
 
       const messageId = nextMessageId();
       // Strip any leading slash directive (e.g. /discuss, /analyze) — these are system
@@ -943,6 +948,16 @@ export function usePunk(projectId: string) {
             window.dispatchEvent(evt);
           }
         }
+
+        // Process next message in queue if any
+        if (messageQueueRef.current.length > 0) {
+          const next = messageQueueRef.current.shift();
+          if (next) {
+            setTimeout(() => {
+              sendMessage(next.prompt, next.minds, next.effectiveMode);
+            }, 500);
+          }
+        }
       };
 
       const handleEvent = (event: PunkStreamEvent) => {
@@ -963,6 +978,10 @@ export function usePunk(projectId: string) {
           case "sdk_init_info": {
             const { models, account } = event.data;
             useWorkspaceStore.getState().setSdkInfo(models, account);
+            // Clear stale rate limit info from the previous session.
+            // Rate limit events are session-scoped — an overage or warning from
+            // last session has no meaning for this new one.
+            useWorkspaceStore.getState().setRateLimitInfo(null);
             break;
           }
 
@@ -1078,14 +1097,37 @@ export function usePunk(projectId: string) {
               break;
             }
 
-            // If the process died without ever sending a result event, surface an error
-            if (!resultReceived) {
+            // If the process died without ever sending a result event, surface an error.
+            // Ignore if aborted is true, which indicates an intentional abort/cancellation.
+            if (!resultReceived && !event.data?.aborted) {
               const s = useProjectsStore.getState();
               if (!s.projects.get(projectId)?.conversation.error) {
-                s.setConversationError(
-                  projectId,
-                  "Process exited without responding — session may be invalid. Try again.",
-                );
+                // --- Phase 3: Auto-Resume from Checkpoint ---
+                const sessionId = ""; // backend uses projectId for turn archives currently
+                resumeFromCheckpoint(projectId, sessionId).then(async (checkpoint) => {
+                  const currentRetries = retryAttemptRef.current[projectId] || 0;
+                  if (checkpoint && currentRetries < 1) {
+                    retryAttemptRef.current[projectId] = currentRetries + 1;
+                    console.log(`[pane] Unexpected exit on turn ${checkpoint.turn}. Auto-resuming from checkpoint (attempt 1)...`);
+                    
+                    s.setConversationStatusMessage(projectId, "recovering session...");
+                    await new Promise(r => setTimeout(r, 2000));
+                    
+                    resetStreamingState(projectId);
+                    // Re-trigger the same prompt that was in flight (or just continue from history)
+                    sendMessage(prompt, minds, effectiveMode);
+                  } else {
+                    s.setConversationError(
+                      projectId,
+                      "Process exited without responding — session may be invalid. Try again.",
+                    );
+                  }
+                }).catch(() => {
+                  s.setConversationError(
+                    projectId,
+                    "Process exited without responding — session may be invalid. Try again.",
+                  );
+                });
               }
             }
             finishProcessing();

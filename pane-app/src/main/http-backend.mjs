@@ -11,12 +11,20 @@ const { AbortController, fetch, TextDecoder, console } = globalThis;
 
 import { PunkBackend } from "./punk-backend.mjs";
 import { ToolExecutor } from "./tool-executor.mjs";
-import { compileContext, mergeState, readState, getContextLimit, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, writeHandoffWithHistory, updateLatestHandoff, readHandoff } from "./session-context.mjs";
+import { compileContext, mergeState, readState, getContextLimit, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, writeHandoffWithHistory, updateLatestHandoff, readHandoff } from "./pane-system-prompt.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
 import { estimateConversationTokens } from "./token-budget.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
 import contextManager from "./context-manager.mjs";
 import { calculateCost } from "./pricing.mjs";
+import {
+  summarize,
+  storeRaw,
+} from "./tool-result-cache.mjs";
+import { manageConversation } from "./conversation-lifecycle.mjs";
+import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
+import { openJournal, canResume, replay, clearJournal } from "./session-journal.mjs";
+import { getPaneDb } from "./pane-db.mjs";
 
 // ============================================================================
 // Context Window Manager — Pane-owned conversation lifecycle
@@ -33,95 +41,7 @@ import { calculateCost } from "./pricing.mjs";
 
 const CONTEXT_WINDOW_CAP = 128000;  // Universal cap — works for any model
 const OUTPUT_RESERVE     = 8192;
-const PRUNE_TOOL_AGE     = 6;       // Prune tool results older than N messages back
 
-/**
- * Prune old tool results in conversation history to compact outcome summaries.
- * A file read from 8 turns ago doesn't need 3,000 tokens of content —
- * just "Read punk-engine.mjs (1,847 lines)".
- *
- * @param {Array} messages - the messages array (mutated in place)
- * @param {number} recentCount - number of recent messages to leave untouched
- * @returns {{ pruned: number, tokensSaved: number }}
- */
-function pruneOldToolResults(messages, recentCount = PRUNE_TOOL_AGE) {
-  if (messages.length <= recentCount + 1) return { pruned: 0, tokensSaved: 0 };
-
-  let pruned = 0;
-  let charsSaved = 0;
-  const cutoff = messages.length - recentCount;
-
-  for (let i = 1; i < cutoff; i++) {  // skip index 0 (system message)
-    const msg = messages[i];
-
-    // Prune tool result content (role: "tool" in Pane history)
-    if (msg.role === "tool" || msg.role === "user") {
-      const content = msg.content;
-
-      if (typeof content === "string" && content.length > 500) {
-        // Simple string tool result — summarize
-        const summary = _summarizeToolOutput(content);
-        charsSaved += content.length - summary.length;
-        msg.content = summary;
-        pruned++;
-      } else if (Array.isArray(content)) {
-        // Content blocks — prune tool_result blocks
-        for (let j = 0; j < content.length; j++) {
-          const block = content[j];
-          if (block.type === "tool_result" && typeof block.content === "string" && block.content.length > 500) {
-            const summary = _summarizeToolOutput(block.content);
-            charsSaved += block.content.length - summary.length;
-            content[j] = { ...block, content: summary };
-            pruned++;
-          }
-        }
-      }
-    }
-
-    // Prune assistant messages with large tool_use input blocks
-    if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      for (let j = 0; j < msg.content.length; j++) {
-        const block = msg.content[j];
-        if (block.type === "tool_use" && block.input) {
-          const inputStr = typeof block.input === "string" ? block.input : JSON.stringify(block.input);
-          if (inputStr.length > 1000) {
-            // Keep tool name and a summary, drop the full input
-            const name = block.name || "tool";
-            const truncated = inputStr.slice(0, 100) + "...";
-            charsSaved += inputStr.length - truncated.length;
-            msg.content[j] = { ...block, input: { _pruned: true, summary: `${name}: ${truncated}` } };
-            pruned++;
-          }
-        }
-      }
-    }
-  }
-
-  const tokensSaved = Math.round(charsSaved / 4);
-  return { pruned, tokensSaved };
-}
-
-/**
- * Summarize a tool output to a compact one-liner.
- * Extracts key information: file paths, line counts, error status.
- */
-function _summarizeToolOutput(output) {
-  const lines = output.split("\n");
-  const lineCount = lines.length;
-
-  // File content (common pattern: starts with line numbers or code)
-  if (lineCount > 10) {
-    const firstLine = lines[0].trim();
-    const lastLine = lines[lineCount - 1].trim();
-    return `[${lineCount} lines] ${firstLine.slice(0, 120)}... → ...${lastLine.slice(0, 80)}`;
-  }
-
-  // Short output — keep as-is if under threshold
-  if (output.length <= 500) return output;
-
-  // Long single block — truncate with marker
-  return output.slice(0, 300) + `\n...[${lineCount} lines, ${output.length} chars truncated]`;
-}
 
 /**
  * Manage the context window: prune tool results, check size, summarize if needed.
@@ -131,59 +51,13 @@ function _summarizeToolOutput(output) {
  * @param {number} systemTokens - estimated tokens in the system prompt
  * @returns {{ action: string, tokensBefore: number, tokensAfter: number }}
  */
-function manageContextWindow(messages, systemTokens = 0) {
-  const estimateTokens = (msgs) => {
-    let chars = 0;
-    for (const m of msgs) {
-      if (typeof m.content === "string") chars += m.content.length;
-      else if (Array.isArray(m.content)) {
-        for (const b of m.content) {
-          if (typeof b === "string") chars += b.length;
-          else if (b.text) chars += b.text.length;
-          else if (b.content) chars += (typeof b.content === "string" ? b.content.length : JSON.stringify(b.content).length);
-          else if (b.input) chars += JSON.stringify(b.input).length;
-        }
-      }
-    }
-    return Math.round(chars / 4);
-  };
-
+function manageContextWindow(messages, systemTokens = 0, projectId = null) {
   const budget = CONTEXT_WINDOW_CAP - OUTPUT_RESERVE - systemTokens;
-  const tokensBefore = estimateTokens(messages);
-
-  // Phase 1: ALWAYS prune old tool results — this is a cost optimization,
-  // not just overflow prevention. A 3,000-token file read from 6 turns ago
-  // is waste regardless of window pressure.
-  const pruneResult = pruneOldToolResults(messages);
-  let tokensAfter = estimateTokens(messages);
-
-  if (pruneResult.pruned > 0) {
-    console.log(`[http] Window: pruned ${pruneResult.pruned} tool results, saved ~${pruneResult.tokensSaved} tokens`);
-  }
-
-  if (tokensAfter <= budget * 0.9) {
-    return {
-      action: pruneResult.pruned > 0 ? "pruned" : "none",
-      tokensBefore,
-      tokensAfter,
-    };
-  }
-
-  // Phase 2: Drop oldest conversation turns (keep system + last N)
-  // Keep at least 8 recent messages (4 turns) for coherence
-  const MIN_RECENT = 8;
-  while (messages.length > MIN_RECENT + 1 && tokensAfter > budget * 0.85) {
-    // Remove the message right after system (index 1)
-    messages.splice(1, 1);
-    tokensAfter = estimateTokens(messages);
-  }
-
-  console.log(
-    `[http] Window managed: ${tokensBefore} → ${tokensAfter} tokens ` +
-    `(pruned ${pruneResult.pruned} tools, ${messages.length} messages remaining)`
-  );
-
-  return { action: "trimmed", tokensBefore, tokensAfter };
+  return manageConversation(messages, {
+    systemTokens,
+    budget,
+    strategy: "progressive",
+  });
 }
 
 // ============================================================================
@@ -974,6 +848,61 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  // ── On-demand context tools ──────────────────────────────────────────────
+  // These replace pre-loaded context in the system prompt. The model calls
+  // them when it actually needs context, instead of Pane guessing upfront.
+  {
+    type: "function",
+    function: {
+      name: "pane_get_session_state",
+      description:
+        "Get the current session state: active task, pending todos, locked decisions, recent actions, and working set. Call this when you need to know what work has been done or what's pending — it is NOT pre-loaded into context.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_get_project_map",
+      description:
+        "Get the project's file structure — every indexed file with path and type. Call this to understand the codebase layout before exploring. Useful on first turn or when working in unfamiliar areas.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_get_recent_changes",
+      description:
+        "Get recent file changes: git diff summary, modified files since last turn, and current branch status. Call this to understand what changed recently.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_read_journal",
+      description:
+        "Read the session journal — a log of all messages, tool results, and progress snapshots from the current and recent sessions. Optionally search by keyword. Use this to recall what happened earlier in the conversation or in a previous session that was interrupted.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Optional keyword to search for in journal entries. Omit to get the most recent entries." },
+          limit: { type: "number", description: "Maximum number of entries to return (default: 10)" },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_get_handoff",
+      description:
+        "Get the handoff document from the most recent previous session — accomplishments, blockers, next steps, and discoveries. Call this on cold start if you need context about what was done before.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
 ];
 
 // ── Phase-based tool lists ─────────────────────────────────────────────────
@@ -1588,6 +1517,7 @@ export class ApiBackend extends PunkBackend {
     const abortController = new AbortController();
     this.activeRequests.set(request.projectId, abortController);
     const spawnStartTime = Date.now();
+    let journal = null; // Hoisted — opened inside try, closed in finally
 
     this.onEvent(
       request.projectId,
@@ -1703,7 +1633,50 @@ export class ApiBackend extends PunkBackend {
       // Attach tier metadata to the system message for prepareRequest() to consume
       const messages = [{ role: "system", content: systemPrompt, _tiers: systemTiers }];
 
-      if (request.history) {
+      // ── Session Resume: journal-first message loading ─────────────────────
+      // Check if a previous session died mid-work. If a journal exists and is
+      // fresh, replay it instead of using the renderer's truncated history.
+      // The journal has the FULL conversation state including tool results,
+      // auto-continuation prompts, and responses that the renderer may never
+      // have received (stream died before delivery).
+      //
+      // Cache impact: messages replay verbatim, so Anthropic's prefix cache
+      // hits on everything the model already saw. The system prompt is fresh
+      // (it changes per-session), but frozen/session tiers still cache-hit
+      // if content hasn't changed.
+      const isNewConversation = !request.history || request.history.length === 0;
+      let journalResumed = false;
+      let lastProgress = null;
+
+      if (!isNewConversation) {
+        const resumeCheck = canResume(request.projectId);
+        if (resumeCheck.resumable && resumeCheck.meta) {
+          const journalData = replay(request.projectId);
+          if (journalData.messages.length > 0) {
+            // Journal has more context than the renderer's slice(-20) —
+            // use it as the source of truth
+            for (const msg of journalData.messages) {
+              messages.push(msg);
+            }
+            lastProgress = journalData.progress;
+            journalResumed = true;
+            console.log(
+              `[http] ⟲ RESUMED from journal: ${journalData.messages.length} messages, ` +
+              `last activity ${Math.round((Date.now() - resumeCheck.meta.lastAppendAt) / 1000)}s ago` +
+              (lastProgress ? `, progress: ${lastProgress.accomplishments?.length || 0} accomplishments` : ""),
+            );
+
+            // Surface the resume to the UI
+            this.onEvent(request.projectId, {
+              event: "status",
+              data: { message: "resuming previous session..." },
+            }, request.requestId);
+          }
+        }
+      }
+
+      // Fall back to renderer history if no journal resume
+      if (!journalResumed && request.history) {
         for (const msg of request.history) {
           if (msg.type === "user") {
             messages.push({
@@ -1720,7 +1693,7 @@ export class ApiBackend extends PunkBackend {
       }
 
       console.log(
-        `[http] Loaded ${messages.length} messages from history (roles: ${messages.map((m) => m.role).join(", ")})`,
+        `[http] Loaded ${messages.length} messages (${journalResumed ? "journal" : "history"})`,
       );
 
       // Prefix-caching optimization is applied in prepareRequest() per-provider,
@@ -1736,7 +1709,7 @@ export class ApiBackend extends PunkBackend {
       //   Phase 2: Drop oldest turns if still over budget
       // This replaces the old contextManager.shouldAutoCompact approach.
       const systemTokens = context.budget?.systemUsed || Math.round((systemPrompt?.length || 0) / 4);
-      const windowResult = manageContextWindow(messages, systemTokens);
+      const windowResult = manageContextWindow(messages, systemTokens, request.projectId);
       if (windowResult.action !== "none") {
         this.onEvent(request.projectId, {
           event: "window_managed",
@@ -1749,16 +1722,56 @@ export class ApiBackend extends PunkBackend {
         }, request.requestId);
       }
 
-      messages.push({
-        role: "user",
-        content: [{ type: "text", text: request.prompt }],
+      // Build the user prompt for this turn. If resuming from journal with
+      // progress data, inject the progress context so the model knows exactly
+      // where it was when it dropped.
+      if (journalResumed && lastProgress) {
+        const resumeParts = [request.prompt];
+        resumeParts.push("\n\n[Session resumed — your previous session was interrupted. Here is your progress:]");
+        if (lastProgress.accomplishments?.length > 0) {
+          resumeParts.push(`\n[Completed]\n${lastProgress.accomplishments.map(a => `- ${a}`).join("\n")}`);
+        }
+        if (lastProgress.decisions?.length > 0) {
+          resumeParts.push(`\n[Decisions locked — do not revisit]\n${lastProgress.decisions.map(d => `- ${d}`).join("\n")}`);
+        }
+        if (lastProgress.pendingTodos?.length > 0) {
+          resumeParts.push(`\n[Remaining work]\n${lastProgress.pendingTodos.map(t => `- ${t}`).join("\n")}`);
+        }
+        resumeParts.push("\nPick up exactly where you left off. Do NOT re-explore files you already read.");
+
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: resumeParts.join("\n") }],
+        });
+      } else {
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: request.prompt }],
+        });
+      }
+
+      // ── Session Journal ───────────────────────────────────────────────────
+      // Open the journal for this session. If resuming, we append to the
+      // existing journal (preserving the full history). If new, we start fresh.
+      // The journal is the crash-safe source of truth for the messages array.
+      journal = openJournal(request.projectId, {
+        fresh: isNewConversation && !journalResumed,
+        model: request.model,
+        provider: request.provider,
       });
 
+      // Journal the new user message (the one we just pushed)
+      journal.append(messages[messages.length - 1]);
+
       let turn = 0;
-      const maxTurns = 100;
-      let sessionOutput = ""; // Accumulate all model text for pattern extraction
-      let turnRetryCount = 0;  // Retries for insufficient_system_resource
+      const maxTurns = 500;
+      let sessionOutput = ""; // Accumulate model text for pattern extraction (capped)
+      const SESSION_OUTPUT_CAP = 512_000; // ~500KB — enough for extraction, avoids unbounded growth
+      let disconnectRetryCount = 0; // Retries for premature stream disconnects
       const arbiterChangedFiles = new Set(); // Track files modified for Turn Sentinel
+
+      const MAX_TURN_RETRIES = 3;
+      let turnRetryCount = 0;
 
       while (turn < maxTurns) {
         turn++;
@@ -1769,6 +1782,7 @@ export class ApiBackend extends PunkBackend {
 
         const state = {
           accumulated: "",
+          thinking: "", // Track reasoning for resilience checks
           toolUses: new Map(),
           finishReason: null,
           model: resolvedModel,
@@ -1776,6 +1790,7 @@ export class ApiBackend extends PunkBackend {
         };
         this.requestStates.set(request.projectId, state);
 
+        try {
         // deepseek-reasoner (R1) does not support function calling — sending tools
         // returns HTTP 400. It also ignores sampling params (temperature etc.).
         const isDeepSeekReasoner =
@@ -1822,6 +1837,7 @@ export class ApiBackend extends PunkBackend {
           (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
           apiConfig.provider === "kimi" ||
           apiConfig.provider === "stepfun" ||
+          apiConfig.provider === "xiaomi" ||
           (apiConfig.provider === "openrouter" && orPersonality.supportsTools)
         ) {
           body.tools = getToolsForPhase(phase);
@@ -1837,6 +1853,11 @@ export class ApiBackend extends PunkBackend {
         if (request.thinking && apiConfig.provider === "openrouter") {
           // OpenRouter standard reasoning toggle
           body.include_reasoning = true;
+        }
+
+        if (request.thinking && apiConfig.provider === "xiaomi") {
+          // Xiaomi Mimo thinking mode — supported on mimo-v2-pro and mimo-v2-omni
+          body.enable_thinking = true;
         }
 
         const { url, headers, finalBody } = await this.prepareRequest(
@@ -1873,6 +1894,18 @@ export class ApiBackend extends PunkBackend {
         // Track retry history for debugging
         const retryHistory = [];
         let lastErrorType = null;
+
+        // Lightweight pre-call checkpoint: save the last 6 messages instead of
+        // the full array. Avoids the 60GB memory spike from structuredClone on
+        // massive conversation arrays, but gives error recovery actual state to
+        // restore from (previously saved messages: null which was useless).
+        saveTurn(request.projectId, turn, {
+          messages: messages.slice(-6),
+          fullLength: messages.length,
+          turn,
+          timestamp: Date.now(),
+          phase: "pre-call"
+        });
 
         while (true) {
           try {
@@ -2151,7 +2184,9 @@ export class ApiBackend extends PunkBackend {
         if (state.accumulated) {
           finalContent.push({ type: "text", text: state.accumulated });
           // Accumulate text for pattern extraction in handoff
-          sessionOutput += (sessionOutput ? "\n\n" : "") + state.accumulated;
+          if (sessionOutput.length < SESSION_OUTPUT_CAP) {
+            sessionOutput += (sessionOutput ? "\n\n" : "") + state.accumulated;
+          }
         }
         for (const tool of state.toolUses.values()) {
           let parsedInput = {};
@@ -2184,15 +2219,166 @@ export class ApiBackend extends PunkBackend {
         );
 
         messages.push({ role: "assistant", content: finalContent });
+        journal.append({ role: "assistant", content: finalContent }, { turn, phase: "response" });
 
         // LOOP CONTROL
         const hasTools = state.toolUses.size > 0;
         const hasContent = state.accumulated.trim().length > 0;
+        const wasThinking = state.thinking.trim().length > 0;
         const isLengthLimited = state.finishReason === "length";
         const isToolCalls = state.finishReason === "tool_calls";
 
-        // If no reason to continue, break
-        if (!hasTools && !isLengthLimited && !isToolCalls) break;
+        // Handle premature stream disconnects
+        // Detect two cases:
+        //   1. Stream died with nothing: finishReason null, no content, no tools
+        //   2. Stream died mid-output: finishReason null, but has partial content/thinking
+        // Both mean the API connection dropped before the model finished its turn.
+        const streamDiedEmpty = state.finishReason == null && !hasContent && !hasTools;
+        const streamDiedMidOutput = state.finishReason == null && (hasContent || wasThinking);
+
+        if ((streamDiedEmpty || streamDiedMidOutput) && !abortController.signal.aborted) {
+          if (disconnectRetryCount < 3) {
+            disconnectRetryCount++;
+            turn--; // Don't consume a turn
+
+            const diag = streamDiedMidOutput
+              ? `partial output (${state.accumulated.length} chars text, ${state.thinking.length} chars thinking)`
+              : wasThinking ? "abandoned thought" : "no data received";
+            console.warn(`[http] Stream closed prematurely (${diag}). Retrying turn ${turn + 1} (attempt ${disconnectRetryCount}/3)...`);
+
+            // Strip the assistant message — it's incomplete
+            messages.pop();
+
+            // If we had partial thinking/content, preserve it as context for the retry
+            // so the model doesn't lose its reasoning if the retry also partially fails
+            if (streamDiedMidOutput && disconnectRetryCount >= 2) {
+              const partialContext = [];
+              if (state.thinking.trim()) {
+                partialContext.push(`[Your partial reasoning from dropped connection — continue from here]\n...${state.thinking.slice(-400)}`);
+              }
+              if (state.accumulated.trim()) {
+                partialContext.push(`[Your partial output from dropped connection — continue from here]\n...${state.accumulated.slice(-300)}`);
+              }
+              if (partialContext.length > 0) {
+                const disconnectMsg = {
+                  role: "user",
+                  content: [{ type: "text", text: partialContext.join("\n\n") }]
+                };
+                messages.push(disconnectMsg);
+                journal.append(disconnectMsg, { turn, phase: "disconnect-recovery" });
+              }
+            }
+
+            // Surface the retry to the UI
+            this.onEvent(request.projectId, {
+              event: "status",
+              data: { message: `connection dropped — retrying turn (${disconnectRetryCount}/3)` },
+            }, request.requestId);
+
+            await new Promise((resolve) => setTimeout(resolve, 2000 * disconnectRetryCount));
+
+            // Clear status
+            this.onEvent(request.projectId, {
+              event: "status",
+              data: { message: null },
+            }, request.requestId);
+
+            continue;
+          } else {
+            console.error("[http] Stream closed prematurely 3 times in a row. Falling through.");
+          }
+        }
+        
+        disconnectRetryCount = 0; // Reset on success
+
+        // If no reason to continue, check for pending todos before breaking
+        if (!hasTools && !isLengthLimited && !isToolCalls) {
+          const todos = readState(request.projectId).todos || [];
+          const workLeft = todos.some(t => t.status === "pending" || t.status === "in_progress");
+
+          if (workLeft && turn < maxTurns) {
+            const remaining = todos.filter(t => t.status !== "completed");
+            console.log(`[http] Auto-continuing turn ${turn} - work is pending (${remaining.length} todos)`);
+
+            // ── Progress-aware continuation ──────────────────────────────────
+            // The model dropped mid-work. Instead of a generic "continue", we
+            // reconstruct what it already accomplished + decided so it picks up
+            // where it left off rather than re-exploring from scratch.
+            const continuationParts = [];
+
+            continuationParts.push("You stopped before finishing. Here is your progress so far — pick up exactly where you left off, do NOT re-explore or re-read files you already examined.");
+
+            // Inject what the model already accomplished this session
+            const sessionState = readState(request.projectId);
+            const recentActions = sessionState.recentActions || [];
+            if (recentActions.length > 0) {
+              const actionSummary = recentActions.slice(-5).map(a => `- ${a.content}`).join("\n");
+              continuationParts.push(`\n[Actions completed so far]\n${actionSummary}`);
+            }
+
+            // Inject decisions locked this session
+            const decisions = sessionState.decisions || [];
+            if (decisions.length > 0) {
+              const decisionSummary = decisions.slice(-3).map(d => `- ${d.content}`).join("\n");
+              continuationParts.push(`\n[Decisions already made — do not revisit]\n${decisionSummary}`);
+            }
+
+            // Inject the model's own last thinking/content as a mirror
+            // Walk backwards through messages to find the last assistant content
+            for (let i = messages.length - 1; i >= Math.max(0, messages.length - 4); i--) {
+              const m = messages[i];
+              if (m.role === "assistant") {
+                // Extract thinking if present (model's reasoning before it dropped)
+                const thinkingBlock = Array.isArray(m.content)
+                  ? m.content.find(b => b.type === "thinking")
+                  : null;
+                if (thinkingBlock?.thinking) {
+                  // Last 500 chars of thinking — the most recent reasoning
+                  const tail = thinkingBlock.thinking.slice(-500);
+                  continuationParts.push(`\n[Your last reasoning before dropping]\n...${tail}`);
+                }
+                // Extract text content if present
+                const textContent = Array.isArray(m.content)
+                  ? m.content.filter(b => b.type === "text").map(b => b.text).join("\n")
+                  : typeof m.content === "string" ? m.content : "";
+                if (textContent.trim()) {
+                  const tail = textContent.slice(-300);
+                  continuationParts.push(`\n[Your last output before dropping]\n...${tail}`);
+                }
+                break;
+              }
+            }
+
+            // Remaining work
+            const todoList = remaining.map(t => `- [${t.status}] ${t.content}`).join("\n");
+            continuationParts.push(`\n[Remaining work]\n${todoList}`);
+
+            // Stall warning
+            if (arbiterChangedFiles.size === 0) {
+              continuationParts.push("\nWARNING: Your last turn made no file changes. Use tools (write_file, replace, bash) to actually implement — do not just discuss.");
+            }
+
+            const contMsg = {
+              role: "user",
+              content: [{ type: "text", text: continuationParts.join("\n") }]
+            };
+            messages.push(contMsg);
+            journal.append(contMsg, { turn, phase: "auto-continue" });
+
+            // Journal progress snapshot — if the session dies after this,
+            // the next resume will know exactly what was accomplished
+            const progressState = readState(request.projectId);
+            journal.writeProgress({
+              accomplishments: (progressState.recentActions || []).slice(-5).map(a => a.content),
+              decisions: (progressState.decisions || []).map(d => d.content),
+              pendingTodos: (progressState.todos || []).filter(t => t.status !== "completed").map(t => t.content),
+              turn,
+            });
+
+            continue;
+          }
+          break;
+        }
 
         // If it was just a length limit without tools, we continue immediately
         // BUT ONLY IF we actually got some content, otherwise we are likely in a loop
@@ -2215,6 +2401,7 @@ export class ApiBackend extends PunkBackend {
           request.workingDir,
         );
         const toolResults = [];
+        let toolSeq = 0; // sequence counter for tool-result-cache
 
         for (const tool of state.toolUses.values()) {
           let parsedInput = {};
@@ -2244,8 +2431,24 @@ export class ApiBackend extends PunkBackend {
               parsedInput,
             );
           }
-          const isError = !result.success;
+          let isError = !result.success;
           let content = result.output || result.error || "";
+
+          // ── Immediate Tool Verification (Reflex Gate) ──────────────────
+          // If a tool failed or was "hollow" (e.g. replace matched 0 lines),
+          // augment the result with an actionable correction directive.
+          // This keeps the model in the same "hot" context turn to fix it.
+          if (tool.name === "replace" && !isError && content.includes("0 replacements")) {
+            const filePath = parsedInput.file_path || parsedInput.path;
+            content = `Error: 0 replacements made in ${filePath}. ` +
+                      `The 'old_string' you provided did not match any text in the file. ` +
+                      `TIP: Read the file again to ensure you have the exact text, including all whitespace and indentation. ` +
+                      `The file content may have changed or your mental model of it is stale.`;
+            isError = true; // Treat hollow replacement as an error to trigger re-thinking
+          }
+          if (tool.name === "write_file" && isError) {
+            content = `Error writing file: ${content}. Ensure the path is correct and you have permission.`;
+          }
 
           // ── Tool Result Enrichment ─────────────────────────────────────
           // When the model uses exploration tools (read_file, grep, glob),
@@ -2368,13 +2571,24 @@ export class ApiBackend extends PunkBackend {
           );
 
           // --- PUSH AS CANONICAL TOOL ROLE ---
-          messages.push({
+          const toolMsg = {
             role: "tool",
             tool_call_id: tool.id,
             name: tool.name,
             content,
             is_error: isError,
-          });
+          };
+          messages.push(toolMsg);
+          journal.append(toolMsg, { turn, phase: "tool-result" });
+
+          // Persist raw result to disk cache — survives pruning for future summarization
+          try {
+            storeRaw(request.projectId, turn, toolSeq++, {
+              toolName: tool.name,
+              args: parsedInput,
+              content,
+            });
+          } catch {} // cache write failure is non-blocking
         }
 
         // Always refresh context after tool execution — ensures every turn has fresh state
@@ -2431,10 +2645,54 @@ export class ApiBackend extends PunkBackend {
 
         // Window management with stable system prompt
         const loopSystemTokens = Math.round((messages[0]?.content?.length || 0) / 4);
-        manageContextWindow(messages, loopSystemTokens);
-      }
+        manageContextWindow(messages, loopSystemTokens, request.projectId);
+        } catch (turnError) {
+          // Per-turn error handling — retry recoverable errors inside the loop
+          if (turnError.name === "AbortError") throw turnError; // propagate to outer
+          const isRecoverable = (err) => {
+            const msg = (err.message || "").toLowerCase();
+            return (
+              msg.includes("429") || msg.includes("500") || msg.includes("502") ||
+              msg.includes("503") || msg.includes("504") || msg.includes("econnreset") ||
+              msg.includes("etimedout") || msg.includes("insufficient_system_resource")
+            );
+          };
+          if (isRecoverable(turnError) && turnRetryCount < MAX_TURN_RETRIES) {
+            turnRetryCount++;
+            const delay = Math.pow(2, turnRetryCount) * 1000;
+            console.warn(`[http] Recoverable error on turn ${turn}. Retrying in ${delay}ms (attempt ${turnRetryCount}/${MAX_TURN_RETRIES}). Error: ${turnError.message}`);
+            this.onEvent(request.projectId, {
+              event: "status",
+              data: { message: `error — retrying turn ${turn} in ${delay/1000}s (${turnRetryCount}/${MAX_TURN_RETRIES})` },
+            }, request.requestId);
+            await new Promise(r => setTimeout(r, delay));
+            // Try to restore from checkpoint. Pre-call checkpoints save
+            // the last 6 messages (lightweight), post-turn saves the full array.
+            const checkpoint = loadTurn(request.projectId, turn);
+            if (checkpoint && checkpoint.messages?.length > 0) {
+              if (checkpoint.phase === "pre-call" && checkpoint.fullLength) {
+                // Pre-call checkpoint only has tail — splice it back onto the
+                // messages array at the correct position to avoid losing earlier context
+                const keepFromCurrent = messages.slice(0, checkpoint.fullLength - checkpoint.messages.length);
+                messages = [...keepFromCurrent, ...checkpoint.messages];
+                console.log(`[http] Restored turn ${turn} from pre-call checkpoint (${checkpoint.messages.length} tail msgs, ${messages.length} total)`);
+              } else {
+                messages = checkpoint.messages;
+                console.log(`[http] Restored turn ${turn} from full checkpoint (${messages.length} msgs)`);
+              }
+              turn--;
+              continue;
+            } else {
+              console.warn(`[http] No usable checkpoint for turn ${turn}, retrying with current state`);
+              turn--;
+              continue;
+            }
+          }
+          throw turnError; // non-recoverable — propagate to outer catch
+        }
 
-      // Turn completed cleanly — mark all in_progress todos as done
+        // Turn completed cleanly — mark boundary in journal and advance todos
+      journal.markTurn(turn);
       autoAdvanceTodos(request.projectId, "turn_end", this.onEvent.bind(this), request.requestId);
 
       // ── Turn Sentinel: independently verify the LLM's work ─────────────
@@ -2558,6 +2816,15 @@ export class ApiBackend extends PunkBackend {
         console.warn(`[http] Failed to write handoff: ${err.message}`);
       }
 
+      // Archive after each successful turn (end-of-turn checkpoint)
+      saveTurn(request.projectId, turn, {
+        messages: structuredClone(messages),
+        turn,
+        timestamp: Date.now(),
+        phase: "post-turn"
+      });
+      }
+
       // Signal successful completion — mirrors cli-worker's "result" event so the
       // renderer's resultReceived flag is set and no false "Process exited" error fires.
       this.onEvent(
@@ -2588,19 +2855,35 @@ export class ApiBackend extends PunkBackend {
         },
         request.requestId,
       );
+
+      // Cleanup turn archive and journal on successful completion
+      clearTurns(request.projectId);
+      journal.close();
+      clearJournal(request.projectId);
     } catch (error) {
+      // ── Emergency handoff: persist discoveries even on crash/abort ──────
+      // Without this, everything the model learned this session is lost.
+      try {
+        const crashHandoff = generateHandoff(request.projectId, { writeFile: false });
+        crashHandoff._exitReason = error.name === "AbortError" ? "aborted" : "error";
+        crashHandoff._errorMessage = error.message;
+        writeHandoffWithHistory(request.projectId, crashHandoff);
+        console.log(`[http] Emergency handoff written on ${crashHandoff._exitReason}`);
+      } catch (handoffErr) {
+        console.warn(`[http] Emergency handoff failed: ${handoffErr.message}`);
+      }
+
       if (error.name === "AbortError") {
         this.onEvent(
           request.projectId,
           {
             event: "processEnded",
-            data: { exit_code: null },
+            data: { exit_code: null, aborted: true },
           },
           request.requestId,
         );
       } else {
-        // Emit a result event with error subtype so the renderer gets a clean
-        // error message rather than the generic "Process exited without responding".
+        // Non-recoverable error (recoverable retries handled in per-turn catch above)
         this.onEvent(
           request.projectId,
           {
@@ -2639,6 +2922,16 @@ export class ApiBackend extends PunkBackend {
         );
       }
     } finally {
+      // Close journal on any exit path — on success it's already cleared,
+      // on error/abort it persists on disk for resume
+      try { journal?.close(); } catch {}
+
+      // Clear status if we're done or failing
+      this.onEvent(request.projectId, {
+        event: "status",
+        data: { message: null },
+      }, request.requestId);
+
       this.activeRequests.delete(request.projectId);
       this.requestStates.delete(request.projectId);
     }
@@ -2780,9 +3073,9 @@ export class ApiBackend extends PunkBackend {
         break;
       }
 
-      case "xiaomi":
-        url =
-          apiConfig.baseUrl || "https://api.xiaomimimo.com/v1/chat/completions";
+      case "xiaomi": {
+        const base = apiConfig.baseUrl ? apiConfig.baseUrl.replace(/\/$/, "") : "https://api.xiaomimimo.com/v1";
+        url = (base.includes("/chat/completions") || base.includes("/messages")) ? base : `${base}/chat/completions`;
         headers = {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
@@ -2794,6 +3087,7 @@ export class ApiBackend extends PunkBackend {
           user: userTag,
         };
         break;
+      }
 
       case "anthropic": {
         url = apiConfig.baseUrl || "https://api.anthropic.com/v1/messages";
@@ -3058,6 +3352,8 @@ export class ApiBackend extends PunkBackend {
         return "step-3.5-flash";
       case "kimi":
         return "moonshot-v1-128k";
+      case "xiaomi":
+        return "mimo-v2-flash";
       case "anthropic":
         return "claude-sonnet-4-6";
       case "openrouter":
@@ -3253,6 +3549,7 @@ export class ApiBackend extends PunkBackend {
       // deepseek-reasoner uses reasoning_content; stepfun uses reasoning;
       // kimi uses standard content only. Tool-call handling is identical
       // to the openrouter block above so they share that logic via fallthrough.
+      case "xiaomi":
       case "deepseek":
       case "kimi":
       case "stepfun": {
@@ -3263,9 +3560,17 @@ export class ApiBackend extends PunkBackend {
           if (delta?.content) content = delta.content;
         }
 
-        // deepseek-reasoner → reasoning_content; stepfun native → reasoning
-        if (delta?.reasoning_content) thinking = delta.reasoning_content;
-        if (delta?.reasoning)         thinking = delta.reasoning;
+        // Use the model personality registry to read the correct reasoning field.
+        const personality = getModelStreamingConfig(state?.model ?? "");
+        if (personality.reasoningField && delta?.[personality.reasoningField]) {
+          thinking = delta[personality.reasoningField];
+        }
+
+        // Fallback for known fields if personality check failed
+        if (!thinking) {
+          if (delta?.reasoning_content) thinking = delta.reasoning_content;
+          if (delta?.reasoning)         thinking = delta.reasoning;
+        }
 
         if (hasDeltaToolCalls) {
           const tc = event.choices[0].delta.tool_calls[0];
@@ -3456,6 +3761,7 @@ export class ApiBackend extends PunkBackend {
     }
 
     if (thinking) {
+      state.thinking += thinking; // Accumulate for resilience checks
       this.onEvent(
         projectId,
         {
@@ -3547,6 +3853,12 @@ export class ApiBackend extends PunkBackend {
       this.activeRequests.delete(projectId);
     }
     this.requestStates.delete(projectId);
+    // Kill any background processes spawned by tools for this project
+    const executor = this.toolExecutors.get(projectId);
+    if (executor) {
+      executor.cleanup();
+      this.toolExecutors.delete(projectId);
+    }
   }
 
   async terminate(projectId) {
@@ -3557,6 +3869,11 @@ export class ApiBackend extends PunkBackend {
     for (const controller of this.activeRequests.values()) controller.abort();
     this.activeRequests.clear();
     this.requestStates.clear();
+    // Clean up ALL tool executors — kill background processes, release references
+    for (const [, executor] of this.toolExecutors) {
+      executor.cleanup();
+    }
+    this.toolExecutors.clear();
   }
 
   async getOpenRouterModels() {
@@ -3626,9 +3943,9 @@ export class ApiBackend extends PunkBackend {
     if (!apiConfig.apiKey) return [];
 
     try {
-      const url = apiConfig.baseUrl
-        ? apiConfig.baseUrl.replace(/\/chat\/completions\/?$/, "/models")
-        : "https://api.xiaomimimo.com/v1/models";
+      const base = apiConfig.baseUrl ? apiConfig.baseUrl.replace(/\/$/, "") : "https://api.xiaomimimo.com/v1";
+      const baseUrlClean = base.replace(/\/(chat\/completions|messages)\/?$/, "");
+      const url = baseUrlClean.endsWith("/models") ? baseUrlClean : `${baseUrlClean}/models`;
       const response = await fetch(url, {
         headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
         signal: AbortSignal.timeout(12_000),

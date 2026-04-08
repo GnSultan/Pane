@@ -10,10 +10,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import crypto from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 import { BrowserWindow, utilityProcess, ipcMain } from "electron";
 import { getPaneDb } from "./pane-db.mjs";
+import { TaskRunner } from "./task-runner.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -33,7 +34,7 @@ function getEnvWithPath() {
   return { ...process.env, PATH: combined };
 }
 
-const STALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes of silence = stalled
+const STALL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes of silence = stalled
 
 /**
  * Run a CLI command and return its stdout as a string.
@@ -141,7 +142,7 @@ import { ApiBackend } from "./http-backend.mjs";
 // Kept as comments for reference — the planning agent owns these now.
 import { PunkBackend } from "./punk-backend.mjs";
 import { modelManager } from "./model-manager.mjs";
-import { readState } from "./session-context.mjs";
+import { readState } from "./pane-system-prompt.mjs";
 import { routingStore } from "./routing-store.mjs";
 import { classifyDomain } from "./routing-oracle.mjs";
 import { ensurePriors } from "./benchmark-scout.mjs";
@@ -324,6 +325,7 @@ class CliBackend extends PunkBackend {
     this.command = command;
     this.activeRequests = new Map(); // requestId -> projectId
     this._requestResolvers = new Map(); // requestId -> resolve function
+    this._loginResolver = null;
   }
 
   getWorker() {
@@ -335,6 +337,19 @@ class CliBackend extends PunkBackend {
     });
 
     this.worker.on("message", (message) => {
+      if (message.type === "login_status") {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) win.webContents.send("pane-claude-signin", { type: "status", ...message });
+        }
+        return;
+      }
+      if (message.type === "login_result") {
+        if (this._loginResolver) {
+          this._loginResolver(message);
+          this._loginResolver = null;
+        }
+        return;
+      }
       // Persist CLI session IDs to SQLite (survives app restarts)
       if (message.type === "persist_session_id") {
         try {
@@ -700,6 +715,27 @@ class PunkEngine {
     // _projectLastOutcome entries older than 30 minutes.
     this._sweepInterval = setInterval(() => this._sweepStaleOutcomes(), 5 * 60 * 1000);
     if (this._sweepInterval.unref) this._sweepInterval.unref(); // don't keep process alive
+
+    // Control Inversion Engine
+    this.taskRunner = new TaskRunner(
+      async (projectId, prompt, systemOverride, request) => {
+        const backend = this.getBackendForRequest(request);
+        if (backend.spawnStep) {
+          return await backend.spawnStep(projectId, prompt, systemOverride, request);
+        }
+        // Fallback for CLI backends which don't support explicit spawnStep (though they should)
+        const isCli = !backend.supportsToolCalling;
+        const modifiedRequest = {
+          ...request,
+          prompt: isCli ? `${systemOverride}\n\n---\n\n${prompt}` : prompt,
+          _systemOverride: isCli ? undefined : systemOverride,
+          history: [],
+        };
+        await backend.spawn(modifiedRequest);
+        return { messages: [] };
+      },
+      (pid, event, rid) => this.handleBackendEvent(pid, event, rid)
+    );
   }
 
   _sweepStaleOutcomes() {
@@ -2020,7 +2056,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       model: planRoute.model,
       thinking: planRoute.thinking ?? (strategy.reasoning === "deep"),
     };
-    const planText = await runPlanningAgent({
+    const planningResult = await runPlanningAgent({
       request: planningRequest,
       planRoute,
       strategy,
@@ -2028,7 +2064,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       onEvent: (pid, event, rid) => this.handleBackendEvent(pid, event, rid),
     });
 
-    if (!planText) {
+    if (!planningResult) {
       console.error("[punk] planning agent returned no plan — aborting orchestration");
       this.handleBackendEvent(projectId, {
         event: "orchestration_error",
@@ -2036,6 +2072,8 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       }, request.requestId);
       return;
     }
+
+    const { planText } = planningResult;
 
     // ── EXECUTION MODEL SELECTION ─────────────────────────────────────────
     const classifierExec = classifierDecision?.executionModel;
@@ -2052,10 +2090,9 @@ Respond with a single concise principle statement (one sentence, under 150 chara
 
     console.log(`[punk] execution → ${execRoute?.provider}/${execRoute?.model}`);
 
-    // ── EXECUTION PASS ────────────────────────────────────────────────────
+    // ── EXECUTION PASS (Stateful Turn) ────────────────────────────────────
     // Execution model receives the plan as context and implements it.
-    // For CLI backends: fold plan into the prompt.
-    // For HTTP backends: use _systemPrepend so the plan is in the system prompt.
+    // By keeping it in a single turn, we maximize context caching (KV cache).
     const executionRequest = {
       ...request,
       phase:          "execution",
@@ -2478,6 +2515,76 @@ export async function registerPunkHandlers() {
   ipcMain.handle("sdk_fork_session", async (_event, { sessionId }) => {
     const { forkSession } = await import("@anthropic-ai/claude-agent-sdk");
     return forkSession(sessionId);
+  });
+
+  // ── Claude auth state — reads ~/.claude.json directly ────────────────────
+  // This is the source of truth regardless of whether a session is running.
+  // The prefetch only fires when the worker spawns, so we need this for
+  // immediate auth state on Profile open and after logout.
+  ipcMain.handle("get_claude_auth_state", () => {
+    const configPath = path.join(os.homedir(), ".claude.json");
+    try {
+      const raw = readFileSync(configPath, "utf-8");
+      const config = JSON.parse(raw);
+      const acct = config.oauthAccount;
+      if (!acct?.emailAddress && !acct?.accountUuid) {
+        return { authenticated: false, account: null };
+      }
+      return {
+        authenticated: true,
+        account: {
+          email: acct.emailAddress || null,
+          displayName: acct.displayName || null,
+          organizationName: acct.organizationName || null,
+          billingType: acct.billingType || null,
+          // normalize string "True"/"False" from the CLI config
+          hasExtraUsageEnabled:
+            acct.hasExtraUsageEnabled === true ||
+            acct.hasExtraUsageEnabled === "True",
+          subscriptionCreatedAt: acct.subscriptionCreatedAt || null,
+        },
+      };
+    } catch {
+      return { authenticated: false, account: null };
+    }
+  });
+
+  // ── Claude signin — triggers OAuth flow via SDK's forceLoginMethod ─────────
+  // The worker opens the SDK with forceLoginMethod: "claudeai" which causes
+  // the SDK to emit auth_status messages with the browser URL. Those get
+  // forwarded as "pane-claude-signin" events to the renderer. When auth
+  // completes, the resolver fires and we refresh auth state.
+  ipcMain.handle("claude_signin", async () => {
+    const backend = punkEngine.backends?.claude;
+    if (!backend) return { success: false, error: "Claude backend not available" };
+    const worker = backend.getWorker();
+
+    return new Promise((resolve) => {
+      backend._loginResolver = resolve;
+      worker.postMessage({ type: "start_login" });
+    });
+  });
+
+  // ── Claude logout — removes oauthAccount from ~/.claude.json ─────────────
+  // Mirrors what `claude logout` does. After removing auth, broadcasts null
+  // account to all renderer windows so the UI reflects the signed-out state.
+  ipcMain.handle("claude_signout", () => {
+    const configPath = path.join(os.homedir(), ".claude.json");
+    try {
+      const raw = readFileSync(configPath, "utf-8");
+      const config = JSON.parse(raw);
+      delete config.oauthAccount;
+      writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+    } catch {
+      // If we can't read/write, treat as signed out anyway
+    }
+    // Broadcast cleared account to all windows
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send("pane-sdk-auth", { account: null, models: null });
+      }
+    }
+    return { success: true };
   });
 }
 

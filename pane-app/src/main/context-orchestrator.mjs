@@ -29,7 +29,7 @@ import path from "node:path";
 import os from "node:os";
 import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
 import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
-import { MODEL_CONTEXT_LIMITS, readState } from "./session-context.mjs";
+import { MODEL_CONTEXT_LIMITS, readState } from "./pane-system-prompt.mjs";
 import { estimateTokens, getModelLimit, getDefaultOutputBudget, createRequestBudget } from "./token-budget.mjs";
 import { saveContextCheckpoint } from "./context-checkpoints.mjs";
 import { contextStore } from "./context-store.mjs";

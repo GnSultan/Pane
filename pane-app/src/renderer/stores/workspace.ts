@@ -79,6 +79,7 @@ interface WorkspaceState {
   setSdkInfo: (models: import("../lib/punk-types").SdkModel[] | null, account: import("../lib/punk-types").SdkAccount | null) => void;
   rateLimitInfo: import("../lib/punk-types").RateLimitInfo | null;
   setRateLimitInfo: (info: import("../lib/punk-types").RateLimitInfo | null) => void;
+  lastTokenUsageAt: number;
   // Profile data
   profileName: string;
   profileBio: string;
@@ -533,10 +534,19 @@ export const useWorkspaceStore: ReturnType<typeof createWorkspaceStore> =
 });
 
 // Listen for SDK auth info — arrives from prefetch before any project is active.
-// Fixes the bug where Profile shows "not signed in" even when authenticated.
+// Also fires on logout (account: null) so the Profile UI reflects sign-out immediately.
 (window as any).electronAPI.on("pane-sdk-auth", (data: any) => {
-  if (data?.account || data?.models) {
+  const hasAccount = data?.account != null;
+  const hasModels  = data?.models  != null;
+
+  if (hasAccount || hasModels) {
+    // New auth info arrived — update account/models only.
+    // Rate limit clearing is handled session-scoped in handleEvent's sdk_init_info case.
     useWorkspaceStore.getState().setSdkInfo(data.models || null, data.account || null);
+  } else {
+    // Explicit null broadcast (logout) — clear account and stale usage indicators
+    useWorkspaceStore.getState().setSdkInfo(null, null);
+    useWorkspaceStore.getState().setRateLimitInfo(null);
   }
 });
 
