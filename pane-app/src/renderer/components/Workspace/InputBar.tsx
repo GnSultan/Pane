@@ -730,6 +730,7 @@ export function InputBar({
   const [modelPickerExpanded, setModelPickerExpanded] = useState(false);
   const [modePickerExpanded, setModePickerExpanded] = useState(false);
   const [isFadingOut, setIsFadingOut] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [caretPos, setCaretPos] = useState<{
     top: number;
     left: number;
@@ -753,6 +754,7 @@ export function InputBar({
       const prompt = (e as CustomEvent).detail?.prompt;
       if (prompt) {
         setValue(prompt);
+        setExpanded(true);
         // Focus the textarea so the user can review and send
         requestAnimationFrame(() => {
           const ta = document.querySelector<HTMLTextAreaElement>("[data-pane-input]");
@@ -784,6 +786,7 @@ export function InputBar({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
 
   const todos = useProjectsStore(
     useShallow(
@@ -921,18 +924,41 @@ export function InputBar({
     return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
   }, [updateCaret]);
 
-  // Auto-focus when not processing
+  // selectionchange fires on every cursor move including mid-hold arrow repeats —
+  // covers the gap that keyup misses during continuous navigation.
   useEffect(() => {
-    if (!isProcessing && textareaRef.current && isConversationVisible()) {
+    const handler = () => {
+      if (document.activeElement === textareaRef.current) updateCaret();
+    };
+    document.addEventListener("selectionchange", handler);
+    return () => document.removeEventListener("selectionchange", handler);
+  }, [updateCaret]);
+
+  // Collapse to ghost state when clicking outside the card with an empty input.
+  useEffect(() => {
+    if (!expanded) return;
+    const handler = (e: MouseEvent) => {
+      if (cardRef.current && !cardRef.current.contains(e.target as Node)) {
+        if (!value.trim()) setExpanded(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [expanded, value]);
+
+  // Auto-focus when input expands
+  useEffect(() => {
+    if (expanded && textareaRef.current && isConversationVisible()) {
       textareaRef.current.focus();
     }
-  }, [isProcessing]);
+  }, [expanded]);
 
   // Cmd+K focus
   useEffect(() => {
     const handler = () => {
-      if (textareaRef.current && isConversationVisible()) {
-        textareaRef.current.focus();
+      if (isConversationVisible()) {
+        setExpanded(true);
+        requestAnimationFrame(() => textareaRef.current?.focus());
       }
     };
     window.addEventListener("pane:focus-input", handler);
@@ -1010,6 +1036,7 @@ export function InputBar({
           // Carry mode forward to next turn — conversation is continuous
           setLastSentMode(sentMode);
           setValue("");
+          setExpanded(false);
           setModeOverride(null);
           setDetectedMode(null);
         }
@@ -1103,8 +1130,19 @@ export function InputBar({
         />
       )}
 
+      {/* Ghost trigger — absolute, zero layout footprint, floats over scroll content */}
+      {!expanded && !isProcessing && !isFadingOut && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="absolute bottom-0 left-0 right-0 text-left bg-transparent font-mono text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors px-5 py-3"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          let's build
+        </button>
+      )}
+
       {/* One card. Textarea + thoughts picker + button bar in column. */}
-      <div className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative flex flex-col">
+      {expanded && <div ref={cardRef} className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative flex flex-col">
 
         {attachMenu !== "thoughts" && <div ref={caretContainerRef} className="relative overflow-hidden">
           <textarea
@@ -1314,7 +1352,7 @@ export function InputBar({
             </>
           )}
         </div>
-      </div>
+      </div>}
     </div>
   );
 }
