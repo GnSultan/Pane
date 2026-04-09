@@ -28,6 +28,7 @@
   --color-pane-syn-attribute: var(--pane-syn-attribute);
   --color-pane-syn-string: var(--pane-syn-data);
   --color-pane-syn-number: var(--pane-syn-data-number);
+  --color-pane-accent: var(--pane-accent);
 
   --font-mono: "Geist Mono Variable", ui-monospace, monospace;
   --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -201,6 +202,7 @@
 
   /* Terminal accent — the machine's voice */
   --pane-terminal: #8AACCA;
+  --pane-accent: var(--pane-status-added);
 
   /* Overlay */
   --pane-overlay: rgba(20, 19, 18, 0.7);

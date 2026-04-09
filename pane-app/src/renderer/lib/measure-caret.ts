@@ -1,53 +1,66 @@
 /**
- * measureCaretPos — mirror-based caret position measurement for textareas.
+ * measureCaretPos — Range-based caret position measurement.
  *
- * Creates a hidden mirror div that replicates the textarea's computed styles,
- * inserts a zero-width marker at the caret position, then reads its coordinates.
- * Used to position a custom amber cursor overlay on top of the textarea.
+ * Queries a collapsed Range directly on the overlay text node — the same
+ * element the user actually sees.  Range.getClientRects() returns the exact
+ * sub-pixel insertion-point rect with no font/wrap approximation possible.
+ *
+ * Requirements:
+ *   container  — the `position: relative` wrapper that both the textarea
+ *                and the overlay live inside.
+ *   overlay    — an absolutely-positioned div whose first child is a <span>
+ *                containing the textarea's value text.  Its scrollTop must
+ *                be kept in sync with the textarea's scrollTop via onScroll.
  */
 export function measureCaretPos(
   el: HTMLTextAreaElement,
   container: HTMLElement,
+  overlay: HTMLElement,
 ): { top: number; left: number; lineHeight: number } | null {
   const sel = el.selectionStart;
   if (sel === null) return null;
 
   const computed = window.getComputedStyle(el);
-
-  const mirror = document.createElement("div");
-  mirror.setAttribute("aria-hidden", "true");
-  Object.assign(mirror.style, {
-    position: "absolute",
-    top: "0",
-    left: "0",
-    visibility: "hidden",
-    pointerEvents: "none",
-    width: el.clientWidth + "px",
-    whiteSpace: "pre-wrap",
-    wordBreak: "break-word",
-    overflowWrap: "break-word",
-    padding: computed.padding,
-    font: computed.font,
-    letterSpacing: computed.letterSpacing,
-    lineHeight: computed.lineHeight,
-    boxSizing: computed.boxSizing,
-  });
-
-  mirror.appendChild(document.createTextNode(el.value.slice(0, sel)));
-  const marker = document.createElement("span");
-  marker.textContent = "\u200b"; // zero-width space — no visual impact
-  mirror.appendChild(marker);
-
-  container.appendChild(mirror);
   const caretH = parseFloat(computed.fontSize) || 15;
-  // Use the vertical center of the marker box — unambiguous regardless of
-  // whether offsetTop lands at the top or bottom of the line box.
-  const markerCenter = marker.offsetTop + marker.offsetHeight / 2;
-  const result = {
-    top: markerCenter - el.scrollTop - caretH / 2,
-    left: marker.offsetLeft,
-    lineHeight: caretH,
-  };
-  container.removeChild(mirror);
-  return result;
+  const containerRect = container.getBoundingClientRect();
+
+  // The overlay structure: <div> <span>{value}</span> … </div>
+  const textSpan = overlay.firstElementChild as HTMLElement | null;
+  const textNode = textSpan?.firstChild;
+
+  if (textNode && textNode.nodeType === Node.TEXT_NODE) {
+    const len = (textNode as Text).length;
+    const pos = Math.min(sel, len);
+    const range = document.createRange();
+    range.setStart(textNode, pos);
+    range.setEnd(textNode, pos);
+
+    // A collapsed range returns 0 or 1 ClientRect.  When it returns one,
+    // that rect is the exact insertion-point position in the overlay's layout.
+    const rects = range.getClientRects();
+    if (rects.length > 0) {
+      const r = rects[0];
+      // Render the caret slightly taller than the raw cap-height so it reads
+      // clearly at any font size.  Re-centre top so it stays visually balanced
+      // within the line box (r.height = full leading, caretH = font-size).
+      const renderH = caretH + 4;
+      return {
+        top: r.top - containerRect.top + (r.height - renderH) / 2,
+        left: r.left - containerRect.left,
+        lineHeight: renderH,
+      };
+    }
+  }
+
+  // Fallback for empty textarea or edge cases: anchor to text span origin.
+  if (textSpan) {
+    const r = textSpan.getBoundingClientRect();
+    return {
+      top: r.top - containerRect.top,
+      left: r.left - containerRect.left,
+      lineHeight: caretH + 4,
+    };
+  }
+
+  return null;
 }

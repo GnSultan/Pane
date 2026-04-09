@@ -9,6 +9,7 @@ import {
 } from "../../lib/tauri-commands";
 import type { GitCommit, GitStatusInfo } from "../../lib/tauri-commands";
 import type { ElectronAPI } from "../../lib/electron";
+import { measureCaretPos } from "../../lib/measure-caret";
 
 const electronAPI = window.electronAPI as ElectronAPI;
 
@@ -199,40 +200,6 @@ interface GitStatusProps {
   projectId: string;
 }
 
-// Measures caret position — same technique as InputBar
-function measureCaretPos(
-  el: HTMLTextAreaElement,
-  container: HTMLElement,
-): { top: number; left: number; lineHeight: number } | null {
-  const sel = el.selectionStart;
-  if (sel === null) return null;
-  const computed = window.getComputedStyle(el);
-  const mirror = document.createElement("div");
-  mirror.setAttribute("aria-hidden", "true");
-  Object.assign(mirror.style, {
-    position: "absolute", top: "0", left: "0",
-    visibility: "hidden", pointerEvents: "none",
-    width: el.clientWidth + "px",
-    whiteSpace: "pre-wrap", wordBreak: "break-word", overflowWrap: "break-word",
-    padding: computed.padding, font: computed.font,
-    letterSpacing: computed.letterSpacing, lineHeight: computed.lineHeight,
-    boxSizing: computed.boxSizing,
-  });
-  mirror.appendChild(document.createTextNode(el.value.slice(0, sel)));
-  const marker = document.createElement("span");
-  marker.textContent = "\u200b";
-  mirror.appendChild(marker);
-  container.appendChild(mirror);
-  const caretH = parseFloat(computed.fontSize) || 13;
-  const markerCenter = marker.offsetTop + marker.offsetHeight / 2;
-  const result = {
-    top: markerCenter - el.scrollTop - caretH / 2,
-    left: marker.offsetLeft,
-    lineHeight: caretH,
-  };
-  container.removeChild(mirror);
-  return result;
-}
 
 export function GitStatus({ root, projectId }: GitStatusProps) {
   const [status, setStatus] = useState<GitStatusInfo | null>(null);
@@ -251,6 +218,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
   const [caretPos, setCaretPos] = useState<{ top: number; left: number; lineHeight: number } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
 
   // ── Load ────────────────────────────────────────────────────────────────────
   const load = useCallback(async () => {
@@ -293,12 +261,13 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
 
   useEffect(() => { applyHeight(); }, [commitMessage, applyHeight]);
 
-  // ── Static caret ─────────────────────────────────────────────────────────────
+  // Update static caret position using Range API on the overlay text node.
   const updateCaret = useCallback(() => {
     const el = textareaRef.current;
     const container = caretContainerRef.current;
-    if (!el || !container || document.activeElement !== el) { setCaretPos(null); return; }
-    setCaretPos(measureCaretPos(el, container));
+    const overlay = overlayRef.current;
+    if (!el || !container || !overlay || document.activeElement !== el) { setCaretPos(null); return; }
+    setCaretPos(measureCaretPos(el, container, overlay));
   }, []);
 
   useEffect(() => {
@@ -561,6 +530,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
             onKeyDown={handleKeyDown}
             onFocus={() => { setFocused(true); updateCaret(); }}
             onBlur={() => { setFocused(false); setCaretPos(null); }}
+            onScroll={() => { if (overlayRef.current && textareaRef.current) overlayRef.current.scrollTop = textareaRef.current.scrollTop; }}
             placeholder={
               drafting ? "drafting…"
               : fileCount === 0 ? "working tree clean"
@@ -582,6 +552,32 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
               paddingBottom: "32px",
             }}
           />
+          {/* Invisible overlay — Range API measures caret position from this text node */}
+          <div
+            ref={overlayRef}
+            aria-hidden
+            style={{
+              position: "absolute",
+              top: 0, left: 0, right: 0, bottom: 0,
+              overflow: "auto",
+              overflowX: "hidden",
+              pointerEvents: "none",
+              opacity: 0,
+              userSelect: "none",
+              fontSize: "var(--pane-panel-font-size)",
+              lineHeight: "1.75",
+              fontFamily: "var(--font-mono)",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              paddingLeft: "1.5rem",
+              paddingRight: "1.5rem",
+              paddingTop: "1.25rem",
+              paddingBottom: "32px",
+              boxSizing: "border-box",
+            }}
+          >
+            <span>{commitMessage}</span>
+          </div>
           {focused && caretPos && (
             <div
               aria-hidden
@@ -591,7 +587,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
                 left: caretPos.left,
                 width: 2,
                 height: caretPos.lineHeight,
-                background: "var(--pane-editor-cursor)",
+                background: "var(--pane-accent)",
                 pointerEvents: "none",
               }}
             />

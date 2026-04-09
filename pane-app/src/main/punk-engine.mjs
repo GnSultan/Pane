@@ -716,6 +716,11 @@ class PunkEngine {
     this._sweepInterval = setInterval(() => this._sweepStaleOutcomes(), 5 * 60 * 1000);
     if (this._sweepInterval.unref) this._sweepInterval.unref(); // don't keep process alive
 
+    // Set after claude_signout to prevent a reinitialize() call from silently
+    // re-creating an authenticated claude backend from leftover keychain credentials.
+    // Cleared by claude_signin on successful auth.
+    this._claudeSignedOut = false;
+
     // Control Inversion Engine
     this.taskRunner = new TaskRunner(
       async (projectId, prompt, systemOverride, request) => {
@@ -793,7 +798,9 @@ class PunkEngine {
     console.log(`[punk] Backend availability: claude=${this.backendAvailability.claude}, gemini=${this.backendAvailability.gemini}, api=${this.backendAvailability.api}`);
 
     // Create backend instances for available backends
-    if (this.backendAvailability.claude) {
+    // _claudeSignedOut is set by claude_signout to prevent re-auth from keychain
+    // after the user explicitly signs out. Cleared when the user signs back in.
+    if (this.backendAvailability.claude && !this._claudeSignedOut) {
       this.backends.claude = new CliBackend(onEvent, "claude");
       console.log("[punk] Claude CLI backend initialized");
       this.prefetchClaudeModels();
@@ -902,6 +909,9 @@ class PunkEngine {
 
     // CLI-backed providers
     if (provider === "anthropic" && this.backendAvailability.claude) {
+      if (!this.backends.claude) {
+        throw new Error("Claude backend is not available — please sign in first");
+      }
       return this.backends.claude;
     }
 
@@ -2482,6 +2492,12 @@ export async function registerPunkHandlers() {
   });
 
   ipcMain.handle("reinitialize_punk_backend", async (_event, args) => {
+    // When explicitly re-initializing the claude backend (called after successful
+    // sign-in), clear the sign-out gate so the fresh backend can be created and
+    // the prefetch runs. Routing config changes ("api") must NOT clear the gate.
+    if (args?.backend === "claude-code") {
+      punkEngine._claudeSignedOut = false;
+    }
     await punkEngine.reinitialize(args?.backend);
   });
 
@@ -2555,30 +2571,69 @@ export async function registerPunkHandlers() {
   // forwarded as "pane-claude-signin" events to the renderer. When auth
   // completes, the resolver fires and we refresh auth state.
   ipcMain.handle("claude_signin", async () => {
-    const backend = punkEngine.backends?.claude;
-    if (!backend) return { success: false, error: "Claude backend not available" };
-    const worker = backend.getWorker();
+    let backend = punkEngine.backends?.claude;
 
+    // If the backend was nulled by sign-out, create a fresh CliBackend for the
+    // OAuth flow. The _claudeSignedOut gate is cleared so the new backend is
+    // allowed. Once auth completes, the renderer calls reinitializePunkBackend
+    // which runs a full reinit with prefetch.
+    if (!backend) {
+      punkEngine._claudeSignedOut = false;
+      const onEvent = (projectId, event, requestId) =>
+        punkEngine.handleBackendEvent(projectId, event, requestId);
+      backend = new CliBackend(onEvent, "claude");
+      punkEngine.backends.claude = backend;
+    }
+
+    const worker = backend.getWorker();
     return new Promise((resolve) => {
       backend._loginResolver = resolve;
       worker.postMessage({ type: "start_login" });
     });
   });
 
-  // ── Claude logout — removes oauthAccount from ~/.claude.json ─────────────
-  // Mirrors what `claude logout` does. After removing auth, broadcasts null
-  // account to all renderer windows so the UI reflects the signed-out state.
-  ipcMain.handle("claude_signout", () => {
-    const configPath = path.join(os.homedir(), ".claude.json");
-    try {
-      const raw = readFileSync(configPath, "utf-8");
-      const config = JSON.parse(raw);
-      delete config.oauthAccount;
-      writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
-    } catch {
-      // If we can't read/write, treat as signed out anyway
+  // ── Claude logout ─────────────────────────────────────────────────────────
+  // Three-step sign-out to close all credential doors:
+  //   1. Run `claude logout` via the CLI binary — clears tokens from the
+  //      macOS keychain and any other storage the CLI owns. Editing
+  //      ~/.claude.json alone is insufficient; the CLI caches credentials
+  //      outside the JSON file and a fresh worker can re-authenticate from
+  //      those cached sources even after oauthAccount is deleted.
+  //   2. Kill and null the CliBackend so getWorker() cannot spawn a new
+  //      authenticated process before step 1 completes.
+  //   3. Broadcast null account to all renderer windows.
+  ipcMain.handle("claude_signout", async () => {
+    // Step 1 — kill current worker first so it can't race with the logout cmd
+    const backend = punkEngine.backends?.claude;
+    if (backend) {
+      await backend.shutdown().catch(() => {});
+      punkEngine.backends.claude = null; // block getWorker() from respawning
     }
-    // Broadcast cleared account to all windows
+
+    // Mark as signed out BEFORE any reinitialize() can run (e.g. from routing
+    // config changes in Profile). Without this flag, reinitialize() would call
+    // detectBackendAvailability() → find the SDK installed → create a new
+    // CliBackend → worker picks up leftover keychain credentials → re-authed.
+    punkEngine._claudeSignedOut = true;
+
+    // Step 2 — run the CLI's own logout to clear keychain + all credential stores.
+    // Pass stdin: "" so the process doesn't hang waiting for input (some versions
+    // of `claude logout` prompt for confirmation). The empty string closes stdin
+    // immediately, causing any pending prompt to receive EOF and exit.
+    try {
+      await spawnWithStallTimeout("claude", ["logout"], { env: getEnvWithPath(), stdin: "" });
+    } catch {
+      // If the CLI isn't reachable, fall back to editing ~/.claude.json directly
+      try {
+        const configPath = path.join(os.homedir(), ".claude.json");
+        const raw = readFileSync(configPath, "utf-8");
+        const config = JSON.parse(raw);
+        delete config.oauthAccount;
+        writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+      } catch {}
+    }
+
+    // Step 3 — broadcast cleared account so the UI reflects sign-out immediately
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed()) {
         win.webContents.send("pane-sdk-auth", { account: null, models: null });

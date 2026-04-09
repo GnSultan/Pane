@@ -1956,32 +1956,32 @@ export function Profile() {
             })()}
 
             {isClaudeAuthenticated && (() => {
-              // Always render the usage bar — 0% baseline when no data has
-              // arrived yet so we can see the moment it starts climbing.
-              const util = rateLimitInfo?.utilization ?? 0;
-              const pct = Math.round(util * 100);
-              const hasData = rateLimitInfo?.utilization != null;
+              // utilization arrives only on allowed_warning / rejected events (~60%+).
+              // Don't pretend we know usage is 0% — show "—" until real data lands.
+              const util = rateLimitInfo?.utilization ?? null;
+              const pct = util != null ? Math.round(util * 100) : null;
+              const hasData = util != null;
               const barColor =
-                util >= 0.85 ? "bg-pane-error" :
-                util >= 0.7  ? "bg-pane-status-modified" :
+                util != null && util >= 0.85 ? "bg-pane-error" :
+                util != null && util >= 0.7  ? "bg-pane-status-modified" :
                 "bg-pane-status-added";
               const textColor =
-                util >= 0.85 ? "text-pane-error" :
-                util >= 0.7  ? "text-[var(--pane-status-modified)]" :
-                hasData      ? "text-[var(--pane-status-added)]" :
+                util != null && util >= 0.85 ? "text-pane-error" :
+                util != null && util >= 0.7  ? "text-[var(--pane-status-modified)]" :
+                hasData                      ? "text-[var(--pane-status-added)]" :
                 "text-pane-text-secondary/40";
               return (
                 <>
                   <div className="flex items-center justify-between">
                     <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>session</span>
                     <span className={`font-mono tabular-nums ${textColor}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      {pct}%
+                      {hasData ? `${pct}%` : "—"}
                     </span>
                   </div>
                   <div className="h-1.5 w-full bg-pane-text/[0.06] rounded-full overflow-hidden">
                     <div
-                      className={`h-full rounded-full transition-all ${barColor}`}
-                      style={{ width: `${Math.min(100, pct)}%` }}
+                      className={`h-full rounded-full transition-all ${hasData ? barColor : ""}`}
+                      style={{ width: hasData ? `${Math.min(100, pct!)}%` : "0%" }}
                     />
                   </div>
                   {rateLimitInfo?.resetsAt != null && (

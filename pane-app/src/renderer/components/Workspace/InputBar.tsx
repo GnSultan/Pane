@@ -9,6 +9,7 @@ import {
   getContextLimit,
 } from "../../lib/models";
 import { previewRoute, showFilePicker, brainMindGetAll, type RoutePreview, type MindEntry } from "../../lib/tauri-commands";
+import { measureCaretPos } from "../../lib/measure-caret";
 
 const EMPTY_TODOS: Todo[] = [];
 
@@ -129,7 +130,11 @@ function RateLimitIndicator() {
   const pct = info.utilization != null ? Math.round(info.utilization * 100) : null;
   const isOverage = info.isUsingOverage === true;
   const isRejected = info.status === "rejected";
-  const overageRejected = info.overageStatus === "rejected";
+  // overageStatus: "rejected" means "overage billing is disabled on this account" — the API
+  // sends this on every response for accounts that haven't enabled pay-as-you-go overage.
+  // Only treat it as actionable when the request itself was also rejected (status: "rejected"),
+  // otherwise it's a false positive for subscription users who are well within their limits.
+  const overageRejected = info.overageStatus === "rejected" && isRejected;
 
   // Subscription users: don't show until 60% utilization — below that is noise.
   // Credit users (pay-as-you-go): show overage state immediately since it has
@@ -138,7 +143,7 @@ function RateLimitIndicator() {
     (sdkAccount as any)?.billingType === "stripe_subscription" ||
     (sdkAccount as any)?.subscription != null;
 
-  // Overage rejected (exhausted all usage)
+  // Overage rejected (exhausted all usage / overage disabled and request blocked)
   if (overageRejected) {
     const resetTime = overageResetMs ? formatRelativeTime(overageResetMs) : null;
     // "out of credits" only makes sense for credit/pay-as-you-go users.
@@ -153,30 +158,23 @@ function RateLimitIndicator() {
     );
   }
 
-  // Using extra usage / overage (subscription exceeded but still allowed)
-  if (isOverage) {
-    const overageResets = overageResetMs ? formatRelativeTime(overageResetMs) : null;
+  // Standard rate limit at ≥60% — this takes priority over the generic
+  // "extra usage" label because a concrete percentage is always more
+  // informative. If the SDK sends utilization even in overage state, show it.
+  if (pct != null && pct >= 60) {
+    const resetTime = resetEpochMs ? formatRelativeTime(resetEpochMs) : null;
+    const prefix = isOverage ? "extra usage · " : "";
     return (
-      <span className="font-mono tabular-nums text-[var(--pane-status-modified)]" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-        extra usage{overageResets ? ` · resets ${overageResets}` : ""}
+      <span
+        className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-[var(--pane-status-modified)]"}`}
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        {prefix}{pct}%{isRejected ? " · limit reached" : " · limit"}{resetTime && ` · resets ${resetTime}`}
       </span>
     );
   }
 
-  // Standard rate limit — only show at ≥60% utilization so the bar is
-  // informational (approaching limit) not alarming (constantly visible).
-  if (pct == null || pct < 60) return null;
-
-  const resetTime = resetEpochMs ? formatRelativeTime(resetEpochMs) : null;
-
-  return (
-    <span
-      className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-[var(--pane-status-modified)]"}`}
-      style={{ fontSize: "var(--pane-font-size-xs)" }}
-    >
-      {pct}%{isRejected ? " · limit reached" : " · limit"}{resetTime && ` · resets ${resetTime}`}
-    </span>
-  );
+  return null;
 }
 
 function ContextUsageIndicator({ projectId }: { projectId: string }) {
@@ -215,58 +213,12 @@ function ContextUsageIndicator({ projectId }: { projectId: string }) {
 //
 // Chrome's caret blink is native — CSS `animation` on `caret-color` only works
 // in Firefox. The reliable fix: hide the native caret with `caretColor: transparent`
-// and render a static 2px amber div positioned via the mirror-div technique.
+// and render a static 2px div positioned via the Range API on the overlay text node.
 //
 // The mirror is a hidden div with identical typography/padding to the textarea.
 // We insert text up to selectionStart, append a zero-width marker span, then
 // read marker.offsetTop/offsetLeft as the caret coordinates.
 
-function measureCaretPos(
-  el: HTMLTextAreaElement,
-  container: HTMLElement,
-): { top: number; left: number; lineHeight: number } | null {
-  const sel = el.selectionStart;
-  if (sel === null) return null;
-
-  const computed = window.getComputedStyle(el);
-
-  const mirror = document.createElement("div");
-  mirror.setAttribute("aria-hidden", "true");
-  Object.assign(mirror.style, {
-    position: "absolute",
-    top: "0",
-    left: "0",
-    visibility: "hidden",
-    pointerEvents: "none",
-    width: el.clientWidth + "px",
-    whiteSpace: "pre-wrap",
-    wordBreak: "break-word",
-    overflowWrap: "break-word",
-    padding: computed.padding,
-    font: computed.font,
-    letterSpacing: computed.letterSpacing,
-    lineHeight: computed.lineHeight,
-    boxSizing: computed.boxSizing,
-  });
-
-  mirror.appendChild(document.createTextNode(el.value.slice(0, sel)));
-  const marker = document.createElement("span");
-  marker.textContent = "\u200b"; // zero-width space — no visual impact
-  mirror.appendChild(marker);
-
-  container.appendChild(mirror);
-  const caretH = parseFloat(computed.fontSize) || 15;
-  // Use the vertical center of the marker box — unambiguous regardless of
-  // whether offsetTop lands at the top or bottom of the line box.
-  const markerCenter = marker.offsetTop + marker.offsetHeight / 2;
-  const result = {
-    top: markerCenter - el.scrollTop - caretH / 2,
-    left: marker.offsetLeft,
-    lineHeight: caretH,
-  };
-  container.removeChild(mirror);
-  return result;
-}
 
 interface InputBarProps {
   projectId: string;
@@ -948,21 +900,17 @@ export function InputBar({
     }
   }, [isProcessing]);
 
-  // Update static caret position
+  // Update static caret position using Range API on the overlay text node.
   const updateCaret = useCallback(() => {
     const el = textareaRef.current;
     const container = caretContainerRef.current;
-    if (!el || !container || document.activeElement !== el) {
+    const overlay = overlayRef.current;
+    if (!el || !container || !overlay || document.activeElement !== el) {
       setCaretPos(null);
       return;
     }
-    setCaretPos(measureCaretPos(el, container));
+    setCaretPos(measureCaretPos(el, container, overlay));
   }, []);
-
-  // Reposition on every value change (covers typing)
-  useEffect(() => {
-    if (textareaFocused) updateCaret();
-  }, [value, textareaFocused, updateCaret]);
 
   // Reposition on selection movement (arrows, mouse clicks, scroll)
   useEffect(() => {
@@ -1013,9 +961,14 @@ export function InputBar({
     }
   }, []);
 
+  // Auto-resize + caret update in one effect so the order is guaranteed:
+  // height/scrollTop are fully stabilised before the caret is measured.
+  // (Previously updateCaret ran first, then applyTextareaHeight changed
+  // scrollTop behind its back — causing wrong caret position after line breaks.)
   useEffect(() => {
     applyTextareaHeight();
-  }, [value, applyTextareaHeight]);
+    if (textareaFocused) updateCaret();
+  }, [value, applyTextareaHeight, textareaFocused, updateCaret]);
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
@@ -1212,7 +1165,7 @@ export function InputBar({
                 left: caretPos.left,
                 width: 2,
                 height: caretPos.lineHeight,
-                background: "var(--pane-editor-cursor)",
+                background: "var(--pane-accent)",
                 pointerEvents: "none",
               }}
             />

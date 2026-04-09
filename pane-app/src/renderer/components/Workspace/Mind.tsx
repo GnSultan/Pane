@@ -52,6 +52,7 @@ function EntryItem({
   const [editValue, setEditValue] = useState(entry.content);
   const editRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
   const [caretPos, setCaretPos] = useState<{
     top: number;
     left: number;
@@ -72,11 +73,12 @@ function EntryItem({
   const updateCaret = useCallback(() => {
     const el = editRef.current;
     const container = caretContainerRef.current;
-    if (!el || !container || document.activeElement !== el) {
+    const overlay = overlayRef.current;
+    if (!el || !container || !overlay || document.activeElement !== el) {
       setCaretPos(null);
       return;
     }
-    setCaretPos(measureCaretPos(el, container));
+    setCaretPos(measureCaretPos(el, container, overlay));
   }, []);
 
   useEffect(() => {
@@ -170,6 +172,27 @@ function EntryItem({
             }}
             placeholder="edit your thought..."
           />
+          {/* Invisible overlay — Range API measures caret position from this text node */}
+          <div
+            ref={overlayRef}
+            aria-hidden
+            style={{
+              position: "absolute",
+              top: 0, left: 0, right: 0, bottom: 0,
+              overflow: "hidden",
+              pointerEvents: "none",
+              opacity: 0,
+              userSelect: "none",
+              fontSize: "var(--pane-font-size-sm)",
+              lineHeight: "1.85",
+              fontFamily: "var(--font-mono)",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              boxSizing: "border-box",
+            }}
+          >
+            <span>{editValue}</span>
+          </div>
           {textareaFocused && caretPos && (
             <div
               aria-hidden
@@ -179,7 +202,7 @@ function EntryItem({
                 left: caretPos.left,
                 width: 2,
                 height: caretPos.lineHeight,
-                background: "var(--pane-editor-cursor)",
+                background: "var(--pane-accent)",
                 pointerEvents: "none",
               }}
             />
@@ -364,6 +387,7 @@ export function Mind() {
   } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSaveRef = useRef<Promise<void> | null>(null);
 
@@ -402,11 +426,12 @@ export function Mind() {
   const updateCaret = useCallback(() => {
     const el = textareaRef.current;
     const container = caretContainerRef.current;
-    if (!el || !container || document.activeElement !== el) {
+    const overlay = overlayRef.current;
+    if (!el || !container || !overlay || document.activeElement !== el) {
       setCaretPos(null);
       return;
     }
-    setCaretPos(measureCaretPos(el, container));
+    setCaretPos(measureCaretPos(el, container, overlay));
   }, []);
 
   // Reposition on every value change (covers typing)
@@ -574,6 +599,27 @@ export function Mind() {
                   minHeight: "120px",
                 }}
               />
+              {/* Invisible overlay — Range API measures caret position from this text node */}
+              <div
+                ref={overlayRef}
+                aria-hidden
+                style={{
+                  position: "absolute",
+                  top: 0, left: 0, right: 0, bottom: 0,
+                  overflow: "hidden",
+                  pointerEvents: "none",
+                  opacity: 0,
+                  userSelect: "none",
+                  fontSize: "var(--pane-font-size)",
+                  lineHeight: "1.85",
+                  fontFamily: "var(--font-mono)",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                  boxSizing: "border-box",
+                }}
+              >
+                <span>{draft}</span>
+              </div>
               {/* Static amber cursor — replaces the native blinking caret */}
               {textareaFocused && caretPos && (
                 <div
@@ -584,7 +630,7 @@ export function Mind() {
                     left: caretPos.left,
                     width: 2,
                     height: caretPos.lineHeight,
-                    background: "var(--pane-editor-cursor)",
+                    background: "var(--pane-accent)",
                     pointerEvents: "none",
                   }}
                 />

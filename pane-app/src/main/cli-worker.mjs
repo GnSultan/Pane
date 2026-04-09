@@ -1588,6 +1588,15 @@ process.parentPort.on("message", ({ data }) => {
             data: { message: `Spawn error: ${err.message}` },
           },
         });
+        // Always send processEnded so completionPromise in backend.spawn() resolves.
+        // Without this the send_to_punk IPC invoke hangs forever when handleSpawn throws
+        // before handleClaudeSpawn/handleGeminiSpawn (which have their own finally blocks).
+        sendToMain({
+          type: "event",
+          projectId: data.projectId,
+          requestId: data.requestId,
+          event: { event: "processEnded", data: { exit_code: 1, aborted: false } },
+        });
       });
       break;
     case "restore_session_id":

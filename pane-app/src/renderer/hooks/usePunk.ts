@@ -913,8 +913,11 @@ export function usePunk(projectId: string) {
       let resultReceived = false;
       let resultSafetyTimer: ReturnType<typeof setTimeout> | null = null;
       let orchestrationActive = false; // true while TaskRunner is running steps
+      let finishCalled = false; // guard against double-call (timer fires then processEnded arrives)
 
       const finishProcessing = () => {
+        if (finishCalled) return;
+        finishCalled = true;
         if (resultSafetyTimer) {
           clearTimeout(resultSafetyTimer);
           resultSafetyTimer = null;
@@ -973,20 +976,64 @@ export function usePunk(projectId: string) {
 
         switch (event.event) {
           case "processStarted":
+            // Start the safety watchdog immediately. If the SDK hangs before
+            // producing a result event (mid-tool-execution or on initial connect
+            // stall), there would otherwise be no timer to auto-recover.
+            // Every subsequent event resets this timer via the top of handleEvent.
+            if (!resultSafetyTimer) {
+              resultSafetyTimer = setTimeout(() => {
+                console.warn(
+                  `[pane] processStarted safety timer — stream silent for ${MODEL_SAFETY_TIMEOUT_MS / 1000}s, force-finishing`,
+                );
+                finishProcessing();
+              }, MODEL_SAFETY_TIMEOUT_MS);
+            }
             break;
 
           case "sdk_init_info": {
             const { models, account } = event.data;
             useWorkspaceStore.getState().setSdkInfo(models, account);
-            // Clear stale rate limit info from the previous session.
-            // Rate limit events are session-scoped — an overage or warning from
-            // last session has no meaning for this new one.
-            useWorkspaceStore.getState().setRateLimitInfo(null);
+            // Clear rateLimitInfo only when its reset window has definitively
+            // passed. sdk_init_info fires on session start AND on the hourly
+            // refreshCliModels background cycle, so we must not blindly clear —
+            // that wipes valid data on every background tick. We only clear when
+            // resetsAt (or overageResetsAt) is in the past. Future-window data is
+            // kept. This fixes stale isUsingOverage state persisting across reset
+            // windows (the auto-expire timer in InputBar only runs while mounted,
+            // so it doesn't catch app-restart staleness).
+            const current = useWorkspaceStore.getState().rateLimitInfo;
+            if (current) {
+              const mainExpired = current.resetsAt && current.resetsAt * 1000 < Date.now();
+              const overageExpired = current.overageResetsAt && current.overageResetsAt * 1000 < Date.now();
+              // Clear if the relevant reset window has passed
+              const hasOnlyOverage = !current.resetsAt && current.overageResetsAt;
+              if (hasOnlyOverage ? overageExpired : mainExpired) {
+                useWorkspaceStore.getState().setRateLimitInfo(null);
+              }
+            }
             break;
           }
 
           case "rate_limit": {
-            useWorkspaceStore.getState().setRateLimitInfo(event.data);
+            // The SDK only sends `utilization` on allowed_warning / rejected events.
+            // Every "allowed" request also fires a rate_limit_event with no utilization —
+            // storing it raw would overwrite the last-known warning % with null, making
+            // the session bar snap back to 0% after every message. Merge incoming fields
+            // but preserve existing utilization + status when the new event has neither,
+            // as long as we're still in the same reset window.
+            const incoming = event.data;
+            const current = useWorkspaceStore.getState().rateLimitInfo;
+            const isSameWindow =
+              !current?.resetsAt ||
+              !incoming.resetsAt ||
+              incoming.resetsAt === current.resetsAt;
+            const merged =
+              incoming.utilization == null &&
+              current?.utilization != null &&
+              isSameWindow
+                ? { ...incoming, utilization: current.utilization, status: current.status }
+                : incoming;
+            useWorkspaceStore.getState().setRateLimitInfo(merged);
             break;
           }
 
@@ -1217,6 +1264,13 @@ export function usePunk(projectId: string) {
           }
 
           case "error": {
+            // Clear the safety timer (started on processStarted) so it doesn't
+            // fire 5 minutes later after the error has already been handled.
+            finishCalled = true;
+            if (resultSafetyTimer) {
+              clearTimeout(resultSafetyTimer);
+              resultSafetyTimer = null;
+            }
             const s = useProjectsStore.getState();
             s.setConversationError(projectId, event.data.message);
             s.setConversationProcessing(projectId, false);

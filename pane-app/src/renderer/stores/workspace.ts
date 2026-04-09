@@ -295,7 +295,19 @@ function createWorkspaceStore() {
     sdkAccount: null,
     setSdkInfo: (models, account) => set({ sdkModels: models, sdkAccount: account }),
     rateLimitInfo: null,
-    setRateLimitInfo: (info) => set({ rateLimitInfo: info }),
+    setRateLimitInfo: (info) => {
+      // Persist to localStorage so the Profile session bar survives app restarts.
+      // rate_limit_event only fires on message send — without this, the bar is
+      // always 0% on cold open until the first message goes out.
+      try {
+        if (info) {
+          localStorage.setItem("pane:rateLimitInfo", JSON.stringify(info));
+        } else {
+          localStorage.removeItem("pane:rateLimitInfo");
+        }
+      } catch {}
+      set({ rateLimitInfo: info });
+    },
     lastTokenUsageAt: 0,
     // Profile data
     profileName: "",
@@ -549,6 +561,22 @@ export const useWorkspaceStore: ReturnType<typeof createWorkspaceStore> =
     useWorkspaceStore.getState().setRateLimitInfo(null);
   }
 });
+
+// Hydrate rateLimitInfo from localStorage on startup — without this the
+// Profile session bar shows 0% until the first message fires a rate_limit_event.
+// Only restore if the reset window is still in the future; expired data is dropped.
+try {
+  const raw = localStorage.getItem("pane:rateLimitInfo");
+  if (raw) {
+    const stored = JSON.parse(raw) as import("../lib/punk-types").RateLimitInfo;
+    const resetsAt = stored?.resetsAt ?? stored?.overageResetsAt;
+    if (resetsAt && resetsAt * 1000 > Date.now()) {
+      useWorkspaceStore.getState().setRateLimitInfo(stored);
+    } else {
+      localStorage.removeItem("pane:rateLimitInfo");
+    }
+  }
+} catch {}
 
 // Listen for OS theme changes — re-apply when in system mode
 const systemMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");

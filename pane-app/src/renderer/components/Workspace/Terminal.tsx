@@ -14,6 +14,7 @@ import {
 import { useProjectsStore } from "../../stores/projects";
 import type { TerminalTab } from "../../stores/projects";
 import stripAnsi from "strip-ansi";
+import { measureCaretPos } from "../../lib/measure-caret";
 
 interface TerminalProps {
   projectId: string;
@@ -101,50 +102,6 @@ function ProgressBar({ pct, label }: { pct: number; label: string }) {
   );
 }
 
-function measureCaretPos(
-  el: HTMLTextAreaElement,
-  container: HTMLElement,
-): { top: number; left: number; lineHeight: number } | null {
-  const sel = el.selectionStart;
-  if (sel === null) return null;
-
-  const computed = window.getComputedStyle(el);
-
-  const mirror = document.createElement("div");
-  mirror.setAttribute("aria-hidden", "true");
-  Object.assign(mirror.style, {
-    position: "absolute",
-    top: "0",
-    left: "0",
-    visibility: "hidden",
-    pointerEvents: "none",
-    width: el.clientWidth + "px",
-    whiteSpace: "pre-wrap",
-    wordBreak: "break-word",
-    overflowWrap: "break-word",
-    padding: computed.padding,
-    font: computed.font,
-    letterSpacing: computed.letterSpacing,
-    lineHeight: computed.lineHeight,
-    boxSizing: computed.boxSizing,
-  });
-
-  mirror.appendChild(document.createTextNode(el.value.slice(0, sel)));
-  const marker = document.createElement("span");
-  marker.textContent = "\u200b"; // zero-width space
-  mirror.appendChild(marker);
-
-  container.appendChild(mirror);
-  const caretH = parseFloat(computed.fontSize) || 15;
-  const markerCenter = marker.offsetTop + marker.offsetHeight / 2;
-  const result = {
-    top: markerCenter - el.scrollTop - caretH / 2,
-    left: marker.offsetLeft,
-    lineHeight: caretH,
-  };
-  container.removeChild(mirror);
-  return result;
-}
 
 function shortenPath(fullPath: string, home: string): string {
   if (fullPath === home) return "~";
@@ -293,6 +250,7 @@ function TerminalTabContent({
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const caretContainerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef(state);
   const liveOutputRaf = useRef(0);  // rAF handle for throttled live output updates
   const scrollRaf = useRef(0);       // rAF handle for throttled auto-scroll
@@ -465,15 +423,16 @@ function TerminalTabContent({
     };
   }, [tabId, projectId]); // initialCwd intentionally omitted — used once at mount, must not retrigger on cd
 
-  // Update static caret position
+  // Update static caret position using Range API on the overlay text node.
   const updateCaret = useCallback(() => {
     const el = inputRef.current;
     const container = caretContainerRef.current;
-    if (!el || !container || document.activeElement !== el) {
+    const overlay = overlayRef.current;
+    if (!el || !container || !overlay || document.activeElement !== el) {
       setCaretPos(null);
       return;
     }
-    setCaretPos(measureCaretPos(el, container));
+    setCaretPos(measureCaretPos(el, container, overlay));
   }, []);
 
   // Reposition on every value change (covers typing)
@@ -786,6 +745,7 @@ function TerminalTabContent({
                 setTextareaFocused(true);
                 updateCaret();
               }}
+              onScroll={() => { if (overlayRef.current && inputRef.current) overlayRef.current.scrollTop = inputRef.current.scrollTop; }}
               onBlur={() => {
                 setTextareaFocused(false);
                 setCaretPos(null);
@@ -804,6 +764,30 @@ function TerminalTabContent({
                 WebkitAppearance: "none",
               }}
             />
+            {/* Invisible overlay — Range API measures caret position from this text node */}
+            <div
+              ref={overlayRef}
+              aria-hidden
+              style={{
+                position: "absolute",
+                top: 0, left: 0, right: 0, bottom: 0,
+                overflow: "auto",
+                overflowX: "hidden",
+                pointerEvents: "none",
+                opacity: 0,
+                userSelect: "none",
+                fontSize: "var(--pane-font-size-base)",
+                lineHeight: "1.5rem",
+                fontFamily: "var(--font-mono)",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                padding: 0,
+                margin: 0,
+                boxSizing: "border-box",
+              }}
+            >
+              <span>{command}</span>
+            </div>
             {textareaFocused && caretPos && (
               <div
                 aria-hidden
@@ -813,7 +797,7 @@ function TerminalTabContent({
                   left: caretPos.left,
                   width: 2,
                   height: caretPos.lineHeight,
-                  background: "var(--pane-editor-cursor)",
+                  background: "var(--pane-accent)",
                   pointerEvents: "none",
                 }}
               />
