@@ -1112,6 +1112,86 @@ function registerWatcherHandlers() {
     }
   });
 }
+/**
+ * Watch ~/.pane/projects and ~/.pane/session for changes written by the MCP
+ * server's pane_roadmap tool. When an external CLI agent (Gemini, Claude CLI)
+ * calls pane_roadmap, it writes files directly — no Electron IPC is involved.
+ * This watcher bridges the gap so the UI roadmap panel and phase indicator
+ * stay in sync regardless of which backend is driving the agent.
+ */
+function startMcpFileWatcher() {
+  const paneDir = path.join(os.homedir(), ".pane");
+  const projectsDir = path.join(paneDir, "projects");
+  const sessionDir  = path.join(paneDir, "session");
+
+  // Track last-seen phase per project to avoid spurious phase_changed events.
+  const lastPhase = new Map();
+
+  // Debounce map — avoid double-firing on rapid writes.
+  const timers = new Map();
+  function debounced(key, fn, ms = 300) {
+    if (timers.has(key)) clearTimeout(timers.get(key));
+    timers.set(key, setTimeout(() => { timers.delete(key); fn(); }, ms));
+  }
+
+  // Watch roadmap files — emit roadmap_updated when any roadmap.json changes.
+  try {
+    fs.mkdirSync(projectsDir, { recursive: true });
+    const roadmapWatcher = chokidar.watch(projectsDir, {
+      ignoreInitial: true,
+      depth: 2,
+      persistent: true,
+      usePolling: false,
+      awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+    });
+    roadmapWatcher.on("change", (filePath) => {
+      if (!filePath.endsWith("roadmap.json")) return;
+      const projectId = path.basename(path.dirname(filePath));
+      debounced(`roadmap:${projectId}`, () => {
+        try {
+          const roadmap = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+          punkEngine.handleBackendEvent(projectId, { event: "roadmap_updated", data: { roadmap } });
+        } catch { /* ignore parse errors during write */ }
+      });
+    });
+  } catch (err) {
+    console.warn("[mcp-watcher] Could not watch projects dir:", err.message);
+  }
+
+  // Watch session state files — emit phase_changed when phase field changes.
+  try {
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const stateWatcher = chokidar.watch(sessionDir, {
+      ignoreInitial: true,
+      depth: 2,
+      persistent: true,
+      usePolling: false,
+      awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+    });
+    stateWatcher.on("change", (filePath) => {
+      if (!filePath.endsWith("state.json")) return;
+      const projectId = path.basename(path.dirname(filePath));
+      debounced(`state:${projectId}`, () => {
+        try {
+          const state = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+          const phase = state.phase || "idle";
+          if (lastPhase.get(projectId) === phase) return; // no change
+          lastPhase.set(projectId, phase);
+          punkEngine.handleBackendEvent(projectId, { event: "phase_changed", data: { phase } });
+          // Also sync in-memory workflow manager so phase gates reflect the new phase.
+          // Dynamic import is fire-and-forget — mergeState will re-read from file
+          // on next access if this loses the race, so errors are safe to ignore.
+          import("./pane-system-prompt.mjs").then(({ mergeState }) => {
+            mergeState(projectId, { phase });
+          }).catch(() => {});
+        } catch { /* ignore parse errors */ }
+      });
+    });
+  } catch (err) {
+    console.warn("[mcp-watcher] Could not watch session dir:", err.message);
+  }
+}
+
 function registerCheckpointHandlers(db) {
   const CHECKPOINT_MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
   const CHECKPOINT_MAX_FILES = 200;
@@ -2391,6 +2471,12 @@ app.whenReady().then(async () => {
     agentCall: (sys, prompt, workingDir) => punkEngine.agentCall(sys, prompt, workingDir),
     sendToRenderer,
   });
+
+  // Watch ~/.pane/projects/*/roadmap.json and ~/.pane/session/*/state.json so
+  // the UI reacts when an external CLI agent (Gemini, Claude) writes via the
+  // MCP server's pane_roadmap tool. Without this the roadmap panel and phase
+  // indicator only update when the Electron-side ToolExecutor fires events.
+  startMcpFileWatcher();
 
   // Daily backup at midnight — silent, automatic, 7-day rotation + cloud push
   startBackupSchedule();

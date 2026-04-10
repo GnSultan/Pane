@@ -588,16 +588,35 @@ async function handleClaudeSpawn({
   });
 
   // ── Write Pane section to CLAUDE.md so Claude SDK uses MCP tools effectively ──
+  // Phase directive goes at the top of CLAUDE.md — it's the strongest behavioral
+  // contract for Claude SDK. Without this, the agent ignores lean context phase
+  // guidance and defaults to "be helpful, start building."
   // Marked with delimiters so user content is never touched.
   try {
     const claudeMdPath = path.join(workingDir, "CLAUDE.md");
     const PANE_START = "<!-- PANE:START -->";
     const PANE_END = "<!-- PANE:END -->";
 
+    // Inject current phase directive at the top of CLAUDE.md
+    let phaseDirective = "";
+    try {
+      const { getPhaseContext } = await import("./workflow-manager.mjs");
+      const phaseCtx = getPhaseContext(projectId);
+      if (phaseCtx.phase && phaseCtx.phase !== "idle") {
+        phaseDirective = `## CURRENT PHASE: ${phaseCtx.phase.toUpperCase()}
+
+${phaseCtx.guidance}
+
+---
+
+`;
+      }
+    } catch {}
+
     const paneSection = `${PANE_START}
 # Pane Workspace
 
-This project is managed by Pane. You have pane_ MCP tools that are faster than manual exploration.
+${phaseDirective}This project is managed by Pane. You have pane_ MCP tools that are faster than manual exploration.
 
 ## Tool Priority (follow this order)
 
@@ -617,6 +636,14 @@ This project is managed by Pane. You have pane_ MCP tools that are faster than m
 - **pane_architecture_brief** — locked decisions and patterns for a subsystem
 - **pane_ui_constraints** — design rules for component types
 - **pane_run_in_terminal** — run tests to verify, don't guess
+
+## Workflow Tools
+
+- **pane_roadmap** — Read or update the project roadmap. Actions: read, create, set_kickoff_field, populate_steps, update_step, add_decision, update_verification, complete_milestone, log_session, skip_milestone, add_milestone, reorder_milestones
+  - **set_kickoff_field**: Save a discovery field from the conversation. Call this silently as you learn things — do not mention it to the user. If you call 'create' before you have enough context, the tool will tell you exactly what's still missing.
+  - **create**: Create the roadmap with milestones. Will be rejected if required kickoff fields are missing.
+- **pane_clarify** — Ask the user a product decision question and pause until they respond. Use for genuine ambiguity only.
+- **pane_verify** — Run verification checks (typescript, lint, build, audit) and return structured results.
 
 ## Quality Standards
 
@@ -1050,11 +1077,16 @@ async function handleGeminiSpawn({
           ...existingSettings,
           mcpServers: {
             pane: {
+              // Use system node — the MCP server only needs standard Node builtins
+              // (fs, path, os, readline, child_process). better-sqlite3 is loaded
+              // optionally and degrades gracefully if unavailable.
               command: "node",
               args: [mcpServerDest],
               env: {
                 PANE_PROJECT_ID: projectId,
                 PANE_PROJECT_ROOT: workingDir,
+                HOME: process.env.HOME || os.homedir(),
+                PATH: process.env.PATH || "",
               },
               trust: true,
             },
@@ -1072,10 +1104,26 @@ async function handleGeminiSpawn({
     const PANE_START = "<!-- PANE:START -->";
     const PANE_END = "<!-- PANE:END -->";
 
+    // Same phase directive as CLAUDE.md
+    let geminiPhaseDirective = "";
+    try {
+      const { getPhaseContext } = await import("./workflow-manager.mjs");
+      const phaseCtx = getPhaseContext(projectId);
+      if (phaseCtx.phase && phaseCtx.phase !== "idle") {
+        geminiPhaseDirective = `## CURRENT PHASE: ${phaseCtx.phase.toUpperCase()}
+
+${phaseCtx.guidance}
+
+---
+
+`;
+      }
+    } catch {}
+
     const paneSection = `${PANE_START}
 # Pane Workspace
 
-This project is managed by Pane. You have pane_ MCP tools that are faster than manual exploration.
+${geminiPhaseDirective}This project is managed by Pane. You have pane_ MCP tools that are faster than manual exploration.
 
 ## Tool Priority (follow this order)
 
@@ -1095,6 +1143,14 @@ This project is managed by Pane. You have pane_ MCP tools that are faster than m
 - **pane_architecture_brief** — locked decisions and patterns for a subsystem
 - **pane_ui_constraints** — design rules for component types
 - **pane_run_in_terminal** — run tests to verify, don't guess
+
+## Workflow Tools
+
+- **pane_roadmap** — Read or update the project roadmap. Actions: read, create, set_kickoff_field, populate_steps, update_step, add_decision, update_verification, complete_milestone, log_session, skip_milestone, add_milestone, reorder_milestones
+  - **set_kickoff_field**: Save a discovery field from the conversation. Call this silently as you learn things — do not mention it to the user. If you call 'create' before you have enough context, the tool will tell you exactly what's still missing.
+  - **create**: Create the roadmap with milestones. Will be rejected if required kickoff fields are missing.
+- **pane_clarify** — Ask the user a product decision question and pause until they respond. Use for genuine ambiguity only.
+- **pane_verify** — Run verification checks (typescript, lint, build, audit) and return structured results.
 
 ## Quality Standards
 
@@ -1476,13 +1532,19 @@ async function handleSpawn({
   const home = os.homedir();
   const paneDir = path.join(home, ".pane");
 
-  // Extract MCP server to ~/.pane/ so external node can access it outside .asar
+  // Extract MCP server and its dependencies to ~/.pane/ so external node can
+  // access them outside .asar. find-references.mjs is a static import inside
+  // pane-mcp-server.mjs — it must live alongside it.
   const mcpServerSrc = path.join(__dirname, "pane-mcp-server.mjs");
   const mcpServerDest = path.join(paneDir, "pane-mcp-server.mjs");
+  const findRefSrc = path.join(__dirname, "find-references.mjs");
+  const findRefDest = path.join(paneDir, "find-references.mjs");
   try {
     await fsp.mkdir(paneDir, { recursive: true });
     const mcpServerContent = await fsp.readFile(mcpServerSrc, "utf-8");
     await fsp.writeFile(mcpServerDest, mcpServerContent, "utf-8");
+    const findRefContent = await fsp.readFile(findRefSrc, "utf-8");
+    await fsp.writeFile(findRefDest, findRefContent, "utf-8");
   } catch (err) {
     console.warn("[cli-worker] Failed to write MCP server:", err.message);
   }

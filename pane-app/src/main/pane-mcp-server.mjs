@@ -12,8 +12,18 @@ import { promisify } from "node:util";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 
 import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
-const Database = require("better-sqlite3");
+
+// better-sqlite3 is a native addon — it may not be resolvable when the MCP
+// server runs under a different Node.js binary than the one Pane was built
+// with (e.g. the system node used by Gemini CLI). Load it optionally so the
+// server can still start and serve all non-DB tools.
+let Database = null;
+try {
+  const _require = createRequire(import.meta.url);
+  Database = _require("better-sqlite3");
+} catch {
+  // DB-dependent tools will return a graceful error; all others work fine.
+}
 
 const execAsync = promisify(exec);
 
@@ -22,9 +32,10 @@ const PROJECT_ID = process.env.PANE_PROJECT_ID || "";
 const PROJECT_ROOT = process.env.PANE_PROJECT_ROOT || "";
 const DB_PATH = path.join(PANE_DIR, "pane.db");
 
-// Database instance — opened lazily
+// Database instance — opened lazily. Returns null if better-sqlite3 is unavailable.
 let _db = null;
 function getDb() {
+  if (!Database) return null;
   if (!_db) {
     _db = new Database(DB_PATH);
     _db.pragma("journal_mode = WAL");
@@ -524,6 +535,42 @@ const TOOLS = [
     },
   },
   {
+    name: "pane_roadmap",
+    description: "Read or update the project roadmap and workflow phase. Use this to manage the entire build lifecycle: discovery → planning → execution → verification → reflection.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["read", "create", "set_kickoff_field", "populate_steps", "update_step", "add_decision", "update_verification", "complete_milestone", "log_session", "skip_milestone", "add_milestone", "reorder_milestones"],
+          description: "read: get current roadmap | create: create roadmap with milestones | set_kickoff_field: save a discovery field | populate_steps: add steps to active milestone | update_step: mark a step status | add_decision: log a product decision | update_verification: record verification results | complete_milestone: finish milestone and advance | log_session: log session notes | skip_milestone: skip with reason | add_milestone: add a new milestone | reorder_milestones: reorder upcoming milestones",
+        },
+        field: { type: "string", description: "For set_kickoff_field: one of projectName, corePurpose, targetUser, platform, coreEntities, firstUsableAction, scopeBoundaries, existingContext, referenceApps, constraints, deployTarget" },
+        value: { description: "For set_kickoff_field: the value to store (string or array)" },
+        name: { type: "string", description: "For create: project name" },
+        purpose: { type: "string", description: "For create: core purpose of the project" },
+        stack: { type: "object", description: "For create: technology stack info" },
+        milestones: { type: "array", description: "For create: array of {title, description} objects" },
+        steps: { type: "array", description: "For populate_steps: array of {title, detail?} objects" },
+        milestone_id: { type: "string", description: "For update_step, add_decision, skip_milestone" },
+        step_id: { type: "string", description: "For update_step" },
+        step_status: { type: "string", enum: ["pending", "in_progress", "done", "blocked"], description: "For update_step" },
+        question: { type: "string", description: "For add_decision" },
+        answer: { type: "string", description: "For add_decision" },
+        verification_passed: { type: "boolean", description: "For update_verification" },
+        checks: { type: "array", description: "For update_verification: array of check result strings" },
+        steps_completed: { type: "number", description: "For log_session" },
+        notes: { type: "string", description: "For log_session" },
+        reason: { type: "string", description: "For skip_milestone" },
+        title: { type: "string", description: "For add_milestone" },
+        description: { type: "string", description: "For add_milestone" },
+        order: { type: "number", description: "For add_milestone" },
+        ordered_ids: { type: "array", description: "For reorder_milestones: milestone IDs in desired order" },
+      },
+      required: ["action"],
+    },
+  },
+  {
     name: "explore",
     description: "Semantic codebase exploration — search by meaning, get the full picture. Returns relevant files, key functions with code excerpts, module relationships, and project constraints. One call replaces multiple grep + read cycles. Use this when you need to understand how something works, find where something is implemented, or get context before making changes.",
     inputSchema: {
@@ -538,6 +585,126 @@ const TOOLS = [
     },
   },
 ];
+
+// ---------------------------------------------------------------------------
+// Roadmap + workflow helpers — self-contained file I/O, no Electron imports.
+// Mirrors roadmap-manager.mjs and workflow-manager.mjs but uses only node:fs.
+// ---------------------------------------------------------------------------
+
+const PROJECTS_DIR = path.join(PANE_DIR, "projects");
+const SESSION_DIR  = path.join(PANE_DIR, "session");
+
+function makeId() {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+// Roadmap CRUD
+function roadmapPath(id) { return path.join(PROJECTS_DIR, id, "roadmap.json"); }
+function readRoadmap(id) {
+  try { return JSON.parse(fs.readFileSync(roadmapPath(id), "utf-8")); } catch { return null; }
+}
+function writeRoadmap(id, roadmap) {
+  fs.mkdirSync(path.join(PROJECTS_DIR, id), { recursive: true });
+  fs.writeFileSync(roadmapPath(id), JSON.stringify(roadmap, null, 2), "utf-8");
+}
+
+// Session state (phase + kickoff context)
+function statePath(id) { return path.join(SESSION_DIR, id, "state.json"); }
+function readSessionState(id) {
+  try { return JSON.parse(fs.readFileSync(statePath(id), "utf-8")); } catch { return {}; }
+}
+function writeSessionState(id, state) {
+  fs.mkdirSync(path.join(SESSION_DIR, id), { recursive: true });
+  fs.writeFileSync(statePath(id), JSON.stringify(state, null, 2), "utf-8");
+}
+function mergeSessionState(id, delta) {
+  const state = readSessionState(id);
+  writeSessionState(id, { ...state, ...delta });
+}
+
+// Phase helpers
+function getPhase(id) { return readSessionState(id).phase || "idle"; }
+function transitionPhase(id, phase, _reason) {
+  mergeSessionState(id, { phase, phaseEnteredAt: Date.now(), suspended: false, clarification: null });
+}
+
+// Kickoff validation — mirrors KICKOFF_REQUIRED_FIELDS in workflow-manager.mjs
+const KICKOFF_FIELDS = {
+  projectName:       { label: "project name",            validator: null },
+  corePurpose:       { label: "core purpose",            validator: null },
+  targetUser:        { label: "who uses it",             validator: null },
+  platform:          { label: "platform",                validator: null },
+  coreEntities:      { label: "core data entities (≥2)", validator: (v) => Array.isArray(v) && v.length >= 2 },
+  firstUsableAction: { label: "first usable action",     validator: null },
+  scopeBoundaries:   { label: "scope boundaries (≥1)",   validator: (v) => Array.isArray(v) && v.length >= 1 },
+};
+const KICKOFF_OPTIONAL = new Set(["existingContext", "referenceApps", "constraints", "deployTarget"]);
+const ALL_KICKOFF_FIELD_NAMES = new Set([...Object.keys(KICKOFF_FIELDS), ...KICKOFF_OPTIONAL]);
+
+function getKickoffCtx(id)    { return readSessionState(id).kickoffContext || {}; }
+function setKickoffFieldValue(id, field, value) {
+  const state = readSessionState(id);
+  const kickoff = state.kickoffContext || {};
+  kickoff[field] = value;
+  writeSessionState(id, { ...state, kickoffContext: kickoff });
+}
+function getMissingKickoffFields(id) {
+  const ctx = getKickoffCtx(id);
+  return Object.entries(KICKOFF_FIELDS)
+    .filter(([key, def]) => {
+      const v = ctx[key];
+      if (v === undefined || v === null || v === "") return true;
+      return def.validator && !def.validator(v);
+    })
+    .map(([key]) => key);
+}
+
+// Roadmap mutation helpers (mirrors roadmap-manager.mjs)
+function getActiveMilestone(id) {
+  const r = readRoadmap(id);
+  return r ? (r.milestones.find(m => m.status === "active") || null) : null;
+}
+function updateMilestone(id, milestoneId, delta) {
+  const r = readRoadmap(id);
+  if (!r) return null;
+  const i = r.milestones.findIndex(m => m.id === milestoneId);
+  if (i === -1) return null;
+  r.milestones[i] = { ...r.milestones[i], ...delta };
+  r.updatedAt = Date.now();
+  writeRoadmap(id, r);
+  return r;
+}
+function updateStepInMilestone(id, milestoneId, stepId, delta) {
+  const r = readRoadmap(id);
+  if (!r) return null;
+  const m = r.milestones.find(m => m.id === milestoneId);
+  if (!m) return null;
+  const i = (m.steps || []).findIndex(s => s.id === stepId);
+  if (i === -1) return null;
+  m.steps[i] = { ...m.steps[i], ...delta };
+  r.updatedAt = Date.now();
+  writeRoadmap(id, r);
+  return r;
+}
+function advanceToNextMilestone(id) {
+  const r = readRoadmap(id);
+  if (!r) return null;
+  const ai = r.milestones.findIndex(m => m.status === "active");
+  if (ai !== -1) { r.milestones[ai].status = "done"; r.milestones[ai].completedAt = Date.now(); }
+  const upcoming = r.milestones
+    .filter(m => m.status === "upcoming")
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  let next = null;
+  if (upcoming.length > 0) {
+    const ni = r.milestones.findIndex(m => m.id === upcoming[0].id);
+    r.milestones[ni].status = "active";
+    r.milestones[ni].startedAt = Date.now();
+    next = r.milestones[ni];
+  }
+  r.updatedAt = Date.now();
+  writeRoadmap(id, r);
+  return next;
+}
 
 // --- Tool implementations ---
 
@@ -761,6 +928,7 @@ async function handleToolCall(name, args) {
 
     case "pane_change_history": {
       const db = getDb();
+      if (!db) return text("Change history requires the native SQLite module, which is only available when running inside Pane. Use the Claude backend for this tool.");
       let rows = [];
       try {
         rows = db.prepare("SELECT * FROM change_history WHERE project_id = ? ORDER BY timestamp DESC LIMIT 500").all(PROJECT_ID);
@@ -785,6 +953,7 @@ async function handleToolCall(name, args) {
       const query = args?.query;
       const filePath = args?.file_path;
       const db = getDb();
+      if (!db) return text("Change search requires the native SQLite module, which is only available when running inside Pane. Use the Claude backend for this tool.");
       let rows = [];
 
       try {
@@ -813,6 +982,7 @@ async function handleToolCall(name, args) {
     case "pane_revert_change": {
       const changeId = args?.change_id;
       const db = getDb();
+      if (!db) return text("Change revert requires the native SQLite module, which is only available when running inside Pane. Use the Claude backend for this tool.");
       let change = null;
       try {
         change = db.prepare("SELECT * FROM change_history WHERE id = ?").get(changeId);
@@ -1641,6 +1811,227 @@ async function handleToolCall(name, args) {
 
       await writeJson(subsystemsPath, data);
       return text(`Recorded architectural decision for "${matched.name}": "${decision}"`);
+    }
+
+    case "pane_roadmap": {
+      const action = args?.action;
+      const pid = PROJECT_ID;
+
+      if (action === "read") {
+        const r = readRoadmap(pid);
+        if (!r) return text("No roadmap found. Start a kickoff conversation and call pane_roadmap(action: 'create') when ready.");
+        return text(JSON.stringify(r, null, 2));
+      }
+
+      if (action === "set_kickoff_field") {
+        const { field, value } = args || {};
+        if (!field || value === undefined || value === null) {
+          return text("set_kickoff_field requires 'field' and 'value'.");
+        }
+        if (!ALL_KICKOFF_FIELD_NAMES.has(field)) {
+          return text(`Unknown field "${field}". Valid: ${[...ALL_KICKOFF_FIELD_NAMES].join(", ")}`);
+        }
+        const def = KICKOFF_FIELDS[field];
+        if (def?.validator && !def.validator(value)) {
+          return text(`Invalid value for "${field}" — ${def.label}`);
+        }
+        setKickoffFieldValue(pid, field, value);
+        const missing = getMissingKickoffFields(pid);
+        if (missing.length === 0) {
+          return text(`Field "${field}" saved. All 7 required fields gathered — call pane_roadmap(action: 'create') now.`);
+        }
+        const missingLabels = missing.map(f => KICKOFF_FIELDS[f]?.label || f);
+        return text(`Field "${field}" saved. Still needed (${missing.length}): ${missingLabels.join(", ")}`);
+      }
+
+      if (action === "create") {
+        // Validate kickoff completeness when in kickoff phase
+        const phase = getPhase(pid);
+        if (phase === "kickoff") {
+          const missing = getMissingKickoffFields(pid);
+          if (missing.length > 0) {
+            const labels = missing.map(f => KICKOFF_FIELDS[f]?.label || f);
+            return text(`Cannot create roadmap yet — missing: ${labels.join(", ")}. Use set_kickoff_field to save each.`);
+          }
+        }
+        const discovery = getKickoffCtx(pid);
+        const milestones = (args?.milestones || []).map((m, i) => ({
+          id: makeId(),
+          title: m.title,
+          description: m.description || "",
+          status: i === 0 ? "active" : "upcoming",
+          order: i,
+          steps: [],
+          verification: { status: "pending", checks: [], completedAt: null },
+          startedAt: i === 0 ? Date.now() : null,
+          completedAt: null,
+        }));
+        const roadmap = {
+          projectId: pid,
+          name: args?.name || discovery.projectName || "Untitled Project",
+          purpose: args?.purpose || discovery.corePurpose || "",
+          stack: args?.stack || {},
+          discovery,
+          milestones,
+          decisions: [],
+          sessionLog: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        writeRoadmap(pid, roadmap);
+        if (phase === "kickoff" || phase === "idle") {
+          transitionPhase(pid, "planning", "roadmap created");
+        }
+        return text(`Roadmap created with ${milestones.length} milestones. You are now in PLANNING phase — research the codebase, break the first milestone into steps, then call populate_steps.`);
+      }
+
+      if (action === "populate_steps") {
+        const active = getActiveMilestone(pid);
+        if (!active) return text("No active milestone to add steps to.");
+        const steps = (args?.steps || []).map(s => ({
+          id: makeId(), title: s.title, status: "pending", notes: s.detail || null,
+        }));
+        if (!steps.some(s => s.title.toLowerCase().includes("verify"))) {
+          steps.push({ id: makeId(), title: "Verify everything works end to end", status: "pending", notes: null });
+        }
+        updateMilestone(pid, active.id, { steps });
+        const phase = getPhase(pid);
+        if (phase === "planning") transitionPhase(pid, "execution", "steps populated");
+        return text(`${steps.length} steps added to "${active.title}". You are now in EXECUTION phase — work through each step in order.`);
+      }
+
+      if (action === "update_step") {
+        const { milestone_id, step_id, step_status } = args || {};
+        if (!milestone_id || !step_id || !step_status) {
+          return text("update_step requires milestone_id, step_id, and step_status.");
+        }
+        updateStepInMilestone(pid, milestone_id, step_id, { status: step_status });
+        // Auto-transition to verification when all non-verification steps are done
+        const r = readRoadmap(pid);
+        const am = r?.milestones?.find(m => m.status === "active");
+        if (am?.steps && getPhase(pid) === "execution") {
+          const nonVerify = am.steps.filter(s => !s.title.toLowerCase().includes("verify"));
+          if (nonVerify.length > 0 && nonVerify.every(s => s.status === "done")) {
+            transitionPhase(pid, "verification", "all implementation steps done");
+            return text(`Step updated. All implementation steps done — you are now in VERIFICATION phase. Run tsc, lint, build, then call update_verification.`);
+          }
+        }
+        return text(`Step updated to "${step_status}".`);
+      }
+
+      if (action === "add_decision") {
+        const r = readRoadmap(pid);
+        if (!r) return text("No roadmap found.");
+        r.decisions = r.decisions || [];
+        r.decisions.push({
+          id: makeId(), question: args?.question || "", answer: args?.answer || "",
+          milestoneId: args?.milestone_id || null, madeAt: Date.now(),
+        });
+        r.updatedAt = Date.now();
+        writeRoadmap(pid, r);
+        return text("Decision logged.");
+      }
+
+      if (action === "update_verification") {
+        const active = getActiveMilestone(pid);
+        if (!active) return text("No active milestone.");
+        updateMilestone(pid, active.id, {
+          verification: {
+            status: args?.verification_passed ? "passed" : "failed",
+            checks: args?.checks || [],
+            completedAt: Date.now(),
+          },
+        });
+        if (args?.verification_passed && getPhase(pid) === "verification") {
+          transitionPhase(pid, "reflection", "verification passed");
+          return text("Verification passed. You are now in REFLECTION phase — summarize, log_session, then complete_milestone.");
+        }
+        return text("Verification failed. Fix issues and re-run.");
+      }
+
+      if (action === "complete_milestone") {
+        const active = getActiveMilestone(pid);
+        if (!active) return text("No active milestone.");
+        updateMilestone(pid, active.id, { status: "done", completedAt: Date.now() });
+        const next = advanceToNextMilestone(pid);
+        if (getPhase(pid) === "reflection") {
+          transitionPhase(pid, next ? "planning" : "idle", next ? "next milestone" : "project complete");
+        }
+        return text(next
+          ? `Milestone "${active.title}" complete. Next: "${next.title}" — you are now in PLANNING phase.`
+          : `Milestone "${active.title}" complete. All milestones done — project complete!`);
+      }
+
+      if (action === "log_session") {
+        const r = readRoadmap(pid);
+        if (!r) return text("No roadmap found.");
+        const active = r.milestones.find(m => m.status === "active");
+        r.sessionLog = r.sessionLog || [];
+        r.sessionLog.push({
+          id: makeId(), startedAt: Date.now() - 3600000, endedAt: Date.now(),
+          milestoneId: active?.id || null,
+          stepsCompleted: args?.steps_completed || 0,
+          notes: args?.notes || "",
+        });
+        r.updatedAt = Date.now();
+        writeRoadmap(pid, r);
+        return text("Session logged.");
+      }
+
+      if (action === "skip_milestone") {
+        if (!args?.milestone_id) return text("skip_milestone requires milestone_id.");
+        const r = readRoadmap(pid);
+        if (!r) return text("No roadmap found.");
+        const i = r.milestones.findIndex(m => m.id === args.milestone_id);
+        if (i === -1) return text("Milestone not found.");
+        r.milestones[i] = { ...r.milestones[i], status: "done", completedAt: Date.now(), skipped: true, skipReason: args?.reason || "" };
+        // Activate next upcoming milestone
+        const upcoming = r.milestones.filter(m => m.status === "upcoming").sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+        if (upcoming.length > 0) {
+          const ni = r.milestones.findIndex(m => m.id === upcoming[0].id);
+          r.milestones[ni].status = "active"; r.milestones[ni].startedAt = Date.now();
+        }
+        r.updatedAt = Date.now();
+        writeRoadmap(pid, r);
+        const nextActive = r.milestones.find(m => m.status === "active");
+        transitionPhase(pid, nextActive ? "planning" : "idle", "milestone skipped");
+        return text(`Milestone skipped. ${args?.reason || ""}`.trim());
+      }
+
+      if (action === "add_milestone") {
+        const r = readRoadmap(pid);
+        if (!r) return text("No roadmap found. Create one first with pane_roadmap(action: 'create').");
+        const m = {
+          id: makeId(), title: args?.title || "Untitled Milestone",
+          description: args?.description || "", status: "upcoming",
+          order: args?.order ?? r.milestones.length,
+          steps: [], verification: { status: "pending", checks: [], completedAt: null },
+          startedAt: null, completedAt: null,
+        };
+        r.milestones.push(m);
+        r.milestones.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+        r.milestones.forEach((m, i) => { m.order = i; });
+        r.updatedAt = Date.now();
+        writeRoadmap(pid, r);
+        return text(`Milestone "${m.title}" added.`);
+      }
+
+      if (action === "reorder_milestones") {
+        if (!Array.isArray(args?.ordered_ids)) return text("reorder_milestones requires ordered_ids array.");
+        const r = readRoadmap(pid);
+        if (!r) return text("No roadmap found.");
+        const fixed    = r.milestones.filter(m => m.status !== "upcoming");
+        const moveable = r.milestones.filter(m => m.status === "upcoming");
+        const reordered = args.ordered_ids.map(id => moveable.find(m => m.id === id)).filter(Boolean);
+        moveable.filter(m => !reordered.includes(m)).forEach(m => reordered.push(m));
+        r.milestones = [...fixed, ...reordered];
+        r.milestones.forEach((m, i) => { m.order = i; });
+        r.updatedAt = Date.now();
+        writeRoadmap(pid, r);
+        return text("Milestones reordered.");
+      }
+
+      return text(`Unknown pane_roadmap action: ${action}`);
     }
 
     case "explore": {

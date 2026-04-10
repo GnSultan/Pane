@@ -7,7 +7,9 @@
       ],
       "env": {
         "PANE_PROJECT_ID": "test-project",
-        "PANE_PROJECT_ROOT": "/Users/macbook/Pane/pane-app"
+        "PANE_PROJECT_ROOT": "/Users/macbook/Pane/pane-app",
+        "HOME": "/Users/macbook",
+        "PATH": "/Users/macbook/.nvm/versions/node/v22.19.0/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/bin:/bin:/usr/sbin:/sbin"
       },
       "trust": true
     }

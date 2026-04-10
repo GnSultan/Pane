@@ -1051,77 +1051,88 @@ export function InputBar({
 
   return (
     <div className="bg-transparent">
-      {/* Processing indicator — only exists when active, no reserved space */}
-      {(isProcessing || isFadingOut) && !todoPanelOpen && (
-          <div
-            className={`flex items-center gap-3 px-3 pb-3 ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
+      {/* Processing indicator — absolute like the ghost trigger, floats over scroll
+          content with zero layout footprint and no background. Hidden once the
+          user expands the input bar (expanded card takes over). */}
+      {(isProcessing || isFadingOut) && !todoPanelOpen && !expanded && (
+        <div
+          className={`absolute bottom-0 left-0 right-0 flex items-center gap-3 px-3 pb-3 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
+        >
+          {/* Radiating strokes — gentle spin */}
+          <svg
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            className="text-pane-text-secondary/70 shrink-0 animate-gentle-spin"
           >
-            {/* Radiating strokes — gentle spin */}
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              className="text-pane-text-secondary/70 shrink-0 animate-gentle-spin"
-            >
-              <line x1="12" y1="2"     x2="12"    y2="6" />
-              <line x1="16.24" y1="7.76"  x2="19.07" y2="4.93" />
-              <line x1="18" y1="12"    x2="22"    y2="12" />
-              <line x1="16.24" y1="16.24" x2="19.07" y2="19.07" />
-              <line x1="12" y1="18"    x2="12"    y2="22" />
-              <line x1="7.76" y1="16.24"  x2="4.93"  y2="19.07" />
-              <line x1="6"  y1="12"    x2="2"     y2="12" />
-              <line x1="7.76" y1="7.76"   x2="4.93"  y2="4.93" />
-            </svg>
-            {/* Previous indicators — swap above SVG for either if needed
-            — circle-pulse (breathing circle):
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" strokeWidth="1.5"
-                 className="text-pane-text-secondary shrink-0">
-              <circle cx="12" cy="12" r="7" fill="none"
-                      className="animate-circle-pulse"
-                      style={{ strokeWidth: "var(--circle-stroke-width, 1.5)" }} />
-            </svg>
-            — radiate (staggered opacity ripple):
-            use animate-radiate-N classes on each stroke
-            */}
-            {todos.length > 0 && (
-              <button
-                onClick={() => setTodoPanelOpen((v) => !v)}
-                className="text-pane-text-secondary font-mono hover:text-pane-text btn-press shrink-0 truncate"
-                style={{ fontSize: "var(--pane-font-size-sm)" }}
-              >
-                {(() => {
-                  const completedCount = todos.filter(
-                    (t) => t.status === "completed",
-                  ).length;
-                  const totalCount = todos.length;
-                  const inProgressIdx = todos.findIndex(
-                    (t) => t.status === "in_progress",
-                  );
-                  const currentIdx =
-                    inProgressIdx !== -1 ? inProgressIdx : completedCount;
-
-                  const displayIdx = Math.min(currentIdx, totalCount - 1);
-                  const currentTask = todos[displayIdx];
-
-                  if (completedCount === totalCount) return "done";
-                  return `${completedCount + 1}/${totalCount} ${currentTask?.activeForm || currentTask?.content}`;
-                })()}
-              </button>
-            )}
+            <line x1="12" y1="2"     x2="12"    y2="6" />
+            <line x1="16.24" y1="7.76"  x2="19.07" y2="4.93" />
+            <line x1="18" y1="12"    x2="22"    y2="12" />
+            <line x1="16.24" y1="16.24" x2="19.07" y2="19.07" />
+            <line x1="12" y1="18"    x2="12"    y2="22" />
+            <line x1="7.76" y1="16.24"  x2="4.93"  y2="19.07" />
+            <line x1="6"  y1="12"    x2="2"     y2="12" />
+            <line x1="7.76" y1="7.76"   x2="4.93"  y2="4.93" />
+          </svg>
+          {/* Previous indicators — swap above SVG for either if needed
+          — circle-pulse (breathing circle):
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" strokeWidth="1.5"
+               className="text-pane-text-secondary shrink-0">
+            <circle cx="12" cy="12" r="7" fill="none"
+                    className="animate-circle-pulse"
+                    style={{ strokeWidth: "var(--circle-stroke-width, 1.5)" }} />
+          </svg>
+          — radiate (staggered opacity ripple):
+          use animate-radiate-N classes on each stroke
+          */}
+          {todos.length > 0 ? (
             <button
-              onClick={onAbort}
-              className="text-pane-error font-mono hover:text-pane-error/80 ml-auto btn-press"
+              onClick={() => setTodoPanelOpen((v) => !v)}
+              className="text-pane-text-secondary font-mono hover:text-pane-text btn-press shrink-0 truncate"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
-              stop
+              {(() => {
+                const completedCount = todos.filter(
+                  (t) => t.status === "completed",
+                ).length;
+                const totalCount = todos.length;
+                const inProgressIdx = todos.findIndex(
+                  (t) => t.status === "in_progress",
+                );
+                const currentIdx =
+                  inProgressIdx !== -1 ? inProgressIdx : completedCount;
+
+                const displayIdx = Math.min(currentIdx, totalCount - 1);
+                const currentTask = todos[displayIdx];
+
+                if (completedCount === totalCount) return "done";
+                return `${completedCount + 1}/${totalCount} ${currentTask?.activeForm || currentTask?.content}`;
+              })()}
             </button>
-          </div>
-        )}
+          ) : (
+            /* Placeholder — tap to open input bar and queue next message */
+            <button
+              onClick={() => setExpanded(true)}
+              className="font-mono text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors text-left"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              let's build
+            </button>
+          )}
+          <button
+            onClick={onAbort}
+            className="text-pane-error font-mono hover:text-pane-error/80 ml-auto btn-press"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            stop
+          </button>
+        </div>
+      )}
 
       {todoPanelOpen && todos.length > 0 && (
         <TodoPanel
