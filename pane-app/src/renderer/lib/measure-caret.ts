@@ -29,17 +29,28 @@ export function measureCaretPos(
   const textNode = textSpan?.firstChild;
 
   if (textNode && textNode.nodeType === Node.TEXT_NODE) {
-    const len = (textNode as Text).length;
-    const pos = Math.min(sel, len);
+    const originalValue = textNode.nodeValue || "";
+    const selStart = Math.min(sel, originalValue.length);
     const range = document.createRange();
-    range.setStart(textNode, pos);
-    range.setEnd(textNode, pos);
+    
+    // First attempt: direct measurement
+    range.setStart(textNode, selStart);
+    range.setEnd(textNode, selStart);
+    let rects = range.getClientRects();
 
-    // A collapsed range returns 0 or 1 ClientRect.  When it returns one,
-    // that rect is the exact insertion-point position in the overlay's layout.
-    const rects = range.getClientRects();
-    if (rects.length > 0) {
-      const r = rects[0];
+    // Second attempt: if zero rects (trailing newline edge case), 
+    // temporarily insert a dummy char to force a layout box.
+    if (rects.length === 0) {
+      textNode.nodeValue = originalValue.slice(0, selStart) + "\u200B" + originalValue.slice(selStart);
+      range.setStart(textNode, selStart);
+      range.setEnd(textNode, selStart + 1);
+      rects = range.getClientRects();
+      // Restore original value immediately
+      textNode.nodeValue = originalValue;
+    }
+
+    const r = rects[0];
+    if (r) {
       // Render the caret slightly taller than the raw cap-height so it reads
       // clearly at any font size.  Re-centre top so it stays visually balanced
       // within the line box (r.height = full leading, caretH = font-size).

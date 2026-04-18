@@ -211,6 +211,8 @@ interface ProjectsState {
     projectId: string,
     todos: import("../lib/punk-types").Todo[],
   ) => void;
+  setPendingInput: (projectId: string, pendingInput: import("../lib/punk-types").ConversationState["pendingInput"]) => void;
+  clearPendingInput: (projectId: string) => void;
   setIsPlanning: (projectId: string, isPlanning: boolean) => void;
   setConversationPhase: (projectId: string, phase: import("../lib/punk-types").ConversationState["phase"]) => void;
   updateLastToolUseInput: (
@@ -782,6 +784,20 @@ function createProjectsStore() {
         })),
       ),
 
+    setPendingInput: (projectId, pendingInput) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: { ...p.conversation, pendingInput },
+        })),
+      ),
+
+    clearPendingInput: (projectId) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: { ...p.conversation, pendingInput: null },
+        })),
+      ),
+
     setIsPlanning: (projectId, isPlanning) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -896,6 +912,7 @@ function createProjectsStore() {
             tokensSaved: 0,
             historyTotalCount: historyInfo?.totalCount ?? 0,
             historyStartIndex: historyInfo?.startIndex ?? 0,
+            pendingInput: null,
           },
         })),
       ),

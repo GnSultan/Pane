@@ -88,6 +88,14 @@ function _createSchema(db) {
       updated_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS cli_sessions (
+      project_id TEXT NOT NULL,
+      backend    TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (project_id, backend)
+    );
+
     CREATE TABLE IF NOT EXISTS change_history (
       id          TEXT    PRIMARY KEY,
       project_id  TEXT    NOT NULL,
@@ -236,6 +244,14 @@ function _prepareStatements(db) {
       VALUES (?, ?, ?, ?)
     `),
     getConvMeta: db.prepare("SELECT session_id, model FROM conversation_meta WHERE project_id = ?"),
+
+    // cli_sessions — per-backend session IDs (survive app restarts without clobbering)
+    upsertCliSession: db.prepare(`
+      INSERT OR REPLACE INTO cli_sessions (project_id, backend, session_id, updated_at)
+      VALUES (?, ?, ?, ?)
+    `),
+    deleteCliSession: db.prepare("DELETE FROM cli_sessions WHERE project_id = ? AND backend = ?"),
+    getCliSessions: db.prepare("SELECT project_id, session_id FROM cli_sessions WHERE backend = ?"),
 
     // change_history
     insertChange: db.prepare(`
@@ -482,6 +498,29 @@ export async function runMigrationIfNeeded(db) {
     try { await _migrateArchivedConversations(db); } catch (e) { console.error("[pane-db] archived migration error:", e.message); }
     db.stmts.setMigrationVersion.run(3);
     console.log("[pane-db] Migration v3 complete.");
+  }
+
+  if (version < 4) {
+    // Migrate session IDs from conversation_meta → cli_sessions.
+    // conversation_meta stored one session_id per project, so switching
+    // backends (claude ↔ gemini) clobbered the other's ID. cli_sessions
+    // is keyed on (project_id, backend) so each backend keeps its own.
+    console.log("[pane-db] Running migration v4: per-backend session IDs...");
+    try {
+      const rows = db.prepare(
+        "SELECT project_id, session_id, model FROM conversation_meta WHERE session_id IS NOT NULL"
+      ).all();
+      for (const row of rows) {
+        const backend = row.model || "claude"; // model column stored backend name
+        db.stmts.upsertCliSession.run(row.project_id, backend, row.session_id, Date.now());
+      }
+      // Clear session_id from conversation_meta — cli_sessions owns this now
+      db.prepare("UPDATE conversation_meta SET session_id = NULL").run();
+    } catch (e) {
+      console.error("[pane-db] v4 migration error:", e.message);
+    }
+    db.stmts.setMigrationVersion.run(4);
+    console.log("[pane-db] Migration v4 complete.");
   }
 }
 

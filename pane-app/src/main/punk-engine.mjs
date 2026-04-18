@@ -14,7 +14,6 @@ import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 import { BrowserWindow, utilityProcess, ipcMain } from "electron";
 import { getPaneDb } from "./pane-db.mjs";
-import { TaskRunner } from "./task-runner.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -138,8 +137,6 @@ async function detectBackendAvailability() {
 
 import { ApiBackend } from "./http-backend.mjs";
 
-// Planning phase system prompts moved to planning-agent.mjs.
-// Kept as comments for reference — the planning agent owns these now.
 import { PunkBackend } from "./punk-backend.mjs";
 import { modelManager } from "./model-manager.mjs";
 import { readState } from "./pane-system-prompt.mjs";
@@ -190,43 +187,21 @@ function computeOutcomeScore(tracked) {
 const __dirname = import.meta.dirname;
 
 // ============================================================================
-// Default Intent Routing Config
+// Default Power Combo
 // ============================================================================
 
-const DEFAULT_INTENT_ROUTING = {
-  "gemini": {
-    plan: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
-    execute: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
-    explain: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
-    other: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
-  },
+// Global default: Opus thinks, Sonnet builds.
+// Provider-agnostic — either slot can be any provider the user has access to.
+// Used as fallback when settings.json has no power_combo configured.
+const DEFAULT_POWER_COMBO = {
+  // Keyed variants kept only for migration from old per-backend format
   "claude-code": {
-    plan: { provider: "anthropic", model: "opus", thinking: false },
-    execute: { provider: "anthropic", model: "sonnet", thinking: false },
-    explain: { provider: "anthropic", model: "sonnet", thinking: false },
-    other: { provider: "anthropic", model: "sonnet", thinking: false },
+    thinking:  { provider: "anthropic", model: "opus",   thinking: false },
+    execution: { provider: "anthropic", model: "sonnet", thinking: false },
   },
   api: {
-    plan: {
-      provider: "openrouter",
-      model: "stepfun/step-3.5-flash:free",
-      thinking: true,
-    },
-    execute: {
-      provider: "openrouter",
-      model: "stepfun/step-3.5-flash:free",
-      thinking: true,
-    },
-    explain: {
-      provider: "openrouter",
-      model: "stepfun/step-3.5-flash:free",
-      thinking: true,
-    },
-    other: {
-      provider: "openrouter",
-      model: "stepfun/step-3.5-flash:free",
-      thinking: true,
-    },
+    thinking:  { provider: "openrouter", model: "stepfun/step-3.5-flash:free", thinking: true },
+    execution: { provider: "openrouter", model: "stepfun/step-3.5-flash:free", thinking: true },
   },
 };
 
@@ -264,56 +239,6 @@ const DEFAULT_INTENT_ROUTING = {
  * @returns {void}
  */
 
-// ============================================================================
-/**
- * Write Edit/Write tool_use blocks from a CLI step directly to pane's change-history.
- * CLI backends use native tools (Edit, Write) that don't call the record_change IPC
- * handler. Step events use a stepRequestId filtered out by the renderer, so they
- * never reach recordChangeHistory() in usePunk.ts. We record them here instead.
- */
-async function recordStepChangesToHistory(projectId, workingDir, toolUses) {
-  const editTools = toolUses.filter(t =>
-    t.name === "Edit" || t.name === "Write" ||
-    t.name === "write_file" || t.name === "replace"
-  );
-  if (editTools.length === 0) return;
-
-  let db;
-  try {
-    db = getPaneDb();
-  } catch (err) {
-    console.warn("[punk] Database not available, skipping change recording:", err.message);
-    return;
-  }
-  
-  if (!db.stmts.insertChange) {
-    console.warn("[punk] Database not fully initialized, skipping change recording");
-    return;
-  }
-  
-  for (const tool of editTools) {
-    let filePath = tool.input?.file_path || tool.input?.path || "";
-    if (workingDir && path.isAbsolute(filePath) && filePath.startsWith(workingDir)) {
-      filePath = path.relative(workingDir, filePath);
-    }
-
-    const id = `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    try {
-      db.stmts.insertChange.run(
-        id,
-        projectId,
-        filePath,
-        tool.input?.old_string || null,
-        tool.input?.new_string || tool.input?.content || "",
-        `[step] ${tool.name}`,
-        Date.now(),
-        workingDir || null
-      );
-    } catch (err) {
-      console.warn("[punk] Failed to record step change to SQLite:", err.message);
-    }
-  }
-}
 
 // CLI Backend (wraps existing cli-worker.mjs)
 // ============================================================================
@@ -350,16 +275,26 @@ class CliBackend extends PunkBackend {
         }
         return;
       }
-      // Persist CLI session IDs to SQLite (survives app restarts)
+      // Persist CLI session IDs to cli_sessions table — keyed on
+      // (project_id, backend) so switching between Claude and Gemini in
+      // the same conversation doesn't clobber the other's session ID.
       if (message.type === "persist_session_id") {
         try {
           const db = getPaneDb();
-          db.stmts.upsertConvMeta.run(
-            message.projectId,
-            message.sessionId,
-            message.backend || null,
-            Date.now(),
-          );
+          if (message.sessionId) {
+            db.stmts.upsertCliSession.run(
+              message.projectId,
+              message.backend || this.command,
+              message.sessionId,
+              Date.now(),
+            );
+          } else {
+            // null sessionId = stale session cleared by worker
+            db.stmts.deleteCliSession.run(
+              message.projectId,
+              message.backend || this.command,
+            );
+          }
         } catch {}
         return;
       }
@@ -394,13 +329,13 @@ class CliBackend extends PunkBackend {
       this.worker = null;
     });
 
-    // Restore persisted session IDs so resume works after app restart
+    // Restore persisted session IDs for THIS backend only.
+    // cli_sessions is keyed on (project_id, backend) so each worker
+    // only gets its own sessions — no cross-contamination.
     try {
       const db = getPaneDb();
-      const allMeta = db.prepare(
-        "SELECT project_id, session_id FROM conversation_meta WHERE session_id IS NOT NULL"
-      ).all();
-      for (const row of allMeta) {
+      const rows = db.stmts.getCliSessions.all(this.command);
+      for (const row of rows) {
         this.worker.postMessage({
           type: "restore_session_id",
           projectId: row.project_id,
@@ -486,111 +421,6 @@ class CliBackend extends PunkBackend {
       this.worker = null;
     }
     this.activeRequests.clear();
-  }
-
-  /**
-   * Execute a single orchestration step through the CLI backend.
-   * The system override is folded into the user prompt since we can't
-   * inject an arbitrary system prompt into the Claude/Gemini CLI binary.
-   * A fresh sessionId ensures no prior conversation history bleeds in.
-   */
-  async spawnStep(projectId, prompt, systemOverride, request) {
-    const stepRequestId = `step-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    // Fold the system override into the user message as preamble context.
-    // The CLI binary controls its own system prompt, but the model will
-    // still follow grounded instructions prepended to the user turn.
-    const stepPrompt = systemOverride
-      ? `[Step context — follow these instructions precisely]\n${systemOverride}\n\n[Your task]\n${prompt}`
-      : prompt;
-
-    const stepRequest = {
-      ...request,
-      projectId,
-      prompt: stepPrompt,
-      requestId: stepRequestId,
-      history: [],     // belt-and-suspenders: no history
-    };
-
-    // CLI spawn is fire-and-forget — we must wait for processEnded before returning.
-    // Collect tool_use blocks during the step so we can record them to pane's
-    // change-history (step events use stepRequestId, so renderer never sees them).
-    const stepToolUses = [];
-    let stepDoneResolve;
-    const stepDone = new Promise(r => { stepDoneResolve = r; });
-    const origOnEvent = this.onEvent;
-    this.onEvent = (pid, event, rid) => {
-      if (rid === stepRequestId) {
-        // Collect tool_use blocks from assistant messages for change-history recording
-        if (event.event === "message") {
-          const parsed = event.data?.parsed;
-          if (parsed?.type === "assistant") {
-            const content = parsed.message?.content || [];
-            for (const block of content) {
-              if (block.type === "tool_use") stepToolUses.push(block);
-            }
-          }
-        }
-
-        // processEnded: resolve the step, do NOT forward to renderer — it would
-        // close the main listener (which is still waiting for orchestration_complete).
-        if (event.event === "processEnded") {
-          this.onEvent = origOnEvent;
-          stepDoneResolve();
-          return;
-        }
-
-        // Suppress system/init (overwrites session ID), result (session-ending),
-        // user messages (step prompts clutter conversation), tool results (noise).
-        if (event.event === "message") {
-          const t = event.data?.parsed?.type;
-          if (t === "system" || t === "result" || t === "user" || t === "tool") return;
-
-          // Strip TodoWrite/TodoRead from assistant messages — the plan todo list is
-          // managed by orchestration_plan/orchestration_step_complete events; execution
-          // model's internal task tracking would overwrite those plan steps.
-          if (t === "assistant") {
-            const blocks = event.data?.parsed?.message?.content || [];
-            const filtered = blocks.filter(
-              b => !(b.type === "tool_use" && (b.name === "TodoWrite" || b.name === "TodoRead"))
-            );
-            if (filtered.length === 0) return;
-            if (filtered.length !== blocks.length) {
-              event = { ...event, data: { ...event.data, parsed: {
-                ...event.data.parsed,
-                message: { ...event.data.parsed.message, content: filtered },
-              }}};
-            }
-          }
-          // Suppress standalone TodoWrite/TodoRead tool_use messages too
-          if (t === "tool_use") {
-            const name = event.data?.parsed?.name;
-            if (name === "TodoWrite" || name === "TodoRead") return;
-          }
-        }
-
-        // Forward remaining step events (streaming text, tool_use, assistant messages)
-        // under the main requestId — user sees execution activity in real time.
-        origOnEvent(pid, event, request.requestId);
-        return;
-      }
-      origOnEvent(pid, event, rid);
-    };
-
-    await this.spawn(stepRequest);
-    // Wait for the model to actually finish (processEnded fires from worker)
-    await Promise.race([stepDone, new Promise(r => setTimeout(r, 10 * 60 * 1000))]);
-    this.onEvent = origOnEvent; // ensure restore even on timeout
-
-    // Write Edit/Write tool calls directly to pane's change-history.
-    // CLI backends bypass the renderer's recordChangeHistory, so we do it here.
-    if (stepToolUses.length > 0) {
-      await recordStepChangesToHistory(projectId, request.workingDir, stepToolUses).catch(err =>
-        console.warn("[spawnStep] change-history recording failed:", err.message)
-      );
-    }
-
-    return { messages: [] };
   }
 
   /**
@@ -721,26 +551,6 @@ class PunkEngine {
     // Cleared by claude_signin on successful auth.
     this._claudeSignedOut = false;
 
-    // Control Inversion Engine
-    this.taskRunner = new TaskRunner(
-      async (projectId, prompt, systemOverride, request) => {
-        const backend = this.getBackendForRequest(request);
-        if (backend.spawnStep) {
-          return await backend.spawnStep(projectId, prompt, systemOverride, request);
-        }
-        // Fallback for CLI backends which don't support explicit spawnStep (though they should)
-        const isCli = !backend.supportsToolCalling;
-        const modifiedRequest = {
-          ...request,
-          prompt: isCli ? `${systemOverride}\n\n---\n\n${prompt}` : prompt,
-          _systemOverride: isCli ? undefined : systemOverride,
-          history: [],
-        };
-        await backend.spawn(modifiedRequest);
-        return { messages: [] };
-      },
-      (pid, event, rid) => this.handleBackendEvent(pid, event, rid)
-    );
   }
 
   _sweepStaleOutcomes() {
@@ -964,36 +774,40 @@ class PunkEngine {
     }
   }
 
-  async loadIntentRouting() {
+  async loadPowerCombo() {
     try {
       const content = await fs.readFile(
         path.join(os.homedir(), ".pane", "settings.json"),
         "utf-8",
       );
       const settings = JSON.parse(content);
+      const raw = settings.power_combo;
 
-      // Unified model selection: route based on the user's active provider,
-      // not the legacy punk_backend setting. If user selected anthropic in
-      // the model picker, use the claude-code routing table so all LLM calls
-      // (orchestration planning, execution, commit drafts, indexing) go
-      // through the same provider the conversation uses.
-      const activeProvider = settings.selected_model_provider || null;
-      const providerToRoutingKey = { anthropic: "claude-code", gemini: "gemini" };
-      const routingKey = providerToRoutingKey[activeProvider]
-        || settings.punk_backend || "api";
+      // Flat format: { thinking: {...}, execution: {...} }
+      if (raw?.thinking && raw?.execution) return raw;
 
-      const routing = settings.intent_routing?.[routingKey];
-      if (routing) return routing;
+      // Migration: old keyed format { "api": {...}, "claude-code": {...} }
+      if (raw && typeof raw === "object") {
+        const keyed = raw["claude-code"] || raw["api"] || raw["gemini"];
+        if (keyed?.thinking && keyed?.execution) {
+          console.log("[punk] migrating keyed power_combo → flat");
+          return keyed;
+        }
+      }
 
-      return DEFAULT_INTENT_ROUTING[routingKey] || DEFAULT_INTENT_ROUTING["api"];
+      // Migration: oldest intent_routing format
+      const oldRouting = settings.intent_routing;
+      if (oldRouting && typeof oldRouting === "object") {
+        const r = oldRouting["claude-code"] || oldRouting["api"];
+        if (r?.plan && r?.execute) {
+          console.log("[punk] migrating intent_routing → power_combo");
+          return { thinking: r.plan, execution: r.execute };
+        }
+      }
     } catch {}
 
-    const settings = await this.loadSettings();
-    const activeProvider = settings.selected_model_provider || null;
-    const providerToRoutingKey = { anthropic: "claude-code", gemini: "gemini" };
-    const routingKey = providerToRoutingKey[activeProvider]
-      || settings.punk_backend || "api";
-    return DEFAULT_INTENT_ROUTING[routingKey] || DEFAULT_INTENT_ROUTING["api"];
+    // Default: Opus thinks, Sonnet builds
+    return DEFAULT_POWER_COMBO["claude-code"] || DEFAULT_POWER_COMBO["api"];
   }
 
   async loadIntentAutoRoute() {
@@ -1488,7 +1302,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // bypass classification — they're user overrides, resolved inline.
     const sessionState = readState(resolvedRequest.projectId);
     const promptText = (resolvedRequest.prompt || "").trim().toLowerCase();
-    const hasSlashOverride = /^\/(?:plan|direct|raw|discuss|chat|orchestrate|steps|exec|analyze)\b/.test(promptText);
+    const hasSlashOverride = /^\/(?:direct|raw|discuss|chat|exec|analyze)\b/.test(promptText);
 
     const pendingTodos = (resolvedRequest.todos || []).filter(t => t.status !== "completed").length;
 
@@ -1504,27 +1318,23 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       // No quickCall, no routing oracle, just go straight to backend.
       strategy = { mode: "direct", discovery: false, reasoning: "shallow", verification: "none", confidence: 1.0, reason: "system override", signals: [] };
       console.log("[punk] system override — skipping classification");
-    } else if (resolvedRequest.effectiveMode) {
-      // ── Mode pill / carry-forward — single source of truth ──
-      // The renderer resolved the mode (auto-detected or user-tapped).
-      // Skip all re-classification — use this directly so the system prompt
-      // stays consistent across turns in the same conversation flow.
-      const modeStrategies = {
-        plan:    { mode: "analyze",     discovery: true,  reasoning: "deep",    verification: "none" },
-        analyze: { mode: "analyze",     discovery: true,  reasoning: "deep",    verification: "none" },
-        execute: { mode: "direct",      discovery: false, reasoning: "shallow", verification: "diff" },
-        discuss: { mode: "discuss",     discovery: false, reasoning: "deep",    verification: "none" },
+    } else if (resolvedRequest.phase) {
+      // ── Phase system — single source of truth ──
+      // The renderer sends the sticky phase (think/build/verify/idle).
+      // Phase is set explicitly by user or approval patterns — never per-message classified.
+      const phaseStrategies = {
+        think:  { mode: "analyze", discovery: true,  reasoning: "deep",    verification: "none" },
+        build:  { mode: "direct",  discovery: false, reasoning: "shallow", verification: "diff" },
+        idle:   { mode: "direct",  discovery: false, reasoning: "shallow", verification: "none" },
       };
-      const modeStrat = modeStrategies[resolvedRequest.effectiveMode] || modeStrategies.execute;
-      strategy = { ...modeStrat, confidence: 1.0, reason: `mode: ${resolvedRequest.effectiveMode}`, signals: [] };
-      // Map to intent so context assembly gets a consistent directive
-      const modeToIntent = { plan: "plan", analyze: "plan", execute: "execute", discuss: "explain" };
-      resolvedRequest.intent = modeToIntent[resolvedRequest.effectiveMode] || resolvedRequest.intent;
-      // Strip any leading slash directive the renderer may have prepended (e.g. /discuss, /analyze).
-      // effectiveMode is the authoritative routing signal; CLI backends treat leading / as their
-      // own internal commands and will terminate or fail when they see an unknown one.
+      const phaseStrat = phaseStrategies[resolvedRequest.phase] || phaseStrategies.build;
+      strategy = { ...phaseStrat, confidence: 1.0, reason: `phase: ${resolvedRequest.phase}`, signals: [] };
+      // Map phase to intent for context assembly
+      const phaseToIntent = { think: "plan", build: "execute", idle: "execute" };
+      resolvedRequest.intent = phaseToIntent[resolvedRequest.phase] || resolvedRequest.intent;
+      // Strip any leading slash directive the renderer may have prepended
       resolvedRequest.prompt = (resolvedRequest.prompt || "").replace(/^\/[\w]+\s*/, "").trim();
-      console.log(`[punk] effectiveMode → ${resolvedRequest.effectiveMode} (strategy: ${strategy.mode}, intent: ${resolvedRequest.intent})`);
+      console.log(`[punk] phase → ${resolvedRequest.phase} (strategy: ${strategy.mode}, intent: ${resolvedRequest.intent})`);
     } else if (hasSlashOverride) {
       // ── Slash overrides — user knows what they want ──
       const slashStrategies = {
@@ -1533,9 +1343,6 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         exec:        { mode: "direct",      discovery: false, reasoning: "shallow", verification: "none" },
         discuss:     { mode: "discuss",     discovery: false, reasoning: "deep",    verification: "none" },
         chat:        { mode: "discuss",     discovery: false, reasoning: "deep",    verification: "none" },
-        orchestrate: { mode: "orchestrate", discovery: true,  reasoning: "deep",    verification: "diff" },
-        steps:       { mode: "orchestrate", discovery: true,  reasoning: "deep",    verification: "diff" },
-        plan:        { mode: "orchestrate", discovery: false, reasoning: "deep",    verification: "diff" },
         analyze:     { mode: "analyze",     discovery: true,  reasoning: "deep",    verification: "none" },
       };
       const cmd = promptText.match(/^\/([\w]+)/)?.[1] || "direct";
@@ -1659,13 +1466,14 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // autoRoute comes directly from the frontend request — always current.
     // Fallback to disk only when not present (e.g. internal spawns).
     const autoRoute = request.autoRoute ?? (await this.loadIntentAutoRoute());
-    const routing   = await this.loadIntentRouting();
+    const combo     = await this.loadPowerCombo();
 
-    // Intent slot — used for fallback routing when heuristic doesn't pick a model
-    const intentSlot = strategy.mode === "discuss" ? "explain" : "execute";
-    if (!resolvedRequest.intent) resolvedRequest.intent = intentSlot;
+    // Phase-based fallback route: think/verify → thinking model, build/idle → execution model
+    const phase = resolvedRequest.phase || "build";
+    const comboSlot = phase === "think" ? "thinking" : "execution";
+    if (!resolvedRequest.intent) resolvedRequest.intent = comboSlot === "thinking" ? "plan" : "execute";
 
-    const intentRoute = routing[intentSlot] || routing["execute"];
+    const intentRoute = combo[comboSlot] || combo["execution"];
 
     // When autoRoute is off the user has pinned a model — respect it exactly.
     // When autoRoute is on the router owns model selection entirely.
@@ -1675,15 +1483,17 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     let escalationLevel = localDecision?.escalationStage ?? 0;
 
     if (userExplicitOverride) {
+      // User has pinned a model — always respect their pick.
+      // Phase affects strategy (mode, discovery, reasoning) but NOT model selection.
       resolvedRequest.thinking = request.thinking ?? false;
       console.log(`[punk] user model lock → ${resolvedRequest.provider}/${resolvedRequest.model}`);
     } else if (localDecision?.modelTier && autoRoute) {
       // ── Heuristic tier → concrete model resolution ──
       // The heuristic router returns a tier (cheap/mid/capable/frontier).
-      // We resolve that to a concrete provider/model from the current backend.
+      // Within-phase escalation: base provider comes from the active combo slot.
       const tier = localDecision.modelTier;
       const isGemini = catalogData?.backend === "gemini";
-      const baseProvider = isGemini ? "gemini" : "anthropic";
+      const baseProvider = isGemini ? "gemini" : (intentRoute?.provider || "anthropic");
 
       const TIER_MODELS = {
         gemini: { cheap: "gemini-3-flash-preview", mid: "gemini-3-flash-preview", capable: "gemini-3-flash-preview", frontier: "gemini-3-flash-preview" },
@@ -1961,46 +1771,21 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       }
     }
 
-    // ── CONTROL INVERSION CHECK ───────────────────────────────────────────
-    // Strategy engine drives orchestration — classifier's mode decision is the gate.
-    if (!resolvedRequest._systemOverride) {
-      let orchestrationEnabled = true;
-      try {
-        const settings = await this.loadSettings();
-        orchestrationEnabled = settings.orchestration_enabled ?? true;
-      } catch {}
-
-      // ── ANALYZE MODE ───────────────────────────────────────────────────
-      // Deep investigation with read-only tools. Bypasses orchestration
-      // (no plan→execute cycle). The model explores broadly, traces
-      // connections, and reports findings without modifying any files.
-      if (strategy.mode === "analyze") {
-        console.log("[punk] ANALYZE mode — deep reading, no execution");
-        resolvedRequest._systemPrepend =
-          "ANALYZE: You are in analysis mode. Read broadly, trace connections across the codebase, " +
-          "and report findings with structured implications and recommendations. " +
-          "Do NOT modify any files. Do NOT use write_file, replace, or bash to make changes. " +
-          "Use read_file, glob, search, and grep to investigate. " +
-          "Structure your response with clear sections: findings, root causes, implications, and next steps.";
-        const backend = this.getBackendForRequest(resolvedRequest);
-        await backend.spawn(resolvedRequest);
-        return;
-      }
-
-      if (strategy.mode === "orchestrate" && orchestrationEnabled) {
-        console.log(
-          `[punk] 🎯 ORCHESTRATING via Plan tool` +
-          (strategy.discovery ? " [discovery first]" : " [planning first]"),
-        );
-        try {
-          await this._orchestrate(resolvedRequest, routing, strategy, localDecision);
-        } catch (err) {
-          console.error(`[punk] Orchestration failed, falling back to direct:`, err.message);
-          const backend = this.getBackendForRequest(resolvedRequest);
-          await backend.spawn(resolvedRequest);
-        }
-        return;
-      }
+    // ── ANALYZE MODE ──────────────────────────────────────────────────────
+    // Think phase and /analyze slash — read-only deep investigation.
+    // The model explores broadly, traces connections, and reports findings
+    // without modifying any files.
+    if (!resolvedRequest._systemOverride && strategy.mode === "analyze") {
+      console.log("[punk] ANALYZE mode — deep reading, no execution");
+      resolvedRequest._systemPrepend =
+        "ANALYZE: You are in analysis mode. Read broadly, trace connections across the codebase, " +
+        "and report findings with structured implications and recommendations. " +
+        "Do NOT modify any files. Do NOT use write_file, replace, or bash to make changes. " +
+        "Use read_file, glob, search, and grep to investigate. " +
+        "Structure your response with clear sections: findings, root causes, implications, and next steps.";
+      const backend = this.getBackendForRequest(resolvedRequest);
+      await backend.spawn(resolvedRequest);
+      return;
     }
 
     try {
@@ -2019,138 +1804,10 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     }
   }
 
-  /**
-   * Multi-model orchestration: planning model writes a natural markdown plan
-   * that streams to the user, then execution model implements it immediately.
-   *
-   * The plan is the model's natural output — readable in the conversation.
-   * The execution model receives the plan as context and runs autonomously.
-   */
-  async _orchestrate(request, routing, strategy, classifierDecision = null) {
-    const projectId = request.projectId;
-
-    this.handleBackendEvent(projectId, {
-      event: "orchestration_start",
-      data: { prompt: request.prompt },
-    }, request.requestId);
-
-    // ── PLANNING MODEL SELECTION ──────────────────────────────────────────
-    // When smart routing is off, use the user's pinned model for everything.
-    // When on, use the routing table's plan slot (or classifier override).
-    const autoRoute = request.autoRoute ?? (await this.loadIntentAutoRoute());
-    const classifierPlan = classifierDecision?.planningModel;
-    const planRoute = !autoRoute
-      ? { provider: request.provider, model: request.model, thinking: request.thinking ?? false }
-      : classifierPlan
-        ? { provider: classifierPlan.provider, model: classifierPlan.model, thinking: strategy.reasoning === "deep" }
-        : (routing["plan"] || routing["execute"]);
-
-    const phase = strategy.discovery ? "discovery" : "planning";
-    this.handleBackendEvent(projectId, {
-      event: "orchestration_phase",
-      data: { phase, model: planRoute.model, provider: planRoute.provider },
-    }, request.requestId);
-
-    console.log(
-      `[punk] planning → ${planRoute.provider}/${planRoute.model}` +
-      (strategy.discovery ? " [discovery]" : " [direct]"),
-    );
-
-    // ── PLANNING PASS ─────────────────────────────────────────────────────
-    // Planning model explores the codebase and writes a natural markdown plan.
-    // The plan streams directly to the user — no JSON parsing, no validation.
-    const { runPlanningAgent } = await import("./planning-agent.mjs");
-    const planningRequest = {
-      ...request,
-      provider: planRoute.provider,
-      model: planRoute.model,
-      thinking: planRoute.thinking ?? (strategy.reasoning === "deep"),
-    };
-    const planningResult = await runPlanningAgent({
-      request: planningRequest,
-      planRoute,
-      strategy,
-      backend: this.getBackendForRequest(planningRequest),
-      onEvent: (pid, event, rid) => this.handleBackendEvent(pid, event, rid),
-    });
-
-    if (!planningResult) {
-      console.error("[punk] planning agent returned no plan — aborting orchestration");
-      this.handleBackendEvent(projectId, {
-        event: "orchestration_error",
-        data: { message: "Planning model did not produce a plan." },
-      }, request.requestId);
-      return;
-    }
-
-    const { planText } = planningResult;
-
-    // ── EXECUTION MODEL SELECTION ─────────────────────────────────────────
-    const classifierExec = classifierDecision?.executionModel;
-    const execRoute = !autoRoute
-      ? { provider: request.provider, model: request.model, thinking: request.thinking ?? false }
-      : classifierExec
-        ? { provider: classifierExec.provider, model: classifierExec.model, thinking: false }
-        : routing["execute"];
-
-    this.handleBackendEvent(projectId, {
-      event: "orchestration_phase",
-      data: { phase: "executing", model: execRoute?.model, provider: execRoute?.provider },
-    }, request.requestId);
-
-    console.log(`[punk] execution → ${execRoute?.provider}/${execRoute?.model}`);
-
-    // ── EXECUTION PASS (Stateful Turn) ────────────────────────────────────
-    // Execution model receives the plan as context and implements it.
-    // By keeping it in a single turn, we maximize context caching (KV cache).
-    const executionRequest = {
-      ...request,
-      phase:          "execution",
-      provider:       execRoute?.provider || request.provider,
-      model:          execRoute?.model    || request.model,
-      thinking:       execRoute?.thinking ?? request.thinking ?? false,
-      prompt:         request.prompt,
-    };
-    
-    // Get appropriate backend for execution request
-    const executionBackend = this.getBackendForRequest(executionRequest);
-    const isCliBackend = !executionBackend.supportsToolCalling;
-    
-    const executionInstructions =
-      `The following plan was written by the planning model after exploring the codebase:\n\n` +
-      `${planText}\n\n---\n\n` +
-      `Execute the plan above. Use your tools to read, modify, and create files as described. ` +
-      `Work through each phase methodically. Do not re-plan — implement.`;
-
-    executionRequest.prompt = isCliBackend
-      ? `${executionInstructions}\n\n---\n\nOriginal task: ${request.prompt}`
-      : request.prompt;
-    
-    executionRequest._systemPrepend = isCliBackend ? undefined : executionInstructions;
-
-    try {
-      await executionBackend.spawn(executionRequest);
-      
-      // Send completion event once execution is finished
-      this.handleBackendEvent(projectId, {
-        event: "orchestration_complete",
-        data: {
-          summary: "Execution completed",
-          completedSteps: 1,
-          totalSteps: 1,
-          allPassed: true,
-          typeCheckPassed: true,
-          touchedFiles: [],
-        },
-      }, request.requestId);
-    } catch (err) {
-      console.error(`[punk] Orchestrated execution failed: ${err.message}`);
-      this.handleBackendEvent(projectId, {
-        event: "orchestration_error",
-        data: { message: `Execution failed: ${err.message}` },
-      }, request.requestId);
-    }
-  }
+  // _orchestrate() and _verifyExecution() removed — replaced by the Think/Build
+  // phase system where the user is the coordinator, not Pane's code.
+  // The human-in-the-loop model (Think → review → Build) is more robust than
+  // automated plan→execute→verify pipelines.
 
   async abort(projectId) {
     // Try all backends - the request could be in any of them
@@ -2183,7 +1840,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     if (!autoRoute) return null; // User has pinned a model — no preview needed
 
     const settings = await this.loadSettings();
-    const routing = await this.loadIntentRouting();
+    const combo = await this.loadPowerCombo();
 
     try {
       const { routeIntegrated } = await import("./integrated-router.mjs");
@@ -2208,12 +1865,12 @@ Respond with a single concise principle statement (one sentence, under 150 chara
 
       if (!decision?.modelTier) return null;
 
-      // Map tier to concrete model from the user's routing table.
-      // ONLY returns models the user has configured — never invents models.
+      // Map tier to concrete model from the user's power combo.
+      // frontier tier → thinking model, everything else → execution model.
       const tier = decision.modelTier;
-      const tierToSlot = { cheap: "other", mid: "explain", capable: "execute", frontier: "plan" };
-      const slot = tierToSlot[tier] || "execute";
-      const route = routing[slot] || routing["execute"];
+      const route = tier === "frontier"
+        ? (combo["thinking"] || combo["execution"])
+        : (combo["execution"] || combo["thinking"]);
 
       if (!route) return null;
 
@@ -2267,10 +1924,10 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         thinking: false,
       };
     } else {
-      // Smart routing ON — use the routing table's explain slot
-      // (lightest model the user configured for their provider).
-      const routing = await this.loadIntentRouting();
-      const explainRoute = routing["explain"] || routing["execute"] || {};
+      // Smart routing ON — use the execution slot from the power combo
+      // (the lighter of the two models the user configured).
+      const combo = await this.loadPowerCombo();
+      const explainRoute = combo["execution"] || combo["thinking"] || {};
       request = {
         provider: explainRoute.provider || settings.selected_model_provider || null,
         model: explainRoute.model || settings.selected_model || null,
@@ -2399,7 +2056,7 @@ export async function registerPunkHandlers() {
       todos,
       autoRoute,
       minds,
-      effectiveMode,
+      phase,
       // Mind chat fields — when projectId starts with "mind:", these override defaults
       systemPromptOverride,
       _systemOverride,
@@ -2419,7 +2076,7 @@ export async function registerPunkHandlers() {
       todos,
       autoRoute,
       minds,
-      effectiveMode,
+      phase,
       ...(systemPromptOverride ? { systemPromptOverride } : {}),
       ...(_systemOverride ? { _systemOverride } : {}),
       ...(tools ? { tools } : {}),

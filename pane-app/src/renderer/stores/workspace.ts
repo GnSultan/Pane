@@ -1,9 +1,8 @@
 import { create } from "zustand";
 import type { ActionId, KeyBinding } from "../lib/keybindings";
 import {
-  DEFAULT_BACKEND_ROUTING,
-  type IntentRouting,
-  type BackendRouting,
+  DEFAULT_POWER_COMBO,
+  type PowerCombo,
 } from "../lib/models";
 import type { OpenRouterModel } from "../lib/tauri-commands";
 import {
@@ -53,8 +52,8 @@ interface WorkspaceState {
   setDisabledProviders: (providers: string[]) => void;
   toggleProvider: (provider: string) => void;
   isProviderEnabled: (provider: string) => boolean;
-  intentRouting: BackendRouting;
-  intentAutoRoute: boolean;
+  powerCombo: PowerCombo;
+  autoEscalate: boolean;
   openRouterModels: OpenRouterModel[];
   allModels: Record<string, OpenRouterModel[]>;
   fuzzyFinderOpen: boolean;
@@ -131,9 +130,9 @@ interface WorkspaceState {
   setHttpProvider: (provider: string) => void;
   setHttpApiKeys: (keys: Record<string, string>) => void;
   setHttpBaseUrls: (urls: Record<string, string>) => void;
-  getEffectiveRouting: () => IntentRouting | undefined;
-  setIntentRouting: (routing: IntentRouting | null) => void;
-  setIntentAutoRoute: (autoRoute: boolean) => void;
+  getEffectiveCombo: () => PowerCombo | undefined;
+  setPowerCombo: (combo: PowerCombo | null) => void;
+  setAutoEscalate: (autoEscalate: boolean) => void;
 }
 
 function applyFontSize(size: number) {
@@ -240,8 +239,8 @@ function createWorkspaceStore() {
       set({ disabledProviders: next });
     },
     isProviderEnabled: (provider) => !get().disabledProviders.includes(provider),
-    intentRouting: DEFAULT_BACKEND_ROUTING,
-    intentAutoRoute: true,
+    powerCombo: DEFAULT_POWER_COMBO,
+    autoEscalate: true,
     openRouterModels: [],
     allModels: {},
     fetchOpenRouterModels: async () => {
@@ -499,30 +498,12 @@ function createWorkspaceStore() {
     },
     setHttpBaseUrls: (urls: Record<string, string>) =>
       set({ httpBaseUrls: urls }),
-    getEffectiveRouting: () => {
-      const { intentRouting } = get();
-      // For transparent routing, use API routing as the default unified configuration
-      return (
-        intentRouting["api"] ||
-        DEFAULT_BACKEND_ROUTING["api"]
-      );
+    getEffectiveCombo: () => get().powerCombo,
+    setPowerCombo: (combo) => {
+      if (!combo) return;
+      set({ powerCombo: combo });
     },
-    setIntentRouting: (routing) => {
-      if (!routing) return;
-      const { intentRouting } = get();
-      const defaultRouting = DEFAULT_BACKEND_ROUTING["api"];
-
-      set({
-        intentRouting: {
-          ...intentRouting,
-          "api": {
-            ...defaultRouting,
-            ...routing,
-          },
-        },
-      });
-    },
-    setIntentAutoRoute: (autoRoute) => set({ intentAutoRoute: autoRoute }),
+    setAutoEscalate: (autoEscalate) => set({ autoEscalate }),
   }));
 }
 

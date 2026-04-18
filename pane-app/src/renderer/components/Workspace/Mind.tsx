@@ -8,7 +8,7 @@ import {
 } from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";
 import { useMindStore } from "../../stores/mind";
-import { measureCaretPos } from "../../lib/measure-caret";
+import { CaretTextArea } from "../shared";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -51,14 +51,6 @@ function EntryItem({
 }) {
   const [editValue, setEditValue] = useState(entry.content);
   const editRef = useRef<HTMLTextAreaElement>(null);
-  const caretContainerRef = useRef<HTMLDivElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
-  const [caretPos, setCaretPos] = useState<{
-    top: number;
-    left: number;
-    lineHeight: number;
-  } | null>(null);
-  const [textareaFocused, setTextareaFocused] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(false);
@@ -70,30 +62,6 @@ function EntryItem({
   const displayedContent =
     isLong && !expanded ? entry.content.slice(0, 280) + "..." : entry.content;
 
-  const updateCaret = useCallback(() => {
-    const el = editRef.current;
-    const container = caretContainerRef.current;
-    const overlay = overlayRef.current;
-    if (!el || !container || !overlay || document.activeElement !== el) {
-      setCaretPos(null);
-      return;
-    }
-    setCaretPos(measureCaretPos(el, container, overlay));
-  }, []);
-
-  useEffect(() => {
-    if (textareaFocused) updateCaret();
-  }, [editValue, textareaFocused, updateCaret]);
-
-  useEffect(() => {
-    if (!isEditing) return;
-    const el = editRef.current;
-    if (!el) return;
-    const events = ["click", "keyup", "mouseup", "select", "scroll"];
-    events.forEach((e) => el.addEventListener(e, updateCaret));
-    return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
-  }, [isEditing, updateCaret]);
-
   useEffect(() => {
     if (!isEditing) return;
     setEditValue(entry.content);
@@ -102,15 +70,11 @@ function EntryItem({
       editRef.current.focus();
       const len = editRef.current.value.length;
       editRef.current.setSelectionRange(len, len);
-      editRef.current.style.height = "auto";
-      editRef.current.style.height = `${editRef.current.scrollHeight}px`;
     }, 0);
   }, [isEditing, entry.content]);
 
   const handleEditChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setEditValue(e.target.value);
-    e.target.style.height = "auto";
-    e.target.style.height = `${e.target.scrollHeight}px`;
   };
 
   const handleEditKeyDown = (e: React.KeyboardEvent) => {
@@ -145,69 +109,26 @@ function EntryItem({
   if (isEditing) {
     return (
       <div
-        onClick={() => editRef.current?.focus()}
-        className="mb-3 rounded-xl ring-1 ring-pane-border/40 px-5 py-4 bg-pane-bg cursor-text"
+        className="mb-3 rounded-xl ring-1 ring-pane-border/40 bg-pane-bg cursor-text"
       >
-        <div ref={caretContainerRef} className="relative">
-          <textarea
-            ref={editRef}
-            value={editValue}
-            onChange={handleEditChange}
-            onKeyDown={handleEditKeyDown}
-            onFocus={() => {
-              setTextareaFocused(true);
-              updateCaret();
-            }}
-            onBlur={() => {
-              setTextareaFocused(false);
-              setCaretPos(null);
-              if (editValue.trim()) onSaveEdit(editValue);
-              else onCancelEdit();
-            }}
-            className="w-full font-mono text-pane-text bg-transparent outline-none resize-none leading-[1.85] placeholder:text-pane-text-secondary/20"
-            style={{
-              fontSize: "var(--pane-font-size-sm)",
-              caretColor: "transparent",
-              minHeight: "120px",
-            }}
-            placeholder="edit your thought..."
-          />
-          {/* Invisible overlay — Range API measures caret position from this text node */}
-          <div
-            ref={overlayRef}
-            aria-hidden
-            style={{
-              position: "absolute",
-              top: 0, left: 0, right: 0, bottom: 0,
-              overflow: "hidden",
-              pointerEvents: "none",
-              opacity: 0,
-              userSelect: "none",
-              fontSize: "var(--pane-font-size-sm)",
-              lineHeight: "1.85",
-              fontFamily: "var(--font-mono)",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              boxSizing: "border-box",
-            }}
-          >
-            <span>{editValue}</span>
-          </div>
-          {textareaFocused && caretPos && (
-            <div
-              aria-hidden
-              style={{
-                position: "absolute",
-                top: caretPos.top,
-                left: caretPos.left,
-                width: 2,
-                height: caretPos.lineHeight,
-                background: "var(--pane-accent)",
-                pointerEvents: "none",
-              }}
-            />
-          )}
-        </div>
+        <CaretTextArea
+          ref={editRef}
+          value={editValue}
+          onChange={handleEditChange}
+          onKeyDown={handleEditKeyDown}
+          onBlur={() => {
+            if (editValue.trim()) onSaveEdit(editValue);
+            else onCancelEdit();
+          }}
+          className="w-full"
+          style={{
+            fontSize: "var(--pane-font-size-sm)",
+            lineHeight: "1.85",
+            padding: "1rem 1.25rem",
+          }}
+          minHeight={120}
+          placeholder="edit your thought..."
+        />
         <div className="flex items-center justify-between mt-3">
           <span
             className="font-mono text-pane-text-secondary/25"
@@ -379,15 +300,7 @@ export function Mind() {
   const [draft, setDraft] = useState("");
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [textareaFocused, setTextareaFocused] = useState(false);
-  const [caretPos, setCaretPos] = useState<{
-    top: number;
-    left: number;
-    lineHeight: number;
-  } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const caretContainerRef = useRef<HTMLDivElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSaveRef = useRef<Promise<void> | null>(null);
 
@@ -421,40 +334,6 @@ export function Mind() {
     );
     return () => unlisten();
   }, [setEntries]);
-
-  // Update static caret position
-  const updateCaret = useCallback(() => {
-    const el = textareaRef.current;
-    const container = caretContainerRef.current;
-    const overlay = overlayRef.current;
-    if (!el || !container || !overlay || document.activeElement !== el) {
-      setCaretPos(null);
-      return;
-    }
-    setCaretPos(measureCaretPos(el, container, overlay));
-  }, []);
-
-  // Reposition on every value change (covers typing)
-  useEffect(() => {
-    if (textareaFocused) updateCaret();
-  }, [draft, textareaFocused, updateCaret]);
-
-  // Reposition on selection movement (arrows, mouse clicks, scroll)
-  useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    const events = ["click", "keyup", "mouseup", "select", "scroll"];
-    events.forEach((e) => el.addEventListener(e, updateCaret));
-    return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
-  }, [updateCaret]);
-
-  // Auto-resize textarea
-  useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [draft]);
 
   // Focus textarea when Mind becomes visible
   const mindVisible = useProjectsStore((s) => {
@@ -571,71 +450,23 @@ export function Mind() {
         <div className="max-w-[780px] mx-auto w-full px-10 pt-[35vh] pb-48">
           {/* ── Compose zone ── */}
           <div
-            onClick={() => textareaRef.current?.focus()}
-            className={`rounded-xl ring-1 px-5 py-4 bg-pane-bg mb-12 transition-all cursor-text
-              ${textareaFocused ? "ring-pane-text/10 ring-2" : "ring-pane-border/40"}
-            `}
+            className={`rounded-xl ring-1 bg-pane-bg mb-12 transition-all cursor-text ring-pane-border/40`}
           >
-            <div ref={caretContainerRef} className="relative">
-              <textarea
-                ref={textareaRef}
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={handleKeyDown}
-                onBlur={() => {
-                  handleBlur();
-                  setTextareaFocused(false);
-                  setCaretPos(null);
-                }}
-                onFocus={() => {
-                  setTextareaFocused(true);
-                  updateCaret();
-                }}
-                placeholder="what's on your mind..."
-                className="w-full font-mono text-pane-text bg-transparent outline-none resize-none leading-[1.85] placeholder:text-pane-text-secondary/20"
-                style={{
-                  fontSize: "var(--pane-font-size)",
-                  caretColor: "transparent",
-                  minHeight: "120px",
-                }}
-              />
-              {/* Invisible overlay — Range API measures caret position from this text node */}
-              <div
-                ref={overlayRef}
-                aria-hidden
-                style={{
-                  position: "absolute",
-                  top: 0, left: 0, right: 0, bottom: 0,
-                  overflow: "hidden",
-                  pointerEvents: "none",
-                  opacity: 0,
-                  userSelect: "none",
-                  fontSize: "var(--pane-font-size)",
-                  lineHeight: "1.85",
-                  fontFamily: "var(--font-mono)",
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                  boxSizing: "border-box",
-                }}
-              >
-                <span>{draft}</span>
-              </div>
-              {/* Static amber cursor — replaces the native blinking caret */}
-              {textareaFocused && caretPos && (
-                <div
-                  aria-hidden
-                  style={{
-                    position: "absolute",
-                    top: caretPos.top,
-                    left: caretPos.left,
-                    width: 2,
-                    height: caretPos.lineHeight,
-                    background: "var(--pane-accent)",
-                    pointerEvents: "none",
-                  }}
-                />
-              )}
-            </div>
+            <CaretTextArea
+              ref={textareaRef}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={handleKeyDown}
+              onBlur={handleBlur}
+              placeholder="what's on your mind..."
+              className="w-full"
+              style={{
+                fontSize: "var(--pane-font-size)",
+                lineHeight: "1.85",
+                padding: "1rem 1.25rem",
+              }}
+              minHeight={120}
+            />
 
             <div className="flex items-center justify-between pt-3 mt-2">
               <span

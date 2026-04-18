@@ -258,8 +258,8 @@ export const Conversation = memo(function Conversation({
   }, []);
 
   const handleSend = useCallback(
-    (msg: string, minds?: Array<{ id: string }>, effectiveMode?: string) => {
-      sendMessage(msg, minds, effectiveMode);
+    (msg: string, minds?: Array<{ id: string }>, phase?: string) => {
+      sendMessage(msg, minds, phase);
       scrollToBottom();
     },
     [sendMessage, scrollToBottom],

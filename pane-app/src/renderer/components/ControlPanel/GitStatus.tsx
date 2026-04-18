@@ -9,7 +9,7 @@ import {
 } from "../../lib/tauri-commands";
 import type { GitCommit, GitStatusInfo } from "../../lib/tauri-commands";
 import type { ElectronAPI } from "../../lib/electron";
-import { measureCaretPos } from "../../lib/measure-caret";
+import { CaretTextArea } from "../shared";
 
 const electronAPI = window.electronAPI as ElectronAPI;
 
@@ -214,11 +214,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
   const [ahead, setAhead] = useState(0);
   const [behind, setBehind] = useState(0);
   const [switchStatus, setSwitchStatus] = useState<string | null>(null);
-  const [focused, setFocused] = useState(false);
-  const [caretPos, setCaretPos] = useState<{ top: number; left: number; lineHeight: number } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const caretContainerRef = useRef<HTMLDivElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
 
   // ── Load ────────────────────────────────────────────────────────────────────
   const load = useCallback(async () => {
@@ -250,37 +246,6 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
       .catch(() => {})
       .finally(() => setDrafting(false));
   }, [loading]);
-
-  // ── Textarea auto-grow ──────────────────────────────────────────────────────
-  const applyHeight = useCallback(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "1px";
-    el.style.height = Math.min(Math.max(el.scrollHeight, 110), window.innerHeight * 0.4) + "px";
-  }, []);
-
-  useEffect(() => { applyHeight(); }, [commitMessage, applyHeight]);
-
-  // Update static caret position using Range API on the overlay text node.
-  const updateCaret = useCallback(() => {
-    const el = textareaRef.current;
-    const container = caretContainerRef.current;
-    const overlay = overlayRef.current;
-    if (!el || !container || !overlay || document.activeElement !== el) { setCaretPos(null); return; }
-    setCaretPos(measureCaretPos(el, container, overlay));
-  }, []);
-
-  useEffect(() => {
-    if (focused) updateCaret();
-  }, [commitMessage, focused, updateCaret]);
-
-  useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    const events = ["click", "keyup", "mouseup", "select", "scroll"];
-    events.forEach((e) => el.addEventListener(e, updateCaret));
-    return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
-  }, [updateCaret]);
 
   // ── Actions ──────────────────────────────────────────────────────────────────
   const handleCommit = async () => {
@@ -522,77 +487,26 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
           </button>
         )}
 
-        <div ref={caretContainerRef} className="relative overflow-hidden">
-          <textarea
-            ref={textareaRef}
-            value={commitMessage}
-            onChange={(e) => setCommitMessage(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onFocus={() => { setFocused(true); updateCaret(); }}
-            onBlur={() => { setFocused(false); setCaretPos(null); }}
-            onScroll={() => { if (overlayRef.current && textareaRef.current) overlayRef.current.scrollTop = textareaRef.current.scrollTop; }}
-            placeholder={
-              drafting ? "drafting…"
-              : fileCount === 0 ? "working tree clean"
-              : "commit message"
-            }
-            disabled={committing || fileCount === 0}
-            rows={1}
-            className="w-full bg-transparent text-pane-text font-mono
-                       resize-none outline-none
-                       placeholder:text-pane-text-secondary/30
-                       leading-[1.75] px-6 pt-5
-                       overflow-y-auto overflow-x-hidden
-                       disabled:opacity-30"
-            style={{
-              fontSize: "var(--pane-panel-font-size)",
-              caretColor: "transparent",
-              minHeight: "110px",
-              maxHeight: "40vh",
-              paddingBottom: "32px",
-            }}
-          />
-          {/* Invisible overlay — Range API measures caret position from this text node */}
-          <div
-            ref={overlayRef}
-            aria-hidden
-            style={{
-              position: "absolute",
-              top: 0, left: 0, right: 0, bottom: 0,
-              overflow: "auto",
-              overflowX: "hidden",
-              pointerEvents: "none",
-              opacity: 0,
-              userSelect: "none",
-              fontSize: "var(--pane-panel-font-size)",
-              lineHeight: "1.75",
-              fontFamily: "var(--font-mono)",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              paddingLeft: "1.5rem",
-              paddingRight: "1.5rem",
-              paddingTop: "1.25rem",
-              paddingBottom: "32px",
-              boxSizing: "border-box",
-            }}
-          >
-            <span>{commitMessage}</span>
-          </div>
-          {focused && caretPos && (
-            <div
-              aria-hidden
-              style={{
-                position: "absolute",
-                top: caretPos.top,
-                left: caretPos.left,
-                width: 2,
-                height: caretPos.lineHeight,
-                background: "var(--pane-accent)",
-                pointerEvents: "none",
-              }}
-            />
-          )}
-        </div>
+        <CaretTextArea
+          ref={textareaRef}
+          value={commitMessage}
+          onChange={(e) => setCommitMessage(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder={
+            drafting ? "drafting…"
+            : fileCount === 0 ? "working tree clean"
+            : "commit message"
+          }
+          disabled={committing || fileCount === 0}
+          className="w-full"
+          style={{
+            fontSize: "var(--pane-panel-font-size)",
+            lineHeight: "1.75",
+            padding: "1.25rem 1.5rem 32px 1.5rem",
+          }}
+          minHeight={110}
+          maxHeight={window.innerHeight * 0.4}
+        />
 
         {/* Buttons — absolute bottom, floating inside the card, no background */}
         <div

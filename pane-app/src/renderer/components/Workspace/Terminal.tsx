@@ -14,7 +14,7 @@ import {
 import { useProjectsStore } from "../../stores/projects";
 import type { TerminalTab } from "../../stores/projects";
 import stripAnsi from "strip-ansi";
-import { measureCaretPos } from "../../lib/measure-caret";
+import { CaretTextArea } from "../shared";
 
 interface TerminalProps {
   projectId: string;
@@ -240,17 +240,9 @@ function TerminalTabContent({
   const [isRunning, setIsRunning] = useState(state.isRunning);
   const [cwd, setCwd] = useState(state.cwd);
   const [historyIndex, setHistoryIndex] = useState(-1);
-  const [caretPos, setCaretPos] = useState<{
-    top: number;
-    left: number;
-    lineHeight: number;
-  } | null>(null);
-  const [textareaFocused, setTextareaFocused] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const caretContainerRef = useRef<HTMLDivElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef(state);
   const liveOutputRaf = useRef(0);  // rAF handle for throttled live output updates
   const scrollRaf = useRef(0);       // rAF handle for throttled auto-scroll
@@ -422,48 +414,6 @@ function TerminalTabContent({
       tabStates.delete(tabId);
     };
   }, [tabId, projectId]); // initialCwd intentionally omitted — used once at mount, must not retrigger on cd
-
-  // Update static caret position using Range API on the overlay text node.
-  const updateCaret = useCallback(() => {
-    const el = inputRef.current;
-    const container = caretContainerRef.current;
-    const overlay = overlayRef.current;
-    if (!el || !container || !overlay || document.activeElement !== el) {
-      setCaretPos(null);
-      return;
-    }
-    setCaretPos(measureCaretPos(el, container, overlay));
-  }, []);
-
-  // Reposition on every value change (covers typing)
-  useEffect(() => {
-    if (textareaFocused) updateCaret();
-  }, [command, textareaFocused, updateCaret]);
-
-  // Auto-resize textarea height to fit content (same pattern as InputBar).
-  // minH matches the line-height (1.5rem) so single-line always shows fully.
-  const applyInputHeight = useCallback(() => {
-    const el = inputRef.current;
-    if (!el) return;
-    const lineH = parseFloat(getComputedStyle(el).lineHeight) || 24;
-    const minH = lineH;
-    const maxH = 200;
-    el.style.height = "1px";
-    el.style.height = Math.min(Math.max(el.scrollHeight, minH), maxH) + "px";
-  }, []);
-
-  useEffect(() => {
-    applyInputHeight();
-  }, [command, applyInputHeight]);
-
-  // Reposition on selection movement (arrows, mouse clicks, scroll)
-  useEffect(() => {
-    const el = inputRef.current;
-    if (!el) return;
-    const events = ["click", "keyup", "mouseup", "select", "scroll"];
-    events.forEach((e) => el.addEventListener(e, updateCaret));
-    return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
-  }, [updateCaret]);
 
   // Auto-scroll — fires on both completed lines and live streaming output.
   // rAF-throttled so rapid liveOutput updates don't cause scroll jank.
@@ -732,77 +682,25 @@ function TerminalTabContent({
           >
             {displayPath} $
           </span>
-          <div ref={caretContainerRef} className="flex-1 relative">
-            <textarea
-              ref={inputRef}
-              value={command}
-              onChange={(e) => {
-                setCommand(e.target.value);
-                setHistoryIndex(-1);
-              }}
-              onKeyDown={handleKeyDown}
-              onFocus={() => {
-                setTextareaFocused(true);
-                updateCaret();
-              }}
-              onScroll={() => { if (overlayRef.current && inputRef.current) overlayRef.current.scrollTop = inputRef.current.scrollTop; }}
-              onBlur={() => {
-                setTextareaFocused(false);
-                setCaretPos(null);
-              }}
-              readOnly={isRunning}
-              placeholder={isRunning ? "" : "command"}
-              className="w-full bg-transparent border-none outline-none resize-none text-pane-text font-mono placeholder:text-pane-text-secondary/20"
-              style={{
-                fontSize: "var(--pane-font-size-base)",
-                lineHeight: "1.5rem",
-                padding: 0,
-                margin: 0,
-                border: 0,
-                caretColor: "transparent",
-                appearance: "none",
-                WebkitAppearance: "none",
-              }}
-            />
-            {/* Invisible overlay — Range API measures caret position from this text node */}
-            <div
-              ref={overlayRef}
-              aria-hidden
-              style={{
-                position: "absolute",
-                top: 0, left: 0, right: 0, bottom: 0,
-                overflow: "auto",
-                overflowX: "hidden",
-                pointerEvents: "none",
-                opacity: 0,
-                userSelect: "none",
-                fontSize: "var(--pane-font-size-base)",
-                lineHeight: "1.5rem",
-                fontFamily: "var(--font-mono)",
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-word",
-                padding: 0,
-                margin: 0,
-                boxSizing: "border-box",
-              }}
-            >
-              <span>{command}</span>
-            </div>
-            {textareaFocused && caretPos && (
-              <div
-                aria-hidden
-                style={{
-                  position: "absolute",
-                  top: caretPos.top,
-                  left: caretPos.left,
-                  width: 2,
-                  height: caretPos.lineHeight,
-                  background: "var(--pane-accent)",
-                  pointerEvents: "none",
-                }}
-              />
-            )}
-          </div>
+          <CaretTextArea
+            ref={inputRef}
+            value={command}
+            onChange={(e) => {
+              setCommand(e.target.value);
+              setHistoryIndex(-1);
+            }}
+            onKeyDown={handleKeyDown}
+            readOnly={isRunning}
+            placeholder={isRunning ? "" : "command"}
+            minHeight={24}
+            maxHeight={200}
+            className="flex-1"
+            style={{
+              fontSize: "var(--pane-font-size-base)",
+              lineHeight: "1.5rem",
+              padding: 0,
+            }}
+          />
         </div>
       </div>
     </div>

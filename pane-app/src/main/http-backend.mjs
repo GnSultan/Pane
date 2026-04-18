@@ -916,8 +916,11 @@ const WRITE_TOOL_NAMES = new Set([
 ]);
 
 function getToolsForPhase(phase) {
-  if (phase === "planning") {
-    // Read/explore only — model cannot modify files during planning
+  // User-facing phases "think"/"analyze" and internal "planning" are all read-only.
+  // "build"/"execution" get the full tool set.
+  const readOnlyPhases = new Set(["planning", "think", "analyze"]);
+  if (readOnlyPhases.has(phase)) {
+    // Read/explore only — model cannot modify files during think/planning phases
     return TOOL_DEFINITIONS.filter(t => !WRITE_TOOL_NAMES.has(t.function.name));
   }
   // execution — all tools
@@ -4369,49 +4372,4 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
-  /**
-   * Execute a single step — constrained spawn with a custom system prompt.
-   * Returns { messages } with the conversation from this step.
-   */
-  async spawnStep(projectId, prompt, systemOverride, request) {
-    const collectedMessages = [];
-    const stepRequestId = `step-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    // Wrap onEvent to collect messages for verification
-    const originalOnEvent = this.onEvent;
-    this.onEvent = (pid, event, rid) => {
-      if (pid === projectId && event.event === "message") {
-        const parsed = event.data?.parsed;
-        if (parsed?.type === "assistant" && parsed.message) {
-          collectedMessages.push({ role: "assistant", content: parsed.message.content });
-        }
-        if (parsed?.type === "user" && parsed.message) {
-          collectedMessages.push({ role: "user", content: parsed.message.content });
-        }
-      }
-      // Forward all events to renderer
-      originalOnEvent(pid, event, rid);
-    };
-
-    try {
-      // Create a modified request with the system override.
-      // history is always cleared here — execution model gets a narrow job card,
-      // not the full conversation. Context comes from the system prompt built by
-      // TaskRunner (which synthesizes handoff from Pane's change history).
-      const stepRequest = {
-        ...request,
-        projectId,
-        prompt,
-        requestId: stepRequestId,
-        _systemOverride: systemOverride,
-        history: [], // narrow job card: no prior conversation
-      };
-
-      await this.spawn(stepRequest);
-      return { messages: collectedMessages };
-    } finally {
-      // Restore original onEvent
-      this.onEvent = originalOnEvent;
-    }
-  }
 }

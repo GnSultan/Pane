@@ -41,13 +41,18 @@ import type {
   ServerToolUseBlock,
   WebSearchToolResultBlock,
   MemoryEvent,
+  PanePhase,
 } from "../lib/punk-types";
 import { getContextLimit } from "../lib/models";
 
 // Mode-to-intent mapping: the mode pill is the single classification authority.
 // This replaces the three independent classifiers that could disagree.
-const MODE_TO_INTENT: Record<string, string> = {
-  plan: "plan", analyze: "plan", execute: "execute", discuss: "explain",
+// Phase → intent mapping for context assembly (think/verify → plan, build → execute)
+const PHASE_TO_INTENT: Record<string, string> = {
+  think: "plan",
+  build: "execute",
+  verify: "plan",
+  idle:  "execute",
 };
 
 // Active tool input animations keyed by `${projectId}:${toolId}`.
@@ -847,10 +852,10 @@ export function usePunk(projectId: string) {
   // and from nulling the session ID — the new message needs both intact.
   const intentionalAbortRef = useRef(false);
   const retryAttemptRef = useRef<Record<string, number>>({});
-  const messageQueueRef = useRef<Array<{ prompt: string; minds?: Array<{ id: string }>; effectiveMode?: string }>>([]);
+  const messageQueueRef = useRef<Array<{ prompt: string; minds?: Array<{ id: string }>; phase?: string }>>([]);
 
   const sendMessage = useCallback(
-    async (prompt: string, minds?: Array<{ id: string }>, effectiveMode?: string) => {
+    async (prompt: string, minds?: Array<{ id: string }>, phase?: string) => {
       const store = useProjectsStore.getState();
       const project = store.projects.get(projectId);
       if (!project) return;
@@ -858,7 +863,7 @@ export function usePunk(projectId: string) {
       // If already processing, queue the message instead of aborting.
       // This prevents the "Hard Kill" where follow-up messages reset the model mid-task.
       if (project.conversation.isProcessing) {
-        messageQueueRef.current.push({ prompt, minds, effectiveMode });
+        messageQueueRef.current.push({ prompt, minds, phase });
         store.setConversationStatusMessage(projectId, "Message queued (agent is busy)");
         setTimeout(() => {
           const current = useProjectsStore.getState().projects.get(projectId);
@@ -877,12 +882,20 @@ export function usePunk(projectId: string) {
       // routing signals, not user-visible text. The backend strips them too before sending
       // to the model, so the display text should match what the model actually sees.
       const displayPrompt = prompt.replace(/^\/[\w]+\s*/, "").trim();
+
+      // Resolve the phase early so we can stamp the message and update the store
+      // before the backend responds — the pill and message metadata stay in sync
+      // with what was actually sent, not what the store happened to hold before.
+      const effectivePhaseEarly = (phase === "think" || phase === "build" ? phase : "build") as PanePhase;
+      store.setConversationPhase(projectId, effectivePhaseEarly);
+
       const userMessage: ConversationMessage = {
         id: messageId,
         type: "user",
         content: [{ type: "text", text: displayPrompt }],
         timestamp: Date.now(),
         isStreaming: false,
+        phase: effectivePhaseEarly,
       };
 
       try {
@@ -912,7 +925,6 @@ export function usePunk(projectId: string) {
       let assistantMessageAdded = false;
       let resultReceived = false;
       let resultSafetyTimer: ReturnType<typeof setTimeout> | null = null;
-      let orchestrationActive = false; // true while TaskRunner is running steps
       let finishCalled = false; // guard against double-call (timer fires then processEnded arrives)
 
       const finishProcessing = () => {
@@ -957,7 +969,7 @@ export function usePunk(projectId: string) {
           const next = messageQueueRef.current.shift();
           if (next) {
             setTimeout(() => {
-              sendMessage(next.prompt, next.minds, next.effectiveMode);
+              sendMessage(next.prompt, next.minds, next.phase);
             }, 500);
           }
         }
@@ -1131,10 +1143,8 @@ export function usePunk(projectId: string) {
           }
 
           case "processEnded": {
-            // During orchestration the TaskRunner spawns one process per step.
-            // Each step exit fires processEnded — ignore these mid-plan or we'd
-            // mark the conversation done and show spurious errors after step 1.
-            if (orchestrationActive) break;
+            // Always clear any suspended tool input — the process is done.
+            useProjectsStore.getState().clearPendingInput(projectId);
 
             // This processEnded belongs to a session that was intentionally aborted
             // to make way for a new message. Skip all cleanup — isProcessing stays
@@ -1162,7 +1172,7 @@ export function usePunk(projectId: string) {
                     
                     resetStreamingState(projectId);
                     // Re-trigger the same prompt that was in flight (or just continue from history)
-                    sendMessage(prompt, minds, effectiveMode);
+                    sendMessage(prompt, minds, phase);
                   } else {
                     s.setConversationError(
                       projectId,
@@ -1263,6 +1273,16 @@ export function usePunk(projectId: string) {
             break;
           }
 
+          case "phase_changed": {
+            // Backend (file watcher on session state) detected a phase transition.
+            // Sync the store so the pill and next-message routing both reflect it.
+            const p = event.data?.phase;
+            if (p === "think" || p === "build") {
+              useProjectsStore.getState().setConversationPhase(projectId, p as PanePhase);
+            }
+            break;
+          }
+
           case "error": {
             // Clear the safety timer (started on processStarted) so it doesn't
             // fire 5 minutes later after the error has already been handled.
@@ -1341,165 +1361,10 @@ export function usePunk(projectId: string) {
             break;
           }
 
-          // ── Orchestration Events (Control Inversion) ──────────────────
-          case "orchestration_phase": {
-            const { phase, model, provider } = event.data;
-            const s = useProjectsStore.getState();
-            s.setConversationPhase(projectId, phase);
-            const label =
-              phase === "discovery" ? "Understanding the task..."
-              : phase === "planning" ? `Planning with ${model || provider || "model"}...`
-              : phase === "executing" ? `Executing with ${model || provider || "model"}...`
-              : phase === "validating" ? "Verifying plan..."
-              : phase === "replanning" ? "Revising plan..."
-              : "Executing...";
-            s.setConversationStatusMessage(projectId, label);
-            // Execution phase: the execution model's processEnded is the real terminal event.
-            if (phase === "executing") orchestrationActive = false;
-            break;
-          }
-
-          case "orchestration_start": {
-            orchestrationActive = true;
-            break;
-          }
-
-          case "orchestration_planning_start": {
-            // Planning model's messages stream through as regular conversation events.
-            // No placeholder needed — user sees tool calls and text directly.
-            useProjectsStore.getState().setConversationStatusMessage(projectId, "Planning...");
-            break;
-          }
-
-          case "orchestration_step": {
-            const { phase, stepIndex, totalSteps, message } = event.data;
-            console.log(`[orchestration] ${phase}: ${message}`);
-            const s = useProjectsStore.getState();
-            s.setConversationStatusMessage(
-              projectId,
-              `Step ${stepIndex || "?"}/${totalSteps || "?"}: ${message}`,
-            );
-            // Mark the proportional task as in_progress when a step starts executing.
-            // Tasks are fewer than steps — map by ratio so the active indicator tracks correctly.
-            if (phase === "executing" && stepIndex && totalSteps) {
-              const proj = s.projects.get(projectId);
-              if (proj?.conversation.todos?.length) {
-                const numTasks = proj.conversation.todos.length;
-                const activeTask = Math.floor((stepIndex - 1) / totalSteps * numTasks);
-                s.setConversationTodos(projectId, proj.conversation.todos.map(
-                  (todo: Todo, idx: number) => ({
-                    ...todo,
-                    status: idx < activeTask
-                      ? "completed" as const
-                      : idx === activeTask
-                        ? "in_progress" as const
-                        : "pending" as const,
-                  })
-                ));
-              }
-            }
-            break;
-          }
-
-          case "orchestration_step_complete": {
-            const { stepIndex, totalSteps, passed, action } = event.data;
-            console.log(
-              `[orchestration] Step ${stepIndex}/${totalSteps} ${passed ? "passed" : "failed"}: ${action}`,
-            );
-            // Update todos using proportional mapping — tasks are fewer than steps.
-            const s = useProjectsStore.getState();
-            const proj = s.projects.get(projectId);
-            if (proj?.conversation.todos) {
-              const numTasks = proj.conversation.todos.length;
-              const completedTasks = Math.floor(stepIndex / totalSteps * numTasks);
-              const updatedTodos = proj.conversation.todos.map(
-                (todo: Todo, idx: number) => ({
-                  ...todo,
-                  status: idx < completedTasks
-                    ? "completed" as const
-                    : idx === completedTasks
-                      ? "in_progress" as const
-                      : "pending" as const,
-                }),
-              );
-              s.setConversationTodos(projectId, updatedTodos);
-            }
-            break;
-          }
-
-          case "orchestration_complete": {
-            orchestrationActive = false;
-            useProjectsStore.getState().setConversationPhase(projectId, "idle");
-            const {
-              summary,
-              completedSteps,
-              totalSteps: total,
-              allPassed,
-              typeCheckPassed,
-              touchedFiles,
-            } = event.data;
-            console.log(
-              `[orchestration] Complete: ${completedSteps}/${total} steps passed` +
-              ` | tsc: ${typeCheckPassed ? "✓" : "✗"}` +
-              ` | touched: ${touchedFiles?.length ?? 0} files (${summary})`,
-            );
-            const s = useProjectsStore.getState();
-            s.setConversationStatusMessage(
-              projectId,
-              allPassed && typeCheckPassed
-                ? `All ${total} steps completed`
-                : !typeCheckPassed
-                  ? `${completedSteps}/${total} steps — type check failed`
-                  : `${completedSteps}/${total} steps completed`,
-            );
-            resultReceived = true;
-            finishProcessing();
-
-            // Record file changes from orchestration steps
-            try {
-              const proj = useProjectsStore.getState().projects.get(projectId);
-              if (proj && proj.conversation.messages.length > 1) {
-                recordChangeHistory(projectId, proj.conversation.messages);
-              }
-            } catch {}
-            break;
-          }
-
-          case "orchestration_typecheck": {
-            const { passed, output } = event.data;
-            console.log(
-              `[orchestration] Type check: ${passed ? "passed ✓" : "failed ✗"}`,
-              passed ? "" : output,
-            );
-            const s = useProjectsStore.getState();
-            s.setConversationStatusMessage(
-              projectId,
-              passed
-                ? "Type check passed ✓"
-                : `Type check failed — ${output.slice(0, 80)}`,
-            );
-            break;
-          }
-
-          case "orchestration_error": {
-            orchestrationActive = false;
-            useProjectsStore.getState().setConversationPhase(projectId, "idle");
-            console.error(`[orchestration] Error: ${event.data.message}`);
-            const s = useProjectsStore.getState();
-            // Clean up planning-stream if it's still present (e.g. CLI plan parse failure)
-            const errProj = s.projects.get(projectId);
-            const planStream = errProj?.conversation.messages.find((m) => m.id === "planning-stream");
-            if (planStream) s.removeConversationMessageById(projectId, "planning-stream");
-            s.setConversationError(projectId, event.data.message);
-            finishProcessing();
-
-            // Record any changes made before the error
-            try {
-              const proj = useProjectsStore.getState().projects.get(projectId);
-              if (proj && proj.conversation.messages.length > 1) {
-                recordChangeHistory(projectId, proj.conversation.messages);
-              }
-            } catch {}
+          case "awaiting_input": {
+            // Tool execution is paused waiting for user input.
+            // Store the pending state so the UI can render the appropriate prompt.
+            useProjectsStore.getState().setPendingInput(projectId, event.data);
             break;
           }
         }
@@ -1507,9 +1372,9 @@ export function usePunk(projectId: string) {
 
       try {
         const conversation = project.conversation;
-        // Intent derived from mode pill — single source of truth.
-        // No re-classification from keywords.
-        const intent = MODE_TO_INTENT[effectiveMode || ""] || "other";
+        // Phase-based intent — single source of truth, no per-message re-classification.
+        const effectivePhase = phase || "think";
+        const intent = PHASE_TO_INTENT[effectivePhase] || "execute";
 
         const activeFile = project.activeFilePath || undefined;
         await Promise.race([
@@ -1526,7 +1391,7 @@ export function usePunk(projectId: string) {
         const selectedModel = ws.selectedModel;
         const selectedModelThinking = ws.selectedModelThinking;
         const selectedModelProvider = ws.selectedModelProvider;
-        const intentAutoRoute = ws.intentAutoRoute;
+        const autoEscalate = ws.autoEscalate;
 
         const truncatedHistory = conversation.messages.slice(-20);
         const todos = conversation.todos;
@@ -1543,9 +1408,9 @@ export function usePunk(projectId: string) {
             thinking: selectedModelThinking,
             provider: selectedModelProvider,
             todos,
-            autoRoute: intentAutoRoute,
+            autoRoute: autoEscalate,
             minds,
-            effectiveMode,
+            phase: effectivePhase,
           }
         );
       } catch (err) {

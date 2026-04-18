@@ -22,6 +22,7 @@ const BASE_PATH = join(homedir(), '.pane', 'session');
  * @property {number|null} lastUserPromptHash - djb2 hash
  * @property {string|null} lastUserPromptText - last prompt text, max 500 chars
  * @property {number|null} struggleStartedAt - timestamp when streak began
+ * @property {"think"|"build"|"idle"} currentPhase - sticky phase for this project
  */
 
 /** @returns {ThreadState} */
@@ -35,6 +36,8 @@ function defaults() {
     lastUserPromptHash: null,
     lastUserPromptText: null,
     struggleStartedAt: null,
+    // Phase system
+    currentPhase: 'idle',
   };
 }
 
@@ -185,3 +188,19 @@ export function updateLastResponse(projectId, responseSummary) {
 
   writeThreadState(projectId, state);
 }
+
+// ── Phase system helpers ──────────────────────────────────────────────────────
+
+/**
+ * Update the sticky phase for a project.
+ * @param {string} projectId
+ * @param {"think"|"build"|"verify"|"idle"} phase
+ * @returns {ThreadState} updated state
+ */
+export function updatePhase(projectId, phase) {
+  const state = readThreadState(projectId);
+  state.currentPhase = phase;
+  writeThreadState(projectId, state);
+  return state;
+}
+

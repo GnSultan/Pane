@@ -15,8 +15,8 @@ import { useWorkspaceStore, type Theme } from "../stores/workspace";
 import { useProjectsStore } from "../stores/projects";
 import type { ActionId, KeyBinding } from "../lib/keybindings";
 import {
-  DEFAULT_BACKEND_ROUTING,
-  type BackendRouting,
+  DEFAULT_POWER_COMBO,
+  type PowerCombo,
 } from "../lib/models";
 
 // App readiness gate — other hooks (git, watcher) wait for this before starting
@@ -105,12 +105,31 @@ export function useSettingsPersistence() {
           );
         }
 
-        // 3. Routing Restore
-        const rawRouting = settings.intent_routing as BackendRouting | null;
-        useWorkspaceStore.setState({ intentRouting: rawRouting ?? DEFAULT_BACKEND_ROUTING });
+        // 3. Routing restore — flat PowerCombo { thinking, execution }
+        //    Migration path: old format was keyed by backend ("api", "claude-code", "gemini")
+        const rawCombo = settings.power_combo as any;
+        const legacyRouting = settings.intent_routing as any;
+        let restoredCombo: PowerCombo | null = null;
+
+        if (rawCombo?.thinking && rawCombo?.execution) {
+          // New flat format
+          restoredCombo = rawCombo as PowerCombo;
+        } else if (rawCombo && typeof rawCombo === "object") {
+          // Old keyed format — pick the most specific key available
+          const keyed = rawCombo["claude-code"] || rawCombo["api"] || rawCombo["gemini"];
+          if (keyed?.thinking && keyed?.execution) restoredCombo = keyed as PowerCombo;
+        } else if (legacyRouting) {
+          // Oldest format: 4-slot intent_routing
+          const r = legacyRouting["claude-code"] || legacyRouting["api"];
+          if (r?.plan && r?.execute) {
+            restoredCombo = { thinking: r.plan, execution: r.execute };
+          }
+        }
+
+        useWorkspaceStore.setState({ powerCombo: restoredCombo ?? DEFAULT_POWER_COMBO });
 
         if (settings.intent_auto_route !== undefined) {
-          ws.setIntentAutoRoute(settings.intent_auto_route);
+          ws.setAutoEscalate(settings.intent_auto_route);
         }
 
         // 4. Project restoration — conversations load lazily in Conversation.tsx
@@ -269,8 +288,8 @@ export function useSettingsPersistence() {
         http_api_keys: ws.httpApiKeys,
         http_base_urls: ws.httpBaseUrls,
         disabled_providers: ws.disabledProviders,
-        intent_routing: ws.intentRouting as BackendRouting,
-        intent_auto_route: ws.intentAutoRoute,
+        power_combo: ws.powerCombo,
+        intent_auto_route: ws.autoEscalate,
       }).catch((err) => console.error("[persistence] Save failed:", err));
     };
 
@@ -283,8 +302,8 @@ export function useSettingsPersistence() {
     const unsubWorkspace = useWorkspaceStore.subscribe((state, prev) => {
       // Deep comparison for routing to avoid unnecessary saves but capture changes
       const routingChanged =
-        JSON.stringify(state.intentRouting) !==
-        JSON.stringify(prev.intentRouting);
+        JSON.stringify(state.powerCombo) !==
+        JSON.stringify(prev.powerCombo);
       const keysChanged =
         JSON.stringify(state.httpApiKeys) !== JSON.stringify(prev.httpApiKeys);
       const urlsChanged =
@@ -308,7 +327,7 @@ export function useSettingsPersistence() {
         routingChanged ||
         keysChanged ||
         urlsChanged ||
-        state.intentAutoRoute !== prev.intentAutoRoute
+        state.autoEscalate !== prev.autoEscalate
       ) {
         debouncedSave();
       }

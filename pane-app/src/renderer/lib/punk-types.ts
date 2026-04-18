@@ -66,7 +66,7 @@ export interface StrategySignal {
 
 export interface StrategyBlock {
   type: "strategy";
-  mode: "direct" | "orchestrate" | "discuss";
+  mode: "direct" | "analyze" | "discuss";
   discovery: boolean;
   reasoning: "shallow" | "deep";
   verification: "none" | "diff" | "test";
@@ -260,106 +260,6 @@ export interface PunkEventArbiterVerdict {
   data: ArbiterVerdict;
 }
 
-// ── Orchestration Events (Control Inversion) ────────────────────────────
-
-export interface OrchestrationStartEvent {
-  event: "orchestration_start";
-  data: { prompt: string };
-}
-
-export interface OrchestrationPlanningStartEvent {
-  event: "orchestration_planning_start";
-  data: Record<string, never>;
-}
-
-export interface OrchestrationPlanningChunkEvent {
-  event: "orchestration_planning_chunk";
-  data: { chunk: string };
-}
-
-export interface OrchestrationPlanEvent {
-  event: "orchestration_plan";
-  data: {
-    summary: string;
-    humanBrief?: string;
-    humanTasks?: string[];
-    steps: { index: number; action: string; type: string; files: string[] }[];
-    totalSteps: number;
-    planId?: string;
-    planningModel?: string;
-    executionModel?: string;
-  };
-}
-
-export interface OrchestrationStepEvent {
-  event: "orchestration_step";
-  data: {
-    phase: string;
-    stepIndex?: number;
-    totalSteps?: number;
-    action?: string;
-    type?: string;
-    message: string;
-    reason?: string;
-  };
-}
-
-export interface OrchestrationStepCompleteEvent {
-  event: "orchestration_step_complete";
-  data: {
-    stepIndex: number;
-    totalSteps: number;
-    passed: boolean;
-    reason: string;
-    action: string;
-    scopeViolations?: string[];
-    changedFiles?: string[];
-    retry?: boolean;
-  };
-}
-
-export interface OrchestrationCompleteEvent {
-  event: "orchestration_complete";
-  data: {
-    summary: string;
-    totalSteps: number;
-    completedSteps: number;
-    allPassed: boolean;
-    typeCheckPassed: boolean;
-    typeCheckOutput: string | null;
-    touchedFiles: string[];
-    results: {
-      index: number;
-      action: string;
-      passed: boolean;
-      reason: string;
-      scopeViolations: string[];
-      changedFiles: string[];
-    }[];
-  };
-}
-
-export interface OrchestrationTypecheckEvent {
-  event: "orchestration_typecheck";
-  data: {
-    passed: boolean;
-    output: string;
-  };
-}
-
-export interface OrchestrationErrorEvent {
-  event: "orchestration_error";
-  data: { message: string };
-}
-
-export interface OrchestrationPhaseEvent {
-  event: "orchestration_phase";
-  data: {
-    phase: "discovery" | "planning" | "executing" | "validating" | "replanning" | "execution";
-    model?: string;
-    provider?: string;
-  };
-}
 
 export interface SdkModel {
   /** Model identifier (SDK field: "value") */
@@ -415,6 +315,25 @@ export interface PunkEventRateLimit {
   data: RateLimitInfo;
 }
 
+export interface PunkEventAwaitingInput {
+  event: "awaiting_input";
+  data: {
+    toolId: string;
+    question: string | null;
+    inputType: "plan_approval" | "question";
+  };
+}
+
+// ── Phase system ─────────────────────────────────────────────────────────────
+// think = discuss + brainstorm + plan (thinking model, read-only)
+// build = execute (execution model, full tools)
+export type PanePhase = "think" | "build" | "idle";
+
+export interface PunkEventPhaseChanged {
+  event: "phase_changed";
+  data: { phase: PanePhase };
+}
+
 export type PunkStreamEvent = (
   | PunkEventMessage
   | PunkEventProcessStarted
@@ -428,19 +347,11 @@ export type PunkStreamEvent = (
   | PunkEventTodosUpdated
   | PunkEventActiveTaskUpdated
   | PunkEventArbiterVerdict
-  | OrchestrationStartEvent
-  | OrchestrationPlanningStartEvent
-  | OrchestrationPlanningChunkEvent
-  | OrchestrationPlanEvent
-  | OrchestrationStepEvent
-  | OrchestrationStepCompleteEvent
-  | OrchestrationCompleteEvent
-  | OrchestrationTypecheckEvent
-  | OrchestrationErrorEvent
-  | OrchestrationPhaseEvent
   | PunkEventSdkInitInfo
   | PunkEventRateLimit
   | PunkEventTokenUsage
+  | PunkEventAwaitingInput
+  | PunkEventPhaseChanged
 ) & { requestId?: string };
 
 // Plan message types — the blueprint Pane produces before execution
@@ -512,6 +423,8 @@ export interface ConversationMessage {
   isHistorical?: boolean;
   // Quality verdict from the Turn Sentinel
   verdict?: ArbiterVerdict;
+  // Phase active when this message was sent (think | build)
+  phase?: PanePhase;
 }
 
 // File checkpoint types
@@ -538,7 +451,7 @@ export interface ConversationState {
   serviceTier: string | null;
   isProcessing: boolean;
   isPlanning: boolean;
-  phase: "idle" | "discovery" | "planning" | "executing" | "validating" | "replanning" | "execution"; // Current orchestration phase
+  phase: PanePhase;
 
   isRestored: boolean; // true once loaded from disk at startup
   error: string | null;
@@ -560,6 +473,12 @@ export interface ConversationState {
   // Pagination — how much history is on disk vs. loaded in memory
   historyTotalCount: number; // Total messages in the conversation file
   historyStartIndex: number; // Index of the first loaded message (0 = all loaded)
+  // Suspended tool call awaiting user input (plan approval or AskUserQuestion)
+  pendingInput: {
+    toolId: string;
+    question: string | null;
+    inputType: "plan_approval" | "question";
+  } | null;
 }
 
 // Memory event types for automatic extraction
@@ -610,5 +529,6 @@ export function createEmptyConversation(): ConversationState {
     tokensSaved: 0,
     historyTotalCount: 0,
     historyStartIndex: 0,
+    pendingInput: null,
   };
 }

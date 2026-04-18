@@ -395,6 +395,20 @@ export function MessageBubble({
           )}
         </div>
         <div className="flex items-center justify-end gap-2 mt-1">
+          {message.phase && message.phase !== "idle" && (
+            <span
+              className="font-mono"
+              style={{
+                fontSize: "var(--pane-font-size-xs)",
+                color: message.phase === "think"
+                  ? "var(--pane-status-modified)"
+                  : "var(--pane-status-added)",
+                opacity: 0.5,
+              }}
+            >
+              {message.phase}
+            </span>
+          )}
           {message.checkpointId && (
             <CheckpointIndicator
               checkpointId={message.checkpointId}

@@ -6,7 +6,7 @@ import {
   engineKey,
   DEFAULT_BACKEND_ROUTING,
   type EngineOption,
-  type IntentRouting,
+  type PowerCombo,
   isThinkingModel,
   getContextWindowForModel,
 } from "../../lib/models";
@@ -541,15 +541,12 @@ function AiEnginesSection({
 }: {
   httpApiKeys: Record<string, string>;
 }) {
-  const routing = useWorkspaceStore(useShallow((s) => s.getEffectiveRouting()));
+  const combo = useWorkspaceStore(useShallow((s) => s.getEffectiveCombo()));
   const allModels = useWorkspaceStore((s) => s.allModels);
   const sdkModels = useWorkspaceStore((s) => s.sdkModels);
   const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
 
-  // For transparent routing, we show all engines but need to know which are usable
-  // CLI providers (anthropic for Claude Code, gemini for Gemini CLI) are always usable if installed
-  // HTTP providers need API keys
   const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
   const [geminiAvailable, setGeminiAvailable] = useState(false);
 
@@ -568,7 +565,6 @@ function AiEnginesSection({
   // Build a flat list of all usable engines from dynamic data for auto-heal
   const usableEngines = useMemo(() => {
     const engines: EngineOption[] = [];
-    // SDK models for anthropic
     if (sdkModels && sdkModels.length > 0 && claudeCodeAvailable && !disabledProviders.includes("anthropic")) {
       sdkModels.forEach((m) => engines.push({
         label: m.displayName || m.value,
@@ -578,7 +574,6 @@ function AiEnginesSection({
         requiresKey: "anthropic",
       }));
     }
-    // allModels for everything else
     for (const [provider, models] of Object.entries(allModels)) {
       if (!models || models.length === 0) continue;
       if (provider === "anthropic" && engines.some((e) => e.provider === "anthropic")) continue;
@@ -601,131 +596,64 @@ function AiEnginesSection({
     return engines;
   }, [allModels, sdkModels, claudeCodeAvailable, geminiAvailable, httpApiKeys, disabledProviders]);
 
-  const autoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
-  const setIntentRouting = useWorkspaceStore((s) => s.setIntentRouting);
+  const autoRoute = useWorkspaceStore((s) => s.autoEscalate);
+  const setPowerCombo = useWorkspaceStore((s) => s.setPowerCombo);
+  const setAutoEscalate = useWorkspaceStore((s) => s.setAutoEscalate);
 
-  // Auto-heal: when availability changes (CLI installed/uninstalled, keys added/removed),
-  // reset any slot that points to a provider that is no longer usable.
+  // Auto-heal: when availability changes, reset any combo slot pointing to an unusable provider.
   useEffect(() => {
     const isProviderUsable = (provider: string) => {
-      // Claude Code CLI handles anthropic provider
       if (provider === "anthropic") return claudeCodeAvailable;
-      // Gemini CLI handles gemini provider
       if (provider === "gemini") return geminiAvailable;
-      // HTTP providers need API keys
       return !!httpApiKeys?.[provider];
     };
 
     const firstUsable = usableEngines[0];
-
-    // Nothing we can do if there are no usable engines at all
     if (!firstUsable) return;
 
-    const current = routing;
-    const updates: Partial<IntentRouting> = {};
+    const current = combo;
+    const updates: Partial<PowerCombo> = {};
 
-    if (current?.plan && !isProviderUsable(current.plan.provider)) {
-      updates.plan = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
+    if (current?.thinking && !isProviderUsable(current.thinking.provider)) {
+      updates.thinking = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
     }
-    if (current?.execute && !isProviderUsable(current.execute.provider)) {
-      updates.execute = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
-    }
-    if (current?.explain && !isProviderUsable(current.explain.provider)) {
-      updates.explain = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
-    }
-    if (current?.other && !isProviderUsable(current.other.provider)) {
-      updates.other = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
+    if (current?.execution && !isProviderUsable(current.execution.provider)) {
+      updates.execution = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
     }
 
     if (Object.keys(updates).length > 0) {
-      setIntentRouting({ ...current, ...updates } as IntentRouting);
+      setPowerCombo({ ...current, ...updates } as PowerCombo);
     }
-    // Only re-run when availability changes
   }, [httpApiKeys, claudeCodeAvailable, geminiAvailable]);
-
-  const setIntentAutoRoute = useWorkspaceStore((s) => s.setIntentAutoRoute);
 
   const handleThinkingChange = (opt: EngineOption) => {
     const isReasoningProvider =
-      opt.provider === "openrouter" ||
-      opt.provider === "kimi" ||
-      opt.provider === "xiaomi" ||
-      opt.provider === "deepseek";
-
-    const next = {
-      plan: {
-        provider: opt.provider,
-        model: opt.model,
-        thinking: opt.thinking || isReasoningProvider,
-      },
-      execute: routing?.execute || DEFAULT_BACKEND_ROUTING["api"]!.execute,
-      explain: routing?.explain || DEFAULT_BACKEND_ROUTING["api"]!.explain,
-      other: routing?.other || DEFAULT_BACKEND_ROUTING["api"]!.other,
-    };
-    setIntentRouting(next);
-    // Reinitialize to apply routing changes
+      opt.provider === "openrouter" || opt.provider === "kimi" ||
+      opt.provider === "xiaomi" || opt.provider === "deepseek";
+    setPowerCombo({
+      thinking: { provider: opt.provider, model: opt.model, thinking: opt.thinking || isReasoningProvider },
+      execution: combo?.execution || DEFAULT_BACKEND_ROUTING["api"]!.execution,
+    });
     reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleBuildingChange = (opt: EngineOption) => {
-    const next = {
-      plan: routing?.plan || DEFAULT_BACKEND_ROUTING["api"]!.plan,
-      execute: {
-        provider: opt.provider,
-        model: opt.model,
-        thinking: opt.thinking,
-      },
-      explain: routing?.explain || DEFAULT_BACKEND_ROUTING["api"]!.explain,
-      other: routing?.other || DEFAULT_BACKEND_ROUTING["api"]!.other,
-    };
-    setIntentRouting(next);
-    // Reinitialize to apply routing changes
-    reinitializePunkBackend("api").catch(() => {});
-  };
-
-  const handleExplainChange = (opt: EngineOption) => {
-    const next = {
-      plan: routing?.plan || DEFAULT_BACKEND_ROUTING["api"]!.plan,
-      execute: routing?.execute || DEFAULT_BACKEND_ROUTING["api"]!.execute,
-      explain: {
-        provider: opt.provider,
-        model: opt.model,
-        thinking: opt.thinking,
-      },
-      other: routing?.other || DEFAULT_BACKEND_ROUTING["api"]!.other,
-    };
-    setIntentRouting(next);
-    // Reinitialize to apply routing changes
-    reinitializePunkBackend("api").catch(() => {});
-  };
-
-  const handleOtherChange = (opt: EngineOption) => {
-    const next = {
-      plan: routing?.plan || DEFAULT_BACKEND_ROUTING["api"]!.plan,
-      execute: routing?.execute || DEFAULT_BACKEND_ROUTING["api"]!.execute,
-      explain: routing?.explain || DEFAULT_BACKEND_ROUTING["api"]!.explain,
-      other: {
-        provider: opt.provider,
-        model: opt.model,
-        thinking: opt.thinking,
-      },
-    };
-    setIntentRouting(next);
-    // Reinitialize to apply routing changes
+    setPowerCombo({
+      thinking:  combo?.thinking  || DEFAULT_BACKEND_ROUTING["api"]!.thinking,
+      execution: { provider: opt.provider, model: opt.model, thinking: opt.thinking },
+    });
     reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleAutoRouteToggle = () => {
-    setIntentAutoRoute(!autoRoute);
-    // Reinitialize to apply routing changes
+    setAutoEscalate(!autoRoute);
     reinitializePunkBackend("api").catch(() => {});
   };
 
   const resolveEngine = (
     current: { provider: string; model: string; thinking: boolean } | undefined,
   ): EngineOption => {
-    const routingDefault = DEFAULT_BACKEND_ROUTING["api"];
-    const target = current || routingDefault?.plan;
+    const target = current || DEFAULT_BACKEND_ROUTING["api"]!.thinking;
     if (!target) return usableEngines[0] || { label: "none", provider: "", model: "", thinking: false, requiresKey: "" };
 
     // Try usableEngines (already built from allModels + sdkModels)
@@ -762,12 +690,10 @@ function AiEnginesSection({
     };
   };
 
-  const thinkingEngine = resolveEngine(routing?.plan);
-  const buildingEngine = resolveEngine(routing?.execute);
-  const explainingEngine = resolveEngine(routing?.explain);
-  const otherEngine = resolveEngine(routing?.other);
+  const thinkingEngine = resolveEngine(combo?.thinking);
+  const buildingEngine = resolveEngine(combo?.execution);
 
-  // Check if each engine's provider is usable
+  // Check if each slot's provider is usable
   const isProviderUsable = (provider: string) => {
     if (provider === "anthropic") return claudeCodeAvailable;
     if (provider === "gemini") return geminiAvailable;
@@ -776,8 +702,6 @@ function AiEnginesSection({
 
   const missingThinkingKey = !isProviderUsable(thinkingEngine.provider);
   const missingBuildingKey = !isProviderUsable(buildingEngine.provider);
-  const missingExplainingKey = !isProviderUsable(explainingEngine.provider);
-  const missingOtherKey = !isProviderUsable(otherEngine.provider);
 
   return (
     <div className="flex flex-col gap-4">
@@ -831,7 +755,7 @@ function AiEnginesSection({
                     className="text-pane-text-secondary/50 font-mono"
                     style={{ fontSize: "var(--pane-font-size-xs)" }}
                   >
-                    architecture, design, decisions
+                    planning, brainstorming, verification
                   </span>
                 </div>
                 <div className="flex items-center gap-2">
@@ -912,75 +836,6 @@ function AiEnginesSection({
               )}
             </div>
 
-            <div className="py-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <div className="flex flex-col gap-0.5">
-                  <span
-                    className="text-pane-text font-mono"
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  >
-                    when explaining
-                  </span>
-                  <span
-                    className="text-pane-text-secondary/50 font-mono"
-                    style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  >
-                    understanding code, walkthroughs
-                  </span>
-                </div>
-                <EngineSelect
-                  allModels={allModels}
-                  sdkModels={sdkModels}
-                  httpApiKeys={httpApiKeys}
-                  disabledProviders={disabledProviders}
-                  value={engineKey(explainingEngine)}
-                  onChange={handleExplainChange}
-                />
-              </div>
-              {missingExplainingKey && (
-                <span
-                  className="text-pane-error font-mono"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  ⚠ {explainingEngine.provider === "anthropic" ? "Claude not connected" : explainingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${explainingEngine.requiresKey}`} — {explainingEngine.provider === "anthropic" ? "sign in below" : explainingEngine.provider === "gemini" ? "install CLI" : "add key below"}
-                </span>
-              )}
-            </div>
-
-            <div className="py-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <div className="flex flex-col gap-0.5">
-                  <span
-                    className="text-pane-text font-mono"
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  >
-                    everything else
-                  </span>
-                  <span
-                    className="text-pane-text-secondary/50 font-mono"
-                    style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  >
-                    chat, questions, general tasks
-                  </span>
-                </div>
-                <EngineSelect
-                  allModels={allModels}
-                  sdkModels={sdkModels}
-                  httpApiKeys={httpApiKeys}
-                  disabledProviders={disabledProviders}
-                  value={engineKey(otherEngine)}
-                  onChange={handleOtherChange}
-                />
-              </div>
-              {missingOtherKey && (
-                <span
-                  className="text-pane-error font-mono"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  ⚠ {otherEngine.provider === "anthropic" ? "Claude not connected" : otherEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${otherEngine.requiresKey}`} — {otherEngine.provider === "anthropic" ? "sign in below" : otherEngine.provider === "gemini" ? "install CLI" : "add key below"}
-                </span>
-              )}
-            </div>
 
             <div className="py-2">
               <span

@@ -212,7 +212,7 @@ export interface ProjectSessionState {
   name?: string;
 }
 
-import type { BackendRouting } from "./models";
+import type { PowerCombo } from "./models";
 
 export interface UserSettings {
   project_roots: string[];
@@ -237,7 +237,8 @@ export interface UserSettings {
   http_api_keys?: Record<string, string>;
   http_base_urls?: Record<string, string>;
   disabled_providers?: string[];
-  intent_routing?: BackendRouting;
+  intent_routing?: Record<string, unknown>;  // deprecated — migration only
+  power_combo?: PowerCombo;
   intent_auto_route?: boolean;
 }
 
@@ -259,10 +260,10 @@ export interface SendToPunkOptions {
   todos?: Todo[];
   autoRoute?: boolean;
   minds?: Array<{ id: string }>;
-  /** Effective mode from the mode pill — single source of truth for orchestration.
-   *  When set, overrides the heuristic router so the system prompt stays
-   *  consistent across turns. */
-  effectiveMode?: string;
+  /** Sticky phase from the phase pill — single source of truth for model routing.
+   *  "think" uses thinking model (plan+verify), "build" uses execution model.
+   *  When set, overrides heuristic router so routing stays consistent across turns. */
+  phase?: string;
   // Mind chat overrides — when projectId starts with "mind:", these control behavior
   systemPromptOverride?: string;
   _systemOverride?: boolean;
@@ -302,10 +303,6 @@ export async function sendToPunk(
   // Self-cleaning listener — stays active until processEnded/error (or
   // orchestration_complete/orchestration_error when orchestration is active).
   let cleanup: (() => void) | null = null;
-  // During orchestration, processEnded fires after each internal spawn
-  // (planning, each execution step). We must NOT close the listener on those
-  // mid-orchestration processEnded events — only on the final terminal event.
-  let orchestrationActive = false;
 
   const closeListener = () => {
     draining = false;
@@ -345,24 +342,10 @@ export async function sendToPunk(
       const event = queue.shift()!;
       onEvent(event);
 
-      // Track orchestration lifecycle so we know which processEnded is truly terminal.
-      if (event.event === "orchestration_start") orchestrationActive = true;
-      if (
-        event.event === "orchestration_complete" ||
-        event.event === "orchestration_error" ||
-        (event.event === "orchestration_phase" && event.data?.phase === "executing")
-      ) {
-        orchestrationActive = false;
-      }
-
-      // Terminal events: clean up after processing, don't schedule another drain.
-      // During orchestration, processEnded fires after each internal spawn — ignore those.
-      // Only close when orchestration itself ends, or on a top-level processEnded/error.
+      // Terminal events: close the listener and stop draining.
       const isTerminal =
         event.event === "error" ||
-        event.event === "orchestration_complete" ||
-        event.event === "orchestration_error" ||
-        (event.event === "processEnded" && !orchestrationActive);
+        event.event === "processEnded";
 
       if (isTerminal) {
         closeListener();
@@ -410,7 +393,7 @@ export async function sendToPunk(
       todos: opts.todos,
       autoRoute: opts.autoRoute,
       minds: opts.minds,
-      effectiveMode: opts.effectiveMode,
+      phase: opts.phase,
       // Mind chat overrides — forwarded when present
       ...(opts.systemPromptOverride ? { systemPromptOverride: opts.systemPromptOverride } : {}),
       ...(opts._systemOverride ? { _systemOverride: opts._systemOverride } : {}),
@@ -1515,4 +1498,16 @@ export async function reviewSessionsList(projectId: string): Promise<{ sessions:
 
 export async function reviewSessionLatest(projectId: string): Promise<{ session: ReviewSession | null; findings: ReviewFinding[] }> {
   return electronAPI.invoke("review_session_latest", { projectId });
+}
+
+/**
+ * Respond to a suspended tool call (plan approval or AskUserQuestion).
+ * Resolves the pending Promise in the backend, unblocking the model loop.
+ */
+export async function respondToTool(
+  projectId: string,
+  toolId: string,
+  response: string,
+): Promise<boolean> {
+  return electronAPI.invoke("punk:respond-to-tool", { projectId, toolId, response });
 }

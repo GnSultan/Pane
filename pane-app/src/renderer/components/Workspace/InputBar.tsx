@@ -9,84 +9,52 @@ import {
   getContextLimit,
 } from "../../lib/models";
 import { previewRoute, showFilePicker, brainMindGetAll, type RoutePreview, type MindEntry } from "../../lib/tauri-commands";
-import { measureCaretPos } from "../../lib/measure-caret";
+import { CaretTextArea } from "../shared";
 
 const EMPTY_TODOS: Todo[] = [];
 
 // ── Reactive mode indicator ─────────────────────────────────────────────
 // Auto-detected from route preview, one-tap override by user.
 
-const MODE_CYCLE = ["plan", "analyze", "execute", "discuss"] as const;
+// ── Two-phase system ─────────────────────────────────────────────────────────
+// think = discuss + brainstorm + plan (thinking model)
+// build = execute the plan (execution model)
+// Phase is sticky — persists across messages until explicitly changed.
 
-const MODE_CONFIG: Record<string, { directive: string; color: string }> = {
-  plan:    { directive: "/analyze ", color: "var(--pane-status-modified)" },
-  analyze: { directive: "/analyze ", color: "var(--pane-accent)" },
-  execute: { directive: "",          color: "var(--pane-status-added)" },
-  discuss: { directive: "/discuss ", color: "var(--pane-terminal)" },
+const PHASE_CYCLE = ["think", "build"] as const;
+type PhaseName = typeof PHASE_CYCLE[number];
+
+const PHASE_CONFIG: Record<PhaseName, { color: string }> = {
+  think: { color: "var(--pane-status-modified)" },
+  build: { color: "var(--pane-status-added)" },
 };
 
-interface DetectedMode {
-  mode: string;
-  directive: string;
-  color: string;
-}
-
-function mapRouteToMode(preview: RoutePreview): string {
-  if (preview.mode === "analyze") return "analyze";
-  if (preview.mode === "discuss") return "discuss";
-  if (preview.mode === "orchestrate") return "plan";
-  if (preview.taskType === "explain" || preview.taskType === "architect") return "plan";
-  if (preview.taskType === "conversation" || preview.taskType === "quick-answer") return "discuss";
-  return "execute";
-}
-
 /**
- * Detect if the message is a strong signal to LEAVE the current mode.
- * Weak references to other modes ("plan it out" inside a discuss session)
- * are NOT transition signals — the user is talking about planning, not
- * requesting a mode switch.
- *
- * Only explicit action phrases break the current flow.
+ * Detect a strong phase transition signal from the user's message.
+ * Only explicit action or pause phrases trigger a switch.
+ * Weak references ("let's plan this later") are NOT transitions.
  */
-function detectTransition(text: string, currentMode: string): string | null {
+function detectPhaseTransition(text: string, currentPhase: PhaseName): PhaseName | null {
   const t = text.trim().toLowerCase();
 
-  // From discuss/plan/analyze → execute: user wants action NOW
-  if (currentMode !== "execute") {
+  // think → build: user approves a plan and wants action now
+  if (currentPhase === "think") {
     if (/^(do it|go ahead|ship it|let'?s go|build it|execute|make it happen|yes do it|ok do it|start building|let'?s build|implement it|go for it)\s*[.!]?$/i.test(t)) {
-      return "execute";
+      return "build";
     }
-    // Short approvals after the model asked "should I proceed?" — only if very short
     if (t.length < 20 && /^(yes|yep|yup|ok|okay|sure|proceed|approved|lgtm|go)\s*[.!]?$/i.test(t)) {
-      return "execute";
+      return "build";
     }
   }
 
-  // From execute → discuss: user wants to stop and talk
-  if (currentMode === "execute") {
-    if (/^(wait|stop|hold on|let'?s (talk|discuss|think)|actually|pause)\b/i.test(t)) {
-      return "discuss";
+  // build → think: user wants to stop and rethink
+  if (currentPhase === "build") {
+    if (/^(wait|stop|hold on|let'?s (talk|discuss|think|rethink)|actually|pause)\b/i.test(t)) {
+      return "think";
     }
   }
 
-  // No strong signal — stay in current mode
   return null;
-}
-
-/** Instant client-side intent guess — no IPC, runs on every keystroke. */
-function quickClassify(text: string): string {
-  const t = text.trim().toLowerCase();
-  if (t.length < 5) return "execute";
-  // Discuss: short questions
-  if (t.endsWith("?") && t.length < 120) return "discuss";
-  // Analyze: investigation keywords
-  if (/\b(analyze|audit|investigate|trace|where are we|what's wrong|how does|review the|deep dive|go deep|explain how)\b/i.test(t)) return "analyze";
-  // Plan: architecture / long vision
-  if (/\b(plan|design|architect|rethink|reimagine|strategy|approach|vision|proposal)\b/i.test(t)) return "plan";
-  if (t.split("\n").length >= 6 || t.length > 800) return "plan";
-  // Discuss: general questions
-  if (/^(what|why|how|when|where|who|which|is|are|can|could|would|should|does|do)\b/i.test(t) && t.endsWith("?")) return "discuss";
-  return "execute";
 }
 
 function formatRelativeTime(epochMs: number): string {
@@ -222,7 +190,7 @@ function ContextUsageIndicator({ projectId }: { projectId: string }) {
 
 interface InputBarProps {
   projectId: string;
-  onSend: (message: string, minds?: Array<{ id: string }>, effectiveMode?: string) => void;
+  onSend: (message: string, minds?: Array<{ id: string }>, phase?: string) => void;
   onAbort: () => void;
   isProcessing: boolean;
 }
@@ -333,17 +301,16 @@ function ModelPickerTrigger({
 
 // ─── Mode picker — inline carousel ───────────────────────────────────────────
 
-function ModePickerExpanded({
-  activeMode,
+function PhasePickerExpanded({
+  activePhase,
   onSelect,
   onClose,
 }: {
-  activeMode: string;
-  onSelect: (mode: string) => void;
+  activePhase: PhaseName;
+  onSelect: (phase: PhaseName) => void;
   onClose: () => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const modes = MODE_CYCLE as unknown as string[];
 
   // Click outside to close
   useEffect(() => {
@@ -357,13 +324,13 @@ function ModePickerExpanded({
   return (
     <div ref={containerRef} className="flex-1 min-w-0 flex items-center gap-1 pointer-events-auto">
       <div className="flex-1" />
-      {modes.map((mode) => {
-        const config = MODE_CONFIG[mode];
-        const active = mode === activeMode;
+      {PHASE_CYCLE.map((phase) => {
+        const config = PHASE_CONFIG[phase];
+        const active = phase === activePhase;
         return (
           <button
-            key={mode}
-            onClick={() => { onSelect(mode); onClose(); }}
+            key={phase}
+            onClick={() => { onSelect(phase); onClose(); }}
             className={`shrink-0 flex items-center px-3 py-0.5 transition-opacity hover:opacity-100 ${active ? "opacity-100" : "opacity-35"}`}
           >
             <span
@@ -374,7 +341,7 @@ function ModePickerExpanded({
                 lineHeight: 1.5,
               }}
             >
-              {mode}
+              {phase}
             </span>
           </button>
         );
@@ -731,22 +698,24 @@ export function InputBar({
   const [modePickerExpanded, setModePickerExpanded] = useState(false);
   const [isFadingOut, setIsFadingOut] = useState(false);
   const [expanded, setExpanded] = useState(false);
-  const [caretPos, setCaretPos] = useState<{
-    top: number;
-    left: number;
-    lineHeight: number;
-  } | null>(null);
-  const [textareaFocused, setTextareaFocused] = useState(false);
 
   // Attach menu: closed → menu → thoughts
   const [attachMenu, setAttachMenu] = useState<"closed" | "menu" | "thoughts">("closed");
 
-  // Reactive mode indicator — auto-detected from route preview
-  const [detectedMode, setDetectedMode] = useState<DetectedMode | null>(null);
-  const [modeOverride, setModeOverride] = useState<string | null>(null);
-  // Carry-forward: what mode was used on the last sent message.
-  // Stays active until a strong transition signal overrides it.
-  const [lastSentMode, setLastSentMode] = useState<string | null>(null);
+  // Phase system — sticky, derived from conversation store.
+  // phaseOverride is a local tap (cleared after send to re-sync with store).
+  const [phaseOverride, setPhaseOverride] = useState<PhaseName | null>(null);
+
+  // Read sticky phase from conversation store — authoritative source of truth
+  const storePhase = useProjectsStore(
+    (s) => {
+      const raw = s.projects.get(projectId)?.conversation.phase;
+      if (raw === "think" || raw === "build") return raw as PhaseName;
+      return "think" as PhaseName; // default to think for new conversations
+    }
+  );
+
+  const currentPhase: PhaseName = phaseOverride ?? storePhase;
 
   // Prefill from external sources (e.g., Lens "fix" button)
   useEffect(() => {
@@ -767,25 +736,10 @@ export function InputBar({
   }, []);
 
 
-  // Prepend mode directive: manual pill override > nothing.
-  // Auto-detected mode is informational only — it does NOT prepend a directive
-  // unless the user explicitly taps the pill to pin it.
-  const buildPrompt = useCallback(
-    (trimmed: string) => {
-      // Manual override from pill tap — user explicitly chose this mode
-      if (modeOverride) {
-        const config = MODE_CONFIG[modeOverride];
-        if (config?.directive) return config.directive + trimmed;
-      }
-      // Auto-detected: don't prepend anything — let the backend route naturally
-      return trimmed;
-    },
-    [modeOverride],
-  );
+  // No directive prepending needed — phase is passed as a separate field.
+  const buildPrompt = useCallback((trimmed: string) => trimmed, []);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const caretContainerRef = useRef<HTMLDivElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
 
   const todos = useProjectsStore(
@@ -796,10 +750,8 @@ export function InputBar({
   const selectedModel = useWorkspaceStore((s) => s.selectedModel);
   const setSelectedModel = useWorkspaceStore((s) => s.setSelectedModel);
   const setHttpProvider = useWorkspaceStore((s) => s.setHttpProvider);
-  const intentAutoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
-  const setIntentAutoRoute = useWorkspaceStore((s) => s.setIntentAutoRoute);
-
-  // const intentRouting = useWorkspaceStore((s) => s.getEffectiveRouting());
+  const autoEscalate = useWorkspaceStore((s) => s.autoEscalate);
+  const setAutoEscalate = useWorkspaceStore((s) => s.setAutoEscalate);
 
   const routedModel = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.routedModel ?? null,
@@ -824,7 +776,7 @@ export function InputBar({
   const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    if (!intentAutoRoute || isProcessing || value.trim().length < 3) {
+    if (!autoEscalate || isProcessing || value.trim().length < 3) {
       setRoutePreview(null);
       return;
     }
@@ -839,57 +791,24 @@ export function InputBar({
     return () => {
       if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
     };
-  }, [value, intentAutoRoute, isProcessing, projectId]);
+  }, [value, autoEscalate, isProcessing, projectId]);
 
-  // Mode classification with conversation carry-forward.
-  // If we sent in a mode last turn, stay in it unless there's a strong transition signal.
-  // This prevents "yeah plan it out" in a discuss session from switching to plan mode.
+  // Phase transition detection — only updates phaseOverride on strong signals.
+  // Weak references ("let's think about this") inside build phase do NOT switch.
   useEffect(() => {
-    if (modeOverride) return; // user tapped the pill — don't auto-update
+    if (phaseOverride) return; // user already tapped the pill
     const trimmed = value.trim();
-    if (trimmed.length < 5) {
-      // Short text: show carry-forward mode if we have one, otherwise nothing
-      if (lastSentMode) {
-        const config = MODE_CONFIG[lastSentMode];
-        if (config) setDetectedMode({ mode: lastSentMode, directive: config.directive, color: config.color });
-      } else {
-        setDetectedMode(null);
-      }
-      return;
-    }
+    if (trimmed.length < 3) return;
+    const transition = detectPhaseTransition(trimmed, currentPhase);
+    if (transition) setPhaseOverride(transition);
+  }, [value, currentPhase, phaseOverride]);
 
-    // If we have a carry-forward mode, only break out on strong transition signals
-    if (lastSentMode) {
-      const transition = detectTransition(trimmed, lastSentMode);
-      if (transition) {
-        const config = MODE_CONFIG[transition];
-        if (config) setDetectedMode({ mode: transition, directive: config.directive, color: config.color });
-      } else {
-        // Stay in the carry-forward mode
-        const config = MODE_CONFIG[lastSentMode];
-        if (config) setDetectedMode({ mode: lastSentMode, directive: config.directive, color: config.color });
-      }
-      return;
-    }
-
-    // No carry-forward — fresh classification
-    const mode = routePreview ? mapRouteToMode(routePreview) : quickClassify(trimmed);
-    const config = MODE_CONFIG[mode];
-    if (config) {
-      setDetectedMode({ mode, directive: config.directive, color: config.color });
-    }
-  }, [value, routePreview, modeOverride, lastSentMode]);
-
-  // Clear override when input empties (but keep lastSentMode for carry-forward)
+  // Clear override when input empties
   useEffect(() => {
-    if (value.trim().length < 3 && !lastSentMode) {
-      setDetectedMode(null);
-      setModeOverride(null);
-    }
-  }, [value, lastSentMode]);
+    if (value.trim().length < 3) setPhaseOverride(null);
+  }, [value]);
 
   // Handle graceful fadeout of processing indicator.
-  // Only fade out after real processing happened — not on initial mount.
   const wasProcessingRef = useRef(false);
   useEffect(() => {
     if (isProcessing) {
@@ -902,37 +821,6 @@ export function InputBar({
       return () => clearTimeout(timer);
     }
   }, [isProcessing]);
-
-  // Update static caret position using Range API on the overlay text node.
-  const updateCaret = useCallback(() => {
-    const el = textareaRef.current;
-    const container = caretContainerRef.current;
-    const overlay = overlayRef.current;
-    if (!el || !container || !overlay || document.activeElement !== el) {
-      setCaretPos(null);
-      return;
-    }
-    setCaretPos(measureCaretPos(el, container, overlay));
-  }, []);
-
-  // Reposition on selection movement (arrows, mouse clicks, scroll)
-  useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    const events = ["click", "keyup", "mouseup", "select", "scroll"];
-    events.forEach((e) => el.addEventListener(e, updateCaret));
-    return () => events.forEach((e) => el.removeEventListener(e, updateCaret));
-  }, [updateCaret]);
-
-  // selectionchange fires on every cursor move including mid-hold arrow repeats —
-  // covers the gap that keyup misses during continuous navigation.
-  useEffect(() => {
-    const handler = () => {
-      if (document.activeElement === textareaRef.current) updateCaret();
-    };
-    document.addEventListener("selectionchange", handler);
-    return () => document.removeEventListener("selectionchange", handler);
-  }, [updateCaret]);
 
   // Collapse to ghost state when clicking outside the card with an empty input.
   useEffect(() => {
@@ -964,37 +852,6 @@ export function InputBar({
     window.addEventListener("pane:focus-input", handler);
     return () => window.removeEventListener("pane:focus-input", handler);
   }, []);
-
-  // Auto-resize textarea — always floor at minH so it never collapses to one line.
-  // Setting to "1px" first forces scrollHeight to report the true content height.
-  // Runs on mount ([] dep) to stamp the initial height before first paint,
-  // and on every value change to grow/shrink with content.
-  const applyTextareaHeight = useCallback(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    const minH = 56;
-    const maxH = window.innerHeight * 0.4;
-    // Don't collapse below minH — set to 1px only to measure scrollHeight,
-    // then immediately restore to the correct height in the same frame.
-    el.style.height = "1px";
-    const overflowing = el.scrollHeight > maxH;
-    el.style.height = Math.min(Math.max(el.scrollHeight, minH), maxH) + "px";
-    // When overflowing, the browser's native caret scroll only guarantees the
-    // caret lands within [scrollTop, scrollTop + clientHeight]. Force-scroll
-    // to absolute bottom when typing at the end so content stays visible.
-    if (overflowing && el.selectionEnd >= el.value.length - 1) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, []);
-
-  // Auto-resize + caret update in one effect so the order is guaranteed:
-  // height/scrollTop are fully stabilised before the caret is measured.
-  // (Previously updateCaret ran first, then applyTextareaHeight changed
-  // scrollTop behind its back — causing wrong caret position after line breaks.)
-  useEffect(() => {
-    applyTextareaHeight();
-    if (textareaFocused) updateCaret();
-  }, [value, applyTextareaHeight, textareaFocused, updateCaret]);
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
@@ -1031,14 +888,10 @@ export function InputBar({
         e.preventDefault();
         const trimmed = value.trim();
         if (trimmed) {
-          const sentMode = modeOverride || detectedMode?.mode || null;
-          onSend(buildPrompt(trimmed), undefined, sentMode || undefined);
-          // Carry mode forward to next turn — conversation is continuous
-          setLastSentMode(sentMode);
+          onSend(buildPrompt(trimmed), undefined, currentPhase);
           setValue("");
           setExpanded(false);
-          setModeOverride(null);
-          setDetectedMode(null);
+          setPhaseOverride(null); // re-sync with store phase after send
         }
       }
       if (e.key === "Escape" && isProcessing) {
@@ -1046,7 +899,7 @@ export function InputBar({
         onAbort();
       }
     },
-    [value, isProcessing, onSend, onAbort, buildPrompt, modeOverride, detectedMode],
+    [value, isProcessing, onSend, onAbort, buildPrompt, currentPhase],
   );
 
   return (
@@ -1155,71 +1008,22 @@ export function InputBar({
       {/* One card. Textarea + thoughts picker + button bar in column. */}
       {expanded && <div ref={cardRef} className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative flex flex-col">
 
-        {attachMenu !== "thoughts" && <div ref={caretContainerRef} className="relative overflow-hidden">
-          <textarea
-            data-pane-input
+        {attachMenu !== "thoughts" && (
+          <CaretTextArea
             ref={textareaRef}
             value={value}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
-            onFocus={() => { setTextareaFocused(true); updateCaret(); if (attachMenu === "menu") setAttachMenu("closed"); }}
-            onBlur={() => { setTextareaFocused(false); setCaretPos(null); }}
-            onScroll={() => { if (overlayRef.current && textareaRef.current) overlayRef.current.scrollTop = textareaRef.current.scrollTop; }}
             placeholder={isProcessing ? "" : "let's build..."}
-            className="w-full bg-transparent text-pane-text font-mono
-                       resize-none outline-none placeholder:text-pane-text-secondary
-                       leading-[1.75] px-5 pt-4 pb-3 overflow-y-auto overflow-x-hidden"
+            minHeight={56}
+            maxHeight={window.innerHeight * 0.4}
+            autoResize
+            className="w-full"
             style={{
-              fontSize: "var(--pane-font-size)",
-              caretColor: "transparent",
-              color: "transparent",
-              minHeight: "56px",
-              maxHeight: "40vh",
-              height: "56px",
+              padding: "1rem 1.25rem 0.75rem 1.25rem",
             }}
           />
-          {/* Highlight overlay — mirrors textarea text */}
-          <div
-            ref={overlayRef}
-            aria-hidden="true"
-            style={{
-              position: "absolute",
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              overflow: "hidden",
-              pointerEvents: "none",
-              fontSize: "var(--pane-font-size)",
-              lineHeight: "1.75",
-              paddingTop: "1rem",
-              paddingBottom: "0.75rem",
-              paddingLeft: "1.25rem",
-              paddingRight: "1.25rem",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              fontFamily: "ui-monospace, 'Cascadia Code', 'Cascadia Mono', 'Fira Code', Consolas, monospace",
-            }}
-          >
-            <span style={{ color: "var(--pane-text)" }}>{value}</span>
-            {/* Invisible trailing character keeps scrollHeight stable */}
-            <span aria-hidden> </span>
-          </div>
-          {textareaFocused && caretPos && (
-            <div
-              aria-hidden
-              style={{
-                position: "absolute",
-                top: caretPos.top,
-                left: caretPos.left,
-                width: 2,
-                height: caretPos.lineHeight,
-                background: "var(--pane-accent)",
-                pointerEvents: "none",
-              }}
-            />
-          )}
-        </div>}
+        )}
 
         {/* Send — top right, only when textarea is visible */}
         {attachMenu !== "thoughts" && value.trim().length > 0 && (
@@ -1227,12 +1031,9 @@ export function InputBar({
             onClick={() => {
               const trimmed = value.trim();
               if (!trimmed) return;
-              const sentMode = modeOverride || detectedMode?.mode || null;
-              onSend(buildPrompt(trimmed), undefined, sentMode || undefined);
-              setLastSentMode(sentMode);
+              onSend(buildPrompt(trimmed), undefined, currentPhase);
               setValue("");
-              setModeOverride(null);
-              setDetectedMode(null);
+              setPhaseOverride(null);
             }}
             className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
             title="Send (Enter)"
@@ -1260,9 +1061,9 @@ export function InputBar({
           {modelPickerExpanded ? (
             <ModelPickerExpanded
               value={selectedModel}
-              autoRoute={intentAutoRoute}
+              autoRoute={autoEscalate}
               onChange={handleModelChange}
-              onToggleAutoRoute={setIntentAutoRoute}
+              onToggleAutoRoute={setAutoEscalate}
               onClose={() => setModelPickerExpanded(false)}
             />
           ) : (
@@ -1317,17 +1118,15 @@ export function InputBar({
                 </div>
               )}
 
-              {/* Spacer — always present except when ModePickerExpanded takes the whole row */}
+              {/* Spacer — always present except when PhasePickerExpanded takes the whole row */}
               {!modePickerExpanded && <div className="flex-1" />}
               {!isProcessing && (() => {
-                const mode = modeOverride || detectedMode?.mode || lastSentMode || "execute";
-                const config = MODE_CONFIG[mode];
-                const color = config?.color || "var(--pane-text-secondary)";
+                const color = PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)";
                 if (modePickerExpanded) {
                   return (
-                    <ModePickerExpanded
-                      activeMode={mode}
-                      onSelect={(m) => setModeOverride(m)}
+                    <PhasePickerExpanded
+                      activePhase={currentPhase}
+                      onSelect={(p) => setPhaseOverride(p)}
                       onClose={() => setModePickerExpanded(false)}
                     />
                   );
@@ -1340,7 +1139,7 @@ export function InputBar({
                       hover:text-pane-text btn-press transition-colors"
                     style={{ color }}
                   >
-                    <span>{mode}</span>
+                    <span>{currentPhase}</span>
                   </button>
                 );
               })()}
@@ -1354,7 +1153,7 @@ export function InputBar({
               <div className="pointer-events-auto">
                 <ModelPickerTrigger
                   value={selectedModel}
-                  autoRoute={intentAutoRoute}
+                  autoRoute={autoEscalate}
                   routedModel={routedModel}
                   isProcessing={isProcessing}
                   onClick={() => setModelPickerExpanded(true)}

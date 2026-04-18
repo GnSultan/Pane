@@ -9,6 +9,17 @@ export interface EngineOption {
   outputCost?: number | null; // $/Mtok output
 }
 
+// Two-slot power combo: thinking model (plan + verify) + execution model (build)
+export interface PowerCombo {
+  thinking: { provider: string; model: string; thinking: boolean };
+  execution: { provider: string; model: string; thinking: boolean };
+}
+
+// Map of backendId -> PowerCombo configuration
+export type BackendRouting = Record<string, PowerCombo>;
+
+// Keep IntentRouting as a migration type — read from old settings.json
+/** @deprecated Use PowerCombo. Kept only for settings migration. */
 export interface IntentRouting {
   plan: { provider: string; model: string; thinking: boolean };
   execute: { provider: string; model: string; thinking: boolean };
@@ -16,51 +27,30 @@ export interface IntentRouting {
   other: { provider: string; model: string; thinking: boolean };
 }
 
-// Map of backendId -> Routing configuration
-export type BackendRouting = Record<string, IntentRouting>;
-
-export const DEFAULT_GEMINI_ROUTING: IntentRouting = {
-  plan: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
-  execute: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
-  explain: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
-  other: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
+export const DEFAULT_GEMINI_COMBO: PowerCombo = {
+  thinking:  { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
+  execution: { provider: "gemini", model: "gemini-3-flash-preview", thinking: false },
 };
 
-export const DEFAULT_HTTP_ROUTING: IntentRouting = {
-  plan: {
-    provider: "deepseek",
-    model: "deepseek-r1",
-    thinking: true,
-  },
-  execute: {
-    provider: "deepseek",
-    model: "deepseek-v3",
-    thinking: false,
-  },
-  explain: {
-    provider: "deepseek",
-    model: "deepseek-v3",
-    thinking: false,
-  },
-  other: {
-    provider: "deepseek",
-    model: "deepseek-v3",
-    thinking: false,
-  },
+export const DEFAULT_HTTP_COMBO: PowerCombo = {
+  thinking:  { provider: "deepseek", model: "deepseek-r1", thinking: true },
+  execution: { provider: "deepseek", model: "deepseek-v3", thinking: false },
 };
 
-export const DEFAULT_CLAUDE_CODE_ROUTING: IntentRouting = {
-  plan: { provider: "anthropic", model: "claude-opus-4-6", thinking: false },
-  execute: { provider: "anthropic", model: "claude-sonnet-4-6", thinking: false },
-  explain: { provider: "anthropic", model: "claude-sonnet-4-6", thinking: false },
-  other: { provider: "anthropic", model: "claude-sonnet-4-6", thinking: false },
+export const DEFAULT_CLAUDE_CODE_COMBO: PowerCombo = {
+  thinking:  { provider: "anthropic", model: "claude-opus-4-6",   thinking: false },
+  execution: { provider: "anthropic", model: "claude-sonnet-4-6", thinking: false },
 };
 
 export const DEFAULT_BACKEND_ROUTING: BackendRouting = {
-  api: DEFAULT_HTTP_ROUTING,
-  "claude-code": DEFAULT_CLAUDE_CODE_ROUTING,
-  "gemini": DEFAULT_GEMINI_ROUTING,
+  api:          DEFAULT_HTTP_COMBO,
+  "claude-code": DEFAULT_CLAUDE_CODE_COMBO,
+  gemini:       DEFAULT_GEMINI_COMBO,
 };
+
+// Single global default — provider-agnostic. Opus thinks, Sonnet builds.
+// User overrides this in Profile. Any provider can fill either slot.
+export const DEFAULT_POWER_COMBO: PowerCombo = DEFAULT_CLAUDE_CODE_COMBO;
 
 export function isThinkingModel(model: string): boolean {
   if (!model) return false;

@@ -712,9 +712,14 @@ ${PANE_END}`;
   // silently continue rather than surfacing an error. Capped at MAX_AUTO_RESUMES
   // to prevent infinite loops on genuinely stuck sessions.
   const MAX_AUTO_RESUMES = 50;
-  // Resume within-conversation continuity if history exists; new conversations (historyLength=0) start fresh.
-  // Pane context infrastructure handles project-level context; session resume handles conversation-level history.
-  let resumeSessionId = historyLength > 0 ? (activeSessionIds.get(projectId) || null) : null;
+  // Always attempt to resume a stored session — the SDK server holds the full
+  // conversation state for a generous window (24h+). The historyLength gate was
+  // causing a race condition: history loads async after mount, so the first
+  // message after restart always saw historyLength=0 and dropped the session ID.
+  // Genuinely new conversations have no entry in activeSessionIds, so they start
+  // fresh naturally. Expired sessions are caught below ("No conversation found")
+  // and retried as fresh — no silent failure.
+  let resumeSessionId = activeSessionIds.get(projectId) || null;
   let autoResumes = 0;
   let sdkInfoEmitted = false;
 
@@ -722,6 +727,7 @@ ${PANE_END}`;
     while (true) {
       let hitMaxTurns = false;
       let maxTurnsSessionId = null;
+      let hitStaleSession = false;
 
       const q = query({
         prompt: autoResumes > 0 ? "continue" : prompt,
@@ -772,6 +778,24 @@ ${PANE_END}`;
         if (msg.type === "result" && msg.subtype === "error_max_turns") {
           hitMaxTurns = true;
           maxTurnsSessionId = msg.session_id || resumeSessionId;
+          break;
+        }
+
+        // Stale session ID — the Claude session expired on Anthropic's servers.
+        // Clear the stored ID, suppress the error from the renderer, and retry
+        // the same prompt as a fresh session. Context arrives via the handoff.
+        if (
+          msg.type === "result" &&
+          msg.subtype === "error" &&
+          resumeSessionId &&
+          typeof msg.error === "string" &&
+          msg.error.includes("No conversation found")
+        ) {
+          activeSessionIds.delete(projectId);
+          resumeSessionId = null;
+          // Overwrite the persisted session ID with null so it isn't restored on restart
+          sendToMain({ type: "persist_session_id", projectId, sessionId: null, backend: "claude" });
+          hitStaleSession = true;
           break;
         }
 
@@ -851,6 +875,9 @@ ${PANE_END}`;
           });
         }
       }
+
+      // Stale session: retry the same prompt without a session ID
+      if (hitStaleSession) continue;
 
       if (!hitMaxTurns) break;
 
@@ -1178,7 +1205,7 @@ ${PANE_END}`;
   // ── Session resume: use Gemini's native --resume when session exists ──
   // When resuming, Gemini loads full history from its session file — no
   // preamble needed, just the new prompt. Saves tokens and avoids stale history.
-  const geminiResumeId = history && history.length > 0 ? (activeSessionIds.get(projectId) || null) : null;
+  const geminiResumeId = activeSessionIds.get(projectId) || null;
 
   let historyPreamble = "";
   if (!geminiResumeId && history && history.length > 0) {
@@ -1488,7 +1515,9 @@ async function handleSpawn({
 
   if (isCli) {
     // Lean mode: ~500 tokens instead of 5000. MCP tools provide the rest.
-    const isResume = historyLength > 0 && activeSessionIds.has(projectId);
+    // Use activeSessionIds as the source of truth — historyLength can be 0
+    // on first message after restart (async load race) even with a valid session.
+    const isResume = activeSessionIds.has(projectId);
     try {
       context = orchestrateContext(projectId, {
         mode: "lean",
