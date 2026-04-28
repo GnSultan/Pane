@@ -1466,7 +1466,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // autoRoute comes directly from the frontend request — always current.
     // Fallback to disk only when not present (e.g. internal spawns).
     const autoRoute = request.autoRoute ?? (await this.loadIntentAutoRoute());
-    const combo     = await this.loadPowerCombo();
+    const combo     = request.powerCombo ?? (await this.loadPowerCombo());
 
     // Phase-based fallback route: think/verify → thinking model, build/idle → execution model
     const phase = resolvedRequest.phase || "build";
@@ -2055,6 +2055,7 @@ export async function registerPunkHandlers() {
       provider,
       todos,
       autoRoute,
+      powerCombo,
       minds,
       phase,
       // Mind chat fields — when projectId starts with "mind:", these override defaults
@@ -2075,6 +2076,7 @@ export async function registerPunkHandlers() {
       provider,
       todos,
       autoRoute,
+      powerCombo,
       minds,
       phase,
       ...(systemPromptOverride ? { systemPromptOverride } : {}),

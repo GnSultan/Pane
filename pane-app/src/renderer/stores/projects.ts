@@ -9,6 +9,9 @@ import type {
   ArbiterVerdict,
 } from "../lib/punk-types";
 import { createEmptyConversation } from "../lib/punk-types";
+import type { PowerCombo } from "../lib/models";
+import { DEFAULT_POWER_COMBO } from "../lib/models";
+import { useWorkspaceStore } from "./workspace";
 
 export interface ProjectGit {
   branch: string | null;
@@ -34,6 +37,7 @@ export interface Project {
   id: string;
   root: string;
   name: string;
+  rootMissing?: boolean; // true when the folder no longer exists at the stored path
   expandedDirs: Set<string>;
   dirContents: Map<string, FileEntry[]>;
   loadingDirs: Set<string>;
@@ -51,11 +55,30 @@ export interface Project {
   activeTerminalTabId: string | null;
   checkpoints: CheckpointMeta[];
   scrollPositions: Map<string, { scrollTop: number; cursor: { row: number; column: number } }>;
+  /** Per-project power combo: which model serves each phase (think/build).
+   *  When set, overrides the global workspace powerCombo for this project.
+   *  Undefined means "use workspace default". */
+  powerCombo?: PowerCombo;
+  /** Per-project auto-route toggle. Undefined means "use workspace default". */
+  autoEscalate?: boolean;
 }
 
-function createProject(root: string): Project {
+/**
+ * Generate a stable project ID.
+ * New projects get a UUID. Existing projects pass their stored ID so all
+ * memory/SQLite data (keyed on the old derived ID) stays intact.
+ */
+function generateProjectId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback for environments without crypto.randomUUID
+  return `proj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function createProject(root: string, stableId?: string): Project {
   const name = root.split("/").filter(Boolean).pop() || root;
-  const id = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
+  const id = stableId ?? generateProjectId();
   return {
     id,
     root,
@@ -85,7 +108,7 @@ function createProject(root: string): Project {
   };
 }
 
-// Ensure unique IDs by appending a counter if needed
+// Ensure unique IDs — UUIDs won't collide but derived IDs from old projects might
 function ensureUniqueId(id: string, existing: Map<string, Project>): string {
   if (!existing.has(id)) return id;
   let i = 2;
@@ -99,9 +122,12 @@ interface ProjectsState {
   projectOrder: string[]; // ordered list of project IDs for Cmd+1/2/3
 
   // Project lifecycle
-  addProject: (root: string) => string; // returns project ID
+  addProject: (root: string, stableId?: string) => string; // returns project ID
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
+  rebindProject: (id: string, newRoot: string) => void; // update root binding after folder move/rename
+  markRootMissing: (id: string, missing: boolean) => void;
+  migrateProjectId: (oldId: string, newId: string) => void; // swap store entry from old derived ID to UUID
   setActiveProject: (id: string) => void;
 
   // Active project helpers
@@ -166,11 +192,15 @@ interface ProjectsState {
     messageId: string,
     content: ContentBlock[],
   ) => void;
+  updateMessageReasoning: (
+    projectId: string,
+    messageId: string,
+    reasoning: string,
+  ) => void;
   updateLastAssistantContent: (
     projectId: string,
     content: ContentBlock[],
-  ) => void;
-  appendToLastAssistantText: (projectId: string, text: string) => void;
+  ) => void;  appendToLastAssistantText: (projectId: string, text: string) => void;
   appendToLastAssistantThinking: (projectId: string, thinking: string) => void;
   setLastThinkingSignature: (projectId: string, signature: string) => void;
   setConversationModel: (projectId: string, model: string) => void;
@@ -242,6 +272,11 @@ interface ProjectsState {
   markTerminalTabDead: (projectId: string, tabId: string) => void;
   updateTerminalTabCwd: (projectId: string, tabId: string, cwd: string) => void;
 
+  // Per-project routing
+  setProjectPowerCombo: (projectId: string, combo: PowerCombo) => void;
+  setProjectAutoEscalate: (projectId: string, autoEscalate: boolean) => void;
+  getProjectEffectiveCombo: (projectId: string) => PowerCombo;
+
   // Checkpoints
   addCheckpoint: (projectId: string, meta: CheckpointMeta) => void;
   setCheckpoints: (projectId: string, checkpoints: CheckpointMeta[]) => void;
@@ -267,17 +302,21 @@ function createProjectsStore() {
     activeProjectId: null,
     projectOrder: [],
 
-    addProject: (root: string) => {
+    addProject: (root: string, stableId?: string) => {
       const state = get();
-      // Don't add duplicate roots
+      // Don't add duplicate roots — return existing project ID
       for (const p of state.projects.values()) {
         if (p.root === root) {
           set({ activeProjectId: p.id });
           return p.id;
         }
       }
-      const project = createProject(root);
-      project.id = ensureUniqueId(project.id, state.projects);
+      // If a stableId is provided and already exists (e.g. from a previous session),
+      // trust it — don't ensureUnique since it IS the canonical identity.
+      const project = createProject(root, stableId);
+      if (!stableId) {
+        project.id = ensureUniqueId(project.id, state.projects);
+      }
       const next = new Map(state.projects);
       next.set(project.id, project);
       set({
@@ -290,6 +329,33 @@ function createProjectsStore() {
 
     renameProject: (id: string, name: string) => {
       set((state) => updateProject(state, id, () => ({ name: name.trim() || state.projects.get(id)?.name || "" })));
+    },
+
+    rebindProject: (id: string, newRoot: string) => {
+      set((state) =>
+        updateProject(state, id, () => ({
+          root: newRoot,
+          name: newRoot.split("/").filter(Boolean).pop() || newRoot,
+          rootMissing: false,
+        }))
+      );
+    },
+
+    markRootMissing: (id: string, missing: boolean) => {
+      set((state) => updateProject(state, id, () => ({ rootMissing: missing })));
+    },
+
+    migrateProjectId: (oldId: string, newId: string) => {
+      set((state) => {
+        const project = state.projects.get(oldId);
+        if (!project) return {}; // already migrated or doesn't exist
+        const next = new Map(state.projects);
+        next.delete(oldId);
+        next.set(newId, { ...project, id: newId });
+        const nextOrder = state.projectOrder.map((pid) => (pid === oldId ? newId : pid));
+        const nextActive = state.activeProjectId === oldId ? newId : state.activeProjectId;
+        return { projects: next, projectOrder: nextOrder, activeProjectId: nextActive };
+      });
     },
 
     removeProject: (id: string) => {
@@ -547,6 +613,16 @@ function createProjectsStore() {
         updateProject(state, projectId, (p) => {
           const msgs = p.conversation.messages.map((m) =>
             m.id === messageId ? { ...m, content } : m,
+          );
+          return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
+    updateMessageReasoning: (projectId, messageId, reasoning) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const msgs = p.conversation.messages.map((m) =>
+            m.id === messageId ? { ...m, reasoning_content: reasoning } : m,
           );
           return { conversation: { ...p.conversation, messages: msgs } };
         }),
@@ -973,6 +1049,25 @@ function createProjectsStore() {
           ),
         })),
       ),
+
+    // Per-project routing
+    setProjectPowerCombo: (projectId, combo) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({ powerCombo: combo })),
+      ),
+
+    setProjectAutoEscalate: (projectId, autoEscalate) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({ autoEscalate })),
+      ),
+
+    getProjectEffectiveCombo: (projectId) => {
+      const state = get();
+      const project = state.projects.get(projectId);
+      if (project?.powerCombo) return project.powerCombo;
+      // Fall back to workspace store's global combo
+      return useWorkspaceStore.getState().powerCombo || DEFAULT_POWER_COMBO;
+    },
 
     // Checkpoints
     addCheckpoint: (projectId, meta) =>

@@ -115,6 +115,7 @@ export interface AssistantMessage {
   type: "assistant";
   message: {
     content: ContentBlock[];
+    reasoning_content?: string;
     stop_reason?: "end_turn" | "tool_use" | "max_tokens" | null;
     usage?: {
       input_tokens?: number;
@@ -407,6 +408,7 @@ export interface ConversationMessage {
   id: string;
   type: "user" | "assistant" | "system" | "result" | "plan";
   content: ContentBlock[];
+  reasoning_content?: string;
   timestamp: number;
   isStreaming: boolean;
   costUsd?: number;

@@ -8,6 +8,8 @@ import {
   brainGetProfile,
   brainGetAvatar,
   saveConversationToMain,
+  checkPathExists,
+  migrateProjectId,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/punk-types";
@@ -133,28 +135,106 @@ export function useSettingsPersistence() {
         }
 
         // 4. Project restoration — conversations load lazily in Conversation.tsx
-        const { addProject, setActiveProject, toggleDir } =
+        const { addProject, setActiveProject, toggleDir, markRootMissing } =
           useProjectsStore.getState();
+
+        // project_ids maps root path → stable ID.
+        // On first launch after this update, existing projects won't have entries
+        // here. We fall back to the OLD derived-ID formula so their data
+        // (SQLite rows, memory files, brain graph) stays intact. New projects
+        // added after this update get real UUIDs.
+        const projectIds: Record<string, string> = settings.project_ids ?? {};
+
+        /** Reproduce the pre-UUID derived ID from a root path. */
+        function deriveOldId(root: string): string {
+          const name = root.split("/").filter(Boolean).pop() || root;
+          return name.toLowerCase().replace(/[^a-z0-9]/g, "-");
+        }
 
         if (settings.project_roots?.length > 0) {
           let activeId: string | null = null;
-          const projectIds: string[] = [];
+          const projectIds_: Record<string, string> = { ...projectIds };
+          const projectEntries: Array<{ id: string; root: string }> = [];
+          // Track which projects need migration: { root, oldId, newId }
+          const toMigrate: Array<{ root: string; oldId: string; newId: string }> = [];
+
           for (const root of settings.project_roots as string[]) {
-            const id = addProject(root);
-            projectIds.push(id);
-            if (root === settings.active_project_root) activeId = id;
+            if (projectIds_[root]) {
+              // Already has a stable ID — no migration needed
+              const id = addProject(root, projectIds_[root]);
+              projectEntries.push({ id, root });
+              if (root === settings.active_project_root) activeId = id;
+            } else {
+              // First launch after the update — derive the old ID, generate a UUID,
+              // and queue a migration so all data moves to the UUID atomically.
+              const oldId = deriveOldId(root);
+              const newId = (typeof crypto !== "undefined" && crypto.randomUUID)
+                ? crypto.randomUUID()
+                : `proj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+              toMigrate.push({ root, oldId, newId });
+              // Load the project immediately with the old ID so the UI isn't
+              // blocked waiting for the async migration to finish.
+              const id = addProject(root, oldId);
+              projectEntries.push({ id, root });
+              if (root === settings.active_project_root) activeId = id;
+            }
           }
+
           if (activeId) setActiveProject(activeId);
 
           // Mark all as restored AFTER the loops
-          for (const id of projectIds) {
+          for (const { id } of projectEntries) {
             useProjectsStore.getState().setConversationRestored(id, true);
           }
 
+          // Run migrations in the background — swap each project from its old
+          // derived ID to a real UUID. The project is already loaded and usable
+          // with the old ID; after migration completes we swap the store entry
+          // to the UUID and write the updated project_ids to disk.
+          if (toMigrate.length > 0) {
+            Promise.all(
+              toMigrate.map(async ({ root, oldId, newId }) => {
+                const result = await migrateProjectId(oldId, newId).catch(() => ({ success: false }));
+                if (result.success) {
+                  // Swap the store: rebind from oldId → newId so subsequent
+                  // data writes (conversations, brain, etc.) use the UUID.
+                  useProjectsStore.getState().migrateProjectId(oldId, newId);
+                  projectIds_[root] = newId;
+                } else {
+                  // Migration failed — keep the old derived ID as a stable
+                  // fallback. It'll be retried on the next launch.
+                  projectIds_[root] = oldId;
+                }
+              })
+            ).then(() => {
+              saveSettings({ project_ids: projectIds_ }).catch(() => {});
+              // Path-existence check after migration so we use final IDs
+              _checkMissingRoots(projectEntries.map(({ root }) => ({
+                id: projectIds_[root]!,
+                root,
+              })));
+            }).catch(() => {});
+          } else if (JSON.stringify(projectIds_) !== JSON.stringify(projectIds)) {
+            // No migrations needed but projectIds_ may have changed (e.g. a
+            // write-back from a previous partial run). Persist it.
+            saveSettings({ project_ids: projectIds_ }).catch(() => {});
+            _checkMissingRoots(projectEntries);
+          } else {
+            _checkMissingRoots(projectEntries);
+          }
+
+          function _checkMissingRoots(entries: Array<{ id: string; root: string }>) {
+            Promise.all(
+              entries.map(async ({ id, root }) => {
+                const exists = await checkPathExists(root).catch(() => true);
+                if (!exists) markRootMissing(id, true);
+              })
+            ).catch(() => {});
+          }
+
           const restoreProjectState = (idx: number) => {
-            if (idx >= projectIds.length) return;
-            const id = projectIds[idx]!;
-            const root = settings.project_roots[idx]!;
+            if (idx >= projectEntries.length) return;
+            const { id, root } = projectEntries[idx]!;
             const state: ProjectSessionState | undefined =
               settings.project_states?.[root];
 
@@ -184,6 +264,13 @@ export function useSettingsPersistence() {
                   return { projects: next };
                 });
               }
+              // Restore per-project power combo and auto-escalate
+              if (state.power_combo) {
+                useProjectsStore.getState().setProjectPowerCombo(id, state.power_combo);
+              }
+              if (state.auto_escalate !== undefined) {
+                useProjectsStore.getState().setProjectAutoEscalate(id, state.auto_escalate);
+              }
               if (state.active_file_path) {
                 readFile(state.active_file_path)
                   .then((content) => {
@@ -194,7 +281,7 @@ export function useSettingsPersistence() {
                   .catch(() => {});
               }
             }
-            if (idx + 1 < projectIds.length) {
+            if (idx + 1 < projectEntries.length) {
               requestIdleCallback(() => restoreProjectState(idx + 1));
             }
           };
@@ -253,23 +340,28 @@ export function useSettingsPersistence() {
 
       const project_roots: string[] = [];
       const project_states: Record<string, ProjectSessionState> = {};
+      const project_ids: Record<string, string> = {};
 
       for (const id of ps.projectOrder) {
         const p = ps.projects.get(id);
         if (!p) continue;
         project_roots.push(p.root);
+        project_ids[p.root] = p.id; // always persist the stable ID
         project_states[p.root] = {
           name: p.name,
           expanded_dirs: Array.from(p.expandedDirs),
           active_file_path: p.activeFilePath,
           recent_files: p.recentFiles,
           scroll_positions: Object.fromEntries(p.scrollPositions.entries()),
+          power_combo: p.powerCombo,
+          auto_escalate: p.autoEscalate,
         };
       }
 
       saveSettings({
         project_roots,
         active_project_root: activeProject?.root ?? null,
+        project_ids,
         control_panel_visible: ws.controlPanelVisible,
         project_states,
         font_size: ws.fontSize,

@@ -16,6 +16,25 @@ export async function readDirectory(path: string): Promise<FileEntry[]> {
   return electronAPI.invoke("read_directory", { path });
 }
 
+export async function checkPathExists(path: string): Promise<boolean> {
+  return electronAPI.invoke("check-path-exists", { path });
+}
+
+export async function migrateProjectId(
+  oldId: string,
+  newId: string,
+): Promise<{ success: boolean; error?: string }> {
+  return electronAPI.invoke("migrate-project-id", { oldId, newId });
+}
+
+export async function rebindProject(
+  projectId: string,
+  oldRoot: string,
+  newRoot: string,
+): Promise<{ success: boolean; error?: string }> {
+  return electronAPI.invoke("rebind-project", { projectId, oldRoot, newRoot });
+}
+
 export async function readDirectoryTree(
   path: string,
   maxDepth: number,
@@ -85,7 +104,7 @@ export async function getTokenTimeSeries(
   return electronAPI.invoke("get_token_timeseries", { projectId, sinceMs });
 }
 
-export async function getModelRates(models: string[]): Promise<Record<string, { input: number; output: number } | null>> {
+export async function getModelRates(models: string[]): Promise<Record<string, { input: number; output: number; cache_read?: number } | null>> {
   return electronAPI.invoke("get_model_rates", { models });
 }
 
@@ -201,6 +220,8 @@ export async function getGitLog(
   return electronAPI.invoke("get_git_log", { path, count: count ?? 50 });
 }
 
+import type { PowerCombo } from "./models";
+
 export interface ProjectSessionState {
   expanded_dirs: string[];
   active_file_path: string | null;
@@ -210,12 +231,16 @@ export interface ProjectSessionState {
     { scrollTop: number; cursor: { row: number; column: number } }
   >;
   name?: string;
+  /** Per-project power combo override. When set, this project uses
+   *  its own thinking/execution models instead of the global default. */
+  power_combo?: PowerCombo;
+  /** Per-project auto-route toggle. */
+  auto_escalate?: boolean;
 }
-
-import type { PowerCombo } from "./models";
 
 export interface UserSettings {
   project_roots: string[];
+  project_ids?: Record<string, string>;
   active_project_root: string | null;
   control_panel_visible: boolean;
   project_states: Record<string, ProjectSessionState>;
@@ -246,7 +271,7 @@ export async function loadSettings(): Promise<UserSettings> {
   return electronAPI.invoke("load_settings");
 }
 
-export async function saveSettings(settings: UserSettings): Promise<void> {
+export async function saveSettings(settings: Partial<UserSettings>): Promise<void> {
   return electronAPI.invoke("save_settings", { settings });
 }
 
@@ -260,6 +285,9 @@ export interface SendToPunkOptions {
   todos?: Todo[];
   autoRoute?: boolean;
   minds?: Array<{ id: string }>;
+  /** Per-project power combo: which model to use for each phase.
+   *  When present, the backend uses this instead of reading from disk. */
+  powerCombo?: PowerCombo;
   /** Sticky phase from the phase pill — single source of truth for model routing.
    *  "think" uses thinking model (plan+verify), "build" uses execution model.
    *  When set, overrides heuristic router so routing stays consistent across turns. */
@@ -392,6 +420,7 @@ export async function sendToPunk(
       provider: opts.provider,
       todos: opts.todos,
       autoRoute: opts.autoRoute,
+      powerCombo: opts.powerCombo,
       minds: opts.minds,
       phase: opts.phase,
       // Mind chat overrides — forwarded when present

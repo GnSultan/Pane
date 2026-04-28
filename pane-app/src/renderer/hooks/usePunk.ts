@@ -1391,7 +1391,9 @@ export function usePunk(projectId: string) {
         const selectedModel = ws.selectedModel;
         const selectedModelThinking = ws.selectedModelThinking;
         const selectedModelProvider = ws.selectedModelProvider;
-        const autoEscalate = ws.autoEscalate;
+        // Per-project power combo: project-level overrides workspace default
+        const projectCombo = project.powerCombo;
+        const projectAutoRoute = project.autoEscalate ?? ws.autoEscalate;
 
         const truncatedHistory = conversation.messages.slice(-20);
         const todos = conversation.todos;
@@ -1408,7 +1410,8 @@ export function usePunk(projectId: string) {
             thinking: selectedModelThinking,
             provider: selectedModelProvider,
             todos,
-            autoRoute: autoEscalate,
+            autoRoute: projectAutoRoute,
+            powerCombo: projectCombo,
             minds,
             phase: effectivePhase,
           }
@@ -1568,6 +1571,12 @@ function handlePunkMessage(
               ];
             }
             store.updateLastAssistantContent(projectId, merged);
+            
+            // Capture reasoning_content if present
+            const reasoning = (msg.message as any).reasoning_content;
+            if (reasoning) {
+              store.updateMessageReasoning(projectId, last.id, reasoning);
+            }
           } else {
             store.updateLastAssistantContent(projectId, finalContent);
           }
@@ -1590,6 +1599,7 @@ function handlePunkMessage(
           id: nextMessageId(),
           type: "assistant",
           content: finalContent,
+          reasoning_content: (msg.message as any).reasoning_content,
           timestamp: Date.now(),
           isStreaming: false,
         };

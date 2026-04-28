@@ -55,7 +55,7 @@ async function runTypeCheck(workingDir) {
   try {
     // npx tsc --noEmit outputs diagnostics to stdout on failure (exit code 2)
     // We want the output even on failure, so we catch the error.
-    await execAsync("npx tsc --noEmit --pretty false 2>&1", {
+    await execAsync("npx tsc --noEmit --incremental --pretty false 2>&1", {
       cwd: workingDir,
       timeout: TSC_TIMEOUT_MS,
       maxBuffer: 512 * 1024,
@@ -244,16 +244,29 @@ function extractName(msg) {
  */
 
 /**
+ * Normalize a file path to project-relative form regardless of input format.
+ */
+function toProjectRelative(filePath, workingDir) {
+  if (!filePath) return filePath;
+  if (!path.isAbsolute(filePath)) return filePath.replace(/^\.?\//, "");
+  if (workingDir && filePath.startsWith(workingDir)) {
+    return filePath.slice(workingDir.length).replace(/^\//, "");
+  }
+  return filePath;
+}
+
+/**
  * Build a verdict from raw diagnostics, filtered to only show issues
  * in files that were changed this turn.
  *
  * @param {Array} tscDiags - Raw tsc diagnostics
  * @param {Array} eslintDiags - Raw eslint diagnostics
  * @param {string[]} changedFiles - Files modified this turn
+ * @param {string} workingDir - Project root
  * @returns {ArbiterVerdict}
  */
-function buildVerdict(tscDiags, eslintDiags, changedFiles) {
-  const changedSet = new Set(changedFiles.map(f => f.replace(/^\.\//, "")));
+function buildVerdict(tscDiags, eslintDiags, changedFiles, workingDir) {
+  const changedSet = new Set(changedFiles.map(f => toProjectRelative(f, workingDir)));
 
   // Filter diagnostics to only changed files — the LLM is not responsible
   // for pre-existing errors in files it didn't touch.
@@ -458,12 +471,12 @@ function detectBrokenImports(db, projectId, changedFiles, workingDir) {
         const sourceContent = fs.readFileSync(path.join(workingDir, source_file), "utf-8");
         // Extract named imports from the changed file
         // Match: import { foo, bar } from './changedFile'
-        const importRe = /import\s*\{([^}]+)\}\s*from\s*['"][^'"]*$/gm;
+        const importRe = /import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/gm;
         for (const match of sourceContent.matchAll(importRe)) {
-          const importLine = match[0];
+          const importPath = match[2]; // the resolved import path
           // Check if this import references the changed file
           const changedBasename = path.basename(changedFile).replace(/\.[^.]+$/, "");
-          if (!importLine.includes(changedBasename)) continue;
+          if (!importPath.includes(changedBasename)) continue;
 
           const names = match[1].split(",").map(n => {
             const parts = n.trim().split(/\s+as\s+/);
@@ -554,6 +567,13 @@ export async function runTurnSentinel(projectId, workingDir, changedFiles, optio
     return { pass: true, score: 100, typeErrors: [], lintErrors: [], findings: [], changedFiles: [], timestamp: Date.now() };
   }
 
+  // Load baseline (captured on first sentinel run of this session)
+  const baselinePath = path.join(SESSION_DIR, projectId, "arbiter-baseline.json");
+  let baseline = [];
+  try {
+    baseline = JSON.parse(fs.readFileSync(baselinePath, "utf-8"));
+  } catch {}
+
   // Run tsc and eslint in parallel
   const [tscDiags, eslintDiags] = await Promise.all([
     runTypeCheck(workingDir).catch(err => {
@@ -566,9 +586,20 @@ export async function runTurnSentinel(projectId, workingDir, changedFiles, optio
     }),
   ]);
 
+  // Filter out pre-existing errors from baseline
+  const baselineKeys = new Set(baseline.map(d => `${d.file}:${d.line}:${d.code}`));
+  const newTscDiags = tscDiags.filter(d => !baselineKeys.has(`${d.file}:${d.line}:${d.code}`));
+
+  // If no baseline yet, write one now and use all diags (first run)
+  if (baseline.length === 0 && tscDiags.length > 0) {
+    await fsPromises.writeFile(baselinePath, JSON.stringify(tscDiags), "utf-8");
+  }
+
   // Architecture sentinel: circular deps + broken imports (sync, <50ms)
   let archFindings = [];
   try {
+    // Wait briefly for the async symbol indexer to process the new files
+    await new Promise(r => setTimeout(r, 500));
     archFindings = runArchitectureSentinel(projectId, workingDir, changedFiles, options.db);
   } catch (err) {
     console.warn(`[arbiter] Architecture sentinel failed: ${err.message}`);
@@ -582,7 +613,7 @@ export async function runTurnSentinel(projectId, workingDir, changedFiles, optio
     console.warn(`[arbiter] Proactive guidance failed: ${err.message}`);
   }
 
-  const verdict = buildVerdict(tscDiags, eslintDiags, changedFiles);
+  const verdict = buildVerdict(newTscDiags, eslintDiags, changedFiles, workingDir);
 
   // Merge architecture findings into verdict
   for (const af of archFindings) {
@@ -613,6 +644,10 @@ export async function runTurnSentinel(projectId, workingDir, changedFiles, optio
       JSON.stringify(verdict, null, 2),
       "utf-8",
     );
+    if (verdict.pass) {
+      // Explicitly clear so stale failing verdicts don't re-inject on read-only turns
+      try { await fsPromises.unlink(path.join(sessionDir, "arbiter-verdict.json")); } catch {}
+    }
   } catch (err) {
     console.warn(`[arbiter] Failed to persist verdict: ${err.message}`);
   }
@@ -656,6 +691,10 @@ export function readVerdict(projectId) {
  */
 export function formatVerdictForContext(verdict) {
   if (!verdict || verdict.pass || verdict.findings.length === 0) return null;
+  // Don't inject a verdict older than 10 minutes — it's stale.
+  // Errors that old have either been fixed or are pre-existing noise.
+  const ageMs = Date.now() - (verdict.timestamp || 0);
+  if (ageMs > 10 * 60 * 1000) return null;
 
   const lines = [
     "⚠ ARBITER — Pane independently verified your last changes and found problems:",

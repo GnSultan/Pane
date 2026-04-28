@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { useWorkspaceStore } from "../../stores/workspace";
+import { useProjectsStore } from "../../stores/projects";
 import { useShallow } from "zustand/react/shallow";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -536,7 +537,7 @@ function EngineSelect({
   );
 }
 
-function AiEnginesSection({
+function PaneAutoSection({
   httpApiKeys,
 }: {
   httpApiKeys: Record<string, string>;
@@ -600,6 +601,23 @@ function AiEnginesSection({
   const setPowerCombo = useWorkspaceStore((s) => s.setPowerCombo);
   const setAutoEscalate = useWorkspaceStore((s) => s.setAutoEscalate);
 
+  // Sync combo changes to active project for per-project override
+  const syncComboToProject = useCallback((combo: PowerCombo) => {
+    const ps = useProjectsStore.getState();
+    const activeProjectId = ps.activeProjectId;
+    if (activeProjectId) {
+      ps.setProjectPowerCombo(activeProjectId, combo);
+    }
+  }, []);
+
+  const syncAutoRouteToProject = useCallback((auto: boolean) => {
+    const ps = useProjectsStore.getState();
+    const activeProjectId = ps.activeProjectId;
+    if (activeProjectId) {
+      ps.setProjectAutoEscalate(activeProjectId, auto);
+    }
+  }, []);
+
   // Auto-heal: when availability changes, reset any combo slot pointing to an unusable provider.
   useEffect(() => {
     const isProviderUsable = (provider: string) => {
@@ -622,31 +640,39 @@ function AiEnginesSection({
     }
 
     if (Object.keys(updates).length > 0) {
-      setPowerCombo({ ...current, ...updates } as PowerCombo);
+      const healed = { ...current, ...updates } as PowerCombo;
+      setPowerCombo(healed);
+      syncComboToProject(healed);
     }
-  }, [httpApiKeys, claudeCodeAvailable, geminiAvailable]);
+  }, [httpApiKeys, claudeCodeAvailable, geminiAvailable, syncComboToProject]);
 
   const handleThinkingChange = (opt: EngineOption) => {
     const isReasoningProvider =
       opt.provider === "openrouter" || opt.provider === "kimi" ||
       opt.provider === "xiaomi" || opt.provider === "deepseek";
-    setPowerCombo({
+    const newCombo: PowerCombo = {
       thinking: { provider: opt.provider, model: opt.model, thinking: opt.thinking || isReasoningProvider },
       execution: combo?.execution || DEFAULT_BACKEND_ROUTING["api"]!.execution,
-    });
+    };
+    setPowerCombo(newCombo);
+    syncComboToProject(newCombo);
     reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleBuildingChange = (opt: EngineOption) => {
-    setPowerCombo({
+    const newCombo: PowerCombo = {
       thinking:  combo?.thinking  || DEFAULT_BACKEND_ROUTING["api"]!.thinking,
       execution: { provider: opt.provider, model: opt.model, thinking: opt.thinking },
-    });
+    };
+    setPowerCombo(newCombo);
+    syncComboToProject(newCombo);
     reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleAutoRouteToggle = () => {
-    setAutoEscalate(!autoRoute);
+    const next = !autoRoute;
+    setAutoEscalate(next);
+    syncAutoRouteToProject(next);
     reinitializePunkBackend("api").catch(() => {});
   };
 
@@ -860,6 +886,7 @@ const API_KEY_PROVIDERS = [
   { key: "anthropic", label: "Anthropic", placeholder: "sk-ant-...", docsUrl: "https://console.anthropic.com/settings/keys" },
   { key: "openrouter", label: "OpenRouter", placeholder: "sk-or-...", docsUrl: "https://openrouter.ai/keys" },
   { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/", showBaseUrl: true },
+  { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
 ] as const;
 
 // Gemini CLI — external, needs install
@@ -1545,7 +1572,7 @@ export function Profile() {
         <path d="M9 9h6v6H9z" />
       </svg>
     ),
-    aiEngines: (
+    paneAuto: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
         <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
       </svg>
@@ -1907,12 +1934,12 @@ export function Profile() {
 
         {/* AI Engines Section */}
         <AccordionSection
-          title="ai engines"
-          icon={icons.aiEngines}
-          isExpanded={expandedSection === "aiEngines"}
-          onToggle={() => setExpandedSection(expandedSection === "aiEngines" ? null : "aiEngines")}
+          title="pane auto"
+          icon={icons.paneAuto}
+          isExpanded={expandedSection === "paneAuto"}
+          onToggle={() => setExpandedSection(expandedSection === "paneAuto" ? null : "paneAuto")}
         >
-          <AiEnginesSection httpApiKeys={httpApiKeys} />
+          <PaneAutoSection httpApiKeys={httpApiKeys} />
         </AccordionSection>
 
         {/* API Keys Section */}

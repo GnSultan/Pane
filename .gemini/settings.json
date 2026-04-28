@@ -6,10 +6,10 @@
         "/Users/macbook/.pane/pane-mcp-server.mjs"
       ],
       "env": {
-        "PANE_PROJECT_ID": "pane",
+        "PANE_PROJECT_ID": "56e1ff33-fcc2-45e0-b7c7-012f9fc5a2a3",
         "PANE_PROJECT_ROOT": "/Users/macbook/Pane",
         "HOME": "/Users/macbook",
-        "PATH": "/Users/macbook/.nvm/versions/node/v22.19.0/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        "PATH": "/Users/macbook/.nvm/versions/node/v22.19.0/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/macbook/Pane/pane-app/node_modules/.bin:/Users/macbook/Pane/pane-app/node_modules/.bin:/Users/macbook/Pane/node_modules/.bin:/Users/macbook/node_modules/.bin:/Users/node_modules/.bin:/node_modules/.bin:/Users/macbook/.nvm/versions/node/v22.19.0/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin:/Users/macbook/.nvm/versions/node/v22.19.0/bin:/opt/homebrew/bin:/usr/local/bin:/Users/macbook/Pane/pane-app/node_modules/.bin:/Users/macbook/Pane/node_modules/.bin:/Users/macbook/node_modules/.bin:/Users/node_modules/.bin:/node_modules/.bin:/Users/macbook/.nvm/versions/node/v22.19.0/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin:/Users/macbook/Library/pnpm:/Users/macbook/.bun/bin:/Users/macbook/Downloads/google-cloud-sdk/bin:/Users/macbook/.codeium/windsurf/bin:/Users/macbook/Library/Python/3.9/bin:/Library/PostgreSQL/17/bin:/Library/PostgreSQL/15/bin:/Users/macbook/.nvm/versions/node/v22.19.0/bin:/Users/macbook/.pyenv/shims:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin:/Library/Apple/usr/bin:/Users/macbook/.cargo/bin:/Users/macbook/.turso"
       },
       "trust": true
     }

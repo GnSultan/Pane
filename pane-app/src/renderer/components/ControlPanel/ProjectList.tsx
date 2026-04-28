@@ -1,6 +1,10 @@
 import { useState, useCallback, useRef } from "react";
 import { useProjectsStore } from "../../stores/projects";
 import { NewThreadPicker } from "./NewThreadPicker";
+import { rebindProject } from "../../lib/tauri-commands";
+import { detectProjectRoot } from "../../lib/tauri-commands";
+
+const electronAPI = (window as any).electronAPI;
 
 // Each row subscribes to its own primitive data — no inline objects in selectors
 function ProjectRow({
@@ -19,11 +23,16 @@ function ProjectRow({
   const name = useProjectsStore((s) => s.projects.get(id)?.name ?? "");
   const hasUnread = useProjectsStore((s) => s.projects.get(id)?.hasUnreadCompletion ?? false);
   const isActive = useProjectsStore((s) => s.activeProjectId === id);
+  const rootMissing = useProjectsStore((s) => s.projects.get(id)?.rootMissing ?? false);
+  const root = useProjectsStore((s) => s.projects.get(id)?.root ?? "");
   const setActiveProject = useProjectsStore((s) => s.setActiveProject);
   const renameProject = useProjectsStore((s) => s.renameProject);
+  const storeRebindProject = useProjectsStore((s) => s.rebindProject);
+  const markRootMissing = useProjectsStore((s) => s.markRootMissing);
 
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState("");
+  const [isRebinding, setIsRebinding] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const isDragging = dragIndex === index;
@@ -41,6 +50,52 @@ function ProjectRow({
     if (trimmed && trimmed !== name) renameProject(id, trimmed);
     setEditing(false);
   };
+
+  const handleRebind = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setIsRebinding(true);
+    try {
+      const selected = await electronAPI.invoke("open-directory-dialog");
+      if (!selected || typeof selected !== "string") return;
+      const newRoot = await detectProjectRoot(selected);
+      const result = await rebindProject(id, root, newRoot);
+      if (result.success) {
+        storeRebindProject(id, newRoot);
+        markRootMissing(id, false);
+      }
+    } finally {
+      setIsRebinding(false);
+    }
+  };
+
+  // Missing root: show a compact rebind row instead of the normal row
+  if (rootMissing) {
+    return (
+      <div
+        className={`w-full flex items-center gap-1.5 h-8 px-2 rounded-md ${
+          isActive ? "bg-pane-text/[0.08]" : ""
+        }`}
+        style={{ fontSize: "var(--pane-panel-font-size)" }}
+      >
+        <span className="text-pane-text-secondary w-3 shrink-0"
+              style={{ fontSize: "var(--pane-panel-font-size-xs)" }}>
+          {index + 1}
+        </span>
+        <span className="truncate flex-1 text-left text-pane-text-secondary/50 line-through">
+          {name}
+        </span>
+        <button
+          onClick={handleRebind}
+          disabled={isRebinding}
+          className="shrink-0 font-mono text-pane-status-modified hover:text-pane-text transition-colors disabled:opacity-40"
+          style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
+          title={`Folder not found at ${root} — click to rebind`}
+        >
+          {isRebinding ? "..." : "rebind"}
+        </button>
+      </div>
+    );
+  }
 
   return (
     <button

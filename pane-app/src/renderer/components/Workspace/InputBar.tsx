@@ -260,12 +260,14 @@ function ModelPickerTrigger({
   routedModel,
   isProcessing,
   onClick,
+  plain,
 }: {
   value: string;
   autoRoute: boolean;
   routedModel?: string | null;
   isProcessing?: boolean;
   onClick: () => void;
+  plain?: boolean;
 }) {
   const fetchedModels = useWorkspaceStore((s) => s.allModels);
   const label = useMemo(() => {
@@ -284,6 +286,19 @@ function ModelPickerTrigger({
     }
     return value.toLowerCase() || "model";
   }, [value, autoRoute, routedModel, isProcessing, fetchedModels]);
+
+  if (plain) {
+    return (
+      <button
+        onClick={onClick}
+        className="inline-flex items-center gap-1.5 text-pane-text-secondary btn-press select-none"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        <div className={`w-1.5 h-1.5 rounded-full transition-colors shrink-0 ${autoRoute ? "bg-pane-status-added" : "bg-pane-text-secondary"}`} />
+        <span>{label}</span>
+      </button>
+    );
+  }
 
   return (
     <button
@@ -761,13 +776,23 @@ export function InputBar({
     (s) => s.projects.get(projectId)?.root ?? "",
   );
 
-  // Handle model change and sync provider
+  // Handle model change and sync provider + per-project power combo
   const handleModelChange = useCallback(
     (modelValue: string, thinking: boolean = false, provider?: string) => {
       setSelectedModel(modelValue, thinking, provider);
       if (provider) setHttpProvider(provider);
     },
     [setSelectedModel, setHttpProvider],
+  );
+
+  // Handle auto-route toggle — saves to both workspace (global default) and project
+  const handleToggleAutoRoute = useCallback(
+    (v: boolean) => {
+      setAutoEscalate(v);
+      const ps = useProjectsStore.getState();
+      ps.setProjectAutoEscalate(projectId, v);
+    },
+    [setAutoEscalate, projectId],
   );
 
   // ── Route preview: show predicted model as user types ──────────────────
@@ -977,9 +1002,27 @@ export function InputBar({
               let's build
             </button>
           )}
+          <div className="ml-auto shrink-0 flex items-center gap-1.5">
+            {/* Mode pill — shows active phase in collapsed bar */}
+            <button
+              onClick={() => setExpanded(true)}
+              className="font-mono btn-press shrink-0 px-2 py-0.5 rounded transition-colors"
+              style={{ fontSize: "var(--pane-font-size-xs)", color: PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)" }}
+            >
+              {currentPhase}
+            </button>
+            <ModelPickerTrigger
+              value={selectedModel}
+              autoRoute={autoEscalate}
+              routedModel={routedModel}
+              isProcessing={isProcessing}
+              onClick={() => { setModelPickerExpanded(true); setExpanded(true); }}
+              plain
+            />
+          </div>
           <button
             onClick={onAbort}
-            className="text-pane-error font-mono hover:text-pane-error/80 ml-auto btn-press"
+            className="text-pane-error font-mono hover:text-pane-error/80 btn-press shrink-0"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
             stop
@@ -996,17 +1039,68 @@ export function InputBar({
 
       {/* Ghost trigger — absolute, zero layout footprint, floats over scroll content */}
       {!expanded && !isProcessing && !isFadingOut && (
-        <button
-          onClick={() => setExpanded(true)}
-          className="absolute bottom-0 left-0 right-0 text-left bg-transparent font-mono text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors px-5 py-3"
+        <div
+          className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-transparent font-mono px-5 py-3 pointer-events-none"
           style={{ fontSize: "var(--pane-font-size-xs)" }}
         >
-          let's build
-        </button>
+          <button
+            onClick={() => setExpanded(true)}
+            className="pointer-events-auto text-left text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors"
+          >
+            let's build
+          </button>
+          <div className="pointer-events-auto shrink-0 flex items-center gap-1.5">
+            {/* Mode pill — shows active phase in ghost trigger */}
+            <button
+              onClick={() => setExpanded(true)}
+              className="font-mono btn-press shrink-0 px-2 py-0.5 rounded transition-colors"
+              style={{ fontSize: "var(--pane-font-size-xs)", color: PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)" }}
+            >
+              {currentPhase}
+            </button>
+            <ModelPickerTrigger
+              value={selectedModel}
+              autoRoute={autoEscalate}
+              routedModel={routedModel}
+              isProcessing={isProcessing}
+              onClick={() => { setModelPickerExpanded(true); setExpanded(true); }}
+              plain
+            />
+          </div>
+        </div>
       )}
 
       {/* One card. Textarea + thoughts picker + button bar in column. */}
       {expanded && <div ref={cardRef} className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative flex flex-col">
+
+        {/* Spinner — floats top-left of card, same size as collapsed bar spinner */}
+        {isProcessing && attachMenu !== "thoughts" && (
+          <svg
+            width="18" height="18" viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+            className="absolute top-3 left-3 z-10 text-pane-text-secondary/70 shrink-0 animate-gentle-spin pointer-events-none"
+          >
+            <line x1="12" y1="2" x2="12" y2="6" />
+            <line x1="16.24" y1="7.76" x2="19.07" y2="4.93" />
+            <line x1="18" y1="12" x2="22" y2="12" />
+            <line x1="16.24" y1="16.24" x2="19.07" y2="19.07" />
+            <line x1="12" y1="18" x2="12" y2="22" />
+            <line x1="7.76" y1="16.24" x2="4.93" y2="19.07" />
+            <line x1="6" y1="12" x2="2" y2="12" />
+            <line x1="7.76" y1="7.76" x2="4.93" y2="4.93" />
+          </svg>
+        )}
+
+        {/* Stop — floats top-right of card */}
+        {isProcessing && attachMenu !== "thoughts" && (
+          <button
+            onClick={onAbort}
+            className="absolute top-2.5 right-3 z-10 pointer-events-auto text-pane-error font-mono hover:text-pane-error/80 btn-press shrink-0"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            stop
+          </button>
+        )}
 
         {attachMenu !== "thoughts" && (
           <CaretTextArea
@@ -1063,7 +1157,7 @@ export function InputBar({
               value={selectedModel}
               autoRoute={autoEscalate}
               onChange={handleModelChange}
-              onToggleAutoRoute={setAutoEscalate}
+              onToggleAutoRoute={handleToggleAutoRoute}
               onClose={() => setModelPickerExpanded(false)}
             />
           ) : (
@@ -1120,7 +1214,7 @@ export function InputBar({
 
               {/* Spacer — always present except when PhasePickerExpanded takes the whole row */}
               {!modePickerExpanded && <div className="flex-1" />}
-              {!isProcessing && (() => {
+              {isProcessing ? null : (() => {
                 const color = PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)";
                 if (modePickerExpanded) {
                   return (

@@ -13,5 +13,10 @@
       },
       "trust": true
     }
+  },
+  "security": {
+    "folderTrust": {
+      "enabled": false
+    }
   }
 }

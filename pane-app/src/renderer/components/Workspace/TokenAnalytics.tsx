@@ -33,7 +33,6 @@ function formatTokens(val: number) {
   return val.toString();
 }
 
-// @ts-ignore — timeAgo reserved for upcoming relative-timestamp display
 // function timeAgo(ts: number) { ... }
 
 function DailyCostChart({ data }: { data: TokenTimeSeriesRow[] }) {
@@ -92,10 +91,10 @@ function DailyCostChart({ data }: { data: TokenTimeSeriesRow[] }) {
 export function TokenAnalytics({ projectId }: { projectId: string | null }) {
   const [data, setData] = useState<TokenAnalyticsRow[]>([]);
   const [timeSeries, setTimeSeries] = useState<TokenTimeSeriesRow[]>([]);
-  const [rates, setRates] = useState<Record<string, { input: number; output: number } | null>>({});
+  const [rates, setRates] = useState<Record<string, { input: number; output: number; cache_read?: number } | null>>({});
   const [range, setRange] = useState<TimeRange>("month");
   const [loading, setLoading] = useState(true);
-  const lastTokenUsageAt = useWorkspaceStore((s) => (s as any).lastTokenUsageAt ?? 0);
+  const lastTokenUsageAt = useWorkspaceStore((s) => s.lastTokenUsageAt);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -143,13 +142,20 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
     );
   }, [data]);
 
-  // Estimate cache savings: (cached_tokens * full_input_rate - cached_tokens * cache_rate)
-  // Simplified: cached tokens saved ~90% of their input cost on average
+  // Estimate cache savings per-model using actual per-model cache_read rate.
+  // Savings = cached_tokens * (full_input_price - cache_read_price).
+  // When cache_read is unknown (not in OpenRouter data), savings = 0 (safe fallback).
   const cacheSavings = useMemo(() => {
-    if (totals.cached === 0 || totals.input === 0) return 0;
-    const avgInputCostPerToken = totals.cost > 0 ? totals.cost / (totals.input + totals.output) : 0;
-    return totals.cached * avgInputCostPerToken * 0.8; // ~80% average savings across providers
-  }, [totals]);
+    let savings = 0;
+    for (const row of data) {
+      const rate = rates[row.model];
+      if (!rate || row.total_cache_read === 0) continue;
+      const inputPricePerToken = rate.input / 1_000_000;
+      const cacheReadPrice = typeof rate.cache_read === "number" ? rate.cache_read / 1_000_000 : inputPricePerToken;
+      savings += row.total_cache_read * (inputPricePerToken - cacheReadPrice);
+    }
+    return savings;
+  }, [data, rates]);
 
   // Unique providers in the data — for dynamic links
   const activeProviders = useMemo(() => {
@@ -240,24 +246,35 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                     <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                       {row.call_count} calls{(() => {
                         const r = rates[row.model];
-                        if (r && (r.input > 0 || r.output > 0)) return ` · $${r.input}/${r.output}M`;
+                        if (r) return ` · $${r.input}/${r.output}M`;
                         return "";
                       })()}
                     </span>
                   </div>
 
-                  {/* Cost bar */}
+                  {/* Cost bar — green segment shows estimated cache savings proportion */}
                   <div className="h-1.5 w-full bg-pane-text/[0.04] rounded-full overflow-hidden flex mb-2">
-                    {row.total_cache_read > 0 && (
-                      <div
-                        className="h-full bg-pane-status-added/40 rounded-l-full"
-                        style={{ width: `${(row.total_cache_read / (row.total_input_tokens + row.total_output_tokens)) * (row.total_cost_usd / maxCost) * 100}%` }}
-                      />
-                    )}
-                    <div
-                      className="h-full bg-pane-text/25"
-                      style={{ width: `${((row.total_cost_usd / maxCost) * 100) - (row.total_cache_read > 0 ? (row.total_cache_read / (row.total_input_tokens + row.total_output_tokens)) * (row.total_cost_usd / maxCost) * 100 : 0)}%` }}
-                    />
+                    {(() => {
+                      const rate = rates[row.model];
+                      const cacheSavedUsd = rate && row.total_cache_read > 0
+                        ? (() => {
+                            const inputPricePerToken = rate.input / 1_000_000;
+                            const cacheReadPrice = typeof rate.cache_read === "number" ? rate.cache_read / 1_000_000 : inputPricePerToken;
+                            return row.total_cache_read * (inputPricePerToken - cacheReadPrice);
+                          })()
+                        : 0;
+                      const costPct = maxCost > 0 ? (row.total_cost_usd / maxCost) * 100 : 0;
+                      const cachePct = maxCost > 0 ? Math.min((cacheSavedUsd / maxCost) * 100, costPct) : 0;
+                      const normalPct = costPct - cachePct;
+                      return (
+                        <>
+                          {cachePct > 0 && (
+                            <div className="h-full bg-pane-status-added/40 rounded-l-full" style={{ width: `${cachePct}%` }} />
+                          )}
+                          <div className="h-full bg-pane-text/25" style={{ width: `${normalPct}%` }} />
+                        </>
+                      );
+                    })()}
                   </div>
 
                   {/* Stats */}

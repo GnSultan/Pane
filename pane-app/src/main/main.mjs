@@ -838,6 +838,141 @@ Improvements
     await fs.promises.mkdir(resolved, { recursive: true });
     return resolved;
   });
+
+  ipcMain.handle("check-path-exists", async (_event, { path: p }) => {
+    try {
+      await fs.promises.access(p);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  /**
+   * One-time migration: rename all data from an old derived project ID to a
+   * new stable UUID. Covers every SQLite table with a project_id column and
+   * all on-disk directories keyed on project ID.
+   *
+   * Called at startup for each existing project that doesn't yet have a UUID
+   * in project_ids. Safe to retry — if the old ID has no data the UPDATE/rename
+   * no-ops cleanly.
+   */
+  ipcMain.handle("migrate-project-id", async (_event, { oldId, newId }) => {
+    const db = getPaneDb();
+    const PANE_DIR = path.join(os.homedir(), ".pane");
+
+    try {
+      // ── SQLite: migrate all tables in one transaction ──────────────────────
+      const migrate = db.transaction(() => {
+        const tables = [
+          "messages",
+          "conversation_meta",
+          "change_history",
+          "checkpoints",
+          "state_blobs",
+          "scroll_positions",
+          "token_usage",
+          "quality_metrics",
+          "correction_events",
+        ];
+        for (const table of tables) {
+          db.prepare(`UPDATE ${table} SET project_id = ? WHERE project_id = ?`).run(newId, oldId);
+        }
+        // cli_sessions has a composite primary key (project_id, backend) —
+        // UPDATE would violate uniqueness if a row with (newId, backend) already
+        // exists. Use INSERT OR REPLACE to handle that edge case.
+        const sessions = db.prepare("SELECT * FROM cli_sessions WHERE project_id = ?").all(oldId);
+        for (const row of sessions) {
+          db.prepare(
+            "INSERT OR REPLACE INTO cli_sessions (project_id, backend, session_id, updated_at) VALUES (?, ?, ?, ?)"
+          ).run(newId, row.backend, row.session_id, row.updated_at);
+          db.prepare("DELETE FROM cli_sessions WHERE project_id = ? AND backend = ?").run(oldId, row.backend);
+        }
+        // FTS5 virtual table — can't UPDATE UNINDEXED columns directly.
+        // Read by rowid, delete, re-insert with new project_id.
+        const ftsRows = db.prepare("SELECT rowid, message_id, text_content FROM messages_fts WHERE project_id = ?").all(oldId);
+        for (const row of ftsRows) {
+          db.prepare("DELETE FROM messages_fts WHERE rowid = ?").run(row.rowid);
+          db.prepare("INSERT INTO messages_fts(project_id, message_id, text_content) VALUES (?, ?, ?)").run(newId, row.message_id, row.text_content);
+        }
+      });
+      migrate();
+
+      // ── File system: rename all directories keyed on projectId ────────────
+      const dirs = [
+        [path.join(PANE_DIR, "memory", oldId),      path.join(PANE_DIR, "memory", newId)],
+        [path.join(PANE_DIR, "session", oldId),     path.join(PANE_DIR, "session", newId)],
+        [path.join(PANE_DIR, "checkpoints", oldId), path.join(PANE_DIR, "checkpoints", newId)],
+      ];
+      for (const [oldPath, newPath] of dirs) {
+        try {
+          await fs.promises.access(oldPath);
+          await fs.promises.rename(oldPath, newPath);
+        } catch {
+          // dir doesn't exist — nothing to rename
+        }
+      }
+
+      // Brain context is a single JSON file, not a directory
+      const brainCtxDir = path.join(PANE_DIR, "brain", "context");
+      const oldCtx = path.join(brainCtxDir, `${oldId}.json`);
+      const newCtx = path.join(brainCtxDir, `${newId}.json`);
+      try {
+        await fs.promises.access(oldCtx);
+        await fs.promises.rename(oldCtx, newCtx);
+      } catch {
+        // file doesn't exist — nothing to rename
+      }
+
+      console.log(`[pane] Migrated project ${oldId} → ${newId}`);
+      return { success: true };
+    } catch (err) {
+      console.error(`[pane] Migration failed for ${oldId}:`, err.message);
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("rebind-project", async (_event, { projectId, oldRoot, newRoot }) => {
+    const filePath = settingsPath();
+    try {
+      const content = await fs.promises.readFile(filePath, "utf-8");
+      const settings = JSON.parse(content);
+
+      // Update project_ids: remove old root mapping, add new root mapping
+      const projectIds = settings.project_ids ?? {};
+      if (oldRoot && projectIds[oldRoot]) {
+        delete projectIds[oldRoot];
+      }
+      projectIds[newRoot] = projectId;
+      settings.project_ids = projectIds;
+
+      // Update project_roots array to replace old root with new
+      if (settings.project_roots) {
+        settings.project_roots = settings.project_roots.map((r) =>
+          r === oldRoot ? newRoot : r
+        );
+      }
+
+      // Update active_project_root if it was the rebound project
+      if (settings.active_project_root === oldRoot) {
+        settings.active_project_root = newRoot;
+      }
+
+      // Update project_states: move state from old root key to new root key
+      if (settings.project_states?.[oldRoot]) {
+        settings.project_states[newRoot] = settings.project_states[oldRoot];
+        delete settings.project_states[oldRoot];
+      }
+
+      const json = JSON.stringify(settings, null, 2);
+      const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
+      await fs.promises.writeFile(tmpPath, json, "utf-8");
+      await fs.promises.rename(tmpPath, filePath);
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
   ipcMain.handle("get_claude_plan_info", async () => {
     try {
       const claudeConfigPath = path.join(os.homedir(), ".claude.json");
@@ -2365,7 +2500,7 @@ function createWindow() {
     icon: iconPath,
     show: false,
     webPreferences: {
-      preload: path.join(__dirname, "../preload/preload.mjs"),
+      preload: path.join(__dirname, "../preload/preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,

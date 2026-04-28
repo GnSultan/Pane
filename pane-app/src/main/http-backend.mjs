@@ -261,17 +261,20 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "web_fetch",
-      description: "Analyzes and extracts information from URLs.",
+      description: "Fetches the content of a URL and returns it as plain text. Use this to read documentation, READMEs, GitHub files, API references, or any web page.",
       parameters: {
         type: "object",
         properties: {
-          prompt: {
+          url: {
             type: "string",
-            description:
-              "A string containing the URL(s) and specific analysis instructions",
+            description: "The URL to fetch",
+          },
+          instructions: {
+            type: "string",
+            description: "Optional: specific information to extract or focus on from the page (e.g. 'get the installation steps', 'extract all code snippets')",
           },
         },
-        required: ["prompt"],
+        required: ["url"],
       },
     },
   },
@@ -1165,10 +1168,53 @@ function _anthropicContextLength(id) {
   return 200000;
 }
 
-// ─── Model Streaming Personality Registry ────────────────────────────────────
-// Maps model-ID prefixes (more specific first) to their known streaming
-// behavior. Used by handleStreamEvent when provider="openrouter" to know
-// which delta field carries reasoning content and whether tools are supported.
+// ─── Model Output Limit Registry ────────────────────────────────────────────
+// Maps model-ID substrings to their maximum output token budget.
+// Used to set max_tokens per request without hardcoding provider-level logic
+// in the hot path. Rules are checked in order — more specific entries first.
+//
+// Reasoning models (deepseek-reasoner, mimo-v2-pro, stepfun) consume thinking
+// tokens from the same pool as output tokens, so their budgets are larger.
+// StepFun is omitted intentionally — their docs say not to set max_tokens.
+//
+// If no entry matches, the fallback is DEFAULT_MAX_TOKENS (4096).
+const MODEL_OUTPUT_LIMITS = [
+  // DeepSeek
+  { match: "deepseek-reasoner",    maxTokens: 32768,  omit: false },
+  { match: "deepseek-chat",        maxTokens: 8192,   omit: false },
+  { match: "deepseek",             maxTokens: 8192,   omit: false },
+  // Xiaomi MiMo — thinking tokens count against max_tokens
+  { match: "mimo-v2-pro",          maxTokens: 65536,  omit: false }, // ~16K thinking + 48K output
+  { match: "mimo-v2-omni",         maxTokens: 65536,  omit: false },
+  { match: "mimo-v2-flash",        maxTokens: 16384,  omit: false },
+  { match: "mimo",                 maxTokens: 16384,  omit: false }, // future MiMo variants
+  // StepFun — docs say not to set max_tokens for reasoning models
+  { match: "step-",                maxTokens: null,   omit: true  },
+  // Kimi — standard output, 8K is safe
+  { match: "moonshot",             maxTokens: 8192,   omit: false },
+  // Qwen / Alibaba
+  { match: "qwen",                 maxTokens: 8192,   omit: false },
+  // Anthropic (via HTTP path — normally via native SDK)
+  { match: "claude",               maxTokens: 8192,   omit: false },
+];
+
+const DEFAULT_MAX_TOKENS = 4096;
+
+/**
+ * Resolve the max_tokens value for a given model ID.
+ * Returns { maxTokens: number | null, omit: boolean }.
+ * When omit=true, max_tokens should be deleted from the request body entirely.
+ */
+function resolveMaxTokens(modelId) {
+  if (!modelId) return { maxTokens: DEFAULT_MAX_TOKENS, omit: false };
+  const lower = modelId.toLowerCase();
+  for (const entry of MODEL_OUTPUT_LIMITS) {
+    if (lower.includes(entry.match)) {
+      return { maxTokens: entry.maxTokens, omit: entry.omit };
+    }
+  }
+  return { maxTokens: DEFAULT_MAX_TOKENS, omit: false };
+}
 const MODEL_STREAMING_CONFIG = [
   // deepseek-reasoner must come before generic deepseek/
   ["deepseek/deepseek-reasoner",  { reasoningField: "reasoning_content", supportsTools: false }],
@@ -1287,8 +1333,13 @@ export class ApiBackend extends PunkBackend {
   normalizeMessages(messages, provider, model = null) {
     const isAnthropic = provider === "anthropic";
     const isGemini = provider === "gemini";
-    const isOpenAI =
+    const isDeepSeek =
       provider === "deepseek" ||
+      model?.toLowerCase().includes("deepseek") ||
+      (provider === "openrouter" && model?.toLowerCase().includes("deepseek"));
+
+    const isOpenAI =
+      isDeepSeek ||
       provider === "kimi" ||
       provider === "openrouter" ||
       provider === "stepfun" ||
@@ -1296,13 +1347,14 @@ export class ApiBackend extends PunkBackend {
       provider === "alibaba" ||
       provider === "dashscope";
 
-    // deepseek-reasoner does not support tools or reasoning_content in history.
-    // Strip both from any assistant messages so we don't get 400s on multi-turn R1.
+    // deepseek-reasoner history rules:
+    // REQUIRES passing reasoning_content back to avoid 400 errors.
     const isReasoner =
-      (provider === "deepseek" && model === "deepseek-reasoner") ||
-      (provider === "openrouter" &&
-        (model?.includes("deepseek-reasoner") ||
-          model?.includes("deepseek/deepseek-r1")));
+      isDeepSeek &&
+      (model?.includes("reasoner") ||
+        model?.includes("r1") ||
+        model?.includes("prover") || // deepseek-prover-v2 is math-only, no tool support
+        model?.includes("thinking"));
 
     const preFiltered = [];
     // COLLAPSE CONSECUTIVE USER MESSAGES (Retry inflation fix)
@@ -1331,81 +1383,95 @@ export class ApiBackend extends PunkBackend {
 
       // --- 1. HANDLE ASSISTANT MESSAGES ---
       if (role === "assistant") {
-        if (typeof content === "string") {
-          if (isReasoner) {
-            // Strip reasoning_content — deepseek-reasoner returns 400 if it appears
-            // in a subsequent request's message history.
-            // eslint-disable-next-line no-unused-vars
-            const { reasoning_content: _rc, tool_calls: _tc, ...safe } = msg;
-            normalized.push(safe);
-          } else {
-            normalized.push(msg);
+        if (isOpenAI) {
+          const assistantMsg = { role: "assistant", content: "" };
+
+          // 1. Extract potential reasoning (verbatim field or from thinking blocks)
+          let reasoning = undefined;
+          if (msg.reasoning_content !== undefined) {
+            reasoning = msg.reasoning_content;
+          } else if (Array.isArray(content)) {
+            reasoning = content
+              .filter((c) => c.type === "thinking")
+              .map((c) => c.thinking)
+              .join("\n")
+              .trim();
           }
-        } else if (Array.isArray(content)) {
-          if (isOpenAI) {
-            const text = content
+
+          // 2. Extract text content
+          if (typeof content === "string") {
+            assistantMsg.content = content;
+          } else if (Array.isArray(content)) {
+            assistantMsg.content = content
               .filter((c) => c.type === "text")
               .map((c) => c.text)
               .join("\n");
-            const toolUses = content.filter((c) => c.type === "tool_use");
-            const assistantMsg = { role: "assistant", content: text || "" };
+          }
 
-            // deepseek-reasoner does not support tool_calls — omit entirely
-            if (!isReasoner && (toolUses.length > 0 || msg.tool_calls)) {
-              const rawCalls =
-                msg.tool_calls ||
-                toolUses.map((tu) => ({
-                  id: tu.id,
-                  type: "function",
-                  function: {
-                    name: tu.name,
-                    arguments: tu.input,
-                  },
-                }));
+          // 3. Handle tool calls (omitted for Reasoner, which doesn't support them)
+          if (!isReasoner && (msg.tool_calls || (Array.isArray(content) && content.some(c => c.type === "tool_use")))) {
+            const toolUses = Array.isArray(content) ? content.filter(c => c.type === "tool_use") : [];
+            const rawCalls =
+              msg.tool_calls ||
+              toolUses.map((tu) => ({
+                id: tu.id,
+                type: "function",
+                function: {
+                  name: tu.name,
+                  arguments: tu.input,
+                },
+              }));
 
-              const calls = rawCalls.map((tc) => {
-                let args = tc.function?.arguments || "";
-                if (typeof args === "string") {
-                  try {
-                    const trimmed = args.trim();
-                    if (!trimmed) {
+            const calls = rawCalls.map((tc) => {
+              let args = tc.function?.arguments || "";
+              if (typeof args === "string") {
+                try {
+                  const trimmed = args.trim();
+                  if (!trimmed) {
+                    args = "{}";
+                  } else {
+                    const parsed = JSON.parse(trimmed);
+                    if (parsed === null || typeof parsed !== "object") {
                       args = "{}";
                     } else {
-                      const parsed = JSON.parse(trimmed);
-                      if (parsed === null || typeof parsed !== "object") {
-                        args = "{}";
-                      } else {
-                        args = trimmed;
-                      }
+                      args = trimmed;
                     }
-                  } catch {
-                    // Malformed JSON (cutoff or hallucination)
-                    args = "{}";
                   }
-                } else if (args === null || typeof args !== "object") {
+                } catch {
                   args = "{}";
-                } else {
-                  // If it's an object, stringify it
-                  args = JSON.stringify(args);
                 }
+              } else if (args === null || typeof args !== "object") {
+                args = "{}";
+              } else {
+                args = JSON.stringify(args);
+              }
 
-                return {
-                  id: tc.id,
-                  type: "function",
-                  function: {
-                    name: tc.function?.name,
-                    arguments: args,
-                  },
-                };
-              });
+              return {
+                id: tc.id,
+                type: "function",
+                function: {
+                  name: tc.function?.name,
+                  arguments: args,
+                },
+              };
+            });
 
+            if (calls.length > 0) {
               assistantMsg.tool_calls = calls;
               calls.forEach((tc) => pendingToolCallIds.add(tc.id));
             }
-            normalized.push(assistantMsg);
-          } else {
-            normalized.push(msg);
           }
+
+          // 4. Reasoning Content Logic: DeepSeek-specific
+          // For DeepSeek models, if reasoning exists (even if empty), pass it back.
+          if (isDeepSeek && reasoning !== undefined) {
+            assistantMsg.reasoning_content = reasoning;
+          }
+
+          normalized.push(assistantMsg);
+        } else {
+          // Anthropic/Gemini/etc. — preserve original structure
+          normalized.push(msg);
         }
         continue;
       }
@@ -1796,36 +1862,40 @@ export class ApiBackend extends PunkBackend {
         try {
         // deepseek-reasoner (R1) does not support function calling — sending tools
         // returns HTTP 400. It also ignores sampling params (temperature etc.).
+        // We expand this to V4 and other thinking models that share this protocol.
         const isDeepSeekReasoner =
-          apiConfig.provider === "deepseek" && resolvedModel === "deepseek-reasoner";
+          apiConfig.provider === "deepseek" && 
+          (resolvedModel.includes("reasoner") || 
+           resolvedModel.includes("r1") || 
+           resolvedModel.includes("prover") || 
+           resolvedModel.includes("thinking"));
 
-        // max_tokens budget per provider/model:
-        //   deepseek-reasoner: 32 K (model default; CoT tokens count against budget)
-        //   deepseek-chat:      8 K (published API maximum)
-        //   stepfun:            omitted entirely — StepFun docs say not to set
-        //                       max_tokens for reasoning models; the model manages
-        //                       its own CoT budget. We still set a value here and
-        //                       delete it below for the stepfun case.
-        //   everything else:    4 K (safe default for kimi / openrouter / anthropic)
-        const maxTokens = isDeepSeekReasoner ? 32768
-          : apiConfig.provider === "deepseek" ? 8192
-          : 4096;
+        // Resolve max_tokens from the registry — no per-provider if/else chains.
+        // resolveMaxTokens checks the model ID against MODEL_OUTPUT_LIMITS and
+        // returns the right budget. omit=true means the field should be removed
+        // entirely (e.g. StepFun reasoning models manage their own CoT budget).
+        const { maxTokens, omit: omitMaxTokens } = resolveMaxTokens(resolvedModel);
 
         const body = {
           model: resolvedModel,
           messages: this.normalizeMessages(messages, apiConfig.provider, resolvedModel),
           stream: true,
-          max_tokens: maxTokens,
+          max_tokens: maxTokens ?? DEFAULT_MAX_TOKENS,
         };
+
+        if (omitMaxTokens) {
+          delete body.max_tokens;
+        }
+
+        // Request usage data in streaming response for OpenAI-compatible providers.
+        // Without this flag, some APIs (DeepSeek, Kimi, etc.) omit the usage object
+        // from the final SSE chunk, breaking cost and cache rate tracking entirely.
+        if (["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(apiConfig.provider)) {
+          body.stream_options = { include_usage: true };
+        }
 
         if (apiConfig.provider === "openrouter") {
           body.repetition_penalty = 1.1;
-        }
-
-        // StepFun docs say not to set max_tokens for reasoning models — let
-        // the model manage its own CoT budget.
-        if (apiConfig.provider === "stepfun") {
-          delete body.max_tokens;
         }
 
         // Phase-based tool filtering — planning phase gets Plan tool, discovery gets read-only.
@@ -1859,7 +1929,19 @@ export class ApiBackend extends PunkBackend {
         }
 
         if (request.thinking && apiConfig.provider === "xiaomi") {
-          // Xiaomi Mimo thinking mode — supported on mimo-v2-pro and mimo-v2-omni
+          // MiMo thinking mode — thinking tokens consume from the same max_tokens
+          // pool as output. Double the resolved budget to give the model room to
+          // reason without starving its output. The registry already sets a generous
+          // base for pro/omni; doubling it here accounts for heavy CoT sessions.
+          body.enable_thinking = true;
+          if (!omitMaxTokens) {
+            body.max_tokens = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
+          }
+        }
+
+        if (request.thinking && apiConfig.provider === "deepseek" && !isDeepSeekReasoner) {
+          // DeepSeek-chat (V3) thinking mode — returns reasoning_content in the response.
+          // reasoning_content MUST be passed back on every subsequent turn.
           body.enable_thinking = true;
         }
 
@@ -2207,22 +2289,38 @@ export class ApiBackend extends PunkBackend {
         }
 
         // Final assistant message for this turn
+        const parsedMessage = {
+          type: "assistant",
+          message: { content: finalContent },
+        };
+        const isDeepSeekModel = apiConfig.provider === "deepseek" || (apiConfig.provider === "openrouter" && resolvedModel.includes("deepseek"));
+        const deepseekThinking = isDeepSeekModel && (
+          isDeepSeekReasoner || 
+          (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
+          (apiConfig.provider === "openrouter" && body.include_reasoning)
+        ) && state.thinking !== undefined;
+        
+        if (deepseekThinking) {
+          parsedMessage.message.reasoning_content = state.thinking;
+        }
+
         this.onEvent(
           request.projectId,
           {
             event: "message",
             data: {
-              parsed: {
-                type: "assistant",
-                message: { content: finalContent },
-              },
+              parsed: parsedMessage,
             },
           },
           request.requestId,
         );
 
-        messages.push({ role: "assistant", content: finalContent });
-        journal.append({ role: "assistant", content: finalContent }, { turn, phase: "response" });
+        const assistantEntry = { role: "assistant", content: finalContent };
+        if (deepseekThinking) {
+          assistantEntry.reasoning_content = state.thinking;
+        }
+        messages.push(assistantEntry);
+        journal.append(assistantEntry, { turn, phase: "response" });
 
         // LOOP CONTROL
         const hasTools = state.toolUses.size > 0;
@@ -2299,66 +2397,117 @@ export class ApiBackend extends PunkBackend {
           const todos = readState(request.projectId).todos || [];
           const workLeft = todos.some(t => t.status === "pending" || t.status === "in_progress");
 
-          if (workLeft && turn < maxTurns) {
-            const remaining = todos.filter(t => t.status !== "completed");
-            console.log(`[http] Auto-continuing turn ${turn} - work is pending (${remaining.length} todos)`);
+          // MIMO-specific: also catch premature stops where the model ended
+          // with "stop" but the last output looks unfinished (e.g. ends mid-code,
+          // mid-sentence, or with an explicit "I'll continue" / "Next I will" signal).
+          // This happens when the model runs out of reasoning budget and wraps up
+          // too early even though max_tokens wasn't actually hit.
+          const isMimoProvider = request.provider === "xiaomi" ||
+            (request.provider === "openrouter" && (resolvedModel || "").includes("mimo"));
+          const lastOutput = state.accumulated.trimEnd();
+          const looksIncomplete = isMimoProvider && state.finishReason === "stop" && (
+            // Ends mid-code block (unclosed fence)
+            (lastOutput.match(/```/g) || []).length % 2 !== 0 ||
+            // Explicit continuation signal the model wrote
+            /(?:I(?:'ll| will| can) (?:now |continue|proceed|implement|write|add)|Next[,:]?\s+I|Let me (?:now |continue|proceed)|Moving on|Continuing)/i.test(lastOutput.slice(-300)) ||
+            // Ends with punctuation that implies more is coming
+            /[,:]\s*$/.test(lastOutput.slice(-50))
+          );
 
-            // ── Progress-aware continuation ──────────────────────────────────
-            // The model dropped mid-work. Instead of a generic "continue", we
-            // reconstruct what it already accomplished + decided so it picks up
-            // where it left off rather than re-exploring from scratch.
+          if ((workLeft || looksIncomplete) && turn < maxTurns) {
+            const remaining = todos.filter(t => t.status !== "completed");
+            const continueReason = looksIncomplete && !workLeft
+              ? "incomplete output detected"
+              : `work is pending (${remaining.length} todos)`;
+            console.log(`[http] Auto-continuing turn ${turn} - ${continueReason}`);
+
             const continuationParts = [];
 
-            continuationParts.push("You stopped before finishing. Here is your progress so far — pick up exactly where you left off, do NOT re-explore or re-read files you already examined.");
+            if (looksIncomplete && !workLeft) {
+              // ── Incomplete-output continuation (MIMO / reasoning model stopped early) ──
+              // The model issued finish_reason:stop but left its output unfinished.
+              // We don't inject todos (there are none) — just tell it to pick up
+              // exactly where it left off, mirroring what it last wrote so it doesn't
+              // re-explore from the top.
+              continuationParts.push("Your output was cut short. Continue exactly from where you left off — do NOT restart, re-explain, or repeat anything already written.");
 
-            // Inject what the model already accomplished this session
-            const sessionState = readState(request.projectId);
-            const recentActions = sessionState.recentActions || [];
-            if (recentActions.length > 0) {
-              const actionSummary = recentActions.slice(-5).map(a => `- ${a.content}`).join("\n");
-              continuationParts.push(`\n[Actions completed so far]\n${actionSummary}`);
-            }
-
-            // Inject decisions locked this session
-            const decisions = sessionState.decisions || [];
-            if (decisions.length > 0) {
-              const decisionSummary = decisions.slice(-3).map(d => `- ${d.content}`).join("\n");
-              continuationParts.push(`\n[Decisions already made — do not revisit]\n${decisionSummary}`);
-            }
-
-            // Inject the model's own last thinking/content as a mirror
-            // Walk backwards through messages to find the last assistant content
-            for (let i = messages.length - 1; i >= Math.max(0, messages.length - 4); i--) {
-              const m = messages[i];
-              if (m.role === "assistant") {
-                // Extract thinking if present (model's reasoning before it dropped)
-                const thinkingBlock = Array.isArray(m.content)
-                  ? m.content.find(b => b.type === "thinking")
-                  : null;
-                if (thinkingBlock?.thinking) {
-                  // Last 500 chars of thinking — the most recent reasoning
-                  const tail = thinkingBlock.thinking.slice(-500);
-                  continuationParts.push(`\n[Your last reasoning before dropping]\n...${tail}`);
+              // Mirror the model's last partial output so it has the exact tail to continue from
+              for (let i = messages.length - 1; i >= Math.max(0, messages.length - 4); i--) {
+                const m = messages[i];
+                if (m.role === "assistant") {
+                  // Last reasoning tail — helps reasoning models pick up their thought
+                  const thinkingBlock = Array.isArray(m.content)
+                    ? m.content.find(b => b.type === "thinking")
+                    : null;
+                  if (thinkingBlock?.thinking) {
+                    const tail = thinkingBlock.thinking.slice(-400);
+                    continuationParts.push(`\n[Your last reasoning — continue the thought]\n...${tail}`);
+                  }
+                  // Last output tail — the exact characters the model stopped after
+                  const textContent = Array.isArray(m.content)
+                    ? m.content.filter(b => b.type === "text").map(b => b.text).join("\n")
+                    : typeof m.content === "string" ? m.content : "";
+                  if (textContent.trim()) {
+                    const tail = textContent.slice(-500);
+                    continuationParts.push(`\n[Your last output — pick up from this exact point]\n...${tail}`);
+                  }
+                  break;
                 }
-                // Extract text content if present
-                const textContent = Array.isArray(m.content)
-                  ? m.content.filter(b => b.type === "text").map(b => b.text).join("\n")
-                  : typeof m.content === "string" ? m.content : "";
-                if (textContent.trim()) {
-                  const tail = textContent.slice(-300);
-                  continuationParts.push(`\n[Your last output before dropping]\n...${tail}`);
-                }
-                break;
               }
-            }
+            } else {
+              // ── Todo-based continuation (model stopped with pending work) ──────────
+              // The model stopped but there is tracked work remaining.
+              // Reconstruct what it already accomplished so it picks up where it left
+              // off rather than re-exploring from scratch.
+              continuationParts.push("You stopped before finishing. Here is your progress so far — pick up exactly where you left off, do NOT re-explore or re-read files you already examined.");
 
-            // Remaining work
-            const todoList = remaining.map(t => `- [${t.status}] ${t.content}`).join("\n");
-            continuationParts.push(`\n[Remaining work]\n${todoList}`);
+              // Inject what the model already accomplished this session
+              const sessionState = readState(request.projectId);
+              const recentActions = sessionState.recentActions || [];
+              if (recentActions.length > 0) {
+                const actionSummary = recentActions.slice(-5).map(a => `- ${a.content}`).join("\n");
+                continuationParts.push(`\n[Actions completed so far]\n${actionSummary}`);
+              }
 
-            // Stall warning
-            if (arbiterChangedFiles.size === 0) {
-              continuationParts.push("\nWARNING: Your last turn made no file changes. Use tools (write_file, replace, bash) to actually implement — do not just discuss.");
+              // Inject decisions locked this session
+              const decisions = sessionState.decisions || [];
+              if (decisions.length > 0) {
+                const decisionSummary = decisions.slice(-3).map(d => `- ${d.content}`).join("\n");
+                continuationParts.push(`\n[Decisions already made — do not revisit]\n${decisionSummary}`);
+              }
+
+              // Mirror the model's own last thinking/content
+              for (let i = messages.length - 1; i >= Math.max(0, messages.length - 4); i--) {
+                const m = messages[i];
+                if (m.role === "assistant") {
+                  const thinkingBlock = Array.isArray(m.content)
+                    ? m.content.find(b => b.type === "thinking")
+                    : null;
+                  if (thinkingBlock?.thinking) {
+                    const tail = thinkingBlock.thinking.slice(-500);
+                    continuationParts.push(`\n[Your last reasoning before dropping]\n...${tail}`);
+                  }
+                  const textContent = Array.isArray(m.content)
+                    ? m.content.filter(b => b.type === "text").map(b => b.text).join("\n")
+                    : typeof m.content === "string" ? m.content : "";
+                  if (textContent.trim()) {
+                    const tail = textContent.slice(-300);
+                    continuationParts.push(`\n[Your last output before dropping]\n...${tail}`);
+                  }
+                  break;
+                }
+              }
+
+              // Remaining work
+              if (remaining.length > 0) {
+                const todoList = remaining.map(t => `- [${t.status}] ${t.content}`).join("\n");
+                continuationParts.push(`\n[Remaining work]\n${todoList}`);
+              }
+
+              // Stall warning
+              if (arbiterChangedFiles.size === 0) {
+                continuationParts.push("\nWARNING: Your last turn made no file changes. Use tools (write_file, replace, bash) to actually implement — do not just discuss.");
+              }
             }
 
             const contMsg = {
@@ -3427,17 +3576,24 @@ export class ApiBackend extends PunkBackend {
     //   Xiaomi/OpenAI: prompt_tokens_details.cached_tokens
     //   Gemini:     cachedContentTokenCount (in usageMetadata, handled below)
     if (event.usage) {
+      // Normalize cache_read first — needed for input_tokens normalization below.
+      const _cacheRead =
+        event.usage.cache_read_input_tokens ||                    // Anthropic (handled separately, but harmless)
+        event.usage.prompt_cache_hit_tokens ||                     // DeepSeek
+        event.usage.cached_tokens ||                               // Kimi
+        event.usage.cached_token ||                                // StepFun (singular)
+        event.usage.prompt_tokens_details?.cached_tokens ||        // Xiaomi / OpenAI-compatible
+        0;
+      // OpenAI-compatible providers (DeepSeek, Kimi, Xiaomi, etc.) report prompt_tokens
+      // as the TOTAL — cached + non-cached. Anthropic reports input_tokens as non-cached
+      // only (overwritten below). Normalize here so the DB is always non-cached only,
+      // which makes cache rate and cost calculations correct for all providers.
+      const _rawInput = event.usage.prompt_tokens || event.usage.input_tokens || 0;
       state.usage = {
-        input_tokens: event.usage.prompt_tokens || event.usage.input_tokens || 0,
+        input_tokens: Math.max(0, _rawInput - _cacheRead),
         output_tokens: event.usage.completion_tokens || event.usage.output_tokens || 0,
         cache_creation_input_tokens: event.usage.cache_creation_input_tokens || 0,
-        cache_read_input_tokens:
-          event.usage.cache_read_input_tokens ||                    // Anthropic
-          event.usage.prompt_cache_hit_tokens ||                     // DeepSeek
-          event.usage.cached_tokens ||                               // Kimi
-          event.usage.cached_token ||                                // StepFun (singular)
-          event.usage.prompt_tokens_details?.cached_tokens ||        // Xiaomi / OpenAI-compatible
-          0,
+        cache_read_input_tokens: _cacheRead,
         cost: event.usage.cost || null,
       };
     }
@@ -3458,12 +3614,14 @@ export class ApiBackend extends PunkBackend {
     }
 
     // Gemini specific usage in usageMetadata
+    // promptTokenCount is TOTAL (includes cached) — normalize to non-cached only.
     if (provider === "gemini" && event.usageMetadata) {
+      const _geminiCacheRead = event.usageMetadata.cachedContentTokenCount || 0;
       state.usage = {
-        input_tokens: event.usageMetadata.promptTokenCount || 0,
+        input_tokens: Math.max(0, (event.usageMetadata.promptTokenCount || 0) - _geminiCacheRead),
         output_tokens: event.usageMetadata.candidatesTokenCount || 0,
         cache_creation_input_tokens: 0,
-        cache_read_input_tokens: event.usageMetadata.cachedContentTokenCount || 0,
+        cache_read_input_tokens: _geminiCacheRead,
       };
     }
 
@@ -4096,6 +4254,11 @@ export class ApiBackend extends PunkBackend {
       // No tools — pure text generation for planning
     };
 
+    // Request usage data in streaming response for OpenAI-compatible providers
+    if (["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(apiConfig.provider)) {
+      body.stream_options = { include_usage: true };
+    }
+
     const { url, headers, finalBody } = await this.prepareRequest(apiConfig, body, request);
 
     const cleanBody = { ...(finalBody || body), stream: true };
@@ -4183,6 +4346,7 @@ export class ApiBackend extends PunkBackend {
               usage = {
                 prompt_tokens: parsed.usageMetadata.promptTokenCount,
                 completion_tokens: parsed.usageMetadata.candidatesTokenCount,
+                prompt_cache_hit_tokens: parsed.usageMetadata.cachedContentTokenCount || 0,
               };
             }
 
@@ -4212,11 +4376,17 @@ export class ApiBackend extends PunkBackend {
         }
 
         // Emit token_usage for the planning call
-        const totalInput = usage?.prompt_tokens || usage?.input_tokens || 0;
-        const totalOutput =
-          usage?.completion_tokens || usage?.output_tokens || 0;
+        // Normalize input_tokens: OpenAI-compatible and Gemini report prompt_tokens as
+        // TOTAL (cached + non-cached). Anthropic reports input_tokens as non-cached only.
+        // Subtracting cacheRead from raw input is safe for all non-Anthropic providers.
+        const _rawInput = usage?.prompt_tokens || usage?.input_tokens || 0;
         const cacheRead =
           usage?.cache_read_input_tokens || usage?.prompt_cache_hit_tokens || 0;
+        const totalInput = apiConfig.provider !== "anthropic"
+          ? Math.max(0, _rawInput - cacheRead)
+          : _rawInput;
+        const totalOutput =
+          usage?.completion_tokens || usage?.output_tokens || 0;
         const cacheWrite = usage?.cache_creation_input_tokens || 0;
 
         const callCost = calculateCost({

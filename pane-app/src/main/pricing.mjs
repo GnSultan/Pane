@@ -293,6 +293,7 @@ export function getModelRates(model) {
   return {
     input: typeof pricing.input === "number" ? pricing.input : 0,
     output: typeof pricing.output === "number" ? pricing.output : 0,
+    cache_read: pricing.cache_read,
   };
 }
 

@@ -171,8 +171,8 @@ const VIOLATION_PATTERNS = [
 
 /**
  * Count delimiter balance while skipping strings, template literals, comments,
- * and regex literals. Returns the net imbalance and the line where the last
- * unmatched opener was seen.
+ * and regex literals (now actually implemented). Returns the net imbalance and
+ * the line where the last unmatched opener was seen.
  *
  * @param {string} content - Full file content
  * @param {string} open - Opening delimiter character
@@ -207,6 +207,38 @@ function countDelimiterBalance(content, open, close) {
       for (let j = i; j < end + 2; j++) { if (content[j] === "\n") line++; }
       i = end + 2;
       continue;
+    }
+
+    // Skip regex literals — /pattern/flags
+    // A '/' starts a regex when preceded by an operator, keyword, or open paren.
+    if (ch === "/" && next !== "/" && next !== "*") {
+      let j = i - 1;
+      while (j >= 0 && (content[j] === " " || content[j] === "\t")) j--;
+      const prev = j >= 0 ? content[j] : "";
+      const isRegexStart = prev === "" || "=([,!&|?:;{}\n".includes(prev) ||
+        /\b(return|typeof|instanceof|in|of|void|delete|throw|new|case)$/.test(
+          content.slice(Math.max(0, j - 9), j + 1)
+        );
+      if (isRegexStart) {
+        i++;
+        while (i < content.length) {
+          if (content[i] === "\\") { i += 2; continue; } // escaped char
+          if (content[i] === "[") {
+            // Character class — ] inside doesn't close the regex
+            i++;
+            while (i < content.length && content[i] !== "]") {
+              if (content[i] === "\\") i++;
+              i++;
+            }
+          }
+          if (content[i] === "/") { i++; break; } // end of regex body
+          if (content[i] === "\n") break;          // malformed — bail
+          i++;
+        }
+        // Consume flags (gimsuy)
+        while (i < content.length && /[gimsuy]/.test(content[i])) i++;
+        continue;
+      }
     }
 
     // Skip strings (single/double quotes)
@@ -1374,14 +1406,53 @@ export class ToolExecutor {
   /**
    * Fetch a URL and extract text content
    */
-  async executeWebFetch(toolId, prompt) {
-    const urlMatch = prompt.match(/https?:\/\/[^\s]+/);
-    if (!urlMatch) {
-      return { success: false, output: "No URL found in the prompt.", toolId };
+  async executeWebFetch(toolId, url, instructions = "") {
+    if (!url || !url.trim()) {
+      return { success: false, output: "No URL provided.", toolId };
     }
-    const url = urlMatch[0];
+    const urlMatch = url.trim().match(/^https?:\/\/[^\s]+/);
+    if (!urlMatch) {
+      return { success: false, output: `Invalid URL: "${url.slice(0, 100)}"`, toolId };
+    }
+    const cleanUrl = urlMatch[0];
+
+    const header = instructions
+      ? `[Fetched: ${cleanUrl}]\n[Focus: ${instructions}]\n\n`
+      : `[Fetched: ${cleanUrl}]\n\n`;
+
+    // Try Tavily Extract first — handles JS-rendered pages, returns clean markdown.
     try {
-      const response = await fetch(url, {
+      const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+      const tavilyKey = settings.http_api_keys?.tavily || settings.tavilyApiKey;
+
+      if (tavilyKey) {
+        const response = await fetch("https://api.tavily.com/extract", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            api_key: tavilyKey,
+            urls: [cleanUrl],
+            include_images: false,
+          }),
+          signal: AbortSignal.timeout(20000),
+        });
+        if (response.ok) {
+          const data = await response.json();
+          const result = data.results?.[0];
+          if (result?.raw_content) {
+            const content = result.raw_content.slice(0, 15000);
+            return { success: true, output: header + content, toolId };
+          }
+        }
+      }
+    } catch {
+      // Tavily unavailable or failed — fall through to direct fetch
+    }
+
+    // Fallback: direct fetch with HTML → plain text stripping
+    try {
+      const response = await fetch(cleanUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         },
@@ -1391,16 +1462,15 @@ export class ToolExecutor {
         return { success: false, output: `Failed to fetch URL: ${response.status} ${response.statusText}`, toolId };
       }
       const text = await response.text();
-      // Very basic HTML to text conversion
       const cleanText = text
         .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
         .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
         .replace(/<[^>]+>/g, " ")
         .replace(/\s+/g, " ")
         .trim()
-        .slice(0, 15000); // Cap at 15k chars
+        .slice(0, 15000);
 
-      return { success: true, output: cleanText, toolId };
+      return { success: true, output: header + cleanText, toolId };
     } catch (err) {
       return { success: false, output: `Error fetching URL: ${err.message}`, toolId };
     }
@@ -1420,7 +1490,7 @@ export class ToolExecutor {
     try {
       const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
       const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
-      const tavilyKey = settings.tavilyApiKey;
+      const tavilyKey = settings.http_api_keys?.tavily || settings.tavilyApiKey;
 
       if (tavilyKey) {
         const response = await fetch("https://api.tavily.com/search", {
@@ -1638,7 +1708,7 @@ export class ToolExecutor {
           return await this.executeGoogleWebSearch(toolId, input.query);
 
         case "web_fetch":
-          return await this.executeWebFetch(toolId, input.prompt);
+          return await this.executeWebFetch(toolId, input.url, input.instructions || "");
 
         case "pane_project_context": {
           const data = await readJson(path.join(stateDir, "project.json"));

@@ -7,7 +7,6 @@ import type {
   ServerToolUseBlock,
   WebSearchToolResultBlock,
   JsonBlock,
-  ArbiterVerdict,
 } from "../../lib/punk-types";
 import { restoreCheckpoint, getCheckpointDiff } from "../../lib/tauri-commands";
 import type { CheckpointDiffFile } from "../../lib/tauri-commands";
@@ -252,74 +251,6 @@ function JsonBlockDisplay({ block }: { block: JsonBlock }) {
   );
 }
 
-function VerdictBadge({ verdict }: { verdict: ArbiterVerdict }) {
-  const [expanded, setExpanded] = useState(false);
-  const errors = verdict.findings.filter((f) => f.severity === "error");
-  const warnings = verdict.findings.filter((f) => f.severity === "warning");
-  const hasGuidance = (verdict.guidance?.length ?? 0) > 0;
-  const hasExpandable = !verdict.pass || hasGuidance;
-
-  // Green: pass. Yellow: warnings only. Red: errors.
-  const color = verdict.pass
-    ? "text-emerald-500/70"
-    : errors.length > 0
-      ? "text-red-400/70"
-      : "text-amber-400/70";
-
-  const dot = verdict.pass ? "●" : errors.length > 0 ? "▲" : "▲";
-
-  const label = verdict.pass
-    ? "clean"
-    : errors.length > 0
-      ? `${errors.length} error${errors.length > 1 ? "s" : ""}`
-      : `${warnings.length} warning${warnings.length > 1 ? "s" : ""}`;
-
-  return (
-    <div className="flex flex-col">
-      <button
-        onClick={() => hasExpandable && setExpanded(!expanded)}
-        className={`flex items-center gap-1.5 text-[10px] font-mono tracking-wider ${color} ${
-          hasExpandable ? "hover:opacity-80 cursor-pointer" : "cursor-default"
-        }`}
-      >
-        <span className="text-[8px]">{dot}</span>
-        <span>{label}</span>
-        {verdict.score < 100 && (
-          <span className="text-pane-text-secondary/40">{verdict.score}</span>
-        )}
-        {hasGuidance && verdict.pass && (
-          <span className="text-[var(--pane-terminal)]/50">
-            {verdict.guidance!.length} suggestion{verdict.guidance!.length > 1 ? "s" : ""}
-          </span>
-        )}
-      </button>
-      {expanded && (
-        <div className="mt-2 ml-1 text-[10px] font-mono leading-relaxed text-pane-text-secondary/60 max-w-lg">
-          {verdict.findings.slice(0, 5).map((f, i) => (
-            <div key={i} className="flex gap-2 mb-1">
-              <span className={f.severity === "error" ? "text-red-400/70" : "text-amber-400/70"}>
-                {f.severity === "error" ? "err" : "wrn"}
-              </span>
-              <span className="text-pane-text-secondary/40">{f.file}:{f.line}</span>
-              <span>{f.plain}</span>
-            </div>
-          ))}
-          {verdict.guidance && verdict.guidance.length > 0 && (
-            <>
-              {verdict.findings.length > 0 && <div className="mt-2 mb-1 border-t border-pane-text/5" />}
-              {verdict.guidance.map((g, i) => (
-                <div key={`g-${i}`} className="flex gap-2 mb-1">
-                  <span className="text-[var(--pane-terminal)]/50">tip</span>
-                  <span>{g.plain}</span>
-                </div>
-              ))}
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
 
 export function MessageBubble({
   message,
@@ -395,20 +326,6 @@ export function MessageBubble({
           )}
         </div>
         <div className="flex items-center justify-end gap-2 mt-1">
-          {message.phase && message.phase !== "idle" && (
-            <span
-              className="font-mono"
-              style={{
-                fontSize: "var(--pane-font-size-xs)",
-                color: message.phase === "think"
-                  ? "var(--pane-status-modified)"
-                  : "var(--pane-status-added)",
-                opacity: 0.5,
-              }}
-            >
-              {message.phase}
-            </span>
-          )}
           {message.checkpointId && (
             <CheckpointIndicator
               checkpointId={message.checkpointId}
@@ -585,9 +502,6 @@ export function MessageBubble({
               justCompleted ? "opacity-0" : "opacity-100"
             }`}
           >
-            {message.verdict && (
-              <VerdictBadge verdict={message.verdict} />
-            )}
             {(message.costUsd !== undefined ||
               message.durationMs !== undefined) && (
               <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary tracking-wider">

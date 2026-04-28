@@ -1251,7 +1251,7 @@ ${PANE_END}`;
     "gemini",
     "--output-format",
     "stream-json",
-    "--yolo",
+    "--approval-mode=yolo",
     "--allowed-mcp-server-names",
     "pane",
   ];
