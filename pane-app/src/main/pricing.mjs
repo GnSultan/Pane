@@ -299,15 +299,18 @@ export function getModelRates(model) {
 
 /**
  * Calculate the cost of a turn in USD.
+ * Returns a result object with provenance metadata so the analytics layer
+ * knows whether the cost came from the API, was estimated, or is unknown.
+ *
  * @param {Object} params
  * @param {string} params.model
- * @param {string} params.provider
+ * @param {string} params.provider - Unused but kept for future per-provider pricing.
  * @param {number} params.inputTokens
  * @param {number} params.outputTokens
  * @param {number} [params.cacheReadTokens]
  * @param {number} [params.cacheWriteTokens]
  * @param {number} [params.apiReportedCost] - If provided by API (OpenRouter), use it.
- * @returns {number}
+ * @returns {{ cost: number, source: "api"|"estimated"|"unknown", rateSnapshot: Object|null }}
  */
 export function calculateCost({
   model,
@@ -320,19 +323,27 @@ export function calculateCost({
 }) {
   // If API already gave us the cost (OpenRouter), trust it.
   if (apiReportedCost !== null && apiReportedCost >= 0) {
-    return +apiReportedCost.toFixed(6);
+    return {
+      cost: +apiReportedCost.toFixed(6),
+      source: "api",
+      rateSnapshot: null,
+    };
   }
 
-  if (!model) return 0;
+  if (!model) {
+    return { cost: 0, source: "unknown", rateSnapshot: null };
+  }
 
   // Free-tier models (OpenRouter :free suffix) cost nothing
-  if (model.endsWith(":free")) return 0;
+  if (model.endsWith(":free")) {
+    return { cost: 0, source: "estimated", rateSnapshot: { input: 0, output: 0 } };
+  }
 
   const pricing = _findPricing(model);
 
   if (!pricing) {
     console.warn(`[pricing] No pricing for model "${model}" — cost will show as $0`);
-    return 0;
+    return { cost: 0, source: "unknown", rateSnapshot: null };
   }
 
   // Anthropic reports input_tokens as the NON-cached portion.
@@ -352,7 +363,17 @@ export function calculateCost({
     (Math.max(0, cacheWriteTokens) / 1_000_000) * (pricing.cache_write || pricing.input || 0);
 
   const totalCost = inputCost + outputCost + cacheReadCost + cacheWriteCost;
-  return +totalCost.toFixed(6);
+
+  return {
+    cost: +totalCost.toFixed(6),
+    source: "estimated",
+    rateSnapshot: {
+      input: pricing.input || 0,
+      output: pricing.output || 0,
+      cache_read: pricing.cache_read || 0,
+      cache_write: pricing.cache_write || 0,
+    },
+  };
 }
 
 /**

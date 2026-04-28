@@ -145,6 +145,8 @@ function _createSchema(db) {
       cache_creation_input_tokens INTEGER DEFAULT 0,
       cache_read_input_tokens     INTEGER DEFAULT 0,
       cost_usd                    REAL    NOT NULL,
+      cost_source                 TEXT    NOT NULL DEFAULT 'estimated',
+      cost_rate_snapshot          TEXT,
       duration_ms                 INTEGER DEFAULT 0,
       timestamp                   INTEGER NOT NULL
     );
@@ -303,9 +305,10 @@ function _prepareStatements(db) {
       INSERT INTO token_usage
         (id, project_id, provider, activity_type, model,
          input_tokens, output_tokens, cache_creation_input_tokens,
-         cache_read_input_tokens, cost_usd, duration_ms, timestamp)
+         cache_read_input_tokens, cost_usd, cost_source, cost_rate_snapshot,
+         duration_ms, timestamp)
       VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     getTokenAnalytics: db.prepare(`
       SELECT
@@ -317,8 +320,17 @@ function _prepareStatements(db) {
         SUM(cost_usd) as total_cost_usd,
         AVG(duration_ms) as avg_duration_ms,
         COUNT(*) as call_count,
-        MAX(timestamp) as last_used
-      FROM token_usage
+        MAX(timestamp) as last_used,
+        SUM(CASE WHEN cost_source = 'unknown' THEN 1 ELSE 0 END) as unknown_cost_count,
+        SUM(CASE WHEN cost_source = 'api' THEN 1 ELSE 0 END) as api_reported_count,
+        SUM(CASE WHEN cost_source = 'estimated' THEN 1 ELSE 0 END) as estimated_count,
+        (SELECT cost_rate_snapshot FROM token_usage tu2
+         WHERE tu2.model = t.model
+           AND tu2.provider = t.provider
+           AND tu2.activity_type = t.activity_type
+           AND tu2.cost_rate_snapshot IS NOT NULL
+         ORDER BY tu2.timestamp DESC LIMIT 1) as latest_rate_snapshot
+      FROM token_usage t
       WHERE project_id = ? AND timestamp >= ?
       GROUP BY model, provider, activity_type
       ORDER BY call_count DESC
@@ -333,8 +345,17 @@ function _prepareStatements(db) {
         SUM(cost_usd) as total_cost_usd,
         AVG(duration_ms) as avg_duration_ms,
         COUNT(*) as call_count,
-        MAX(timestamp) as last_used
-      FROM token_usage
+        MAX(timestamp) as last_used,
+        SUM(CASE WHEN cost_source = 'unknown' THEN 1 ELSE 0 END) as unknown_cost_count,
+        SUM(CASE WHEN cost_source = 'api' THEN 1 ELSE 0 END) as api_reported_count,
+        SUM(CASE WHEN cost_source = 'estimated' THEN 1 ELSE 0 END) as estimated_count,
+        (SELECT cost_rate_snapshot FROM token_usage tu2
+         WHERE tu2.model = t.model
+           AND tu2.provider = t.provider
+           AND tu2.activity_type = t.activity_type
+           AND tu2.cost_rate_snapshot IS NOT NULL
+         ORDER BY tu2.timestamp DESC LIMIT 1) as latest_rate_snapshot
+      FROM token_usage t
       WHERE timestamp >= ?
       GROUP BY model, provider, activity_type
       ORDER BY call_count DESC
@@ -346,7 +367,10 @@ function _prepareStatements(db) {
         SUM(input_tokens) as daily_input,
         SUM(output_tokens) as daily_output,
         SUM(cache_read_input_tokens) as daily_cache_read,
-        COUNT(*) as daily_calls
+        COUNT(*) as daily_calls,
+        SUM(CASE WHEN cost_source = 'unknown' THEN 1 ELSE 0 END) as unknown_cost_count,
+        SUM(CASE WHEN cost_source = 'api' THEN 1 ELSE 0 END) as api_reported_count,
+        SUM(CASE WHEN cost_source = 'estimated' THEN 1 ELSE 0 END) as estimated_count
       FROM token_usage
       WHERE project_id = ? AND timestamp >= ?
       GROUP BY day
@@ -359,7 +383,10 @@ function _prepareStatements(db) {
         SUM(input_tokens) as daily_input,
         SUM(output_tokens) as daily_output,
         SUM(cache_read_input_tokens) as daily_cache_read,
-        COUNT(*) as daily_calls
+        COUNT(*) as daily_calls,
+        SUM(CASE WHEN cost_source = 'unknown' THEN 1 ELSE 0 END) as unknown_cost_count,
+        SUM(CASE WHEN cost_source = 'api' THEN 1 ELSE 0 END) as api_reported_count,
+        SUM(CASE WHEN cost_source = 'estimated' THEN 1 ELSE 0 END) as estimated_count
       FROM token_usage
       WHERE timestamp >= ?
       GROUP BY day
@@ -521,6 +548,23 @@ export async function runMigrationIfNeeded(db) {
     }
     db.stmts.setMigrationVersion.run(4);
     console.log("[pane-db] Migration v4 complete.");
+  }
+
+  if (version < 5) {
+    console.log("[pane-db] Running migration v5: cost provenance columns...");
+    // SQLite doesn't support ADD COLUMN IF NOT EXISTS — use try/catch per column
+    try {
+      db.exec("ALTER TABLE token_usage ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'estimated'");
+    } catch (e) {
+      if (!e.message.includes("duplicate column")) throw e;
+    }
+    try {
+      db.exec("ALTER TABLE token_usage ADD COLUMN cost_rate_snapshot TEXT");
+    } catch (e) {
+      if (!e.message.includes("duplicate column")) throw e;
+    }
+    db.stmts.setMigrationVersion.run(5);
+    console.log("[pane-db] Migration v5 complete.");
   }
 }
 

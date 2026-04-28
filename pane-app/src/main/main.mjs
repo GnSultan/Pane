@@ -66,6 +66,8 @@ async function registerClaudeHandlers() {
           usage.cache_creation_input_tokens || 0,
           usage.cache_read_input_tokens || 0,
           usage.cost_usd,
+          usage.cost_source || 'estimated',
+          usage.cost_rate_snapshot || null,
           usage.duration_ms || 0,
           Date.now(),
         );
@@ -2449,8 +2451,9 @@ function registerBrainHandlers() {
 async function registerIpcHandlers() {
   let db = null;
   try {
-    const { initPaneDb } = await import("./pane-db.mjs");
+    const { initPaneDb, runMigrationIfNeeded } = await import("./pane-db.mjs");
     db = initPaneDb();
+    await runMigrationIfNeeded(db);
     console.log("[main] Database initialized successfully");
   } catch (err) {
     console.error("[main] Failed to initialize database:", err.message);

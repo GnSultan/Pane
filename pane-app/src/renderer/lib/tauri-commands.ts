@@ -79,6 +79,10 @@ export interface TokenAnalyticsRow {
   avg_duration_ms: number;
   call_count: number;
   last_used: number;
+  unknown_cost_count: number;
+  api_reported_count: number;
+  estimated_count: number;
+  latest_rate_snapshot: string | null;
 }
 
 export interface TokenTimeSeriesRow {
@@ -88,6 +92,9 @@ export interface TokenTimeSeriesRow {
   daily_output: number;
   daily_cache_read: number;
   daily_calls: number;
+  unknown_cost_count: number;
+  api_reported_count: number;
+  estimated_count: number;
 }
 
 export async function getTokenAnalytics(

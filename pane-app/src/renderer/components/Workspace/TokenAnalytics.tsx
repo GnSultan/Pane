@@ -41,7 +41,7 @@ function DailyCostChart({ data }: { data: TokenTimeSeriesRow[] }) {
   const capped = data.slice(-30);
   const maxCost = Math.max(...capped.map(d => d.daily_cost), 0.001);
   const [hovered, setHovered] = useState<TokenTimeSeriesRow | null>(null);
-  const height = 48;
+  const height = 96;
   const barWidth = Math.max(4, Math.min(12, 280 / capped.length));
   const gap = 2;
   const width = capped.length * (barWidth + gap);
@@ -142,13 +142,24 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
     );
   }, [data]);
 
+  // Resolve the effective rate for a row: prefer the snapshot of what was actually
+  // used at estimation time, fall back to today's live list price.
+  function effectiveRate(row: TokenAnalyticsRow): { input: number; output: number; cache_read?: number } | null {
+    if (row.latest_rate_snapshot) {
+      try { return JSON.parse(row.latest_rate_snapshot); } catch {
+        // Malformed snapshot — fall through to live rates below
+      }
+    }
+    return rates[row.model] ?? null;
+  }
+
   // Estimate cache savings per-model using actual per-model cache_read rate.
   // Savings = cached_tokens * (full_input_price - cache_read_price).
   // When cache_read is unknown (not in OpenRouter data), savings = 0 (safe fallback).
   const cacheSavings = useMemo(() => {
     let savings = 0;
     for (const row of data) {
-      const rate = rates[row.model];
+      const rate = effectiveRate(row);
       if (!rate || row.total_cache_read === 0) continue;
       const inputPricePerToken = rate.input / 1_000_000;
       const cacheReadPrice = typeof rate.cache_read === "number" ? rate.cache_read / 1_000_000 : inputPricePerToken;
@@ -166,7 +177,7 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
   const maxCost = Math.max(...data.map(r => r.total_cost_usd), 0.000001);
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-8">
       {/* Range selector */}
       <div className="flex items-center gap-1">
         {(["today", "week", "month", "all"] as const).map((r) => (
@@ -186,25 +197,25 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
       </div>
 
       {/* Summary cards */}
-      <div className="grid grid-cols-3 gap-3">
-        <div className="p-3 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-1">
+      <div className="grid grid-cols-3 gap-4">
+        <div className="p-5 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-2">
           <span className="text-pane-text-secondary font-mono text-xs uppercase tracking-wider">spend</span>
-          <span className="text-lg font-mono text-pane-text font-medium tabular-nums">{formatCost(totals.cost)}</span>
-          <span className="text-xs font-mono text-pane-text-secondary">{totals.calls} calls</span>
+          <span className="text-2xl font-mono text-pane-text font-semibold tabular-nums">{formatCost(totals.cost)}</span>
+          <span className="text-sm font-mono text-pane-text-secondary">{totals.calls} calls</span>
         </div>
-        <div className="p-3 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-1">
+        <div className="p-5 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-2">
           <span className="text-pane-text-secondary font-mono text-xs uppercase tracking-wider">tokens</span>
-          <span className="text-lg font-mono text-pane-text font-medium tabular-nums">{formatTokens(totals.input + totals.output)}</span>
-          <span className="text-xs font-mono text-pane-text-secondary">
+          <span className="text-2xl font-mono text-pane-text font-semibold tabular-nums">{formatTokens(totals.input + totals.output)}</span>
+          <span className="text-sm font-mono text-pane-text-secondary">
             {formatTokens(totals.input)} in · {formatTokens(totals.output)} out
           </span>
         </div>
-        <div className="p-3 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-1">
+        <div className="p-5 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-2">
           <span className="text-pane-text-secondary font-mono text-xs uppercase tracking-wider">cache savings</span>
-          <span className="text-lg font-mono text-pane-status-added font-medium tabular-nums">
+          <span className="text-2xl font-mono text-pane-status-added font-semibold tabular-nums">
             {cacheSavings > 0 ? formatCost(cacheSavings) : "—"}
           </span>
-          <span className="text-xs font-mono text-pane-text-secondary">
+          <span className="text-sm font-mono text-pane-text-secondary">
             {totals.cached > 0 && (totals.input + totals.cached) > 0
               ? `${Math.round((totals.cached / (totals.input + totals.cached)) * 100)}% hit rate`
               : "no cache data"}
@@ -245,8 +256,8 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                     </span>
                     <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                       {row.call_count} calls{(() => {
-                        const r = rates[row.model];
-                        if (r) return ` · $${r.input}/${r.output}M`;
+                        const r = effectiveRate(row);
+                        if (r) return ` · ${r.input}/${r.output}M`;
                         return "";
                       })()}
                     </span>
@@ -255,7 +266,7 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                   {/* Cost bar — green segment shows estimated cache savings proportion */}
                   <div className="h-1.5 w-full bg-pane-text/[0.04] rounded-full overflow-hidden flex mb-2">
                     {(() => {
-                      const rate = rates[row.model];
+                      const rate = effectiveRate(row);
                       const cacheSavedUsd = rate && row.total_cache_read > 0
                         ? (() => {
                             const inputPricePerToken = rate.input / 1_000_000;
@@ -284,6 +295,9 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                     </span>
                     <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                       {formatCost(row.total_cost_usd)}
+                      {row.unknown_cost_count > 0 && (
+                        <span className="text-pane-text-secondary/40 ml-0.5" title={`${row.unknown_cost_count} calls with unknown pricing`}>?</span>
+                      )}
                     </span>
                     {cacheHit > 0 && (
                       <span className="font-mono text-pane-status-added tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>

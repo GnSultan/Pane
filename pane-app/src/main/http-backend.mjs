@@ -2227,7 +2227,7 @@ export class ApiBackend extends PunkBackend {
         turnRetryCount = 0; // reset on a successful turn
 
         // ─── Analytics Capture ─────────────────────────────────────────────
-        const turnCost = calculateCost({
+        const { cost: turnCost, source: costSource, rateSnapshot } = calculateCost({
           model: state.model,
           provider: apiConfig.provider,
           inputTokens: state.usage?.input_tokens || 0,
@@ -2251,6 +2251,8 @@ export class ApiBackend extends PunkBackend {
                 state.usage?.cache_creation_input_tokens || 0,
               cache_read_input_tokens: state.usage?.cache_read_input_tokens || 0,
               cost_usd: turnCost,
+              cost_source: costSource,
+              cost_rate_snapshot: rateSnapshot ? JSON.stringify(rateSnapshot) : null,
               duration_ms: Date.now() - turnStartTime,
             },
           },
@@ -4389,7 +4391,7 @@ export class ApiBackend extends PunkBackend {
           usage?.completion_tokens || usage?.output_tokens || 0;
         const cacheWrite = usage?.cache_creation_input_tokens || 0;
 
-        const callCost = calculateCost({
+        const { cost: callCost, source: costSource, rateSnapshot } = calculateCost({
           model,
           provider: apiConfig.provider,
           inputTokens: totalInput,
@@ -4412,6 +4414,8 @@ export class ApiBackend extends PunkBackend {
               cache_creation_input_tokens: cacheWrite,
               cache_read_input_tokens: cacheRead,
               cost_usd: callCost,
+              cost_source: costSource,
+              cost_rate_snapshot: rateSnapshot ? JSON.stringify(rateSnapshot) : null,
               duration_ms: Date.now() - callStartTime,
             },
           },
