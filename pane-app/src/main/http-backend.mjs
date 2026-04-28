@@ -1369,6 +1369,7 @@ export class ApiBackend extends PunkBackend {
 
     const normalized = [];
     const pendingToolCallIds = new Set();
+    let lastToolCallAssistantIndex = -1;
 
     for (const msg of preFiltered) {
       const { role, content } = msg;
@@ -1469,6 +1470,9 @@ export class ApiBackend extends PunkBackend {
           }
 
           normalized.push(assistantMsg);
+          if (assistantMsg.tool_calls) {
+            lastToolCallAssistantIndex = normalized.length - 1;
+          }
         } else {
           // Anthropic/Gemini/etc. — preserve original structure
           normalized.push(msg);
@@ -1545,14 +1549,17 @@ export class ApiBackend extends PunkBackend {
     }
 
     // --- 4. AUTO-HEAL: Close orphaned tool calls ---
+    // Insert fake results at the correct position — right after the assistant
+    // message that made those tool calls — instead of appending at the end.
     // Skip for deepseek-reasoner — it has no tool support so tool messages must
     // never appear in the history regardless.
     if (isOpenAI && !isReasoner && pendingToolCallIds.size > 0) {
       console.warn(
         `[http] history sequence error: ${pendingToolCallIds.size} tool calls missing results. Healing...`,
       );
+      const fakeResults = [];
       for (const id of pendingToolCallIds) {
-        normalized.push({
+        fakeResults.push({
           role: "tool",
           tool_call_id: id,
           content:
@@ -1560,6 +1567,12 @@ export class ApiBackend extends PunkBackend {
           is_error: true,
         });
       }
+      // Insert after the last assistant with tool_calls, or fall back to append
+      const insertAt = Math.min(
+        lastToolCallAssistantIndex + 1,
+        normalized.length,
+      );
+      normalized.splice(insertAt, 0, ...fakeResults);
     }
 
     return normalized;
@@ -2300,7 +2313,7 @@ export class ApiBackend extends PunkBackend {
           isDeepSeekReasoner || 
           (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
           (apiConfig.provider === "openrouter" && body.include_reasoning)
-        ) && state.thinking !== undefined;
+        ) && state.thinking;
         
         if (deepseekThinking) {
           parsedMessage.message.reasoning_content = state.thinking;
