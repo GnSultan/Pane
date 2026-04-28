@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { ipcMain, BrowserWindow } from "electron";
 import { HttpBackend } from "./http-backend.mjs";
-import { MODEL_PRICING } from "./pricing.mjs";
+import { getPricingForModel } from "./pricing.mjs";
 
 const CACHE_DIR = path.join(os.homedir(), ".pane", "cache");
 const CACHE_FILE = path.join(CACHE_DIR, "models.json");
@@ -11,19 +11,10 @@ const CACHE_FILE = path.join(CACHE_DIR, "models.json");
 /**
  * Look up pricing for a model ID from the pricing module.
  * Returns { input_cost, output_cost } in $/Mtok, or nulls if unknown.
+ * Uses the dynamic pricing cache (OpenRouter → disk cache → cold-start seed).
  */
 function lookupPricing(modelId) {
-  if (!modelId) return { input_cost: null, output_cost: null };
-  const lower = modelId.toLowerCase();
-  for (const [prefix, pricing] of Object.entries(MODEL_PRICING)) {
-    if (lower.includes(prefix.toLowerCase())) {
-      return {
-        input_cost: pricing.input ?? null,
-        output_cost: pricing.output ?? null,
-      };
-    }
-  }
-  return { input_cost: null, output_cost: null };
+  return getPricingForModel(modelId);
 }
 
 /**
