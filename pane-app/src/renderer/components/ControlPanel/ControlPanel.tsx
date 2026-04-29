@@ -56,7 +56,7 @@ export function ControlPanel() {
       </div>
 
       {/* Menu — icon at bottom, items expand upward from it */}
-      <div className="px-2 shrink-0 flex flex-col justify-end min-h-9">
+      <div className="px-2 pb-2 shrink-0 flex flex-col justify-end min-h-9">
         <Menu
           currentMode={mode}
           isGitRepo={isGitRepo}
