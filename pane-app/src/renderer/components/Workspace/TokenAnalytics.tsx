@@ -355,19 +355,22 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                               : 0;
                             return (
                               <div key={`${row.model}-${row.provider}-${row.activity_type}`}
-                                className="flex items-center justify-between py-1.5 px-3 rounded-lg bg-pane-surface/30">
+                                className="flex flex-col gap-0.5 py-2 px-3 rounded-lg bg-pane-surface/30">
                                 <span className="font-mono text-pane-text truncate" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                                   {row.model.split("/").pop()}
                                   {row.provider !== provider && (
                                     <span className="text-pane-text-secondary"> · {row.provider}</span>
                                   )}
                                 </span>
-                                <div className="flex items-center gap-3 shrink-0">
+                                <div className="flex items-center gap-5">
                                   <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                                     {row.call_count} calls
                                   </span>
                                   <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                    {formatTokens(row.total_input_tokens)} / {formatTokens(row.total_output_tokens)}
+                                    {formatTokens(row.total_input_tokens)} in
+                                  </span>
+                                  <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {formatTokens(row.total_output_tokens)} out
                                   </span>
                                   <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                                     {formatCost(row.total_cost_usd)}
@@ -377,7 +380,7 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                                   </span>
                                   {cacheHit > 0 && (
                                     <span className="font-mono text-pane-status-added tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                      {cacheHit}%
+                                      {cacheHit}% cache
                                     </span>
                                   )}
                                 </div>
@@ -390,10 +393,17 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                             <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                               Total · {total.modelCount} {total.modelCount === 1 ? "model" : "models"} · {total.calls} calls
                             </span>
-                            <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                              {formatTokens(total.input)} / {formatTokens(total.output)}
-                              <span className="text-pane-text-secondary ml-2">{formatCost(total.cost)}</span>
-                            </span>
+                            <div className="flex items-center gap-5">
+                              <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                {formatTokens(total.input)} in
+                              </span>
+                              <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                {formatTokens(total.output)} out
+                              </span>
+                              <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                {formatCost(total.cost)}
+                              </span>
+                            </div>
                           </div>
                         </div>
                       </motion.div>
