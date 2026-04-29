@@ -136,6 +136,23 @@ interface MenuProps {
 export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, position }: MenuProps) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Hover open — immediate on enter
+  const handleMouseEnter = useCallback(() => {
+    if (closeTimerRef.current) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+    setOpen(true);
+  }, []);
+
+  // Hover close — delayed so user can reach the popup
+  const handleMouseLeave = useCallback(() => {
+    closeTimerRef.current = setTimeout(() => {
+      setOpen(false);
+    }, 200);
+  }, []);
 
   // Close on outside click
   useEffect(() => {
@@ -145,7 +162,6 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
         setOpen(false);
       }
     };
-    // Delay to avoid the trigger click propagating
     requestAnimationFrame(() => document.addEventListener("mousedown", handler));
     return () => document.removeEventListener("mousedown", handler);
   }, [open]);
@@ -160,6 +176,13 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
     return () => window.removeEventListener("keydown", handler);
   }, [open]);
 
+  // Cleanup timer on unmount
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+    };
+  }, []);
+
   const handleSelect = useCallback((mode: PaneMode) => {
     onSelectMode(mode);
     setOpen(false);
@@ -168,10 +191,14 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
   const triggerSize = position === "workspace" ? "w-8 h-8" : "w-7 h-7";
 
   return (
-    <div ref={menuRef} className="relative">
+    <div
+      ref={menuRef}
+      className="relative"
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+    >
       {/* Trigger */}
       <button
-        onClick={() => setOpen((v) => !v)}
         className={`${triggerSize} flex items-center justify-center rounded-xl text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04] relative`}
         title="modes"
       >
@@ -181,8 +208,9 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
       {/* Expanded menu — positioned upward from trigger */}
       {open && (
         <div
-          className="absolute bottom-full mb-1 left-0 min-w-[140px] bg-pane-bg border border-pane-border/40 rounded-xl shadow-xl py-1 z-50"
-          style={position === "workspace" ? { left: "0" } : { left: "0" }}
+          className="absolute bottom-full mb-1 left-0 min-w-[200px] bg-pane-bg border border-pane-border/40 rounded-xl shadow-xl py-1 z-50"
+          onMouseEnter={handleMouseEnter}
+          onMouseLeave={handleMouseLeave}
         >
           {MODES.map((m) => {
             if (m.requiresGit && !isGitRepo) return null;
@@ -191,7 +219,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
               <button
                 key={m.id}
                 onClick={() => handleSelect(m.id)}
-                className={`w-full flex items-center gap-3 px-3 py-1.5 font-mono text-left transition-colors relative
+                className={`w-full flex items-center gap-4 px-4 py-2 font-mono text-left transition-colors relative
                   ${isActive
                     ? "text-pane-text bg-pane-text/[0.08]"
                     : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04]"
