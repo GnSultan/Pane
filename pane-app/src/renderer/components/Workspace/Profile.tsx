@@ -881,11 +881,12 @@ function PaneAutoSection({
 
 // API key providers — each has a key input field
 const API_KEY_PROVIDERS = [
-  { key: "gemini", label: "Google Gemini", placeholder: "AI...", docsUrl: "https://aistudio.google.com/app/apikey" },
-  { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys" },
-  { key: "anthropic", label: "Anthropic", placeholder: "sk-ant-...", docsUrl: "https://console.anthropic.com/settings/keys" },
-  { key: "openrouter", label: "OpenRouter", placeholder: "sk-or-...", docsUrl: "https://openrouter.ai/keys" },
-  { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/", showBaseUrl: true },
+  { key: "gemini", label: "Google Gemini", placeholder: "AI...", docsUrl: "https://aistudio.google.com/app/apikey", showBaseUrl: true, defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta" },
+  { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys", showBaseUrl: true, defaultBaseUrl: "https://api.deepseek.com/v1/chat/completions" },
+  { key: "anthropic", label: "Anthropic", placeholder: "sk-ant-...", docsUrl: "https://console.anthropic.com/settings/keys", showBaseUrl: true, defaultBaseUrl: "https://api.anthropic.com/v1/messages" },
+  { key: "openrouter", label: "OpenRouter", placeholder: "sk-or-...", docsUrl: "https://openrouter.ai/keys", showBaseUrl: true, defaultBaseUrl: "https://openrouter.ai/api/v1/chat/completions" },
+  { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/", showBaseUrl: true, defaultBaseUrl: "https://api.xiaomimimo.com/v1" },
+  { key: "kimi", label: "Kimi (Moonshot)", placeholder: "sk-...", docsUrl: "https://platform.moonshot.cn/", showBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1/chat/completions" },
   { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
 ] as const;
 
@@ -909,19 +910,25 @@ function ApiKeysSection({
   claudeCodeAvailable?: boolean;
   geminiAvailable?: boolean;
 }) {
-  void _geminiAvailable; // passed through from parent, reserved for future use
+  void _geminiAvailable;
   const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
-  void (claudeCodeAvailable && sdkAccount != null); // reserved for per-provider auth gating
+  void (claudeCodeAvailable && sdkAccount != null);
   const [visible, setVisible] = useState<Record<string, boolean>>({});
+  const [expandedActive, setExpandedActive] = useState<string | null>(null);
+  const [expandedAvailable, setExpandedAvailable] = useState<string | null>(null);
   const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
   const toggleProvider = useWorkspaceStore((s) => s.toggleProvider);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const toggleKeyFor = (key: string) =>
+    (key === "anthropic" || key === "gemini") ? `${key}-api` : key;
 
   const ProviderToggle = ({ toggleKey, label }: { toggleKey: string; label: string }) => {
     const off = disabledProviders.includes(toggleKey);
     return (
       <button
         onClick={() => toggleProvider(toggleKey)}
-        className={`w-6 h-3.5 rounded-full relative transition-colors ${off ? "bg-pane-text-secondary/20" : "bg-pane-status-added/60"}`}
+        className={`w-6 h-3.5 rounded-full relative transition-colors shrink-0 ${off ? "bg-pane-text-secondary/20" : "bg-pane-status-added/60"}`}
         title={off ? `enable ${label}` : `disable ${label}`}
       >
         <div className={`absolute top-0.5 w-2.5 h-2.5 rounded-full bg-white transition-all ${off ? "left-0.5" : "left-[11px]"}`} />
@@ -929,122 +936,272 @@ function ApiKeysSection({
     );
   };
 
+  const activeProviders = API_KEY_PROVIDERS.filter((p) => !!httpApiKeys[p.key]);
+  const availableProviders = API_KEY_PROVIDERS.filter((p) => !httpApiKeys[p.key]);
+
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex flex-col gap-2">
-        {API_KEY_PROVIDERS.map((p) => {
-          const { key, label, placeholder, docsUrl } = p;
-          const showBaseUrl = (p as any).showBaseUrl;
-          const toggleKey = (key === "anthropic" || key === "gemini") ? `${key}-api` : key;
-          const val = httpApiKeys[key] || "";
-          const baseUrl = httpBaseUrls[key] || "";
-          const hasKey = !!val;
-          const isVisible = visible[key] ?? false;
-          const isOff = hasKey && disabledProviders.includes(toggleKey);
-          return (
-            <div key={key} className={`py-2 flex flex-col gap-1 ${isOff ? "opacity-40" : ""}`}>
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  {hasKey && <ProviderToggle toggleKey={toggleKey} label={label} />}
-                  <span
-                    className="text-pane-text font-mono"
-                    style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  >
-                    {label}
-                  </span>
-                </div>
-                <a
-                  href={docsUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-pane-text-secondary/40 hover:text-pane-text-secondary font-mono"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+    <div className="flex flex-col gap-4">
+      {/* Active providers */}
+      {activeProviders.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <span
+            className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            active
+          </span>
+          {activeProviders.map((p) => {
+            const { key, label, placeholder, docsUrl } = p;
+            const showBaseUrl = (p as any).showBaseUrl;
+            const defaultBaseUrl = (p as any).defaultBaseUrl;
+            const toggleKey = toggleKeyFor(key);
+            const val = httpApiKeys[key] || "";
+            const baseUrl = httpBaseUrls[key] || "";
+            const isExpanded = expandedActive === key;
+            const isVisible = visible[key] ?? false;
+            const isOff = disabledProviders.includes(toggleKey);
+
+            return (
+              <div key={key} className={`rounded-lg overflow-hidden ring-1 ring-pane-border/30 transition-colors ${isOff ? "opacity-40" : ""}`}>
+                {/* Collapsed header */}
+                <button
+                  onClick={() => setExpandedActive(isExpanded ? null : key)}
+                  className="flex items-center justify-between w-full py-2 px-3 bg-pane-bg hover:bg-pane-bg/80 active:bg-pane-bg/60 transition-all"
                 >
-                  get key ↗
-                </a>
-              </div>
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center gap-2">
-                  <input
-                    type={isVisible ? "text" : "password"}
-                    value={val}
-                    onChange={(e) => onKeyChange(key, e.target.value)}
-                    placeholder={placeholder}
-                    className="flex-1 px-2 py-1 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
-                    style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  />
-                  {val && (
-                    <button
-                      onClick={() =>
-                        setVisible((v) => ({ ...v, [key]: !v[key] }))
-                      }
-                      className="text-pane-text-secondary/40 hover:text-pane-text-secondary shrink-0"
-                      title={isVisible ? "Hide" : "Show"}
+                  <div className="flex items-center gap-2 min-w-0">
+                    <motion.svg
+                      animate={{ rotate: isExpanded ? 90 : 0 }}
+                      transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+                      width="10"
+                      height="10"
+                      viewBox="0 0 10 10"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      className="text-pane-text-secondary/30 shrink-0"
                     >
-                      {isVisible ? (
-                        <svg
-                          width="14"
-                          height="14"
-                          viewBox="0 0 14 14"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.4"
-                          strokeLinecap="round"
-                        >
-                          <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
-                          <circle cx="7" cy="7" r="1.5" />
-                        </svg>
-                      ) : (
-                        <svg
-                          width="14"
-                          height="14"
-                          viewBox="0 0 14 14"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.4"
-                          strokeLinecap="round"
-                        >
-                          <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
-                          <circle cx="7" cy="7" r="1.5" />
-                          <path d="M2 2l10 10" />
-                        </svg>
-                      )}
-                    </button>
-                  )}
-                  {val && (
+                      <path d="M3 2L6 5L3 8" />
+                    </motion.svg>
                     <span
-                      className="text-pane-text-secondary/30 font-mono shrink-0"
+                      className="text-pane-text font-mono truncate"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {label}
+                    </span>
+                    <span
+                      className="text-pane-text-secondary/25 font-mono shrink-0"
                       style={{ fontSize: "var(--pane-font-size-xs)" }}
                     >
                       ••••{val.slice(-4)}
                     </span>
+                  </div>
+                  <div className="flex items-center gap-2.5 shrink-0">
+                    <a
+                      href={docsUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-pane-text-secondary/25 hover:text-pane-text-secondary font-mono transition-colors"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      ↗
+                    </a>
+                    <ProviderToggle toggleKey={toggleKey} label={label} />
+                  </div>
+                </button>
+
+                {/* Expanded content */}
+                <AnimatePresence initial={false}>
+                  {isExpanded && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.2, ease: [0.2, 0, 0, 1] }}
+                      className="overflow-hidden"
+                    >
+                      <div className="p-3 pt-2 border-t border-pane-border/30 bg-pane-bg/30 flex flex-col gap-2">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type={isVisible ? "text" : "password"}
+                            value={val}
+                            onChange={(e) => onKeyChange(key, e.target.value)}
+                            placeholder={placeholder}
+                            className="flex-1 px-2 py-1 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
+                            style={{ fontSize: "var(--pane-font-size-xs)" }}
+                          />
+                          {val && (
+                            <button
+                              onClick={() => setVisible((v) => ({ ...v, [key]: !v[key] }))}
+                              className="text-pane-text-secondary/40 hover:text-pane-text-secondary shrink-0"
+                            >
+                              {isVisible ? (
+                                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+                                  <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
+                                  <circle cx="7" cy="7" r="1.5" />
+                                </svg>
+                              ) : (
+                                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+                                  <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
+                                  <circle cx="7" cy="7" r="1.5" />
+                                  <path d="M2 2l10 10" />
+                                </svg>
+                              )}
+                            </button>
+                          )}
+                        </div>
+                        {showBaseUrl && (
+                          <div className="flex items-center gap-2 pl-4 border-l border-pane-border/20">
+                            <span
+                              className="text-pane-text-secondary/40 font-mono whitespace-nowrap"
+                              style={{ fontSize: "var(--pane-font-size-xs)" }}
+                            >
+                              base url
+                            </span>
+                            <input
+                              type="text"
+                              value={baseUrl}
+                              onChange={(e) => onBaseUrlChange?.(key, e.target.value)}
+                              placeholder={defaultBaseUrl || "https://..."}
+                              className="flex-1 px-2 py-0.5 rounded-lg font-mono text-pane-text-secondary border border-pane-border/20 hover:border-pane-border/40 outline-none placeholder:text-pane-text-secondary/20 bg-transparent"
+                              style={{ fontSize: "var(--pane-font-size-xs)" }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    </motion.div>
                   )}
-                </div>
-                {showBaseUrl && (
-                  <div className="flex items-center gap-2 pl-4 border-l border-pane-border/20">
+                </AnimatePresence>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Available providers */}
+      {availableProviders.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <span
+            className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            available
+          </span>
+          {availableProviders.map((p) => {
+            const { key, label, placeholder, docsUrl } = p;
+            const showBaseUrl = (p as any).showBaseUrl;
+            const defaultBaseUrl = (p as any).defaultBaseUrl;
+            const isExpanded = expandedAvailable === key;
+
+            return (
+              <div key={key} className={`rounded-lg overflow-hidden ring-1 transition-colors ${isExpanded ? "ring-pane-border/30" : "ring-pane-border/10 hover:ring-pane-border/20"}`}>
+                {/* Compact row — click to expand */}
+                <button
+                  onClick={() => setExpandedAvailable(isExpanded ? null : key)}
+                  className={`flex items-center justify-between w-full py-2 px-3 transition-all ${isExpanded ? "bg-pane-bg" : "bg-pane-bg/30 hover:bg-pane-bg/50 active:bg-pane-bg/60"}`}
+                >
+                  <div className="flex items-center gap-2">
+                    <motion.svg
+                      animate={{ rotate: isExpanded ? 90 : 0 }}
+                      transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+                      width="10"
+                      height="10"
+                      viewBox="0 0 10 10"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      className="text-pane-text-secondary/15 shrink-0"
+                    >
+                      <path d="M3 2L6 5L3 8" />
+                    </motion.svg>
                     <span
-                      className="text-pane-text-secondary/40 font-mono whitespace-nowrap"
+                      className="text-pane-text-secondary/50 font-mono"
                       style={{ fontSize: "var(--pane-font-size-xs)" }}
                     >
-                      base url
+                      {label}
                     </span>
-                    <input
-                      type="text"
-                      value={baseUrl}
-                      onChange={(e) => onBaseUrlChange?.(key, e.target.value)}
-                      placeholder="https://api.xiaomimimo.com/v1"
-                      className="flex-1 px-2 py-0.5 rounded-lg font-mono text-pane-text-secondary border border-pane-border/20 hover:border-pane-border/40 outline-none placeholder:text-pane-text-secondary/20 bg-transparent"
-                      style={{ fontSize: "var(--pane-font-size-xs)" }}
-                    />
                   </div>
-                )}
+                  <a
+                    href={docsUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-pane-text-secondary/15 hover:text-pane-text-secondary/50 font-mono transition-colors"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    get key ↗
+                  </a>
+                </button>
+
+                {/* Expanded fields — appears when clicked */}
+                <AnimatePresence initial={false}>
+                  {isExpanded && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.2, ease: [0.2, 0, 0, 1] }}
+                      className="overflow-hidden"
+                    >
+                      <div className="p-3 pt-2 border-t border-pane-border/30 bg-pane-bg/30 flex flex-col gap-2">
+                        <input
+                          ref={inputRef}
+                          type="password"
+                          value={httpApiKeys[key] || ""}
+                          onChange={(e) => onKeyChange(key, e.target.value)}
+                          placeholder={placeholder}
+                          autoFocus
+                          className="flex-1 px-2 py-1 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
+                          style={{ fontSize: "var(--pane-font-size-xs)" }}
+                        />
+                        {showBaseUrl && (
+                          <div className="flex items-center gap-2 pl-4 border-l border-pane-border/20">
+                            <span
+                              className="text-pane-text-secondary/40 font-mono whitespace-nowrap"
+                              style={{ fontSize: "var(--pane-font-size-xs)" }}
+                            >
+                              base url
+                            </span>
+                            <input
+                              type="text"
+                              value={httpBaseUrls[key] || ""}
+                              onChange={(e) => onBaseUrlChange?.(key, e.target.value)}
+                              placeholder={defaultBaseUrl || "https://..."}
+                              className="flex-1 px-2 py-0.5 rounded-lg font-mono text-pane-text-secondary border border-pane-border/20 hover:border-pane-border/40 outline-none placeholder:text-pane-text-secondary/20 bg-transparent"
+                              style={{ fontSize: "var(--pane-font-size-xs)" }}
+                            />
+                          </div>
+                        )}
+                        <span
+                          className="text-pane-text-secondary/25 font-mono"
+                          style={{ fontSize: "var(--pane-font-size-xs)" }}
+                        >
+                          paste your key — it saves automatically
+                        </span>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Empty state */}
+      {activeProviders.length === 0 && availableProviders.length === 0 && (
+        <span
+          className="text-pane-text-secondary/30 font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          no providers
+        </span>
+      )}
+
       <span
-        className="text-pane-text-secondary/40 font-mono"
+        className="text-pane-text-secondary/30 font-mono"
         style={{ fontSize: "var(--pane-font-size-xs)" }}
       >
         saved automatically
@@ -1399,7 +1556,6 @@ export function Profile() {
   const setTheme = useWorkspaceStore((s) => s.setTheme);
   const completionSound = useWorkspaceStore((s) => s.completionSound);
   const setCompletionSound = useWorkspaceStore((s) => s.setCompletionSound);
-  const playCompletionSound = useWorkspaceStore((s) => s.playCompletionSound);
   const punkBackend = useWorkspaceStore((s) => s.punkBackend);
   const httpApiKeys = useWorkspaceStore((s) => s.httpApiKeys);
   const setHttpApiKeys = useWorkspaceStore((s) => s.setHttpApiKeys);
@@ -1411,6 +1567,8 @@ export function Profile() {
 
   const [philosophy, setPhilosophy] = useState("");
   const [rules, setRules] = useState("");
+  const [hoveredTheme, setHoveredTheme] = useState<string | null>(null);
+  const [showFineTune, setShowFineTune] = useState(false);
   const philosophySaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Accordion state - only one section expanded at a time
@@ -1731,155 +1889,6 @@ export function Profile() {
           </div>
         </AccordionSection>
 
-        {/* Claude Section */}
-        <AccordionSection
-          title="claude"
-          icon={icons.claude}
-          isExpanded={expandedSection === "claude"}
-          onToggle={() => setExpandedSection(expandedSection === "claude" ? null : "claude")}
-        >
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full flex-shrink-0 ${isClaudeAuthenticated ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
-                <span
-                  className={`font-mono ${isClaudeAuthenticated ? "text-[var(--pane-status-added)]" : "text-pane-text-secondary"}`}
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  {isClaudeAuthenticated
-                    ? (
-                        // Priority: direct auth displayName > direct auth email > SDK email > "connected"
-                        claudeAuthState?.account?.displayName ||
-                        claudeAuthState?.account?.email ||
-                        sdkAccount?.email ||
-                        (sdkAccount as any)?.organization ||
-                        "connected"
-                      )
-                    : "not signed in"}
-                </span>
-              </div>
-              {isClaudeAuthenticated ? (
-                <button
-                  onClick={() =>
-                    claudeSignout()
-                      .then(() => {
-                        setClaudeAuthState({ authenticated: false, account: null });
-                        useWorkspaceStore.getState().setSdkInfo(null, null);
-                        useWorkspaceStore.getState().setRateLimitInfo(null);
-                      })
-                      .catch(() => {})
-                  }
-                  className="font-mono text-pane-text-secondary/60 hover:text-pane-text-secondary transition-colors"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  sign out
-                </button>
-              ) : (
-                <button
-                  onClick={() => {
-                    if (claudeSigningIn) return;
-                    setClaudeSigningIn(true);
-                    setClaudeSigninStatus([]);
-                    claudeSignin()
-                      .then((result) => {
-                        if (result?.success) {
-                          // Refresh auth state from ~/.claude.json
-                          getClaudeAuthState().then((state) => {
-                            if (state) setClaudeAuthState(state);
-                          }).catch(() => {});
-                          // Also trigger prefetch to update SDK account info
-                          reinitializePunkBackend("claude-code").catch(() => {});
-                        }
-                      })
-                      .catch(() => {})
-                      .finally(() => {
-                        setClaudeSigningIn(false);
-                        setClaudeSigninStatus([]);
-                      });
-                  }}
-                  className="font-mono text-pane-text-secondary hover:text-pane-text transition-colors"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  {claudeSigningIn ? "signing in…" : "sign in"}
-                </button>
-              )}
-            </div>
-
-            {!isClaudeAuthenticated && claudeSigningIn && claudeSigninStatus.length > 0 && (
-              <div className="flex flex-col gap-1">
-                {claudeSigninStatus.map((line, i) => (
-                  <span key={i} className="font-mono text-pane-text-secondary/60 break-all" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    {line}
-                  </span>
-                ))}
-              </div>
-            )}
-
-            {isClaudeAuthenticated && (() => {
-              // Show billing type from direct auth (most reliable) or SDK account
-              const billing =
-                claudeAuthState?.account?.billingType ||
-                (sdkAccount as any)?.billingType ||
-                null;
-              const plan =
-                sdkAccount?.subscription ||
-                (sdkAccount as any)?.subscriptionType ||
-                (sdkAccount as any)?.planType ||
-                (billing === "stripe_subscription" ? "max" : null) ||
-                null;
-              return plan ? (
-                <div className="flex items-center justify-between">
-                  <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>plan</span>
-                  <span className="font-mono text-[var(--pane-status-added)]" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    {plan}
-                  </span>
-                </div>
-              ) : null;
-            })()}
-
-            {isClaudeAuthenticated && (() => {
-              // utilization arrives only on allowed_warning / rejected events (~60%+).
-              // Don't pretend we know usage is 0% — show "—" until real data lands.
-              const util = rateLimitInfo?.utilization ?? null;
-              const pct = util != null ? Math.round(util * 100) : null;
-              const hasData = util != null;
-              const barColor =
-                util != null && util >= 0.85 ? "bg-pane-error" :
-                util != null && util >= 0.7  ? "bg-pane-status-modified" :
-                "bg-pane-status-added";
-              const textColor =
-                util != null && util >= 0.85 ? "text-pane-error" :
-                util != null && util >= 0.7  ? "text-[var(--pane-status-modified)]" :
-                hasData                      ? "text-[var(--pane-status-added)]" :
-                "text-pane-text-secondary/40";
-              return (
-                <>
-                  <div className="flex items-center justify-between">
-                    <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>session</span>
-                    <span className={`font-mono tabular-nums ${textColor}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      {hasData ? `${pct}%` : "—"}
-                    </span>
-                  </div>
-                  <div className="h-1.5 w-full bg-pane-text/[0.06] rounded-full overflow-hidden">
-                    <div
-                      className={`h-full rounded-full transition-all ${hasData ? barColor : ""}`}
-                      style={{ width: hasData ? `${Math.min(100, pct!)}%` : "0%" }}
-                    />
-                  </div>
-                  {rateLimitInfo?.resetsAt != null && (
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>resets</span>
-                      <span className="font-mono text-[var(--pane-status-added)] tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                        {formatResetTime(rateLimitInfo.resetsAt)}
-                      </span>
-                    </div>
-                  )}
-                </>
-              );
-            })()}
-          </div>
-        </AccordionSection>
-
         {/* Usage Section */}
         <AccordionSection
           title="usage & spend"
@@ -1968,29 +1977,43 @@ export function Profile() {
           isExpanded={expandedSection === "appearance"}
           onToggle={() => setExpandedSection(expandedSection === "appearance" ? null : "appearance")}
         >
-          <div className="flex flex-col gap-4">
-            <div className="flex items-center justify-between">
-              <span className="text-pane-text-secondary/60 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                theme
-              </span>
-              <div className="flex gap-1">
+          <div className="flex flex-col gap-0">
+            {/* Theme — circles, filled when active, hollow when inactive, name appears below */}
+            <div className="flex flex-col items-center gap-2 py-4">
+              <div className="flex items-center gap-3">
                 {(["system", "dark", "light", "pure", "glass"] as const).map((t) => (
                   <button
                     key={t}
                     onClick={() => setTheme(t)}
-                    className={`px-3 py-1 rounded-lg font-mono ${theme === t ? "bg-pane-text/[0.12] text-pane-text ring-1 ring-pane-text/20" : "text-pane-text-secondary/40 hover:text-pane-text-secondary hover:bg-pane-text/[0.04]"}`}
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  >
-                    {t}
-                  </button>
+                    onMouseEnter={() => setHoveredTheme(t)}
+                    onMouseLeave={() => setHoveredTheme(null)}
+                    className={`w-4 h-4 rounded-full transition-all duration-200 ${
+                      theme === t
+                        ? "bg-pane-text ring-2 ring-pane-text/30"
+                        : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"
+                    }`}
+                  />
                 ))}
               </div>
+              <span
+                className="text-pane-text-secondary/50 font-mono text-center"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                {hoveredTheme || theme}
+              </span>
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <span className="text-pane-text-secondary/60 font-mono block mb-2" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  chat font
+            {/* Separator */}
+            <div className="border-t border-pane-border/20" />
+
+            {/* Text size — primary control + weight, fine-tune for editor/panel */}
+            <div className="flex flex-col gap-3 py-4">
+              <div className="flex items-center justify-between">
+                <span
+                  className="text-pane-text-secondary/50 font-mono"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  text size
                 </span>
                 <FontSizeControl
                   value={fontSize}
@@ -1999,30 +2022,11 @@ export function Profile() {
                   onReset={() => useWorkspaceStore.getState().resetFontSize()}
                 />
               </div>
-              <div>
-                <span className="text-pane-text-secondary/60 font-mono block mb-2" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  editor font
-                </span>
-                <FontSizeControl
-                  value={editorFontSize}
-                  onIncrease={() => useWorkspaceStore.getState().increaseEditorFontSize()}
-                  onDecrease={() => useWorkspaceStore.getState().decreaseEditorFontSize()}
-                  onReset={() => useWorkspaceStore.getState().resetEditorFontSize()}
-                />
-              </div>
-              <div>
-                <span className="text-pane-text-secondary/60 font-mono block mb-2" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  panel font
-                </span>
-                <FontSizeControl
-                  value={panelFontSize}
-                  onIncrease={() => useWorkspaceStore.getState().increasePanelFontSize()}
-                  onDecrease={() => useWorkspaceStore.getState().decreasePanelFontSize()}
-                  onReset={() => useWorkspaceStore.getState().resetPanelFontSize()}
-                />
-              </div>
-              <div>
-                <span className="text-pane-text-secondary/60 font-mono block mb-2" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              <div className="flex items-center justify-between">
+                <span
+                  className="text-pane-text-secondary/50 font-mono"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
                   weight
                 </span>
                 <FontSizeControl
@@ -2033,40 +2037,110 @@ export function Profile() {
                   unit=""
                 />
               </div>
+
+              {/* Fine-tune toggle */}
+              <button
+                onClick={() => setShowFineTune(!showFineTune)}
+                className="flex items-center gap-1.5 text-pane-text-secondary/30 hover:text-pane-text-secondary/60 font-mono transition-colors self-start"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                <motion.svg
+                  animate={{ rotate: showFineTune ? 90 : 0 }}
+                  transition={{ duration: 0.2 }}
+                  width="10"
+                  height="10"
+                  viewBox="0 0 10 10"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                >
+                  <path d="M3 2L6 5L3 8" />
+                </motion.svg>
+                fine-tune
+              </button>
+              <AnimatePresence initial={false}>
+                {showFineTune && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.2, ease: [0.2, 0, 0, 1] }}
+                    className="overflow-hidden"
+                  >
+                    <div className="flex flex-col gap-2 pl-4 border-l border-pane-border/20">
+                      <div className="flex items-center justify-between">
+                        <span
+                          className="text-pane-text-secondary/40 font-mono"
+                          style={{ fontSize: "var(--pane-font-size-xs)" }}
+                        >
+                          editor
+                        </span>
+                        <FontSizeControl
+                          value={editorFontSize}
+                          onIncrease={() => useWorkspaceStore.getState().increaseEditorFontSize()}
+                          onDecrease={() => useWorkspaceStore.getState().decreaseEditorFontSize()}
+                          onReset={() => useWorkspaceStore.getState().resetEditorFontSize()}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span
+                          className="text-pane-text-secondary/40 font-mono"
+                          style={{ fontSize: "var(--pane-font-size-xs)" }}
+                        >
+                          panel
+                        </span>
+                        <FontSizeControl
+                          value={panelFontSize}
+                          onIncrease={() => useWorkspaceStore.getState().increasePanelFontSize()}
+                          onDecrease={() => useWorkspaceStore.getState().decreasePanelFontSize()}
+                          onReset={() => useWorkspaceStore.getState().resetPanelFontSize()}
+                        />
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </div>
 
-            <div className="flex items-center justify-between pt-2">
-              <span className="text-pane-text-secondary/60 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                sound
-              </span>
-              <div className="flex gap-1">
-                <select
-                  value={completionSound}
-                  onChange={(e) => setCompletionSound(e.target.value)}
-                  className="px-3 py-1.5 rounded-lg font-mono bg-pane-surface text-pane-text border border-pane-border/40 hover:border-pane-border outline-none"
-                  style={{ fontSize: "var(--pane-font-size-sm)" }}
-                >
-                  <option value="none">none</option>
-                  {[
-                    "Basso", "Blow", "Bottle", "Frog", "Funk", "Glass",
-                    "Hero", "Morse", "Ping", "Pop", "Purr", "Sosumi",
-                    "Submarine", "Tink",
-                  ].map((s) => (
-                    <option key={s} value={s}>
-                      {s.toLowerCase()}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  onClick={playCompletionSound}
-                  disabled={completionSound === "none"}
-                  className="px-3 py-1.5 rounded-lg font-mono text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04] disabled:opacity-30 disabled:cursor-default"
-                  style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  title="Test sound"
-                >
-                  ▶
-                </button>
+            {/* Separator */}
+            <div className="border-t border-pane-border/20" />
+
+            {/* Sound — three dots: none / subtle / present. Clicking plays immediately */}
+            <div className="flex flex-col items-center gap-2 py-4">
+              <div className="flex items-center gap-3">
+                {[
+                  { id: "none", label: "none" },
+                  { id: "Tink", label: "subtle" },
+                  { id: "Pop", label: "present" },
+                ].map((s) => {
+                  const isActive = s.id === "Pop"
+                    ? completionSound !== "none" && completionSound !== "Tink"
+                    : completionSound === s.id;
+                  return (
+                    <button
+                      key={s.id}
+                      onClick={() => {
+                        setCompletionSound(s.id);
+                        if (s.id !== "none") {
+                          (window as any).electronAPI.invoke("play_sound", { sound: s.id });
+                        }
+                      }}
+                      className={`w-4 h-4 rounded-full transition-all duration-200 ${
+                        isActive
+                          ? "bg-pane-text ring-2 ring-pane-text/30"
+                          : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"
+                      }`}
+                    />
+                  );
+                })}
               </div>
+              <span
+                className="text-pane-text-secondary/50 font-mono text-center"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                {completionSound === "none" ? "none" : completionSound === "Tink" ? "subtle" : "present"}
+              </span>
             </div>
           </div>
         </AccordionSection>
@@ -2096,33 +2170,182 @@ export function Profile() {
           <CloudSection />
         </AccordionSection>
 
-        {/* Integrations — external CLIs, only when available */}
-        {geminiAvailable && (
-          <AccordionSection
-            title="integrations"
-            icon={icons.integrations}
-            isExpanded={expandedSection === "integrations"}
-            onToggle={() => setExpandedSection(expandedSection === "integrations" ? null : "integrations")}
-          >
-            <div className="flex flex-col gap-2">
-              {CLI_PROVIDERS.map(({ key, label }) => (
-                <div key={key} className={`flex items-center justify-between ${disabledProviders.includes(key) ? "opacity-40" : ""}`}>
+        {/* Integrations Section */}
+        <AccordionSection
+          title="integrations"
+          icon={icons.integrations}
+          isExpanded={expandedSection === "integrations"}
+          onToggle={() => setExpandedSection(expandedSection === "integrations" ? null : "integrations")}
+        >
+          <div className="flex flex-col gap-6">
+            {/* Claude */}
+            <div>
+              <div className="flex items-center gap-2 mb-3">
+                <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>claude</span>
+              </div>
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => toggleProvider(key)}
-                      className={`w-3 h-3 rounded-full ring-1 transition-colors ${
-                        disabledProviders.includes(key) ? "bg-transparent ring-pane-text-secondary/30" : "bg-pane-status-added ring-pane-status-added"
-                      }`}
-                      title={disabledProviders.includes(key) ? `enable ${label}` : `disable ${label}`}
-                    />
-                    <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-xs)" }}>{label}</span>
+                    <div className={`w-2 h-2 rounded-full flex-shrink-0 ${isClaudeAuthenticated ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
+                    <span
+                      className={`font-mono ${isClaudeAuthenticated ? "text-[var(--pane-status-added)]" : "text-pane-text-secondary"}`}
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {isClaudeAuthenticated
+                        ? (
+                            claudeAuthState?.account?.displayName ||
+                            claudeAuthState?.account?.email ||
+                            sdkAccount?.email ||
+                            (sdkAccount as any)?.organization ||
+                            "connected"
+                          )
+                        : "not signed in"}
+                    </span>
                   </div>
-                  <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>available</span>
+                  {isClaudeAuthenticated ? (
+                    <button
+                      onClick={() =>
+                        claudeSignout()
+                          .then(() => {
+                            setClaudeAuthState({ authenticated: false, account: null });
+                            useWorkspaceStore.getState().setSdkInfo(null, null);
+                            useWorkspaceStore.getState().setRateLimitInfo(null);
+                          })
+                          .catch(() => {})
+                      }
+                      className="font-mono text-pane-text-secondary/60 hover:text-pane-text-secondary transition-colors"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      sign out
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => {
+                        if (claudeSigningIn) return;
+                        setClaudeSigningIn(true);
+                        setClaudeSigninStatus([]);
+                        claudeSignin()
+                          .then((result) => {
+                            if (result?.success) {
+                              getClaudeAuthState().then((state) => {
+                                if (state) setClaudeAuthState(state);
+                              }).catch(() => {});
+                              reinitializePunkBackend("claude-code").catch(() => {});
+                            }
+                          })
+                          .catch(() => {})
+                          .finally(() => {
+                            setClaudeSigningIn(false);
+                            setClaudeSigninStatus([]);
+                          });
+                      }}
+                      className="font-mono text-pane-text-secondary hover:text-pane-text transition-colors"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {claudeSigningIn ? "signing in…" : "sign in"}
+                    </button>
+                  )}
                 </div>
-              ))}
+
+                {!isClaudeAuthenticated && claudeSigningIn && claudeSigninStatus.length > 0 && (
+                  <div className="flex flex-col gap-1">
+                    {claudeSigninStatus.map((line, i) => (
+                      <span key={i} className="font-mono text-pane-text-secondary/60 break-all" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                        {line}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {isClaudeAuthenticated && (() => {
+                  const billing =
+                    claudeAuthState?.account?.billingType ||
+                    (sdkAccount as any)?.billingType ||
+                    null;
+                  const plan =
+                    sdkAccount?.subscription ||
+                    (sdkAccount as any)?.subscriptionType ||
+                    (sdkAccount as any)?.planType ||
+                    (billing === "stripe_subscription" ? "max" : null) ||
+                    null;
+                  return plan ? (
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>plan</span>
+                      <span className="font-mono text-[var(--pane-status-added)]" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                        {plan}
+                      </span>
+                    </div>
+                  ) : null;
+                })()}
+
+                {isClaudeAuthenticated && (() => {
+                  const util = rateLimitInfo?.utilization ?? null;
+                  const pct = util != null ? Math.round(util * 100) : null;
+                  const hasData = util != null;
+                  const barColor =
+                    util != null && util >= 0.85 ? "bg-pane-error" :
+                    util != null && util >= 0.7  ? "bg-pane-status-modified" :
+                    "bg-pane-status-added";
+                  const textColor =
+                    util != null && util >= 0.85 ? "text-pane-error" :
+                    util != null && util >= 0.7  ? "text-[var(--pane-status-modified)]" :
+                    hasData                      ? "text-[var(--pane-status-added)]" :
+                    "text-pane-text-secondary/40";
+                  return (
+                    <>
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>session</span>
+                        <span className={`font-mono tabular-nums ${textColor}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                          {hasData ? `${pct}%` : "—"}
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full bg-pane-text/[0.06] rounded-full overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all ${hasData ? barColor : ""}`}
+                          style={{ width: hasData ? `${Math.min(100, pct!)}%` : "0%" }}
+                        />
+                      </div>
+                      {rateLimitInfo?.resetsAt != null && (
+                        <div className="flex items-center justify-between">
+                          <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>resets</span>
+                          <span className="font-mono text-[var(--pane-status-added)] tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                            {formatResetTime(rateLimitInfo.resetsAt)}
+                          </span>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
             </div>
-          </AccordionSection>
-        )}
+
+            {/* Gemini CLI */}
+            {geminiAvailable && (
+              <div>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>gemini</span>
+                </div>
+                <div className="flex flex-col gap-2">
+                  {CLI_PROVIDERS.map(({ key, label }) => (
+                    <div key={key} className={`flex items-center justify-between ${disabledProviders.includes(key) ? "opacity-40" : ""}`}>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => toggleProvider(key)}
+                          className={`w-3 h-3 rounded-full ring-1 transition-colors ${
+                            disabledProviders.includes(key) ? "bg-transparent ring-pane-text-secondary/30" : "bg-pane-status-added ring-pane-status-added"
+                          }`}
+                          title={disabledProviders.includes(key) ? `enable ${label}` : `disable ${label}`}
+                        />
+                        <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-xs)" }}>{label}</span>
+                      </div>
+                      <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>available</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </AccordionSection>
       </div>
     </div>
   );
