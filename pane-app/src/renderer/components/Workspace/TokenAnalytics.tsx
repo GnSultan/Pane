@@ -289,54 +289,57 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
 
               return (
                 <div key={provider} className="flex flex-col gap-1">
-                  {/* Collapsed/expanded row — click to toggle */}
+                  {/* Collapsed row — thick proportion bar, no stats */}
                   <div
-                    className="flex items-center gap-3 cursor-pointer select-none px-0.5 py-1 rounded-lg hover:bg-pane-text/[0.02] transition-colors"
+                    className="flex items-center gap-3 cursor-pointer select-none group"
                     onClick={() => toggleProvider(provider)}
                   >
-                    <span className="w-3 text-center font-mono text-pane-text-secondary/40" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                    <span className="w-3 text-center font-mono text-pane-text-secondary/40 shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                       {isExpanded ? "▾" : "▸"}
                     </span>
-                    <span className="font-mono text-pane-text text-sm">{providerLabel}</span>
+                    <span className="font-mono text-pane-text text-sm w-[110px] shrink-0">{providerLabel}</span>
 
-                    {groupedData.length > 1 && (
-                      <>
-                        <div className="flex-1 h-1 bg-pane-text/[0.04] rounded-full overflow-hidden max-w-[120px]">
-                          <div
-                            className="h-full bg-pane-text/15 rounded-full"
-                            style={{ width: `${providerPct}%` }}
-                          />
-                        </div>
-                        <span className="font-mono text-pane-text-secondary/50 tabular-nums w-9 text-right" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                          {providerPct}%
-                        </span>
-                      </>
+                    {groupedData.length > 1 ? (
+                      <div className="flex-1 h-6 bg-pane-text/[0.03] rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-pane-text/10 rounded-full transition-all duration-200"
+                          style={{ width: `${providerPct}%` }}
+                        />
+                      </div>
+                    ) : (
+                      <div className="flex-1" />
                     )}
 
-                    <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      {formatTokens(totalTokens)} total · {total.calls} calls
+                    <span className="font-mono text-pane-text-secondary/60 tabular-nums w-10 text-right shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      {providerPct}%
                     </span>
-                    <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      {formatCost(total.cost)}
-                    </span>
-
-                    {link && (
-                      <a
-                        href={link.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={e => e.stopPropagation()}
-                        className="font-mono text-pane-text-secondary/30 hover:text-pane-text-secondary transition-colors ml-auto"
-                        style={{ fontSize: "var(--pane-font-size-xs)" }}
-                      >
-                        ↗
-                      </a>
-                    )}
                   </div>
 
-                  {/* Expanded model rows */}
+                  {/* Expanded detail — stats + model rows under left border */}
                   {isExpanded && (
-                    <div className="flex flex-col gap-0.5 ml-5 pl-3 border-l border-pane-border/10">
+                    <div className="ml-5 pl-3 border-l border-pane-border/10 flex flex-col gap-0.5">
+                      {/* Stats strip */}
+                      <div className="flex items-center gap-4 px-3 py-0.5">
+                        <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                          {formatTokens(totalTokens)} total · {total.calls} calls
+                        </span>
+                        <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                          {formatCost(total.cost)}
+                        </span>
+                        {link && (
+                          <a
+                            href={link.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="font-mono text-pane-text-secondary/30 hover:text-pane-text-secondary transition-colors"
+                            style={{ fontSize: "var(--pane-font-size-xs)" }}
+                          >
+                            ↗ {link.label}
+                          </a>
+                        )}
+                      </div>
+
+                      {/* Model rows */}
                       {rows.map((row) => {
                         const totalInput = row.total_input_tokens + row.total_cache_read;
                         const cacheHit = totalInput > 0
