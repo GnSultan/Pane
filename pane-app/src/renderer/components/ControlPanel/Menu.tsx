@@ -187,7 +187,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
     setOpen(false);
   }, [onSelectMode]);
 
-  const triggerSize = position === "workspace" ? "w-8 h-8" : "w-7 h-7";
+  const triggerSize = position === "workspace" ? "w-8 h-8" : "w-6 h-6";
   return (
     <div
       ref={menuRef}
