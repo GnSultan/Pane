@@ -1,4 +1,5 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import { getTokenAnalytics, getTokenTimeSeries, getModelRates, type TokenAnalyticsRow, type TokenTimeSeriesRow } from "../../lib/tauri-commands";
 import { useWorkspaceStore } from "../../stores/workspace";
 
@@ -94,15 +95,7 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
   const [timeSeries, setTimeSeries] = useState<TokenTimeSeriesRow[]>([]);
   const [rates, setRates] = useState<Record<string, { input: number; output: number; cache_read?: number } | null>>({});
   const [range, setRange] = useState<TimeRange>("month");
-  const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
-  const toggleProvider = useCallback((provider: string) => {
-    setExpandedProviders(prev => {
-      const next = new Set(prev);
-      if (next.has(provider)) next.delete(provider);
-      else next.add(provider);
-      return next;
-    });
-  }, []);
+  const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const lastTokenUsageAt = useWorkspaceStore((s) => s.lastTokenUsageAt);
 
@@ -278,26 +271,23 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
             <span className="text-pane-text-secondary font-mono text-xs">no usage data for this period</span>
           </div>
         ) : (
-          <div className="flex flex-col gap-8">
+          <div className="flex flex-col gap-4">
             {groupedData.map(({ provider, rows, total }) => {
               const link = PROVIDER_LINKS[provider];
               const providerLabel = link?.label ?? provider.charAt(0).toUpperCase() + provider.slice(1);
               const totalTokens = total.input + total.output;
               const totalAllTokens = totals.input + totals.output;
               const providerPct = totalAllTokens > 0 ? Math.round((totalTokens / totalAllTokens) * 100) : 0;
-              const isExpanded = expandedProviders.has(provider);
+              const isExpanded = expandedProvider === provider;
 
               return (
-                <div key={provider} className="flex flex-col gap-1">
-                  {/* Collapsed row — thick proportion bar, no stats */}
-                  <div
-                    className="flex items-center gap-3 cursor-pointer select-none group"
-                    onClick={() => toggleProvider(provider)}
+                <div key={provider} className="rounded-lg overflow-hidden ring-1 ring-pane-border/30 transition-colors">
+                  {/* Header — click to toggle */}
+                  <button
+                    onClick={() => setExpandedProvider(isExpanded ? null : provider)}
+                    className="flex items-center gap-3 w-full group py-2 px-4 bg-pane-bg hover:bg-pane-bg/80 active:bg-pane-bg/60 transition-all"
                   >
-                    <span className="w-3 text-center font-mono text-pane-text-secondary/40 shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      {isExpanded ? "▾" : "▸"}
-                    </span>
-                    <span className="font-mono text-pane-text text-sm w-[110px] shrink-0">{providerLabel}</span>
+                    <span className="font-mono text-pane-text text-sm w-[110px] shrink-0 text-left">{providerLabel}</span>
 
                     {groupedData.length > 1 ? (
                       <div className="flex-1 h-6 bg-pane-text/[0.03] rounded-full overflow-hidden">
@@ -313,82 +303,102 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                     <span className="font-mono text-pane-text-secondary/60 tabular-nums w-10 text-right shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                       {providerPct}%
                     </span>
-                  </div>
 
-                  {/* Expanded detail — stats + model rows under left border */}
-                  {isExpanded && (
-                    <div className="ml-5 pl-3 border-l border-pane-border/10 flex flex-col gap-0.5">
-                      {/* Stats strip */}
-                      <div className="flex items-center gap-4 px-3 py-0.5">
-                        <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                          {formatTokens(totalTokens)} total · {total.calls} calls
-                        </span>
-                        <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                          {formatCost(total.cost)}
-                        </span>
-                        {link && (
-                          <a
-                            href={link.url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="font-mono text-pane-text-secondary/30 hover:text-pane-text-secondary transition-colors"
-                            style={{ fontSize: "var(--pane-font-size-xs)" }}
-                          >
-                            ↗ {link.label}
-                          </a>
-                        )}
-                      </div>
+                    <motion.svg
+                      animate={{ rotate: isExpanded ? 180 : 0 }}
+                      transition={{ duration: 0.3, ease: [0.4, 0, 0.2, 1] }}
+                      width="12" height="12" viewBox="0 0 12 12" fill="none"
+                      stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+                      className="text-pane-text-secondary/40 group-hover:text-pane-text-secondary"
+                    >
+                      <path d="M3 4.5L6 7.5L9 4.5" />
+                    </motion.svg>
+                  </button>
 
-                      {/* Model rows */}
-                      {rows.map((row) => {
-                        const totalInput = row.total_input_tokens + row.total_cache_read;
-                        const cacheHit = totalInput > 0
-                          ? Math.round((row.total_cache_read / totalInput) * 100)
-                          : 0;
-                        return (
-                          <div key={`${row.model}-${row.provider}-${row.activity_type}`}
-                            className="flex items-center justify-between py-1.5 px-3 rounded-lg bg-pane-surface/30">
-                            <span className="font-mono text-pane-text truncate" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                              {row.model.split("/").pop()}
-                              {row.provider !== provider && (
-                                <span className="text-pane-text-secondary"> · {row.provider}</span>
-                              )}
+                  {/* Expanded content */}
+                  <AnimatePresence initial={false}>
+                    {isExpanded && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.3, ease: [0.2, 0, 0, 1] }}
+                        className="overflow-hidden"
+                      >
+                        <div className="p-4 bg-pane-bg/30 border-t border-pane-border/30 flex flex-col gap-3">
+                          {/* Stats strip */}
+                          <div className="flex items-center gap-4">
+                            <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                              {formatTokens(totalTokens)} total · {total.calls} calls
                             </span>
-                            <div className="flex items-center gap-3 shrink-0">
-                              <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                {row.call_count} calls
-                              </span>
-                              <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                {formatTokens(row.total_input_tokens)} / {formatTokens(row.total_output_tokens)}
-                              </span>
-                              <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                {formatCost(row.total_cost_usd)}
-                                {row.unknown_cost_count > 0 && (
-                                  <span className="text-pane-text-secondary/40 ml-0.5" title={`${row.unknown_cost_count} calls with unknown pricing`}>?</span>
-                                )}
-                              </span>
-                              {cacheHit > 0 && (
-                                <span className="font-mono text-pane-status-added tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                  {cacheHit}%
-                                </span>
-                              )}
-                            </div>
+                            <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                              {formatCost(total.cost)}
+                            </span>
+                            {link && (
+                              <a
+                                href={link.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="font-mono text-pane-text-secondary/30 hover:text-pane-text-secondary transition-colors"
+                                style={{ fontSize: "var(--pane-font-size-xs)" }}
+                              >
+                                ↗ {link.label}
+                              </a>
+                            )}
                           </div>
-                        );
-                      })}
 
-                      {/* Provider totals row */}
-                      <div className="flex items-center justify-between px-3 pt-1.5 pb-0.5 mt-0.5 border-t border-pane-border/10">
-                        <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                          Total · {total.modelCount} {total.modelCount === 1 ? "model" : "models"} · {total.calls} calls
-                        </span>
-                        <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                          {formatTokens(total.input)} / {formatTokens(total.output)}
-                          <span className="text-pane-text-secondary ml-2">{formatCost(total.cost)}</span>
-                        </span>
-                      </div>
-                    </div>
-                  )}
+                          {/* Model rows */}
+                          {rows.map((row) => {
+                            const totalInput = row.total_input_tokens + row.total_cache_read;
+                            const cacheHit = totalInput > 0
+                              ? Math.round((row.total_cache_read / totalInput) * 100)
+                              : 0;
+                            return (
+                              <div key={`${row.model}-${row.provider}-${row.activity_type}`}
+                                className="flex items-center justify-between py-1.5 px-3 rounded-lg bg-pane-surface/30">
+                                <span className="font-mono text-pane-text truncate" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                  {row.model.split("/").pop()}
+                                  {row.provider !== provider && (
+                                    <span className="text-pane-text-secondary"> · {row.provider}</span>
+                                  )}
+                                </span>
+                                <div className="flex items-center gap-3 shrink-0">
+                                  <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {row.call_count} calls
+                                  </span>
+                                  <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {formatTokens(row.total_input_tokens)} / {formatTokens(row.total_output_tokens)}
+                                  </span>
+                                  <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {formatCost(row.total_cost_usd)}
+                                    {row.unknown_cost_count > 0 && (
+                                      <span className="text-pane-text-secondary/40 ml-0.5" title={`${row.unknown_cost_count} calls with unknown pricing`}>?</span>
+                                    )}
+                                  </span>
+                                  {cacheHit > 0 && (
+                                    <span className="font-mono text-pane-status-added tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                      {cacheHit}%
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+
+                          {/* Provider totals row */}
+                          <div className="flex items-center justify-between pt-3 border-t border-pane-border/10">
+                            <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                              Total · {total.modelCount} {total.modelCount === 1 ? "model" : "models"} · {total.calls} calls
+                            </span>
+                            <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                              {formatTokens(total.input)} / {formatTokens(total.output)}
+                              <span className="text-pane-text-secondary ml-2">{formatCost(total.cost)}</span>
+                            </span>
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </div>
               );
             })}
