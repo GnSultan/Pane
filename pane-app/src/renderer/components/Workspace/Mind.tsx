@@ -447,7 +447,7 @@ export function Mind() {
     <div className="h-full relative">
       {/* Scrollable list view */}
       <div className="absolute inset-0 overflow-y-auto overflow-x-hidden custom-scrollbar">
-        <div className="max-w-[780px] mx-auto w-full px-10 pt-[35vh] pb-48">
+        <div className="mx-auto w-full px-10 pt-[35vh] pb-48">
           {/* ── Compose zone ── */}
           <div
             className={`rounded-xl ring-1 bg-pane-bg mb-12 transition-all cursor-text ring-pane-border/40`}

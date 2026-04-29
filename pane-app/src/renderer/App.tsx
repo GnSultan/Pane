@@ -47,9 +47,13 @@ function ResizeHandle() {
 }
 
 function App() {
-  const controlPanelVisible = useWorkspaceStore((s) => s.controlPanelVisible);
   const controlPanelWidth = useWorkspaceStore((s) => s.controlPanelWidth);
-  const toggleControlPanel = useWorkspaceStore((s) => s.toggleControlPanel);
+  // Sidebar visibility derived from active mode — shown only in conversation mode.
+  // When no project exists (empty state), sidebar is visible to show the thread list.
+  const sidebarVisible = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.mode === "conversation" : true;
+  });
   const toggleMind = () => {
     const { activeProjectId, setMode } = useProjectsStore.getState();
     if (activeProjectId) setMode(activeProjectId, "mind");
@@ -126,9 +130,15 @@ function App() {
       if (!finalAction) return;
 
       switch (finalAction) {
-        case "toggle-panel":
-          toggleControlPanel();
+        case "toggle-panel": {
+          // Cmd+B now goes to conversation mode — the conceptual equivalent of "showing the sidebar"
+          const { activeProjectId: pid, setMode: sm } = useProjectsStore.getState();
+          if (pid) {
+            sm(pid, "conversation");
+            requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-input")));
+          }
           break;
+        }
         case "toggle-mode": {
           const { activeProjectId, projects, toggleMode } =
             useProjectsStore.getState();
@@ -171,9 +181,10 @@ function App() {
           window.dispatchEvent(new CustomEvent("pane:focus-input"));
           break;
         case "new-file": {
-          const ws = useWorkspaceStore.getState();
-          if (!ws.controlPanelVisible) {
-            ws.toggleControlPanel();
+          const { activeProjectId: pid2, projects, setMode: sm2 } = useProjectsStore.getState();
+          const project = pid2 ? projects.get(pid2) : null;
+          if (project?.mode !== "conversation") {
+            if (pid2) sm2(pid2, "conversation");
             setTimeout(
               () => window.dispatchEvent(new CustomEvent("pane:new-file")),
               100,
@@ -311,7 +322,7 @@ function App() {
     // Capture phase so shortcuts fire before Ace editor eats them (e.g. Cmd+/)
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [toggleControlPanel]);
+  }, []);
 
   return (
     <div className="relative h-screen w-screen bg-pane-bg overflow-hidden">
@@ -322,7 +333,7 @@ function App() {
       />
 
       <div className="flex h-full pt-2 pb-2 pl-2 gap-1">
-        {controlPanelVisible && (
+        {sidebarVisible && (
           <>
             <div className="shrink-0" style={{ width: controlPanelWidth }}>
               <ControlPanel />

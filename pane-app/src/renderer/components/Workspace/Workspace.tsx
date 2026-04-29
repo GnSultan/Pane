@@ -9,6 +9,7 @@ import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
 import { FuzzyFinder } from "../FuzzyFinder/FuzzyFinder";
 import { FileSearch } from "../FileSearch/FileSearch";
 import { GitStatus } from "../ControlPanel/GitStatus";
+import { Menu, type PaneMode } from "../ControlPanel/Menu";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { detectProjectRoot } from "../../lib/tauri-commands";
@@ -174,6 +175,30 @@ export function Workspace() {
     });
   }, []);
 
+  const mode = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.mode ?? "conversation" : "conversation";
+  });
+  const isGitRepo = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.git.isGitRepo ?? false : false;
+  });
+  const hasUnreadLens = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.hasUnreadLens ?? false : false;
+  });
+  const setMode = useProjectsStore((s) => s.setMode);
+
+  const handleSelectMode = useCallback((newMode: PaneMode) => {
+    const id = useProjectsStore.getState().activeProjectId;
+    if (!id) return;
+    setMode(id, newMode);
+    if (newMode === "conversation") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-input")));
+    else if (newMode === "viewer") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-editor")));
+    else if (newMode === "search") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-search")));
+    else if (newMode === "filesearch") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-filesearch")));
+  }, [setMode]);
+
   return (
     <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
       {/* Conversation page — participates in the same [data-page] CSS system as every other page.
@@ -272,6 +297,18 @@ export function Workspace() {
         </div>
       )}
 
+      {/* Menu — shown in workspace when sidebar is hidden (non-conversation modes) */}
+      {mode !== "conversation" && (
+        <div className="absolute bottom-3 left-3 z-30">
+          <Menu
+            currentMode={mode}
+            isGitRepo={isGitRepo}
+            hasUnreadLens={hasUnreadLens}
+            onSelectMode={handleSelectMode}
+            position="workspace"
+          />
+        </div>
+      )}
     </div>
   );
 }

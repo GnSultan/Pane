@@ -1630,7 +1630,7 @@ export function Profile() {
       className="h-full overflow-y-auto overflow-x-hidden px-12 pt-8 pb-48 relative"
       data-no-drag
     >
-      <div className="max-w-xl mx-auto flex flex-col gap-y-8">
+      <div className="mx-auto flex flex-col gap-y-8">
         {/* Identity Section */}
         <AccordionSection
           title="identity"
