@@ -61,6 +61,14 @@ export interface Project {
   powerCombo?: PowerCombo;
   /** Per-project auto-route toggle. Undefined means "use workspace default". */
   autoEscalate?: boolean;
+  /** Per-project explicit model pin. When set, this project always uses
+   *  this model when auto-route is off, regardless of workspace default.
+   *  Undefined means "use workspace default selectedModel". */
+  selectedModel?: string;
+  /** Per-project model provider. Undefined means "use workspace default". */
+  selectedModelProvider?: string;
+  /** Per-project thinking override. Undefined means "use workspace default". */
+  selectedModelThinking?: boolean;
 }
 
 /**
@@ -275,6 +283,7 @@ interface ProjectsState {
   // Per-project routing
   setProjectPowerCombo: (projectId: string, combo: PowerCombo) => void;
   setProjectAutoEscalate: (projectId: string, autoEscalate: boolean) => void;
+  setProjectSelectedModel: (projectId: string, model: string, thinking: boolean, provider?: string) => void;
   getProjectEffectiveCombo: (projectId: string) => PowerCombo;
 
   // Checkpoints
@@ -1059,6 +1068,15 @@ function createProjectsStore() {
     setProjectAutoEscalate: (projectId, autoEscalate) =>
       set((state) =>
         updateProject(state, projectId, () => ({ autoEscalate })),
+      ),
+
+    setProjectSelectedModel: (projectId, model, thinking, provider) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          selectedModel: model,
+          selectedModelThinking: thinking,
+          selectedModelProvider: provider,
+        })),
       ),
 
     getProjectEffectiveCombo: (projectId) => {

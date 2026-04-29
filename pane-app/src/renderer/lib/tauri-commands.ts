@@ -243,6 +243,12 @@ export interface ProjectSessionState {
   power_combo?: PowerCombo;
   /** Per-project auto-route toggle. */
   auto_escalate?: boolean;
+  /** Per-project explicit model pin. */
+  selected_model?: string;
+  /** Per-project model provider. */
+  selected_model_provider?: string;
+  /** Per-project thinking override. */
+  selected_model_thinking?: boolean;
 }
 
 export interface UserSettings {

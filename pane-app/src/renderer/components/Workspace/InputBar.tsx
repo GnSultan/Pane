@@ -762,10 +762,15 @@ export function InputBar({
       (s) => s.projects.get(projectId)?.conversation.todos ?? EMPTY_TODOS,
     ),
   );
-  const selectedModel = useWorkspaceStore((s) => s.selectedModel);
+  // Per-project model: project-level overrides workspace default
+  const wsSelectedModel = useWorkspaceStore((s) => s.selectedModel);
+  const wsAutoEscalate = useWorkspaceStore((s) => s.autoEscalate);
+  const projectModel = useProjectsStore((s) => s.projects.get(projectId)?.selectedModel ?? null);
+  const projectAutoRoute = useProjectsStore((s) => s.projects.get(projectId)?.autoEscalate ?? null);
+  const selectedModel = projectModel ?? wsSelectedModel;
+  const autoEscalate = projectAutoRoute ?? wsAutoEscalate;
   const setSelectedModel = useWorkspaceStore((s) => s.setSelectedModel);
   const setHttpProvider = useWorkspaceStore((s) => s.setHttpProvider);
-  const autoEscalate = useWorkspaceStore((s) => s.autoEscalate);
   const setAutoEscalate = useWorkspaceStore((s) => s.setAutoEscalate);
 
   const routedModel = useProjectsStore(
@@ -776,13 +781,16 @@ export function InputBar({
     (s) => s.projects.get(projectId)?.root ?? "",
   );
 
-  // Handle model change and sync provider + per-project power combo
+  // Handle model change and sync provider + per-project model
   const handleModelChange = useCallback(
     (modelValue: string, thinking: boolean = false, provider?: string) => {
       setSelectedModel(modelValue, thinking, provider);
       if (provider) setHttpProvider(provider);
+      // Also persist to project for per-project model isolation
+      const ps = useProjectsStore.getState();
+      ps.setProjectSelectedModel(projectId, modelValue, thinking, provider);
     },
-    [setSelectedModel, setHttpProvider],
+    [setSelectedModel, setHttpProvider, projectId],
   );
 
   // Handle auto-route toggle — saves to both workspace (global default) and project

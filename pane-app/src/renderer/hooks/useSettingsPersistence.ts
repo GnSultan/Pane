@@ -271,6 +271,15 @@ export function useSettingsPersistence() {
               if (state.auto_escalate !== undefined) {
                 useProjectsStore.getState().setProjectAutoEscalate(id, state.auto_escalate);
               }
+              // Restore per-project selected model
+              if (state.selected_model) {
+                useProjectsStore.getState().setProjectSelectedModel(
+                  id,
+                  state.selected_model,
+                  state.selected_model_thinking ?? false,
+                  state.selected_model_provider,
+                );
+              }
               if (state.active_file_path) {
                 readFile(state.active_file_path)
                   .then((content) => {
@@ -355,6 +364,9 @@ export function useSettingsPersistence() {
           scroll_positions: Object.fromEntries(p.scrollPositions.entries()),
           power_combo: p.powerCombo,
           auto_escalate: p.autoEscalate,
+          selected_model: p.selectedModel,
+          selected_model_provider: p.selectedModelProvider,
+          selected_model_thinking: p.selectedModelThinking,
         };
       }
 

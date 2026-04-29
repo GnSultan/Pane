@@ -1388,9 +1388,10 @@ export function usePunk(projectId: string) {
           new Promise((resolve) => setTimeout(resolve, 1000)),
         ]);
         const ws = useWorkspaceStore.getState();
-        const selectedModel = ws.selectedModel;
-        const selectedModelThinking = ws.selectedModelThinking;
-        const selectedModelProvider = ws.selectedModelProvider;
+        // Per-project model: project-level overrides workspace default
+        const selectedModel = project.selectedModel ?? ws.selectedModel;
+        const selectedModelThinking = project.selectedModelThinking ?? ws.selectedModelThinking ?? false;
+        const selectedModelProvider = project.selectedModelProvider ?? ws.selectedModelProvider;
         // Per-project power combo: project-level overrides workspace default
         const projectCombo = project.powerCombo;
         const projectAutoRoute = project.autoEscalate ?? ws.autoEscalate;
