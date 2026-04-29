@@ -91,13 +91,12 @@ function ChangeHistoryIcon() {
 }
 
 function MenuTriggerIcon() {
-  // 2×2 grid of panes — represents navigation/modes
+  // Three expanding horizontal bars — a menu/list that fans outward.
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="1" y="1" width="6" height="6" rx="1.5" />
-      <rect x="9" y="1" width="6" height="6" rx="1.5" />
-      <rect x="1" y="9" width="6" height="6" rx="1.5" />
-      <rect x="9" y="9" width="6" height="6" rx="1.5" />
+      <path d="M4.5 4h7" />
+      <path d="M3 8h10" />
+      <path d="M1.5 12h13" />
     </svg>
   );
 }
@@ -112,7 +111,7 @@ interface ModeDef {
 }
 
 const MODES: ModeDef[] = [
-  { id: "conversation", label: "chat", icon: <ConversationIcon /> },
+  { id: "conversation", label: "threads", icon: <ConversationIcon /> },
   { id: "viewer", label: "files", icon: <FileIcon /> },
   { id: "search", label: "search", icon: <SearchIcon /> },
   { id: "git", label: "git", icon: <GitIcon />, requiresGit: true },
@@ -147,7 +146,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
     setOpen(true);
   }, []);
 
-  // Hover close — delayed so user can reach the popup
+  // Hover close — short delay allows mouse to move between items and icon
   const handleMouseLeave = useCallback(() => {
     closeTimerRef.current = setTimeout(() => {
       setOpen(false);
@@ -189,29 +188,16 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
   }, [onSelectMode]);
 
   const triggerSize = position === "workspace" ? "w-8 h-8" : "w-7 h-7";
-
   return (
     <div
       ref={menuRef}
-      className="relative"
+      className={`flex flex-col ${open ? 'bg-pane-bg border border-pane-border/40 rounded-xl' : ''}`}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
-      {/* Trigger */}
-      <button
-        className={`${triggerSize} flex items-center justify-center rounded-xl text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04] relative`}
-        title="modes"
-      >
-        <MenuTriggerIcon />
-      </button>
-
-      {/* Expanded menu — positioned upward from trigger */}
-      {open && (
-        <div
-          className="absolute bottom-full mb-1 left-0 min-w-[260px] bg-pane-bg border border-pane-border/40 rounded-xl py-1 z-50"
-          onMouseEnter={handleMouseEnter}
-          onMouseLeave={handleMouseLeave}
-        >
+      {open ? (
+        /* Menu items — fully replaces the icon on hover */
+        <div className="flex flex-col py-1 min-w-[260px]">
           {MODES.map((m) => {
             if (m.requiresGit && !isGitRepo) return null;
             const isActive = currentMode === m.id;
@@ -240,6 +226,14 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
             );
           })}
         </div>
+      ) : (
+        /* Trigger icon — only visible when menu is closed */
+        <button
+          className={`${triggerSize} flex items-center justify-center rounded-md bg-pane-bg ring-1 ring-pane-border/25 text-pane-text-secondary hover:text-pane-text btn-press transition-colors`}
+          title="modes"
+        >
+          <MenuTriggerIcon />
+        </button>
       )}
     </div>
   );
