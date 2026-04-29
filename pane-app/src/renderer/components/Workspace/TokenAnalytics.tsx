@@ -94,6 +94,15 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
   const [timeSeries, setTimeSeries] = useState<TokenTimeSeriesRow[]>([]);
   const [rates, setRates] = useState<Record<string, { input: number; output: number; cache_read?: number } | null>>({});
   const [range, setRange] = useState<TimeRange>("month");
+  const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
+  const toggleProvider = useCallback((provider: string) => {
+    setExpandedProviders(prev => {
+      const next = new Set(prev);
+      if (next.has(provider)) next.delete(provider);
+      else next.add(provider);
+      return next;
+    });
+  }, []);
   const [loading, setLoading] = useState(true);
   const lastTokenUsageAt = useWorkspaceStore((s) => s.lastTokenUsageAt);
 
@@ -203,10 +212,8 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
           { cost: 0, input: 0, output: 0, calls: 0, modelCount: 0 }
         ),
       }))
-      .sort((a, b) => b.total.cost - a.total.cost);
+      .sort((a, b) => (b.total.input + b.total.output) - (a.total.input + a.total.output));
   }, [data]);
-
-  const maxCost = Math.max(...data.map(r => r.total_cost_usd), 0.000001);
 
   return (
     <div className="flex flex-col gap-8">
@@ -275,128 +282,110 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
             {groupedData.map(({ provider, rows, total }) => {
               const link = PROVIDER_LINKS[provider];
               const providerLabel = link?.label ?? provider.charAt(0).toUpperCase() + provider.slice(1);
-              const providerPct = totals.cost > 0 ? Math.round((total.cost / totals.cost) * 100) : 0;
+              const totalTokens = total.input + total.output;
+              const totalAllTokens = totals.input + totals.output;
+              const providerPct = totalAllTokens > 0 ? Math.round((totalTokens / totalAllTokens) * 100) : 0;
+              const isExpanded = expandedProviders.has(provider);
 
               return (
-                <div key={provider} className="flex flex-col gap-1.5">
-                  {/* Provider header */}
-                  <div className="flex items-center justify-between px-0.5">
+                <div key={provider} className="flex flex-col gap-1">
+                  {/* Collapsed/expanded row — click to toggle */}
+                  <div
+                    className="flex items-center gap-3 cursor-pointer select-none px-0.5 py-1 rounded-lg hover:bg-pane-text/[0.02] transition-colors"
+                    onClick={() => toggleProvider(provider)}
+                  >
+                    <span className="w-3 text-center font-mono text-pane-text-secondary/40" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      {isExpanded ? "▾" : "▸"}
+                    </span>
                     <span className="font-mono text-pane-text text-sm">{providerLabel}</span>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                        {formatTokens(total.input + total.output)} total
-                      </span>
-                      {link && (
-                        <a
-                          href={link.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="font-mono text-pane-text-secondary/30 hover:text-pane-text-secondary transition-colors"
-                          style={{ fontSize: "var(--pane-font-size-xs)" }}
-                        >
-                          ↗
-                        </a>
-                      )}
-                    </div>
-                  </div>
 
-                  {/* Provider proportion bar */}
-                  {groupedData.length > 1 && (
-                    <div className="flex items-center gap-2">
-                      <div className="flex-1 h-1 bg-pane-text/[0.04] rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-pane-text/15 rounded-full"
-                          style={{ width: `${providerPct}%` }}
-                        />
-                      </div>
-                      <span className="font-mono text-pane-text-secondary/50 tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                        {providerPct}%
-                      </span>
-                    </div>
-                  )}
-
-                  {/* Model rows */}
-                  {rows.map((row) => {
-                    // Cache hit = cached / (cached + non-cached input). They're additive, not overlapping.
-                    const totalInput = row.total_input_tokens + row.total_cache_read;
-                    const cacheHit = totalInput > 0
-                      ? Math.round((row.total_cache_read / totalInput) * 100)
-                      : 0;
-                    return (
-                      <div key={`${row.model}-${row.provider}-${row.activity_type}`}
-                        className="p-3 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20">
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-pane-text font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                            {row.model.split("/").pop()}
-                            {row.provider !== provider && (
-                              <span className="text-pane-text-secondary"> · {row.provider}</span>
-                            )}
-                          </span>
-                          <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                            {row.call_count} calls{(() => {
-                              const r = effectiveRate(row);
-                              if (r) return ` · ${r.input}/${r.output}M`;
-                              return "";
-                            })()}
-                          </span>
+                    {groupedData.length > 1 && (
+                      <>
+                        <div className="flex-1 h-1 bg-pane-text/[0.04] rounded-full overflow-hidden max-w-[120px]">
+                          <div
+                            className="h-full bg-pane-text/15 rounded-full"
+                            style={{ width: `${providerPct}%` }}
+                          />
                         </div>
+                        <span className="font-mono text-pane-text-secondary/50 tabular-nums w-9 text-right" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                          {providerPct}%
+                        </span>
+                      </>
+                    )}
 
-                        {/* Cost bar — green segment shows estimated cache savings proportion */}
-                        <div className="h-1.5 w-full bg-pane-text/[0.04] rounded-full overflow-hidden flex mb-2">
-                          {(() => {
-                            const rate = effectiveRate(row);
-                            const cacheSavedUsd = rate && row.total_cache_read > 0
-                              ? (() => {
-                                  const inputPricePerToken = rate.input / 1_000_000;
-                                  const cacheReadPrice = typeof rate.cache_read === "number" ? rate.cache_read / 1_000_000 : inputPricePerToken;
-                                  return row.total_cache_read * (inputPricePerToken - cacheReadPrice);
-                                })()
-                              : 0;
-                            const costPct = maxCost > 0 ? (row.total_cost_usd / maxCost) * 100 : 0;
-                            const cachePct = maxCost > 0 ? Math.min((cacheSavedUsd / maxCost) * 100, costPct) : 0;
-                            const normalPct = costPct - cachePct;
-                            return (
-                              <>
-                                {cachePct > 0 && (
-                                  <div className="h-full bg-pane-status-added/40 rounded-l-full" style={{ width: `${cachePct}%` }} />
-                                )}
-                                <div className="h-full bg-pane-text/25" style={{ width: `${normalPct}%` }} />
-                              </>
-                            );
-                          })()}
-                        </div>
-
-                        {/* Stats */}
-                        <div className="flex items-center gap-3">
-                          <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                            {formatTokens(row.total_input_tokens)} in / {formatTokens(row.total_output_tokens)} out
-                          </span>
-                          <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                            {formatCost(row.total_cost_usd)}
-                            {row.unknown_cost_count > 0 && (
-                              <span className="text-pane-text-secondary/40 ml-0.5" title={`${row.unknown_cost_count} calls with unknown pricing`}>?</span>
-                            )}
-                          </span>
-                          {cacheHit > 0 && (
-                            <span className="font-mono text-pane-status-added tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                              {cacheHit}% cached
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-
-                  {/* Provider totals row */}
-                  <div className="flex items-center justify-between px-0.5 pt-1.5 border-t border-pane-border/10">
-                    <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      Total · {total.modelCount} {total.modelCount === 1 ? "model" : "models"} · {total.calls} calls
+                    <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                      {formatTokens(totalTokens)} total · {total.calls} calls
                     </span>
                     <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                      {formatTokens(total.input)} in / {formatTokens(total.output)} out
-                      <span className="text-pane-text-secondary ml-2">{formatCost(total.cost)}</span>
+                      {formatCost(total.cost)}
                     </span>
+
+                    {link && (
+                      <a
+                        href={link.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={e => e.stopPropagation()}
+                        className="font-mono text-pane-text-secondary/30 hover:text-pane-text-secondary transition-colors ml-auto"
+                        style={{ fontSize: "var(--pane-font-size-xs)" }}
+                      >
+                        ↗
+                      </a>
+                    )}
                   </div>
+
+                  {/* Expanded model rows */}
+                  {isExpanded && (
+                    <div className="flex flex-col gap-0.5 ml-5 pl-3 border-l border-pane-border/10">
+                      {rows.map((row) => {
+                        const totalInput = row.total_input_tokens + row.total_cache_read;
+                        const cacheHit = totalInput > 0
+                          ? Math.round((row.total_cache_read / totalInput) * 100)
+                          : 0;
+                        return (
+                          <div key={`${row.model}-${row.provider}-${row.activity_type}`}
+                            className="flex items-center justify-between py-1.5 px-3 rounded-lg bg-pane-surface/30">
+                            <span className="font-mono text-pane-text truncate" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                              {row.model.split("/").pop()}
+                              {row.provider !== provider && (
+                                <span className="text-pane-text-secondary"> · {row.provider}</span>
+                              )}
+                            </span>
+                            <div className="flex items-center gap-3 shrink-0">
+                              <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                {row.call_count} calls
+                              </span>
+                              <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                {formatTokens(row.total_input_tokens)} / {formatTokens(row.total_output_tokens)}
+                              </span>
+                              <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                {formatCost(row.total_cost_usd)}
+                                {row.unknown_cost_count > 0 && (
+                                  <span className="text-pane-text-secondary/40 ml-0.5" title={`${row.unknown_cost_count} calls with unknown pricing`}>?</span>
+                                )}
+                              </span>
+                              {cacheHit > 0 && (
+                                <span className="font-mono text-pane-status-added tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                  {cacheHit}%
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                      {/* Provider totals row */}
+                      <div className="flex items-center justify-between px-3 pt-1.5 pb-0.5 mt-0.5 border-t border-pane-border/10">
+                        <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                          Total · {total.modelCount} {total.modelCount === 1 ? "model" : "models"} · {total.calls} calls
+                        </span>
+                        <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                          {formatTokens(total.input)} / {formatTokens(total.output)}
+                          <span className="text-pane-text-secondary ml-2">{formatCost(total.cost)}</span>
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })}
