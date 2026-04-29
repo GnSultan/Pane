@@ -1375,6 +1375,37 @@ export class ApiBackend extends PunkBackend {
       const { role, content } = msg;
 
       if (role === "system") {
+        // Tool results stored as system messages in front-end conversation
+        // history (handlePunkMessage stores tool results as type: "system").
+        // For OpenAI-compatible APIs (DeepSeek etc.), these MUST become
+        // role: "tool" messages to satisfy strict tool_call→tool sequencing.
+        // System messages with tool_results bypass the normal tool handler
+        // below, so we handle them here.
+        if (isOpenAI && Array.isArray(content) && content.some((c) => c.type === "tool_result")) {
+          for (const c of content) {
+            if (c.type === "tool_result") {
+              const res = {
+                role: "tool",
+                tool_call_id: c.tool_use_id,
+                name: c.name,
+                content:
+                  typeof c.content === "string"
+                    ? c.content
+                    : JSON.stringify(c.content),
+                is_error: c.is_error,
+              };
+              if (pendingToolCallIds.has(res.tool_call_id)) {
+                normalized.push(res);
+                pendingToolCallIds.delete(res.tool_call_id);
+              } else {
+                console.warn(
+                  `[http] Pruning orphaned tool result (from system msg) for ${res.tool_call_id}`,
+                );
+              }
+            }
+          }
+          continue;
+        }
         // Preserve _tiers metadata through normalization — prepareRequest()
         // needs it for Anthropic cache breakpoints. It's stripped there before
         // the request body is serialized.
