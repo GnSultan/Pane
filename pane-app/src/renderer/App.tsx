@@ -3,8 +3,6 @@ import { setWindowTitle, destroyPty } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ControlPanel } from "./components/ControlPanel/ControlPanel";
 import { Workspace } from "./components/Workspace/Workspace";
-import { FuzzyFinder } from "./components/FuzzyFinder/FuzzyFinder";
-import { FileSearch } from "./components/FileSearch/FileSearch";
 import { TaskNotification } from "./components/shared/TaskNotification";
 import { useWorkspaceStore } from "./stores/workspace";
 import { useProjectsStore } from "./stores/projects";
@@ -52,10 +50,6 @@ function App() {
   const controlPanelVisible = useWorkspaceStore((s) => s.controlPanelVisible);
   const controlPanelWidth = useWorkspaceStore((s) => s.controlPanelWidth);
   const toggleControlPanel = useWorkspaceStore((s) => s.toggleControlPanel);
-  const toggleFuzzyFinder = useWorkspaceStore((s) => s.toggleFuzzyFinder);
-  const fuzzyFinderOpen = useWorkspaceStore((s) => s.fuzzyFinderOpen);
-  const toggleFileSearch = useWorkspaceStore((s) => s.toggleFileSearch);
-  const fileSearchOpen = useWorkspaceStore((s) => s.fileSearchOpen);
   const toggleMind = () => {
     const { activeProjectId, setMode } = useProjectsStore.getState();
     if (activeProjectId) setMode(activeProjectId, "mind");
@@ -159,12 +153,20 @@ function App() {
           }
           break;
         }
-        case "fuzzy-finder":
-          toggleFuzzyFinder();
+        case "fuzzy-finder": {
+          const { activeProjectId: pid, projects, setMode: sm } = useProjectsStore.getState();
+          if (pid) {
+            sm(pid, projects.get(pid)?.mode === "search" ? "conversation" : "search");
+          }
           break;
-        case "file-search":
-          toggleFileSearch();
+        }
+        case "file-search": {
+          const { activeProjectId: pid2, projects: p2, setMode: sm2 } = useProjectsStore.getState();
+          if (pid2) {
+            sm2(pid2, p2.get(pid2)?.mode === "filesearch" ? "conversation" : "filesearch");
+          }
           break;
+        }
         case "focus-chat":
           window.dispatchEvent(new CustomEvent("pane:focus-input"));
           break;
@@ -309,7 +311,7 @@ function App() {
     // Capture phase so shortcuts fire before Ace editor eats them (e.g. Cmd+/)
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [toggleControlPanel, toggleFuzzyFinder, toggleFileSearch]);
+  }, [toggleControlPanel]);
 
   return (
     <div className="relative h-screen w-screen bg-pane-bg overflow-hidden">
@@ -333,8 +335,6 @@ function App() {
         </div>
       </div>
 
-      {fuzzyFinderOpen && <FuzzyFinder />}
-      {fileSearchOpen && <FileSearch />}
       <TaskNotification />
     </div>
   );

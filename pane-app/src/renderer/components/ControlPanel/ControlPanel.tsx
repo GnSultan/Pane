@@ -1,7 +1,6 @@
 import { useState, useCallback, useEffect, type ReactNode } from "react";
 import { ProjectList } from "./ProjectList";
 import { useProjectsStore } from "../../stores/projects";
-import { useWorkspaceStore } from "../../stores/workspace";
 
 // --- Inline SVG icons (16x16, outlined) ---
 // Pane design language: panel forms, 1.5px stroke, rx="2" matches button radius
@@ -187,7 +186,7 @@ export function ControlPanel() {
     }
   }, [isGitRepo, mode, activeProjectId]);
 
-  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens") => {
+  const handleSetMode = useCallback((newMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch") => {
     if (!activeProjectId) return;
     if (mode === newMode) return;
     setMode(activeProjectId, newMode);
@@ -196,6 +195,8 @@ export function ControlPanel() {
     // no-op in Chromium — the rAF fires after the browser's layout pass.
     if (newMode === "conversation") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-input")));
     else if (newMode === "viewer") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-editor")));
+    else if (newMode === "search") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-search")));
+    else if (newMode === "filesearch") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-filesearch")));
   }, [activeProjectId, mode, setMode]);
 
   return (
@@ -228,7 +229,8 @@ export function ControlPanel() {
         />
         <ToolbarButton
           icon={<SearchIcon />}
-          onClick={() => useWorkspaceStore.getState().toggleFuzzyFinder()}
+          active={mode === "search"}
+          onClick={() => handleSetMode("search")}
           tooltip="Search"
         />
         {isGitRepo && (

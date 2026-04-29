@@ -56,15 +56,10 @@ interface WorkspaceState {
   autoEscalate: boolean;
   openRouterModels: OpenRouterModel[];
   allModels: Record<string, OpenRouterModel[]>;
-  fuzzyFinderOpen: boolean;
-  fileSearchOpen: boolean;
   fetchOpenRouterModels: () => Promise<void>;
   fetchAllModels: () => Promise<void>;
   refreshAllModels: () => Promise<void>;
-  toggleFuzzyFinder: () => void;
-  closeFuzzyFinder: () => void;
-  toggleFileSearch: () => void;
-  closeFileSearch: () => void;
+
   // Backend availability for transparent routing
   backendAvailability: {
     claudeCode: boolean;
@@ -213,8 +208,6 @@ function createWorkspaceStore() {
   return create<WorkspaceState>()((set, get) => ({
     controlPanelVisible: true,
     controlPanelWidth: 240,
-    fuzzyFinderOpen: false,
-    fileSearchOpen: false,
     fontSize: DEFAULT_FONT_SIZE,
     panelFontSize: DEFAULT_PANEL_FONT_SIZE,
     editorFontSize: DEFAULT_EDITOR_FONT_SIZE,
@@ -358,12 +351,6 @@ function createWorkspaceStore() {
       })),
     setControlPanelWidth: (width: number) =>
       set({ controlPanelWidth: Math.max(200, Math.min(480, width)) }),
-    toggleFuzzyFinder: () =>
-      set((state) => ({ fuzzyFinderOpen: !state.fuzzyFinderOpen })),
-    closeFuzzyFinder: () => set({ fuzzyFinderOpen: false }),
-    toggleFileSearch: () =>
-      set((state) => ({ fileSearchOpen: !state.fileSearchOpen })),
-    closeFileSearch: () => set({ fileSearchOpen: false }),
     increaseFontSize: () =>
       set((state) => {
         const next = Math.max(1, state.fontSize + 1);

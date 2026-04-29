@@ -6,6 +6,8 @@ import { Profile } from "./Profile";
 import { Mind } from "./Mind";
 import { Lens } from "./Lens";
 import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
+import { FuzzyFinder } from "../FuzzyFinder/FuzzyFinder";
+import { FileSearch } from "../FileSearch/FileSearch";
 import { GitStatus } from "../ControlPanel/GitStatus";
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
@@ -217,6 +219,16 @@ export function Workspace() {
           <ChangeHistoryPanel projectId={activeProjectId} />
         </div>
       )}
+
+      {/* Search page — FuzzyFinder inline, visible when mode="search" */}
+      <div data-page="search" className="absolute inset-0 bg-pane-bg">
+        {activeProjectId && <FuzzyFinder />}
+      </div>
+
+      {/* Filesearch page — FileSearch inline, visible when mode="filesearch" */}
+      <div data-page="filesearch" className="absolute inset-0 bg-pane-bg">
+        {activeProjectId && <FileSearch />}
+      </div>
 
       {/* Update notification pills — inside the workspace border, top-right corner */}
       {showUpdate && (

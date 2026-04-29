@@ -499,7 +499,9 @@ html[data-theme="glass"] #root {
 [data-mode="mind"] > [data-page="mind"],
 [data-mode="profile"] > [data-page="profile"],
 [data-mode="history"] > [data-page="history"],
-[data-mode="lens"] > [data-page="lens"] {
+[data-mode="lens"] > [data-page="lens"],
+[data-mode="search"] > [data-page="search"],
+[data-mode="filesearch"] > [data-page="filesearch"] {
   pointer-events: auto;
   z-index: 20;
   content-visibility: visible;

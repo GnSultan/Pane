@@ -44,7 +44,7 @@ export interface Project {
   selectedPath: string | null;
   activeFilePath: string | null;
   activeFileContent: string | null;
-  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens";
+  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
   conversation: ConversationState;
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
@@ -168,7 +168,7 @@ interface ProjectsState {
   // Per-project mode
   setMode: (
     projectId: string,
-    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens",
+    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch",
   ) => void;
   toggleMode: (projectId: string) => void;
 
@@ -517,7 +517,7 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => {
           // Toggle between Chat and Viewer (file explorer / directory browser)
-          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens";
+          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
           if (p.mode === "conversation") {
             nextMode = "viewer";
           } else {

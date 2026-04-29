@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import Fuse from "fuse.js";
-import { useWorkspaceStore } from "../../stores/workspace";
 import { useProjectsStore } from "../../stores/projects";
 import { useShallow } from "zustand/react/shallow";
 import { walkProjectFiles, readFile, searchInFiles, type SearchResult } from "../../lib/tauri-commands";
@@ -24,8 +23,6 @@ export function FuzzyFinder() {
   const [isSearchingCode, setIsSearchingCode] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
-
-  const closeFuzzyFinder = useWorkspaceStore((s) => s.closeFuzzyFinder);
 
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const projectRoot = useProjectsStore((s) => {
@@ -52,10 +49,16 @@ export function FuzzyFinder() {
     }
   }, [projectRoot, activeProjectId, lastIndexed, isLoading]);
 
-  // Auto-focus input
+  // Mode-driven auto-focus: focus input whenever mode becomes "search"
+  const mode = useProjectsStore((s) => {
+    if (!s.activeProjectId) return null;
+    return s.projects.get(s.activeProjectId)?.mode ?? null;
+  });
   useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
+    if (mode === "search") {
+      inputRef.current?.focus();
+    }
+  }, [mode]);
 
   // Search for code content when query changes
   useEffect(() => {
@@ -143,14 +146,14 @@ export function FuzzyFinder() {
       } catch (err) {
         console.error("Failed to open file:", err);
       }
-      closeFuzzyFinder();
+      if (activeProjectId) useProjectsStore.getState().setMode(activeProjectId, "viewer");
     },
-    [projectRoot, activeProjectId, closeFuzzyFinder],
+    [projectRoot, activeProjectId],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
-      closeFuzzyFinder();
+      if (activeProjectId) useProjectsStore.getState().setMode(activeProjectId, "conversation");
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
       setSelectedIndex((i) => Math.min(i + 1, allResults.length - 1));
@@ -166,15 +169,13 @@ export function FuzzyFinder() {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[12%]"
-      onClick={closeFuzzyFinder}
+      className="h-full w-full flex items-start justify-center pt-[12%]"
+      onKeyDown={handleKeyDown}
     >
       <div
         className={`w-full max-w-[560px] mx-4 bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden flex flex-col animate-fadeSlideUp ${
           hasResults ? "max-h-[420px]" : ""
         }`}
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={handleKeyDown}
       >
         <div className="px-5 py-4 shrink-0">
           <input
