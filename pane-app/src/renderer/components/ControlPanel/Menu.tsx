@@ -151,7 +151,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
   const handleMouseLeave = useCallback(() => {
     closeTimerRef.current = setTimeout(() => {
       setOpen(false);
-    }, 200);
+    }, 50);
   }, []);
 
   // Close on outside click
@@ -208,7 +208,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
       {/* Expanded menu — positioned upward from trigger */}
       {open && (
         <div
-          className="absolute bottom-full mb-1 left-0 min-w-[200px] bg-pane-bg border border-pane-border/40 rounded-xl shadow-xl py-1 z-50"
+          className="absolute bottom-full mb-1 left-0 min-w-[260px] bg-pane-bg border border-pane-border/40 rounded-xl py-1 z-50"
           onMouseEnter={handleMouseEnter}
           onMouseLeave={handleMouseLeave}
         >
