@@ -91,12 +91,12 @@ function ChangeHistoryIcon() {
 }
 
 function MenuTriggerIcon() {
-  // Three expanding horizontal bars — a menu/list that fans outward.
+  // Three horizontal bars, left-aligned, longest at top — suggesting a menu.
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M4.5 4h7" />
-      <path d="M3 8h10" />
-      <path d="M1.5 12h13" />
+      <path d="M2 4.5h12" />
+      <path d="M2 8h9" />
+      <path d="M2 11.5h6" />
     </svg>
   );
 }
