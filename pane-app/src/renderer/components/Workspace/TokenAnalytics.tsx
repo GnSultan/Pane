@@ -362,25 +362,23 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                                     <span className="text-pane-text-secondary"> · {row.provider}</span>
                                   )}
                                 </span>
-                                <div className="flex items-center gap-5">
-                                  <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                <div className="flex items-center gap-5 w-full">
+                                  <span className="font-mono text-pane-text-secondary tabular-nums shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                                     {row.call_count} calls
                                   </span>
-                                  <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                    {formatTokens(row.total_input_tokens)} in
+                                  <span className="font-mono text-pane-text-secondary tabular-nums shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {formatTokens(row.total_input_tokens)} in / {formatTokens(row.total_output_tokens)} out
                                   </span>
-                                  <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                    {formatTokens(row.total_output_tokens)} out
-                                  </span>
-                                  <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                  <div className="flex-1" />
+                                  <span className="font-mono text-pane-text tabular-nums shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                                     {formatCost(row.total_cost_usd)}
                                     {row.unknown_cost_count > 0 && (
                                       <span className="text-pane-text-secondary/40 ml-0.5" title={`${row.unknown_cost_count} calls with unknown pricing`}>?</span>
                                     )}
                                   </span>
                                   {cacheHit > 0 && (
-                                    <span className="font-mono text-pane-status-added tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                      {cacheHit}% cache
+                                    <span className="font-mono text-pane-status-added tabular-nums shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                      {cacheHit}% cached
                                     </span>
                                   )}
                                 </div>
@@ -395,10 +393,7 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                             </span>
                             <div className="flex items-center gap-5">
                               <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                {formatTokens(total.input)} in
-                              </span>
-                              <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                {formatTokens(total.output)} out
+                                {formatTokens(total.input)} in / {formatTokens(total.output)} out
                               </span>
                               <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                                 {formatCost(total.cost)}
