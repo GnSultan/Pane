@@ -1,7 +1,6 @@
-import { useEffect, useState, useMemo, useCallback } from "react";
+import { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { getTokenAnalytics, getTokenTimeSeries, getModelRates, type TokenAnalyticsRow, type TokenTimeSeriesRow } from "../../lib/tauri-commands";
-import { useWorkspaceStore } from "../../stores/workspace";
 
 type TimeRange = "today" | "week" | "month" | "all";
 
@@ -32,6 +31,15 @@ function formatTokens(val: number) {
   if (val >= 1_000_000) return (val / 1_000_000).toFixed(1) + "M";
   if (val >= 1_000) return (val / 1_000).toFixed(1) + "k";
   return val.toString();
+}
+
+function formatModelName(name: string) {
+  return name
+    .split("/")
+    .pop()!
+    .split(/[-_]/)
+    .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
+    .join(" ");
 }
 
 function DailyTokensChart({ data }: { data: TokenTimeSeriesRow[] }) {
@@ -90,14 +98,15 @@ function DailyTokensChart({ data }: { data: TokenTimeSeriesRow[] }) {
   );
 }
 
-export function TokenAnalytics({ projectId }: { projectId: string | null }) {
+export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | null; isExpanded: boolean }) {
   const [data, setData] = useState<TokenAnalyticsRow[]>([]);
   const [timeSeries, setTimeSeries] = useState<TokenTimeSeriesRow[]>([]);
   const [rates, setRates] = useState<Record<string, { input: number; output: number; cache_read?: number } | null>>({});
   const [range, setRange] = useState<TimeRange>("month");
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const lastTokenUsageAt = useWorkspaceStore((s) => s.lastTokenUsageAt);
+  const [lastFetchedAt, setLastFetchedAt] = useState<number>(0);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -109,6 +118,7 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
       ]);
       setData(rows);
       setTimeSeries(series);
+      setLastFetchedAt(Date.now());
       // Fetch list prices for all models in the results
       const models = [...new Set(rows.map(r => r.model))];
       if (models.length > 0) {
@@ -121,15 +131,30 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
     }
   }, [projectId, range]);
 
-  // Fetch on mount and range change
+  // Fetch on mount and when range changes
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
-  // Live updates — refetch 2s after each token_usage event
+  // Visibility-gated polling — only fetch/refresh when the accordion is expanded.
+  // When opened: fetch immediately, then poll every 30s.
+  // When closed: stop polling. This replaces the old push-based lastTokenUsageAt
+  // subscription that caused re-renders on every single token_usage event.
   useEffect(() => {
-    if (!lastTokenUsageAt) return;
-    const timer = setTimeout(fetchAll, 2000);
-    return () => clearTimeout(timer);
-  }, [lastTokenUsageAt, fetchAll]);
+    if (isExpanded) {
+      // If there's stale data (never fetched or last fetch > 30s ago), refresh now.
+      // Otherwise the mount-+range-driven fetch above already has fresh data.
+      const isStale = lastFetchedAt === 0 || Date.now() - lastFetchedAt > 30_000;
+      if (isStale) {
+        fetchAll();
+      }
+      pollRef.current = setInterval(fetchAll, 30_000);
+    }
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
+  }, [isExpanded, fetchAll, lastFetchedAt]);
 
   const totals = useMemo(() => {
     return data.reduce(
@@ -223,7 +248,7 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
             }`}
             style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
-            {r}
+            {r.charAt(0).toUpperCase() + r.slice(1)}
           </button>
         ))}
       </div>
@@ -356,8 +381,8 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                             return (
                               <div key={`${row.model}-${row.provider}-${row.activity_type}`}
                                 className="flex flex-col gap-0.5 py-2 px-3 rounded-lg bg-pane-surface/30">
-                                <span className="font-mono text-pane-text truncate" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                  {row.model.split("/").pop()}
+                                <span className="font-mono text-pane-text truncate" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+                                  {formatModelName(row.model)}
                                   {row.provider !== provider && (
                                     <span className="text-pane-text-secondary"> · {row.provider}</span>
                                   )}
@@ -392,10 +417,10 @@ export function TokenAnalytics({ projectId }: { projectId: string | null }) {
                               Total · {total.modelCount} {total.modelCount === 1 ? "model" : "models"} · {total.calls} calls
                             </span>
                             <div className="flex items-center gap-5">
-                              <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                              <span className="font-mono text-pane-text-secondary/60 tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                                 {formatTokens(total.input)} in / {formatTokens(total.output)} out
                               </span>
-                              <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                              <span className="font-mono text-pane-text-secondary/60 tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                                 {formatCost(total.cost)}
                               </span>
                             </div>

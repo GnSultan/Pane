@@ -1567,8 +1567,6 @@ export function Profile() {
 
   const [philosophy, setPhilosophy] = useState("");
   const [rules, setRules] = useState("");
-  const [hoveredTheme, setHoveredTheme] = useState<string | null>(null);
-  const [showFineTune, setShowFineTune] = useState(false);
   const philosophySaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Accordion state - only one section expanded at a time
@@ -1896,7 +1894,7 @@ export function Profile() {
           isExpanded={expandedSection === "usage"}
           onToggle={() => setExpandedSection(expandedSection === "usage" ? null : "usage")}
         >
-          <TokenAnalytics projectId={null} />
+          <TokenAnalytics projectId={null} isExpanded={expandedSection === "usage"} />
         </AccordionSection>
 
         {/* Philosophy Section */}
@@ -1978,35 +1976,43 @@ export function Profile() {
           onToggle={() => setExpandedSection(expandedSection === "appearance" ? null : "appearance")}
         >
           <div className="flex flex-col gap-0">
-            {/* Theme — circles, filled when active, hollow when inactive, name appears below */}
-            <div className="flex flex-col items-center gap-2 py-4">
+            {/* Theme — circles preview each theme's actual bg/text colors */}
+            <div className="flex items-center justify-between py-4">
+              <span
+                className="text-pane-text-secondary/50 font-mono"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                theme
+              </span>
               <div className="flex items-center gap-3">
-                {(["system", "dark", "light", "pure", "glass"] as const).map((t) => (
+                {([
+                  { id: "system" as const, bg: "linear-gradient(135deg, #1C1B1A 50%, #F4F2EC 50%)", ring: "#A8A59E" },
+                  { id: "dark" as const, bg: "#1C1B1A", ring: "#D8D5CE" },
+                  { id: "light" as const, bg: "#F4F2EC", ring: "#1A1918" },
+                  { id: "pure" as const, bg: "#FFFFFF", ring: "#0A0A0A" },
+                  { id: "glass" as const, bg: "transparent", ring: "#D8D5CE" },
+                ]).map((t) => (
                   <button
-                    key={t}
-                    onClick={() => setTheme(t)}
-                    onMouseEnter={() => setHoveredTheme(t)}
-                    onMouseLeave={() => setHoveredTheme(null)}
-                    className={`w-4 h-4 rounded-full transition-all duration-200 ${
-                      theme === t
-                        ? "bg-pane-text ring-2 ring-pane-text/30"
-                        : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"
-                    }`}
+                    key={t.id}
+                    onClick={() => setTheme(t.id)}
+                    className="w-4 h-4 rounded-full transition-all duration-200"
+                    style={{
+                      background: t.bg,
+                      backgroundSize: "cover",
+                      boxShadow: theme === t.id
+                        ? `0 0 0 2px ${t.ring}`
+                        : `0 0 0 1px ${t.ring}40`,
+                      border: t.id === "glass" ? "0.5px solid rgba(255,255,255,0.15)" : "none",
+                    }}
                   />
                 ))}
               </div>
-              <span
-                className="text-pane-text-secondary/50 font-mono text-center"
-                style={{ fontSize: "var(--pane-font-size-xs)" }}
-              >
-                {hoveredTheme || theme}
-              </span>
             </div>
 
             {/* Separator */}
             <div className="border-t border-pane-border/20" />
 
-            {/* Text size — primary control + weight, fine-tune for editor/panel */}
+            {/* Text size — four rows: chat, weight, editor, panel */}
             <div className="flex flex-col gap-3 py-4">
               <div className="flex items-center justify-between">
                 <span
@@ -2037,77 +2043,47 @@ export function Profile() {
                   unit=""
                 />
               </div>
-
-              {/* Fine-tune toggle */}
-              <button
-                onClick={() => setShowFineTune(!showFineTune)}
-                className="flex items-center gap-1.5 text-pane-text-secondary/30 hover:text-pane-text-secondary/60 font-mono transition-colors self-start"
-                style={{ fontSize: "var(--pane-font-size-xs)" }}
-              >
-                <motion.svg
-                  animate={{ rotate: showFineTune ? 90 : 0 }}
-                  transition={{ duration: 0.2 }}
-                  width="10"
-                  height="10"
-                  viewBox="0 0 10 10"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
+              <div className="flex items-center justify-between">
+                <span
+                  className="text-pane-text-secondary/50 font-mono"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  <path d="M3 2L6 5L3 8" />
-                </motion.svg>
-                fine-tune
-              </button>
-              <AnimatePresence initial={false}>
-                {showFineTune && (
-                  <motion.div
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.2, ease: [0.2, 0, 0, 1] }}
-                    className="overflow-hidden"
-                  >
-                    <div className="flex flex-col gap-2 pl-4 border-l border-pane-border/20">
-                      <div className="flex items-center justify-between">
-                        <span
-                          className="text-pane-text-secondary/40 font-mono"
-                          style={{ fontSize: "var(--pane-font-size-xs)" }}
-                        >
-                          editor
-                        </span>
-                        <FontSizeControl
-                          value={editorFontSize}
-                          onIncrease={() => useWorkspaceStore.getState().increaseEditorFontSize()}
-                          onDecrease={() => useWorkspaceStore.getState().decreaseEditorFontSize()}
-                          onReset={() => useWorkspaceStore.getState().resetEditorFontSize()}
-                        />
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span
-                          className="text-pane-text-secondary/40 font-mono"
-                          style={{ fontSize: "var(--pane-font-size-xs)" }}
-                        >
-                          panel
-                        </span>
-                        <FontSizeControl
-                          value={panelFontSize}
-                          onIncrease={() => useWorkspaceStore.getState().increasePanelFontSize()}
-                          onDecrease={() => useWorkspaceStore.getState().decreasePanelFontSize()}
-                          onReset={() => useWorkspaceStore.getState().resetPanelFontSize()}
-                        />
-                      </div>
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
+                  editor
+                </span>
+                <FontSizeControl
+                  value={editorFontSize}
+                  onIncrease={() => useWorkspaceStore.getState().increaseEditorFontSize()}
+                  onDecrease={() => useWorkspaceStore.getState().decreaseEditorFontSize()}
+                  onReset={() => useWorkspaceStore.getState().resetEditorFontSize()}
+                />
+              </div>
+              <div className="flex items-center justify-between">
+                <span
+                  className="text-pane-text-secondary/50 font-mono"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  panel
+                </span>
+                <FontSizeControl
+                  value={panelFontSize}
+                  onIncrease={() => useWorkspaceStore.getState().increasePanelFontSize()}
+                  onDecrease={() => useWorkspaceStore.getState().decreasePanelFontSize()}
+                  onReset={() => useWorkspaceStore.getState().resetPanelFontSize()}
+                />
+              </div>
             </div>
 
             {/* Separator */}
             <div className="border-t border-pane-border/20" />
 
-            {/* Sound — three dots: none / subtle / present. Clicking plays immediately */}
-            <div className="flex flex-col items-center gap-2 py-4">
+            {/* Sound — three dots: none / subtle / present. Active dot uses accent color. Clicking plays immediately */}
+            <div className="flex items-center justify-between py-4">
+              <span
+                className="text-pane-text-secondary/50 font-mono"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                sound
+              </span>
               <div className="flex items-center gap-3">
                 {[
                   { id: "none", label: "none" },
@@ -2128,19 +2104,13 @@ export function Profile() {
                       }}
                       className={`w-4 h-4 rounded-full transition-all duration-200 ${
                         isActive
-                          ? "bg-pane-text ring-2 ring-pane-text/30"
+                          ? "bg-pane-accent ring-2 ring-pane-accent/30"
                           : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"
                       }`}
                     />
                   );
                 })}
               </div>
-              <span
-                className="text-pane-text-secondary/50 font-mono text-center"
-                style={{ fontSize: "var(--pane-font-size-xs)" }}
-              >
-                {completionSound === "none" ? "none" : completionSound === "Tink" ? "subtle" : "present"}
-              </span>
             </div>
           </div>
         </AccordionSection>
