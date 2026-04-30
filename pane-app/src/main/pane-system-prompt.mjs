@@ -13,7 +13,7 @@
  *
  * Three-tier context model for provider-agnostic caching:
  *
- *   frozen  — identity, rules, guide, brief, purpose, DNA, profile atoms, global memory.
+ *   frozen  — identity, rules, guide, brief, purpose, DNA, global memory.
  *             Set once per session, never changes between turns.
  *             MUST come first in the prompt to enable prefix caching on all providers.
  *             Anthropic: explicit cache_control breakpoint.
@@ -37,6 +37,7 @@ import os from "node:os";
 import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
 import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
 import { getActiveJournal, applyMergeDelta } from "./session-journal.mjs";
+import { getDNA } from "./developer-dna.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -367,32 +368,17 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     stableParts.push("");
   }
 
-  // ── Profile digest: compiled behavioral fingerprint ─────────────────────
-  // Pre-computed from 584 preferences + 311 anti-patterns + rules + philosophy
-  // into a dense ~300-token summary. Stored at ~/.pane/profile/digest.txt.
-  // Replaces raw profile atom injection (0-8 atoms) with BETTER coverage
-  // of the developer's working style in fewer tokens.
-  //
-  // Falls back to legacy profile atoms if no digest exists.
-  let profileDigest = "";
-  try {
-    profileDigest = fs.readFileSync(path.join(PROFILE_DIR, "digest.txt"), "utf-8").trim();
-  } catch {}
-
-  if (profileDigest) {
-    stableParts.push("Developer profile:");
-    stableParts.push(profileDigest);
+  // ── Developer DNA: consolidated identity path ──────────────────────────
+  // Gets the compiled identity fingerprint from developer-dna.mjs, which
+  // reads identity.json, philosophy.md, and rules.md. Replaces the old
+  // triple-path approach (profile/digest.txt + brain profile atoms + DNA).
+  // The orchestrator (context-orchestrator.mjs) also uses getDNA() in its
+  // frozen tier — this ensures compileContext follows the same single path.
+  const dna = getDNA();
+  if (dna) {
+    stableParts.push("Developer DNA:");
+    stableParts.push(dna);
     stableParts.push("");
-  } else {
-    // Fallback: inject raw scored profile atoms (legacy path)
-    const profileAtoms = (brainCtx.atoms || brainCtx.profileAtoms || [])
-      .filter(a => a.entityType !== "system_atom" && a.facet !== "rule");
-
-    if (profileAtoms.length > 0) {
-      stableParts.push("Relevant preferences:");
-      for (const atom of profileAtoms.slice(0, 8)) stableParts.push(`- ${atom.content}`);
-      stableParts.push("");
-    }
   }
 
   // Project brief: accumulated cross-session wisdom.
