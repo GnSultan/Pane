@@ -95,12 +95,22 @@ function App() {
       }
 
       // Cmd+1-9 — project switching (hardcoded, not rebindable)
+      // Sorted by lastActivityAt descending to match the visual order in ProjectList
       if ((e.metaKey || e.ctrlKey) && e.key >= "1" && e.key <= "9") {
         const index = parseInt(e.key) - 1;
-        const { projectOrder, setActiveProject } = useProjectsStore.getState();
-        if (index < projectOrder.length) {
+        const state = useProjectsStore.getState();
+        const { projects, projectOrder, setActiveProject } = state;
+        const sortedOrder = [...projectOrder].sort((a, b) => {
+          const aTime = projects.get(a)?.lastActivityAt ?? null;
+          const bTime = projects.get(b)?.lastActivityAt ?? null;
+          if (aTime !== null && bTime !== null) return bTime - aTime;
+          if (aTime !== null) return -1;
+          if (bTime !== null) return 1;
+          return projectOrder.indexOf(a) - projectOrder.indexOf(b);
+        });
+        if (index < sortedOrder.length) {
           e.preventDefault();
-          setActiveProject(projectOrder[index]!);
+          setActiveProject(sortedOrder[index]!);
         }
         return;
       }

@@ -1,30 +1,44 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useRef } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useProjectsStore } from "../../stores/projects";
 import { NewThreadPicker } from "./NewThreadPicker";
-import { rebindProject } from "../../lib/tauri-commands";
-import { detectProjectRoot } from "../../lib/tauri-commands";
+import { rebindProject, detectProjectRoot } from "../../lib/tauri-commands";
 
 const electronAPI = (window as any).electronAPI;
 
+function formatRelativeTime(epochMs: number): string {
+  const diff = Date.now() - epochMs;
+  if (diff < 60_000) return "now";
+  if (diff < 3_600_000) return Math.floor(diff / 60_000) + "m";
+  if (diff < 86_400_000) return Math.floor(diff / 3_600_000) + "h";
+  if (diff < 604_800_000) return Math.floor(diff / 86_400_000) + "d";
+  if (diff < 2_592_000_000) return Math.floor(diff / 604_800_000) + "w";
+  return new Date(epochMs).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+}
+
 // Each row subscribes to its own primitive data — no inline objects in selectors
-function ProjectRow({
-  id,
-  index,
-  dragIndex,
-  dropIndex,
-  onPointerDown,
-}: {
-  id: string;
-  index: number;
-  dragIndex: number | null;
-  dropIndex: number | null;
-  onPointerDown: (e: React.PointerEvent, index: number) => void;
-}) {
+function ProjectRow({ id }: { id: string }) {
   const name = useProjectsStore((s) => s.projects.get(id)?.name ?? "");
-  const hasUnread = useProjectsStore((s) => s.projects.get(id)?.hasUnreadCompletion ?? false);
+  const hasUnread = useProjectsStore(
+    (s) => s.projects.get(id)?.hasUnreadCompletion ?? false,
+  );
   const isActive = useProjectsStore((s) => s.activeProjectId === id);
-  const rootMissing = useProjectsStore((s) => s.projects.get(id)?.rootMissing ?? false);
+  const rootMissing = useProjectsStore(
+    (s) => s.projects.get(id)?.rootMissing ?? false,
+  );
   const root = useProjectsStore((s) => s.projects.get(id)?.root ?? "");
+  const lastUserPromptText = useProjectsStore(
+    (s) => s.projects.get(id)?.lastUserPromptText ?? null,
+  );
+  const lastResponseSummary = useProjectsStore(
+    (s) => s.projects.get(id)?.lastResponseSummary ?? null,
+  );
+  const lastActivityAt = useProjectsStore(
+    (s) => s.projects.get(id)?.lastActivityAt ?? null,
+  );
   const setActiveProject = useProjectsStore((s) => s.setActiveProject);
   const renameProject = useProjectsStore((s) => s.renameProject);
   const storeRebindProject = useProjectsStore((s) => s.rebindProject);
@@ -35,8 +49,13 @@ function ProjectRow({
   const [isRebinding, setIsRebinding] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const isDragging = dragIndex === index;
-  const isDropTarget = dragIndex !== null && dropIndex === index && dragIndex !== index;
+  const hasActivity = lastActivityAt !== null;
+  const excerpt = hasActivity
+    ? lastUserPromptText || lastResponseSummary || ""
+    : "";
+  const truncatedExcerpt =
+    excerpt.length > 80 ? excerpt.slice(0, 80) + "…" : excerpt;
+  const relativeTime = hasActivity ? formatRelativeTime(lastActivityAt!) : "";
 
   const startEdit = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -68,7 +87,7 @@ function ProjectRow({
     }
   };
 
-  // Missing root: show a compact rebind row instead of the normal row
+  // Missing root: show a compact rebind row
   if (rootMissing) {
     return (
       <div
@@ -77,10 +96,6 @@ function ProjectRow({
         }`}
         style={{ fontSize: "var(--pane-panel-font-size)" }}
       >
-        <span className="text-pane-text-secondary w-3 shrink-0"
-              style={{ fontSize: "var(--pane-panel-font-size-xs)" }}>
-          {index + 1}
-        </span>
         <span className="truncate flex-1 text-left text-pane-text-secondary/50 line-through">
           {name}
         </span>
@@ -98,114 +113,121 @@ function ProjectRow({
   }
 
   return (
-    <button
-      key={id}
-      data-project-index={index}
-      onClick={() => !editing && setActiveProject(id)}
-      onPointerDown={(e) => !editing && onPointerDown(e, index)}
+    <div
       className={`
-        w-full flex items-center gap-1.5 h-8 px-2 truncate group btn-press
-        ${isActive ? "bg-pane-text/[0.08] rounded-md text-pane-text" : "text-pane-text-secondary hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40 hover:rounded-md hover:text-pane-text"}
-        ${isDragging ? "opacity-40" : ""}
-        ${isDropTarget ? "border-t-2 border-pane-text/30" : "border-t-2 border-transparent"}
+        w-full flex flex-col gap-0 px-2.5 py-2 rounded-md group btn-press cursor-pointer
+        ${
+          isActive
+            ? "bg-pane-text/[0.08] text-pane-text"
+            : "text-pane-text-secondary hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40 hover:rounded-md hover:text-pane-text"
+        }
       `}
-      style={{ fontSize: "var(--pane-panel-font-size)" }}
+      onClick={() => !editing && setActiveProject(id)}
     >
-      <span className="text-pane-text-secondary w-3 shrink-0"
-            style={{ fontSize: "var(--pane-panel-font-size-xs)" }}>
-        {index + 1}
-      </span>
+      {/* Header row: name left, timestamp right */}
+      <div className="flex items-center justify-between min-w-0">
+        {editing ? (
+          <input
+            ref={inputRef}
+            value={editValue}
+            onChange={(e) => setEditValue(e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitEdit();
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setEditing(false);
+              }
+            }}
+            onBlur={commitEdit}
+            className="flex-1 min-w-0 bg-transparent outline-none text-pane-text"
+            style={{ fontSize: "var(--pane-panel-font-size)" }}
+          />
+        ) : (
+          <span
+            className="truncate text-pane-text font-medium"
+            style={{ fontSize: "var(--pane-panel-font-size)" }}
+          >
+            {name}
+          </span>
+        )}
 
-      {editing ? (
-        <input
-          ref={inputRef}
-          value={editValue}
-          onChange={(e) => setEditValue(e.target.value)}
-          onClick={(e) => e.stopPropagation()}
-          onPointerDown={(e) => e.stopPropagation()}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") { e.preventDefault(); commitEdit(); }
-            if (e.key === "Escape") { e.preventDefault(); setEditing(false); }
-          }}
-          onBlur={commitEdit}
-          className="flex-1 min-w-0 bg-transparent outline-none text-pane-text"
-          style={{ fontSize: "var(--pane-panel-font-size)" }}
-        />
-      ) : (
-        <span className="truncate flex-1 text-left">{name}</span>
-      )}
+        <div className="flex items-center gap-1.5 shrink-0 ml-2">
+          {hasActivity && !editing && (
+            <span
+              className="text-pane-text-secondary/40 whitespace-nowrap"
+              style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
+            >
+              {relativeTime}
+            </span>
+          )}
+          {hasUnread && !editing && (
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0 animate-pulse" />
+          )}
+          {!editing && (
+            <span
+              onPointerDown={startEdit}
+              className="shrink-0 text-pane-text-secondary/30 opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-3.5 h-3.5 btn-press"
+            >
+              <svg
+                width="9"
+                height="9"
+                viewBox="0 0 10 10"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.25"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M7 1.5l1.5 1.5-5.5 5.5H1.5V7L7 1.5z" />
+              </svg>
+            </span>
+          )}
+        </div>
+      </div>
 
-      {hasUnread && !editing && (
-        <span className="inline-block w-2 h-2 rounded-full bg-pane-status-added shrink-0 animate-pulse" />
-      )}
-
-      {!editing && (
+      {/* Excerpt row — only when the thread has activity */}
+      {hasActivity && (
         <span
-          onPointerDown={startEdit}
-          className="shrink-0 text-pane-text-secondary opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-4 h-4 btn-press"
+          className="truncate text-pane-text-secondary/50 leading-tight mt-0.5"
+          style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
         >
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M7 1.5l1.5 1.5-5.5 5.5H1.5V7L7 1.5z" />
-          </svg>
+          {truncatedExcerpt}
         </span>
       )}
-    </button>
+    </div>
   );
 }
 
 export function ProjectList() {
-  const projectOrder = useProjectsStore((s) => s.projectOrder);
-  const reorderProjects = useProjectsStore((s) => s.reorderProjects);
+  const sortedOrder = useProjectsStore(
+    useShallow((s) => {
+      const order = s.projectOrder;
+      const map = s.projects;
+      return [...order].sort((a, b) => {
+        const aTime = map.get(a)?.lastActivityAt ?? null;
+        const bTime = map.get(b)?.lastActivityAt ?? null;
+        // Both have activity: most recent first
+        if (aTime !== null && bTime !== null) return bTime - aTime;
+        // Active threads come before inactive ones
+        if (aTime !== null) return -1;
+        if (bTime !== null) return 1;
+        // Both inactive: insertion order
+        return order.indexOf(a) - order.indexOf(b);
+      });
+    }),
+  );
 
-  const [dragIndex, setDragIndex] = useState<number | null>(null);
-  const [dropIndex, setDropIndex] = useState<number | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
 
-  const handlePointerDown = useCallback(
-    (e: React.PointerEvent, index: number) => {
-      if (e.button !== 0 || projectOrder.length <= 1) return;
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-      setDragIndex(index);
-    },
-    [projectOrder.length],
-  );
-
-  const handlePointerMove = useCallback(
-    (e: React.PointerEvent) => {
-      if (dragIndex === null) return;
-      const el = document.elementFromPoint(e.clientX, e.clientY);
-      const item = el?.closest("[data-project-index]");
-      if (item) {
-        const idx = parseInt(item.getAttribute("data-project-index")!);
-        setDropIndex(idx);
-      }
-    },
-    [dragIndex],
-  );
-
-  const handlePointerUp = useCallback(() => {
-    if (dragIndex !== null && dropIndex !== null && dragIndex !== dropIndex) {
-      reorderProjects(dragIndex, dropIndex);
-    }
-    setDragIndex(null);
-    setDropIndex(null);
-  }, [dragIndex, dropIndex, reorderProjects]);
-
   return (
-    <div
-      className="px-2 py-1.5 space-y-0.5"
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-    >
-      {projectOrder.map((id, index) => (
-        <ProjectRow
-          key={id}
-          id={id}
-          index={index}
-          dragIndex={dragIndex}
-          dropIndex={dropIndex}
-          onPointerDown={handlePointerDown}
-        />
+    <div className="px-2 py-1.5 space-y-0.5">
+      {sortedOrder.map((id) => (
+        <ProjectRow key={id} id={id} />
       ))}
 
       {pickerOpen ? (
