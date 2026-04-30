@@ -292,10 +292,20 @@ export function ProjectList() {
       ) : (
         <button
           onClick={() => setPickerOpen(true)}
-          className="w-full flex items-center h-8 px-2 rounded-md btn-press text-pane-text-secondary hover:bg-pane-text/[0.08] hover:text-pane-text active:bg-pane-text/[0.12]"
-          style={{ fontSize: "var(--pane-panel-font-size)" }}
+          className="w-full flex flex-col gap-0 px-2.5 py-4 rounded-md group btn-press cursor-pointer text-left text-pane-text-secondary hover:bg-pane-text/[0.08] hover:text-pane-text active:bg-pane-text/[0.12]"
         >
-          + new thread
+          <span
+            className="truncate text-pane-text font-medium"
+            style={{ fontSize: "var(--pane-panel-font-size)" }}
+          >
+            New thread +
+          </span>
+          <span
+            className="truncate text-pane-text-secondary/40 leading-tight mt-0.5"
+            style={{ fontSize: "var(--pane-panel-font-size)" }}
+          >
+            your journey to production begins here…
+          </span>
         </button>
       )}
 
