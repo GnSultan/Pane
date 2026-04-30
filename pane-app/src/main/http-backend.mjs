@@ -11,7 +11,7 @@ const { AbortController, fetch, TextDecoder, console } = globalThis;
 
 import { PunkBackend } from "./punk-backend.mjs";
 import { ToolExecutor } from "./tool-executor.mjs";
-import { compileContext, mergeState, readState, getContextLimit, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, writeHandoffWithHistory, updateLatestHandoff, readHandoff } from "./pane-system-prompt.mjs";
+import { mergeState, readState, getContextLimit, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, writeHandoffWithHistory, updateLatestHandoff, readHandoff } from "./pane-system-prompt.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
 import { estimateConversationTokens } from "./token-budget.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
@@ -31,7 +31,7 @@ import { getPaneDb } from "./pane-db.mjs";
 // ============================================================================
 //
 // Pane maintains a 128k context window as a living document:
-//   - System prompt: ~4k, always current (managed by compileContext/orchestrator)
+//   - System prompt: ~4k, always current (managed by orchestrator)
 //   - Conversation: up to ~108k, actively pruned
 //   - Output reserve: ~8k
 //
@@ -1823,7 +1823,7 @@ export class ApiBackend extends PunkBackend {
 
       const historyLength = request.history ? request.history.length : 0;
 
-      // Update session state before compileContext
+      // Update session state before context assembly
       const stateUpdate = {
         lastProvider: apiConfig.provider,
         lastIntent: request.intent,
@@ -1848,24 +1848,18 @@ export class ApiBackend extends PunkBackend {
         console.warn("[http] Failed to fetch SQLite changes for context:", err.message);
       }
 
-      // Budget-aware context assembly via orchestrator (falls back to legacy)
-      let context;
-      try {
-        const conversationTokens = estimateConversationTokens(request.history || []);
-        context = orchestrateContext(request.projectId, {
-          intent: request.intent,
-          historyLength,
-          backend: "http",
-          model: request.model,
-          sqliteChanges,
-          conversationTokens,
-        });
-        if (context.budget?.layersDropped > 0) {
-          console.log(`[http] Context budget: ${context.budget.systemUsed}/${context.budget.systemBudget} tokens (dropped: ${context.budget.droppedNames.join(", ")})`);
-        }
-      } catch (err) {
-        console.warn(`[http] Orchestrator failed, falling back: ${err.message}`);
-        context = compileContext(request.projectId, request.intent, historyLength, "http", sqliteChanges);
+      // Budget-aware context assembly via orchestrator (single path)
+      const conversationTokens = estimateConversationTokens(request.history || []);
+      const context = orchestrateContext(request.projectId, {
+        intent: request.intent,
+        historyLength,
+        backend: "http",
+        model: request.model,
+        sqliteChanges,
+        conversationTokens,
+      });
+      if (context.budget?.layersDropped > 0) {
+        console.log(`[http] Context budget: ${context.budget.systemUsed}/${context.budget.systemBudget} tokens (dropped: ${context.budget.droppedNames.join(", ")})`);
       }
 
       // ── Build system prompt with tier metadata for cache-aware providers ──
