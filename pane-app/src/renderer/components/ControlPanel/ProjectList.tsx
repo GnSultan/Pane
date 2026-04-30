@@ -19,7 +19,7 @@ function formatRelativeTime(epochMs: number): string {
   });
 }
 
-// Each row subscribes to its own primitive data — no inline objects in selectors
+/** Active thread row — same as before with the addition of an archive icon. */
 function ProjectRow({ id }: { id: string }) {
   const name = useProjectsStore((s) => s.projects.get(id)?.name ?? "");
   const hasUnread = useProjectsStore(
@@ -41,6 +41,7 @@ function ProjectRow({ id }: { id: string }) {
   );
   const setActiveProject = useProjectsStore((s) => s.setActiveProject);
   const renameProject = useProjectsStore((s) => s.renameProject);
+  const archiveProject = useProjectsStore((s) => s.archiveProject);
   const storeRebindProject = useProjectsStore((s) => s.rebindProject);
   const markRootMissing = useProjectsStore((s) => s.markRootMissing);
 
@@ -115,7 +116,7 @@ function ProjectRow({ id }: { id: string }) {
   return (
     <div
       className={`
-        w-full flex flex-col gap-0 px-2.5 py-2 rounded-md group btn-press cursor-pointer
+        w-full flex flex-col gap-0 px-2.5 py-4 rounded-md group btn-press cursor-pointer
         ${
           isActive
             ? "bg-pane-text/[0.08] text-pane-text"
@@ -169,23 +170,48 @@ function ProjectRow({ id }: { id: string }) {
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0 animate-pulse" />
           )}
           {!editing && (
-            <span
-              onPointerDown={startEdit}
-              className="shrink-0 text-pane-text-secondary/30 opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-3.5 h-3.5 btn-press"
-            >
-              <svg
-                width="9"
-                height="9"
-                viewBox="0 0 10 10"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.25"
-                strokeLinecap="round"
-                strokeLinejoin="round"
+            <>
+              {/* Archive icon */}
+              <span
+                onClick={(e) => {
+                  e.stopPropagation();
+                  archiveProject(id);
+                }}
+                className="shrink-0 text-pane-text-secondary/30 opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-3.5 h-3.5 btn-press"
+                title="Archive thread"
               >
-                <path d="M7 1.5l1.5 1.5-5.5 5.5H1.5V7L7 1.5z" />
-              </svg>
-            </span>
+                <svg
+                  width="9"
+                  height="9"
+                  viewBox="0 0 10 10"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.25"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M8.5 8.5h-7v-6h7v6zM3 3V1.5h4V3M1.5 3h7" />
+                </svg>
+              </span>
+              {/* Edit icon */}
+              <span
+                onPointerDown={startEdit}
+                className="shrink-0 text-pane-text-secondary/30 opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-3.5 h-3.5 btn-press"
+              >
+                <svg
+                  width="9"
+                  height="9"
+                  viewBox="0 0 10 10"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.25"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M7 1.5l1.5 1.5-5.5 5.5H1.5V7L7 1.5z" />
+                </svg>
+              </span>
+            </>
           )}
         </div>
       </div>
@@ -194,11 +220,36 @@ function ProjectRow({ id }: { id: string }) {
       {hasActivity && (
         <span
           className="truncate text-pane-text-secondary/50 leading-tight mt-0.5"
-          style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
+          style={{ fontSize: "var(--pane-panel-font-size-sm)" }}
         >
           {truncatedExcerpt}
         </span>
       )}
+    </div>
+  );
+}
+
+/** Compact archived row — name + restore action only, no excerpt or timing. */
+function ArchivedRow({ id }: { id: string }) {
+  const name = useProjectsStore((s) => s.projects.get(id)?.name ?? "");
+  const restoreProject = useProjectsStore((s) => s.restoreProject);
+
+  return (
+    <div className="w-full flex items-center gap-1.5 h-7 px-2 rounded-md">
+      <span
+        className="truncate flex-1 text-left text-pane-text-secondary/50"
+        style={{ fontSize: "var(--pane-panel-font-size)" }}
+      >
+        {name}
+      </span>
+      <button
+        onClick={() => restoreProject(id)}
+        className="shrink-0 font-mono text-pane-text-secondary/40 hover:text-pane-status-added transition-colors"
+        style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
+        title="Restore thread"
+      >
+        restore
+      </button>
     </div>
   );
 }
@@ -222,11 +273,17 @@ export function ProjectList() {
     }),
   );
 
+  const projects = useProjectsStore((s) => s.projects);
+  const activeIds = sortedOrder.filter((id) => !projects.get(id)?.archived);
+  const archivedIds = sortedOrder.filter((id) => projects.get(id)?.archived);
+
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [archivedOpen, setArchivedOpen] = useState(false);
 
   return (
     <div className="px-2 py-1.5 space-y-0.5">
-      {sortedOrder.map((id) => (
+      {/* Active threads */}
+      {activeIds.map((id) => (
         <ProjectRow key={id} id={id} />
       ))}
 
@@ -240,6 +297,28 @@ export function ProjectList() {
         >
           + new thread
         </button>
+      )}
+
+      {/* Archived section — only shown when there are archived threads */}
+      {archivedIds.length > 0 && (
+        <div className="mt-3">
+          <button
+            onClick={() => setArchivedOpen(!archivedOpen)}
+            className="w-full flex items-center gap-1.5 px-2 h-7 text-pane-text-secondary/40 hover:text-pane-text-secondary transition-colors"
+            style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
+          >
+            <span className="font-mono">{archivedOpen ? "▾" : "▸"}</span>
+            <span>Archived ({archivedIds.length})</span>
+          </button>
+
+          {archivedOpen && (
+            <div className="space-y-0.5 mt-1">
+              {archivedIds.map((id) => (
+                <ArchivedRow key={id} id={id} />
+              ))}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
