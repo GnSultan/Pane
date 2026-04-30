@@ -970,7 +970,7 @@ export function renderInline(text: string, isThinking?: boolean, projectId?: str
             className="font-mono text-pane-error hover:opacity-70 hover:underline cursor-pointer transition-opacity"
             style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
           >
-            {matchPath}
+            {cleanPath}
           </button>
         ) : (
           <code
@@ -978,7 +978,7 @@ export function renderInline(text: string, isThinking?: boolean, projectId?: str
             className="font-mono text-pane-error"
             style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
           >
-            {matchPath}
+            {cleanPath}
           </code>
         )
       );

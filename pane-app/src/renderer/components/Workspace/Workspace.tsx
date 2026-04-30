@@ -11,7 +11,6 @@ import { FileSearch } from "../FileSearch/FileSearch";
 import { GitStatus } from "../ControlPanel/GitStatus";
 import { Menu, type PaneMode } from "../ControlPanel/Menu";
 import { useProjectsStore } from "../../stores/projects";
-import { useWorkspaceStore } from "../../stores/workspace";
 import { detectProjectRoot } from "../../lib/tauri-commands";
 
 import type { ElectronAPI } from '../../lib/electron';
@@ -150,9 +149,6 @@ function GitView({ projectId }: { projectId: string }) {
 export function Workspace() {
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const projectOrder = useProjectsStore((s) => s.projectOrder);
-  const geminiUpdateState = useWorkspaceStore((s) => s.geminiUpdateState);
-  const triggerGeminiUpdate = useWorkspaceStore((s) => s.triggerGeminiUpdate);
-  const showUpdate = !!geminiUpdateState;
   const wsRef = useRef<HTMLDivElement>(null);
 
   // Single store subscription → single data-mode DOM write → CSS handles all page visibility.
@@ -254,48 +250,6 @@ export function Workspace() {
       <div data-page="filesearch" className="absolute inset-0 bg-pane-bg">
         {activeProjectId && <FileSearch />}
       </div>
-
-      {/* Update notification pills — inside the workspace border, top-right corner */}
-      {showUpdate && (
-        <div className="absolute top-1.5 right-1.5 flex items-center gap-2 z-40 pointer-events-none">
-
-          {geminiUpdateState && (
-            <div
-              data-no-drag
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 pointer-events-auto animate-fadeSlideDown"
-            >
-              {geminiUpdateState === "available" && (
-                <button
-                  onClick={() => triggerGeminiUpdate()}
-                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
-                  gemini update available
-                </button>
-              )}
-              {geminiUpdateState === "updating" && (
-                <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
-                  installing gemini...
-                </span>
-              )}
-              {geminiUpdateState === "updated" && (
-                <span className="text-[11px] font-mono text-pane-status-added">
-                  gemini complete
-                </span>
-              )}
-              {geminiUpdateState === "restart" && (
-                <button
-                  onClick={() => window.location.reload()}
-                  className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
-                  restart gemini
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Menu — shown in workspace when sidebar is hidden (non-conversation modes) */}
       {mode !== "conversation" && (

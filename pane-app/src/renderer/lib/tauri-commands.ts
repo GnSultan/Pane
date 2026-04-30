@@ -611,38 +611,6 @@ export async function checkClaudeVersion(): Promise<ClaudeVersionInfo> {
   return electronAPI.invoke("check_claude_version");
 }
 
-// Gemini process management
-
-export interface GeminiVersionInfo {
-  current: string | null;
-  error: string | null;
-}
-
-export interface GeminiUpdateInfo {
-  updateAvailable: boolean;
-  currentVersion: string | null;
-  newVersion: string | null;
-  error: string | null;
-}
-
-export interface GeminiUpdateResult {
-  success: boolean;
-  output: string;
-  error: string | null;
-}
-
-export async function checkGeminiVersion(): Promise<GeminiVersionInfo> {
-  return electronAPI.invoke("check_gemini_version");
-}
-
-export async function checkGeminiUpdate(): Promise<GeminiUpdateInfo> {
-  return electronAPI.invoke("check_gemini_update");
-}
-
-export async function updateGemini(): Promise<GeminiUpdateResult> {
-  return electronAPI.invoke("update_gemini");
-}
-
 // --- File Checkpoints ---
 
 export interface CheckpointResult {

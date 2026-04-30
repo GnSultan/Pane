@@ -1046,6 +1046,18 @@ export function orchestrateContext(projectId, options = {}) {
   const relevanceAdjustments = computeRelevanceAdjustments(contextShape, brainCtx, intent, historyLength);
   applyRelevanceAdjustments(allLayers, relevanceAdjustments);
 
+  // ── Debug logging: PANE_DEBUG_CONTEXT=1 dumps relevance engine decisions ──
+  if (process.env.PANE_DEBUG_CONTEXT === "1") {
+    const adjLog = [...relevanceAdjustments.entries()]
+      .map(([name, delta]) => `${name}: ${delta > 0 ? "+" : ""}${delta}`)
+      .join(", ");
+    const typeSummary = allLayers.map(l => `${l.name}(p${l.priority})`).join(", ");
+    console.log(`[context] ${projectId} turn=${historyLength} intent=${intent} task=${contextShape?.taskType || "?"}`);
+    console.log(`[context] adjustments: ${adjLog || "(none)"}`);
+    console.log(`[context] layers (post-adjustment): ${typeSummary}`);
+    console.log(`[context] budget: limit=${contextLimit} systemBudget=${systemBudget} conversation=${conversationTokens} output=${effectiveOutputBudget}`);
+  }
+
   // Estimate tokens for each layer
   for (const layer of allLayers) {
     layer.tokens = estimateTokens(layer.text);
@@ -1086,6 +1098,15 @@ export function orchestrateContext(projectId, options = {}) {
       // Lower priority — drop entirely
       droppedLayers.push(layer);
     }
+  }
+
+  // ── Debug logging: log what was included vs dropped ──────────────────────
+  if (process.env.PANE_DEBUG_CONTEXT === "1") {
+    const included = includedLayers.map(l => `${l.name}(${l.tokens}t)`).join(", ");
+    const dropped = droppedLayers.map(l => `${l.name}(p${l.priority},${l.tokens}t)`).join(", ");
+    console.log(`[context] included (${includedLayers.length}): ${included}`);
+    if (droppedLayers.length > 0) console.log(`[context] dropped (${droppedLayers.length}): ${dropped}`);
+    console.log(`[context] used: ${usedTokens}/${systemBudget} tokens (${(usedTokens / systemBudget * 100).toFixed(0)}%)`);
   }
 
   // Assemble tiers (ordering: frozen first, session next, turn last)

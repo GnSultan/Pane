@@ -1655,6 +1655,14 @@ export class ToolExecutor {
             path.join(memoryDir, "events.jsonl"),
             JSON.stringify(event) + "\n",
           );
+          // Immediately index into brain knowledge graph so it's semantically
+          // searchable on the next turn — fire-and-forget, non-blocking.
+          if (this._brainRequest) {
+            this._brainRequest("index_events", {
+              projectId: this.projectId,
+              events: [event],
+            }).catch(err => console.warn("[tool-executor] brain index_events (from pane_remember) failed:", err.message));
+          }
           return { success: true, output: `Saved to project memory: [${event.type}] ${event.content}`, toolId };
         }
 
@@ -1699,6 +1707,64 @@ export class ToolExecutor {
             return `[${r.project}] [${e.type}]\n${e.content}`;
           }).join("\n\n");
           return { success: true, output: out, toolId };
+        }
+
+        case "pane_knowledge_graph": {
+          if (!this.projectId) return { success: false, error: "No project active.", toolId };
+          if (!this._brainRequest) return { success: false, error: "Brain worker not available — knowledge graph requires brain.", toolId };
+
+          try {
+            const result = await this._brainRequest("knowledge_graph", { projectId: this.projectId });
+            if (!result || result.error) {
+              return { success: true, output: "Knowledge graph not yet available — create memories with pane_remember first.", toolId };
+            }
+
+            const { typeCounts, nodes, edgeTypes, totalEdges } = result;
+            if (!typeCounts || typeCounts.length === 0) {
+              return { success: true, output: "No nodes in knowledge graph yet. Use pane_remember to record decisions and lessons.", toolId };
+            }
+
+            const parts = [];
+
+            // Summary stats
+            const totalNodes = typeCounts.reduce((s, t) => s + t.count, 0);
+            parts.push(`Knowledge graph: ${totalNodes} nodes, ${totalEdges || 0} edges`);
+            parts.push("");
+
+            // Type breakdown
+            parts.push("Node types:");
+            for (const t of typeCounts) {
+              parts.push(`  ${t.entity_type}: ${t.count}`);
+            }
+            if (edgeTypes && Object.keys(edgeTypes).length > 0) {
+              parts.push("");
+              parts.push("Edge types:");
+              for (const [type, count] of Object.entries(edgeTypes)) {
+                parts.push(`  ${type}: ${count}`);
+              }
+            }
+
+            // Top nodes by confidence
+            if (nodes && nodes.length > 0) {
+              parts.push("");
+              parts.push("Top memories:");
+              const typeLabel = (t) => {
+                const labels = { decision: "Decision", lesson: "Lesson", error_fix: "Fix", pattern: "Pattern", principle: "Principle" };
+                return labels[t] || t;
+              };
+              for (const n of nodes.slice(0, 10)) {
+                const label = typeLabel(n.entity_type);
+                const conf = (n.confidence * 100).toFixed(0);
+                const accesses = n.access_count || 0;
+                parts.push(`  [${label}] (${conf}% conf, ${accesses}x) ${n.content?.slice(0, 200) || n.name}`);
+              }
+              if (nodes.length > 10) parts.push(`  ... and ${nodes.length - 10} more`);
+            }
+
+            return { success: true, output: parts.join("\n"), toolId };
+          } catch (err) {
+            return { success: false, error: `Knowledge graph query failed: ${err.message}`, toolId };
+          }
         }
 
         case "pane_brief": {

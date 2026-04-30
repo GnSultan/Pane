@@ -28,11 +28,8 @@ function App() {
   useGitStatus();
   useSettingsPersistence();
 
-  // Check for updates and fetch models on app launch
+  // Fetch models on app launch
   useEffect(() => {
-    useWorkspaceStore.getState().checkForGeminiUpdate();
-    
-    // Initial fetch of models (cached or background)
     useWorkspaceStore.getState().fetchAllModels();
   }, []);
 

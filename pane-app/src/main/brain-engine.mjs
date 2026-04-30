@@ -2651,10 +2651,11 @@ process.parentPort.on("message", async ({ data }) => {
         // Run the full memory lifecycle: decay → consolidate → graduate
         if (!db) { sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId }); break; }
         try {
-          // Use the existing llmCall relay for consolidation (when enabled)
-          const quickCallRelay = data.enableConsolidation ? llmCall : null;
-
-          const result = await runMemoryLifecycle(db, data.projectId, quickCallRelay);
+          // Always enable consolidation — consolidateMemories() has internal guards
+          // (CONSOLIDATION_THRESHOLD, similarity clustering) and only calls the LLM
+          // when there are actually clusters to synthesize. The old caller-side
+          // Math.random() < 0.1 gate in main.mjs was pure waste.
+          const result = await runMemoryLifecycle(db, data.projectId, llmCall);
           sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId, result });
         } catch (err) {
           console.error("[brain] memory lifecycle error:", err.message);
@@ -2901,6 +2902,78 @@ process.parentPort.on("message", async ({ data }) => {
         if (!db) { sendToMain({ type: "finding_dismiss_result", requestId: data.requestId, success: false }); break; }
         db.prepare(`UPDATE punk_findings SET dismissed = 1 WHERE id = ?`).run(data.findingId);
         sendToMain({ type: "finding_dismiss_result", requestId: data.requestId, success: true });
+        break;
+      }
+
+      // ── Knowledge graph queries ──────────────────────────────────────────
+      case "knowledge_graph": {
+        if (!db) { sendToMain({ type: "knowledge_graph_result", requestId: data.requestId, error: "db not ready" }); break; }
+
+        const kgProjectId = data.projectId;
+
+        // Get type counts (exclude system atoms and profile atoms)
+        const typeCounts = db.prepare(`
+          SELECT entity_type, COUNT(*) as count
+          FROM nodes
+          WHERE project_id = ? AND entity_type NOT IN ('system_atom', 'profile_atom')
+          GROUP BY entity_type
+          ORDER BY count DESC
+        `).all(kgProjectId);
+
+        // Get top nodes (highest confidence, most accessed)
+        const topNodes = db.prepare(`
+          SELECT id, name, entity_type, content, confidence, access_count, priority
+          FROM nodes
+          WHERE project_id = ? AND entity_type NOT IN ('project', 'system_atom', 'profile_atom')
+            AND content != '{}'
+          ORDER BY confidence DESC, access_count DESC
+          LIMIT 20
+        `).all(kgProjectId);
+
+        // Parse node content from JSON storage format
+        const parsedNodes = topNodes.map(n => {
+          let content = n.content;
+          try {
+            const parsed = JSON.parse(n.content);
+            content = parsed.text || parsed.content || n.name;
+          } catch {
+            content = n.content || n.name;
+          }
+          return {
+            id: n.id,
+            name: n.name,
+            entity_type: n.entity_type,
+            content: typeof content === "string" ? content.slice(0, 500) : String(content).slice(0, 500),
+            confidence: n.confidence,
+            access_count: n.access_count,
+          };
+        });
+
+        // Get edge summary for this project's nodes
+        const edges = db.prepare(`
+          SELECT e.type, COUNT(*) as count
+          FROM edges e
+          WHERE e.source_id IN (SELECT id FROM nodes WHERE project_id = ?)
+             OR e.target_id IN (SELECT id FROM nodes WHERE project_id = ?)
+          GROUP BY e.type
+          ORDER BY count DESC
+        `).all(kgProjectId, kgProjectId);
+
+        const edgeTypes = {};
+        let totalEdges = 0;
+        for (const e of edges) {
+          edgeTypes[e.type] = e.count;
+          totalEdges += e.count;
+        }
+
+        sendToMain({
+          type: "knowledge_graph_result",
+          requestId: data.requestId,
+          typeCounts,
+          nodes: parsedNodes,
+          edgeTypes,
+          totalEdges,
+        });
         break;
       }
 

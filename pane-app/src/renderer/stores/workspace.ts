@@ -9,8 +9,6 @@ import {
   getOpenRouterModels,
   getAllModels,
   refreshAllModels,
-  checkGeminiUpdate,
-  updateGemini,
   setAppTheme,
 } from "../lib/tauri-commands";
 
@@ -77,13 +75,6 @@ interface WorkspaceState {
   profileBio: string;
   profileRole: string;
   profileAvatarDataUrl: string | null; // data:image/... URL for display
-  // Gemini updates
-  geminiUpdateAvailable: boolean;
-  geminiUpdateState: "available" | "updating" | "updated" | "restart" | null;
-  geminiCurrentVersion: string | null;
-  geminiNewVersion: string | null;
-  checkForGeminiUpdate: () => Promise<void>;
-  triggerGeminiUpdate: () => Promise<void>;
   setProfileName: (name: string) => void;
   setProfileBio: (bio: string) => void;
   setProfileRole: (role: string) => void;
@@ -300,45 +291,11 @@ function createWorkspaceStore() {
     profileBio: "",
     profileRole: "",
     profileAvatarDataUrl: null,
-    geminiUpdateAvailable: false,
-    geminiUpdateState: null,
-    geminiCurrentVersion: null,
-    geminiNewVersion: null,
     setProfileName: (name: string) => set({ profileName: name }),
     setProfileBio: (bio: string) => set({ profileBio: bio }),
     setProfileRole: (role: string) => set({ profileRole: role }),
     setProfileAvatarDataUrl: (url: string | null) =>
       set({ profileAvatarDataUrl: url }),
-    checkForGeminiUpdate: async () => {
-      const result = await checkGeminiUpdate();
-      if (!result.error && result.updateAvailable) {
-        set({
-          geminiUpdateAvailable: true,
-          geminiUpdateState: "available",
-          geminiCurrentVersion: result.currentVersion,
-          geminiNewVersion: result.newVersion,
-        });
-      } else {
-        set({
-          geminiUpdateAvailable: false,
-          geminiUpdateState: null,
-          geminiCurrentVersion: result.currentVersion,
-          geminiNewVersion: null,
-        });
-      }
-    },
-    triggerGeminiUpdate: async () => {
-      set({ geminiUpdateState: "updating" });
-      const result = await updateGemini();
-      if (result.success) {
-        set({ geminiUpdateState: "updated" });
-        setTimeout(() => {
-          set({ geminiUpdateState: "restart", geminiUpdateAvailable: false });
-        }, 2000);
-      } else {
-        set({ geminiUpdateState: "available" });
-      }
-    },
     increaseFontSize: () =>
       set((state) => {
         const next = Math.max(1, state.fontSize + 1);
