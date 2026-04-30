@@ -220,7 +220,7 @@ function ProjectRow({ id }: { id: string }) {
       {hasActivity && (
         <span
           className="truncate text-pane-text-secondary/50 leading-tight mt-0.5"
-          style={{ fontSize: "var(--pane-panel-font-size-sm)" }}
+          style={{ fontSize: "var(--pane-panel-font-size)" }}
         >
           {truncatedExcerpt}
         </span>
