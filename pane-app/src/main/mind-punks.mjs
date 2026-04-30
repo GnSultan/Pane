@@ -176,6 +176,211 @@ export class MindPunks {
     return { sessionId, findings: allFindings };
   }
 
+  // ── Single Punk Run ────────────────────────────────────────────────────────
+
+  /**
+   * Run a single punk on demand. Supports an optional scope prompt that lets
+   * the user specify what to analyze. When scope is given, it replaces the
+   * standard diff focus — the punk plans its own investigation.
+   *
+   * @param {string} punkName - e.g. "ash", "ghost", "sage"
+   * @param {string} projectId
+   * @param {string} workingDir
+   * @param {string|null} scope - optional user-provided focus, e.g. "trace the payment flow"
+   * @returns {Promise<{ findings: Array }>}
+   */
+  async runSinglePunk(punkName, projectId, workingDir, scope = null) {
+    const persona = await this._loadPersona(punkName);
+    if (!persona) {
+      this._sendToRenderer("pane://punk-progress", {
+        punk: punkName, status: "failed", error: "Persona not found",
+      });
+      return { findings: [] };
+    }
+
+    // Notify: punk started
+    this._sendToRenderer("pane://punk-progress", {
+      projectId, punk: punkName, status: "running",
+    });
+
+    let userPrompt;
+    if (scope && scope.trim().length > 0) {
+      // Scope-driven: the user said "trace the payment flow" or "check auth on the API"
+      // The punk plans its own investigation — scope replaces diff context.
+      userPrompt = scope.trim();
+    } else {
+      // Diff-driven: same as runReview but for a single punk
+      let lastBaseRef = null;
+      try {
+        const latest = await this._brainRequest("review_session_latest", { projectId });
+        if (latest?.session?.base_ref) lastBaseRef = latest.session.base_ref;
+      } catch {}
+      const diffFocus = await this._getDiffFocus(workingDir, lastBaseRef);
+      userPrompt = this._buildUserPrompt(diffFocus, punkName);
+    }
+
+    try {
+      const rawOutput = await this._agentCall(persona, userPrompt, workingDir);
+      const findings = this._parseFindings(rawOutput, punkName);
+
+      // Store findings directly (no review session — single punk runs are standalone)
+      const storedFindings = [];
+      for (const f of findings) {
+        try {
+          const result = await this._brainRequest("review_finding_add", {
+            sessionId: null, // standalone — not part of a review session
+            projectId,
+            punk: punkName,
+            severity: f.severity,
+            finding: f.finding,
+            structured: JSON.stringify(f),
+            location: f.location || null,
+          });
+          if (result?.finding) storedFindings.push(result.finding);
+        } catch {}
+      }
+
+      // Notify: punk complete
+      this._sendToRenderer("pane://punk-complete", {
+        punk: punkName,
+        findings: storedFindings,
+      });
+
+      console.log(`[punks] ${punkName} complete: ${storedFindings.length} findings`);
+      return { findings: storedFindings };
+    } catch (err) {
+      console.error(`[punks] ${punkName} failed:`, err.message);
+      this._sendToRenderer("pane://punk-progress", {
+        punk: punkName, status: "failed", error: err.message,
+      });
+      return { findings: [] };
+    }
+  }
+
+  // ── Previous Finding Check ─────────────────────────────────────────────────
+
+  /**
+   * Re-check past findings for a specific punk. Loads undismissed findings,
+   * feeds them to the punk with the current codebase state, and asks it to
+   * determine if each is still present, resolved, or partially addressed.
+   *
+   * @param {string} punkName
+   * @param {string} projectId
+   * @param {string} workingDir
+   * @returns {Promise<{ findings: Array }>}
+   */
+  async checkPrevious(punkName, projectId, workingDir) {
+    // Load past undismissed findings for this punk
+    const result = await this._brainRequest("findings_by_punk", {
+      projectId, punk: punkName,
+    });
+    const previousFindings = result?.findings || [];
+    if (previousFindings.length === 0) {
+      this._sendToRenderer("pane://punk-complete", {
+        punk: punkName, findings: [], checkPrevious: true,
+      });
+      return { findings: [] };
+    }
+
+    const persona = await this._loadPersona(punkName);
+    if (!persona) {
+      this._sendToRenderer("pane://punk-progress", {
+        punk: punkName, status: "failed", error: "Persona not found",
+      });
+      return { findings: [] };
+    }
+
+    // Notify: check started
+    this._sendToRenderer("pane://punk-progress", {
+      projectId, punk: punkName, status: "checking previous",
+    });
+
+    const previousSummary = previousFindings.map((f, i) => {
+      let structured = {};
+      try { structured = JSON.parse(f.structured || "{}"); } catch {}
+      return `${i + 1}. [${f.severity}] ${f.finding}\n   Location: ${f.location || "N/A"}\n   Remediation: ${structured.remediation || "none"}`;
+    }).join("\n\n");
+
+    // Get current diff for context
+    let diffContext = "";
+    try {
+      const diffFocus = await this._getDiffFocus(workingDir, null);
+      if (diffFocus.stat) diffContext = `\nRecent changes:\n${diffFocus.stat}`;
+    } catch {}
+
+    const userPrompt = `You previously found these issues in this codebase. Check if they have been resolved by examining the current code.\n\nPrevious findings:\n${previousSummary}${diffContext}\n\nFor each finding, determine its current status: "resolved" (fixed/changed), "still_present" (same issue exists), or "partial" (partially addressed).\n\nReturn your assessment as a JSON array with the same structure as your normal findings, with an additional "status" field: "resolved" | "still_present" | "partial".`;
+
+    try {
+      const rawOutput = await this._agentCall(persona, userPrompt, workingDir);
+      const findings = this._parseCheckResults(rawOutput, punkName);
+
+      // Store each checked finding
+      const storedFindings = [];
+      for (const f of findings) {
+        try {
+          const stored = await this._brainRequest("review_finding_add", {
+            sessionId: null,
+            projectId,
+            punk: punkName,
+            severity: "note",
+            finding: f.finding,
+            structured: JSON.stringify(f),
+            location: f.location || null,
+          });
+          if (stored?.finding) storedFindings.push(stored.finding);
+        } catch {}
+      }
+
+      this._sendToRenderer("pane://punk-complete", {
+        punk: punkName, findings: storedFindings, checkPrevious: true,
+      });
+
+      console.log(`[punks] ${punkName} check complete: ${storedFindings.length} statuses`);
+      return { findings: storedFindings };
+    } catch (err) {
+      console.error(`[punks] ${punkName} check failed:`, err.message);
+      this._sendToRenderer("pane://punk-progress", {
+        punk: punkName, status: "failed", error: err.message,
+      });
+      return { findings: [] };
+    }
+  }
+
+  /**
+   * Parse check results — like _parseFindings but tolerant of the "status" field.
+   */
+  _parseCheckResults(rawOutput, punkName) {
+    if (!rawOutput) return [];
+
+    let arr;
+    const fenced = rawOutput.match(/```json\s*\n([\s\S]*?)\n\s*```/);
+    if (fenced) {
+      try { arr = JSON.parse(fenced[1]); } catch {}
+    }
+    if (!arr) {
+      const bracketMatch = rawOutput.match(/\[[\s\S]*\]/);
+      if (bracketMatch) {
+        try { arr = JSON.parse(bracketMatch[0]); } catch {}
+      }
+    }
+
+    if (!Array.isArray(arr)) return [];
+
+    return arr
+      .filter(f => f && typeof f.finding === "string" && f.finding.length > 10)
+      .map(f => ({
+        punk: punkName,
+        severity: "note",
+        finding: `[${f.status || "still_present"}] ${f.finding}`,
+        location: f.location || null,
+        remediation: f.remediation || null,
+        status: f.status || "still_present",
+        flow: f.flow || null,
+        boundary: f.boundary || null,
+        journey: f.journey || null,
+      }));
+  }
+
   // ── Punk Discovery ─────────────────────────────────────────────────────────
 
   /**
@@ -400,6 +605,48 @@ export class MindPunks {
       return lensPost;
     } catch (err) {
       console.error("[punks] _writeLensPost failed:", err.message);
+    }
+  }
+
+  // ── Punk Management ────────────────────────────────────────────────────────
+
+  /**
+   * List all available punks from disk, with metadata extracted from the markdown.
+   * @returns {Promise<Array<{name: string, displayName: string, role: string, color?: string}>>}
+   */
+  async listPunks() {
+    const names = this._discoverPunks();
+    const punks = [];
+    for (const name of names) {
+      const persona = await this._loadPersona(name);
+      const displayName = persona?.match(/^#\s+(.+)/m)?.[1]?.trim() || name;
+      const role = persona?.match(/^## Identity\s*\n\n(.+?)(?:\n\n|$)/ms)?.slice(1)?.[0]?.trim() || "";
+      punks.push({ name, displayName, role });
+    }
+    return punks;
+  }
+
+  /**
+   * Create a new punk persona file on disk.
+   * @param {string} name - kebab-case identifier (becomes filename)
+   * @param {string} personaContent - Full markdown content (# Name, ## Identity, ## Methodology, ## Principles)
+   * @returns {Promise<{success: boolean, error?: string}>}
+   */
+  async createPunk(name, personaContent) {
+    // Validate: alphanumeric + hyphens only, no path traversal
+    if (!name || !/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(name)) {
+      return { success: false, error: "Name must be alphanumeric with optional hyphens" };
+    }
+    if (!personaContent || personaContent.trim().length < 10) {
+      return { success: false, error: "Persona content is too short" };
+    }
+    const filePath = path.join(PUNKS_DIR, `${name}.md`);
+    try {
+      await fs.writeFile(filePath, personaContent.trim(), "utf-8");
+      console.log(`[punks] Created new punk: ${name}`);
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: err.message };
     }
   }
 }

@@ -944,25 +944,23 @@ export function InputBar({
         <div
           className={`absolute bottom-0 left-0 right-0 flex items-center gap-3 px-3 pb-3 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
         >
-          {/* Radiating strokes — gentle spin */}
+          {/* Pane logo — gentle spin */}
           <svg
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            className="text-pane-text-secondary/70 shrink-0 animate-gentle-spin"
+            width="26"
+            height="26"
+            viewBox="0 0 1080 1080"
+            fill="currentColor"
+            className="shrink-0 animate-gentle-spin"
+            style={{ color: "var(--pane-accent)" }}
           >
-            <line x1="12" y1="2"     x2="12"    y2="6" />
-            <line x1="16.24" y1="7.76"  x2="19.07" y2="4.93" />
-            <line x1="18" y1="12"    x2="22"    y2="12" />
-            <line x1="16.24" y1="16.24" x2="19.07" y2="19.07" />
-            <line x1="12" y1="18"    x2="12"    y2="22" />
-            <line x1="7.76" y1="16.24"  x2="4.93"  y2="19.07" />
-            <line x1="6"  y1="12"    x2="2"     y2="12" />
-            <line x1="7.76" y1="7.76"   x2="4.93"  y2="4.93" />
+            <rect x="537.64" y="716.95" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(1532.34 709.43) rotate(117.97)"/>
+            <rect x="339.14" y="645.42" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(911.14 1351.24) rotate(162.97)"/>
+            <rect x="249.37" y="454.48" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(239.05 1165.33) rotate(-152.03)"/>
+            <rect x="320.9" y="255.98" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(95.77 779.63) rotate(-107.03)"/>
+            <rect x="511.84" y="166.21" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(46.18 606.07) rotate(-62.03)"/>
+            <rect x="710.34" y="237.74" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(-66.64 227.28) rotate(-17.03)"/>
+            <rect x="800.11" y="428.68" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(342.42 -320.83) rotate(27.97)"/>
+            <rect x="728.58" y="627.18" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(1219.73 -198.15) rotate(72.97)"/>
           </svg>
           {/* Previous indicators — swap above SVG for either if needed
           — circle-pulse (breathing circle):
@@ -1001,13 +999,13 @@ export function InputBar({
               })()}
             </button>
           ) : (
-            /* Placeholder — tap to open input bar and queue next message */
+            /* Placeholder — shows status when no todos; tap to expand */
             <button
               onClick={() => setExpanded(true)}
               className="font-mono text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors text-left"
               style={{ fontSize: "var(--pane-font-size-xs)" }}
             >
-              let's build
+              working on it
             </button>
           )}
           <div className="ml-auto shrink-0 flex items-center gap-1.5">
@@ -1078,37 +1076,46 @@ export function InputBar({
         </div>
       )}
 
-      {/* One card. Textarea + thoughts picker + button bar in column. */}
-      {expanded && <div ref={cardRef} className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 relative flex flex-col">
-
-        {/* Spinner — floats top-left of card, same size as collapsed bar spinner */}
-        {isProcessing && attachMenu !== "thoughts" && (
+      {/* Processing bar above expanded card — spinner + stop float above, InputBar stays clean */}
+      {expanded && (isProcessing || isFadingOut) && attachMenu !== "thoughts" && (
+        <div
+          className={`flex items-center gap-3 px-3 pb-2 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
+        >
           <svg
-            width="18" height="18" viewBox="0 0 24 24" fill="none"
-            stroke="currentColor" strokeWidth="2" strokeLinecap="round"
-            className="absolute top-3 left-3 z-10 text-pane-text-secondary/70 shrink-0 animate-gentle-spin pointer-events-none"
+            width="26"
+            height="26"
+            viewBox="0 0 1080 1080"
+            fill="currentColor"
+            className="shrink-0 animate-gentle-spin"
+            style={{ color: "var(--pane-accent)" }}
           >
-            <line x1="12" y1="2" x2="12" y2="6" />
-            <line x1="16.24" y1="7.76" x2="19.07" y2="4.93" />
-            <line x1="18" y1="12" x2="22" y2="12" />
-            <line x1="16.24" y1="16.24" x2="19.07" y2="19.07" />
-            <line x1="12" y1="18" x2="12" y2="22" />
-            <line x1="7.76" y1="16.24" x2="4.93" y2="19.07" />
-            <line x1="6" y1="12" x2="2" y2="12" />
-            <line x1="7.76" y1="7.76" x2="4.93" y2="4.93" />
+            <rect x="537.64" y="716.95" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(1532.34 709.43) rotate(117.97)"/>
+            <rect x="339.14" y="645.42" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(911.14 1351.24) rotate(162.97)"/>
+            <rect x="249.37" y="454.48" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(239.05 1165.33) rotate(-152.03)"/>
+            <rect x="320.9" y="255.98" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(95.77 779.63) rotate(-107.03)"/>
+            <rect x="511.84" y="166.21" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(46.18 606.07) rotate(-62.03)"/>
+            <rect x="710.34" y="237.74" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(-66.64 227.28) rotate(-17.03)"/>
+            <rect x="800.11" y="428.68" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(342.42 -320.83) rotate(27.97)"/>
+            <rect x="728.58" y="627.18" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(1219.73 -198.15) rotate(72.97)"/>
           </svg>
-        )}
-
-        {/* Stop — floats top-right of card */}
-        {isProcessing && attachMenu !== "thoughts" && (
+          <span
+            className="font-mono text-pane-text-secondary/40"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            working on it
+          </span>
           <button
             onClick={onAbort}
-            className="absolute top-2.5 right-3 z-10 pointer-events-auto text-pane-error font-mono hover:text-pane-error/80 btn-press shrink-0"
+            className="ml-auto text-pane-error font-mono hover:text-pane-error/80 btn-press shrink-0"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           >
             stop
           </button>
-        )}
+        </div>
+      )}
+
+      {/* One card. Textarea + thoughts picker + button bar in column. */}
+      {expanded && <div ref={cardRef} className="rounded-xl ring-1 ring-pane-border/40 relative flex flex-col">
 
         {attachMenu !== "thoughts" && (
           <CaretTextArea
@@ -1116,7 +1123,7 @@ export function InputBar({
             value={value}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
-            placeholder={isProcessing ? "" : "let's build..."}
+            placeholder="let's build..."
             minHeight={56}
             maxHeight={window.innerHeight * 0.4}
             autoResize
@@ -1222,7 +1229,7 @@ export function InputBar({
 
               {/* Spacer — always present except when PhasePickerExpanded takes the whole row */}
               {!modePickerExpanded && <div className="flex-1" />}
-              {isProcessing ? null : (() => {
+              {(() => {
                 const color = PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)";
                 if (modePickerExpanded) {
                   return (
@@ -1231,6 +1238,16 @@ export function InputBar({
                       onSelect={(p) => setPhaseOverride(p)}
                       onClose={() => setModePickerExpanded(false)}
                     />
+                  );
+                }
+                if (isProcessing) {
+                  return (
+                    <span
+                      className="font-mono shrink-0 px-3 py-1.5 rounded-md"
+                      style={{ fontSize: "var(--pane-font-size-sm)", color }}
+                    >
+                      {currentPhase}
+                    </span>
                   );
                 }
                 return (

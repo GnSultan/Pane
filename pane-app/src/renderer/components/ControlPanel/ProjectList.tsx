@@ -93,7 +93,7 @@ function ProjectRow({ id }: { id: string }) {
     return (
       <div
         className={`w-full flex items-center gap-1.5 h-8 px-2 rounded-md ${
-          isActive ? "bg-pane-text/[0.08]" : ""
+          isActive ? "bg-pane-accent/[0.10]" : ""
         }`}
         style={{ fontSize: "var(--pane-panel-font-size)" }}
       >
@@ -119,7 +119,7 @@ function ProjectRow({ id }: { id: string }) {
         w-full flex flex-col gap-0 px-2.5 py-4 rounded-md group btn-press cursor-pointer
         ${
           isActive
-            ? "bg-pane-text/[0.08] text-pane-text"
+            ? "bg-pane-accent/[0.10] text-pane-text"
             : "text-pane-text-secondary hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40 hover:rounded-md hover:text-pane-text"
         }
       `}
@@ -281,7 +281,7 @@ export function ProjectList() {
   const [archivedOpen, setArchivedOpen] = useState(false);
 
   return (
-    <div className="px-2 py-1.5 space-y-0.5">
+    <div className="py-1.5 space-y-0.5">
       {/* Active threads */}
       {activeIds.map((id) => (
         <ProjectRow key={id} id={id} />

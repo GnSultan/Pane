@@ -828,7 +828,8 @@ ${PANE_END}`;
                   provider: "anthropic",
                   activity_type: "conversation",
                   model: model || "claude-sonnet-4-6",
-                  input_tokens: usage.input_tokens || 0,
+                  // Anthropic reports input_tokens as non-cached — add cache_read for raw total
+                  input_tokens: (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0),
                   output_tokens: usage.output_tokens || 0,
                   cache_creation_input_tokens:
                     usage.cache_creation_input_tokens || 0,

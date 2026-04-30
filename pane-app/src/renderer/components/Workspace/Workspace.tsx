@@ -299,13 +299,12 @@ export function Workspace() {
 
       {/* Menu — shown in workspace when sidebar is hidden (non-conversation modes) */}
       {mode !== "conversation" && (
-        <div className="absolute bottom-3 left-3 z-30">
+        <div className="absolute bottom-3 left-3 z-30 w-80">
           <Menu
             currentMode={mode}
             isGitRepo={isGitRepo}
             hasUnreadLens={hasUnreadLens}
             onSelectMode={handleSelectMode}
-            position="workspace"
           />
         </div>
       )}

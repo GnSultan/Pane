@@ -249,6 +249,9 @@ export interface ProjectSessionState {
   selected_model_provider?: string;
   /** Per-project thinking override. */
   selected_model_thinking?: boolean;
+  /** When true, this thread is archived. Migrates to conversation-level
+   *  is_archived when multi-conversation (Phase 0) lands. */
+  archived?: boolean;
 }
 
 export interface UserSettings {
@@ -1540,6 +1543,90 @@ export async function reviewSessionsList(projectId: string): Promise<{ sessions:
 
 export async function reviewSessionLatest(projectId: string): Promise<{ session: ReviewSession | null; findings: ReviewFinding[] }> {
   return electronAPI.invoke("review_session_latest", { projectId });
+}
+
+// ── Lens v2: Single Punk Execution ───────────────────────────────────────
+
+/**
+ * Run a single punk (ash, ghost, sage) on demand.
+ * Results arrive via pane://punk-progress and pane://punk-complete events.
+ */
+export async function runSinglePunk(
+  punkName: string,
+  projectId: string,
+  workingDir: string,
+  scope?: string | null,
+): Promise<{ started: boolean }> {
+  return electronAPI.invoke("run_single_punk", { punkName, projectId, workingDir, scope });
+}
+
+/**
+ * Re-check a punk's previous findings against the current codebase.
+ * Results arrive via pane://punk-progress and pane://punk-complete events.
+ */
+export async function checkPreviousFindings(
+  punkName: string,
+  projectId: string,
+  workingDir: string,
+): Promise<{ started: boolean }> {
+  return electronAPI.invoke("check_previous_findings", { punkName, projectId, workingDir });
+}
+
+// ── Lens v2: Finding Queries ─────────────────────────────────────────────
+
+export async function findingsList(
+  projectId: string,
+  limit?: number,
+): Promise<{ findings: ReviewFinding[] }> {
+  return electronAPI.invoke("findings_list", { projectId, limit });
+}
+
+export async function findingsByPunk(
+  punkName: string,
+  projectId: string,
+  limit?: number,
+): Promise<{ findings: ReviewFinding[] }> {
+  return electronAPI.invoke("findings_by_punk", { projectId, punkName, limit });
+}
+
+export async function dismissFinding(
+  findingId: string,
+): Promise<{ success: boolean }> {
+  return electronAPI.invoke("dismiss_finding", { findingId });
+}
+
+// ── Punk Management ──────────────────────────────────────────────────────
+
+/** List all available punks from disk with metadata (name, displayName, role). */
+export async function listPunks(): Promise<Array<{ name: string; displayName: string; role: string }>> {
+  return electronAPI.invoke("list_punks");
+}
+
+/** Create a new punk persona file on disk. */
+export async function createPunk(
+  name: string,
+  personaContent: string,
+): Promise<{ success: boolean; error?: string }> {
+  return electronAPI.invoke("create_punk", { name, personaContent });
+}
+
+// ── Thread State ─────────────────────────────────────────────────────────
+// Prompt/response activity data used for the thread list UI.
+
+export async function recordLastPrompt(projectId: string, promptText: string, promptHash: number): Promise<void> {
+  return electronAPI.invoke("record_last_prompt", { projectId, promptText, promptHash });
+}
+
+export async function recordLastResponse(projectId: string, summary: string): Promise<void> {
+  return electronAPI.invoke("record_last_response", { projectId, summary });
+}
+
+export async function getThreadState(projectId: string): Promise<Record<string, unknown> | null> {
+  return electronAPI.invoke("get_thread_state", { projectId });
+}
+
+export async function getAllThreadStates(projectIds: string[]): Promise<Record<string, unknown>> {
+  return electronAPI.invoke("get_all_thread_states", { projectIds });
 }
 
 /**

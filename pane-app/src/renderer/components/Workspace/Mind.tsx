@@ -450,7 +450,7 @@ export function Mind() {
         <div className="mx-auto w-full max-w-4xl px-10 pt-[35vh] pb-48">
           {/* ── Compose zone ── */}
           <div
-            className={`rounded-xl ring-1 bg-pane-bg mb-12 transition-all cursor-text ring-pane-border/40`}
+            className="rounded-xl ring-1 mb-12 ring-pane-border/40 px-5 pt-4 pb-3"
           >
             <CaretTextArea
               ref={textareaRef}
@@ -458,17 +458,16 @@ export function Mind() {
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={handleKeyDown}
               onBlur={handleBlur}
-              placeholder="what's on your mind..."
+              placeholder="what's on your mind?"
               className="w-full"
               style={{
                 fontSize: "var(--pane-font-size)",
                 lineHeight: "1.85",
-                padding: "1rem 1.25rem",
               }}
-              minHeight={120}
+              minHeight={56}
             />
 
-            <div className="flex items-center justify-between pt-3 mt-2">
+            <div className="flex items-center justify-between pt-3">
               <span
                 className="font-mono text-pane-text-secondary/25"
                 style={{ fontSize: "10px" }}

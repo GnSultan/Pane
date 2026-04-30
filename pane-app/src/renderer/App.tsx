@@ -307,7 +307,7 @@ function App() {
 
       <div className="flex h-full pt-2 pb-2 pl-2 gap-1">
         {sidebarVisible && (
-          <div className="shrink-0 w-60">
+          <div className="shrink-0 w-80">
             <ControlPanel />
           </div>
         )}

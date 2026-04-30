@@ -515,6 +515,7 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(entity_type);
     CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_id);
     CREATE INDEX IF NOT EXISTS idx_nodes_confidence ON nodes(confidence);
+    CREATE INDEX IF NOT EXISTS idx_nodes_facet ON nodes(facet);
     CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
     CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
     CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
@@ -530,23 +531,13 @@ function initDatabase() {
       content TEXT NOT NULL,
       completed INTEGER DEFAULT 0,
       embedding BLOB,
+      project_id TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_mind_created ON mind_entries(created_at);
+    CREATE INDEX IF NOT EXISTS idx_mind_project ON mind_entries(project_id);
   `);
-
-  // Migrations for existing mind_entries table
-  try {
-    db.exec("ALTER TABLE mind_entries ADD COLUMN completed INTEGER DEFAULT 0");
-  } catch (err) { /* ignore if exists */ }
-  try {
-    db.exec("ALTER TABLE mind_entries ADD COLUMN embedding BLOB");
-  } catch (err) { /* ignore if exists */ }
-  try {
-    db.exec("ALTER TABLE mind_entries ADD COLUMN project_id TEXT");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_mind_project ON mind_entries(project_id)");
-  } catch (err) { /* ignore if exists */ }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS mind_threads (
@@ -621,26 +612,18 @@ function initDatabase() {
       finding    TEXT    NOT NULL,
       structured TEXT    NOT NULL,
       location   TEXT,
+      dismissed  INTEGER NOT NULL DEFAULT 0,
       created_at TEXT    NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_findings_session ON punk_findings(session_id);
     CREATE INDEX IF NOT EXISTS idx_findings_project ON punk_findings(project_id, created_at);
   `);
 
-  // Migrations for unified atom pool — add priority, sort_order, facet to nodes
-  try {
-    db.exec("ALTER TABLE nodes ADD COLUMN priority REAL DEFAULT 0.5");
-  } catch { /* ignore if exists */ }
-  try {
-    db.exec("ALTER TABLE nodes ADD COLUMN sort_order INTEGER DEFAULT 0");
-  } catch { /* ignore if exists */ }
-  try {
-    db.exec("ALTER TABLE nodes ADD COLUMN facet TEXT DEFAULT NULL");
-  } catch { /* ignore if exists */ }
-  // facet index must come after the column migration — safe for both new and existing DBs
-  try {
-    db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_facet ON nodes(facet)");
-  } catch { /* ignore */ }
+  // Safe migration: add dismissed column if missing (v1.2)
+  // ALTER TABLE ADD COLUMN fails with SQLITE_ERROR on fresh DBs where the column
+  // already exists as part of CREATE TABLE. That's expected — no migration needed.
+  try { db.exec(`ALTER TABLE punk_findings ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0`); } catch {}
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_findings_undismissed ON punk_findings(project_id, dismissed, created_at)`); } catch {}
 
   // Prepare statements for hot paths
   db._stmts = {
@@ -2860,7 +2843,7 @@ process.parentPort.on("message", async ({ data }) => {
         db.prepare(`INSERT INTO punk_findings (id, session_id, project_id, punk, severity, finding, structured, location, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
           rfId, data.sessionId, data.projectId, data.punk, data.severity, data.finding, data.structured ?? "{}", data.location ?? null, rfCreated
         );
-        sendToMain({ type: "review_finding", requestId: data.requestId, finding: { id: rfId, session_id: data.sessionId, punk: data.punk, severity: data.severity, finding: data.finding, location: data.location, created_at: rfCreated } });
+        sendToMain({ type: "review_finding", requestId: data.requestId, finding: { id: rfId, session_id: data.sessionId, project_id: data.projectId, punk: data.punk, severity: data.severity, finding: data.finding, structured: data.structured ?? "{}", location: data.location, created_at: rfCreated } });
         break;
       }
 
@@ -2886,6 +2869,38 @@ process.parentPort.on("message", async ({ data }) => {
           rsFindings = db.prepare(`SELECT * FROM punk_findings WHERE session_id = ? ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, punk`).all(rsLatest.id);
         }
         sendToMain({ type: "review_session_latest", requestId: data.requestId, session: rsLatest ?? null, findings: rsFindings });
+        break;
+      }
+
+      // ── Punk finding queries for Lens v2 ──────────────────────────────────
+      case "findings_list": {
+        if (!db) { sendToMain({ type: "findings_list_result", requestId: data.requestId, findings: [] }); break; }
+        const fList = db.prepare(`
+          SELECT * FROM punk_findings
+          WHERE project_id = ? AND dismissed = 0
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).all(data.projectId, data.limit ?? 50);
+        sendToMain({ type: "findings_list_result", requestId: data.requestId, findings: fList });
+        break;
+      }
+
+      case "findings_by_punk": {
+        if (!db) { sendToMain({ type: "findings_by_punk_result", requestId: data.requestId, findings: [] }); break; }
+        const fByPunk = db.prepare(`
+          SELECT * FROM punk_findings
+          WHERE project_id = ? AND punk = ? AND dismissed = 0
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).all(data.projectId, data.punk, data.limit ?? 50);
+        sendToMain({ type: "findings_by_punk_result", requestId: data.requestId, findings: fByPunk });
+        break;
+      }
+
+      case "finding_dismiss": {
+        if (!db) { sendToMain({ type: "finding_dismiss_result", requestId: data.requestId, success: false }); break; }
+        db.prepare(`UPDATE punk_findings SET dismissed = 1 WHERE id = ?`).run(data.findingId);
+        sendToMain({ type: "finding_dismiss_result", requestId: data.requestId, success: true });
         break;
       }
 

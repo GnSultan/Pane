@@ -69,6 +69,16 @@ export interface Project {
   selectedModelProvider?: string;
   /** Per-project thinking override. Undefined means "use workspace default". */
   selectedModelThinking?: boolean;
+  /** Last user prompt text (max 500 chars) — for thread list preview. */
+  lastUserPromptText: string | null;
+  /** Last response summary (max 200 chars) — for thread list preview. */
+  lastResponseSummary: string | null;
+  /** Epoch ms of last user or model activity — for thread list sorting. */
+  lastActivityAt: number | null;
+  /** When true, this thread is archived — hidden from main list, visible
+   *  in a collapsible "Archived" section. Migrates to conversation-level
+   *  is_archived when multi-conversation (Phase 0) lands. */
+  archived?: boolean;
 }
 
 /**
@@ -113,6 +123,9 @@ function createProject(root: string, stableId?: string): Project {
     activeTerminalTabId: null,
     checkpoints: [],
     scrollPositions: new Map(),
+    lastUserPromptText: null,
+    lastResponseSummary: null,
+    lastActivityAt: null,
   };
 }
 
@@ -132,6 +145,8 @@ interface ProjectsState {
   // Project lifecycle
   addProject: (root: string, stableId?: string) => string; // returns project ID
   removeProject: (id: string) => void;
+  archiveProject: (id: string) => void;
+  restoreProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
   rebindProject: (id: string, newRoot: string) => void; // update root binding after folder move/rename
   markRootMissing: (id: string, missing: boolean) => void;
@@ -285,6 +300,8 @@ interface ProjectsState {
   setProjectAutoEscalate: (projectId: string, autoEscalate: boolean) => void;
   setProjectSelectedModel: (projectId: string, model: string, thinking: boolean, provider?: string) => void;
   getProjectEffectiveCombo: (projectId: string) => PowerCombo;
+  // Thread list activity
+  setThreadActivity: (projectId: string, fields: { lastUserPromptText?: string | null; lastResponseSummary?: string | null; lastActivityAt?: number | null }) => void;
 
   // Checkpoints
   addCheckpoint: (projectId: string, meta: CheckpointMeta) => void;
@@ -326,6 +343,8 @@ function createProjectsStore() {
       if (!stableId) {
         project.id = ensureUniqueId(project.id, state.projects);
       }
+      // Seed thread activity timestamp so newly added projects sort to top
+      project.lastActivityAt = Date.now();
       const next = new Map(state.projects);
       next.set(project.id, project);
       set({
@@ -381,6 +400,31 @@ function createProjectsStore() {
         activeProjectId: nextActive,
         projectOrder: nextOrder,
       });
+    },
+
+    archiveProject: (id: string) => {
+      set((state) => {
+        const project = state.projects.get(id);
+        if (!project) return {};
+
+        // If archiving the active project, switch to the next non-archived
+        let nextActive = state.activeProjectId;
+        if (state.activeProjectId === id) {
+          const candidates = state.projectOrder.filter(
+            (pid) => pid !== id && !state.projects.get(pid)?.archived,
+          );
+          nextActive = candidates[0] || null;
+        }
+
+        return {
+          ...updateProject(state, id, () => ({ archived: true })),
+          activeProjectId: nextActive,
+        };
+      });
+    },
+
+    restoreProject: (id: string) => {
+      set((state) => updateProject(state, id, () => ({ archived: false })));
     },
 
     setActiveProject: (id: string) => {
@@ -1086,6 +1130,15 @@ function createProjectsStore() {
       // Fall back to workspace store's global combo
       return useWorkspaceStore.getState().powerCombo || DEFAULT_POWER_COMBO;
     },
+
+    setThreadActivity: (projectId, fields) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          lastUserPromptText: fields.lastUserPromptText ?? state.projects.get(projectId)?.lastUserPromptText ?? null,
+          lastResponseSummary: fields.lastResponseSummary ?? state.projects.get(projectId)?.lastResponseSummary ?? null,
+          lastActivityAt: fields.lastActivityAt ?? state.projects.get(projectId)?.lastActivityAt ?? null,
+        })),
+      ),
 
     // Checkpoints
     addCheckpoint: (projectId, meta) =>

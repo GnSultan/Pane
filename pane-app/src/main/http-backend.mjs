@@ -1250,6 +1250,170 @@ function getModelStreamingConfig(modelId) {
 
 export { ApiBackend as HttpBackend }; // backward compat alias
 
+// ============================================================================
+// Pre-send Message Validator — Phase 1: prevent broken tool sequences
+// ============================================================================
+// Walks the normalized messages array and validates tool_call→tool_result
+// sequencing. Strips orphaned tool_calls from assistant messages and drops
+// tool results with no matching tool_call_id in the preceding assistant.
+// Called AFTER normalizeMessages() to catch any remaining sequence bugs
+// before the request body is built.
+//
+// Only applies to OpenAI-compatible providers (DeepSeek, OpenRouter, etc.)
+// where strict tool_call→tool_result ordering is required.
+function validateMessageSequence(messages, provider) {
+  const isOpenAI =
+    !provider || // no provider means OpenAI-compatible
+    provider === "deepseek" ||
+    provider === "kimi" ||
+    provider === "openrouter" ||
+    provider === "stepfun" ||
+    provider === "xiaomi" ||
+    provider === "alibaba" ||
+    provider === "dashscope";
+
+  if (!isOpenAI || !Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  // Walk and track: for each assistant with tool_calls, collect its call IDs.
+  // Then as we walk forward, resolve tool messages against the pending set.
+  const result = [];
+  const pendingToolCallIds = new Set();
+  // Stack of {index, ids: Set} per assistant that issued tool_calls.
+  // Used to correctly strip orphaned calls from the right assistant.
+  const assistantStack = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
+    // ── Assistant messages ──
+    if (msg.role === "assistant") {
+      // Collect tool_call IDs from this assistant
+      const callIds = (msg.tool_calls || []).map(tc => tc.id).filter(Boolean);
+      // Also check content blocks (Anthropic-style tool_use, though rare in OpenAI path)
+      let contentCallIds = [];
+      if (Array.isArray(msg.content)) {
+        contentCallIds = msg.content
+          .filter(c => c.type === "tool_use")
+          .map(c => c.id)
+          .filter(Boolean);
+      }
+      const allIds = [...callIds, ...contentCallIds];
+
+      if (allIds.length > 0) {
+        const idSet = new Set(allIds);
+        assistantStack.push({ index: result.length, ids: idSet });
+        for (const id of allIds) {
+          pendingToolCallIds.add(id);
+        }
+      }
+
+      result.push(msg);
+      continue;
+    }
+
+    // ── Tool messages ──
+    if (msg.role === "tool") {
+      const callId = msg.tool_call_id;
+      if (callId && pendingToolCallIds.has(callId)) {
+        // Valid — this tool result matches a pending tool call
+        pendingToolCallIds.delete(callId);
+        // Remove from the relevant assistant's set
+        for (let s = assistantStack.length - 1; s >= 0; s--) {
+          if (assistantStack[s].ids.has(callId)) {
+            assistantStack[s].ids.delete(callId);
+            break;
+          }
+        }
+        result.push(msg);
+      } else {
+        // Orphaned tool result — drop it
+        console.warn(
+          `[http] validateMessageSequence: dropping orphaned tool result for ${callId}`,
+        );
+      }
+      continue;
+    }
+
+    // ── User messages (boundary) ──
+    if (msg.role === "user") {
+      // Before the user message, flush any assistants with unresolved tool calls.
+      // This catches sequences like: assistant(tool_calls) → user → (missing tool results)
+      for (const entry of assistantStack) {
+        if (entry.ids.size > 0) {
+          const orphanIds = [...entry.ids];
+          console.warn(
+            `[http] validateMessageSequence: assistant at index ${entry.index} has ${orphanIds.length} orphaned tool_calls — stripping`,
+          );
+          // Strip the orphaned tool_calls from the assistant message already in result
+          const assistantMsg = result[entry.index];
+          if (assistantMsg) {
+            const remainingCalls = (assistantMsg.tool_calls || []).filter(
+              tc => !orphanIds.includes(tc.id)
+            );
+            if (remainingCalls.length > 0) {
+              assistantMsg.tool_calls = remainingCalls;
+            } else {
+              delete assistantMsg.tool_calls;
+            }
+          }
+          for (const id of orphanIds) {
+            pendingToolCallIds.delete(id);
+          }
+        }
+      }
+      // Clear the stack — we've crossed a user boundary
+      assistantStack.length = 0;
+      result.push(msg);
+      continue;
+    }
+
+    // Pass through system and other messages unchanged
+    result.push(msg);
+  }
+
+  // End of array: flush any remaining unresolved tool calls
+  for (const entry of assistantStack) {
+    if (entry.ids.size > 0) {
+      const orphanIds = [...entry.ids];
+      console.warn(
+        `[http] validateMessageSequence (end): stripping ${orphanIds.length} orphaned tool_calls from assistant at index ${entry.index}`,
+      );
+      const assistantMsg = result[entry.index];
+      if (assistantMsg) {
+        const remainingCalls = (assistantMsg.tool_calls || []).filter(
+          tc => !orphanIds.includes(tc.id)
+        );
+        if (remainingCalls.length > 0) {
+          assistantMsg.tool_calls = remainingCalls;
+        } else {
+          delete assistantMsg.tool_calls;
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+// ============================================================================
+// Strip Tool History — heal a 400 "insufficient tool messages" response
+// ============================================================================
+// Removes ALL tool_calls from assistant messages and ALL tool-role messages.
+// Produces a clean user↔assistant conversation that any OpenAI-compatible
+// model can process.
+function stripToolHistory(messages) {
+  return messages.map(msg => {
+    if (msg.role === "assistant" && msg.tool_calls) {
+      const cleaned = { ...msg };
+      delete cleaned.tool_calls;
+      return cleaned;
+    }
+    return msg;
+  }).filter(msg => msg.role !== "tool");
+}
+
 export class ApiBackend extends PunkBackend {
   get supportsToolCalling() { return true; }
 
@@ -1627,6 +1791,13 @@ export class ApiBackend extends PunkBackend {
   }
 
   async spawn(request) {
+    // Reset healing flags for this new session — ensured fresh regardless
+    // of previous spawn's state (e.g. auto-resume re-enters spawn).
+    this._healAttemptedThisTurn = false;
+    if (typeof this._sessionRetryCount !== "number") {
+      this._sessionRetryCount = 0;
+    }
+
     const abortController = new AbortController();
     this.activeRequests.set(request.projectId, abortController);
     const spawnStartTime = Date.now();
@@ -1920,9 +2091,13 @@ export class ApiBackend extends PunkBackend {
         // entirely (e.g. StepFun reasoning models manage their own CoT budget).
         const { maxTokens, omit: omitMaxTokens } = resolveMaxTokens(resolvedModel);
 
+        // Phase 1: Normalize — convert frontend message format to API format
+        const normalizedMessages = this.normalizeMessages(messages, apiConfig.provider, resolvedModel);
+        // Phase 2: Validate — catch any remaining tool_call→tool_result sequence bugs
+        const validatedMessages = validateMessageSequence(normalizedMessages, apiConfig.provider);
         const body = {
           model: resolvedModel,
-          messages: this.normalizeMessages(messages, apiConfig.provider, resolvedModel),
+          messages: validatedMessages,
           stream: true,
           max_tokens: maxTokens ?? DEFAULT_MAX_TOKENS,
         };
@@ -2023,6 +2198,11 @@ export class ApiBackend extends PunkBackend {
         // Track retry history for debugging
         const retryHistory = [];
         let lastErrorType = null;
+        // Preserves the error body across the retry loop boundary — the 400
+        // handler reads response.text() to check for "insufficient tool messages",
+        // which exhausts the body stream. If the error is NOT healable and we
+        // break, the code after the loop needs the body text for the error message.
+        let lastResponseBody = "";
 
         // Lightweight pre-call checkpoint: save the last 6 messages instead of
         // the full array. Avoids the 60GB memory spike from structuredClone on
@@ -2062,7 +2242,36 @@ export class ApiBackend extends PunkBackend {
                 // Explicitly categorize common client errors
                 if (status === 400) {
                   lastErrorType = "bad_request";
-                  console.error(`[http] Bad request (400): ${response.statusText}`);
+                  // ── HEALABLE 400: insufficient tool messages ──
+                  // Read the error body to check for sequence violations.
+                  // This catches cases where normalizeMessages + validateMessageSequence
+                  // didn't fully resolve the tool_call→tool_result chain.
+                  const errorBody = await response.text().catch(() => "");
+                  lastResponseBody = errorBody; // Preserve for error message after retry loop
+                  if (errorBody.includes("insufficient tool messages") && !this._healAttemptedThisTurn) {
+                    this._healAttemptedThisTurn = true;
+                    console.warn(`[http] auto-healing: stripping tool history (400: insufficient tool messages)`);
+                    // Notify the UI that Pane is handling it transparently
+                    this.onEvent(request.projectId, {
+                      event: "status",
+                      data: { message: "auto-healing message sequence..." },
+                    }, request.requestId);
+                    // Strip all tool_calls and tool-role messages from the body
+                    body.messages = stripToolHistory(body.messages);
+                    // finalBody may be a different object (prepareRequest creates a copy
+                    // for prefix-cache optimization). Sync it so the next fetch retry
+                    // uses the cleaned messages.
+                    if (finalBody && finalBody !== body && Array.isArray(finalBody.messages)) {
+                      finalBody.messages = body.messages;
+                    }
+                    // Clear status before retry
+                    this.onEvent(request.projectId, {
+                      event: "status",
+                      data: { message: null },
+                    }, request.requestId);
+                    continue; // Don't consume an attempt — heal is free
+                  }
+                  console.error(`[http] Bad request (400): ${errorBody.slice(0, 300)}`);
                 } else if (status === 401) {
                   lastErrorType = "unauthorized";
                   console.error(`[http] Unauthorized (401): Check API key configuration`);
@@ -2205,7 +2414,9 @@ export class ApiBackend extends PunkBackend {
         }
 
         if (!response.ok) {
-          const errorText = await response
+          // If the 400 handler already consumed the response body reading errorBody,
+          // lastResponseBody has it. Otherwise read it fresh.
+          const errorText = lastResponseBody || await response
             .text()
             .catch(() => response.statusText);
           console.error(`[http] API Error: ${response.status} - ${errorText}`);
@@ -2274,7 +2485,9 @@ export class ApiBackend extends PunkBackend {
         const { cost: turnCost, source: costSource, rateSnapshot } = calculateCost({
           model: state.model,
           provider: apiConfig.provider,
-          inputTokens: state.usage?.input_tokens || 0,
+          // input_tokens is now raw total (including cache). Subtract cache_read
+          // so calculateCost doesn't double-count cache at full input rate.
+          inputTokens: Math.max(0, (state.usage?.input_tokens || 0) - (state.usage?.cache_read_input_tokens || 0)),
           outputTokens: state.usage?.output_tokens || 0,
           cacheReadTokens: state.usage?.cache_read_input_tokens || 0,
           cacheWriteTokens: state.usage?.cache_creation_input_tokens || 0,
@@ -3045,6 +3258,9 @@ export class ApiBackend extends PunkBackend {
         request.requestId,
       );
 
+      // Reset session retry counter on success — next session starts fresh
+      this._sessionRetryCount = 0;
+
       this.onEvent(
         request.projectId,
         {
@@ -3059,6 +3275,78 @@ export class ApiBackend extends PunkBackend {
       journal.close();
       clearJournal(request.projectId);
     } catch (error) {
+      // ── SESSION-LEVEL AUTO-RESUME ──────────────────────────────────────
+      // Phase 3: Last resort recovery. When all turn-level retries (network,
+      // stream disconnect, insufficient_system_resource) and the 400 heal
+      // have been exhausted, the session itself might be salvageable by
+      // respawning from scratch. The journal preserves full history; re-spawn
+      // detects the journal and replays it transparently.
+      //
+      // We do NOT auto-resume on:
+      //   • AbortError — user explicitly cancelled
+      //   • 401/403 — auth failures won't fix on retry
+      //   • 422 — validation errors require code changes
+      const isAuthError = error.message?.includes("401") ||
+                          error.message?.includes("403") ||
+                          error.message?.includes("unauthorized") ||
+                          error.message?.includes("forbidden");
+      const isRecoverable = error.name !== "AbortError" && !isAuthError;
+
+      if (isRecoverable && this._sessionRetryCount < 2) {
+        this._sessionRetryCount++;
+        const attempt = this._sessionRetryCount;
+        console.warn(
+          `[http] session-level auto-resume (attempt ${attempt}/2): ${error.message.slice(0, 200)}`,
+        );
+
+        // Preserve discoveries before cleanup
+        try {
+          const crashHandoff = generateHandoff(request.projectId, { writeFile: false });
+          crashHandoff._exitReason = "auto-resume";
+          crashHandoff._errorMessage = error.message;
+          writeHandoffWithHistory(request.projectId, crashHandoff);
+        } catch {}
+
+        // Close the old journal so the re-spawn can open it fresh
+        try { journal?.close(); } catch {}
+
+        // Clean up state so the re-spawn doesn't collide with stale registrations
+        this.activeRequests.delete(request.projectId);
+        this.requestStates.delete(request.projectId);
+
+        // Tell the UI we're recovering
+        this.onEvent(request.projectId, {
+          event: "status",
+          data: { message: `connection lost — resuming session (${attempt}/2)...` },
+        }, request.requestId);
+
+        // Brief settle window for any in-flight operations to drain
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Clear status before re-spawn
+        this.onEvent(request.projectId, {
+          event: "status",
+          data: { message: null },
+        }, request.requestId);
+
+        // Re-spawn the entire session from scratch. The journal on disk has
+        // all messages; this.spawn() detects it via canResume() and replays.
+        // If spawn succeeds, this call returns normally and the catch block
+        // ends here — no error emitted to the user.
+        try {
+          await this.spawn(request);
+          return; // Success — exit without emitting error
+        } catch (respawnErr) {
+          // Re-spawn also failed — fall through to the real error handling
+          console.error(
+            `[http] auto-resume attempt ${attempt} failed: ${respawnErr.message}`,
+          );
+          // Update the error reference so the emergency handoff captures the
+          // final error, not the original one
+          error = respawnErr;
+        }
+      }
+
       // ── Emergency handoff: persist discoveries even on crash/abort ──────
       // Without this, everything the model learned this session is lost.
       try {
@@ -3632,11 +3920,12 @@ export class ApiBackend extends PunkBackend {
         0;
       // OpenAI-compatible providers (DeepSeek, Kimi, Xiaomi, etc.) report prompt_tokens
       // as the TOTAL — cached + non-cached. Anthropic reports input_tokens as non-cached
-      // only (overwritten below). Normalize here so the DB is always non-cached only,
-      // which makes cache rate and cost calculations correct for all providers.
+      // only (overwritten below). Normalize all providers to raw total here so the DB
+      // consistently stores total tokens (including cache). Cache breakdown lives in
+      // cache_read_input_tokens. Cost calculation subtracts cache before billing.
       const _rawInput = event.usage.prompt_tokens || event.usage.input_tokens || 0;
       state.usage = {
-        input_tokens: Math.max(0, _rawInput - _cacheRead),
+        input_tokens: _rawInput,
         output_tokens: event.usage.completion_tokens || event.usage.output_tokens || 0,
         cache_creation_input_tokens: event.usage.cache_creation_input_tokens || 0,
         cache_read_input_tokens: _cacheRead,
@@ -3648,7 +3937,7 @@ export class ApiBackend extends PunkBackend {
     if (provider === "anthropic") {
       if (event.type === "message_start" && event.message?.usage) {
         state.usage = {
-          input_tokens: event.message.usage.input_tokens || 0,
+          input_tokens: (event.message.usage.input_tokens || 0) + (event.message.usage.cache_read_input_tokens || 0),
           output_tokens: event.message.usage.output_tokens || 0,
           cache_creation_input_tokens: event.message.usage.cache_creation_input_tokens || 0,
           cache_read_input_tokens: event.message.usage.cache_read_input_tokens || 0,
@@ -3659,12 +3948,13 @@ export class ApiBackend extends PunkBackend {
       }
     }
 
-    // Gemini specific usage in usageMetadata
-    // promptTokenCount is TOTAL (includes cached) — normalize to non-cached only.
+    // Gemini specific usage in usageMetadata.
+    // promptTokenCount is TOTAL (includes cached). Store raw total; cache
+    // breakdown is in cache_read_input_tokens.
     if (provider === "gemini" && event.usageMetadata) {
       const _geminiCacheRead = event.usageMetadata.cachedContentTokenCount || 0;
       state.usage = {
-        input_tokens: Math.max(0, (event.usageMetadata.promptTokenCount || 0) - _geminiCacheRead),
+        input_tokens: event.usageMetadata.promptTokenCount || 0,
         output_tokens: event.usageMetadata.candidatesTokenCount || 0,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: _geminiCacheRead,
@@ -4422,15 +4712,18 @@ export class ApiBackend extends PunkBackend {
         }
 
         // Emit token_usage for the planning call
-        // Normalize input_tokens: OpenAI-compatible and Gemini report prompt_tokens as
-        // TOTAL (cached + non-cached). Anthropic reports input_tokens as non-cached only.
-        // Subtracting cacheRead from raw input is safe for all non-Anthropic providers.
+        // Normalize input_tokens to raw total (including cache) for consistent DB storage.
+        // OpenAI-compatible and Gemini report prompt_tokens as TOTAL (cached + non-cached).
+        // Anthropic reports input_tokens as non-cached only — add cache_read for raw total.
         const _rawInput = usage?.prompt_tokens || usage?.input_tokens || 0;
         const cacheRead =
           usage?.cache_read_input_tokens || usage?.prompt_cache_hit_tokens || 0;
-        const totalInput = apiConfig.provider !== "anthropic"
-          ? Math.max(0, _rawInput - cacheRead)
+        const totalInput = apiConfig.provider === "anthropic"
+          ? _rawInput + cacheRead
           : _rawInput;
+        const costInput = apiConfig.provider === "anthropic"
+          ? _rawInput
+          : Math.max(0, _rawInput - cacheRead);
         const totalOutput =
           usage?.completion_tokens || usage?.output_tokens || 0;
         const cacheWrite = usage?.cache_creation_input_tokens || 0;
@@ -4438,7 +4731,7 @@ export class ApiBackend extends PunkBackend {
         const { cost: callCost, source: costSource, rateSnapshot } = calculateCost({
           model,
           provider: apiConfig.provider,
-          inputTokens: totalInput,
+          inputTokens: costInput,
           outputTokens: totalOutput,
           cacheReadTokens: cacheRead,
           cacheWriteTokens: cacheWrite,

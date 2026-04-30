@@ -93,7 +93,7 @@ function ChangeHistoryIcon() {
 function MenuTriggerIcon() {
   // Three horizontal bars, left-aligned, longest at top — suggesting a menu.
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
       <path d="M2 4.5h12" />
       <path d="M2 8h9" />
       <path d="M2 11.5h6" />
@@ -111,15 +111,15 @@ interface ModeDef {
 }
 
 const MODES: ModeDef[] = [
-  { id: "conversation", label: "threads", icon: <ConversationIcon /> },
-  { id: "viewer", label: "files", icon: <FileIcon /> },
-  { id: "search", label: "search", icon: <SearchIcon /> },
-  { id: "git", label: "git", icon: <GitIcon />, requiresGit: true },
-  { id: "terminal", label: "terminal", icon: <TerminalIcon /> },
-  { id: "history", label: "history", icon: <ChangeHistoryIcon /> },
-  { id: "lens", label: "lens", icon: <LensIcon /> },
-  { id: "mind", label: "mind", icon: <MindIcon /> },
-  { id: "profile", label: "profile", icon: <ProfileIcon /> },
+  { id: "conversation", label: "Threads", icon: <ConversationIcon /> },
+  { id: "viewer", label: "Files", icon: <FileIcon /> },
+  { id: "search", label: "Search", icon: <SearchIcon /> },
+  { id: "git", label: "Git", icon: <GitIcon />, requiresGit: true },
+  { id: "terminal", label: "Terminal", icon: <TerminalIcon /> },
+  { id: "history", label: "History", icon: <ChangeHistoryIcon /> },
+  { id: "lens", label: "Lens", icon: <LensIcon /> },
+  { id: "mind", label: "Mind", icon: <MindIcon /> },
+  { id: "profile", label: "Profile", icon: <ProfileIcon /> },
 ];
 
 // ─── Menu Component ──────────────────────────────────────────────────────────
@@ -129,29 +129,11 @@ interface MenuProps {
   isGitRepo: boolean;
   hasUnreadLens: boolean;
   onSelectMode: (mode: PaneMode) => void;
-  position: "sidebar" | "workspace";
 }
 
-export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, position }: MenuProps) {
+export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode }: MenuProps) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
-  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Hover open — immediate on enter
-  const handleMouseEnter = useCallback(() => {
-    if (closeTimerRef.current) {
-      clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
-    setOpen(true);
-  }, []);
-
-  // Hover close — short delay allows mouse to move between items and icon
-  const handleMouseLeave = useCallback(() => {
-    closeTimerRef.current = setTimeout(() => {
-      setOpen(false);
-    }, 50);
-  }, []);
 
   // Close on outside click
   useEffect(() => {
@@ -175,61 +157,58 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode, posi
     return () => window.removeEventListener("keydown", handler);
   }, [open]);
 
-  // Cleanup timer on unmount
-  useEffect(() => {
-    return () => {
-      if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
-    };
+  const handleToggle = useCallback(() => {
+    setOpen((prev) => !prev);
   }, []);
 
-  const handleSelect = useCallback((mode: PaneMode) => {
-    onSelectMode(mode);
-    setOpen(false);
-  }, [onSelectMode]);
+  const handleSelect = useCallback(
+    (mode: PaneMode) => {
+      onSelectMode(mode);
+      setOpen(false);
+    },
+    [onSelectMode],
+  );
 
-  const triggerSize = position === "workspace" ? "w-8 h-8" : "w-6 h-6";
   return (
-    <div
-      ref={menuRef}
-      className={`flex flex-col ${open ? 'bg-pane-bg border border-pane-border/40 rounded-xl' : ''}`}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={handleMouseLeave}
-    >
+    <div ref={menuRef} className="w-full">
       {open ? (
-        /* Menu items — fully replaces the icon on hover */
-        <div className="flex flex-col py-1 min-w-[260px]">
-          {MODES.map((m) => {
-            if (m.requiresGit && !isGitRepo) return null;
-            const isActive = currentMode === m.id;
-            return (
-              <button
-                key={m.id}
-                onClick={() => handleSelect(m.id)}
-                className={`w-full flex items-center gap-4 px-4 py-2 font-mono text-left transition-colors relative
-                  ${isActive
-                    ? "text-pane-text bg-pane-text/[0.08]"
-                    : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04]"
-                  }`}
-                style={{ fontSize: "var(--pane-font-size-sm)" }}
-              >
-                <span className="w-4 h-4 flex items-center justify-center shrink-0">
-                  {m.icon}
-                </span>
-                <span>{m.label}</span>
-                {m.id === "lens" && hasUnreadLens && (
-                  <span
-                    className="w-1.5 h-1.5 rounded-full ml-auto"
-                    style={{ background: "var(--pane-terminal)" }}
-                  />
-                )}
-              </button>
-            );
-          })}
+        /* Menu items replace the icon — same spot, full width */
+        <div className="bg-pane-bg rounded-lg ring-1 ring-pane-border/40 shadow-lg">
+          <div className="flex flex-col py-1 px-0.5 w-full">
+            {MODES.map((m) => {
+              if (m.requiresGit && !isGitRepo) return null;
+              const isActive = currentMode === m.id;
+              return (
+                <button
+                  key={m.id}
+                  onClick={() => handleSelect(m.id)}
+                  className={`w-full flex items-center gap-3 px-2.5 h-8 font-mono text-left transition-colors relative rounded-md
+                    ${isActive
+                      ? "text-pane-text bg-pane-accent/[0.10]"
+                      : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40"
+                    }`}
+                  style={{ fontSize: "var(--pane-font-size-sm)" }}
+                >
+                  <span className="w-4 h-4 flex items-center justify-center shrink-0">
+                    {m.icon}
+                  </span>
+                  <span>{m.label}</span>
+                  {m.id === "lens" && hasUnreadLens && (
+                    <span
+                      className="w-1.5 h-1.5 rounded-full ml-auto"
+                      style={{ background: "var(--pane-terminal)" }}
+                    />
+                  )}
+                </button>
+              );
+            })}
+          </div>
         </div>
       ) : (
-        /* Trigger icon — only visible when menu is closed */
+        /* Icon button — only visible when closed */
         <button
-          className={`${triggerSize} flex items-center justify-center rounded-md bg-pane-bg ring-1 ring-pane-border/25 text-pane-text-secondary hover:text-pane-text btn-press transition-colors`}
+          onClick={handleToggle}
+          className="w-8 h-8 flex items-center justify-center rounded-md ring-1 ring-pane-border/40 bg-pane-bg text-pane-text-secondary hover:text-pane-text transition-colors btn-press"
           title="modes"
         >
           <MenuTriggerIcon />

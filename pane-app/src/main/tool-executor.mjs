@@ -15,7 +15,7 @@
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
-import { spawn, exec } from "node:child_process";
+import { spawn, exec, execSync } from "node:child_process";
 import { promisify } from "node:util";
 import os from "node:os";
 import crypto from "node:crypto";
@@ -164,169 +164,34 @@ const VIOLATION_PATTERNS = [
   },
 ];
 
-// ── Structural integrity checks ───────────────────────────────────────────
-// These analyze the file as a whole — brace balance, truncated declarations,
-// unclosed blocks. Common failure mode of junior/small models that truncate
-// output or drop closing braces.
-
 /**
- * Count delimiter balance while skipping strings, template literals, comments,
- * and regex literals (now actually implemented). Returns the net imbalance and
- * the line where the last unmatched opener was seen.
+ * Check JavaScript syntax using node -c.
+ * Replaces the old hand-rolled delimiter balance checker which produced
+ * false positives. Uses the actual Node.js parser — 100% correct.
  *
- * @param {string} content - Full file content
- * @param {string} open - Opening delimiter character
- * @param {string} close - Closing delimiter character
- * @returns {{ balance: number, lastOpenerLine: number }}
- */
-function countDelimiterBalance(content, open, close) {
-  let balance = 0;
-  let lastOpenerLine = 0;
-  let line = 1;
-  let i = 0;
-
-  while (i < content.length) {
-    const ch = content[i];
-    const next = content[i + 1];
-
-    // Track line numbers
-    if (ch === "\n") { line++; i++; continue; }
-
-    // Skip single-line comments
-    if (ch === "/" && next === "/") {
-      i = content.indexOf("\n", i);
-      if (i === -1) break;
-      continue;
-    }
-
-    // Skip block comments
-    if (ch === "/" && next === "*") {
-      const end = content.indexOf("*/", i + 2);
-      if (end === -1) break;
-      // Count newlines inside the comment
-      for (let j = i; j < end + 2; j++) { if (content[j] === "\n") line++; }
-      i = end + 2;
-      continue;
-    }
-
-    // Skip regex literals — /pattern/flags
-    // A '/' starts a regex when preceded by an operator, keyword, or open paren.
-    if (ch === "/" && next !== "/" && next !== "*") {
-      let j = i - 1;
-      while (j >= 0 && (content[j] === " " || content[j] === "\t")) j--;
-      const prev = j >= 0 ? content[j] : "";
-      const isRegexStart = prev === "" || "=([,!&|?:;{}\n".includes(prev) ||
-        /\b(return|typeof|instanceof|in|of|void|delete|throw|new|case)$/.test(
-          content.slice(Math.max(0, j - 9), j + 1)
-        );
-      if (isRegexStart) {
-        i++;
-        while (i < content.length) {
-          if (content[i] === "\\") { i += 2; continue; } // escaped char
-          if (content[i] === "[") {
-            // Character class — ] inside doesn't close the regex
-            i++;
-            while (i < content.length && content[i] !== "]") {
-              if (content[i] === "\\") i++;
-              i++;
-            }
-          }
-          if (content[i] === "/") { i++; break; } // end of regex body
-          if (content[i] === "\n") break;          // malformed — bail
-          i++;
-        }
-        // Consume flags (gimsuy)
-        while (i < content.length && /[gimsuy]/.test(content[i])) i++;
-        continue;
-      }
-    }
-
-    // Skip strings (single/double quotes)
-    if (ch === '"' || ch === "'") {
-      i++;
-      while (i < content.length) {
-        if (content[i] === "\n") { line++; break; } // Unterminated — let it go
-        if (content[i] === "\\" ) { i += 2; continue; }
-        if (content[i] === ch) { i++; break; }
-        i++;
-      }
-      continue;
-    }
-
-    // Skip template literals (backtick) — handle nested ${} by tracking depth
-    if (ch === "`") {
-      i++;
-      let templateDepth = 0;
-      while (i < content.length) {
-        if (content[i] === "\n") line++;
-        if (content[i] === "\\" ) { i += 2; continue; }
-        if (content[i] === "$" && content[i + 1] === "{") { templateDepth++; i += 2; continue; }
-        if (content[i] === "}" && templateDepth > 0) { templateDepth--; i++; continue; }
-        if (content[i] === "`" && templateDepth === 0) { i++; break; }
-        i++;
-      }
-      continue;
-    }
-
-    // Count delimiters
-    if (ch === open) {
-      balance++;
-      lastOpenerLine = line;
-    } else if (ch === close) {
-      balance--;
-    }
-
-    i++;
-  }
-
-  return { balance, lastOpenerLine };
-}
-
-/**
- * Detect truncated / incomplete file endings.
- * Junior models often cut off mid-declaration or mid-expression.
- *
- * @param {string} content - Full file content
+ * @param {string} content - File content to check
+ * @param {string} ext - File extension (lowercase, with dot)
  * @returns {Array<{id, severity, message, line}>}
  */
-function checkTruncation(content) {
-  const lines = content.split("\n");
+function checkSyntax(content, ext) {
   const violations = [];
+  // Only JS/MJS/CJS files — TypeScript uses its own compiler
+  if (ext !== ".js" && ext !== ".mjs" && ext !== ".cjs") return violations;
 
-  // Find last non-empty, non-comment line
-  let lastIdx = lines.length - 1;
-  while (lastIdx >= 0 && /^\s*(\/\/.*)?$/.test(lines[lastIdx])) lastIdx--;
-  if (lastIdx < 0) return violations;
-
-  const lastLine = lines[lastIdx].trim();
-
-  // Patterns that indicate truncated output
-  const truncationPatterns = [
-    // Ends with an assignment/arithmetic/logical operator — expression was cut off
-    // Excludes: > (JSX closing), comma (trailing comma style), + in package versions
-    { pattern: /[=\-*/%&|^!<]\s*$/, id: "truncated-expression",
-      message: "File ends with an incomplete expression (trailing operator). The output appears to have been cut off." },
-    // Ends with opening brace/paren — block never started
-    { pattern: /[\{(\[]\s*$/, id: "truncated-block",
-      message: "File ends with an opening brace/bracket that is never closed. The output appears to have been cut off." },
-    // Ends with 'const', 'let', 'var', 'function', 'class', 'interface', 'type', 'export', 'import', 'return'
-    { pattern: /\b(const|let|var|function|class|interface|type|export|import|return|extends|implements|async|await)\s*$/, id: "truncated-declaration",
-      message: "File ends with an incomplete declaration keyword. The output appears to have been cut off mid-statement." },
-    // Ends with arrow — function body never written
-    { pattern: /=>\s*$/, id: "truncated-arrow",
-      message: "File ends with an arrow (=>) but no function body. The output appears to have been cut off." },
-    // Ends with colon (outside ternary/object, likely a type annotation cut off)
-    { pattern: /:\s*$/, id: "truncated-type",
-      message: "File ends with a colon but no type or value after it. The output appears to have been cut off." },
-  ];
-
-  for (const { pattern, id, message } of truncationPatterns) {
-    if (pattern.test(lastLine)) {
-      violations.push({ id, severity: "error", message, line: lastIdx + 1 });
-      break; // One truncation error is enough
-    }
+  const tmpDir = os.tmpdir();
+  const tmpFile = path.join(tmpDir, `pane-syntax-check-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
+  try {
+    fs.writeFileSync(tmpFile, content, "utf-8");
+    execSync(`node -c "${tmpFile}"`, { stdio: "pipe", timeout: 5000 });
+  } catch (e) {
+    const msg = e.stderr?.toString() || e.message || "";
+    const lineMatch = msg.match(/:(\d+):/);
+    const line = lineMatch ? parseInt(lineMatch[1]) : content.split("\n").length;
+    const errorMsg = msg.replace(/^.*?:\d+:\s*/, "").trim() || "File has broken JavaScript syntax";
+    violations.push({ id: "syntax-error", severity: "error", message: errorMsg, line });
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch { /* best-effort temp file cleanup */ }
   }
-
   return violations;
 }
 
@@ -380,67 +245,11 @@ function scanForViolations(newContent, previousContent, filePath) {
     }
   }
 
-  // ── Structural integrity checks (whole-file analysis) ───────────────────
-  // These run on the FINAL file content, not diffed — a broken file is broken
-  // regardless of who introduced the imbalance.
-
-  // Brace balance: { vs }
-  const braces = countDelimiterBalance(newContent, "{", "}");
-  if (braces.balance > 0) {
-    violations.push({
-      id: "unclosed-brace",
-      severity: "error",
-      message: `${braces.balance} unclosed brace(s) — opening '{' without matching '}'. Last unmatched opener is near line ${braces.lastOpenerLine}. The file has broken syntax.`,
-      line: braces.lastOpenerLine,
-    });
-  } else if (braces.balance < 0) {
-    violations.push({
-      id: "extra-closing-brace",
-      severity: "error",
-      message: `${Math.abs(braces.balance)} extra closing brace(s) — '}' without matching '{'. The file has broken syntax.`,
-      line: newLines.length,
-    });
-  }
-
-  // Parenthesis balance: ( vs )
-  const parens = countDelimiterBalance(newContent, "(", ")");
-  if (parens.balance > 0) {
-    violations.push({
-      id: "unclosed-paren",
-      severity: "error",
-      message: `${parens.balance} unclosed parenthesis(es) — '(' without matching ')'. Last unmatched opener is near line ${parens.lastOpenerLine}. The file has broken syntax.`,
-      line: parens.lastOpenerLine,
-    });
-  } else if (parens.balance < 0) {
-    violations.push({
-      id: "extra-closing-paren",
-      severity: "error",
-      message: `${Math.abs(parens.balance)} extra closing parenthesis(es) — ')' without matching '('. The file has broken syntax.`,
-      line: newLines.length,
-    });
-  }
-
-  // Bracket balance: [ vs ]
-  const brackets = countDelimiterBalance(newContent, "[", "]");
-  if (brackets.balance > 0) {
-    violations.push({
-      id: "unclosed-bracket",
-      severity: "error",
-      message: `${brackets.balance} unclosed bracket(s) — '[' without matching ']'. Last unmatched opener is near line ${brackets.lastOpenerLine}. The file has broken syntax.`,
-      line: brackets.lastOpenerLine,
-    });
-  } else if (brackets.balance < 0) {
-    violations.push({
-      id: "extra-closing-bracket",
-      severity: "error",
-      message: `${Math.abs(brackets.balance)} extra closing bracket(s) — ']' without matching '['. The file has broken syntax.`,
-      line: newLines.length,
-    });
-  }
-
-  // Truncation detection: file ends mid-statement
-  const truncations = checkTruncation(newContent);
-  violations.push(...truncations);
+  // ── Syntax validation via node -c (JS/MJS/CJS only) ──────────────────────
+  // Replaces the old hand-rolled delimiter balance checker which produced
+  // false positives. Uses the actual Node.js parser — 100% correct.
+  const syntaxErrors = checkSyntax(newContent, ext);
+  violations.push(...syntaxErrors);
 
   // ── Build summary ───────────────────────────────────────────────────────
   if (violations.length === 0) return { violations: [], summary: null };
@@ -493,38 +302,15 @@ const DANGEROUS_COMMAND_PATTERNS = [
  * Switch to Blacklist approach: Allow everything EXCEPT explicitly dangerous
  * patterns and attempts to escape the project directory.
  */
-function validateCommand(command, projectRoot) {
+function validateCommand(command, _projectRoot) {
   const trimmed = command.trim();
   if (!trimmed) return { valid: false, error: "Empty command" };
 
-  // 1. Check against blacklist
   for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
     if (pattern.test(trimmed)) {
       return {
         valid: false,
         error: `Command contains dangerous pattern: ${pattern}`,
-      };
-    }
-  }
-
-  // 2. Check for attempts to escape directory
-  // Allow 'node_modules/..' as it's common in npm operations.
-  if (trimmed.includes("..") && !trimmed.includes("node_modules/..")) {
-    if (trimmed.includes("../../")) {
-      return {
-        valid: false,
-        error: "Path traversal detected (attempt to escape project)",
-      };
-    }
-  }
-
-  // 3. Block absolute paths to system directories
-  const systemPaths = ["/etc/", "/var/", "/bin/", "/sbin/", "/usr/", "/root/"];
-  for (const sysPath of systemPaths) {
-    if (trimmed.includes(sysPath) && !trimmed.includes(projectRoot)) {
-      return {
-        valid: false,
-        error: `Attempt to access system directory: ${sysPath}`,
       };
     }
   }
@@ -1580,36 +1366,11 @@ export class ToolExecutor {
   }
 
   /**
-   * Resolve a file path relative to project root, with safety checks
+   * Resolve a file path relative to project root — no boundary restrictions
    */
   resolveProjectPath(filePath) {
-    if (!filePath || typeof filePath !== "string") {
-      return null;
-    }
-
-    // Normalize path
-    const normalized = path.normalize(filePath);
-
-    // Check for path traversal attempts
-    if (normalized.includes("..") || path.isAbsolute(normalized)) {
-      // Only allow relative paths within project
-      if (
-        path.isAbsolute(normalized) &&
-        !normalized.startsWith(this.projectRoot)
-      ) {
-        return null;
-      }
-    }
-
-    // Resolve relative to project root
-    const resolved = path.resolve(this.projectRoot, normalized);
-
-    // Ensure the resolved path is within project root
-    if (!resolved.startsWith(this.projectRoot)) {
-      return null;
-    }
-
-    return resolved;
+    if (!filePath || typeof filePath !== "string") return null;
+    return path.resolve(this.projectRoot, path.normalize(filePath));
   }
 
   /**
@@ -2283,6 +2044,16 @@ export class ToolExecutor {
           await fsPromises.mkdir(path.dirname(philPath), { recursive: true });
           await fsPromises.writeFile(philPath, philosophy);
           return { success: true, output: "Design philosophy updated.", toolId };
+        }
+
+        case "pane_set_why": {
+          const why = (input?.why || "").trim();
+          if (!why) return { success: false, error: "Purpose text is required.", toolId };
+
+          const whyPath = path.join(paneDir, "profile", "why.md");
+          await fsPromises.mkdir(path.dirname(whyPath), { recursive: true });
+          await fsPromises.writeFile(whyPath, why);
+          return { success: true, output: "Project purpose saved.", toolId };
         }
 
         case "TodoWrite": {

@@ -13,6 +13,16 @@ const MODEL_SAFETY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for silent stream
 const RESULT_PROCESSING_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes after result message
 const CHECKPOINT_TIMEOUT_MS = 3 * 1000; // 3 seconds for checkpoint creation
 
+// Simple djb2 hash — used for Jaccard comparison in the heuristic router.
+// The backend stores this to detect near-duplicate prompts.
+function hashString(str: string): number {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash + str.charCodeAt(i)) & 0xffffffff;
+  }
+  return hash >>> 0;
+}
+
 import {
   sendToPunk,
   abortPunk,
@@ -29,6 +39,8 @@ import {
   sessionReadState,
   extractPreferencesFromTurn,
   resumeFromCheckpoint,
+  recordLastPrompt,
+  recordLastResponse,
 } from "../lib/tauri-commands";
 import type {
   PunkStreamEvent,
@@ -898,6 +910,14 @@ export function usePunk(projectId: string) {
         phase: effectivePhaseEarly,
       };
 
+      // Fire-and-forget: persist prompt text for thread list UI
+      recordLastPrompt(projectId, displayPrompt, hashString(displayPrompt)).catch(() => {});
+      useProjectsStore.getState().setThreadActivity(projectId, {
+        lastUserPromptText: displayPrompt.slice(0, 500),
+        lastResponseSummary: null,
+        lastActivityAt: Date.now(),
+      });
+
       try {
         const cpResult = await Promise.race([
           createCheckpoint(projectId, project.root, messageId),
@@ -941,6 +961,34 @@ export function usePunk(projectId: string) {
         s.setConversationRoutedModel(projectId, null);
         s.setLastMessageStreamingDone(projectId);
         s.setIsPlanning(projectId, false);
+
+        // Fire-and-forget: persist response summary for thread list UI
+        const conversation = s.projects.get(projectId)?.conversation;
+        const msgs = conversation?.messages ?? [];
+        let summary = "";
+        // Walk backwards to find the last assistant message with text content
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const msg = msgs[i];
+          if (!msg) continue;
+          if (msg.type === "assistant" && !msg.isStreaming) {
+            const blocks = msg.content ?? [];
+            for (const b of blocks) {
+              if (b.type === "text" && b.text.length > 0) {
+                summary = b.text.slice(0, 200);
+                break;
+              }
+            }
+            break;
+          }
+        }
+        if (summary) {
+          recordLastResponse(projectId, summary).catch(() => {});
+          useProjectsStore.getState().setThreadActivity(projectId, {
+            lastUserPromptText: null,
+            lastResponseSummary: summary,
+            lastActivityAt: Date.now(),
+          });
+        }
 
         setTimeout(() => {
           const current = useProjectsStore.getState().projects.get(projectId);

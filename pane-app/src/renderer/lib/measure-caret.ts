@@ -1,77 +1,81 @@
 /**
- * measureCaretPos — Range-based caret position measurement.
+ * measureCaretPos — Measure caret position using a zero-height marker
+ * aligned to the top of the line box.
  *
- * Queries a collapsed Range directly on the overlay text node — the same
- * element the user actually sees.  Range.getClientRects() returns the exact
- * sub-pixel insertion-point rect with no font/wrap approximation possible.
+ * Clones textarea content into a hidden mirror, then inserts an
+ * inline-block marker after the text before the cursor.  The marker
+ * uses `vertical-align: top` and `height: 0`, so its
+ * getBoundingClientRect().top is exactly the top of the line box —
+ * not a character's glyph box (period baseline) and not a broken
+ * rect from an empty text node.
  *
- * Requirements:
- *   container  — the `position: relative` wrapper that both the textarea
- *                and the overlay live inside.
- *   overlay    — an absolutely-positioned div whose first child is a <span>
- *                containing the textarea's value text.  Its scrollTop must
- *                be kept in sync with the textarea's scrollTop via onScroll.
+ * This works for empty text (marker is the only child) and wrapped
+ * lines (afterText ensures correct wrapping).
  */
 export function measureCaretPos(
   el: HTMLTextAreaElement,
   container: HTMLElement,
-  overlay: HTMLElement,
-): { top: number; left: number; lineHeight: number } | null {
+): { top: number; left: number; lineHeight: number; fontSize: number } | null {
   const sel = el.selectionStart;
   if (sel === null) return null;
 
   const computed = window.getComputedStyle(el);
-  const caretH = parseFloat(computed.fontSize) || 15;
   const containerRect = container.getBoundingClientRect();
+  const scrollTop = el.scrollTop;
+  const scrollLeft = el.scrollLeft || 0;
 
-  // The overlay structure: <div> <span>{value}</span> … </div>
-  const textSpan = overlay.firstElementChild as HTMLElement | null;
-  const textNode = textSpan?.firstChild;
+  const fontSize = parseFloat(computed.fontSize) || 15;
+  const lineHeight = parseFloat(computed.lineHeight) || fontSize * 1.75;
+  const paddingTop = parseFloat(computed.paddingTop) || 0;
+  const paddingLeft = parseFloat(computed.paddingLeft) || 0;
+  const paddingRight = parseFloat(computed.paddingRight) || 0;
 
-  if (textNode && textNode.nodeType === Node.TEXT_NODE) {
-    const originalValue = textNode.nodeValue || "";
-    const selStart = Math.min(sel, originalValue.length);
-    const range = document.createRange();
-    
-    // First attempt: direct measurement
-    range.setStart(textNode, selStart);
-    range.setEnd(textNode, selStart);
-    let rects = range.getClientRects();
+  // Mirror — exact clone of textarea rendering
+  const mirror = document.createElement('div');
+  mirror.style.cssText = [
+    "position: absolute; top: 0; left: 0; pointer-events: none; visibility: hidden;",
+    "white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word;",
+    `width: ${el.clientWidth}px;`,
+    `font-size: ${fontSize}px;`,
+    `line-height: ${lineHeight}px;`,
+    `font-family: ${computed.fontFamily};`,
+    `padding: ${paddingTop}px ${paddingRight}px 0 ${paddingLeft}px;`,
+    "border: 0;",
+    "box-sizing: border-box;",
+  ].join(" ");
+  container.appendChild(mirror);
 
-    // Second attempt: if zero rects (trailing newline edge case), 
-    // temporarily insert a dummy char to force a layout box.
-    if (rects.length === 0) {
-      textNode.nodeValue = originalValue.slice(0, selStart) + "\u200B" + originalValue.slice(selStart);
-      range.setStart(textNode, selStart);
-      range.setEnd(textNode, selStart + 1);
-      rects = range.getClientRects();
-      // Restore original value immediately
-      textNode.nodeValue = originalValue;
+  try {
+    const beforeText = el.value.slice(0, sel);
+    const afterText = el.value.slice(sel);
+
+    if (beforeText) {
+      mirror.appendChild(document.createTextNode(beforeText));
     }
 
-    const r = rects[0];
-    if (r) {
-      // Render the caret slightly taller than the raw cap-height so it reads
-      // clearly at any font size.  Re-centre top so it stays visually balanced
-      // within the line box (r.height = full leading, caretH = font-size).
-      const renderH = caretH + 4;
-      return {
-        top: r.top - containerRect.top + (r.height - renderH) / 2,
-        left: r.left - containerRect.left,
-        lineHeight: renderH,
-      };
-    }
-  }
+    // Zero-height inline-block aligned to line top.
+    // Its bounding box top IS the line top.
+    const marker = document.createElement('span');
+    marker.style.display = 'inline-block';
+    marker.style.width = '0';
+    marker.style.height = '0';
+    marker.style.overflow = 'hidden';
+    marker.style.verticalAlign = 'top';
+    mirror.appendChild(marker);
 
-  // Fallback for empty textarea or edge cases: anchor to text span origin.
-  if (textSpan) {
-    const r = textSpan.getBoundingClientRect();
+    if (afterText) {
+      mirror.appendChild(document.createTextNode(afterText));
+    }
+
+    const markerRect = marker.getBoundingClientRect();
+
     return {
-      top: r.top - containerRect.top,
-      left: r.left - containerRect.left,
-      lineHeight: caretH + 4,
+      top: markerRect.top - containerRect.top - scrollTop,
+      left: markerRect.left - containerRect.left - scrollLeft,
+      lineHeight,
+      fontSize,
     };
+  } finally {
+    mirror.remove();
   }
-
-  return null;
 }

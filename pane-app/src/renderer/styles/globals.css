@@ -31,8 +31,8 @@
   --color-pane-accent: var(--pane-accent);
 
   --font-mono: "Geist Mono Variable", ui-monospace, monospace;
-  --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-panel: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-panel: "Geist Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
 
   /* Animations - fast and subtle for lightest IDE */
   --animate-fadeSlideUp: fadeSlideUp 0.2s ease-out;

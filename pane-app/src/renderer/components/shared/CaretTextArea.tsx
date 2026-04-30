@@ -11,8 +11,7 @@ export const CaretTextArea = forwardRef<HTMLTextAreaElement, CaretTextAreaProps>
   ({ value = "", onChange, onFocus, onBlur, onKeyDown, onScroll, placeholder, className, style, minHeight = 56, maxHeight = 400, autoResize = true, ...props }, ref) => {
     const internalRef = useRef<HTMLTextAreaElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
-    const overlayRef = useRef<HTMLDivElement>(null);
-    const [caretPos, setCaretPos] = useState<{ top: number; left: number; lineHeight: number } | null>(null);
+    const [caretPos, setCaretPos] = useState<{ top: number; left: number; lineHeight: number; fontSize: number } | null>(null);
     const [focused, setFocused] = useState(false);
 
     useImperativeHandle(ref, () => internalRef.current!);
@@ -20,12 +19,11 @@ export const CaretTextArea = forwardRef<HTMLTextAreaElement, CaretTextAreaProps>
     const updateCaret = useCallback(() => {
       const el = internalRef.current;
       const container = containerRef.current;
-      const overlay = overlayRef.current;
-      if (!el || !container || !overlay || document.activeElement !== el) {
+      if (!el || !container || document.activeElement !== el) {
         setCaretPos(null);
         return;
       }
-      setCaretPos(measureCaretPos(el, container, overlay));
+      setCaretPos(measureCaretPos(el, container));
     }, []);
 
     const applyHeight = useCallback(() => {
@@ -95,34 +93,20 @@ export const CaretTextArea = forwardRef<HTMLTextAreaElement, CaretTextAreaProps>
             onBlur?.(e);
           }}
           onScroll={(e) => {
-            if (overlayRef.current) overlayRef.current.scrollTop = e.currentTarget.scrollTop;
+            updateCaret();
             onScroll?.(e);
           }}
-          className="w-full bg-transparent text-transparent resize-none outline-none border-none m-0 block"
+          className="w-full bg-transparent resize-none outline-none border-none m-0 block placeholder:text-pane-text-secondary/25"
           style={{
             ...sharedStyle,
+            color: "var(--pane-text)",
             caretColor: "transparent",
             minHeight: `${minHeight}px`,
             maxHeight: `${maxHeight}px`,
           }}
         />
-        
-        {/* Visible Overlay */}
-        <div
-          ref={overlayRef}
-          aria-hidden="true"
-          className="absolute inset-0 pointer-events-none overflow-hidden"
-          style={{
-            ...sharedStyle,
-            color: "var(--pane-text)",
-          }}
-        >
-          <span>{value}</span>
-          {/* Invisible trailing character keeps scrollHeight stable */}
-          <span aria-hidden> </span>
-        </div>
 
-        {/* Custom Caret */}
+        {/* Custom Caret — full line-height I-beam at the line top */}
         {focused && caretPos && (
           <div
             aria-hidden

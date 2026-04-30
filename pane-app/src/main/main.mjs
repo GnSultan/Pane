@@ -2451,7 +2451,56 @@ function registerBrainHandlers() {
     return { started: true };
   });
 
-  // Review data queries
+  // ── Lens v2: single punk execution ────────────────────────────────────────
+  ipcMain.handle('run_single_punk', async (_event, args) => {
+    if (!mindPunks || !args.punkName || !args.projectId) return { started: false };
+    const { punkName, projectId, workingDir, scope } = args;
+    mindPunks.runSinglePunk(punkName, projectId, workingDir, scope ?? null).catch(err => {
+      console.error(`[punks] ${punkName} failed:`, err.message);
+      sendToRenderer("pane://punk-progress", {
+        punk: punkName, projectId, status: "failed", error: err.message,
+      });
+    });
+    return { started: true };
+  });
+
+  ipcMain.handle('check_previous_findings', async (_event, args) => {
+    if (!mindPunks || !args.punkName || !args.projectId) return { started: false };
+    const { punkName, projectId, workingDir } = args;
+    mindPunks.checkPrevious(punkName, projectId, workingDir).catch(err => {
+      console.error(`[punks] ${punkName} check failed:`, err.message);
+      sendToRenderer("pane://punk-progress", {
+        punk: punkName, projectId, status: "failed", error: err.message,
+      });
+    });
+    return { started: true };
+  });
+
+  // ── Lens v2: finding queries ──────────────────────────────────────────────
+  ipcMain.handle('findings_list', async (_event, args) => {
+    return brainRequest('findings_list', { projectId: args.projectId, limit: args.limit ?? 50 });
+  });
+
+  ipcMain.handle('findings_by_punk', async (_event, args) => {
+    return brainRequest('findings_by_punk', { projectId: args.projectId, punk: args.punkName, limit: args.limit ?? 50 });
+  });
+
+  ipcMain.handle('dismiss_finding', async (_event, args) => {
+    return brainRequest('finding_dismiss', { findingId: args.findingId });
+  });
+
+  // ── Punk Management ────────────────────────────────────────────────────────
+  ipcMain.handle('list_punks', async () => {
+    if (!mindPunks) return [];
+    return mindPunks.listPunks();
+  });
+
+  ipcMain.handle('create_punk', async (_event, args) => {
+    if (!mindPunks) return { success: false, error: "MindPunks not initialized" };
+    return mindPunks.createPunk(args.name, args.personaContent);
+  });
+
+  // ── Review data queries (kept for backward compat with Lens v1) ───────────
   ipcMain.handle('review_findings_list', async (_event, args) => {
     return brainRequest('review_findings_list', { sessionId: args.sessionId });
   });

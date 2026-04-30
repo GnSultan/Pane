@@ -566,6 +566,23 @@ export async function runMigrationIfNeeded(db) {
     db.stmts.setMigrationVersion.run(5);
     console.log("[pane-db] Migration v5 complete.");
   }
+
+  if (version < 6) {
+    console.log("[pane-db] Running migration v6: normalize input_tokens to raw total...");
+    // Old records stored input_tokens as non-cached only. New records store
+    // raw total (including cache_read_input_tokens). Fix old records so
+    // input_tokens + cache_read_input_tokens = raw total across all time.
+    try {
+      const result = db.prepare(
+        "UPDATE token_usage SET input_tokens = input_tokens + cache_read_input_tokens WHERE cache_read_input_tokens > 0"
+      ).run();
+      console.log(`[pane-db] Migration v6 complete: ${result.changes} rows updated.`);
+    } catch (e) {
+      console.error("[pane-db] v6 migration error:", e.message);
+    }
+    db.stmts.setMigrationVersion.run(6);
+    console.log("[pane-db] Migration v6 complete.");
+  }
 }
 
 async function _migrateConversations(db) {

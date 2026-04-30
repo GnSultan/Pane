@@ -50,11 +50,6 @@ function getMessageText(message: ConversationMessage): string {
     .join("\n");
 }
 
-function formatTokenCount(count: number): string {
-  if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
-  return String(count);
-}
-
 function CopyButton({
   onClick,
   copied,
@@ -495,37 +490,14 @@ export function MessageBubble({
           return null;
         })}
 
-        {/* Footer: quality verdict + cost/duration/tokens + copy */}
+        {/* Copy */}
         {!message.isStreaming && (
           <div
-            className={`mt-4 flex items-center gap-4 pl-6 transition-opacity duration-500 ${
+            className={`mt-4 flex items-center justify-end pl-6 transition-opacity duration-500 ${
               justCompleted ? "opacity-0" : "opacity-100"
             }`}
           >
-            {(message.costUsd !== undefined ||
-              message.durationMs !== undefined) && (
-              <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary tracking-wider">
-                {message.costUsd !== undefined && (
-                  <span>${message.costUsd.toFixed(4)}</span>
-                )}
-                {message.durationMs !== undefined && (
-                  <span>{(message.durationMs / 1000).toFixed(1)}s</span>
-                )}
-                {message.inputTokens !== undefined &&
-                  message.outputTokens !== undefined && (
-                    <span>
-                      {formatTokenCount(message.inputTokens)} in /{" "}
-                      {formatTokenCount(message.outputTokens)} out
-                    </span>
-                  )}
-                {message.numTurns !== undefined && message.numTurns > 1 && (
-                  <span>{message.numTurns} turns</span>
-                )}
-              </div>
-            )}
-            <div className="ml-auto">
-              <CopyButton onClick={handleCopy} copied={copied} />
-            </div>
+            <CopyButton onClick={handleCopy} copied={copied} />
           </div>
         )}
       </div>

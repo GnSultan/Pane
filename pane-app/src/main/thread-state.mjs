@@ -6,7 +6,7 @@
  * separate from session-context to avoid circular dependencies.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -23,6 +23,7 @@ const BASE_PATH = join(homedir(), '.pane', 'session');
  * @property {string|null} lastUserPromptText - last prompt text, max 500 chars
  * @property {number|null} struggleStartedAt - timestamp when streak began
  * @property {"think"|"build"|"idle"} currentPhase - sticky phase for this project
+ * @property {number|null} lastActivityAt - epoch ms of last user or model activity
  */
 
 /** @returns {ThreadState} */
@@ -36,6 +37,7 @@ function defaults() {
     lastUserPromptHash: null,
     lastUserPromptText: null,
     struggleStartedAt: null,
+    lastActivityAt: null,
     // Phase system
     currentPhase: 'idle',
   };
@@ -77,7 +79,21 @@ export function readThreadState(projectId) {
     const raw = readFileSync(filePath, 'utf-8');
     const parsed = JSON.parse(raw);
     // Merge with defaults so missing keys get filled in
-    return { ...defaults(), ...parsed };
+    const merged = { ...defaults(), ...parsed };
+
+    // Backfill lastActivityAt from file mtime for existing projects that
+    // were created before the field was added to the schema. This ensures
+    // existing projects with messages show excerpts and sort correctly.
+    if (merged.lastActivityAt === null && (merged.lastUserPromptText || merged.lastResponseSummary)) {
+      try {
+        const stats = statSync(filePath);
+        merged.lastActivityAt = stats.mtimeMs;
+      } catch {
+        merged.lastActivityAt = Date.now();
+      }
+    }
+
+    return merged;
   } catch {
     return defaults();
   }
@@ -171,6 +187,7 @@ export function updateLastPrompt(projectId, promptText, promptHash) {
 
   state.lastUserPromptHash = promptHash;
   state.lastUserPromptText = promptText ? promptText.slice(0, 500) : null;
+  state.lastActivityAt = Date.now();
 
   writeThreadState(projectId, state);
 }
@@ -185,6 +202,7 @@ export function updateLastResponse(projectId, responseSummary) {
   const state = readThreadState(projectId);
 
   state.lastResponseSummary = responseSummary ? responseSummary.slice(0, 200) : null;
+  state.lastActivityAt = Date.now();
 
   writeThreadState(projectId, state);
 }

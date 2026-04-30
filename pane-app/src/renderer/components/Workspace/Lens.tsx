@@ -1,316 +1,418 @@
-import { useEffect, useRef, useState, useCallback } from "react";
-import { useShallow } from "zustand/react/shallow";
-import { useLensStore } from "../../stores/lens";
-import { useReviewStore } from "../../stores/review";
+import { useEffect, useState, useCallback } from "react";
+import { useLensStore, type PunkStatus, type PunkState } from "../../stores/lens";
 import { useProjectsStore } from "../../stores/projects";
-import { useWorkspaceStore } from "../../stores/workspace";
-import { useMindStore } from "../../stores/mind";
-import { lensPostAdd, lensPostsList, lensPostDelete, runReview, reviewSessionLatest, type LensPost, type ReviewFinding } from "../../lib/tauri-commands";
-import { SlashMenu } from "../shared";
+import { runSinglePunk, checkPreviousFindings, runReview, listPunks, createPunk } from "../../lib/tauri-commands";
+import type { ReviewFinding } from "../../lib/tauri-commands";
 
-// Delete confirmation helper — matches Mind pattern (1-click "confirm?", 2-click delete with auto-revert)
+// ─── Icons ───────────────────────────────────────────────────────────────────
 
-const PUNK_PERSONAS: Record<string, { name: string; role: string }> = {
-  bug:        { name: "maya", role: "debugger" },
-  reflection: { name: "noor", role: "constructive thinker" },
-  sentinel:   { name: "zara", role: "the auditor" },
-};
-
-// ─── PostItem ──────────────────────────────────────────────────────────────
-
-const POST_CLAMP_THRESHOLD = 220;
-
-function PostItem({
-  post,
-  showComments,
-  onToggleComments,
-  userName,
-  onDelete,
-}: {
-  post: LensPost;
-  showComments: boolean;
-  onToggleComments: () => void;
-  userName: string;
-  onDelete: () => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const isPunk = post.contributor !== "user";
-  const persona = isPunk ? PUNK_PERSONAS[post.contributor] : null;
-  const name = persona ? persona.name : (userName || "you");
-  const commentCount = post.comment_count ?? 0;
-  const isLong = post.content.length > POST_CLAMP_THRESHOLD;
-
-  const handleDeleteClick = () => {
-    if (confirmDelete) {
-      if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
-      onDelete();
-    } else {
-      setConfirmDelete(true);
-      deleteTimerRef.current = setTimeout(() => setConfirmDelete(false), 2500);
-    }
-  };
-
-  return (
-    <div className="mb-5">
-      <div className="flex items-start gap-2.5 px-1 py-1">
-        {/* Status dot */}
-        <div className="mt-[6px] shrink-0">
-          <div className={`w-1.5 h-1.5 rounded-full ${isPunk ? "bg-pane-terminal" : "bg-pane-text-secondary/40"}`} />
-        </div>
-
-        <div className="flex-1 min-w-0">
-          {/* Name */}
-          <div className="mb-1">
-            <span
-              className="font-mono"
-              style={{
-                fontSize: "var(--pane-font-size-xs)",
-                color: isPunk ? "var(--pane-terminal)" : "var(--pane-text-secondary)",
-                opacity: isPunk ? 0.8 : 0.5,
-              }}
-            >
-              {name}
-            </span>
-            {persona && (
-              <span className="font-mono text-pane-text-secondary/25 ml-1.5" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                {persona.role}
-              </span>
-            )}
-          </div>
-
-          {/* Content — clamped to 4 lines, expand on demand */}
-          <p
-            className={`text-pane-text leading-relaxed whitespace-pre-wrap ${!expanded && isLong ? "line-clamp-4" : ""}`}
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
-          >
-            {post.content}
-          </p>
-
-          {/* Bottom row — read more (left) + comment button (middle) + delete button (right) */}
-          <div className="flex items-center justify-between mt-1.5">
-            <div>
-              {isLong && (
-                <button
-                  onClick={() => setExpanded(!expanded)}
-                  className="font-mono transition-colors btn-press"
-                  style={{
-                    fontSize: "var(--pane-font-size-xs)",
-                    color: "var(--pane-text-secondary)",
-                    opacity: 0.3,
-                  }}
-                  onMouseEnter={(e) => (e.currentTarget.style.opacity = "0.6")}
-                  onMouseLeave={(e) => (e.currentTarget.style.opacity = "0.3")}
-                >
-                  {expanded ? "less" : "more"}
-                </button>
-              )}
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={onToggleComments}
-                className="flex items-center gap-1 transition-colors btn-press font-mono"
-                style={{
-                  fontSize: "var(--pane-font-size-xs)",
-                  color: "var(--pane-text-secondary)",
-                  opacity: showComments ? 0.6 : 0.25,
-                }}
-                title={commentCount > 0 ? `${commentCount} comments` : "comment"}
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
-                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                </svg>
-                {commentCount > 0 && <span>{commentCount}</span>}
-              </button>
-              <button
-                onClick={handleDeleteClick}
-                className="flex items-center transition-colors btn-press font-mono hover:!opacity-100"
-                style={{
-                  fontSize: "var(--pane-font-size-xs)",
-                  color: confirmDelete
-                    ? "var(--pane-error)"
-                    : "var(--pane-text-secondary)",
-                  opacity: confirmDelete ? 0.8 : 0.25,
-                }}
-              >
-                {confirmDelete ? "confirm?" : "delete"}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-    </div>
-  );
+/** Deterministic icon for any punk name. Built-in punks get custom icons. */
+function punkIcon(name: string): string {
+  if (name === "ash") return "◎";
+  if (name === "ghost") return "◈";
+  if (name === "sage") return "○";
+  const n = name.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const iconSet = ["▴", "▾", "◉", "○", "□", "◇", "▸", "◄", "✦", "◆"];
+  return iconSet[n % iconSet.length] ?? "";
 }
 
-// ─── Lens ──────────────────────────────────────────────────────────────────
+// ─── FindingCard ────────────────────────────────────────────────────────────
 
-// ─── Review Section ──────────────────────────────────────────────────────────
+function FindingCard({
+  finding,
+  punkColor,
+  onDismiss,
+  onCheckPrevious,
+}: {
+  finding: ReviewFinding;
+  punkColor: string;
+  onDismiss: () => void;
+  onCheckPrevious: () => void;
+}) {
+  const [showRemediation, setShowRemediation] = useState(false);
 
-const SEVERITY_ORDER: Record<string, number> = { critical: 0, warning: 1, note: 2 };
-const SEVERITY_COLOR: Record<string, string> = {
-  critical: "text-red-400/70",
-  warning: "text-amber-400/70",
-  note: "text-pane-text-secondary/50",
-};
-
-function ReviewSection({ projectId, workingDir }: { projectId: string; workingDir: string }) {
-  const { session, findings, running, progress, setSession, setFindings, setRunning, setAllProgress, setProgress } = useReviewStore();
-
-  // Load latest review on mount
-  useEffect(() => {
-    reviewSessionLatest(projectId).then((result) => {
-      if (result?.session) {
-        setSession(result.session);
-        setFindings(result.findings || []);
-      }
-    }).catch(() => {});
-  }, [projectId]);
-
-  // Listen for review progress events
-  useEffect(() => {
-    const electronAPI = (window as unknown as { electronAPI: { on: (ch: string, fn: (data: unknown) => void) => () => void } }).electronAPI;
-
-    const unlistenProgress = electronAPI.on("pane://review-progress", (data: any) => {
-      if (data.projectId !== projectId) return;
-      if (data.status === "running" && data.punks) {
-        setAllProgress(data.punks);
-      } else if (data.punk) {
-        setProgress(data.punk, data.status);
-      }
-    });
-
-    const unlistenComplete = electronAPI.on("pane://review-complete", (data: any) => {
-      if (data.projectId !== projectId) return;
-      setRunning(false);
-      if (data.findings) setFindings(data.findings);
-      if (data.sessionId) {
-        setSession({
-          id: data.sessionId,
-          project_id: projectId,
-          status: "completed",
-          diff_summary: null,
-          base_ref: null,
-          punk_count: 3,
-          finding_count: data.findings?.length || 0,
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        });
-      }
-    });
-
-    return () => { unlistenProgress(); unlistenComplete(); };
-  }, [projectId]);
-
-  const handleReview = async () => {
-    setRunning(true);
-    setFindings([]);
-    try {
-      await runReview(projectId, workingDir);
-    } catch {
-      setRunning(false);
-    }
-  };
-
-  // Group findings by punk
-  const grouped = new Map<string, ReviewFinding[]>();
-  for (const f of findings) {
-    if (!grouped.has(f.punk)) grouped.set(f.punk, []);
-    grouped.get(f.punk)!.push(f);
+  let structured: any = {};
+  try {
+    structured = JSON.parse(finding.structured || "{}");
+  } catch {
+    // structured may be malformed JSON from older findings — default to empty
   }
-  // Sort within each group by severity
-  for (const [, arr] of grouped) {
-    arr.sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 2) - (SEVERITY_ORDER[b.severity] ?? 2));
-  }
+
+  const severityColor =
+    finding.severity === "critical" ? "#A67272"
+    : finding.severity === "warning" ? "#B8A56A"
+    : "#A8A59E";
+
+  const scopeLabel: string = String(structured.flow || structured.boundary || structured.journey || "");
 
   return (
-    <div className="mb-6">
-      {/* Review button + progress */}
-      <div className="flex items-center gap-3 mb-4">
-        <button
-          onClick={handleReview}
-          disabled={running}
-          className={`font-mono text-[11px] tracking-wider transition-colors btn-press ${
-            running
-              ? "text-pane-text-secondary/30 cursor-default"
-              : "text-[var(--pane-terminal)]/60 hover:text-[var(--pane-terminal)]"
-          }`}
+    <div className="mb-6 last:mb-0">
+      {/* Severity badge + unique identifier */}
+      <div className="flex items-center gap-2 mb-2">
+        <span
+          className="font-mono px-1.5 py-0.5 rounded"
+          style={{
+            fontSize: "var(--pane-font-size-xs)",
+            backgroundColor: `${severityColor}18`,
+            color: severityColor,
+          }}
         >
-          {running ? "reviewing" : "review"}
-        </button>
-        {running && Object.entries(progress).map(([punk, status]) => (
+          {finding.severity}
+        </span>
+        {scopeLabel && (
           <span
-            key={punk}
-            className={`font-mono text-[10px] tracking-wider ${
-              status === "done" ? "text-emerald-500/60"
-              : status === "running" ? "text-[var(--pane-terminal)]/60"
-              : status === "failed" ? "text-red-400/60"
-              : "text-pane-text-secondary/20"
-            }`}
+            className="font-mono text-pane-text-secondary/40 truncate"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
-            {punk} {status === "done" ? "●" : status === "running" ? "..." : status === "failed" ? "x" : "·"}
-          </span>
-        ))}
-        {!running && session && (
-          <span className="font-mono text-[10px] text-pane-text-secondary/30 tracking-wider">
-            {findings.length} finding{findings.length !== 1 ? "s" : ""}
+            {scopeLabel}
           </span>
         )}
       </div>
 
+      {/* Finding text */}
+      <p
+        className="text-pane-text leading-relaxed whitespace-pre-wrap"
+        style={{ fontSize: "var(--pane-font-size-sm)" }}
+      >
+        {finding.finding}
+      </p>
+
+      {/* Location */}
+      {finding.location && (
+        <p
+          className="font-mono text-pane-text-secondary/50 mt-2 truncate"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          {finding.location}
+        </p>
+      )}
+
+      {/* Remediation (collapsible) */}
+      {structured.remediation && (
+        <div className="mt-2.5">
+          <button
+            onClick={() => setShowRemediation(!showRemediation)}
+            className="font-mono transition-colors btn-press"
+            style={{
+              fontSize: "var(--pane-font-size-xs)",
+              color: punkColor,
+              opacity: 0.6,
+            }}
+          >
+            {showRemediation ? "▾ fix" : "▸ fix"}
+          </button>
+          {showRemediation && (
+            <p
+              className="text-pane-text-secondary mt-1 leading-relaxed whitespace-pre-wrap"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              {String(structured.remediation ?? "")}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Actions */}
+      <div className="flex items-center gap-3 mt-3">
+        <button
+          onClick={onDismiss}
+          className="font-mono transition-colors btn-press text-pane-text-secondary/30 hover:text-pane-text-secondary/60"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          dismiss
+        </button>
+        <button
+          onClick={onCheckPrevious}
+          className="font-mono transition-colors btn-press"
+          style={{
+            fontSize: "var(--pane-font-size-xs)",
+            color: punkColor,
+            opacity: 0.5,
+          }}
+        >
+          check if fixed
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── New Punk Form ──────────────────────────────────────────────────────────
+
+function NewPunkForm({ onCreated }: { onCreated: (name: string) => void }) {
+  const [name, setName] = useState("");
+  const [persona, setPersona] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  const handleSubmit = useCallback(async () => {
+    const trimmedName = name.trim().toLowerCase().replace(/\s+/g, "-");
+    const trimmedPersona = persona.trim();
+
+    if (!trimmedName) { setError("Name is required"); return; }
+    if (!/^[a-z][a-z0-9-]*[a-z0-9]$/.test(trimmedName)) {
+      setError("Name must be kebab-case (letters, numbers, hyphens)");
+      return;
+    }
+    if (trimmedPersona.length < 20) {
+      setError("Persona needs more content — include Identity, Methodology, and Principles");
+      return;
+    }
+
+    setCreating(true);
+    setError(null);
+
+    try {
+      const displayName = trimmedName.charAt(0).toUpperCase() + trimmedName.slice(1);
+      const result = await createPunk(trimmedName, `# ${displayName}\n\n${trimmedPersona}`);
+      if (result.success) {
+        const store = useLensStore.getState();
+        store.addPunk(trimmedName, displayName, "custom analyst");
+        setName("");
+        setPersona("");
+        onCreated(trimmedName);
+      } else {
+        setError(result.error ?? "Failed to create punk");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create punk");
+    } finally {
+      setCreating(false);
+    }
+  }, [name, persona, onCreated]);
+
+  return (
+    <div className="border-t border-pane-border/10 pt-6 mt-6">
+      <h2
+        className="font-mono text-pane-text-secondary/50 mb-4"
+        style={{ fontSize: "var(--pane-font-size-sm)" }}
+      >
+        New Punk
+      </h2>
+
+      <input
+        type="text"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="name (kebab-case, e.g. 'api-auditor')"
+        className="w-full bg-transparent font-mono text-pane-text border-b border-pane-border/20 outline-none pb-1 mb-4 transition-colors focus:border-pane-border/60"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+        disabled={creating}
+      />
+
+      <textarea
+        value={persona}
+        onChange={(e) => setPersona(e.target.value)}
+        placeholder={`## Identity
+
+What is this punk? What does it analyze?
+
+## Methodology
+
+1. First principle...
+2. Second principle...
+
+## Principles
+
+- A guiding rule
+- Another one`}
+        className="w-full bg-transparent font-mono text-pane-text border border-pane-border/20 rounded-md outline-none p-3 resize-none transition-colors focus:border-pane-border/60"
+        style={{ fontSize: "var(--pane-font-size-xs)", minHeight: "120px" }}
+        disabled={creating}
+      />
+
+      {error && (
+        <p
+          className="font-mono text-pane-error mt-2"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          {error}
+        </p>
+      )}
+
+      <div className="flex items-center gap-3 mt-3">
+        <button
+          onClick={handleSubmit}
+          disabled={creating}
+          className="font-mono transition-colors btn-press disabled:opacity-30 text-pane-accent hover:text-pane-accent/80"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          {creating ? "creating..." : "create & run"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── PunkSection ────────────────────────────────────────────────────────────
+
+function PunkSection({
+  punk,
+  punkState,
+  onRun,
+  onCheckPrevious,
+}: {
+  punk: { name: string; displayName: string; role: string; color: string };
+  punkState: PunkState;
+  onRun: (name: string, scope?: string) => void;
+  onCheckPrevious: (name: string) => void;
+}) {
+  const setScope = useLensStore((s) => s.setPunkScope);
+  const dismissFinding = useLensStore((s) => s.dismissFinding);
+  const [showScope, setShowScope] = useState(false);
+
+  const statusLabel: React.ReactNode =
+    punkState.status === "running" ? "running..."
+    : punkState.status === "failed" ? "failed"
+    : punkState.status === "completed" ? (
+      punkState.findings.length > 0
+        ? `${punkState.findings.length} finding${punkState.findings.length > 1 ? "s" : ""}`
+        : "nothing found"
+    )
+    : punkState.lastRan
+    ? (() => {
+        const diff = Date.now() - punkState.lastRan;
+        if (diff < 60000) return "just now";
+        if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+        if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+        return `${Math.floor(diff / 86400000)}d ago`;
+      })()
+    : null;
+
+  const handleRun = () => {
+    const scope = punkState.scope.trim() || undefined;
+    onRun(punk.name, scope);
+  };
+
+  return (
+    <div className="mb-8 last:mb-0">
+      {/* Header row */}
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span style={{ color: punk.color }} className="text-sm">
+            {punkIcon(punk.name)}
+          </span>
+          <span
+            className="font-mono"
+            style={{
+              fontSize: "var(--pane-font-size-sm)",
+              color: punk.color,
+            }}
+          >
+            {punk.displayName}
+          </span>
+          <span
+            className="font-mono text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {punk.role}
+          </span>
+          {/* Status */}
+          {punkState.status === "running" && (
+            <span
+              className="font-mono text-pane-accent"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              · running...
+            </span>
+          )}
+          {punkState.status === "failed" && (
+            <span
+              className="font-mono text-pane-error"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              · failed
+            </span>
+          )}
+          {punkState.status === "completed" && (
+            <span
+              className="font-mono text-pane-text-secondary/60"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              · {statusLabel}
+            </span>
+          )}
+          {punkState.status === "idle" && punkState.lastRan && (
+            <span
+              className="font-mono text-pane-text-secondary/30"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              · {statusLabel}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Scope toggle */}
+          <button
+            onClick={() => setShowScope(!showScope)}
+            className="font-mono transition-colors btn-press text-pane-text-secondary/30 hover:text-pane-text-secondary/60"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {showScope ? "—" : "+"}
+          </button>
+          {/* Run button */}
+          <button
+            onClick={handleRun}
+            disabled={punkState.status === "running"}
+            className="font-mono transition-colors btn-press disabled:opacity-30"
+            style={{
+              fontSize: "var(--pane-font-size-xs)",
+              color: punkState.status === "running" ? "var(--pane-text-secondary)" : punk.color,
+            }}
+          >
+            {punkState.status === "running" ? "running..." : "run"}
+          </button>
+          {/* Check previous */}
+          {punkState.findings.length > 0 && punkState.status !== "running" && (
+            <button
+              onClick={() => onCheckPrevious(punk.name)}
+              className="font-mono transition-colors btn-press text-pane-text-secondary/25 hover:text-pane-text-secondary/50"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              recheck
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Scope input (expandable) */}
+      {showScope && (
+        <div className="mb-3">
+          <input
+            type="text"
+            value={punkState.scope}
+            onChange={(e) => setScope(punk.name, e.target.value)}
+            placeholder={`e.g., focus on ${punk.role ? punk.role : "your area of interest"}`}
+            className="w-full bg-transparent font-mono text-pane-text border-b border-pane-border/20 outline-none pb-1 transition-colors focus:border-pane-border/60"
+            style={{
+              fontSize: "var(--pane-font-size-xs)",
+              color: punk.color,
+            }}
+          />
+        </div>
+      )}
+
+      {/* Error message */}
+      {punkState.error && (
+        <p
+          className="font-mono text-pane-error mb-2"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          {punkState.error}
+        </p>
+      )}
+
       {/* Findings */}
-      {findings.length > 0 && (
-        <div className="space-y-4">
-          {[...grouped.entries()].map(([punk, punkFindings]) => (
-            <div key={punk}>
-              {punkFindings.map((f) => (
-                <div key={f.id} className="mb-3 pl-3 border-l border-pane-text/5">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="font-mono text-[10px] text-[var(--pane-terminal)]/50 tracking-wider">{punk}</span>
-                    <span className={`font-mono text-[10px] tracking-wider ${SEVERITY_COLOR[f.severity] || "text-pane-text-secondary/50"}`}>
-                      {f.severity}
-                    </span>
-                    {f.location && (
-                      <span className="font-mono text-[10px] text-pane-text-secondary/30 tracking-wider">
-                        {f.location}
-                      </span>
-                    )}
-                    {f.remediation && (
-                      <button
-                        onClick={() => {
-                          const prompt = `${punk} found an issue that needs fixing:\n\n**Issue:** ${f.finding}\n\n**Location:** ${f.location || "see details"}\n\n**Recommended fix:** ${f.remediation}\n\nImplement this fix.`;
-                          // Switch to conversation and prefill the prompt
-                          const store = useProjectsStore.getState();
-                          store.setMode(projectId, "conversation");
-                          // Dispatch event for InputBar to pick up
-                          window.dispatchEvent(new CustomEvent("pane:prefill-prompt", { detail: { prompt } }));
-                        }}
-                        className="font-mono text-[10px] tracking-wider text-[var(--pane-terminal)]/40 hover:text-[var(--pane-terminal)] transition-colors btn-press"
-                      >
-                        fix
-                      </button>
-                    )}
-                  </div>
-                  <p
-                    className="text-pane-text-secondary/70 leading-relaxed m-0"
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  >
-                    {f.finding}
-                  </p>
-                  {f.remediation && (
-                    <p
-                      className="text-pane-text-secondary/40 leading-relaxed m-0 mt-1"
-                      style={{ fontSize: "var(--pane-font-size-xs)" }}
-                    >
-                      {f.remediation}
-                    </p>
-                  )}
-                </div>
-              ))}
-            </div>
+      {punkState.findings.length > 0 && (
+        <div className="pl-5 border-l border-pane-border/10">
+          {punkState.findings.map((finding: ReviewFinding) => (
+            <FindingCard
+              key={finding.id}
+              finding={finding}
+              punkColor={punk.color}
+              onDismiss={() => dismissFinding(punk.name, finding.id)}
+              onCheckPrevious={() => onCheckPrevious(punk.name)}
+            />
           ))}
         </div>
       )}
@@ -318,259 +420,173 @@ function ReviewSection({ projectId, workingDir }: { projectId: string; workingDi
   );
 }
 
+// ─── Main Lens Component ──────────────────────────────────────────────────────
+
 export function Lens({ projectId }: { projectId: string }) {
-  const posts = useLensStore(useShallow((s) => s.posts.filter((p) => p.project_id === projectId)));
-  const appendPost = useLensStore((s) => s.appendPost);
-  const setPosts = useLensStore((s) => s.setPosts);
-  const deletePost = useLensStore((s) => s.deletePost);
-  const setLoaded = useLensStore((s) => s.setLoaded);
-  const expandedCommentsId = useLensStore((s) => s.expandedCommentsId);
-  const setExpandedCommentsId = useLensStore((s) => s.setExpandedCommentsId);
-
-
+  const punks = useLensStore((s) => s.punks);
+  const init = useLensStore((s) => s.init);
+  const addPunk = useLensStore((s) => s.addPunk);
+  const addPunkFindings = useLensStore((s) => s.addPunkFindings);
+  const setPunkStatus = useLensStore((s) => s.setPunkStatus);
   const workingDir = useProjectsStore((s) => s.projects.get(projectId)?.root ?? "");
-  const userName = useWorkspaceStore((s) => s.profileName);
+  const [showNewForm, setShowNewForm] = useState(false);
 
-  const [composing, setComposing] = useState(false);
-  const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const composeRef = useRef<HTMLDivElement>(null);
-
-  // Slash-menu state for mind entry quick-insert
-  const [slashOpen, setSlashOpen] = useState(false);
-  const [slashQuery, setSlashQuery] = useState("");
-  const slashStartRef = useRef<number>(-1);
-  const mindEntries = useMindStore((s) => s.entries);
-
-  // Load posts on first visit — always re-fetch so navigation away and back is safe
+  // Load existing findings + discover punks on mount
   useEffect(() => {
-    lensPostsList(projectId).then((fetched) => {
-      setPosts(fetched);
-      setLoaded(projectId, true);
-    });
-  }, [projectId]);
+    if (!projectId) return;
+    init(projectId);
 
-  // Listen for new posts from workers via IPC
-  useEffect(() => {
-    const electronAPI = (window as any).electronAPI;
-    const unlisten = electronAPI.on("pane://lens-post", (post: LensPost) => {
-      if (post.project_id === projectId) appendPost(post);
-    });
-    return () => unlisten();
-  }, [projectId]);
-
-  // Scroll to bottom when posts change
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [posts.length]);
-
-  // Auto-focus textarea when compose opens
-  useEffect(() => {
-    if (composing) {
-      requestAnimationFrame(() => textareaRef.current?.focus());
-    }
-  }, [composing]);
-
-  // Close compose on click outside
-  useEffect(() => {
-    if (!composing) return;
-    const handler = (e: MouseEvent) => {
-      if (composeRef.current && !composeRef.current.contains(e.target as Node)) {
-        if (!input.trim()) {
-          setComposing(false);
-          setInput("");
-        }
+    listPunks().then((discovered) => {
+      const store = useLensStore.getState();
+      for (const p of discovered) {
+        store.addPunk(p.name, p.displayName || p.name, p.role);
       }
+    }).catch(() => {});
+  }, [projectId, init, addPunk]);
+
+  // Listen for punk progress/completion events
+  useEffect(() => {
+    type ElectronWindow = Window & typeof globalThis & {
+      electronAPI: {
+        on: (channel: string, cb: (...args: unknown[]) => void) => () => void;
+      };
     };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [composing, input]);
+    const electronAPI = (window as unknown as ElectronWindow).electronAPI;
+    if (!electronAPI) return;
 
-  const handleComposeChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const next = e.target.value;
-    const pos = e.target.selectionStart ?? next.length;
-    setInput(next);
-    // Auto-resize
-    e.target.style.height = "auto";
-    e.target.style.height = `${e.target.scrollHeight}px`;
-
-    if (slashOpen) {
-      const slashIdx = slashStartRef.current - 1;
-      if (next[slashIdx] !== "/" || pos < slashStartRef.current) {
-        setSlashOpen(false);
-      } else {
-        setSlashQuery(next.slice(slashStartRef.current, pos));
-      }
-    } else {
-      if (next[pos - 1] === "/") {
-        const charBefore = next[pos - 2];
-        if (!charBefore || charBefore === " " || charBefore === "\n") {
-          slashStartRef.current = pos;
-          setSlashQuery("");
-          setSlashOpen(true);
-        }
-      }
-    }
-  }, [slashOpen]);
-
-  const handleSlashSelect = useCallback((content: string) => {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const slashIdx = slashStartRef.current - 1;
-    const cursorPos = ta.selectionStart ?? input.length;
-    const before = input.slice(0, slashIdx);
-    const after = input.slice(cursorPos);
-    const next = before + content + after;
-    setInput(next);
-    setSlashOpen(false);
-    requestAnimationFrame(() => {
-      ta.focus();
-      const newPos = before.length + content.length;
-      ta.setSelectionRange(newPos, newPos);
-      ta.style.height = "auto";
-      ta.style.height = `${ta.scrollHeight}px`;
+    const unlistenProgress = electronAPI.on("pane://punk-progress", (event: unknown) => {
+      const ev = event as Record<string, unknown>;
+      const punk = ev.punk as string | undefined;
+      const status = ev.status as string | undefined;
+      const error = ev.error as string | undefined;
+      if (!punk) return;
+      setPunkStatus(punk, status as PunkStatus, error);
     });
-  }, [input]);
 
-  const handleSend = async () => {
-    const text = input.trim();
-    if (!text || sending) return;
-    setSending(true);
-    setInput("");
-    try {
-      const post = await lensPostAdd("user", text, projectId);
-      appendPost(post);
-      setComposing(false);
-    } finally {
-      setSending(false);
-    }
-  };
+    const unlistenComplete = electronAPI.on("pane://punk-complete", (event: unknown) => {
+      const ev = event as Record<string, unknown>;
+      const punk = ev.punk as string | undefined;
+      const findings = ev.findings as ReviewFinding[] | undefined;
+      const checkPrevious = ev.checkPrevious as boolean | undefined;
+      if (!punk) return;
+      if (findings) {
+        addPunkFindings(punk, findings, !!checkPrevious);
+      }
+      setPunkStatus(punk, "completed");
+    });
 
-  const handleDelete = useCallback(async (postId: string) => {
-    try {
-      await lensPostDelete(postId);
-      deletePost(postId);
-    } catch (error) {
-      console.error("Failed to delete post:", error);
-    }
-  }, [deletePost]);
+    return () => {
+      unlistenProgress();
+      unlistenComplete();
+    };
+  }, [projectId, setPunkStatus, addPunkFindings]);
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Slash menu captures Enter/Tab/Escape/Arrows — don't double-handle
-    if (slashOpen && (e.key === "Enter" || e.key === "Tab" || e.key === "Escape" || e.key === "ArrowDown" || e.key === "ArrowUp")) {
-      return;
+  // Handle run single punk
+  const handleRun = useCallback(
+    (name: string, scope?: string) => {
+      if (!projectId || !workingDir) return;
+      setPunkStatus(name, "running");
+      runSinglePunk(name, projectId, workingDir, scope).catch((err) => {
+        setPunkStatus(name, "failed", err.message);
+      });
+    },
+    [projectId, workingDir, setPunkStatus],
+  );
+
+  // Handle check previous findings
+  const handleCheckPrevious = useCallback(
+    (name: string) => {
+      if (!projectId || !workingDir) return;
+      setPunkStatus(name, "running");
+      checkPreviousFindings(name, projectId, workingDir).catch((err) => {
+        setPunkStatus(name, "failed", err.message);
+      });
+    },
+    [projectId, workingDir, setPunkStatus],
+  );
+
+  // Handle run all
+  const handleRunAll = useCallback(() => {
+    if (!projectId || !workingDir) return;
+    const names = Object.keys(punks);
+    for (const name of names) {
+      setPunkStatus(name, "running");
     }
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-    if (e.key === "Escape") {
-      setComposing(false);
-      setInput("");
-    }
-  };
+    runReview(projectId, workingDir).catch((err) => {
+      for (const name of names) {
+        setPunkStatus(name, "failed", err.message);
+      }
+    });
+  }, [projectId, workingDir, punks, setPunkStatus]);
+
+  const isAnyRunning = Object.values(punks).some((p) => p.status === "running");
 
   return (
-    <div className="absolute inset-0 flex flex-col">
-      {/* Feed */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto overflow-x-hidden custom-scrollbar py-4"
-      >
-        <div className="max-w-2xl mx-auto w-full px-4">
-        {/* Review section — on-demand punk analysis */}
-        <ReviewSection projectId={projectId} workingDir={workingDir} />
-
-        {posts.length === 0 && !composing ? (
-          <div className="flex items-center justify-center h-full py-20">
-            <button
-              onClick={() => setComposing(true)}
-              className="font-mono text-pane-text-secondary/30 hover:text-pane-text-secondary/50 transition-colors btn-press"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              what do you notice
-            </button>
-          </div>
-        ) : (
-          posts.map((post) => (
-            <PostItem
-              key={post.id}
-              post={post}
-              showComments={expandedCommentsId === post.id}
-              onToggleComments={() =>
-                setExpandedCommentsId(expandedCommentsId === post.id ? null : post.id)
-              }
-              userName={userName}
-              onDelete={() => handleDelete(post.id)}
-            />
-          ))
-        )}
+    <div className="h-full overflow-y-auto px-6 py-8">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-8">
+        <h1
+          className="font-mono text-pane-text"
+          style={{ fontSize: "var(--pane-font-size-lg)" }}
+        >
+          Lens
+        </h1>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setShowNewForm(!showNewForm)}
+            className="font-mono transition-colors btn-press text-pane-text-secondary/40 hover:text-pane-text-secondary/70"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {showNewForm ? "cancel" : "new"}
+          </button>
+          <button
+            onClick={handleRunAll}
+            disabled={isAnyRunning}
+            className="font-mono transition-colors btn-press disabled:opacity-30 text-pane-text-secondary/40 hover:text-pane-text-secondary/70"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {isAnyRunning ? "running..." : "run all"}
+          </button>
         </div>
       </div>
 
-      {/* Compose — expand on demand */}
-      <div ref={composeRef} className="shrink-0">
-        {composing ? (
-          <div className="bg-pane-bg rounded-t-xl ring-1 ring-pane-border/40 relative">
-            {slashOpen && (
-              <SlashMenu
-                entries={mindEntries}
-                query={slashQuery}
-                onSelect={handleSlashSelect}
-                onDismiss={() => setSlashOpen(false)}
-              />
-            )}
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={handleComposeChange}
-              onKeyDown={handleKeyDown}
-              placeholder="what do you notice"
-              disabled={sending}
-              className="w-full bg-transparent text-pane-text font-mono resize-none outline-none placeholder:text-pane-text-secondary leading-[1.75] px-5 pt-4 overflow-y-auto overflow-x-hidden"
-              style={{
-                fontSize: "var(--pane-font-size)",
-                minHeight: "80px",
-                maxHeight: "30vh",
-                paddingBottom: "36px",
-              }}
-            />
-            {/* Send — top right, only when there's text */}
-            {input.trim().length > 0 && (
-              <button
-                onClick={handleSend}
-                className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
-                </svg>
-              </button>
-            )}
-            {/* Bottom hint row */}
-            <div
-              className="absolute bottom-0 left-0 right-0 flex items-center px-3 pb-2 pointer-events-none"
-              style={{ fontSize: "var(--pane-font-size-xs)" }}
-            >
-              <span className="font-mono text-pane-text-secondary/20">
-                enter to post · shift+enter for newline · esc to cancel
-              </span>
-            </div>
-          </div>
-        ) : (
-          <button
-            onClick={() => setComposing(true)}
-            className="w-full text-left font-mono text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors btn-press px-5 py-3"
-            style={{ fontSize: "var(--pane-font-size-xs)" }}
-          >
-            + observe
-          </button>
-        )}
-      </div>
+      {/* Punk sections */}
+      {Object.entries(punks).map(([name, state]) => (
+        <PunkSection
+          key={name}
+          punk={{
+            name,
+            displayName: state.displayName || name,
+            role: state.role,
+            color: state.color,
+          }}
+          punkState={state}
+          onRun={handleRun}
+          onCheckPrevious={handleCheckPrevious}
+        />
+      ))}
 
+      {/* New Punk Form */}
+      {showNewForm && (
+        <NewPunkForm onCreated={(newName) => {
+          setShowNewForm(false);
+          handleRun(newName);
+        }} />
+      )}
+
+      {/* Empty state */}
+      {!isAnyRunning &&
+        !showNewForm &&
+        Object.values(punks).every((p) => p.findings.length === 0) && (
+        <div
+          className="text-center font-mono text-pane-text-secondary/20 mt-12"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          Three experts are watching your codebase. Or create your own.
+          <br />
+          Run one to get started.
+        </div>
+      )}
     </div>
   );
 }

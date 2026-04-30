@@ -43,26 +43,25 @@ export function ControlPanel() {
 
   return (
     <div
-      className="no-select flex flex-col h-full bg-pane-bg rounded-xl font-panel outline-none ring-1 ring-pane-border/40"
+      className="no-select flex flex-col h-full bg-pane-bg rounded-xl font-panel outline-none ring-1 ring-pane-border/40 relative"
       data-panel="control"
       tabIndex={0}
     >
       {/* Spacer for macOS traffic lights — enough room so they sit inside the panel */}
       <div className="h-12 shrink-0" />
 
-      {/* Thread list — fills available space between traffic lights and toolbar */}
-      <div className="flex-1 min-h-0 overflow-y-auto py-2">
+      {/* Thread list — scrolls, fills remaining space */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-2 pt-2">
         <ProjectList />
       </div>
 
-      {/* Menu — icon at bottom, items expand upward from it */}
-      <div className="px-2 pb-2 shrink-0 flex flex-col justify-end min-h-9">
+      {/* Menu — in normal flow at the bottom, width is the anchor that the thread highlight matches */}
+      <div className="px-2 pb-2">
         <Menu
           currentMode={mode}
           isGitRepo={isGitRepo}
           hasUnreadLens={hasUnreadLens}
           onSelectMode={handleSetMode}
-          position="sidebar"
         />
       </div>
     </div>

@@ -264,7 +264,9 @@ export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | 
           <span className="text-pane-text-secondary font-mono text-xs uppercase tracking-wider">tokens</span>
           <span className="text-2xl font-mono text-pane-text font-semibold tabular-nums">{formatTokens(totals.input + totals.output)}</span>
           <span className="text-sm font-mono text-pane-text-secondary">
-            {formatTokens(totals.input)} in · {formatTokens(totals.output)} out
+            {totals.cached > 0
+              ? `${formatTokens(totals.input - totals.cached)} non-cached · ${formatTokens(totals.cached)} cached · ${formatTokens(totals.output)} out`
+              : `${formatTokens(totals.input)} in · ${formatTokens(totals.output)} out`}
           </span>
         </div>
         <div className="p-5 rounded-xl bg-pane-surface/50 ring-1 ring-pane-border/20 flex flex-col gap-2">
@@ -273,8 +275,8 @@ export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | 
             {cacheSavings > 0 ? formatCost(cacheSavings) : "—"}
           </span>
           <span className="text-sm font-mono text-pane-text-secondary">
-            {totals.cached > 0 && (totals.input + totals.cached) > 0
-              ? `${Math.round((totals.cached / (totals.input + totals.cached)) * 100)}% hit rate`
+            {totals.cached > 0 && totals.input > 0
+              ? `${Math.round((totals.cached / totals.input) * 100)}% hit rate`
               : "no cache data"}
           </span>
         </div>
@@ -374,9 +376,8 @@ export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | 
 
                           {/* Model rows */}
                           {rows.map((row) => {
-                            const totalInput = row.total_input_tokens + row.total_cache_read;
-                            const cacheHit = totalInput > 0
-                              ? Math.round((row.total_cache_read / totalInput) * 100)
+                            const cacheHit = row.total_input_tokens > 0
+                              ? Math.round((row.total_cache_read / row.total_input_tokens) * 100)
                               : 0;
                             return (
                               <div key={`${row.model}-${row.provider}-${row.activity_type}`}
