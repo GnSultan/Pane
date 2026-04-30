@@ -10,6 +10,7 @@ import {
   saveConversationToMain,
   checkPathExists,
   migrateProjectId,
+  getAllThreadStates,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
 import type { ConversationMessage } from "../lib/punk-types";
@@ -20,6 +21,13 @@ import {
   DEFAULT_POWER_COMBO,
   type PowerCombo,
 } from "../lib/models";
+
+/** Shape returned by thread-state.mjs — persisted per-project activity data. */
+interface ThreadStateData {
+  lastUserPromptText?: string | null;
+  lastResponseSummary?: string | null;
+  lastActivityAt?: number | null;
+}
 
 // App readiness gate — other hooks (git, watcher) wait for this before starting
 let resolveAppReady: () => void;
@@ -67,12 +75,6 @@ export function useSettingsPersistence() {
         const ws = useWorkspaceStore.getState();
 
         // 1. Core UI settings
-        if (
-          settings.control_panel_visible !== undefined &&
-          !settings.control_panel_visible
-        ) {
-          ws.toggleControlPanel();
-        }
         if (settings.font_size) ws.setFontSize(settings.font_size);
         if (settings.panel_font_size)
           ws.setPanelFontSize(settings.panel_font_size);
@@ -82,7 +84,6 @@ export function useSettingsPersistence() {
         if (settings.keybindings)
           ws.setKeybindingsRaw(settings.keybindings as Partial<Record<ActionId, KeyBinding>>);
         if (settings.theme) ws.setTheme(settings.theme as Theme);
-        if (settings.panel_width) ws.setControlPanelWidth(settings.panel_width);
         if (settings.completion_sound)
           ws.setCompletionSound(settings.completion_sound);
 
@@ -187,6 +188,19 @@ export function useSettingsPersistence() {
             useProjectsStore.getState().setConversationRestored(id, true);
           }
 
+          // Hydrate thread activity data from persisted state
+          const threadStates: Record<string, unknown> = await getAllThreadStates(projectEntries.map(e => e.id));
+          for (const [id, raw] of Object.entries(threadStates)) {
+            if (!raw) continue;
+            const state = raw as ThreadStateData;
+            if (!state.lastUserPromptText && !state.lastActivityAt) continue;
+            useProjectsStore.getState().setThreadActivity(id, {
+              lastUserPromptText: state.lastUserPromptText ?? null,
+              lastResponseSummary: state.lastResponseSummary ?? null,
+              lastActivityAt: state.lastActivityAt ?? null,
+            });
+          }
+
           // Run migrations in the background — swap each project from its old
           // derived ID to a real UUID. The project is already loaded and usable
           // with the old ID; after migration completes we swap the store entry
@@ -280,6 +294,10 @@ export function useSettingsPersistence() {
                   state.selected_model_provider,
                 );
               }
+              // Restore archived status after all other state is applied
+              if (state.archived) {
+                useProjectsStore.getState().archiveProject(id);
+              }
               if (state.active_file_path) {
                 readFile(state.active_file_path)
                   .then((content) => {
@@ -367,6 +385,7 @@ export function useSettingsPersistence() {
           selected_model: p.selectedModel,
           selected_model_provider: p.selectedModelProvider,
           selected_model_thinking: p.selectedModelThinking,
+          archived: p.archived ?? false,
         };
       }
 
@@ -374,7 +393,6 @@ export function useSettingsPersistence() {
         project_roots,
         active_project_root: activeProject?.root ?? null,
         project_ids,
-        control_panel_visible: ws.controlPanelVisible,
         project_states,
         font_size: ws.fontSize,
         panel_font_size: ws.panelFontSize,
@@ -382,7 +400,6 @@ export function useSettingsPersistence() {
         font_weight: ws.fontWeight,
         keybindings: ws.keybindings,
         theme: ws.theme,
-        panel_width: ws.controlPanelWidth,
         completion_sound: ws.completionSound,
         selected_model: ws.selectedModel,
         selected_model_provider: ws.selectedModelProvider,
@@ -421,8 +438,6 @@ export function useSettingsPersistence() {
         state.fontWeight !== prev.fontWeight ||
         state.keybindings !== prev.keybindings ||
         state.theme !== prev.theme ||
-        state.controlPanelWidth !== prev.controlPanelWidth ||
-        state.controlPanelVisible !== prev.controlPanelVisible ||
         state.completionSound !== prev.completionSound ||
         state.selectedModel !== prev.selectedModel ||
         state.selectedModelProvider !== prev.selectedModelProvider ||

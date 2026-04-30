@@ -28,6 +28,7 @@ import { initCloudAuth } from "./cloud-auth.mjs";
 import { registerCloudSyncHandlers } from "./cloud-sync.mjs";
 import { MindPunks } from "./mind-punks.mjs";
 import { getModelRates } from "./pricing.mjs";
+import { updateLastPrompt, updateLastResponse, readThreadState } from "./thread-state.mjs";
 import { contextStore } from "./context-store.mjs";
 import { getPaneDb, extractMessageText } from "./pane-db.mjs";
 import { loadRecentTurns } from "./session-turns.mjs";
@@ -1020,7 +1021,6 @@ const defaultSettings = {
   font_weight: null,
   keybindings: null,
   theme: null,
-  panel_width: null,
   punk_backend: "api",
   http_provider: "deepseek",
   http_api_keys: {},
@@ -1845,6 +1845,51 @@ function registerStateHandlers(db) {
     } catch (e) {
       console.error("[pane-db] search_conversations error:", e.message);
       return { results: [] };
+    }
+  });
+
+  // ── Thread State Handlers ────────────────────────────────────────────
+  // Persist prompt/response activity data for the thread list UI.
+  // Thread state lives in ~/.pane/session/{projectId}/thread.json,
+  // managed by thread-state.mjs.
+
+  ipcMain.handle("record_last_prompt", async (_event, { projectId, promptText, promptHash }) => {
+    try {
+      updateLastPrompt(projectId, promptText, promptHash);
+    } catch (err) {
+      console.error("[main] record_last_prompt error:", err.message);
+    }
+  });
+
+  ipcMain.handle("record_last_response", async (_event, { projectId, summary }) => {
+    try {
+      updateLastResponse(projectId, summary);
+    } catch (err) {
+      console.error("[main] record_last_response error:", err.message);
+    }
+  });
+
+  ipcMain.handle("get_thread_state", async (_event, { projectId }) => {
+    try {
+      return readThreadState(projectId);
+    } catch (err) {
+      console.error("[main] get_thread_state error:", err.message);
+      return null;
+    }
+  });
+
+  ipcMain.handle("get_all_thread_states", async (_event, { projectIds }) => {
+    try {
+      const result = {};
+      if (Array.isArray(projectIds)) {
+        for (const id of projectIds) {
+          result[id] = readThreadState(id);
+        }
+      }
+      return result;
+    } catch (err) {
+      console.error("[main] get_all_thread_states error:", err.message);
+      return {};
     }
   });
 }

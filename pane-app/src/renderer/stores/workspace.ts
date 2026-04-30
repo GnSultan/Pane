@@ -32,8 +32,6 @@ function resolveTheme(theme: Theme): "dark" | "light" | "pure" | "glass" {
 }
 
 interface WorkspaceState {
-  controlPanelVisible: boolean;
-  controlPanelWidth: number;
   fontSize: number;
   panelFontSize: number;
   editorFontSize: number;
@@ -90,8 +88,6 @@ interface WorkspaceState {
   setProfileBio: (bio: string) => void;
   setProfileRole: (role: string) => void;
   setProfileAvatarDataUrl: (url: string | null) => void;
-  toggleControlPanel: () => void;
-  setControlPanelWidth: (width: number) => void;
   increaseFontSize: () => void;
   decreaseFontSize: () => void;
   resetFontSize: () => void;
@@ -206,8 +202,6 @@ function applyTheme(theme: Theme) {
 
 function createWorkspaceStore() {
   return create<WorkspaceState>()((set, get) => ({
-    controlPanelVisible: true,
-    controlPanelWidth: 240,
     fontSize: DEFAULT_FONT_SIZE,
     panelFontSize: DEFAULT_PANEL_FONT_SIZE,
     editorFontSize: DEFAULT_EDITOR_FONT_SIZE,
@@ -345,12 +339,6 @@ function createWorkspaceStore() {
         set({ geminiUpdateState: "available" });
       }
     },
-    toggleControlPanel: () =>
-      set((state) => ({
-        controlPanelVisible: !state.controlPanelVisible,
-      })),
-    setControlPanelWidth: (width: number) =>
-      set({ controlPanelWidth: Math.max(200, Math.min(480, width)) }),
     increaseFontSize: () =>
       set((state) => {
         const next = Math.max(1, state.fontSize + 1);

@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from "react";
+import { useEffect } from "react";
 import { setWindowTitle, destroyPty } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ControlPanel } from "./components/ControlPanel/ControlPanel";
@@ -10,44 +10,7 @@ import { useFileWatcher } from "./hooks/useFileWatcher";
 import { useGitStatus } from "./hooks/useGitStatus";
 import { useSettingsPersistence } from "./hooks/useSettingsPersistence";
 
-function ResizeHandle() {
-  const handlePointerDown = useCallback((e: React.PointerEvent) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startWidth = useWorkspaceStore.getState().controlPanelWidth;
-
-    const handlePointerMove = (e: PointerEvent) => {
-      const newWidth = startWidth + (e.clientX - startX);
-      useWorkspaceStore.getState().setControlPanelWidth(newWidth);
-    };
-
-    const handlePointerUp = () => {
-      document.removeEventListener("pointermove", handlePointerMove);
-      document.removeEventListener("pointerup", handlePointerUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("pointermove", handlePointerMove);
-    document.addEventListener("pointerup", handlePointerUp);
-  }, []);
-
-  return (
-    <div
-      onPointerDown={handlePointerDown}
-      data-no-drag
-      className="w-1.5 shrink-0 cursor-col-resize hover:bg-pane-text/[0.06]
-                 flex items-center justify-center relative z-20"
-    >
-      <div className="w-[2px] h-8 bg-transparent group-hover:bg-pane-border" />
-    </div>
-  );
-}
-
 function App() {
-  const controlPanelWidth = useWorkspaceStore((s) => s.controlPanelWidth);
   // Sidebar visibility derived from active mode — shown only in conversation mode.
   // When no project exists (empty state), sidebar is visible to show the thread list.
   const sidebarVisible = useProjectsStore((s) => {
@@ -344,12 +307,9 @@ function App() {
 
       <div className="flex h-full pt-2 pb-2 pl-2 gap-1">
         {sidebarVisible && (
-          <>
-            <div className="shrink-0" style={{ width: controlPanelWidth }}>
-              <ControlPanel />
-            </div>
-            <ResizeHandle />
-          </>
+          <div className="shrink-0 w-60">
+            <ControlPanel />
+          </div>
         )}
         <div className="flex-1 min-w-0 pr-2 h-full relative">
           <Workspace />
