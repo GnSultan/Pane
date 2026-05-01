@@ -992,10 +992,17 @@ export interface UserProfile {
   style: { verbosity: string; planFirst: boolean } | null;
   rules: string;
   philosophy: string;
+  dna: string;
 }
 
 export async function brainGetProfile(): Promise<{ profile: UserProfile }> {
   return electronAPI.invoke("brain_get_profile");
+}
+
+export async function brainUpdateDNA(
+  dna: string,
+): Promise<{ updated: boolean }> {
+  return electronAPI.invoke("brain_update_dna", { dna });
 }
 
 export async function brainAddRule(

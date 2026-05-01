@@ -30,6 +30,7 @@ import { ALL_SYSTEM_ATOMS, FACET_WEIGHTS } from "./system-atoms.mjs";
 const BRAIN_DIR = path.join(os.homedir(), ".pane", "brain");
 const MEMORY_DIR = path.join(os.homedir(), ".pane", "memory");
 const PROFILE_DIR = path.join(os.homedir(), ".pane", "profile");
+const DNA_CACHE_PATH = path.join(PROFILE_DIR, "compiled-dna.txt");
 const EXPORTS_DIR = path.join(BRAIN_DIR, "exports");
 
 const SESSION_DIR = path.join(os.homedir(), ".pane", "session");
@@ -2149,6 +2150,13 @@ function updateIdentity(identity) {
   return { updated: true };
 }
 
+// Update DNA (full replacement — bypasses compile step)
+function updateDNA(dna) {
+  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  fs.writeFileSync(DNA_CACHE_PATH, dna, "utf-8");
+  return { updated: true };
+}
+
 // Save avatar (base64 data → file)
 function saveAvatar(base64Data, mimeType) {
   const ext = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
@@ -2243,6 +2251,8 @@ function writeProfileExport() {
 
 // Get full profile for MCP/display
 function getProfile() {
+  let dna = "";
+  try { dna = fs.readFileSync(DNA_CACHE_PATH, "utf-8").trim(); } catch { /* DNA not compiled yet */ }
   return {
     identity: readProfileJson("identity.json"),
     preferences: readProfileJson("preferences.json"),
@@ -2250,6 +2260,7 @@ function getProfile() {
     style: readProfileJson("style.json"),
     rules: readProfileMd("rules.md"),
     philosophy: readProfileMd("philosophy.md"),
+    dna,
   };
 }
 
@@ -2552,6 +2563,12 @@ process.parentPort.on("message", async ({ data }) => {
       case "update_identity": {
         const result = updateIdentity(data.identity);
         sendToMain({ type: "identity_result", requestId: data.requestId, ...result });
+        break;
+      }
+
+      case "update_dna": {
+        const result = updateDNA(data.dna);
+        sendToMain({ type: "dna_result", requestId: data.requestId, ...result });
         break;
       }
 

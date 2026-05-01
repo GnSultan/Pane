@@ -2319,6 +2319,10 @@ function registerBrainHandlers() {
     return brainRequest("update_identity", { identity: args.identity });
   });
 
+  ipcMain.handle("brain_update_dna", async (_event, args) => {
+    return brainRequest("update_dna", { dna: args.dna });
+  });
+
   ipcMain.handle("brain_save_avatar", async (_event, args) => {
     return brainRequest("save_avatar", {
       base64Data: args.base64Data,

@@ -15,8 +15,7 @@ import {
   brainUpdateIdentity,
   brainSaveAvatar,
   brainGetProfile,
-  brainUpdateRules,
-  brainUpdatePhilosophy,
+  brainUpdateDNA,
   reinitializePunkBackend,
   getBackendAvailability,
   getClaudeAuthState,
@@ -1565,9 +1564,8 @@ export function Profile() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const identitySaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [philosophy, setPhilosophy] = useState("");
-  const [rules, setRules] = useState("");
-  const philosophySaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [dnaString, setDnaString] = useState("");
+  const dnaSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Accordion state - only one section expanded at a time
   const [expandedSection, setExpandedSection] = useState<string | null>("identity");
@@ -1624,8 +1622,7 @@ export function Profile() {
     brainGetProfile()
       .then(({ profile }) => {
         if (profile) {
-          setPhilosophy(profile.philosophy || "");
-          setRules(profile.rules || "");
+          setDnaString(profile.dna || "");
         }
       })
       .catch(() => {});
@@ -1644,7 +1641,12 @@ export function Profile() {
   const saveIdentity = useCallback((field: string, value: string) => {
     if (identitySaveRef.current) clearTimeout(identitySaveRef.current);
     identitySaveRef.current = setTimeout(() => {
-      brainUpdateIdentity({ [field]: value }).catch(() => {});
+      brainUpdateIdentity({ [field]: value }).then(() => {
+        // Refresh DNA to reflect identity change in the compiled string
+        brainGetProfile().then(({ profile }) => {
+          if (profile) setDnaString(profile.dna || "");
+        }).catch(() => {});
+      }).catch(() => {});
     }, 500);
   }, []);
 
@@ -1671,23 +1673,12 @@ export function Profile() {
     [],
   );
 
-  const handlePhilosophyChange = useCallback(
+  const handleDnaChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      setPhilosophy(e.target.value);
-      if (philosophySaveRef.current) clearTimeout(philosophySaveRef.current);
-      philosophySaveRef.current = setTimeout(() => {
-        brainUpdatePhilosophy(e.target.value).catch(() => {});
-      }, 800);
-    },
-    [],
-  );
-
-  const handleRulesChange = useCallback(
-    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      setRules(e.target.value);
-      if (philosophySaveRef.current) clearTimeout(philosophySaveRef.current);
-      philosophySaveRef.current = setTimeout(() => {
-        brainUpdateRules(e.target.value).catch(() => {});
+      setDnaString(e.target.value);
+      if (dnaSaveRef.current) clearTimeout(dnaSaveRef.current);
+      dnaSaveRef.current = setTimeout(() => {
+        brainUpdateDNA(e.target.value).catch(() => {});
       }, 800);
     },
     [],
@@ -1887,37 +1878,18 @@ export function Profile() {
           </div>
         </AccordionSection>
 
-        {/* Philosophy Section */}
+        {/* DNA Section */}
         <AccordionSection
-          title="philosophy"
+          title="dna"
           icon={icons.philosophy}
-          isExpanded={expandedSection === "philosophy"}
-          onToggle={() => setExpandedSection(expandedSection === "philosophy" ? null : "philosophy")}
+          isExpanded={expandedSection === "dna"}
+          onToggle={() => setExpandedSection(expandedSection === "dna" ? null : "dna")}
         >
           <textarea
-            value={philosophy}
-            onChange={handlePhilosophyChange}
-            placeholder="your design principles..."
-            rows={4}
-            className="w-full font-mono text-pane-text bg-transparent outline-none resize-none placeholder:text-pane-text-secondary/30 leading-[1.75]"
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
-          />
-        </AccordionSection>
-
-        {/* Rules Section */}
-        <AccordionSection
-          title="rules"
-          icon={icons.rules}
-          isExpanded={expandedSection === "rules"}
-          onToggle={() => setExpandedSection(expandedSection === "rules" ? null : "rules")}
-        >
-          <textarea
-            value={rules}
-            onChange={handleRulesChange}
-            placeholder={
-              "always use bun\nnever auto-commit\nprefer functional over class"
-            }
-            rows={4}
+            value={dnaString}
+            onChange={handleDnaChange}
+            placeholder="your developer dna — what the model sees about how you work..."
+            rows={6}
             className="w-full font-mono text-pane-text bg-transparent outline-none resize-none placeholder:text-pane-text-secondary/30 leading-[1.75]"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           />
@@ -1925,7 +1897,7 @@ export function Profile() {
             className="text-pane-text-secondary/50 font-mono mt-2 block"
             style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
-            one per line — these override observed preferences
+            this is exactly what every model sees about you — edit directly, no compilation needed
           </span>
         </AccordionSection>
 
