@@ -360,8 +360,8 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
     <div className="flex flex-col h-full select-none">
 
       {/* ── Header ──────────────────────────────────────────────────────────── */}
-      {/* z-20 + data-no-drag — same combo the conversation scroll area uses to beat the h-[50px] z-10 drag region */}
-      <div className="h-12 shrink-0 flex items-center px-6 gap-2.5 relative z-20" data-no-drag>
+      {/* z-40 + data-no-drag — beats the h-[50px] z-30 drag region so git controls stay clickable */}
+      <div className="h-12 shrink-0 flex items-center px-6 gap-2.5 relative z-40" data-no-drag>
         <span
           className="font-mono text-pane-terminal/60 uppercase tracking-widest"
           style={{ fontSize: "10px" }}

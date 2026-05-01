@@ -295,13 +295,15 @@ function App() {
   }, []);
 
   return (
-    <div className="relative h-screen w-screen bg-pane-bg overflow-hidden">
-      {/* Full-width titlebar drag region — matches h-12 spacers + pt-2 padding */}
+    <div className="relative h-screen w-screen bg-pane-bg">
+      {/* Titlebar drag region — must stay at App root level for full-width coverage.
+           z-30 sits above active pages (z-20), below interactive headers (z-40).
+           Uses app-region: drag (not -webkit-app-region — dead since Chromium 118+).
+           No background needed — app-region works regardless of element opacity. */}
       <div
-        className="absolute top-0 left-0 right-0 h-[50px] z-10"
+        className="absolute top-0 left-0 right-0 h-[50px] z-30"
         data-tauri-drag-region
       />
-
       <div className="flex h-full pt-2 pb-2 pl-2 gap-1">
         {sidebarVisible && (
           <div className="shrink-0 w-80">

@@ -174,7 +174,7 @@ function TerminalTabBar({
 }) {
   return (
     <div
-      className="shrink-0 flex items-center px-4 pt-2 pb-1 gap-1 relative z-20"
+      className="shrink-0 flex items-center px-4 pt-2 pb-1 gap-1 relative z-40"
       data-no-drag
     >
       {tabs.map((tab) => {

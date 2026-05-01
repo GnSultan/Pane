@@ -72,7 +72,7 @@ export const METHOD_ATOMS = [
   },
   {
     id: "method-verify",
-    text: "VERIFY: After every change, run tests, type-check, or build. Never declare complete without verification.",
+    text: "VERIFY: After every change AND before declaring a task complete, run a final verification pass — type-checking, linting, tests. Confirm every planned step was completed. Fix any issues before declaring done. Never declare complete without verification.",
     facet: "method",
     priority: 0.85,
     sortOrder: 7,

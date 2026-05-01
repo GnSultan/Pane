@@ -182,7 +182,7 @@ function checkSyntax(content, ext) {
   const tmpFile = path.join(tmpDir, `pane-syntax-check-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
   try {
     fs.writeFileSync(tmpFile, content, "utf-8");
-    execSync(`node -c "${tmpFile}"`, { stdio: "pipe", timeout: 5000 });
+    execSync(`${process.execPath} -c "${tmpFile}"`, { stdio: "pipe", timeout: 5000 });
   } catch (e) {
     const msg = e.stderr?.toString() || e.message || "";
     const lineMatch = msg.match(/:(\d+):/);

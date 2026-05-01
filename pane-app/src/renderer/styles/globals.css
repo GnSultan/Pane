@@ -485,8 +485,10 @@ html[data-theme="glass"] #root {
    content-visibility:hidden skips rasterization on inactive pages without evicting from
    the compositor — no tile memory consumed, instant re-activation, 120Hz clean.
    Conversation layers: z-index 0 (inactive) / 1 (active).
-   Non-conversation pages: z-index 0 (inactive) / 20 (active) — above conversations AND
-   the h-[50px] z-10 drag overlay so buttons/inputs aren't eaten by the drag region. */
+   Non-conversation pages: z-index 0 (inactive) / 20 (active) — below
+   the h-[50px] z-30 drag region so the workspace top is draggable.
+   Interactive elements in the top zone use z-40 + data-no-drag to
+   stay clickable above the drag region. */
 [data-page] {
   pointer-events: none;
   z-index: 0;
@@ -507,7 +509,7 @@ html[data-theme="glass"] #root {
   content-visibility: visible;
 }
 
-html, body, #root {
+html, body {
   height: 100%;
   margin: 0;
   padding: 0;
@@ -517,6 +519,19 @@ html, body, #root {
   font-family: var(--font-sans);
   font-weight: var(--pane-font-weight);
 
+}
+
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  /* NO overflow:hidden — that breaks Electron's -webkit-app-region drag hit testing.
+     html and body clip at the viewport edge; children (Workspace, sidebar) handle
+     their own overflow. */
+  background-color: var(--pane-bg);
+  color: var(--pane-text);
+  font-family: var(--font-sans);
+  font-weight: var(--pane-font-weight);
 
 }
 
@@ -549,9 +564,11 @@ html, body, #root {
   background: var(--pane-text-secondary);
 }
 
-/* macOS window drag regions */
+/* macOS window drag regions — use app-region (standard), not -webkit-app-region.
+   The -webkit- prefix was removed in Chromium 118+ (Electron 28+ uses Chromium 118+).
+   Electron 40 ships with Chromium ~125 — the webkit prefix does nothing. */
 [data-tauri-drag-region] {
-  -webkit-app-region: drag;
+  app-region: drag;
 }
 
 [data-tauri-drag-region] button,
@@ -560,7 +577,7 @@ html, body, #root {
 [data-tauri-drag-region] textarea,
 [data-tauri-drag-region] select,
 [data-no-drag] {
-  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 

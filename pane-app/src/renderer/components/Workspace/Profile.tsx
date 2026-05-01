@@ -1887,16 +1887,6 @@ export function Profile() {
           </div>
         </AccordionSection>
 
-        {/* Usage Section */}
-        <AccordionSection
-          title="usage & spend"
-          icon={icons.usage}
-          isExpanded={expandedSection === "usage"}
-          onToggle={() => setExpandedSection(expandedSection === "usage" ? null : "usage")}
-        >
-          <TokenAnalytics projectId={null} isExpanded={expandedSection === "usage"} />
-        </AccordionSection>
-
         {/* Philosophy Section */}
         <AccordionSection
           title="philosophy"
@@ -1937,6 +1927,16 @@ export function Profile() {
           >
             one per line — these override observed preferences
           </span>
+        </AccordionSection>
+
+        {/* Usage Section */}
+        <AccordionSection
+          title="usage & spend"
+          icon={icons.usage}
+          isExpanded={expandedSection === "usage"}
+          onToggle={() => setExpandedSection(expandedSection === "usage" ? null : "usage")}
+        >
+          <TokenAnalytics projectId={null} isExpanded={expandedSection === "usage"} />
         </AccordionSection>
 
         {/* AI Engines Section */}
@@ -2140,182 +2140,7 @@ export function Profile() {
           <CloudSection />
         </AccordionSection>
 
-        {/* Integrations Section */}
-        <AccordionSection
-          title="integrations"
-          icon={icons.integrations}
-          isExpanded={expandedSection === "integrations"}
-          onToggle={() => setExpandedSection(expandedSection === "integrations" ? null : "integrations")}
-        >
-          <div className="flex flex-col gap-6">
-            {/* Claude */}
-            <div>
-              <div className="flex items-center gap-2 mb-3">
-                <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>claude</span>
-              </div>
-              <div className="flex flex-col gap-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className={`w-2 h-2 rounded-full flex-shrink-0 ${isClaudeAuthenticated ? "bg-pane-status-added" : "bg-pane-text-secondary/30"}`} />
-                    <span
-                      className={`font-mono ${isClaudeAuthenticated ? "text-[var(--pane-status-added)]" : "text-pane-text-secondary"}`}
-                      style={{ fontSize: "var(--pane-font-size-xs)" }}
-                    >
-                      {isClaudeAuthenticated
-                        ? (
-                            claudeAuthState?.account?.displayName ||
-                            claudeAuthState?.account?.email ||
-                            sdkAccount?.email ||
-                            (sdkAccount as any)?.organization ||
-                            "connected"
-                          )
-                        : "not signed in"}
-                    </span>
-                  </div>
-                  {isClaudeAuthenticated ? (
-                    <button
-                      onClick={() =>
-                        claudeSignout()
-                          .then(() => {
-                            setClaudeAuthState({ authenticated: false, account: null });
-                            useWorkspaceStore.getState().setSdkInfo(null, null);
-                            useWorkspaceStore.getState().setRateLimitInfo(null);
-                          })
-                          .catch(() => {})
-                      }
-                      className="font-mono text-pane-text-secondary/60 hover:text-pane-text-secondary transition-colors"
-                      style={{ fontSize: "var(--pane-font-size-xs)" }}
-                    >
-                      sign out
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => {
-                        if (claudeSigningIn) return;
-                        setClaudeSigningIn(true);
-                        setClaudeSigninStatus([]);
-                        claudeSignin()
-                          .then((result) => {
-                            if (result?.success) {
-                              getClaudeAuthState().then((state) => {
-                                if (state) setClaudeAuthState(state);
-                              }).catch(() => {});
-                              reinitializePunkBackend("claude-code").catch(() => {});
-                            }
-                          })
-                          .catch(() => {})
-                          .finally(() => {
-                            setClaudeSigningIn(false);
-                            setClaudeSigninStatus([]);
-                          });
-                      }}
-                      className="font-mono text-pane-text-secondary hover:text-pane-text transition-colors"
-                      style={{ fontSize: "var(--pane-font-size-xs)" }}
-                    >
-                      {claudeSigningIn ? "signing in…" : "sign in"}
-                    </button>
-                  )}
-                </div>
 
-                {!isClaudeAuthenticated && claudeSigningIn && claudeSigninStatus.length > 0 && (
-                  <div className="flex flex-col gap-1">
-                    {claudeSigninStatus.map((line, i) => (
-                      <span key={i} className="font-mono text-pane-text-secondary/60 break-all" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                        {line}
-                      </span>
-                    ))}
-                  </div>
-                )}
-
-                {isClaudeAuthenticated && (() => {
-                  const billing =
-                    claudeAuthState?.account?.billingType ||
-                    (sdkAccount as any)?.billingType ||
-                    null;
-                  const plan =
-                    sdkAccount?.subscription ||
-                    (sdkAccount as any)?.subscriptionType ||
-                    (sdkAccount as any)?.planType ||
-                    (billing === "stripe_subscription" ? "max" : null) ||
-                    null;
-                  return plan ? (
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>plan</span>
-                      <span className="font-mono text-[var(--pane-status-added)]" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                        {plan}
-                      </span>
-                    </div>
-                  ) : null;
-                })()}
-
-                {isClaudeAuthenticated && (() => {
-                  const util = rateLimitInfo?.utilization ?? null;
-                  const pct = util != null ? Math.round(util * 100) : null;
-                  const hasData = util != null;
-                  const barColor =
-                    util != null && util >= 0.85 ? "bg-pane-error" :
-                    util != null && util >= 0.7  ? "bg-pane-status-modified" :
-                    "bg-pane-status-added";
-                  const textColor =
-                    util != null && util >= 0.85 ? "text-pane-error" :
-                    util != null && util >= 0.7  ? "text-[var(--pane-status-modified)]" :
-                    hasData                      ? "text-[var(--pane-status-added)]" :
-                    "text-pane-text-secondary/40";
-                  return (
-                    <>
-                      <div className="flex items-center justify-between">
-                        <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>session</span>
-                        <span className={`font-mono tabular-nums ${textColor}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                          {hasData ? `${pct}%` : "—"}
-                        </span>
-                      </div>
-                      <div className="h-1.5 w-full bg-pane-text/[0.06] rounded-full overflow-hidden">
-                        <div
-                          className={`h-full rounded-full transition-all ${hasData ? barColor : ""}`}
-                          style={{ width: hasData ? `${Math.min(100, pct!)}%` : "0%" }}
-                        />
-                      </div>
-                      {rateLimitInfo?.resetsAt != null && (
-                        <div className="flex items-center justify-between">
-                          <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>resets</span>
-                          <span className="font-mono text-[var(--pane-status-added)] tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                            {formatResetTime(rateLimitInfo.resetsAt)}
-                          </span>
-                        </div>
-                      )}
-                    </>
-                  );
-                })()}
-              </div>
-            </div>
-
-            {/* Gemini CLI */}
-            {geminiAvailable && (
-              <div>
-                <div className="flex items-center gap-2 mb-3">
-                  <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>gemini</span>
-                </div>
-                <div className="flex flex-col gap-2">
-                  {CLI_PROVIDERS.map(({ key, label }) => (
-                    <div key={key} className={`flex items-center justify-between ${disabledProviders.includes(key) ? "opacity-40" : ""}`}>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => toggleProvider(key)}
-                          className={`w-3 h-3 rounded-full ring-1 transition-colors ${
-                            disabledProviders.includes(key) ? "bg-transparent ring-pane-text-secondary/30" : "bg-pane-status-added ring-pane-status-added"
-                          }`}
-                          title={disabledProviders.includes(key) ? `enable ${label}` : `disable ${label}`}
-                        />
-                        <span className="font-mono text-pane-text" style={{ fontSize: "var(--pane-font-size-xs)" }}>{label}</span>
-                      </div>
-                      <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>available</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        </AccordionSection>
       </div>
     </div>
   );
