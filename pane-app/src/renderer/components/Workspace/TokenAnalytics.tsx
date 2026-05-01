@@ -27,7 +27,12 @@ function formatCost(val: number) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2 }).format(val);
 }
 
+function formatExact(val: number) {
+  return val.toLocaleString("en-US");
+}
+
 function formatTokens(val: number) {
+  if (val >= 1_000_000_000) return (val / 1_000_000_000).toFixed(1) + "B";
   if (val >= 1_000_000) return (val / 1_000_000).toFixed(1) + "M";
   if (val >= 1_000) return (val / 1_000).toFixed(1) + "k";
   return val.toString();
@@ -181,6 +186,26 @@ export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | 
     return rates[row.model] ?? null;
   }
 
+  // Cache rate from cache-capable models only — old models that predate caching
+  // architecture dilute the rate. A model supports caching if its pricing has a
+  // cache_read field, or if it has any cache activity in its own data.
+  const cacheModelsTotals = useMemo(() => {
+    return data.reduce(
+      (acc, row) => {
+        const modelRate = rates[row.model];
+        const supportsCaching = modelRate
+          ? typeof modelRate.cache_read === "number"
+          : row.total_cache_read > 0 || row.total_cache_creation > 0;
+        if (supportsCaching) {
+          acc.input += row.total_input_tokens;
+          acc.cached += row.total_cache_read;
+        }
+        return acc;
+      },
+      { input: 0, cached: 0 }
+    );
+  }, [data, rates]);
+
   // Estimate cache savings per-model using actual per-model cache_read rate.
   // Savings = cached_tokens * (full_input_price - cache_read_price).
   // When cache_read is unknown (not in OpenRouter data), savings = 0 (safe fallback).
@@ -224,10 +249,12 @@ export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | 
             cost: acc.cost + r.total_cost_usd,
             input: acc.input + r.total_input_tokens,
             output: acc.output + r.total_output_tokens,
+            cached: acc.cached + r.total_cache_read,
+            cacheCreation: acc.cacheCreation + r.total_cache_creation,
             calls: acc.calls + r.call_count,
             modelCount: acc.modelCount + 1,
           }),
-          { cost: 0, input: 0, output: 0, calls: 0, modelCount: 0 }
+          { cost: 0, input: 0, output: 0, cached: 0, cacheCreation: 0, calls: 0, modelCount: 0 }
         ),
       }))
       .sort((a, b) => (b.total.input + b.total.output) - (a.total.input + a.total.output));
@@ -275,9 +302,11 @@ export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | 
             {cacheSavings > 0 ? formatCost(cacheSavings) : "—"}
           </span>
           <span className="text-sm font-mono text-pane-text-secondary">
-            {totals.cached > 0 && totals.input > 0
-              ? `${Math.round((totals.cached / totals.input) * 100)}% hit rate`
-              : "no cache data"}
+            {cacheModelsTotals.cached > 0 && cacheModelsTotals.input > 0
+              ? `${Math.round((cacheModelsTotals.cached / cacheModelsTotals.input) * 100)}% hit rate`
+              : totals.cached > 0
+                ? `${Math.round((totals.cached / totals.input) * 100)}% overall`
+                : "no cache data"}
           </span>
         </div>
       </div>
@@ -353,25 +382,14 @@ export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | 
                         className="overflow-hidden"
                       >
                         <div className="p-4 bg-pane-bg/30 border-t border-pane-border/30 flex flex-col gap-3">
-                          {/* Stats strip */}
-                          <div className="flex items-center gap-4">
+                          {/* Stats strip — exact total tokens + cost pushed right */}
+                          <div className="flex items-center justify-between">
                             <span className="font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                              {formatTokens(totalTokens)} total · {total.calls} calls
+                              {formatExact(totalTokens)} total tokens · {total.calls.toLocaleString("en-US")} calls
                             </span>
                             <span className="font-mono text-pane-text tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                               {formatCost(total.cost)}
                             </span>
-                            {link && (
-                              <a
-                                href={link.url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="font-mono text-pane-text-secondary/30 hover:text-pane-text-secondary transition-colors"
-                                style={{ fontSize: "var(--pane-font-size-xs)" }}
-                              >
-                                ↗ {link.label}
-                              </a>
-                            )}
                           </div>
 
                           {/* Model rows */}
@@ -396,34 +414,50 @@ export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | 
                                     {formatTokens(row.total_input_tokens)} in / {formatTokens(row.total_output_tokens)} out
                                   </span>
                                   <div className="flex-1" />
+                                  {cacheHit > 0 && (
+                                    <span className="font-mono text-pane-status-added tabular-nums shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                      {cacheHit}% cached
+                                    </span>
+                                  )}
                                   <span className="font-mono text-pane-text tabular-nums shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
                                     {formatCost(row.total_cost_usd)}
                                     {row.unknown_cost_count > 0 && (
                                       <span className="text-pane-text-secondary/40 ml-0.5" title={`${row.unknown_cost_count} calls with unknown pricing`}>?</span>
                                     )}
                                   </span>
-                                  {cacheHit > 0 && (
-                                    <span className="font-mono text-pane-status-added tabular-nums shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                      {cacheHit}% cached
-                                    </span>
-                                  )}
                                 </div>
                               </div>
                             );
                           })}
 
-                          {/* Provider totals row */}
+                          {/* Provider totals row — cache: hit vs miss */}
                           <div className="flex items-center justify-between pt-3 border-t border-pane-border/10">
                             <span className="font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                              Total · {total.modelCount} {total.modelCount === 1 ? "model" : "models"} · {total.calls} calls
+                              {total.modelCount} {total.modelCount === 1 ? "model" : "models"} · {total.calls.toLocaleString("en-US")} calls
                             </span>
                             <div className="flex items-center gap-5">
-                              <span className="font-mono text-pane-text-secondary/60 tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                {formatTokens(total.input)} in / {formatTokens(total.output)} out
-                              </span>
-                              <span className="font-mono text-pane-text-secondary/60 tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                                {formatCost(total.cost)}
-                              </span>
+                              {total.cached > 0 ? (
+                                <>
+                                  <span className="font-mono text-pane-status-added tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {formatTokens(total.cached)} hit
+                                  </span>
+                                  <span className="font-mono text-pane-text-secondary/60 tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {formatTokens(total.input - total.cached)} miss
+                                  </span>
+                                  <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {formatTokens(total.output)} out
+                                  </span>
+                                </>
+                              ) : (
+                                <>
+                                  <span className="font-mono text-pane-text-secondary/60 tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {formatTokens(total.input)} in
+                                  </span>
+                                  <span className="font-mono text-pane-text-secondary tabular-nums" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                                    {formatTokens(total.output)} out
+                                  </span>
+                                </>
+                              )}
                             </div>
                           </div>
                         </div>

@@ -39,6 +39,7 @@ import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
 import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
 import { getActiveJournal, applyMergeDelta } from "./session-journal.mjs";
 import { getDNA } from "./developer-dna.mjs";
+import { lookupModelContext } from "./model-registry.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -132,20 +133,26 @@ export const MODEL_CONTEXT_LIMITS = {
  */
 export function getContextLimit(model) {
   if (!model) return 200000;
-  
+
+  // 1. Live registry — API-reported context_length from model-manager.
+  //    Every model fetched from OpenRouter, DeepSeek, Anthropic, etc.
+  //    includes its real context_length. This is the authoritative source.
+  const registryLimit = lookupModelContext(model);
+  if (registryLimit !== null) return registryLimit;
+
   const lower = model.toLowerCase();
-  
-  // First, try exact match for the full model string
+
+  // 2. Static map — known model aliases. Fallback for models not yet
+  //    in the registry (cold start race, local-only models).
   if (MODEL_CONTEXT_LIMITS[lower]) {
     return MODEL_CONTEXT_LIMITS[lower];
   }
-  
-  // Try exact match with the model as-is (case-sensitive)
+
   if (MODEL_CONTEXT_LIMITS[model]) {
     return MODEL_CONTEXT_LIMITS[model];
   }
-  
-  // Try partial matches from most specific to least specific
+
+  // 3. Partial matches from most specific to least specific
   const partialMatches = [
     "anthropic/claude-3.5-sonnet",
     "deepseek/deepseek-r1",
@@ -172,20 +179,20 @@ export function getContextLimit(model) {
     "moonshot",
     "openrouter",
   ];
-  
+
   for (const pattern of partialMatches) {
     if (lower.includes(pattern)) {
       const result = MODEL_CONTEXT_LIMITS[pattern];
       if (result !== undefined) return result;
     }
   }
-  
-  // Fallback: check for provider-level defaults
+
+  // 4. Provider-level defaults
   if (lower.includes("openrouter")) return MODEL_CONTEXT_LIMITS["openrouter"] ?? 200000;
-  if (lower.includes("anthropic")) return MODEL_CONTEXT_LIMITS["sonnet"] ?? 200000; // Default to sonnet
-  if (lower.includes("gemini")) return MODEL_CONTEXT_LIMITS["gemini-1.5"] ?? 200000; // Default to 1.5
+  if (lower.includes("anthropic")) return MODEL_CONTEXT_LIMITS["sonnet"] ?? 200000;
+  if (lower.includes("gemini")) return MODEL_CONTEXT_LIMITS["gemini-1.5"] ?? 200000;
   if (lower.includes("deepseek")) return MODEL_CONTEXT_LIMITS["deepseek-chat"] ?? 200000;
-  
+
   return 200000; // Final fallback
 }
 

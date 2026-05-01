@@ -152,10 +152,11 @@ function ContextUsageIndicator({ projectId }: { projectId: string }) {
   const model = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.model ?? null,
   );
+  const allModels = useWorkspaceStore((s) => s.allModels);
 
   if (!contextTokens || contextTokens === 0) return null;
 
-  const limit = getContextLimit(model);
+  const limit = getContextLimit(model, allModels);
   const pct = Math.round((contextTokens / limit) * 100);
 
   // Only show when it carries signal — sub-50% is noise, warnings start at 70%.

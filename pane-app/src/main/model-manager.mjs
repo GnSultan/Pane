@@ -4,6 +4,20 @@ import os from "node:os";
 import { ipcMain, BrowserWindow } from "electron";
 import { HttpBackend } from "./http-backend.mjs";
 import { getPricingForModel } from "./pricing.mjs";
+import { registerModels } from "./model-registry.mjs";
+
+/**
+ * Walk this.models (provider → models[]) and register every model's
+ * context_length in the shared model registry. Called after any data
+ * change — cache load, API refresh, external update.
+ */
+function registerAllModels(models) {
+  for (const providerModels of Object.values(models)) {
+    if (Array.isArray(providerModels)) {
+      registerModels(providerModels);
+    }
+  }
+}
 
 const CACHE_DIR = path.join(os.homedir(), ".pane", "cache");
 const CACHE_FILE = path.join(CACHE_DIR, "models.json");
@@ -44,6 +58,10 @@ class ModelManager {
 
   async initialize() {
     await this.loadCache();
+
+    // Populate the shared model registry from cached data so budget
+    // functions use API-reported context_length from the start.
+    registerAllModels(this.models);
 
     // Notify renderer immediately with cached data so UI isn't empty on startup
     if (Object.keys(this.models).length > 0) {
@@ -182,6 +200,7 @@ class ModelManager {
 
       if (oldModelsStr !== newModelsStr) {
         this.models[provider] = newModels;
+        registerAllModels(this.models); // update registry with fresh context_length data
         return true;
       }
     } catch (err) {
@@ -201,6 +220,7 @@ class ModelManager {
     const newStr = JSON.stringify(enriched);
     if (oldStr !== newStr) {
       this.models[provider] = enriched;
+      registerAllModels(this.models); // update registry with context_length from CLI data
       return true;
     }
     return false;

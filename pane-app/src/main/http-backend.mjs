@@ -13,7 +13,7 @@ import { PunkBackend } from "./punk-backend.mjs";
 import { ToolExecutor } from "./tool-executor.mjs";
 import { mergeState, readState, getContextLimit, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, writeHandoffWithHistory, updateLatestHandoff, readHandoff } from "./pane-system-prompt.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
-import { estimateConversationTokens } from "./token-budget.mjs";
+import { estimateConversationTokens, getModelLimit } from "./token-budget.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
 import contextManager from "./context-manager.mjs";
 import { calculateCost } from "./pricing.mjs";
@@ -30,33 +30,32 @@ import { getPaneDb } from "./pane-db.mjs";
 // Context Window Manager — Pane-owned conversation lifecycle
 // ============================================================================
 //
-// Pane maintains a 128k context window as a living document:
+// Pane maintains a model-aware context window:
 //   - System prompt: ~4k, always current (managed by orchestrator)
-//   - Conversation: up to ~108k, actively pruned
+//   - Conversation: up to model_limit - output_reserve, actively pruned
 //   - Output reserve: ~8k
 //
 // Instead of emergency compaction when full, the window is continuously
 // managed: old tool results are pruned, oldest turns summarized, stale
 // content dropped. The model always has room to work.
 
-const CONTEXT_WINDOW_CAP = 128000;  // Universal cap — works for any model
-const OUTPUT_RESERVE     = 8192;
-
-
 /**
  * Manage the context window: prune tool results, check size, summarize if needed.
+ * Uses the model's actual context limit instead of a hardcoded cap.
  * Called after building the messages array, before sending to the API.
  *
  * @param {Array} messages - the full messages array
  * @param {number} systemTokens - estimated tokens in the system prompt
- * @returns {{ action: string, tokensBefore: number, tokensAfter: number }}
+ * @param {string|null} projectId
+ * @param {string|null} model - model identifier for context limit lookup
+ * @returns {object} result from manageConversation
  */
-function manageContextWindow(messages, systemTokens = 0, projectId = null) {
-  const budget = CONTEXT_WINDOW_CAP - OUTPUT_RESERVE - systemTokens;
+function manageContextWindow(messages, systemTokens = 0, projectId = null, model = null) {
+  const maxContextTokens = model ? getModelLimit(model) : 128000;
   return manageConversation(messages, {
+    projectId,
     systemTokens,
-    budget,
-    strategy: "progressive",
+    maxContextTokens,
   });
 }
 
@@ -1987,7 +1986,7 @@ export class ApiBackend extends PunkBackend {
       //   Phase 2: Drop oldest turns if still over budget
       // This replaces the old contextManager.shouldAutoCompact approach.
       const systemTokens = context.budget?.systemUsed || Math.round((systemPrompt?.length || 0) / 4);
-      const windowResult = manageContextWindow(messages, systemTokens, request.projectId);
+      const windowResult = manageContextWindow(messages, systemTokens, request.projectId, request.model);
       if (windowResult.action !== "none") {
         this.onEvent(request.projectId, {
           event: "window_managed",
@@ -3050,7 +3049,7 @@ export class ApiBackend extends PunkBackend {
 
         // Window management with stable system prompt
         const loopSystemTokens = Math.round((messages[0]?.content?.length || 0) / 4);
-        manageContextWindow(messages, loopSystemTokens, request.projectId);
+        manageContextWindow(messages, loopSystemTokens, request.projectId, request.model);
         } catch (turnError) {
           // Per-turn error handling — retry recoverable errors inside the loop
           if (turnError.name === "AbortError") throw turnError; // propagate to outer
@@ -4356,7 +4355,7 @@ export class ApiBackend extends PunkBackend {
     await this.abort(projectId);
   }
 
-  async shutdown() {
+  shutdown() {
     for (const controller of this.activeRequests.values()) controller.abort();
     this.activeRequests.clear();
     this.requestStates.clear();

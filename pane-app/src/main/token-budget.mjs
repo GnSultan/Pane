@@ -16,6 +16,7 @@
  */
 
 import { MODEL_CONTEXT_LIMITS } from "./pane-system-prompt.mjs";
+import { lookupModelContext } from "./model-registry.mjs";
 
 // ---------------------------------------------------------------------------
 // Token estimation
@@ -86,20 +87,27 @@ export function estimateConversationTokens(messages) {
 export function getModelLimit(model) {
   if (!model) return 128000;
 
-  // Exact match
+  // 1. Live registry — API-reported context_length from model-manager.
+  //    This is the single source of truth for models fetched from
+  //    OpenRouter, DeepSeek, Anthropic, Gemini, etc. Every model object
+  //    from the API includes its real context_length.
+  const registryLimit = lookupModelContext(model);
+  if (registryLimit !== null) return registryLimit;
+
+  // 2. Static map — known model aliases (opus/sonnet/haiku, etc.)
+  //    Fallback for models not yet in the registry (cold start race).
   if (MODEL_CONTEXT_LIMITS[model]) return MODEL_CONTEXT_LIMITS[model];
 
-  // Prefix match (e.g., "gemini-3-flash" → "gemini-3")
   const modelLower = model.toLowerCase();
   for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
     if (modelLower.startsWith(key.toLowerCase())) return limit;
   }
 
-  // Provider-based heuristic
+  // 3. Provider-based heuristic — catch unknown models by provider family.
+  //    Only reached when neither registry nor static map has the model.
   if (modelLower.includes("gemini")) return 1000000;
   if (modelLower.includes("haiku")) return 200000;
   if (modelLower.includes("claude") || modelLower.includes("opus") || modelLower.includes("sonnet")) return 1000000;
-  if (modelLower.includes("deepseek")) return 128000;
   if (modelLower.includes("qwen")) return 262144;
 
   return 128000;

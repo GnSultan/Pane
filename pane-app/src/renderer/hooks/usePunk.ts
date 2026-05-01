@@ -1103,7 +1103,8 @@ export function usePunk(projectId: string) {
             const usage = event.data;
             if (usage?.input_tokens) {
               const model = store.projects.get(projectId)?.conversation.model ?? null;
-              const limit = getContextLimit(model);
+              const allModels = useWorkspaceStore.getState().allModels;
+              const limit = getContextLimit(model, allModels);
               const ratio = usage.input_tokens / limit;
               const pressure =
                 ratio >= 0.85 ? "high" : ratio >= 0.7 ? "building" : "none";
@@ -1711,7 +1712,8 @@ function handlePunkMessage(
         if (msg.usage?.input_tokens) {
           const model =
             store.projects.get(projectId)?.conversation.model ?? null;
-          const limit = getContextLimit(model);
+          const allModels = useWorkspaceStore.getState().allModels;
+          const limit = getContextLimit(model, allModels);
           const ratio = msg.usage.input_tokens / limit;
           const pressure =
             ratio >= 0.85 ? "high" : ratio >= 0.7 ? "building" : "none";

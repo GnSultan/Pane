@@ -182,7 +182,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode }: Me
                 <button
                   key={m.id}
                   onClick={() => handleSelect(m.id)}
-                  className={`w-full flex items-center gap-3 px-2.5 h-8 font-mono text-left transition-colors relative rounded-md
+                  className={`w-full flex items-center gap-3 px-2.5 h-8 text-left transition-colors relative rounded-md
                     ${isActive
                       ? "text-pane-text bg-pane-accent/[0.10]"
                       : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40"

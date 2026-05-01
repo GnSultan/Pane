@@ -12,8 +12,6 @@ import {
   getContextWindowForModel,
 } from "../../lib/models";
 import {
-  brainUpdateIdentity,
-  brainSaveAvatar,
   brainGetProfile,
   brainUpdateDNA,
   reinitializePunkBackend,
@@ -1526,10 +1524,6 @@ function AccordionSection({
 }
 
 export function Profile() {
-  const profileName = useWorkspaceStore((s) => s.profileName);
-  const profileBio = useWorkspaceStore((s) => s.profileBio);
-  const profileRole = useWorkspaceStore((s) => s.profileRole);
-  const avatarDataUrl = useWorkspaceStore((s) => s.profileAvatarDataUrl);
   const theme = useWorkspaceStore((s) => s.theme);
   const fontSize = useWorkspaceStore((s) => s.fontSize);
   const panelFontSize = useWorkspaceStore((s) => s.panelFontSize);
@@ -1543,9 +1537,6 @@ export function Profile() {
   const setHttpApiKeys = useWorkspaceStore((s) => s.setHttpApiKeys);
   const httpBaseUrls = useWorkspaceStore((s) => s.httpBaseUrls);
   const setHttpBaseUrls = useWorkspaceStore((s) => s.setHttpBaseUrls);
-
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const identitySaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [dnaString, setDnaString] = useState("");
   const dnaSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1612,41 +1603,6 @@ export function Profile() {
     setHttpBaseUrls({ ...httpBaseUrls, [provider]: url });
   };
 
-  const saveIdentity = useCallback((field: string, value: string) => {
-    if (identitySaveRef.current) clearTimeout(identitySaveRef.current);
-    identitySaveRef.current = setTimeout(() => {
-      brainUpdateIdentity({ [field]: value }).then(() => {
-        // Refresh DNA to reflect identity change in the compiled string
-        brainGetProfile().then(({ profile }) => {
-          if (profile) setDnaString(profile.dna || "");
-        }).catch(() => {});
-      }).catch(() => {});
-    }, 500);
-  }, []);
-
-  const handleAvatarClick = useCallback(
-    () => fileInputRef.current?.click(),
-    [],
-  );
-
-  const handleAvatarChange = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const dataUrl = reader.result as string;
-        useWorkspaceStore.getState().setProfileAvatarDataUrl(dataUrl);
-        await brainSaveAvatar(dataUrl.split(",")[1]!, file.type).catch(
-          () => {},
-        );
-      };
-      reader.readAsDataURL(file);
-      e.target.value = "";
-    },
-    [],
-  );
-
   const handleDnaChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       setDnaString(e.target.value);
@@ -1658,24 +1614,9 @@ export function Profile() {
     [],
   );
 
-  const initials = profileName
-    ? profileName
-        .split(" ")
-        .map((w) => w[0])
-        .join("")
-        .toUpperCase()
-        .slice(0, 2)
-    : "";
-
   // Icon components for each section
   const icons = {
     identity: (
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="12" cy="7" r="4" />
-        <path d="M5.5 21a7.5 7.5 0 0115 0" />
-      </svg>
-    ),
-    philosophy: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 20h9" />
         <path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z" />
@@ -1752,112 +1693,12 @@ export function Profile() {
       data-no-drag
     >
       <div className="mx-auto w-full max-w-4xl flex flex-col gap-y-8">
-        {/* Identity Section */}
+        {/* DNA Section */}
         <AccordionSection
           title="identity"
           icon={icons.identity}
           isExpanded={expandedSection === "identity"}
           onToggle={() => setExpandedSection(expandedSection === "identity" ? null : "identity")}
-        >
-          <div className="flex flex-col items-center gap-4">
-            <button
-              onClick={handleAvatarClick}
-              className="relative w-20 h-20 rounded-full overflow-hidden bg-pane-bg ring-1 ring-pane-border/40 hover:ring-pane-text/20 transition-shadow group"
-              title="Change photo"
-            >
-              {avatarDataUrl ? (
-                <img
-                  src={avatarDataUrl}
-                  alt=""
-                  className="w-full h-full object-cover"
-                />
-              ) : (
-                <div className="w-full h-full flex items-center justify-center">
-                  {initials ? (
-                    <span className="font-mono text-pane-text text-lg font-medium">
-                      {initials}
-                    </span>
-                  ) : (
-                    <svg
-                      width="28"
-                      height="28"
-                      viewBox="0 0 28 28"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.5"
-                      strokeLinecap="round"
-                      className="text-pane-text-secondary/40"
-                    >
-                      <circle cx="14" cy="11" r="5" />
-                      <path d="M4 26c0-5.523 4.477-10 10-10s10 4.477 10 10" />
-                    </svg>
-                  )}
-                </div>
-              )}
-              <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 16 16"
-                  fill="none"
-                  stroke="white"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                >
-                  <circle cx="8" cy="8" r="2.5" />
-                  <path d="M2.5 6.5V5a1.5 1.5 0 011.5-1.5h1.5M12 3.5h1.5A1.5 1.5 0 0115 5v1.5M13.5 11v1.5a1.5 1.5 0 01-1.5 1.5h-1.5M4 14H2.5A1.5 1.5 0 011 12.5V11" />
-                </svg>
-              </div>
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/png,image/jpeg,image/webp"
-              className="hidden"
-              onChange={handleAvatarChange}
-            />
-
-            <input
-              type="text"
-              value={profileName}
-              onChange={(e) => {
-                useWorkspaceStore.getState().setProfileName(e.target.value);
-                saveIdentity("name", e.target.value);
-              }}
-              placeholder="your name"
-              className="w-full text-center font-mono text-pane-text bg-transparent outline-none text-lg placeholder:text-pane-text-secondary/30"
-            />
-            <input
-              type="text"
-              value={profileRole}
-              onChange={(e) => {
-                useWorkspaceStore.getState().setProfileRole(e.target.value);
-                saveIdentity("role", e.target.value);
-              }}
-              placeholder="role"
-              className="w-full text-center font-mono text-pane-text-secondary bg-transparent outline-none placeholder:text-pane-text-secondary/30"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            />
-            <textarea
-              value={profileBio}
-              onChange={(e) => {
-                useWorkspaceStore.getState().setProfileBio(e.target.value);
-                saveIdentity("bio", e.target.value);
-              }}
-              placeholder="about you"
-              rows={2}
-              className="w-full text-center font-mono text-pane-text-secondary bg-transparent outline-none resize-none placeholder:text-pane-text-secondary/30 leading-[1.75]"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            />
-          </div>
-        </AccordionSection>
-
-        {/* DNA Section */}
-        <AccordionSection
-          title="dna"
-          icon={icons.philosophy}
-          isExpanded={expandedSection === "dna"}
-          onToggle={() => setExpandedSection(expandedSection === "dna" ? null : "dna")}
         >
           <textarea
             value={dnaString}

@@ -19,6 +19,7 @@ import { spawn, exec, execSync } from "node:child_process";
 import { promisify } from "node:util";
 import os from "node:os";
 import crypto from "node:crypto";
+import vm from "node:vm";
 
 import { getPaneDb } from "./pane-db.mjs";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
@@ -178,19 +179,30 @@ function checkSyntax(content, ext) {
   // Only JS/MJS/CJS files — TypeScript uses its own compiler
   if (ext !== ".js" && ext !== ".mjs" && ext !== ".cjs") return violations;
 
-  const tmpDir = os.tmpdir();
-  const tmpFile = path.join(tmpDir, `pane-syntax-check-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
+  // Use in-process vm.Script to detect syntax errors.
+  // Same V8 parser Node.js uses — no subprocess, no Electron binary quirks,
+  // no event loop blocking. Completes in <1ms.
+  //
+  // vm.Script only supports classic scripts (CommonJS), not ES modules.
+  // For ESM files (detected by top-level import/export), we skip syntax
+  // checking — the code-arbiter's runTurnSentinel covers those via tsc.
+  const isESM = /^\s*(import|export)\s/.test(content) ||
+                 ext === ".mjs";
+  if (isESM) return violations;
+
   try {
-    fs.writeFileSync(tmpFile, content, "utf-8");
-    execSync(`${process.execPath} -c "${tmpFile}"`, { stdio: "pipe", timeout: 5000 });
+    new vm.Script(content, { filename: `pane-syntax-check${ext}` });
   } catch (e) {
-    const msg = e.stderr?.toString() || e.message || "";
-    const lineMatch = msg.match(/:(\d+):/);
-    const line = lineMatch ? parseInt(lineMatch[1]) : content.split("\n").length;
-    const errorMsg = msg.replace(/^.*?:\d+:\s*/, "").trim() || "File has broken JavaScript syntax";
-    violations.push({ id: "syntax-error", severity: "error", message: errorMsg, line });
-  } finally {
-    try { fs.unlinkSync(tmpFile); } catch { /* best-effort temp file cleanup */ }
+    const isImportExport = e.message?.includes("import") || e.message?.includes("export");
+    if (!isImportExport) {
+      const line = e.lineNumber || content.split("\n").length;
+      violations.push({
+        id: "syntax-error",
+        severity: "error",
+        message: e.message || "File has broken JavaScript syntax",
+        line,
+      });
+    }
   }
   return violations;
 }

@@ -93,21 +93,52 @@ export const MODEL_CONTEXT_LIMITS: Record<string, number> = {
 };
 
 /**
- * Get context window for a model. Returns the API-reported context_length when
- * available (passed through allModels), falling back to MODEL_CONTEXT_LIMITS
- * for SDK-alias resolution (opus/sonnet/haiku) and a 128k default.
+ * Get context window for a model.
+ *
+ * Priority:
+ *   1. API-reported context_length from live model data (when provided)
+ *   2. Static MODEL_CONTEXT_LIMITS map for SDK aliases
+ *   3. Provider-based heuristic for unknown models
+ *   4. 128k fallback
+ *
+ * @param model - The model identifier string
+ * @param allModels - Optional map of provider → model objects from the
+ *                    API. Each model object should have a `context_length`
+ *                    field reported by the provider.
  */
-export function getContextLimit(model: string | null): number {
+export function getContextLimit(
+  model: string | null,
+  allModels?: Record<string, { context_length?: number; id: string }[]>,
+): number {
   if (!model) return 128000;
 
-  // Exact match
+  // 1. Search live API data for an exact or prefix match.
+  //    Models fetched from OpenRouter/DeepSeek/etc. include the provider's
+  //    actual context_length — this is the authoritative value.
+  if (allModels) {
+    const lower = model.toLowerCase();
+    for (const models of Object.values(allModels)) {
+      for (const m of models) {
+        if (!m.context_length) continue;
+        const mId = m.id?.toLowerCase();
+        if (mId === lower || lower.startsWith(mId) || mId?.startsWith(lower) || lower.includes(mId!)) {
+          return m.context_length;
+        }
+      }
+    }
+  }
+
+  // 2. Static map — fallback for SDK aliases (opus/sonnet/haiku, etc.)
   if (MODEL_CONTEXT_LIMITS[model]) return MODEL_CONTEXT_LIMITS[model];
 
-  // Partial match for aliases
   const lower = model.toLowerCase();
   for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
     if (lower.includes(key)) return limit;
   }
+
+  // 3. Provider-based heuristic
+  if (lower.includes("gemini")) return 1000000;
+  if (lower.includes("deepseek")) return 1000000; // DeepSeek v3 has 1M context
 
   return 128000;
 }
@@ -115,9 +146,13 @@ export function getContextLimit(model: string | null): number {
 /**
  * Get context window limit for a specific provider and model combination.
  */
-export function getContextWindowForModel(provider: string, model: string): number {
+export function getContextWindowForModel(
+  provider: string,
+  model: string,
+  allModels?: Record<string, { context_length?: number; id: string }[]>,
+): number {
   const fullModelId = `${provider}/${model}`;
-  const fullResult = getContextLimit(fullModelId);
+  const fullResult = getContextLimit(fullModelId, allModels);
   if (fullResult !== 128000) return fullResult;
-  return getContextLimit(model);
+  return getContextLimit(model, allModels);
 }

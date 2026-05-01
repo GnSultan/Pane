@@ -71,14 +71,6 @@ interface WorkspaceState {
   setRateLimitInfo: (info: import("../lib/punk-types").RateLimitInfo | null) => void;
   lastTokenUsageAt: number;
   // Profile data
-  profileName: string;
-  profileBio: string;
-  profileRole: string;
-  profileAvatarDataUrl: string | null; // data:image/... URL for display
-  setProfileName: (name: string) => void;
-  setProfileBio: (bio: string) => void;
-  setProfileRole: (role: string) => void;
-  setProfileAvatarDataUrl: (url: string | null) => void;
   increaseFontSize: () => void;
   decreaseFontSize: () => void;
   resetFontSize: () => void;
@@ -286,16 +278,6 @@ function createWorkspaceStore() {
       set({ rateLimitInfo: info });
     },
     lastTokenUsageAt: 0,
-    // Profile data
-    profileName: "",
-    profileBio: "",
-    profileRole: "",
-    profileAvatarDataUrl: null,
-    setProfileName: (name: string) => set({ profileName: name }),
-    setProfileBio: (bio: string) => set({ profileBio: bio }),
-    setProfileRole: (role: string) => set({ profileRole: role }),
-    setProfileAvatarDataUrl: (url: string | null) =>
-      set({ profileAvatarDataUrl: url }),
     increaseFontSize: () =>
       set((state) => {
         const next = Math.max(1, state.fontSize + 1);

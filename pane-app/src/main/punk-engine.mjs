@@ -251,6 +251,27 @@ class CliBackend extends PunkBackend {
     this.activeRequests = new Map(); // requestId -> projectId
     this._requestResolvers = new Map(); // requestId -> resolve function
     this._loginResolver = null;
+    this._idleTimer = null; // 15-min inactivity timeout
+  }
+
+  /** Kill the worker if 15 minutes pass with zero active requests. */
+  _resetIdleTimer() {
+    if (this._idleTimer) {
+      clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+    }
+    if (this.activeRequests.size === 0) {
+      this._idleTimer = setTimeout(() => {
+        this._idleTimer = null;
+        if (this.activeRequests.size === 0 && this.worker && !this.worker.killed) {
+          console.log(`[punk] Killing idle CLI worker for ${this.command} (15 min inactivity)`);
+          this.worker.postMessage({ type: "shutdown" });
+          this.worker.kill();
+          this.worker = null;
+        }
+      }, 15 * 60 * 1000);
+      if (this._idleTimer.unref) this._idleTimer.unref();
+    }
   }
 
   getWorker() {
@@ -302,6 +323,7 @@ class CliBackend extends PunkBackend {
       if (message.event.event === "processEnded") {
         const rid = message.requestId;
         this.activeRequests.delete(rid);
+        this._resetIdleTimer(); // start 15-min countdown if no more requests
         if (this._requestResolvers.has(rid)) {
           this._requestResolvers.get(rid)(message.event.data);
           this._requestResolvers.delete(rid);
@@ -314,6 +336,10 @@ class CliBackend extends PunkBackend {
       console.warn(
         `[punk] CLI worker for ${this.command} exited with code ${code}`,
       );
+      if (this._idleTimer) {
+        clearTimeout(this._idleTimer);
+        this._idleTimer = null;
+      }
       for (const [requestId, projectId] of this.activeRequests.entries()) {
         const event = {
           event: "processEnded",
@@ -348,6 +374,7 @@ class CliBackend extends PunkBackend {
   }
 
   async spawn(request) {
+    this._resetIdleTimer(); // clear idle timer — we have activity
     const worker = this.getWorker();
     this.activeRequests.set(request.requestId, request.projectId);
 
@@ -402,6 +429,7 @@ class CliBackend extends PunkBackend {
     for (const [rid, pid] of this.activeRequests.entries()) {
       if (pid === projectId) this.activeRequests.delete(rid);
     }
+    this._resetIdleTimer(); // may now be idle
   }
 
   async terminate(projectId) {
@@ -412,9 +440,14 @@ class CliBackend extends PunkBackend {
     for (const [rid, pid] of this.activeRequests.entries()) {
       if (pid === projectId) this.activeRequests.delete(rid);
     }
+    this._resetIdleTimer(); // may now be idle
   }
 
-  async shutdown() {
+  shutdown() {
+    if (this._idleTimer) {
+      clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+    }
     if (this.worker && !this.worker.killed) {
       this.worker.postMessage({ type: "shutdown" });
       this.worker.kill();
@@ -607,19 +640,19 @@ class PunkEngine {
     
     console.log(`[punk] Backend availability: claude=${this.backendAvailability.claude}, gemini=${this.backendAvailability.gemini}, api=${this.backendAvailability.api}`);
 
-    // Create backend instances for available backends
+    // Create backend instances for available backends.
+    // Workers are NOT spawned here — they're lazily created on first request
+    // and killed after 15 minutes of inactivity. See CliBackend._resetIdleTimer().
     // _claudeSignedOut is set by claude_signout to prevent re-auth from keychain
     // after the user explicitly signs out. Cleared when the user signs back in.
     if (this.backendAvailability.claude && !this._claudeSignedOut) {
       this.backends.claude = new CliBackend(onEvent, "claude");
-      console.log("[punk] Claude CLI backend initialized");
-      this.prefetchClaudeModels();
+      console.log("[punk] Claude CLI backend initialized (worker lazy)");
     }
 
     if (this.backendAvailability.gemini) {
       this.backends.gemini = new CliBackend(onEvent, "gemini");
-      console.log("[punk] Gemini CLI backend initialized");
-      this.prefetchGeminiModels();
+      console.log("[punk] Gemini CLI backend initialized (worker lazy)");
     }
     
     // API backend is always available as fallback
@@ -649,21 +682,27 @@ class PunkEngine {
     }
   }
 
+  /**
+   * Eagerly prefetch Claude models via the worker.
+   * Only works if the worker already exists — does NOT spawn one.
+   */
   prefetchClaudeModels() {
-    if (!this.backends.claude) return;
+    if (!this.backends.claude?.worker) return;
     try {
-      const worker = this.backends.claude.getWorker();
-      worker.postMessage({ type: "prefetch_models" });
+      this.backends.claude.worker.postMessage({ type: "prefetch_models" });
     } catch (err) {
       console.warn("[punk] Failed to prefetch Claude SDK models:", err.message);
     }
   }
 
+  /**
+   * Eagerly prefetch Gemini models via the worker.
+   * Only works if the worker already exists — does NOT spawn one.
+   */
   prefetchGeminiModels() {
-    if (!this.backends.gemini) return;
+    if (!this.backends.gemini?.worker) return;
     try {
-      const worker = this.backends.gemini.getWorker();
-      worker.postMessage({ type: "prefetch_gemini_models" });
+      this.backends.gemini.worker.postMessage({ type: "prefetch_gemini_models" });
     } catch (err) {
       console.warn("[punk] Failed to prefetch Gemini models:", err.message);
     }
@@ -672,6 +711,7 @@ class PunkEngine {
   /**
    * Refresh CLI-backed model lists. Called on the same hourly cycle as
    * model-manager's HTTP refresh so cached CLI models stay current.
+   * Only refreshes if the worker already exists — does NOT spawn one.
    */
   refreshCliModels() {
     this.prefetchClaudeModels();
@@ -1888,11 +1928,11 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     }
   }
 
-  async shutdown() {
-    // Shutdown all backends
+  shutdown() {
+    // Shutdown all backends — kill background tool processes, release workers
     for (const backend of Object.values(this.backends)) {
       if (backend) {
-        await backend.shutdown().catch(() => {});
+        try { backend.shutdown(); } catch { /* best-effort during app quit — backend may be partially initialized */ }
       }
     }
   }
@@ -2564,6 +2604,6 @@ export async function preforkPunkWorker() {
   await punkEngine.initialize();
 }
 
-export async function shutdownPunkWorker() {
-  await punkEngine.shutdown();
+export function shutdownPunkWorker() {
+  punkEngine.shutdown();
 }

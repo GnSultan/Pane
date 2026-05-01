@@ -5,8 +5,6 @@ import {
   getCwd,
   detectProjectRoot,
   readFile,
-  brainGetProfile,
-  brainGetAvatar,
   saveConversationToMain,
   checkPathExists,
   migrateProjectId,
@@ -325,28 +323,6 @@ export function useSettingsPersistence() {
         savingDisabled.current = false;
         resolveAppReady();
 
-        brainGetProfile()
-          .then(({ profile }) => {
-            if (profile?.identity) {
-              const ws = useWorkspaceStore.getState();
-              if (profile.identity.name)
-                ws.setProfileName(profile.identity.name);
-              if (profile.identity.bio) ws.setProfileBio(profile.identity.bio);
-              if (profile.identity.role)
-                ws.setProfileRole(profile.identity.role);
-            }
-          })
-          .catch(() => {});
-
-        brainGetAvatar()
-          .then(({ base64, mime }) => {
-            if (base64 && mime) {
-              useWorkspaceStore
-                .getState()
-                .setProfileAvatarDataUrl(`data:${mime};base64,${base64}`);
-            }
-          })
-          .catch(() => {});
       })
       .catch((err) => {
         console.error("[persistence] Load failed:", err);

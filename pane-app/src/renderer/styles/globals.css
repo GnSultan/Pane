@@ -546,9 +546,12 @@ html, body {
   user-select: none;
 }
 
+/* Scrollbar — thin line, barely there.
+   We need scrolling everywhere (Profile, TokenAnalytics, etc.),
+   but the scrollbar itself should be invisible — just a faint line. */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 3px;
+  height: 3px;
 }
 
 ::-webkit-scrollbar-track {
@@ -556,12 +559,18 @@ html, body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--pane-border);
-  border-radius: 3px;
+  background: color-mix(in srgb, var(--pane-text-secondary) 18%, transparent);
+  border-radius: 2px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--pane-text-secondary);
+  background: color-mix(in srgb, var(--pane-text-secondary) 35%, transparent);
+}
+
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--pane-text-secondary) 18%, transparent) transparent;
 }
 
 /* macOS window drag regions — use app-region (standard), not -webkit-app-region.
