@@ -48,7 +48,7 @@ const PROFILE_DIR = path.join(PANE_DIR, "profile");
 // Context layer priorities (lower = more important, never dropped)
 //
 //   0 — critical: core instructions, identity, rules (model breaks without these)
-//   1 — high: project brief, codebase map, DNA, purpose (model is blind without these)
+//   1 — high: project brief, DNA, purpose (model is blind without these)
 //   2 — important: session state, working set, pre-reads, decisions (current task context)
 //   3 — useful: memories, symbols, principles, handoff, mind entries (enrichment)
 //   4 — optional: orientation marker, behavioral fence, method notes (polish)
@@ -121,7 +121,6 @@ function computeRelevanceAdjustments(contextShape, brainCtx, intent, historyLeng
   // Analyze mode: boost everything the model needs for deep investigation
   const mode = contextShape?.mode || null;
   if (mode === "analyze") {
-    adjustments.set("codebase_map", (adjustments.get("codebase_map") || 0) - 1);  // promote
     adjustments.set("brain_memories", (adjustments.get("brain_memories") || 0) - 1);
     adjustments.set("symbol_map", (adjustments.get("symbol_map") || 0) - 1);
     adjustments.set("project_dna", (adjustments.get("project_dna") || 0) - 1);
@@ -144,7 +143,6 @@ function computeRelevanceAdjustments(contextShape, brainCtx, intent, historyLeng
     // Everything else is demoted to EXPENDABLE so the budget drops them.
     // This cuts system prompt from ~5,500 to ~2,400 tokens.
     adjustments.set("pane_guide", +3);          // critical → useful (compressed guide, cut for simple tasks)
-    adjustments.set("codebase_map", +3);        // high → expendable
     adjustments.set("relevant_files", +3);      // useful → expendable
     adjustments.set("project_dna", +2);         // high → useful
     adjustments.set("brain_memories", +3);      // useful → expendable
@@ -164,7 +162,6 @@ function computeRelevanceAdjustments(contextShape, brainCtx, intent, historyLeng
   if (escalation >= 2) {
     adjustments.set("escalation", -2);        // make it critical priority
     adjustments.set("brain_memories", (adjustments.get("brain_memories") || 0) - 1);
-    adjustments.set("codebase_map", (adjustments.get("codebase_map") || 0) - 1);
   }
 
   // ── Conversation depth: early turns need handoff, later turns don't ────
@@ -295,7 +292,7 @@ function _buildLeanContext(projectId, isResume) {
  * placement: "stable" | "dynamic" — backward compat with old callers.
  * tier: "frozen" | "session" | "turn" — three-tier caching model:
  *   frozen  — never changes within a session (identity, rules, brief, DNA)
- *   session — changes when files/scope change (codebase map, relevant files)
+ *   session — changes when files/scope change (relevant files)
  *   turn    — changes every turn (git, todos, actions, memories, symbols)
  */
 function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected = null) {
@@ -322,7 +319,7 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
       ));
     } catch {}
   }
-  if (!brainCtx) brainCtx = { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [] };
+  if (!brainCtx) brainCtx = { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [], authoritativeDecisions: [] };
 
   let state;
   try {
@@ -479,24 +476,6 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
         text: "Note: This project has no recorded purpose yet. If a natural opening arises, ask about the project's goals and call pane_set_why to record them.",
       });
     }
-  }
-
-  // ── 1. CODEBASE MAP (high) ────────────────────────────────────────────
-  const codebaseMap = brainCtx.codebaseMap || [];
-  if (codebaseMap.length > 0) {
-    const lines = [
-      "## Codebase map",
-      "Every file in this project and what it does. Use this to navigate — do not grep for files.",
-      "",
-    ];
-    for (const f of codebaseMap) lines.push(`${f.path} — ${f.desc}`);
-    layers.push({
-      name: "codebase_map",
-      priority: PRIORITY.HIGH,
-      placement: "stable",
-      tier: "session",
-      text: lines.join("\n"),
-    });
   }
 
   // ── 3. RELEVANT FILES (useful) ────────────────────────────────────────
@@ -687,15 +666,32 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
     }
   }
 
-  // ── 2. LOCKED DECISIONS (important) ───────────────────────────────────
-  if (state.decisions.length > 0) {
-    const lines = ["Locked decisions — do not contradict or undo these:"];
-    for (const d of state.decisions.slice(0, 6)) lines.push(`- ${d.content}`);
+  // ── 0. AUTHORITATIVE DECISIONS (critical, frozen) ────────────────────
+  // High-confidence decisions from the brain's accumulated evidence.
+  // Injected every turn — never delta'd out. The model must not contradict
+  // these without explicit user confirmation.
+  const authDecisions = brainCtx?.authoritativeDecisions || [];
+  if (authDecisions.length > 0) {
+    const lines = [
+      "## Authoritative Decisions",
+      "",
+      "These decisions have accumulated enough evidence to be treated as binding constraints. Do not contradict them unless the user explicitly asks you to reconsider.",
+      "",
+    ];
+    for (const d of authDecisions) {
+      const label = d.confidence >= 0.90 ? " [confirmed]" : "";
+      lines.push(`- ${d.content}${label}`);
+    }
+    lines.push("");
+    lines.push(
+      "If you must override one of these, state which decision you're contradicting and why, " +
+      "then wait for explicit confirmation before proceeding. Do not silently contradict."
+    );
     layers.push({
-      name: "locked_decisions",
-      priority: PRIORITY.IMPORTANT,
-      placement: "dynamic",
-      tier: "turn",
+      name: "authoritative_decisions",
+      priority: PRIORITY.CRITICAL,
+      placement: "stable",
+      tier: "frozen",
       text: lines.join("\n"),
     });
   }
@@ -1041,7 +1037,7 @@ export function orchestrateContext(projectId, options = {}) {
       ));
     } catch {}
   }
-  if (!brainCtx) brainCtx = { memories: [], tensions: [], atoms: [], relevantSymbols: [], principles: [] };
+  if (!brainCtx) brainCtx = { memories: [], tensions: [], atoms: [], relevantSymbols: [], principles: [], authoritativeDecisions: [] };
 
   const relevanceAdjustments = computeRelevanceAdjustments(contextShape, brainCtx, intent, historyLength);
   applyRelevanceAdjustments(allLayers, relevanceAdjustments);
@@ -1193,7 +1189,7 @@ function _buildPaneGuide() {
   return [
     "## Working in Pane",
     "",
-    "Pane pre-compiles project context before you see the message — purpose, DNA, codebase map, working set contents, memories, symbols, session state. Start from what you already have. Tools extend context, they don't bootstrap it.",
+    "Pane provides project identity (purpose, DNA, brief) in context. All other project state — file structure, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
     "",
     "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_why when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
   ].join("\n");

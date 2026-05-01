@@ -1475,6 +1475,35 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
     result.synthesis = null;
   }
 
+  // ── Authoritative decisions: high-confidence, outcome-proven constraints ──
+  // These are decisions the brain has accumulated enough evidence for (confidence >= 0.80)
+  // to treat as binding constraints. The orchestrator places them at CRITICAL priority
+  // with frozen tier so the model sees them every turn and cannot contradict them.
+  if (db) {
+    try {
+      const authNodes = db.prepare(`
+        SELECT id, name, content, confidence, created_at
+        FROM nodes
+        WHERE project_id = ? AND entity_type = 'decision' AND confidence >= 0.80
+        ORDER BY confidence DESC, access_count DESC
+        LIMIT 10
+      `).all(projectId);
+      result.authoritativeDecisions = authNodes.map(n => {
+        const parsed = JSON.parse(n.content || '{}');
+        return {
+          id: n.id,
+          content: parsed.text || n.name,
+          confidence: n.confidence,
+          age: n.created_at,
+        };
+      });
+    } catch {
+      result.authoritativeDecisions = [];
+    }
+  } else {
+    result.authoritativeDecisions = [];
+  }
+
   // Full codebase map — every indexed file with a one-line description.
   // The model sees the entire project structure, not just 5 "relevant" files.
   // ~2-4k tokens for a 100-file project. Injected into the stable prompt.

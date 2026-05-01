@@ -20,9 +20,10 @@
  *             DeepSeek/Kimi/Qwen: automatic prefix caching (prefix must be stable).
  *             Gemini: cachedContents API candidate.
  *
- *   session — codebase map, relevant files, approach order.
+ *   session — relevant files, approach order.
  *             Changes when files or task scope change, NOT every turn.
  *             Second in prompt — extends the cacheable prefix when unchanged.
+ *             Codebase map is on-demand via pane_get_project_map (~2-4k tokens saved).
  *
  *   turn    — git status, todos, working set, pre-reads, recent actions, memories,
  *             symbols, intent directive, escalation, handoff, pins, fence.
@@ -338,7 +339,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   stableParts.push(
     "## Working in Pane",
     "",
-    "Pane provides project identity (purpose, DNA, brief) in context. All other project state — codebase map, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
+    "Pane provides project identity (purpose, DNA, brief) in context. All other project state — file structure, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
     "",
     "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_why when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
     "",
