@@ -19,8 +19,6 @@ import {
   reinitializePunkBackend,
   getBackendAvailability,
   getClaudeAuthState,
-  claudeSignin,
-  claudeSignout,
   cloudLogin,
   cloudLogout,
   cloudGetUser,
@@ -889,11 +887,6 @@ const API_KEY_PROVIDERS = [
   { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
 ] as const;
 
-// Gemini CLI — external, needs install
-const CLI_PROVIDERS = [
-  { key: "gemini", label: "Gemini CLI", description: "gemini cli" },
-] as const;
-
 function ApiKeysSection({
   httpApiKeys,
   onKeyChange,
@@ -1532,16 +1525,6 @@ function AccordionSection({
   );
 }
 
-function formatResetTime(unixSeconds: number): string {
-  const date = new Date(unixSeconds * 1000);
-  const diff = date.getTime() - Date.now();
-  if (diff <= 0) return "now";
-  // Show full date + time for the profile (e.g., "Apr 9 · 11:00 AM")
-  const dateStr = date.toLocaleDateString([], { month: "short", day: "numeric" });
-  const timeStr = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  return `${dateStr} · ${timeStr}`;
-}
-
 export function Profile() {
   const profileName = useWorkspaceStore((s) => s.profileName);
   const profileBio = useWorkspaceStore((s) => s.profileBio);
@@ -1573,17 +1556,8 @@ export function Profile() {
   // Detect which CLI backends are available in PATH
   const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
   const [geminiAvailable, setGeminiAvailable] = useState(false);
-  const [claudeAuthState, setClaudeAuthState] = useState<ClaudeAuthState | null>(null);
-  const [claudeSigningIn, setClaudeSigningIn] = useState(false);
-  const [claudeSigninStatus, setClaudeSigninStatus] = useState<string[]>([]);
-  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
-  const rateLimitInfo = useWorkspaceStore((s) => s.rateLimitInfo);
-  // Authenticated if direct auth check says so OR if SDK account arrived via prefetch.
-  // Direct check is the source of truth — SDK account supplements it with extra fields.
-  const isClaudeAuthenticated =
-    claudeAuthState?.authenticated === true || (claudeCodeAvailable && sdkAccount != null);
-  const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
-  const toggleProvider = useWorkspaceStore((s) => s.toggleProvider);
+  const [, setClaudeAuthState] = useState<ClaudeAuthState | null>(null);
+  const [, setClaudeSigninStatus] = useState<string[]>([]);
 
   useEffect(() => {
     // Check backend availability (is the CLI installed?)
