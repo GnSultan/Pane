@@ -69,7 +69,9 @@ export function compileDNA() {
   // ── Identity: who is the user ──────────────────────────────────────────
   if (identity?.name) {
     const role = identity.role ? ` — ${identity.role}` : "";
-    parts.push(`Working with ${identity.name}${role}.`);
+    let identityStr = `Working with ${identity.name}${role}.`;
+    if (identity.bio) identityStr += ` ${identity.bio}`;
+    parts.push(identityStr);
   }
 
   // ── Values: distilled from philosophy.md ───────────────────────────────
@@ -156,27 +158,4 @@ export function getDNA() {
   return compileDNA();
 }
 
-/**
- * Read user-authored rules that should always be injected regardless of
- * backend type. These are the user's own constraints — project-specific
- * or universal — that no backend knows about natively.
- *
- * Only includes rules that are actionable behavioral guidance.
- * Skips: implementation details, fixed bugs, project-specific UI decisions.
- *
- * @returns {string[]} Array of rule strings
- */
-export function getUserRules() {
-  const rules = readProfileFile("rules.md");
-  if (!rules) return [];
 
-  return rules
-    .split("\n")
-    .map(line => line.replace(/^[-*]\s*/, "").trim())
-    .filter(line => {
-      if (!line || line.length < 10) return false;
-      // Skip implementation-specific details
-      if (/tauri-commands|\.tsx?:|\.mjs:|IPC|electron/i.test(line)) return false;
-      return true;
-    });
-}

@@ -380,18 +380,6 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
     text: _buildPaneGuide(),
   });
 
-  // ── 0. IDENTITY + RULES (critical) ────────────────────────────────────
-  const identityRules = _buildIdentityRules();
-  if (identityRules) {
-    layers.push({
-      name: "identity_rules",
-      priority: PRIORITY.CRITICAL,
-      placement: "stable",
-      tier: "frozen",
-      text: identityRules,
-    });
-  }
-
   // ── DEVELOPER DNA (~120 tokens) ──────────────────────────────────────
   // Replaces the old profile_digest (~300 tokens) and profile_atoms layers.
   // Condensed behavioral identity compiled from rules.md + philosophy.md +
@@ -1193,33 +1181,6 @@ function _buildPaneGuide() {
     "",
     "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_why when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
   ].join("\n");
-}
-
-function _buildIdentityRules() {
-  const parts = [];
-
-  let identity = null;
-  try { identity = JSON.parse(fs.readFileSync(path.join(PROFILE_DIR, "identity.json"), "utf-8")); } catch {}
-
-  if (identity?.name) {
-    const roleStr = identity.role ? `, ${identity.role}` : "";
-    parts.push(`You are working with ${identity.name}${roleStr}.`);
-    if (identity.bio) parts.push(identity.bio);
-    parts.push("");
-  }
-
-  let rules = "";
-  try { rules = fs.readFileSync(path.join(PROFILE_DIR, "rules.md"), "utf-8").trim(); } catch {}
-  if (rules) {
-    parts.push("Rules (apply to every response, no exceptions):");
-    for (const line of rules.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed) parts.push(`- ${trimmed}`);
-    }
-    parts.push("");
-  }
-
-  return parts.length > 0 ? parts.join("\n") : null;
 }
 
 function _buildEscalation(contextShape) {

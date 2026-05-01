@@ -345,30 +345,6 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     "",
   );
 
-  // Identity
-  let identity = null;
-  try { identity = JSON.parse(fs.readFileSync(path.join(PROFILE_DIR, "identity.json"), "utf-8")); } catch {}
-
-  if (identity?.name) {
-    const roleStr = identity.role ? `, ${identity.role}` : "";
-    stableParts.push(`You are working with ${identity.name}${roleStr}.`);
-    if (identity.bio) stableParts.push(identity.bio);
-    stableParts.push("");
-  }
-
-  // Explicit rules — ALWAYS injected, never filtered by semantic relevance.
-  // These are behavioral invariants that apply to every single response.
-  let rules = "";
-  try { rules = fs.readFileSync(path.join(PROFILE_DIR, "rules.md"), "utf-8").trim(); } catch {}
-  if (rules) {
-    stableParts.push("Rules (apply to every response, no exceptions):");
-    for (const line of rules.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed) stableParts.push(`- ${trimmed}`);
-    }
-    stableParts.push("");
-  }
-
   // ── Developer DNA: consolidated identity path ──────────────────────────
   // Gets the compiled identity fingerprint from developer-dna.mjs, which
   // reads identity.json, philosophy.md, and rules.md. Replaces the old
