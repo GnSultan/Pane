@@ -192,26 +192,23 @@ export function useLensChat(
             break;
 
           case 'message': {
-            const parsed = (event as any).data?.parsed as PunkStreamMessage | undefined;
+            const msgEvent = event as { event: string; data?: { parsed?: PunkStreamMessage; raw_json?: string } };
+            const parsed = msgEvent.data?.parsed;
             if (!parsed) break;
 
             // ── system:init — capture session ID ──────────────────────────
             if (parsed.type === 'system') {
-              const p = parsed as any;
-              if (p.subtype === 'init' && p.session_id) {
-                lensCommentSetSession(postId, p.session_id).catch(() => {});
+              const initMsg = parsed as { type: "system"; subtype: string; session_id: string };
+              if (initMsg.subtype === 'init' && initMsg.session_id) {
+                lensCommentSetSession(postId, initMsg.session_id).catch(() => {});
               }
               break;
             }
 
             // ── stream_event — real-time text streaming ────────────────────
             if (parsed.type === 'stream_event') {
-              const evt = (parsed as any).event as {
-                type: string;
-                delta?: { type: string; text?: string };
-                content_block?: { type: string; id?: string; name?: string };
-                index?: number;
-              };
+              const streamMsg = parsed as { type: "stream_event"; event: { type: string; delta?: { type: string; text?: string }; content_block?: { type: string; id?: string; name?: string }; index?: number } };
+              const evt = streamMsg.event;
               if (!evt) break;
 
               if (
@@ -247,8 +244,8 @@ export function useLensChat(
             // ── assistant — SDK assembled message ──────────────────────────
             if (parsed.type === 'assistant') {
               flushAll();
-              const p = parsed as any;
-              const finalContent = (p.message?.content || p.content || []) as (TextBlock | ToolUseBlock)[];
+              const assistantMsg = parsed as { message?: { content?: (TextBlock | ToolUseBlock)[] }; content?: (TextBlock | ToolUseBlock)[] };
+              const finalContent = (assistantMsg.message?.content || assistantMsg.content || []) as (TextBlock | ToolUseBlock)[];
               const hasText = finalContent.some((b) => b.type === 'text');
 
               const fallbackId = !assistantMsgId && hasText ? nextId() : '';
@@ -293,8 +290,8 @@ export function useLensChat(
 
             // ── user — tool results ────────────────────────────────────────
             if (parsed.type === 'user') {
-              const p = parsed as any;
-              const content = (p.message?.content || p.content || []) as ToolResultBlock[];
+              const userMsg = parsed as { message?: { content?: ToolResultBlock[] }; content?: ToolResultBlock[] };
+              const content = (userMsg.message?.content || userMsg.content || []);
               if (content.some((b) => b.type === 'tool_result')) {
                 assistantMsgId = '';
               }

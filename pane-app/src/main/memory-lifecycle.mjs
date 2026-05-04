@@ -31,7 +31,7 @@ const DECAY_RATE_PER_WEEK = 0.01;        // Confidence drop per week of no acces
 const REINFORCE_BOOST = 0.05;            // Confidence boost on useful recall
 const CONSOLIDATION_THRESHOLD = 3;        // Min similar observations to consolidate
 const GRADUATION_THRESHOLD = 0.90;        // Confidence to auto-promote to behavioral wiring
-const STALE_THRESHOLD_DAYS = 90;          // Days without access before memory is prunable
+const STALE_THRESHOLD_DAYS = 3;           // Days without access before memory is prunable
 const SIMILARITY_THRESHOLD = 0.75;        // Cosine similarity to consider memories "similar"
 const MAX_DIGEST_LINES = 20;             // Max behavioral rules in profile digest
 
@@ -136,7 +136,7 @@ export async function consolidateMemories(db, projectId, quickCall = null) {
 
   // Parse embeddings
   const withEmbeddings = nodes
-    .filter(n => n.embedding && n.entity_type !== "project" && n.entity_type !== "file")
+    .filter(n => n.embedding && ["decision", "lesson", "pattern", "error_fix"].includes(n.entity_type))
     .map(n => {
       try {
         const emb = n.embedding instanceof Buffer

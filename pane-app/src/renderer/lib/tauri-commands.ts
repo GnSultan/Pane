@@ -1,7 +1,8 @@
 import type { PunkStreamEvent, ConversationMessage, Todo } from "./punk-types";
 
 // Electron IPC bridge
-const electronAPI = (window as any).electronAPI;
+import type { ElectronAPI } from "./electron";
+const electronAPI: ElectronAPI = window.electronAPI;
 
 
 export interface FileEntry {
@@ -507,7 +508,7 @@ export async function getClaudeAuthState(): Promise<ClaudeAuthState> {
 }
 
 /** Initiate Claude OAuth sign-in via the SDK's browser-based auth flow. */
-export async function claudeSignin(): Promise<{ success: boolean; account?: any; error?: string }> {
+export async function claudeSignin(): Promise<{ success: boolean; account?: Record<string, unknown>; error?: string }> {
   return electronAPI.invoke("claude_signin");
 }
 
@@ -875,8 +876,8 @@ export async function readBrief(projectId: string): Promise<string> {
   return electronAPI.invoke("read_brief", { projectId });
 }
 
-export async function getProjectWhy(projectId: string): Promise<string | null> {
-  return electronAPI.invoke("get_project_why", { projectId });
+export async function getProjectAbout(projectId: string): Promise<string | null> {
+  return electronAPI.invoke("get_project_about", { projectId });
 }
 
 export async function extractPreferencesFromTurn(
@@ -999,6 +1000,7 @@ export async function brainGetProfile(): Promise<{ profile: UserProfile }> {
   return electronAPI.invoke("brain_get_profile");
 }
 
+// Updates compiled identity directly (DNA string/bio text)
 export async function brainUpdateDNA(
   dna: string,
 ): Promise<{ updated: boolean }> {

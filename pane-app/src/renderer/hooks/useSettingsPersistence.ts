@@ -108,22 +108,22 @@ export function useSettingsPersistence() {
 
         // 3. Routing restore — flat PowerCombo { thinking, execution }
         //    Migration path: old format was keyed by backend ("api", "claude-code", "gemini")
-        const rawCombo = settings.power_combo as any;
-        const legacyRouting = settings.intent_routing as any;
+        const rawCombo = settings.power_combo as Record<string, unknown> | undefined;
+        const legacyRouting = settings.intent_routing as Record<string, unknown> | undefined;
         let restoredCombo: PowerCombo | null = null;
 
         if (rawCombo?.thinking && rawCombo?.execution) {
           // New flat format
-          restoredCombo = rawCombo as PowerCombo;
+          restoredCombo = rawCombo as unknown as PowerCombo;
         } else if (rawCombo && typeof rawCombo === "object") {
           // Old keyed format — pick the most specific key available
-          const keyed = rawCombo["claude-code"] || rawCombo["api"] || rawCombo["gemini"];
-          if (keyed?.thinking && keyed?.execution) restoredCombo = keyed as PowerCombo;
+          const keyed = (rawCombo["claude-code"] || rawCombo["api"] || rawCombo["gemini"]) as Record<string, unknown> | undefined;
+          if (keyed?.thinking && keyed?.execution) restoredCombo = keyed as unknown as PowerCombo;
         } else if (legacyRouting) {
           // Oldest format: 4-slot intent_routing
-          const r = legacyRouting["claude-code"] || legacyRouting["api"];
+          const r = (legacyRouting["claude-code"] || legacyRouting["api"]) as Record<string, unknown> | undefined;
           if (r?.plan && r?.execute) {
-            restoredCombo = { thinking: r.plan, execution: r.execute };
+            restoredCombo = { thinking: r.plan as PowerCombo["thinking"], execution: r.execute as PowerCombo["execution"] };
           }
         }
 

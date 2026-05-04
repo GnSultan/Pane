@@ -1158,13 +1158,20 @@ function createProjectsStore() {
   }));
 }
 
+interface ViteHotContext {
+  data: Record<string, unknown>;
+}
+interface ViteImportMeta {
+  hot?: ViteHotContext;
+}
+
 // Preserve store across HMR — prevents state loss and stale subscriptions
 export const useProjectsStore: ReturnType<typeof createProjectsStore> =
-  (import.meta as any).hot?.data?.__PROJECTS_STORE__ ??
+  ((import.meta as unknown as ViteImportMeta).hot?.data?.__PROJECTS_STORE__ as ReturnType<typeof createProjectsStore> | undefined) ??
   (() => {
     const store = createProjectsStore();
-    if ((import.meta as any).hot) {
-      (import.meta as any).hot.data.__PROJECTS_STORE__ = store;
+    if ((import.meta as unknown as ViteImportMeta).hot) {
+      (import.meta as unknown as ViteImportMeta).hot!.data.__PROJECTS_STORE__ = store;
     }
     return store;
   })();

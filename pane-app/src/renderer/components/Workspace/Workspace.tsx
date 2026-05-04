@@ -251,9 +251,10 @@ export function Workspace() {
         {activeProjectId && <FileSearch />}
       </div>
 
-      {/* Menu — shown in workspace when sidebar is hidden (non-conversation modes) */}
+      {/* Menu — shown in workspace when sidebar is hidden (non-conversation modes).
+           bottom-1.5 left-1.5 matches the InputBar '+' attach button padding (p-1.5). */}
       {mode !== "conversation" && (
-        <div className="absolute bottom-3 left-3 z-30 w-80">
+        <div className="absolute bottom-1.5 left-1.5 z-50 w-80 pointer-events-none">
           <Menu
             currentMode={mode}
             isGitRepo={isGitRepo}

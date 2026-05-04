@@ -8,7 +8,7 @@
  *   "Where is the function that handles IPC routing?" → answered in <1ms.
  *
  * Layer 3 (Synthesis) is also here:
- *   synthesizeProjectDNA() → compact narrative from decisions/lessons/patterns.
+ *   synthesizeProjectMemory() → compact narrative from decisions/lessons/patterns.
  *   No LLM. Pure DB extraction. Called by brain-engine after indexing.
  *
  * Tables owned:
@@ -577,7 +577,7 @@ export function writeSymbolExport(db, projectId, exportDir) {
  *
  * @returns Synthesis text, or null if nothing to synthesize.
  */
-export function synthesizeProjectDNA(db, projectId) {
+export function synthesizeProjectMemory(db, projectId) {
   if (!db) return null;
 
   const extract = row => {
@@ -670,22 +670,22 @@ export function synthesizeProjectDNA(db, projectId) {
  * @returns Synthesis text, or null.
  */
 export function updateSynthesis(db, projectId) {
-  const text = synthesizeProjectDNA(db, projectId);
+  const text = synthesizeProjectMemory(db, projectId);
   if (!text) return null;
 
   const hash = crypto.createHash("md5").update(text).digest("hex").slice(0, 16);
 
   // Check if unchanged
   const existing = db.prepare(
-    `SELECT source_hash FROM syntheses WHERE project_id = ? AND kind = 'dna'`
+    `SELECT source_hash FROM syntheses WHERE project_id = ? AND kind = 'about'`
   ).get(projectId);
 
   if (existing?.source_hash === hash) return text; // no change
 
   db.prepare(`
     INSERT OR REPLACE INTO syntheses (id, project_id, kind, content, source_hash, generated_at)
-    VALUES (?, ?, 'dna', ?, ?, unixepoch())
-  `).run(`syn-${projectId}-dna`, projectId, text, hash);
+    VALUES (?, ?, 'about', ?, ?, unixepoch())
+  `).run(`syn-${projectId}-about`, projectId, text, hash);
 
   return text;
 }
@@ -697,7 +697,7 @@ export function readSynthesis(db, projectId) {
   if (!db) return null;
   try {
     const row = db.prepare(
-      `SELECT content FROM syntheses WHERE project_id = ? AND kind = 'dna'`
+      `SELECT content FROM syntheses WHERE project_id = ? AND kind = 'about'`
     ).get(projectId);
     return row?.content || null;
   } catch {

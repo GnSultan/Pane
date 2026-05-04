@@ -501,7 +501,7 @@ export interface MemoryEvent {
 }
 
 export interface CheckpointTurn {
-  messages: Array<{ role: string; content: any }>;
+  messages: Array<{ role: string; content: unknown }>;
   turn: number;
   timestamp: number;
   phase?: string;

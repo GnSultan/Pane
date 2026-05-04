@@ -2008,11 +2008,11 @@ function registerMemoryHandlers() {
     }
   });
 
-  ipcMain.handle("get_project_why", async (_event, args) => {
+  ipcMain.handle("get_project_about", async (_event, args) => {
     const { projectId } = args;
     try {
       const content = await fs.promises.readFile(
-        path.join(memoryDir(projectId), "why.md"),
+        path.join(memoryDir(projectId), "about.md"),
         "utf-8",
       );
       return content.trim() || null;
@@ -2290,6 +2290,11 @@ function registerBrainHandlers() {
     return brainRequest("get_stats", {});
   });
 
+  ipcMain.handle("brain_prune", async (_event, args) => {
+    const { projectId } = args;
+    return brainRequest("prune", { projectId });
+  });
+
   ipcMain.handle("brain_get_intelligence_stats", async (_event, args) => {
     const { projectId } = args;
     return brainRequest("get_intelligence_stats", { projectId });
@@ -2517,7 +2522,7 @@ function createWindow() {
     icon: iconPath,
     show: false,
     webPreferences: {
-      preload: path.join(__dirname, "../preload/preload.js"),
+      preload: path.join(__dirname, "../preload/preload.mjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -2533,6 +2538,8 @@ function createWindow() {
   });
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
+    // Auto-open DevTools in dev mode so you can see renderer errors
+    mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
     mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   }
@@ -2629,6 +2636,59 @@ app.whenReady().then(async () => {
   // MCP server's pane_roadmap tool. Without this the roadmap panel and phase
   // indicator only update when the Electron-side ToolExecutor fires events.
   startMcpFileWatcher();
+
+  // ── Startup cleanup: prune accumulated noise ───────────────────────────
+  // The extraction→brain loop was never closed, so raw messages and raw brain
+  // nodes accumulated indefinitely. On first startup after this fix, clean up
+  // existing data: keep only the latest 200 messages per project, prune low-
+  // confidence brain nodes (< 0.15), and reclaim disk via VACUUM.
+  (async () => {
+    try {
+      // Get all projects that have conversation data in pane.db
+      const db = getPaneDb();
+      const projectsWithMessages = db.prepare(
+        `SELECT DISTINCT project_id FROM messages`
+      ).all().map(r => r.project_id);
+
+      // Get all projects that have brain data
+      const brainResult = await brainRequest("get_all_projects", {});
+      const projectsWithBrain = (brainResult?.projects || []);
+
+      const allProjectIds = [...new Set([...projectsWithMessages, ...projectsWithBrain])];
+      if (allProjectIds.length === 0) return;
+
+      console.log(`[main] Startup cleanup: pruning ${allProjectIds.length} projects`);
+
+      for (const projectId of allProjectIds) {
+        // Prune old conversation messages — keep last 200
+        try {
+          const { pruneConversationMessages } = await import("./pane-db.mjs");
+          pruneConversationMessages(projectId, 200);
+        } catch {}
+
+        // Prune low-confidence brain nodes
+        try {
+          await brainRequest("prune", { projectId });
+        } catch {}
+      }
+
+      // VACUUM pane.db to reclaim freelist space
+      try {
+        db.pragma("auto_vacuum = INCREMENTAL");
+        db.exec("PRAGMA incremental_vacuum(10)");
+        console.log("[main] pane.db incremental vacuum complete");
+      } catch {}
+
+      // VACUUM brain.db
+      try {
+        await brainRequest("vacuum", {});
+      } catch {}
+
+      console.log("[main] Startup cleanup complete");
+    } catch (err) {
+      console.warn(`[main] Startup cleanup error (non-fatal): ${err.message}`);
+    }
+  })();
 
   // Daily backup at midnight — silent, automatic, 7-day rotation + cloud push
   startBackupSchedule();

@@ -38,7 +38,7 @@ import os from "node:os";
 import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
 import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
 import { getActiveJournal, applyMergeDelta } from "./session-journal.mjs";
-import { getDNA } from "./developer-dna.mjs";
+import { getIdentity } from "./identity.mjs";
 import { lookupModelContext } from "./model-registry.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
@@ -346,22 +346,19 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   stableParts.push(
     "## Working in Pane",
     "",
-    "Pane provides project identity (purpose, DNA, brief) in context. All other project state — file structure, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
+    "Pane provides project context (about, brief, identity) at start. All other project state — file structure, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
     "",
-    "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_why when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
+    "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_about when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
     "",
   );
 
-  // ── Developer DNA: consolidated identity path ──────────────────────────
-  // Gets the compiled identity fingerprint from developer-dna.mjs, which
-  // reads identity.json, philosophy.md, and rules.md. Replaces the old
-  // triple-path approach (profile/digest.txt + brain profile atoms + DNA).
-  // The orchestrator (context-orchestrator.mjs) also uses getDNA() in its
-  // frozen tier — this ensures compileContext follows the same single path.
-  const dna = getDNA();
-  if (dna) {
-    stableParts.push("Developer DNA:");
-    stableParts.push(dna);
+  // ── Identity: condensed behavioral fingerprint ──────────────────────────
+  // Compiled from identity.json, philosophy.md, and rules.md via identity.mjs.
+  // Written as "you are" not "don't do" — identity internalizes better.
+  const identity = getIdentity();
+  if (identity) {
+    stableParts.push("Developer Identity:");
+    stableParts.push(identity);
     stableParts.push("");
   }
 
@@ -387,58 +384,44 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     stableParts.push("");
   }
 
-  // ── Project purpose (the "why") ───────────────────────────────────────────
-  // Per-project foundational context: what this project is trying to be, who
-  // it serves, what problem it solves. Captured once through exploration and
-  // stored at ~/.pane/memory/{projectId}/why.md.
+  // ── Project About: what this project is (purpose + identity) ───────────────
+  // Single per-project file combining purpose and identity.
+  // Stored at ~/.pane/memory/{projectId}/about.md.
+  // Captured once through exploration, refined over time.
   //
   // If present → stable layer, always injected. Gives every suggestion
   // criteria to reason against.
   //
-  // If absent and first turn → exploration directive in dynamic layer.
-  // Model asks conversational questions, calls pane_set_why when it has enough,
-  // then answers the original message with that context applied.
+  // If absent and early conversation → exploration directive.
+  // Model asks questions, calls pane_set_about when it has enough.
   //
   // Skip for mind: threads — those are thought journals, not code projects.
   if (!projectId.startsWith("mind:")) {
-    let projectWhy = "";
+    let projectAbout = "";
     try {
-      projectWhy = fs.readFileSync(path.join(MEMORY_DIR, projectId, "why.md"), "utf-8").trim();
+      projectAbout = fs.readFileSync(path.join(MEMORY_DIR, projectId, "about.md"), "utf-8").trim();
     } catch {}
 
-    if (projectWhy) {
-      stableParts.push("## Project Purpose");
-      stableParts.push(projectWhy);
+    if (projectAbout) {
+      stableParts.push("## About");
+      stableParts.push(projectAbout);
       stableParts.push("Treat this as active criteria, not background. When suggesting approaches or evaluating trade-offs, reason against this purpose — name tensions when something conflicts, and use it as a tie-breaker when alternatives are close. If a request would move the project away from this purpose, say so.");
       stableParts.push("");
     } else if (historyLength < 4) {
-      // No why yet and conversation is still early — enter exploration mode.
-      // This fires on any project without a why.md, not just brand-new ones.
       dynamicParts.push([
-        "This project has no recorded purpose. Before answering, understand what it is trying to be.",
+        "This project has no recorded context yet. Before answering, understand what it is trying to be.",
         "",
         "Ask one question at a time — start with: what is this project, and what problem does it solve? Follow the thread naturally: who is it for, where is it headed, what it deliberately isn't. Three solid answers is enough.",
         "",
-        "Once you have a clear picture, call pane_set_why with a concise synthesis (2-4 sentences), then answer the original message with that context.",
+        "Once you have a clear picture, call pane_set_about with a concise synthesis (2-4 sentences), then answer the original message with that context.",
         "",
         "If the first message is urgent (crash, broken build, critical bug), answer it first — explore purpose on the next turn.",
       ].join("\n"));
       dynamicParts.push("");
     } else {
-      // Deeper into a conversation with no why — don't interrupt, just remind.
-      dynamicParts.push("Note: This project has no recorded purpose yet. If a natural opening arises, ask about the project's goals and call pane_set_why to record them.");
+      dynamicParts.push("Note: This project has no recorded context yet. If a natural opening arises, ask about the project's goals and call pane_set_about to record them.");
       dynamicParts.push("");
     }
-  }
-
-  // ── Project DNA — accumulated decisions, patterns, lessons synthesized into a narrative.
-  // Compact (<400 tokens). Changes rarely (only when new decisions/lessons reach confidence threshold).
-  // Lives in FROZEN tier — truly stable across turns.
-  const synthesis = brainCtx.synthesis || "";
-  if (synthesis) {
-    frozenParts.push("## Project DNA");
-    frozenParts.push(synthesis);
-    frozenParts.push("");
   }
 
   // Codebase map and relevant files are now retrieved via pane_get_project_map.

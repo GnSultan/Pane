@@ -553,7 +553,7 @@ export class MindPunks {
     if (!projectId) return result;
 
     try {
-      result.why = (await fs.readFile(path.join(PANE_DIR, "memory", projectId, "why.md"), "utf-8")).trim();
+      result.about = (await fs.readFile(path.join(PANE_DIR, "memory", projectId, "about.md"), "utf-8")).trim();
     } catch {}
 
     try {

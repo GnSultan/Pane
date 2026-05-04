@@ -1,13 +1,13 @@
 /**
- * Developer DNA — condensed behavioral identity for the model.
+ * Identity — condensed behavioral identity for the model.
  *
  * Instead of injecting scattered profile files (rules.md, philosophy.md,
  * anti-patterns.json, identity.json, preferences.json) into every system
  * prompt as separate token-heavy layers, we compile them into a single
- * ~100-150 token DNA string that captures the essence of how the model
+ * ~100-150 token string that captures the essence of how the model
  * should behave.
  *
- * The DNA is compiled once (on project load or profile change), cached to
+ * The identity is compiled once (on project load or profile change), cached to
  * disk, and injected as a single frozen layer. It replaces all separate
  * behavioral injections.
  *
@@ -16,7 +16,7 @@
  * - Written as identity ("you are"), not rules ("don't do") — models
  *   internalize identity better than rule lists
  * - Compiled from the user's actual profile, not hardcoded
- * - The arbiter enforces compliance — the DNA sets the standard,
+ * - The arbiter enforces compliance — the identity sets the standard,
  *   the arbiter checks the work
  */
 
@@ -26,7 +26,7 @@ import os from "node:os";
 
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const PROFILE_DIR = path.join(PANE_DIR, "profile");
-const DNA_CACHE_PATH = path.join(PROFILE_DIR, "compiled-dna.txt");
+const IDENTITY_CACHE_PATH = path.join(PROFILE_DIR, "compiled-identity.txt");
 
 /**
  * Read a profile file safely. Returns empty string if missing.
@@ -51,15 +51,15 @@ function readProfileJson(filename) {
 }
 
 /**
- * Compile the Developer DNA from profile files.
+ * Compile the identity from profile files.
  *
  * Reads: identity.json, philosophy.md, rules.md
  * Ignores: anti-patterns.json (noise), preferences.json (too specific),
  *          profile-export.md (derivative), style.json (UI-only)
  *
- * @returns {string} Condensed DNA string (~120 tokens)
+ * @returns {string} Condensed identity string (~120 tokens)
  */
-export function compileDNA() {
+export function compileIdentity() {
   const identity = readProfileJson("identity.json");
   const philosophy = readProfileFile("philosophy.md");
   const rules = readProfileFile("rules.md");
@@ -118,44 +118,48 @@ export function compileDNA() {
   // ── Enforcement notice ─────────────────────────────────────────────────
   parts.push("Pane's quality gates enforce these standards at write time.");
 
-  const dna = parts.join(" ");
+  const identityStr = parts.join(" ");
 
   // Cache to disk
   try {
     fs.mkdirSync(PROFILE_DIR, { recursive: true });
-    fs.writeFileSync(DNA_CACHE_PATH, dna, "utf-8");
-  } catch {}
+    fs.writeFileSync(IDENTITY_CACHE_PATH, identityStr, "utf-8");
+  } catch {
+    // Cache is non-critical — compile works without it next time
+  }
 
-  return dna;
+  return identityStr;
 }
 
 /**
- * Get the compiled DNA, using cache if available.
+ * Get the compiled identity, using cache if available.
  * Recompiles if cache is older than profile files.
  *
  * @returns {string}
  */
-export function getDNA() {
+export function getIdentity() {
   // Check cache freshness
   try {
-    const cacheStat = fs.statSync(DNA_CACHE_PATH);
+    const cacheStat = fs.statSync(IDENTITY_CACHE_PATH);
     const profileFiles = ["identity.json", "philosophy.md", "rules.md"];
     let newestProfile = 0;
     for (const f of profileFiles) {
       try {
         const stat = fs.statSync(path.join(PROFILE_DIR, f));
         if (stat.mtimeMs > newestProfile) newestProfile = stat.mtimeMs;
-      } catch {}
+      } catch {
+        // Profile file may not exist — expected on first boot
+      }
     }
 
     // Cache is fresh if it's newer than all profile files
     if (cacheStat.mtimeMs > newestProfile) {
-      return fs.readFileSync(DNA_CACHE_PATH, "utf-8").trim();
+      return fs.readFileSync(IDENTITY_CACHE_PATH, "utf-8").trim();
     }
-  } catch {}
+  } catch {
+    // Cache file may not exist — expected on cold start, will recompile
+  }
 
   // Cache missing or stale — recompile
-  return compileDNA();
+  return compileIdentity();
 }
-
-

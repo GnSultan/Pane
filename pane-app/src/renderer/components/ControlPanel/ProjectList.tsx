@@ -4,7 +4,7 @@ import { useProjectsStore } from "../../stores/projects";
 import { NewThreadPicker } from "./NewThreadPicker";
 import { rebindProject, detectProjectRoot } from "../../lib/tauri-commands";
 
-const electronAPI = (window as any).electronAPI;
+const electronAPI = window.electronAPI;
 
 function formatRelativeTime(epochMs: number): string {
   const diff = Date.now() - epochMs;

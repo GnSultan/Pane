@@ -39,13 +39,20 @@ function createMindStore() {
   }));
 }
 
+interface ViteHotContext {
+  data: Record<string, unknown>;
+}
+interface ViteImportMeta {
+  hot?: ViteHotContext;
+}
+
 // Preserve store across HMR
 export const useMindStore: ReturnType<typeof createMindStore> =
-  (import.meta as any).hot?.data?.__MIND_STORE__ ??
+  ((import.meta as unknown as ViteImportMeta).hot?.data?.__MIND_STORE__ as ReturnType<typeof createMindStore> | undefined) ??
   (() => {
     const store = createMindStore();
-    if ((import.meta as any).hot) {
-      (import.meta as any).hot.data.__MIND_STORE__ = store;
+    if ((import.meta as unknown as ViteImportMeta).hot) {
+      (import.meta as unknown as ViteImportMeta).hot!.data.__MIND_STORE__ = store;
     }
     return store;
   })();

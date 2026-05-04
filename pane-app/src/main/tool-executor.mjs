@@ -2042,7 +2042,7 @@ export class ToolExecutor {
           try { ctx = JSON.parse(await fsPromises.readFile(contextPath, "utf-8")); } catch {}
 
           if (ctx?.synthesis) {
-            return { success: true, output: `## Project DNA\n\n${ctx.synthesis}`, toolId };
+            return { success: true, output: `## Project Memory\n\n${ctx.synthesis}`, toolId };
           }
 
           // Fallback: check if brain export has enough nodes to build one
@@ -2051,7 +2051,7 @@ export class ToolExecutor {
           try { exported = JSON.parse(await fsPromises.readFile(brainExportPath, "utf-8")); } catch {}
 
           if (!exported || exported.length === 0) {
-            return { success: true, output: "Project DNA not available yet — it builds as decisions and lessons accumulate through your work.", toolId };
+            return { success: true, output: "Project memory not available yet — it builds as decisions and lessons accumulate through your work.", toolId };
           }
 
           const decisions = exported.filter(n => n.type === "decision" && (n.confidence || 0) >= 0.70).slice(0, 12);
@@ -2060,10 +2060,10 @@ export class ToolExecutor {
           const fixes     = exported.filter(n => n.type === "error_fix"&& (n.confidence || 0) >= 0.70).slice(0, 6);
 
           if (decisions.length + patterns.length + lessons.length + fixes.length === 0) {
-            return { success: true, output: "Project DNA not available yet — memory confidence is still building.", toolId };
+            return { success: true, output: "Project memory not available yet — confidence is still building.", toolId };
           }
 
-          const parts = ["## Project DNA\n"];
+          const parts = ["## Project Memory\n"];
           if (decisions.length > 0) {
             parts.push("Architectural decisions:");
             for (const d of decisions) parts.push(`- ${d.content}`);
@@ -2124,14 +2124,15 @@ export class ToolExecutor {
           return { success: true, output: "Design philosophy updated.", toolId };
         }
 
-        case "pane_set_why": {
-          const why = (input?.why || "").trim();
-          if (!why) return { success: false, error: "Purpose text is required.", toolId };
+        case "pane_set_about": {
+          const about = (input?.about || "").trim();
+          if (!about) return { success: false, error: "About text is required.", toolId };
 
-          const whyPath = path.join(paneDir, "profile", "why.md");
-          await fsPromises.mkdir(path.dirname(whyPath), { recursive: true });
-          await fsPromises.writeFile(whyPath, why);
-          return { success: true, output: "Project purpose saved.", toolId };
+          const projectId = process.env.PANE_PROJECT_ID || "";
+          const aboutDir = path.join(paneDir, "memory", projectId);
+          await fsPromises.mkdir(aboutDir, { recursive: true });
+          await fsPromises.writeFile(path.join(aboutDir, "about.md"), about);
+          return { success: true, output: "Project context recorded.", toolId };
         }
 
         case "TodoWrite": {

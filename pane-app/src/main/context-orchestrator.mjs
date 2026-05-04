@@ -36,7 +36,7 @@ import { contextStore } from "./context-store.mjs";
 import { detectPhase, filterAtomsForPhase } from "./conversation-phase.mjs";
 import { readVerdict, formatVerdictForContext, formatQualityStatsForContext, formatGuidanceForContext } from "./code-arbiter.mjs";
 import { getPaneDb } from "./pane-db.mjs";
-import { getDNA } from "./developer-dna.mjs";
+import { getIdentity } from "./identity.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -222,11 +222,11 @@ function applyRelevanceAdjustments(layers, adjustments) {
 function _buildLeanContext(projectId, isResume) {
   const parts = [];
 
-  // ── Developer DNA: condensed behavioral identity (~120 tokens) ──────
+  // ── Developer Identity: condensed behavioral identity (~120 tokens) ──
   // Replaces separate rules/philosophy/identity/anti-patterns injections.
-  // The DNA is compiled from the user's profile files and cached to disk.
-  const dna = getDNA();
-  if (dna) parts.push(dna);
+  // The identity is compiled from the user's profile files and cached to disk.
+  const identity = getIdentity();
+  if (identity) parts.push(identity);
 
   // On resume, the SDK already has full context — just DNA + arbiter
   if (!isResume) {
@@ -380,19 +380,18 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
     text: _buildPaneGuide(),
   });
 
-  // ── DEVELOPER DNA (~120 tokens) ──────────────────────────────────────
-  // Replaces the old profile_digest (~300 tokens) and profile_atoms layers.
+  // ── IDENTITY (~120 tokens) ──────────────────────────────────────────
   // Condensed behavioral identity compiled from rules.md + philosophy.md +
   // identity.json. Written as identity ("you are"), not rules ("don't do").
-  // The arbiter enforces compliance — the DNA sets the standard.
-  const dna = getDNA();
-  if (dna) {
+  // The arbiter enforces compliance — the identity sets the standard.
+  const identity = getIdentity();
+  if (identity) {
     layers.push({
-      name: "developer_dna",
+      name: "identity",
       priority: PRIORITY.CRITICAL,
       placement: "stable",
       tier: "frozen",
-      text: dna,
+      text: identity,
     });
   }
 
@@ -420,48 +419,49 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
     }
   }
 
-  // ── 1. PROJECT PURPOSE (high) ─────────────────────────────────────────
+  // ── 1. ABOUT (high) — project purpose + identity ─────────────────────
+  // Single per-project file (~/.pane/memory/{projectId}/about.md).
   if (!projectId.startsWith("mind:")) {
-    let projectWhy = "";
+    let projectAbout = "";
     try {
-      projectWhy = fs.readFileSync(path.join(MEMORY_DIR, projectId, "why.md"), "utf-8").trim();
+      projectAbout = fs.readFileSync(path.join(MEMORY_DIR, projectId, "about.md"), "utf-8").trim();
     } catch {}
 
-    if (projectWhy) {
+    if (projectAbout) {
       layers.push({
-        name: "project_purpose",
+        name: "project_about",
         priority: PRIORITY.HIGH,
         placement: "stable",
         tier: "frozen",
         text: [
-          "## Project Purpose",
-          projectWhy,
+          "## About",
+          projectAbout,
           "Treat this as active criteria, not background. When suggesting approaches or evaluating trade-offs, reason against this purpose — name tensions when something conflicts, and use it as a tie-breaker when alternatives are close. If a request would move the project away from this purpose, say so.",
         ].join("\n"),
       });
     } else if (historyLength < 4) {
       layers.push({
-        name: "purpose_exploration",
+        name: "about_exploration",
         priority: PRIORITY.IMPORTANT,
         placement: "dynamic",
         tier: "turn",
         text: [
-          "This project has no recorded purpose. Before answering, understand what it is trying to be.",
+          "This project has no recorded context yet. Before answering, understand what it is trying to be.",
           "",
           "Ask one question at a time — start with: what is this project, and what problem does it solve? Follow the thread naturally: who is it for, where is it headed, what it deliberately isn't. Three solid answers is enough.",
           "",
-          "Once you have a clear picture, call pane_set_why with a concise synthesis (2-4 sentences), then answer the original message with that context.",
+          "Once you have a clear picture, call pane_set_about with a concise synthesis (2-4 sentences), then answer the original message with that context.",
           "",
           "If the first message is urgent (crash, broken build, critical bug), answer it first — explore purpose on the next turn.",
         ].join("\n"),
       });
     } else {
       layers.push({
-        name: "purpose_reminder",
+        name: "about_reminder",
         priority: PRIORITY.OPTIONAL,
         placement: "dynamic",
         tier: "turn",
-        text: "Note: This project has no recorded purpose yet. If a natural opening arises, ask about the project's goals and call pane_set_why to record them.",
+        text: "Note: This project has no recorded context yet. If a natural opening arises, ask about the project's goals and call pane_set_about to record them.",
       });
     }
   }
@@ -500,18 +500,6 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
       placement: "stable",
       tier: "session",
       text: lines.join("\n"),
-    });
-  }
-
-  // ── 1. PROJECT DNA (high) ─────────────────────────────────────────────
-  const synthesis = brainCtx.synthesis || "";
-  if (synthesis) {
-    layers.push({
-      name: "project_dna",
-      priority: PRIORITY.HIGH,
-      placement: "stable",
-      tier: "frozen",
-      text: `## Project DNA\n${synthesis}`,
     });
   }
 
@@ -1177,9 +1165,9 @@ function _buildPaneGuide() {
   return [
     "## Working in Pane",
     "",
-    "Pane provides project identity (purpose, DNA, brief) in context. All other project state — file structure, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
+    "Pane provides project context (about, brief, identity) at start. All other project state — file structure, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
     "",
-    "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_why when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
+    "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_about when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
   ].join("\n");
 }
 

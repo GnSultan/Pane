@@ -262,19 +262,22 @@ function TerminalTabContent({
   useEffect(() => {
     const ts = stateRef.current;
 
-    // If this is a resumed session, load history from DB before PTY starts
+    // On resume: restore command history (Up arrow) and last working directory.
+    // Does NOT restore visual output — only persistence that speeds future work.
     if (isNewSessionRef.current) {
       getTerminalHistory(projectId).then(({ commands }) => {
         if (commands.length === 0) return;
-        const restored: TerminalLine[] = [
-          { type: "output", content: "── previous session ──────────────────", timestamp: 0 },
-          ...commands.flatMap((c) => [
-            { type: "command" as const, content: c.cmd, timestamp: c.timestamp },
-            ...(c.output.trim() ? [{ type: "output" as const, content: c.output, timestamp: c.timestamp }] : []),
-          ]),
-          { type: "output", content: "── restored ──────────────────────────", timestamp: 0 },
-        ];
-        setLines((prev) => (prev.length === 0 ? restored : prev));
+        const ts = stateRef.current;
+        // Restore command history for Up/Down arrows
+        const cmds = commands.map((c) => c.cmd).filter(Boolean);
+        if (cmds.length > 0) ts.history = cmds;
+        // Restore last working directory from most recent command
+        const last = commands[commands.length - 1];
+        if (last?.cwd) {
+          ts.cwd = last.cwd;
+          setCwd(last.cwd);
+          useProjectsStore.getState().updateTerminalTabCwd(projectId, tabId, last.cwd);
+        }
       }).catch(() => {});
     }
 
@@ -673,9 +676,12 @@ function TerminalTabContent({
         </div>
       </div>
 
-      {/* Command input — pinned to bottom, full bleed, matching Conversation InputBar */}
-      <div className="absolute bottom-0 left-0 right-0 z-30">
-        <div className="bg-pane-bg rounded-xl flex items-center gap-2 px-4 py-3">
+      {/* Command input — full-width bar pinned to bottom. Matches scroll area padding (px-10).
+           Must be z-40 to sit above page content (z-20) but below the Menu component (z-50, bottom-3 left-3 in Workspace).
+           Terminal page (absolute inset-0, no z-index) doesn't create a stacking context, so
+           children's z-indices collide directly with siblings at the Workspace level. */}
+      <div className="absolute bottom-0 left-0 right-0 z-40">
+        <div className="flex items-center gap-2 py-3 pl-14 pr-10">
           <span
             className="font-mono select-none shrink-0 self-start"
             style={{ fontSize: "var(--pane-font-size-base)", lineHeight: "1.5rem", color: "var(--pane-terminal)", margin: 0, padding: 0 }}

@@ -397,14 +397,14 @@ const TOOLS = [
     },
   },
   {
-    name: "pane_set_why",
-    description: "Set this project's foundational purpose — what it is, who it serves, what problem it solves, where it is headed. Call this once you have understood the project deeply enough to articulate it clearly. This grounds every future suggestion in the project's actual purpose. Per-project, not global.",
+    name: "pane_set_about",
+    description: "Record what this project is — its purpose, identity, and how it works. Call this once you have understood the project deeply enough to articulate it clearly. This grounds every future suggestion in the project's actual context. Per-project, not global. Writes to about.md.",
     inputSchema: {
       type: "object",
       properties: {
-        why: { type: "string", description: "The project's foundational purpose — concise narrative covering what it is, who it's for, the problem it solves, and its direction" },
+        about: { type: "string", description: "The project's description — what it is, who it's for, the problem it solves, its identity and direction" },
       },
-      required: ["why"],
+      required: ["about"],
     },
   },
   {
@@ -516,7 +516,7 @@ const TOOLS = [
   },
   {
     name: "pane_synthesize",
-    description: "Get the project's architectural DNA — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
+    description: "Get the project's accumulated memory — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -902,10 +902,10 @@ async function handleToolCall(name, args) {
 
     case "pane_brief": {
       const parts = [];
-      const why = await readText(path.join(memoryDir, "why.md"));
-      if (why) {
-        parts.push("## Project Purpose");
-        parts.push(why.trim());
+      const about = await readText(path.join(memoryDir, "about.md"));
+      if (about) {
+        parts.push("## About");
+        parts.push(about.trim());
         parts.push("");
       }
       const brief = await readText(path.join(memoryDir, "brief.md"));
@@ -1191,15 +1191,15 @@ async function handleToolCall(name, args) {
       return text("Design philosophy updated.");
     }
 
-    case "pane_set_why": {
-      const why = (args?.why || "").trim();
-      if (!why) return text("Why text is required.");
+    case "pane_set_about": {
+      const about = (args?.about || "").trim();
+      if (!about) return text("About text is required.");
 
-      const whyDir = path.join(PANE_DIR, "memory", PROJECT_ID);
-      await fs.promises.mkdir(whyDir, { recursive: true });
-      await fs.promises.writeFile(path.join(whyDir, "why.md"), why);
+      const aboutDir = path.join(PANE_DIR, "memory", PROJECT_ID);
+      await fs.promises.mkdir(aboutDir, { recursive: true });
+      await fs.promises.writeFile(path.join(aboutDir, "about.md"), about);
 
-      return text("Project purpose recorded. Every future session on this project will carry this context.");
+      return text("Project context recorded. Every future session on this project will carry this information.");
     }
 
     case "pane_find_symbol": {
@@ -1261,13 +1261,13 @@ async function handleToolCall(name, args) {
       const ctx = await readJson(contextPath);
 
       if (ctx?.synthesis) {
-        return text(`## Project DNA\n\n${ctx.synthesis}`);
+        return text(`## Project Memory\n\n${ctx.synthesis}`);
       }
 
       // Fallback: check if brain export has enough nodes to build one
       const exported = await readBrainExport(PROJECT_ID);
       if (!exported || exported.length === 0) {
-        return text("Project DNA not available yet — it builds as decisions and lessons accumulate through your work.");
+        return text("Project memory not available yet — it builds as decisions and lessons accumulate through your work.");
       }
 
       const decisions = exported.filter(n => n.type === "decision" && n.confidence >= 0.70).slice(0, 12);
@@ -1276,10 +1276,10 @@ async function handleToolCall(name, args) {
       const fixes     = exported.filter(n => n.type === "error_fix"&& n.confidence >= 0.70).slice(0, 6);
 
       if (decisions.length + patterns.length + lessons.length + fixes.length === 0) {
-        return text("Project DNA not available yet — memory confidence is still building.");
+        return text("Project memory not available yet — confidence is still building.");
       }
 
-      const parts = ["## Project DNA\n"];
+      const parts = ["## Project Memory\n"];
       if (decisions.length > 0) {
         parts.push("Architectural decisions:");
         for (const d of decisions) parts.push(`- ${d.content}`);

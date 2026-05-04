@@ -22,15 +22,13 @@ import {
   getFileSymbols,
   writeSymbolExport,
   updateSynthesis,
-  readSynthesis,
 } from "./symbol-index.mjs";
-import { resolveModelCache } from "./model-paths.mjs";
 import { ALL_SYSTEM_ATOMS, FACET_WEIGHTS } from "./system-atoms.mjs";
 
 const BRAIN_DIR = path.join(os.homedir(), ".pane", "brain");
 const MEMORY_DIR = path.join(os.homedir(), ".pane", "memory");
 const PROFILE_DIR = path.join(os.homedir(), ".pane", "profile");
-const DNA_CACHE_PATH = path.join(PROFILE_DIR, "compiled-dna.txt");
+const IDENTITY_CACHE_PATH = path.join(PROFILE_DIR, "compiled-identity.txt");
 const EXPORTS_DIR = path.join(BRAIN_DIR, "exports");
 
 const SESSION_DIR = path.join(os.homedir(), ".pane", "session");
@@ -45,9 +43,14 @@ function _readSessionState(projectId) {
 
 // --- State ---
 let db = null;
-let embedder = null;
 let embedderLoading = false;
 let embedderReady = false;
+let _embeddingApiKey = null;
+
+// Jina AI embedding API config
+const EMBEDDING_DIM = 1024; // jina-embeddings-v3 output dimension
+const JINA_API_URL = "https://api.jina.ai/v1/embeddings";
+const JINA_MODEL = "jina-embeddings-v3";
 
 
 // Tracks which projects have completed a full initial index this session.
@@ -691,70 +694,115 @@ function initDatabase() {
       WHERE project_id = ? AND confidence > 0.2
       AND updated_at < datetime('now', ?)
     `),
+    pruneLowConfidence: db.prepare(`
+      DELETE FROM nodes WHERE project_id = ? AND confidence < ? AND entity_type NOT IN ('project', 'file')
+    `),
+    pruneOldVersions: db.prepare(`
+      DELETE FROM node_versions WHERE node_id NOT IN (SELECT id FROM nodes)
+    `),
+    countNodesByProject: db.prepare(`SELECT COUNT(*) AS cnt FROM nodes WHERE project_id = ?`),
   };
 }
 
-// --- Embedder (lazy-loaded, single-threaded WASM to avoid em-pthread leak) ---
+// --- Embedder (Jina AI Cloud API) ---
+//
+// Replaces the local ONNX-based @huggingface/transformers embedder with
+// Jina AI's cloud embedding API. No local model files, no WASM threads,
+// no disk usage. API key is read from ~/.pane/settings.json (http_api_keys.jina).
+
+function _readEmbeddingApiKey() {
+  // Try settings.json first (same pattern as other API keys)
+  try {
+    const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    const key = settings.http_api_keys?.jina;
+    if (key && key.length > 10) return key;
+  } catch {}
+  // Fallback: brain config
+  try {
+    const configPath = path.join(BRAIN_DIR, "config.json");
+    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    return config.embeddingApiKey || null;
+  } catch {}
+  return null;
+}
 
 async function loadEmbedder() {
   if (embedderReady || embedderLoading) return;
   embedderLoading = true;
 
+  _embeddingApiKey = _readEmbeddingApiKey();
+
+  if (!_embeddingApiKey) {
+    console.warn("[brain] No Jina AI API key found. Set http_api_keys.jina in ~/.pane/settings.json");
+    embedderLoading = false;
+    return;
+  }
+
+  // Verify key works with a quick test embed
   try {
-    // Dynamic import — @huggingface/transformers is pure ESM
-    const { pipeline, env } = await import("@huggingface/transformers");
-
-    // Resolve model cache: bundled (prod/dev) or user cache (fallback)
-    const { cacheDir, bundled } = resolveModelCache();
-    env.cacheDir = cacheDir;
-    if (bundled) console.log(`[brain] Using bundled embedder from ${cacheDir}`);
-    else console.warn("[brain] Bundled embedder not found, will download on first use");
-
-    // CRITICAL: prevent em-pthread thread accumulation.
-    //
-    // The default WASM backend (ort-wasm-simd-threaded) spawns Emscripten pthread
-    // workers via node:worker_threads. These workers accumulate across embed()
-    // calls and are never reaped. After ~minutes of use, the process hits macOS's
-    // 4095-thread limit and SIGABRTs, crashing the entire Electron app.
-    //
-    // proxy=false  → no proxy Worker spawned (the primary source of leaking threads)
-    // numThreads=1 → ONNX selects the non-threaded WASM binary (ort-wasm-simd.wasm)
-    //                instead of ort-wasm-simd-threaded.jsep.mjs, so zero em-pthread
-    //                workers are created regardless of how many embed() calls are made.
-    //
-    // NOTE: onnxruntime-node (native C++) was tried but fails in Electron UtilityProcess
-    // ("Unsupported device: cpu. Should be one of: .") — native EP not registered there.
-    env.backends.onnx.wasm.proxy = false;
-    env.backends.onnx.wasm.numThreads = 1;
-
-    embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
-      quantized: true,
-      revision: "main",
-    });
-
+    const test = await _jinaEmbed(["test"]);
+    if (!test || !test[0]) throw new Error("Empty response from Jina API");
+    console.log(`[brain] Jina AI embedding API ready (${EMBEDDING_DIM} dim, model: ${JINA_MODEL})`);
     embedderReady = true;
     sendToMain({ type: "embedder_ready" });
-    console.log("[brain] Embedding model loaded");
-    // Index all atoms now that embedder is ready — system atoms + profile atoms into unified pool
+
+    // Index atoms + migrate old embeddings in background
     Promise.all([
       indexSystemAtoms().catch(err => console.error("[brain] System atom indexing failed:", err.message)),
       indexProfileAtoms().catch(err => console.error("[brain] Profile atom indexing failed:", err.message)),
+      migrateEmbeddings().catch(err => console.error("[brain] Embedding migration failed:", err.message)),
     ]);
   } catch (err) {
-    console.error("[brain] Failed to load embedding model:", err.message);
-    // Brain still works without embeddings — just no semantic search
+    console.error("[brain] Jina API verification failed:", err.message);
+    console.warn("[brain] Brain still works — semantic search will use keyword fallback");
     embedderLoading = false;
   }
 }
 
-async function embed(text) {
-  if (!embedderReady || !embedder) return null;
+/**
+ * Low-level Jina API call. Accepts array of texts, returns array of Float32Array embeddings.
+ * Handles batch requests efficiently — Jina supports multiple inputs per call.
+ */
+async function _jinaEmbed(inputs) {
+  if (!_embeddingApiKey) return null;
   try {
-    const result = await embedder(text, { pooling: "mean", normalize: true });
-    return new Float32Array(result.data);
-  } catch {
+    const response = await fetch(JINA_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${_embeddingApiKey}`,
+      },
+      body: JSON.stringify({
+        model: JINA_MODEL,
+        input: inputs,
+        normalized: true,
+        embedding_type: "float",
+      }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => "");
+      console.warn(`[brain] Jina API error (${response.status}): ${errorBody.slice(0, 200)}`);
+      return null;
+    }
+
+    const data = await response.json();
+    if (!data?.data) return null;
+
+    // Sort by index to maintain input order
+    data.data.sort((a, b) => a.index - b.index);
+    return data.data.map(item => new Float32Array(item.embedding));
+  } catch (err) {
+    console.warn(`[brain] Jina API request failed: ${err.message}`);
     return null;
   }
+}
+
+async function embed(text) {
+  if (!embedderReady || !_embeddingApiKey) return null;
+  const results = await _jinaEmbed([text]);
+  return results ? results[0] : null;
 }
 
 function cosineSimilarity(a, b) {
@@ -762,6 +810,91 @@ function cosineSimilarity(a, b) {
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
   return dot; // Vectors are already normalized, so dot product = cosine similarity
+}
+
+/**
+ * Migrate old 384-dim embeddings to new 1024-dim Jina embeddings.
+ * Runs once on startup after embedder is ready. Only migrates nodes
+ * with 1536-byte embeddings (384 floats × 4 bytes).
+ */
+async function migrateEmbeddings() {
+  if (!db || !embedderReady) return;
+
+  const oldNodes = db.prepare(`
+    SELECT id, content, name FROM nodes
+    WHERE embedding IS NOT NULL AND LENGTH(embedding) = 1536
+    ORDER BY updated_at DESC
+  `).all();
+
+  if (oldNodes.length === 0) {
+    console.log("[brain] No old embeddings to migrate");
+    return;
+  }
+
+  console.log(`[brain] Migrating ${oldNodes.length} old embeddings to ${EMBEDDING_DIM} dim...`);
+
+  let migrated = 0;
+  let failed = 0;
+  const batchSize = 25; // Jina supports batching — send 25 texts per call
+
+  for (let i = 0; i < oldNodes.length; i += batchSize) {
+    const batch = oldNodes.slice(i, i + batchSize);
+    const texts = batch.map(node => {
+      try {
+        const content = JSON.parse(node.content || "{}");
+        return content.text || node.name;
+      } catch {
+        return node.name;
+      }
+    });
+
+    const results = await _jinaEmbed(texts);
+    if (!results) {
+      failed += batch.length;
+      console.warn(`[brain] Migration batch ${i / batchSize} failed — retrying individually...`);
+      // Fall back to individual requests
+      for (const node of batch) {
+        const text = texts[batch.indexOf(node)];
+        const embedding = await embed(text);
+        if (embedding) {
+          const embeddingBuffer = Buffer.from(embedding.buffer);
+          db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, node.id);
+          migrated++;
+        } else {
+          failed++;
+        }
+      }
+      continue;
+    }
+
+    for (let j = 0; j < batch.length; j++) {
+      const embedding = results[j];
+      if (!embedding) { failed++; continue; }
+      const embeddingBuffer = Buffer.from(embedding.buffer);
+      try {
+        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, batch[j].id);
+        migrated++;
+      } catch (err) {
+        console.warn(`[brain] Migration DB update failed for ${batch[j].id}: ${err.message}`);
+        failed++;
+      }
+    }
+
+    // Small delay between batches to stay under rate limits (100 RPM)
+    if (i + batchSize < oldNodes.length) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  console.log(`[brain] Migration complete: ${migrated} re-embedded, ${failed} failed`);
+
+  if (migrated > 0) {
+    // Update project exports that had migrated nodes
+    const projects = db.prepare(`SELECT DISTINCT project_id FROM nodes WHERE project_id IS NOT NULL`).all();
+    for (const p of projects) {
+      if (p.project_id) writeSearchExport(p.project_id);
+    }
+  }
 }
 
 function nodeId(type, content) {
@@ -1215,6 +1348,33 @@ function decayStaleNodes(projectId) {
   return decayed;
 }
 
+// --- Explicit Pruning: remove low-confidence and orphaned nodes ---
+
+function pruneOldNodes(projectId) {
+  if (!db) return { pruned: 0, deletedEdges: 0 };
+
+  let pruned = 0;
+
+  // Remove nodes below 0.15 confidence (noise, contradictions, abandoned paths)
+  const result = db._stmts.pruneLowConfidence.run(projectId, 0.15);
+  pruned += result.changes;
+
+  // Remove orphan edge records (edges whose source or target no longer exists)
+  const orphanEdges = db.prepare(`
+    DELETE FROM edges WHERE id NOT IN (
+      SELECT e.id FROM edges e
+      JOIN nodes n1 ON e.source_id = n1.id
+      JOIN nodes n2 ON e.target_id = n2.id
+    )
+  `).run();
+
+  // Prune orphaned version history
+  db._stmts.pruneOldVersions.run();
+
+  console.log(`[brain] Pruned ${pruned} low-confidence nodes, ${orphanEdges.changes} orphan edges for ${projectId}`);
+  return { pruned, deletedEdges: orphanEdges.changes };
+}
+
 // --- Contextual Search (for proactive injection) ---
 
 async function contextualSearch(query, fileContext, projectId, intent, projectRoot, taskType = null, atomHints = [], projectWhy = "") {
@@ -1381,40 +1541,32 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
 function writeSearchExport(projectId) {
   if (!db) return;
   try {
-    const nodes = db._stmts.getAllProjectNodes.all(projectId);
-    const mindEntries = db.prepare(`SELECT * FROM mind_entries`).all();
+    // Only export meaningful knowledge types — not transient noise like commands
+    const nodes = db.prepare(`
+      SELECT id, name, entity_type, content, confidence
+      FROM nodes
+      WHERE project_id = ?
+        AND entity_type IN ('decision','lesson','pattern','error','error_fix','file','profile_atom','system_atom','project')
+    `).all(projectId);
+    const mindEntries = db.prepare(`SELECT id, content, completed FROM mind_entries`).all();
 
     const exported = nodes.map(n => {
       const content = JSON.parse(n.content || "{}").text || n.name;
-      let embeddingArray = null;
-      if (n.embedding) {
-        const floats = new Float32Array(n.embedding.buffer, n.embedding.byteOffset, n.embedding.byteLength / 4);
-        embeddingArray = Array.from(floats);
-      }
       return {
         id: n.id,
-        name: n.name,
         type: n.entity_type,
         content: content.slice(0, 500),
         confidence: n.confidence,
-        embedding: embeddingArray,
       };
     });
 
-    // Add global mind entries to the project export
+    // Add global mind entries (no embeddings — they're searched via keyword)
     for (const m of mindEntries) {
-      let embeddingArray = null;
-      if (m.embedding) {
-        const floats = new Float32Array(m.embedding.buffer, m.embedding.byteOffset, m.embedding.byteLength / 4);
-        embeddingArray = Array.from(floats);
-      }
       exported.push({
         id: m.id,
-        name: "Mind Thought",
         type: "mind",
         content: m.content,
-        confidence: 0.9, // Human-authored mind entries are high-confidence
-        embedding: embeddingArray,
+        confidence: 0.9,
         completed: !!m.completed,
       });
     }
@@ -1465,16 +1617,6 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
     }
   }
 
-  // Layer 3: Synthesis — cached project DNA narrative
-  if (db) {
-    try {
-      result.synthesis = readSynthesis(db, projectId) || null;
-    } catch {
-      result.synthesis = null;
-    }
-  } else {
-    result.synthesis = null;
-  }
 
   // ── Authoritative decisions: high-confidence, outcome-proven constraints ──
   // These are decisions the brain has accumulated enough evidence for (confidence >= 0.80)
@@ -2140,8 +2282,8 @@ function updateRules(text) {
   return { updated: true };
 }
 
-// Update identity (name, bio, role)
-function updateIdentity(identity) {
+// Update identity (name, bio, role) — merges into identity.json
+function updateIdentityJson(identity) {
   const current = readProfileJson("identity.json") || {};
   const updated = { ...current, ...identity };
   fs.writeFileSync(path.join(PROFILE_DIR, "identity.json"), JSON.stringify(updated, null, 2));
@@ -2150,10 +2292,10 @@ function updateIdentity(identity) {
   return { updated: true };
 }
 
-// Update DNA (full replacement — bypasses compile step)
-function updateDNA(dna) {
+// Update identity DNA (compiled bio text) — writes directly to compiled-identity.txt
+function updateIdentityDna(dna) {
   fs.mkdirSync(PROFILE_DIR, { recursive: true });
-  fs.writeFileSync(DNA_CACHE_PATH, dna, "utf-8");
+  fs.writeFileSync(IDENTITY_CACHE_PATH, dna, "utf-8");
   return { updated: true };
 }
 
@@ -2251,8 +2393,8 @@ function writeProfileExport() {
 
 // Get full profile for MCP/display
 function getProfile() {
-  let dna = "";
-  try { dna = fs.readFileSync(DNA_CACHE_PATH, "utf-8").trim(); } catch { /* DNA not compiled yet */ }
+  let identityStr = "";
+  try { identityStr = fs.readFileSync(IDENTITY_CACHE_PATH, "utf-8").trim(); } catch { /* identity not compiled yet */ }
   return {
     identity: readProfileJson("identity.json"),
     preferences: readProfileJson("preferences.json"),
@@ -2260,7 +2402,7 @@ function getProfile() {
     style: readProfileJson("style.json"),
     rules: readProfileMd("rules.md"),
     philosophy: readProfileMd("philosophy.md"),
-    dna,
+    dna: identityStr,
   };
 }
 
@@ -2386,6 +2528,15 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
+      case "prune": {
+        // Explicitly prune low-confidence nodes and orphaned edges.
+        // Called on startup for all projects, or on-demand via brainRequest.
+        if (!db) { sendToMain({ type: "prune_result", requestId: data.requestId, pruned: 0, deletedEdges: 0 }); break; }
+        const result = pruneOldNodes(data.projectId);
+        sendToMain({ type: "prune_result", requestId: data.requestId, ...result });
+        break;
+      }
+
       case "get_file_symbols": {
         if (!db) { sendToMain({ type: "file_symbols_result", requestId: data.requestId, symbols: [] }); break; }
         const fileSyms = getFileSymbols(db, data.projectId, data.filePath);
@@ -2448,6 +2599,27 @@ process.parentPort.on("message", async ({ data }) => {
       case "get_intelligence_stats": {
         const intStats = getIntelligenceStats(data.projectId);
         sendToMain({ type: "intelligence_stats_result", requestId: data.requestId, stats: intStats });
+        break;
+      }
+
+      case "get_all_projects": {
+        // Return all project IDs that have nodes in the brain database
+        if (!db) { sendToMain({ type: "all_projects_result", requestId: data.requestId, projects: [] }); break; }
+        const rows = db._stmts.getAllProjects.all();
+        sendToMain({ type: "all_projects_result", requestId: data.requestId, projects: rows.map(r => r.project_id) });
+        break;
+      }
+
+      case "vacuum": {
+        // Reclaim disk space by rebuilding the database file
+        if (!db) break;
+        try {
+          db.exec("VACUUM");
+          console.log("[brain] Database vacuum complete");
+        } catch (err) {
+          console.warn(`[brain] Vacuum failed: ${err.message}`);
+        }
+        sendToMain({ type: "vacuum_result", requestId: data.requestId });
         break;
       }
 
@@ -2561,13 +2733,13 @@ process.parentPort.on("message", async ({ data }) => {
       }
 
       case "update_identity": {
-        const result = updateIdentity(data.identity);
+        const result = updateIdentityJson(data.identity);
         sendToMain({ type: "identity_result", requestId: data.requestId, ...result });
         break;
       }
 
       case "update_dna": {
-        const result = updateDNA(data.dna);
+        const result = updateIdentityDna(data.dna);
         sendToMain({ type: "dna_result", requestId: data.requestId, ...result });
         break;
       }

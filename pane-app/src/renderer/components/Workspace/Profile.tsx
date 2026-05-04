@@ -874,8 +874,17 @@ function PaneAutoSection({
 
 // ─── API Keys Section ─────────────────────────────────────────────────────────
 
-// API key providers — each has a key input field
-const API_KEY_PROVIDERS = [
+// API key provider configuration
+interface ApiKeyProvider {
+  key: string;
+  label: string;
+  placeholder: string;
+  docsUrl: string;
+  showBaseUrl?: boolean;
+  defaultBaseUrl?: string;
+}
+
+const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   { key: "gemini", label: "Google Gemini", placeholder: "AI...", docsUrl: "https://aistudio.google.com/app/apikey", showBaseUrl: true, defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta" },
   { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys", showBaseUrl: true, defaultBaseUrl: "https://api.deepseek.com/v1/chat/completions" },
   { key: "anthropic", label: "Anthropic", placeholder: "sk-ant-...", docsUrl: "https://console.anthropic.com/settings/keys", showBaseUrl: true, defaultBaseUrl: "https://api.anthropic.com/v1/messages" },
@@ -883,7 +892,8 @@ const API_KEY_PROVIDERS = [
   { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/", showBaseUrl: true, defaultBaseUrl: "https://api.xiaomimimo.com/v1" },
   { key: "kimi", label: "Kimi (Moonshot)", placeholder: "sk-...", docsUrl: "https://platform.moonshot.cn/", showBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1/chat/completions" },
   { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
-] as const;
+  { key: "jina", label: "Jina AI", placeholder: "jina_...", docsUrl: "https://jina.ai/embeddings/" },
+];
 
 function ApiKeysSection({
   httpApiKeys,
@@ -941,9 +951,7 @@ function ApiKeysSection({
             active
           </span>
           {activeProviders.map((p) => {
-            const { key, label, placeholder, docsUrl } = p;
-            const showBaseUrl = (p as any).showBaseUrl;
-            const defaultBaseUrl = (p as any).defaultBaseUrl;
+            const { key, label, placeholder, docsUrl, showBaseUrl, defaultBaseUrl } = p;
             const toggleKey = toggleKeyFor(key);
             const val = httpApiKeys[key] || "";
             const baseUrl = httpBaseUrls[key] || "";
@@ -1079,9 +1087,7 @@ function ApiKeysSection({
             available
           </span>
           {availableProviders.map((p) => {
-            const { key, label, placeholder, docsUrl } = p;
-            const showBaseUrl = (p as any).showBaseUrl;
-            const defaultBaseUrl = (p as any).defaultBaseUrl;
+            const { key, label, placeholder, docsUrl, showBaseUrl, defaultBaseUrl } = p;
             const isExpanded = expandedAvailable === key;
 
             return (
@@ -1202,7 +1208,7 @@ function ApiKeysSection({
 
 // ─── Cloud Section ────────────────────────────────────────────────────────────
 
-const electronAPI = (window as any).electronAPI;
+const electronAPI = window.electronAPI;
 
 type SyncPhase = "idle" | "compressing" | "encrypting" | "uploading" | "complete" |
   "finding" | "downloading" | "decrypting" | "restoring";
@@ -1254,8 +1260,8 @@ function CloudSection() {
       const u = await cloudLogin();
       setUser(u);
       if (u) cloudGetStatus().then(setStatus).catch(() => {});
-    } catch (err: any) {
-      setSyncError(err?.message || "Login failed");
+    } catch (err: unknown) {
+      setSyncError(err instanceof Error ? err.message : "Login failed");
     } finally {
       setLoggingIn(false);
     }
@@ -1274,8 +1280,8 @@ function CloudSection() {
     setSyncPhase("compressing");
     try {
       await cloudTriggerBackup();
-    } catch (err: any) {
-      setSyncError(err?.message || "Backup failed");
+    } catch (err: unknown) {
+      setSyncError(err instanceof Error ? err.message : "Backup failed");
       setSyncPhase("idle");
     }
   };
@@ -1287,8 +1293,8 @@ function CloudSection() {
     setSyncPhase("finding");
     try {
       await cloudRestore();
-    } catch (err: any) {
-      setSyncError(err?.message || "Restore failed");
+    } catch (err: unknown) {
+      setSyncError(err instanceof Error ? err.message : "Restore failed");
       setSyncPhase("idle");
     } finally {
       setRestoring(false);
@@ -1575,9 +1581,10 @@ export function Profile() {
   }, []);
 
   useEffect(() => {
-    const cleanup = (window as any).electronAPI.on("pane-claude-signin", (data: any) => {
-      if (data.type === "status") {
-        if (data.output?.length) setClaudeSigninStatus(data.output);
+    const cleanup = window.electronAPI.on("pane-claude-signin", (raw: unknown) => {
+      const data = raw as { type?: string; output?: string[] | null } | undefined;
+      if (data?.type === "status" && data.output?.length) {
+        setClaudeSigninStatus(data.output);
       }
     });
     return () => cleanup?.();
@@ -1886,7 +1893,7 @@ export function Profile() {
                       onClick={() => {
                         setCompletionSound(s.id);
                         if (s.id !== "none") {
-                          (window as any).electronAPI.invoke("play_sound", { sound: s.id });
+                          window.electronAPI.invoke("play_sound", { sound: s.id });
                         }
                       }}
                       className={`w-4 h-4 rounded-full transition-all duration-200 ${

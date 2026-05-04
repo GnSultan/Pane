@@ -31,7 +31,7 @@ function FindingCard({
 }) {
   const [showRemediation, setShowRemediation] = useState(false);
 
-  let structured: any = {};
+  let structured: Record<string, unknown> = {};
   try {
     structured = JSON.parse(finding.structured || "{}");
   } catch {
@@ -43,7 +43,7 @@ function FindingCard({
     : finding.severity === "warning" ? "#B8A56A"
     : "#A8A59E";
 
-  const scopeLabel: string = String(structured.flow || structured.boundary || structured.journey || "");
+  const scopeLabel: string = String((structured.flow as string | undefined) ?? (structured.boundary as string | undefined) ?? (structured.journey as string | undefined) ?? "");
 
   return (
     <div className="mb-6 last:mb-0">
@@ -74,7 +74,7 @@ function FindingCard({
         className="text-pane-text leading-relaxed whitespace-pre-wrap"
         style={{ fontSize: "var(--pane-font-size-sm)" }}
       >
-        {finding.finding}
+        {String(finding.finding)}
       </p>
 
       {/* Location */}
@@ -88,7 +88,7 @@ function FindingCard({
       )}
 
       {/* Remediation (collapsible) */}
-      {structured.remediation && (
+      {(structured.remediation as string | undefined) && (
         <div className="mt-2.5">
           <button
             onClick={() => setShowRemediation(!showRemediation)}

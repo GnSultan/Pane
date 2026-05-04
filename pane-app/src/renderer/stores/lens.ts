@@ -208,13 +208,20 @@ function createLensStore() {
   }));
 }
 
+interface ViteHotContext {
+  data: Record<string, unknown>;
+}
+interface ViteImportMeta {
+  hot?: ViteHotContext;
+}
+
 // Preserve store across HMR
 export const useLensStore: ReturnType<typeof createLensStore> =
-  (import.meta as any).hot?.data?.__LENS_STORE__ ??
+  ((import.meta as unknown as ViteImportMeta).hot?.data?.__LENS_STORE__ as ReturnType<typeof createLensStore> | undefined) ??
   (() => {
     const store = createLensStore();
-    if ((import.meta as any).hot) {
-      (import.meta as any).hot.data.__LENS_STORE__ = store;
+    if ((import.meta as unknown as ViteImportMeta).hot) {
+      (import.meta as unknown as ViteImportMeta).hot!.data.__LENS_STORE__ = store;
     }
     return store;
   })();

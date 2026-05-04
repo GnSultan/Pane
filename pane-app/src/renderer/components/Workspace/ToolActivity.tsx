@@ -58,7 +58,7 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       }
       case "pane_checkpoints": return "checkpoints";
       case "pane_change_history": return "change history";
-      case "pane_set_why": return "set why";
+      case "pane_set_about": return "set about";
       case "pane_set_philosophy": return "set philosophy";
       case "pane_set_rule": return "set rule";
       case "pane_synthesize": {

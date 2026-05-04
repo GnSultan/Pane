@@ -508,9 +508,11 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
           maxHeight={window.innerHeight * 0.4}
         />
 
-        {/* Buttons — absolute bottom, floating inside the card, no background */}
+        {/* Buttons — absolute bottom, floating inside the card, no background.
+             pl-12 clears the Menu trigger button (absolute bottom-3 left-3 w-8 h-8 in Workspace),
+             so the push/pull buttons aren't hidden beneath it. */}
         <div
-          className="absolute bottom-0 left-0 right-0 flex items-center gap-2 p-1.5 font-mono pointer-events-none"
+          className="absolute bottom-0 left-0 right-0 flex items-center gap-2 p-1.5 pl-12 font-mono pointer-events-none"
           style={{ fontSize: "var(--pane-font-size-xs)" }}
         >
           <button

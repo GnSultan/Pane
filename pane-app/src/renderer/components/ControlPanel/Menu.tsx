@@ -182,7 +182,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode }: Me
                 <button
                   key={m.id}
                   onClick={() => handleSelect(m.id)}
-                  className={`w-full flex items-center gap-3 px-2.5 h-8 text-left transition-colors relative rounded-md
+                  className={`pointer-events-auto w-full flex items-center gap-3 px-2.5 h-8 text-left transition-colors relative rounded-md
                     ${isActive
                       ? "text-pane-text bg-pane-accent/[0.10]"
                       : "text-pane-text-secondary hover:text-pane-text hover:bg-pane-bg hover:ring-1 hover:ring-pane-border/40"
@@ -208,7 +208,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode }: Me
         /* Icon button — only visible when closed */
         <button
           onClick={handleToggle}
-          className="w-8 h-8 flex items-center justify-center rounded-md ring-1 ring-pane-border/40 bg-pane-bg text-pane-text-secondary hover:text-pane-text transition-colors btn-press"
+          className="pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md ring-1 ring-pane-border/40 bg-pane-bg text-pane-text-secondary hover:text-pane-text transition-colors btn-press"
           title="modes"
         >
           <MenuTriggerIcon />

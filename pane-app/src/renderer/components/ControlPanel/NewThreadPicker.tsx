@@ -48,8 +48,8 @@ export function NewThreadPicker({ onClose }: Props) {
       const created = await electronAPI.invoke("create-directory", path);
       addProject(created as string);
       onClose();
-    } catch (err: any) {
-      setError(err?.message ?? "failed");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "failed");
     }
   };
 

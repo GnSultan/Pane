@@ -155,15 +155,15 @@ function applyTheme(theme: Theme) {
     }
     // Toggle native vibrancy for Liquid Glass
     const vibrancy = resolved === "glass" ? "under-window" : null;
-    (window as any).electronAPI?.invoke("set_vibrancy", { vibrancy }).catch(() => {});
+    window.electronAPI?.invoke("set_vibrancy", { vibrancy }).catch(() => {});
     // Switch dock icon variant
     setAppTheme(resolved);
   };
 
   // Use View Transitions API for a smooth crossfade between themes.
   // Falls back to instant apply if the API isn't available.
-  if ((document as any).startViewTransition) {
-    const transition = (document as any).startViewTransition(apply);
+  if ("startViewTransition" in document) {
+    const transition = (document as Document & { startViewTransition(cb: () => void): { finished: Promise<void> } }).startViewTransition(apply);
     // Style the transition: soft crossfade, no movement
     const style = document.createElement("style");
     style.textContent = `
@@ -387,7 +387,7 @@ function createWorkspaceStore() {
     playCompletionSound: () => {
       const { completionSound } = get();
       if (completionSound === "none") return;
-      (window as any).electronAPI.invoke("play_sound", {
+      window.electronAPI.invoke("play_sound", {
         sound: completionSound,
       });
     },
@@ -421,35 +421,48 @@ function createWorkspaceStore() {
   }));
 }
 
+// Vite HMR context — typed inline since the Vite types are optional at runtime
+interface ViteHotContext {
+  data: Record<string, unknown>;
+}
+interface ViteImportMeta {
+  hot?: ViteHotContext;
+}
+
 // Preserve store across HMR — prevents state loss and stale subscriptions
 export const useWorkspaceStore: ReturnType<typeof createWorkspaceStore> =
-  (import.meta as any).hot?.data?.__WORKSPACE_STORE__ ??
+  ((import.meta as unknown as ViteImportMeta).hot?.data?.__WORKSPACE_STORE__ as ReturnType<typeof createWorkspaceStore> | undefined) ??
   (() => {
     const store = createWorkspaceStore();
-    if ((import.meta as any).hot) {
-      (import.meta as any).hot.data.__WORKSPACE_STORE__ = store;
+    if ((import.meta as unknown as ViteImportMeta).hot) {
+      (import.meta as unknown as ViteImportMeta).hot!.data.__WORKSPACE_STORE__ = store;
     }
     return store;
   })();
 
 // Listen for background model updates from the main process
-(window as any).electronAPI.on("pane:models-updated", (models: any) => {
+window.electronAPI.on("pane:models-updated", (raw: unknown) => {
+  const models = raw as Record<string, import("../lib/tauri-commands").OpenRouterModel[]> | undefined;
   useWorkspaceStore.setState({
-    allModels: models,
-    openRouterModels: models.openrouter || []
+    allModels: models ?? {},
+    openRouterModels: models?.openrouter ?? []
   });
 });
 
 // Listen for SDK auth info — arrives from prefetch before any project is active.
 // Also fires on logout (account: null) so the Profile UI reflects sign-out immediately.
-(window as any).electronAPI.on("pane-sdk-auth", (data: any) => {
+window.electronAPI.on("pane-sdk-auth", (raw: unknown) => {
+  const data = raw as { account?: Record<string, unknown> | null; models?: unknown[] | null } | null;
   const hasAccount = data?.account != null;
   const hasModels  = data?.models  != null;
 
   if (hasAccount || hasModels) {
     // New auth info arrived — update account/models only.
     // Rate limit clearing is handled session-scoped in handleEvent's sdk_init_info case.
-    useWorkspaceStore.getState().setSdkInfo(data.models || null, data.account || null);
+    useWorkspaceStore.getState().setSdkInfo(
+      (data?.models as import("../lib/punk-types").SdkModel[] | null) ?? null,
+      (data?.account as import("../lib/punk-types").SdkAccount | null) ?? null
+    );
   } else {
     // Explicit null broadcast (logout) — clear account and stale usage indicators
     useWorkspaceStore.getState().setSdkInfo(null, null);

@@ -55,8 +55,9 @@ export function ControlPanel() {
         <ProjectList />
       </div>
 
-      {/* Menu — in normal flow at the bottom, width is the anchor that the thread highlight matches */}
-      <div className="px-2 pb-2">
+      {/* Menu — in normal flow at the bottom, width is the anchor that the thread highlight matches.
+           px-1.5 pb-1.5 matches the InputBar '+' attach button padding (p-1.5). */}
+      <div className="px-1.5 pb-1.5">
         <Menu
           currentMode={mode}
           isGitRepo={isGitRepo}

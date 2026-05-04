@@ -108,8 +108,8 @@ function RateLimitIndicator() {
   // Credit users (pay-as-you-go): show overage state immediately since it has
   // direct cost implications.
   const isSubscription =
-    (sdkAccount as any)?.billingType === "stripe_subscription" ||
-    (sdkAccount as any)?.subscription != null;
+    (sdkAccount as Record<string, unknown> | null)?.billingType === "stripe_subscription" ||
+    sdkAccount?.subscription != null;
 
   // Overage rejected (exhausted all usage / overage disabled and request blocked)
   if (overageRejected) {
@@ -275,14 +275,14 @@ function ModelPickerTrigger({
     if (autoRoute) {
       if (isProcessing && routedModel) {
         for (const models of Object.values(fetchedModels)) {
-          const found = (models as any[])?.find((m: any) => m.id === routedModel);
+          const found = models?.find((m) => m.id === routedModel);
           if (found) return (found.name || found.id).toLowerCase();
         }
       }
       return "pane auto";
     }
     for (const models of Object.values(fetchedModels)) {
-      const found = (models as any[])?.find((m: any) => m.id === value);
+      const found = models?.find((m) => m.id === value);
       if (found) return (found.name || found.id).toLowerCase();
     }
     return value.toLowerCase() || "model";
@@ -401,10 +401,10 @@ function ModelPickerExpanded({
     // Group by provider, Claude first, then alphabetical
     const grouped = new Map<string, ModelItem[]>();
     for (const [providerKey, models] of Object.entries(fetchedModels)) {
-      if (!models || (models as any[]).length === 0) continue;
+      if (!models || models.length === 0) continue;
       if (disabledProviders.includes(providerKey)) continue;
       const group: ModelItem[] = [];
-      for (const m of models as any[]) {
+      for (const m of models) {
         group.push({
           kind: "model",
           value: m.id,

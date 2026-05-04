@@ -239,6 +239,11 @@ function _prepareStatements(db) {
       ORDER BY created_at ASC, rowid ASC
       LIMIT ? OFFSET ?
     `),
+    keepLatestMessages: db.prepare(`
+      DELETE FROM messages WHERE project_id = ? AND id NOT IN (
+        SELECT id FROM messages WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?
+      )
+    `),
 
     // conversation_meta
     upsertConvMeta: db.prepare(`
@@ -498,6 +503,30 @@ export function extractMessageText(contentJson) {
   }
 }
 
+/**
+ * Prune old conversation messages from pane.db, keeping only the latest N.
+ * Call after successful post-turn extraction — the structured knowledge is
+ * already in the brain engine's graph, the raw messages are no longer needed.
+ *
+ * FTS is cleaned up automatically via the messages_fts_delete trigger.
+ *
+ * @param {string} projectId
+ * @param {number} [keepCount=200] - Number of most recent messages to retain
+ */
+export function pruneConversationMessages(projectId, keepCount = 200) {
+  try {
+    const db = getPaneDb();
+    if (!db || !db.stmts.keepLatestMessages) return;
+    const before = db.stmts.countMessages.get(projectId)?.cnt ?? 0;
+    if (before <= keepCount) return; // Nothing to prune
+    db.stmts.keepLatestMessages.run(projectId, projectId, keepCount);
+    const after = db.stmts.countMessages.get(projectId)?.cnt ?? 0;
+    console.log(`[pane-db] Pruned messages for ${projectId}: ${before} -> ${after} (kept ${keepCount})`);
+  } catch (err) {
+    console.warn(`[pane-db] pruneConversationMessages failed: ${err.message}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // One-time migration from legacy JSON files
 // ---------------------------------------------------------------------------
@@ -506,11 +535,7 @@ export async function runMigrationIfNeeded(db) {
   const row = db.stmts.getMigrationVersion.get();
   const version = row?.version ?? 0;
 
-  // Always check for legacy files even if version is >= 1, 
-  // to clean up any stragglers or ensure completion.
-  const hasLegacyChanges = fs.existsSync(path.join(PANE_DIR, "change-history"));
-  
-  if (version < 1 || hasLegacyChanges) {
+  if (version < 1) {
     console.log("[pane-db] Checking for one-time migration from JSON files...");
     try { await _migrateConversations(db); } catch (e) { console.error("[pane-db] conv migration error:", e.message); }
     try { await _migrateChangeHistory(db); } catch (e) { console.error("[pane-db] change migration error:", e.message); }
@@ -622,6 +647,15 @@ async function _migrateConversations(db) {
 
       insertMessages(messages);
       console.log(`[pane-db] migrated ${messages.length} messages for project ${projectId}`);
+
+      // Archive the migrated file so it won't be re-processed on restart
+      try {
+        const bakDir = path.join(convDir, "archived");
+        fs.mkdirSync(bakDir, { recursive: true });
+        fs.renameSync(path.join(convDir, file), path.join(bakDir, `${file}.bak`));
+      } catch (e) {
+        console.warn(`[pane-db] failed to archive conversation ${file}:`, e.message);
+      }
     } catch (e) {
       console.error(`[pane-db] failed to migrate conversation ${file}:`, e.message);
     }

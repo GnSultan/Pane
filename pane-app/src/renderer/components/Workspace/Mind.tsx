@@ -320,10 +320,10 @@ export function Mind() {
 
   // Listen for punk-finding events — reload entry list when sentinel creates new entries
   useEffect(() => {
-    const electronAPI = (window as any).electronAPI;
-    const unlisten = electronAPI.on(
+    const unlisten = window.electronAPI.on(
       "pane://punk-finding",
-      (data: { entryId?: string; punkType?: string; projectId?: string }) => {
+      (raw: unknown) => {
+        const data = raw as { entryId?: string; projectId?: string } | undefined;
         if (data?.projectId && !data?.entryId) {
           // Sentinel created new mind entries — reload the full entry list
           brainMindGetAll()

@@ -101,7 +101,7 @@ export function FileSearch() {
       onKeyDown={handleKeyDown}
     >
       <div
-        className={`w-full max-w-[640px] mx-4 bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden flex flex-col animate-fadeSlideUp ${
+        className={`w-full max-w-4xl mx-4 bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden flex flex-col animate-fadeSlideUp ${
           hasResults ? "max-h-[520px]" : ""
         }`}
       >

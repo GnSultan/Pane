@@ -1588,6 +1588,8 @@ function handlePunkMessage(
         return true;
       });
 
+      const msgMsg = msg.message as { content: ContentBlock[]; reasoning_content?: string } | undefined;
+
       if (assistantMessageExists) {
         const project = store.projects.get(projectId);
         if (project) {
@@ -1623,7 +1625,7 @@ function handlePunkMessage(
             store.updateLastAssistantContent(projectId, merged);
             
             // Capture reasoning_content if present
-            const reasoning = (msg.message as any).reasoning_content;
+            const reasoning = msgMsg?.reasoning_content;
             if (reasoning) {
               store.updateMessageReasoning(projectId, last.id, reasoning);
             }
@@ -1649,7 +1651,7 @@ function handlePunkMessage(
           id: nextMessageId(),
           type: "assistant",
           content: finalContent,
-          reasoning_content: (msg.message as any).reasoning_content,
+          reasoning_content: msgMsg?.reasoning_content,
           timestamp: Date.now(),
           isStreaming: false,
         };

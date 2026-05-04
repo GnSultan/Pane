@@ -45,17 +45,17 @@ export function TaskNotification() {
 
   // Listen for review completion — mark Lens as having unread findings
   useEffect(() => {
-    const electronAPI = (window as any).electronAPI;
-    const unlisten = electronAPI.on(
+    const unlisten = window.electronAPI.on(
       "pane://review-complete",
-      (data: { projectId?: string; findings?: unknown[] }) => {
-        if (!data?.projectId || !data?.findings?.length) return;
+      (data: unknown) => {
+        const ev = data as { projectId?: string; findings?: unknown[] } | undefined;
+        if (!ev?.projectId || !ev?.findings?.length) return;
         const s = useProjectsStore.getState();
         const isViewingLens =
-          s.activeProjectId === data.projectId &&
-          s.projects.get(data.projectId)?.mode === "lens";
+          s.activeProjectId === ev.projectId &&
+          s.projects.get(ev.projectId)?.mode === "lens";
         if (!isViewingLens) {
-          s.setHasUnreadLens(data.projectId, true);
+          s.setHasUnreadLens(ev.projectId, true);
         }
       }
     );
@@ -64,10 +64,10 @@ export function TaskNotification() {
 
   // Listen for new Lens posts — set badge if user isn't already on Lens
   useEffect(() => {
-    const electronAPI = (window as any).electronAPI;
-    const unlisten = electronAPI.on(
+    const unlisten = window.electronAPI.on(
       "pane://lens-post",
-      (post: { project_id?: string }) => {
+      (data: unknown) => {
+        const post = data as { project_id?: string } | undefined;
         if (!post?.project_id) return;
         const s = useProjectsStore.getState();
         const isViewingLens =

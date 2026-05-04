@@ -1697,7 +1697,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         let projectWhy = "";
         try {
           projectWhy = (await fs.readFile(
-            path.join(os.homedir(), ".pane", "memory", resolvedRequest.projectId, "why.md"), "utf-8"
+            path.join(os.homedir(), ".pane", "memory", resolvedRequest.projectId, "about.md"), "utf-8"
           )).trim();
         } catch {}
 
@@ -2339,6 +2339,55 @@ export async function registerPunkHandlers() {
       }
     }
     return { success: true };
+  });
+
+  // ── Memory Diagnostics ─────────────────────────────────────────────────
+  // Snapshots the main process memory state. Call from renderer or terminal
+  // when a leak is suspected. Returns V8 heap + OS-level RSS in MB.
+  //
+  // Usage from terminal:
+  //   echo 'require("electron").ipcMain.emit("get_memory_info")' | ...
+  // Or from renderer DevTools:
+  //   await window.electronAPI.getMemoryInfo()
+  ipcMain.handle("get_memory_info", async () => {
+    const usage = process.memoryUsage();
+    const resource = process.resourceUsage ? process.resourceUsage() : null;
+    let v8heap = null;
+    try {
+      const v8 = require("node:v8");
+      v8heap = v8.getHeapStatistics();
+    } catch {}
+
+    return {
+      timestamp: Date.now(),
+      pid: process.pid,
+      memory: {
+        rss_mb:        Math.round(usage.rss / 1024 / 1024),
+        heap_total_mb: Math.round(usage.heapTotal / 1024 / 1024),
+        heap_used_mb:  Math.round(usage.heapUsed / 1024 / 1024),
+        external_mb:   Math.round(usage.external / 1024 / 1024),
+        array_buffers_mb: usage.arrayBuffers
+          ? Math.round(usage.arrayBuffers / 1024 / 1024)
+          : null,
+      },
+      resource_usage: resource ? {
+        max_rss_mb:         Math.round(resource.maxRSS / 1024),
+        shared_mb:          Math.round(resource.sharedSize / 1024),
+        unshared_data_mb:   Math.round(resource.unsharedDataSize / 1024),
+        unshared_stack_mb:  Math.round(resource.unsharedStackSize / 1024),
+      } : null,
+      v8_heap: v8heap ? {
+        total_heap_size_mb:       Math.round(v8heap.total_heap_size / 1024 / 1024),
+        total_heap_executable_mb: Math.round(v8heap.total_heap_size_executable / 1024 / 1024),
+        total_physical_mb:        Math.round(v8heap.total_physical_size / 1024 / 1024),
+        used_heap_mb:             Math.round(v8heap.used_heap_size / 1024 / 1024),
+        heap_size_limit_mb:       Math.round(v8heap.heap_size_limit / 1024 / 1024),
+        mallocated_mb:            Math.round(v8heap.malloced_memory / 1024 / 1024),
+        peak_mallocated_mb:       Math.round(v8heap.peak_malloced_memory / 1024 / 1024),
+        number_of_native_contexts: v8heap.number_of_native_contexts,
+        number_of_detached_contexts: v8heap.number_of_detached_contexts,
+      } : null,
+    };
   });
 }
 

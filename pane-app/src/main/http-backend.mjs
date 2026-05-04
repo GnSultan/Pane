@@ -24,7 +24,7 @@ import {
 import { manageConversation } from "./conversation-lifecycle.mjs";
 import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
 import { openJournal, canResume, replay, clearJournal } from "./session-journal.mjs";
-import { getPaneDb } from "./pane-db.mjs";
+import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 
 // ============================================================================
 // Context Window Manager — Pane-owned conversation lifecycle
@@ -558,7 +558,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_synthesize",
       description:
-        "Get the project's architectural DNA — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
+        "Get the project's accumulated memory — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -610,17 +610,17 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "pane_set_why",
-      description: "Set this project's foundational purpose — what it is trying to be, who it serves, what problem it solves, and where it is headed. Per-project. Call this once you have understood the project's core purpose through conversation.",
+      name: "pane_set_about",
+      description: "Record what this project is — its purpose, identity, and how it works. Per-project. Call this once you have understood the project deeply enough to articulate it clearly. Writes to about.md.",
       parameters: {
         type: "object",
         properties: {
-          why: {
+          about: {
             type: "string",
-            description: "The project's foundational purpose — a concise narrative covering what it is, who it's for, what problem it solves, and its direction",
+            description: "The project's description — what it is, who it's for, the problem it solves, its identity and direction",
           },
         },
-        required: ["why"],
+        required: ["about"],
       },
     },
   },
@@ -912,7 +912,7 @@ const TOOL_DEFINITIONS = [
 // execution — all tools: model implements the plan
 const WRITE_TOOL_NAMES = new Set([
   "run_shell_command", "write_file", "replace",
-  "pane_revert_change", "pane_remember", "pane_set_rule", "pane_set_philosophy", "pane_set_why",
+  "pane_revert_change", "pane_remember", "pane_set_rule", "pane_set_philosophy", "pane_set_about",
   "TodoWrite", "Task", "activate_skill", "codebase_investigator", "generalist",
   "cli_help", "save_memory",
 ]);
@@ -3204,14 +3204,64 @@ export class ApiBackend extends PunkBackend {
             const cheapReq = { provider: null, model: null, thinking: false };
             return this.planningCall(sys, usr, cheapReq);
           };
+          const brainRequestRef = this._brainRequest;
+          const projectId = request.projectId;
           // Fire-and-forget — initial handoff written below, LLM enrichment replaces it in-place
           // via updateLatestHandoff (not writeHandoffWithHistory) to avoid a duplicate history entry
           extractWithLLM(sessionOutput, quickCallFn).then(llmExtracted => {
             if (Object.keys(llmExtracted).length > 0) {
               const enriched = mergeExtractedIntoHandoff({ ...handoff }, llmExtracted);
-              updateLatestHandoff(request.projectId, enriched);
+              updateLatestHandoff(projectId, enriched);
+              // Also index LLM-extracted items into brain
+              const llmEvents = [];
+              for (const item of (llmExtracted.accomplishments || [])) {
+                llmEvents.push({ type: "accomplishment", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
+              }
+              for (const item of (llmExtracted.blockers || [])) {
+                llmEvents.push({ type: "blocker", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
+              }
+              for (const item of (llmExtracted.nextSteps || [])) {
+                llmEvents.push({ type: "intent", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
+              }
+              for (const item of (llmExtracted.discoveries || [])) {
+                llmEvents.push({ type: "discovery", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
+              }
+              if (llmEvents.length > 0 && brainRequestRef) {
+                brainRequestRef("index_events", { projectId, events: llmEvents }).catch(() => {});
+              }
             }
           }).catch(() => {});
+        }
+
+        // ── Close the loop: wire extracted knowledge → brain engine ──────
+        // Send structured extraction output as index_events so it enters the
+        // knowledge graph, gets synthesized, and becomes searchable across
+        // sessions. Then prune the raw messages since they've been extracted.
+        const brainEvents = [];
+        for (const item of (extracted.accomplishments || [])) {
+          brainEvents.push({ type: "accomplishment", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
+        }
+        for (const item of (extracted.blockers || [])) {
+          brainEvents.push({ type: "blocker", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
+        }
+        for (const item of (extracted.nextSteps || [])) {
+          brainEvents.push({ type: "intent", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
+        }
+        for (const item of (extracted.discoveries || [])) {
+          brainEvents.push({ type: "discovery", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
+        }
+        for (const item of (extracted.corrections || [])) {
+          brainEvents.push({ type: "correction", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
+        }
+        if (brainEvents.length > 0 && this._brainRequest) {
+          this._brainRequest("index_events", { projectId: request.projectId, events: brainEvents })
+            .then(result => {
+              // Only prune if brain indexing actually succeeded
+              if (result && result.type !== "error") {
+                pruneConversationMessages(request.projectId, 200);
+              }
+            })
+            .catch(err => console.warn(`[http] brain index_events failed (non-fatal): ${err.message}`));
         }
       }
       try {
