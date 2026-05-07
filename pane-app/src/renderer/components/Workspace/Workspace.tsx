@@ -8,8 +8,8 @@ import { Lens } from "./Lens";
 import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
 import { FuzzyFinder } from "../FuzzyFinder/FuzzyFinder";
 import { FileSearch } from "../FileSearch/FileSearch";
-import { GitStatus } from "../ControlPanel/GitStatus";
-import { Menu, type PaneMode } from "../ControlPanel/Menu";
+import { GitStatus } from "../ThreadPanel/GitStatus";
+import { Menu, type PaneMode } from "../ThreadPanel/Menu";
 import { useProjectsStore } from "../../stores/projects";
 import { detectProjectRoot } from "../../lib/tauri-commands";
 

@@ -7,7 +7,7 @@ import type {
   WebSearchResult,
   WebSearchToolResultError,
 } from "../../lib/punk-types";
-import { MarkdownText } from "./MarkdownText";
+import { MarkdownText, renderHighlightedCode } from "./MarkdownText";
 import { MicroIndicator } from "../shared";
 import { useProjectsStore } from "../../stores/projects";
 import { writePty } from "../../lib/tauri-commands";
@@ -29,6 +29,8 @@ function parseMcpName(name: string): { server: string; tool: string } | null {
   if (tool.startsWith(server + " ")) tool = tool.slice(server.length + 1);
   return { server, tool };
 }
+
+
 
 function summarizeTool(name: string, input: Record<string, unknown>): string {
   // Bare pane_* tool names from API backend (no mcp__ prefix)
@@ -203,51 +205,221 @@ function getToolLabel(name: string): string {
   }
 }
 
-export function ExpandedEditInput({ input }: { input: Record<string, unknown> }) {
+/**
+ * Compute a simple line-level diff by scanning prefix and suffix for common lines.
+ * Returns the minimal set of changed lines: old lines (removed) and new lines (added).
+ * Context lines (unchanged) immediately adjacent to changes are included for orientation.
+ */
+interface DiffLine {
+  type: "same" | "removed" | "added";
+  text: string;
+  /** 1-based line number from the old file (undefined for added lines) */
+  lineNum?: number;
+}
+
+function computeLineDiff(
+  oldLines: string[],
+  newLines: string[],
+  contextLines: number = 2,
+  fileStartLine: number = 1,
+): DiffLine[] {
+  // Find common prefix
+  let prefixLen = 0;
+  while (
+    prefixLen < oldLines.length &&
+    prefixLen < newLines.length &&
+    oldLines[prefixLen] === newLines[prefixLen]
+  ) {
+    prefixLen++;
+  }
+
+  // Find common suffix
+  let suffixLen = 0;
+  while (
+    suffixLen < oldLines.length - prefixLen &&
+    suffixLen < newLines.length - prefixLen &&
+    oldLines[oldLines.length - 1 - suffixLen] === newLines[newLines.length - 1 - suffixLen]
+  ) {
+    suffixLen++;
+  }
+
+  // Slice out the changed region
+  const oldChanged = oldLines.slice(prefixLen, oldLines.length - suffixLen);
+  const newChanged = newLines.slice(prefixLen, newLines.length - suffixLen);
+
+  const result: DiffLine[] = [];
+
+  // Context before changes
+  const contextStart = Math.max(0, prefixLen - contextLines);
+  for (let i = contextStart; i < prefixLen; i++) {
+    result.push({ type: "same", text: oldLines[i]!, lineNum: fileStartLine + i });
+  }
+
+  // Removed lines — line numbers from old file
+  for (let j = 0; j < oldChanged.length; j++) {
+    result.push({ type: "removed", text: oldChanged[j]!, lineNum: fileStartLine + prefixLen + j });
+  }
+
+  // Added lines — line number from the new file position
+  for (let j = 0; j < newChanged.length; j++) {
+    result.push({ type: "added", text: newChanged[j]!, lineNum: fileStartLine + prefixLen + j });
+  }
+
+  // Context after changes — line numbers from old file
+  const suffixStart = oldLines.length - suffixLen;
+  const contextEnd = Math.min(suffixStart + contextLines, oldLines.length);
+  for (let i = suffixStart; i < contextEnd; i++) {
+    result.push({ type: "same", text: oldLines[i]!, lineNum: fileStartLine + i });
+  }
+
+  return result;
+}
+
+/**
+ * Detect syntax highlighting language from a file path.
+ */
+function detectLanguage(filePath: string): string {
+  const ext = filePath.split(".").pop()?.toLowerCase() || "";
+  switch (ext) {
+    case "ts": case "tsx": return "typescript";
+    case "js": case "jsx": case "mjs": case "cjs": return "javascript";
+    case "py": return "python";
+    case "html": return "html";
+    case "css": return "css";
+    case "json": return "json";
+    case "yaml": case "yml": return "yaml";
+    case "md": case "mdx": return "markdown";
+    case "sh": case "bash": case "zsh": return "bash";
+    default: return "javascript";
+  }
+}
+
+export function ExpandedEditInput({ input, result }: { input: Record<string, unknown>; result?: ToolResultBlock }) {
   const oldStr = (input.old_string as string) || "";
   const newStr = (input.new_string as string) || "";
+  const filePath = (input.file_path as string) || "";
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // useEffect fires before paint — scroll position is correct on first frame,
-  // no flash of the top of the file before snapping to the current write position.
+  // Actual line number where the old_string starts in the file (1-based)
+  const fileStartLine = (result?.metadata?.startLine as number) || 1;
+
+  const lang = useMemo(() => detectLanguage(filePath), [filePath]);
+
+  // Two-phase rendering:
+  // Phase 1: replacement hasn't started → old code as plain document (no strikethrough)
+  // Phase 2: new_string is streaming → old code struck through, new code streams in
+  const isReplacing = newStr.length > 0;
+
+  // Scroll to bottom as new replacement code streams in (Phase 2 only)
   useEffect(() => {
-    if (containerRef.current) {
+    if (isReplacing && containerRef.current) {
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
-  }, [oldStr, newStr]);
+  }, [newStr, isReplacing]);
+
+  // ── Phase 1: Old code rendered as it appears in the actual document ──
+  if (!isReplacing) {
+    if (!oldStr) return null;
+    const lines = oldStr.split("\n");
+    return (
+      <div
+        className="font-mono overflow-x-auto max-h-[400px] overflow-y-auto leading-[1.6]"
+        style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
+      >
+        <div className="px-4 py-4 space-y-0">
+          {lines.map((line, i) => (
+            <div key={i} className="whitespace-pre-wrap break-words flex gap-3">
+              {/* Line number — matches file viewer style */}
+              <span
+                className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
+                style={{
+                  width: "3em",
+                  opacity: 0.4,
+                  fontSize: "calc(var(--pane-font-size) - 2px)",
+                }}
+              >
+                {fileStartLine + i}
+              </span>
+              {/* Code — full opacity, no strikethrough, syntax highlighted */}
+              <span>
+                {line.length > 0
+                  ? renderHighlightedCode(line, lang)
+                  : <>&nbsp;</>}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Phase 2: Replacement streaming — full diff with strikethrough ──
+  const diffLines = useMemo(() => {
+    if (!oldStr && !newStr) return [];
+    if (!oldStr) {
+      return newStr.split("\n").map((line) => ({ type: "added" as const, text: line, lineNum: undefined }));
+    }
+    return computeLineDiff(oldStr.split("\n"), newStr.split("\n"), 2, fileStartLine);
+  }, [oldStr, newStr, fileStartLine]);
+
+  if (diffLines.length === 0) return null;
 
   return (
     <div
       ref={containerRef}
-      className="font-mono overflow-x-auto max-h-[400px] overflow-y-auto
-                 leading-[1.6] space-y-0"
+      className="font-mono overflow-x-auto max-h-[400px] overflow-y-auto leading-[1.6]"
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
     >
-      {oldStr && (
-        <div className="px-4 py-4">
-          <div className="text-[9px] uppercase tracking-wider mb-2 text-pane-text-secondary/40">
-            Original
+      <div className="px-4 py-4 space-y-0">
+        {diffLines.map((line, i) => (
+          <div
+            key={i}
+            className="whitespace-pre-wrap break-words flex gap-3"
+            style={{
+              opacity: line.type === "same" ? 0.35 : line.type === "removed" ? 0.75 : 1,
+            }}
+          >
+            {/* Line number — right-aligned in fixed width, dimmed */}
+            <span
+              className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
+              style={{
+                width: "3em",
+                opacity: 0.4,
+                fontSize: "calc(var(--pane-font-size) - 2px)",
+              }}
+            >
+              {line.lineNum}
+            </span>
+            {/* Code content — syntax highlighted */}
+            <span
+              className={line.type === "removed" ? "line-through" : ""}
+              style={{
+                textDecorationColor: line.type === "removed" ? "var(--pane-error)" : undefined,
+                opacity: line.type === "removed" ? 0.7 : 1,
+              }}
+            >
+              {line.text.length > 0
+                ? renderHighlightedCode(line.text, lang)
+                : <>&nbsp;</>}
+            </span>
           </div>
-          <div className="opacity-50">
-            <MarkdownText text={`\`\`\`ts\n${oldStr}\n\`\`\``} />
-          </div>
-        </div>
-      )}
-      {newStr && (
-        <div className="px-4 py-4 border-t border-pane-text-secondary/10">
-          <div className="text-[9px] uppercase tracking-wider mb-2 text-pane-text-secondary/40">
-            Replacement
-          </div>
-          <MarkdownText text={`\`\`\`ts\n${newStr}\n\`\`\``} />
-        </div>
-      )}
+        ))}
+      </div>
     </div>
   );
 }
 
 export function ExpandedWriteInput({ input }: { input: Record<string, unknown> }) {
   const content = (input.content as string) || "";
+  const filePath = (input.file_path as string) || "";
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  const lang = useMemo(() => detectLanguage(filePath), [filePath]);
+
+  const lines = useMemo(() => {
+    if (!content) return [];
+    return content.split("\n");
+  }, [content]);
 
   // useEffect fires before paint — ensures the scroll tracks the stream
   // position on every frame without a top-of-file flash.
@@ -257,6 +429,8 @@ export function ExpandedWriteInput({ input }: { input: Record<string, unknown> }
     }
   }, [content]);
 
+  if (lines.length === 0) return null;
+
   return (
     <div
       ref={scrollRef}
@@ -264,10 +438,28 @@ export function ExpandedWriteInput({ input }: { input: Record<string, unknown> }
                  leading-[1.6]"
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
     >
-      <div className="px-4 py-4">
-        <MarkdownText
-          text={`\`\`\`ts\n${content}\n\`\`\``}
-        />
+      <div className="px-4 py-4 space-y-0">
+        {lines.map((line, i) => (
+          <div key={i} className="whitespace-pre-wrap break-words flex gap-3">
+            {/* Line number — right-aligned in fixed width, dimmed */}
+            <span
+              className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
+              style={{
+                width: "3em",
+                opacity: 0.4,
+                fontSize: "calc(var(--pane-font-size) - 2px)",
+              }}
+            >
+              {i + 1}
+            </span>
+            {/* Code content — syntax highlighted */}
+            <span>
+              {line.length > 0
+                ? renderHighlightedCode(line, lang)
+                : <>&nbsp;</>}
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -295,14 +487,17 @@ function ExpandedTodoInput({ input }: { input: Record<string, unknown> }) {
           </span>
           <span
             className={
-              todo.status === "completed"
+              "min-w-0 truncate " +
+              (todo.status === "completed"
                 ? "text-pane-text-secondary/60 line-through"
                 : todo.status === "in_progress"
                   ? "text-pane-text"
-                  : "text-pane-text-secondary/60"
+                  : "text-pane-text-secondary/60")
             }
           >
-            {todo.content}
+            {todo.content.length > 60
+              ? todo.content.slice(0, 60) + "..."
+              : todo.content}
           </span>
         </div>
       ))}
@@ -321,9 +516,19 @@ function ExpandedDefaultInput({ input }: { input: Record<string, unknown> }) {
   );
 }
 
-function ExpandedReadInput({ result }: { result?: ToolResultBlock }) {
+function ExpandedReadInput({ input, result }: { input?: Record<string, unknown>; result?: ToolResultBlock }) {
   const content = (result?.content as string) || "";
+  const filePath = (input?.file_path as string) || "";
   const hasContent = !!content && !result?.is_error;
+
+  const lang = useMemo(() => detectLanguage(filePath), [filePath]);
+
+  const lines = useMemo(() => {
+    if (!content) return [];
+    return content.split("\n");
+  }, [content]);
+
+  if (!hasContent || lines.length === 0) return null;
 
   return (
     <div
@@ -331,13 +536,29 @@ function ExpandedReadInput({ result }: { result?: ToolResultBlock }) {
                  leading-[1.6]"
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
     >
-      {hasContent && (
-        <div className="px-4 py-4">
-          <MarkdownText
-            text={`\`\`\`ts\n${content}\n\`\`\``}
-          />
-        </div>
-      )}
+      <div className="px-4 py-4 space-y-0">
+        {lines.map((line, i) => (
+          <div key={i} className="whitespace-pre-wrap break-words flex gap-3">
+            {/* Line number — right-aligned in fixed width, dimmed */}
+            <span
+              className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
+              style={{
+                width: "3em",
+                opacity: 0.4,
+                fontSize: "calc(var(--pane-font-size) - 2px)",
+              }}
+            >
+              {i + 1}
+            </span>
+            {/* Code content — syntax highlighted */}
+            <span>
+              {line.length > 0
+                ? renderHighlightedCode(line, lang)
+                : <>&nbsp;</>}
+            </span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -494,7 +715,7 @@ function renderExpandedInput(name: string, input: Record<string, unknown>, resul
   switch (name) {
     case "Edit":
     case "replace":
-      return <ExpandedEditInput input={input} />;
+      return <ExpandedEditInput input={input} result={result} />;
     case "Write":
     case "write_file":
       return <ExpandedWriteInput input={input} />;
@@ -504,7 +725,7 @@ function renderExpandedInput(name: string, input: Record<string, unknown>, resul
       return <ExpandedTodoInput input={input} />;
     case "Read":
     case "read_file":
-      return <ExpandedReadInput result={result} />;
+      return <ExpandedReadInput input={input} result={result} />;
     case "Bash":
     case "run_shell_command":
       return <ExpandedBashInput input={input} />;

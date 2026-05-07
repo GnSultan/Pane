@@ -8,13 +8,10 @@ import {
   isThinkingModel,
   getContextLimit,
 } from "../../lib/models";
-import { previewRoute, showFilePicker, brainMindGetAll, type RoutePreview, type MindEntry } from "../../lib/tauri-commands";
+import { showFilePicker, brainMindGetAll, type MindEntry } from "../../lib/tauri-commands";
 import { CaretTextArea } from "../shared";
 
 const EMPTY_TODOS: Todo[] = [];
-
-// ── Reactive mode indicator ─────────────────────────────────────────────
-// Auto-detected from route preview, one-tap override by user.
 
 // ── Two-phase system ─────────────────────────────────────────────────────────
 // think = discuss + brainstorm + plan (thinking model)
@@ -312,64 +309,6 @@ function ModelPickerTrigger({
       <div className={`w-1.5 h-1.5 rounded-full transition-colors shrink-0 ${autoRoute ? "bg-pane-status-added" : "bg-pane-text-secondary"}`} />
       <span>{label}</span>
     </button>
-  );
-}
-
-// ─── Mode picker — inline carousel ───────────────────────────────────────────
-
-function PhasePickerExpanded({
-  activePhase,
-  onSelect,
-  onClose,
-}: {
-  activePhase: PhaseName;
-  onSelect: (phase: PhaseName) => void;
-  onClose: () => void;
-}) {
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  // Click outside to close
-  useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) onClose();
-    };
-    requestAnimationFrame(() => document.addEventListener("mousedown", handler));
-    return () => document.removeEventListener("mousedown", handler);
-  }, [onClose]);
-
-  return (
-    <div ref={containerRef} className="flex-1 min-w-0 flex items-center gap-1 pointer-events-auto">
-      <div className="flex-1" />
-      {PHASE_CYCLE.map((phase) => {
-        const config = PHASE_CONFIG[phase];
-        const active = phase === activePhase;
-        return (
-          <button
-            key={phase}
-            onClick={() => { onSelect(phase); onClose(); }}
-            className={`shrink-0 flex items-center px-3 py-0.5 transition-opacity hover:opacity-100 ${active ? "opacity-100" : "opacity-35"}`}
-          >
-            <span
-              className="font-mono whitespace-nowrap"
-              style={{
-                fontSize: "var(--pane-font-size-xs)",
-                color: active ? config?.color : "var(--pane-text)",
-                lineHeight: 1.5,
-              }}
-            >
-              {phase}
-            </span>
-          </button>
-        );
-      })}
-      <button
-        onClick={onClose}
-        className="shrink-0 text-pane-text-secondary/30 hover:text-pane-text-secondary/60 transition-colors ml-1"
-        style={{ fontSize: "14px", lineHeight: 1 }}
-      >
-        ×
-      </button>
-    </div>
   );
 }
 
@@ -711,7 +650,6 @@ export function InputBar({
   const [value, setValue] = useState("");
   const [todoPanelOpen, setTodoPanelOpen] = useState(false);
   const [modelPickerExpanded, setModelPickerExpanded] = useState(false);
-  const [modePickerExpanded, setModePickerExpanded] = useState(false);
   const [isFadingOut, setIsFadingOut] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
@@ -803,29 +741,6 @@ export function InputBar({
     },
     [setAutoEscalate, projectId],
   );
-
-  // ── Route preview: show predicted model as user types ──────────────────
-  // Only active when smart routing is on. Debounced 300ms.
-  const [routePreview, setRoutePreview] = useState<RoutePreview | null>(null);
-  const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    if (!autoEscalate || isProcessing || value.trim().length < 3) {
-      setRoutePreview(null);
-      return;
-    }
-
-    if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
-    previewTimerRef.current = setTimeout(() => {
-      previewRoute(value.trim(), projectId)
-        .then(setRoutePreview)
-        .catch(() => setRoutePreview(null));
-    }, 300);
-
-    return () => {
-      if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
-    };
-  }, [value, autoEscalate, isProcessing, projectId]);
 
   // Phase transition detection — only updates phaseOverride on strong signals.
   // Weak references ("let's think about this") inside build phase do NOT switch.
@@ -1228,19 +1143,9 @@ export function InputBar({
                 </div>
               )}
 
-              {/* Spacer — always present except when PhasePickerExpanded takes the whole row */}
-              {!modePickerExpanded && <div className="flex-1" />}
+              <div className="flex-1" />
               {(() => {
                 const color = PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)";
-                if (modePickerExpanded) {
-                  return (
-                    <PhasePickerExpanded
-                      activePhase={currentPhase}
-                      onSelect={(p) => setPhaseOverride(p)}
-                      onClose={() => setModePickerExpanded(false)}
-                    />
-                  );
-                }
                 if (isProcessing) {
                   return (
                     <span
@@ -1253,7 +1158,7 @@ export function InputBar({
                 }
                 return (
                   <button
-                    onClick={() => setModePickerExpanded(true)}
+                    onClick={() => setPhaseOverride(currentPhase === "think" ? "build" : "think")}
                     className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
                       bg-pane-bg ring-1 ring-pane-border/25
                       hover:text-pane-text btn-press transition-colors"
@@ -1263,11 +1168,6 @@ export function InputBar({
                   </button>
                 );
               })()}
-              {routePreview && !isProcessing && (
-                <span className="pointer-events-none opacity-40">
-                  {routePreview.model}
-                </span>
-              )}
               <ContextUsageIndicator projectId={projectId} />
               <RateLimitIndicator />
               <div className="pointer-events-auto">

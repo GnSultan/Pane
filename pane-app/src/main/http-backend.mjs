@@ -11,19 +11,35 @@ const { AbortController, fetch, TextDecoder, console } = globalThis;
 
 import { PunkBackend } from "./punk-backend.mjs";
 import { ToolExecutor } from "./tool-executor.mjs";
-import { mergeState, readState, getContextLimit, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, writeHandoffWithHistory, updateLatestHandoff, readHandoff } from "./pane-system-prompt.mjs";
+import {
+  mergeState,
+  readState,
+  getContextLimit,
+  generateHandoff,
+  extractFromModelOutput,
+  mergeExtractedIntoHandoff,
+  writeHandoffWithHistory,
+  updateLatestHandoff,
+  readHandoff,
+} from "./pane-system-prompt.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
-import { estimateConversationTokens, getModelLimit } from "./token-budget.mjs";
-import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
+import { estimateConversationTokens, estimateTokens, getModelLimit, getDefaultOutputBudget } from "./token-budget.mjs";
+import {
+  extractWithLLM,
+  countHighConfidence,
+  recordCorrections,
+} from "./extraction-tuning.mjs";
 import contextManager from "./context-manager.mjs";
 import { calculateCost } from "./pricing.mjs";
-import {
-  summarize,
-  storeRaw,
-} from "./tool-result-cache.mjs";
-import { manageConversation } from "./conversation-lifecycle.mjs";
+import { summarize, storeRaw } from "./tool-result-cache.mjs";
+import { manageConversation, forcePruneToBudget } from "./conversation-lifecycle.mjs";
 import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
-import { openJournal, canResume, replay, clearJournal } from "./session-journal.mjs";
+import {
+  openJournal,
+  canResume,
+  replay,
+  clearJournal,
+} from "./session-journal.mjs";
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 
 // ============================================================================
@@ -50,7 +66,12 @@ import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
  * @param {string|null} model - model identifier for context limit lookup
  * @returns {object} result from manageConversation
  */
-function manageContextWindow(messages, systemTokens = 0, projectId = null, model = null) {
+function manageContextWindow(
+  messages,
+  systemTokens = 0,
+  projectId = null,
+  model = null,
+) {
   const maxContextTokens = model ? getModelLimit(model) : 128000;
   return manageConversation(messages, {
     projectId,
@@ -260,7 +281,8 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "web_fetch",
-      description: "Fetches the content of a URL and returns it as plain text. Use this to read documentation, READMEs, GitHub files, API references, or any web page.",
+      description:
+        "Fetches the content of a URL and returns it as plain text. Use this to read documentation, READMEs, GitHub files, API references, or any web page.",
       parameters: {
         type: "object",
         properties: {
@@ -270,7 +292,8 @@ const TOOL_DEFINITIONS = [
           },
           instructions: {
             type: "string",
-            description: "Optional: specific information to extract or focus on from the page (e.g. 'get the installation steps', 'extract all code snippets')",
+            description:
+              "Optional: specific information to extract or focus on from the page (e.g. 'get the installation steps', 'extract all code snippets')",
           },
         },
         required: ["url"],
@@ -313,8 +336,14 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          command: { type: "string", description: "The shell command to execute." },
-          timeout: { type: "number", description: "Timeout in seconds (default 30, max 120)." },
+          command: {
+            type: "string",
+            description: "The shell command to execute.",
+          },
+          timeout: {
+            type: "number",
+            description: "Timeout in seconds (default 30, max 120).",
+          },
         },
         required: ["command"],
       },
@@ -417,7 +446,8 @@ const TOOL_DEFINITIONS = [
         properties: {
           query: {
             type: "string",
-            description: "Search query to find changes (matches file, content, or description)",
+            description:
+              "Search query to find changes (matches file, content, or description)",
           },
           file_path: {
             type: "string",
@@ -438,7 +468,8 @@ const TOOL_DEFINITIONS = [
         properties: {
           change_id: {
             type: "string",
-            description: "The ID of the change to revert (use pane_change_history to find IDs)",
+            description:
+              "The ID of the change to revert (use pane_change_history to find IDs)",
           },
         },
         required: ["change_id"],
@@ -476,12 +507,19 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "pane_codebase_compass",
-      description: "Get a 'neighborhood' of code relevant to your intent. Combines semantic search, structural symbols, and spatial dependency mapping to surface files you should look at. Use this when you are entering a new area of the codebase or need to understand the 'blast radius' of a change.",
+      description:
+        "Get a 'neighborhood' of code relevant to your intent. Combines semantic search, structural symbols, and spatial dependency mapping to surface files you should look at. Use this when you are entering a new area of the codebase or need to understand the 'blast radius' of a change.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "What you are looking for or trying to do" },
-          limit: { type: "number", description: "Maximum number of files to return (default 8)" },
+          query: {
+            type: "string",
+            description: "What you are looking for or trying to do",
+          },
+          limit: {
+            type: "number",
+            description: "Maximum number of files to return (default 8)",
+          },
         },
         required: ["query"],
       },
@@ -611,13 +649,15 @@ const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "pane_set_about",
-      description: "Record what this project is — its purpose, identity, and how it works. Per-project. Call this once you have understood the project deeply enough to articulate it clearly. Writes to about.md.",
+      description:
+        "Record what this project is — its purpose, identity, and how it works. Per-project. Call this once you have understood the project deeply enough to articulate it clearly. Writes to about.md.",
       parameters: {
         type: "object",
         properties: {
           about: {
             type: "string",
-            description: "The project's description — what it is, who it's for, the problem it solves, its identity and direction",
+            description:
+              "The project's description — what it is, who it's for, the problem it solves, its identity and direction",
           },
         },
         required: ["about"],
@@ -719,9 +759,9 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "codebase_investigator",
+      name: "pane_investigate",
       description:
-        "Delegate complex codebase analysis, architectural mapping, or bug root-cause investigation to a specialized sub-agent.",
+        "Delegate complex codebase analysis, architectural mapping, or bug root-cause investigation to a specialized sub-agent. Use this for tasks that require methodically tracing through the codebase, reading multiple files, and returning structured findings.",
       parameters: {
         type: "object",
         properties: {
@@ -737,42 +777,6 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "generalist",
-      description:
-        "Delegate repetitive batch tasks or high-volume data processing to a general-purpose sub-agent.",
-      parameters: {
-        type: "object",
-        properties: {
-          request: {
-            type: "string",
-            description: "The task or question for the generalist agent",
-          },
-        },
-        required: ["request"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "cli_help",
-      description:
-        "Answers questions about Gemini CLI features, documentation, and configuration.",
-      parameters: {
-        type: "object",
-        properties: {
-          question: {
-            type: "string",
-            description: "The question about Gemini CLI",
-          },
-        },
-        required: ["question"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "pane_read_files",
       description:
         "Read multiple files at once and return all their contents in a single response. Use this instead of sequential Read calls when you know you need several files — each sequential read resends the entire conversation, so batching 3 reads into 1 call saves significant overhead. Accepts an array of file paths.",
@@ -782,7 +786,8 @@ const TOOL_DEFINITIONS = [
           paths: {
             type: "array",
             items: { type: "string" },
-            description: "Array of file paths to read (relative to project root or absolute)",
+            description:
+              "Array of file paths to read (relative to project root or absolute)",
           },
         },
         required: ["paths"],
@@ -798,7 +803,11 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Natural language description of what you're looking for" },
+          query: {
+            type: "string",
+            description:
+              "Natural language description of what you're looking for",
+          },
         },
         required: ["query"],
       },
@@ -813,8 +822,15 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          target: { type: "string", description: "Component name, file path, or symbol to map (e.g. 'InputBar', 'useProjectsStore')" },
-          depth: { type: "number", description: "Traversal depth (1 or 2, default 1)" },
+          target: {
+            type: "string",
+            description:
+              "Component name, file path, or symbol to map (e.g. 'InputBar', 'useProjectsStore')",
+          },
+          depth: {
+            type: "number",
+            description: "Traversal depth (1 or 2, default 1)",
+          },
         },
         required: ["target"],
       },
@@ -829,7 +845,11 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          component: { type: "string", description: "Component type or description, e.g. 'search input', 'floating panel', 'terminal output'" },
+          component: {
+            type: "string",
+            description:
+              "Component type or description, e.g. 'search input', 'floating panel', 'terminal output'",
+          },
         },
         required: ["component"],
       },
@@ -844,7 +864,11 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          subsystem: { type: "string", description: "Subsystem name or file path (e.g. 'terminal', 'ipc', 'auth')" },
+          subsystem: {
+            type: "string",
+            description:
+              "Subsystem name or file path (e.g. 'terminal', 'ipc', 'auth')",
+          },
         },
         required: ["subsystem"],
       },
@@ -889,8 +913,15 @@ const TOOL_DEFINITIONS = [
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Optional keyword to search for in journal entries. Omit to get the most recent entries." },
-          limit: { type: "number", description: "Maximum number of entries to return (default: 10)" },
+          query: {
+            type: "string",
+            description:
+              "Optional keyword to search for in journal entries. Omit to get the most recent entries.",
+          },
+          limit: {
+            type: "number",
+            description: "Maximum number of entries to return (default: 10)",
+          },
         },
         required: [],
       },
@@ -911,10 +942,18 @@ const TOOL_DEFINITIONS = [
 // planning  — reads + exploration only: model cannot modify files during planning
 // execution — all tools: model implements the plan
 const WRITE_TOOL_NAMES = new Set([
-  "run_shell_command", "write_file", "replace",
-  "pane_revert_change", "pane_remember", "pane_set_rule", "pane_set_philosophy", "pane_set_about",
-  "TodoWrite", "Task", "activate_skill", "codebase_investigator", "generalist",
-  "cli_help", "save_memory",
+  "run_shell_command",
+  "write_file",
+  "replace",
+  "pane_revert_change",
+  "pane_remember",
+  "pane_set_rule",
+  "pane_set_philosophy",
+  "pane_set_about",
+  "TodoWrite",
+  "Task",
+  "activate_skill",
+  "save_memory",
 ]);
 
 function getToolsForPhase(phase) {
@@ -923,7 +962,9 @@ function getToolsForPhase(phase) {
   const readOnlyPhases = new Set(["planning", "think", "analyze"]);
   if (readOnlyPhases.has(phase)) {
     // Read/explore only — model cannot modify files during think/planning phases
-    return TOOL_DEFINITIONS.filter(t => !WRITE_TOOL_NAMES.has(t.function.name));
+    return TOOL_DEFINITIONS.filter(
+      (t) => !WRITE_TOOL_NAMES.has(t.function.name),
+    );
   }
   // execution — all tools
   return TOOL_DEFINITIONS;
@@ -947,7 +988,8 @@ const ANTHROPIC_TOOLS = TOOL_DEFINITIONS.map((td) => ({
 // Auto Todo Advancement — Pane drives status, model just sets content
 // ---------------------------------------------------------------------------
 
-const VERIFY_COMMANDS = /\b(jest|vitest|pytest|mocha|karma|test|tsc|build|lint|eslint|check|cargo\s+check|go\s+vet|go\s+build|make)\b/i;
+const VERIFY_COMMANDS =
+  /\b(jest|vitest|pytest|mocha|karma|test|tsc|build|lint|eslint|check|cargo\s+check|go\s+vet|go\s+build|make)\b/i;
 
 /**
  * Advance todo statuses based on what Pane actually knows happened.
@@ -966,13 +1008,13 @@ function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
   const todos = state.todos;
   if (!todos || todos.length === 0) return;
 
-  const hasPending    = todos.some(t => t.status === "pending");
-  const hasInProgress = todos.some(t => t.status === "in_progress");
-  const allDone       = todos.every(t => t.status === "completed");
+  const hasPending = todos.some((t) => t.status === "pending");
+  const hasInProgress = todos.some((t) => t.status === "in_progress");
+  const allDone = todos.every((t) => t.status === "completed");
 
   if (allDone) return;
 
-  let updated = todos.map(t => ({ ...t })); // shallow clone
+  let updated = todos.map((t) => ({ ...t })); // shallow clone
   let changed = false;
 
   switch (trigger) {
@@ -980,9 +1022,12 @@ function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
       // Turn is beginning. If nothing is in_progress, start the first pending.
       // This gives immediate UI feedback that work is happening.
       if (!hasInProgress) {
-        const firstPending = updated.findIndex(t => t.status === "pending");
+        const firstPending = updated.findIndex((t) => t.status === "pending");
         if (firstPending !== -1) {
-          updated[firstPending] = { ...updated[firstPending], status: "in_progress" };
+          updated[firstPending] = {
+            ...updated[firstPending],
+            status: "in_progress",
+          };
           changed = true;
         }
       }
@@ -995,9 +1040,12 @@ function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
       // If something IS in_progress and a DIFFERENT file is being worked on,
       // complete the current one and advance — heuristic: each write = one todo step.
       if (!hasInProgress) {
-        const firstPending = updated.findIndex(t => t.status === "pending");
+        const firstPending = updated.findIndex((t) => t.status === "pending");
         if (firstPending !== -1) {
-          updated[firstPending] = { ...updated[firstPending], status: "in_progress" };
+          updated[firstPending] = {
+            ...updated[firstPending],
+            status: "in_progress",
+          };
           changed = true;
         }
       }
@@ -1007,14 +1055,22 @@ function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
     case "verify_pass": {
       // A verification command (test/build/tsc) just succeeded.
       // The current in_progress step is done — complete it and start the next.
-      const inProgressIdx = updated.findIndex(t => t.status === "in_progress");
+      const inProgressIdx = updated.findIndex(
+        (t) => t.status === "in_progress",
+      );
       if (inProgressIdx !== -1) {
-        updated[inProgressIdx] = { ...updated[inProgressIdx], status: "completed" };
+        updated[inProgressIdx] = {
+          ...updated[inProgressIdx],
+          status: "completed",
+        };
         changed = true;
         // Advance to next pending
-        const nextPending = updated.findIndex(t => t.status === "pending");
+        const nextPending = updated.findIndex((t) => t.status === "pending");
         if (nextPending !== -1) {
-          updated[nextPending] = { ...updated[nextPending], status: "in_progress" };
+          updated[nextPending] = {
+            ...updated[nextPending],
+            status: "in_progress",
+          };
         }
       }
       break;
@@ -1024,7 +1080,7 @@ function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
       // Turn completed successfully. Mark all in_progress as completed —
       // if the model finished the turn without errors, the work is done.
       let anyCompleted = false;
-      updated = updated.map(t => {
+      updated = updated.map((t) => {
         if (t.status === "in_progress") {
           anyCompleted = true;
           return { ...t, status: "completed" };
@@ -1064,22 +1120,22 @@ function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
 // Format: [id-prefix, display-provider-name, tier (1=frontier, 2=balanced, 3=fast)]
 const CODING_FAMILIES = [
   // MiMo — Xiaomi reasoning/agentic models
-  ["xiaomi/mimo-v2-pro",              "Xiaomi",   1],
-  ["xiaomi/mimo-v2-omni",             "Xiaomi",   2],
-  ["xiaomi/mimo-v2-flash",            "Xiaomi",   2],
+  ["xiaomi/mimo-v2-pro", "Xiaomi", 1],
+  ["xiaomi/mimo-v2-omni", "Xiaomi", 2],
+  ["xiaomi/mimo-v2-flash", "Xiaomi", 2],
   // StepFun
-  ["stepfun/step-3.5-flash",          "StepFun",  2],
+  ["stepfun/step-3.5-flash", "StepFun", 2],
   // Kimi / Moonshot
-  ["moonshot/moonshot-v1",            "Kimi",     2],
+  ["moonshot/moonshot-v1", "Kimi", 2],
   // GLM — Z.ai, thinks before tool calls (more specific first)
-  ["z-ai/glm-4.7-flash",              "Z.ai",     3],
-  ["z-ai/glm-4.7",                    "Z.ai",     2],
+  ["z-ai/glm-4.7-flash", "Z.ai", 3],
+  ["z-ai/glm-4.7", "Z.ai", 2],
   // Qwen3 Coder — only coding-focused models, no catch-all
-  ["qwen/qwen3-coder-next",           "Qwen",     1],
-  ["qwen/qwen3-coder",                "Qwen",     2],
+  ["qwen/qwen3-coder-next", "Qwen", 1],
+  ["qwen/qwen3-coder", "Qwen", 2],
   // MiniMax — multi-agent autonomous
-  ["minimax/minimax-m2.7",            "MiniMax",  2],
-  ["minimax/minimax-m2.5",            "MiniMax",  2],
+  ["minimax/minimax-m2.7", "MiniMax", 2],
+  ["minimax/minimax-m2.5", "MiniMax", 2],
 ];
 
 function _familyFor(modelId) {
@@ -1099,32 +1155,36 @@ function _isPaneModel(m) {
 }
 
 function _normalizeModel(m) {
-  const family  = _familyFor(m.id);
+  const family = _familyFor(m.id);
   // Strip OpenRouter noise from display names: "(self-moderated)", "(extended)",
   // ":nitro", ":floor", ":free" suffixes, and trailing date stamps like " 2024-11"
   const name = (m.name ?? m.id)
     .replace(/\s*\(self-moderated\)/gi, "")
     .replace(/\s*\(extended\)/gi, "")
     .replace(/\s*\(preview\)/gi, " preview")
-    .replace(/:\w+$/,             "")   // :nitro, :free, :floor
-    .replace(/\s+\d{4}-\d{2}$/,  "")   // trailing " 2024-11" date stamps
+    .replace(/:\w+$/, "") // :nitro, :free, :floor
+    .replace(/\s+\d{4}-\d{2}$/, "") // trailing " 2024-11" date stamps
     // Strip provider prefix from name: "Qwen: Qwen 3.6 Plus" → "Qwen 3.6 Plus"
     // "StepFun: Step 3.5 Flash" → "Step 3.5 Flash"
-    .replace(/^[\w.-]+:\s*/,      "")
+    .replace(/^[\w.-]+:\s*/, "")
     .trim();
 
   // Pricing in $/Mtok (OpenRouter uses per-token strings like "0.000003")
-  const inputMtok  = m.pricing?.prompt   ? parseFloat(m.pricing.prompt)  * 1_000_000 : null;
-  const outputMtok = m.pricing?.completion ? parseFloat(m.pricing.completion) * 1_000_000 : null;
+  const inputMtok = m.pricing?.prompt
+    ? parseFloat(m.pricing.prompt) * 1_000_000
+    : null;
+  const outputMtok = m.pricing?.completion
+    ? parseFloat(m.pricing.completion) * 1_000_000
+    : null;
 
   return {
-    id:             m.id,
+    id: m.id,
     name,
     context_length: m.context_length,
-    provider:       family.provider,
-    tier:           family.tier,
-    input_cost:     inputMtok  != null ? +inputMtok.toFixed(4)  : null,
-    output_cost:    outputMtok != null ? +outputMtok.toFixed(4) : null,
+    provider: family.provider,
+    tier: family.tier,
+    input_cost: inputMtok != null ? +inputMtok.toFixed(4) : null,
+    output_cost: outputMtok != null ? +outputMtok.toFixed(4) : null,
   };
 }
 
@@ -1139,8 +1199,10 @@ function _byRelevance(a, b) {
 function _deepSeekDisplayName(id) {
   // Format model IDs: deepseek-xxx-yyy → DeepSeek Xxx Yyy
   // No manual mapping — always reflect what the API serves
-  return id.replace(/^deepseek-/, "DeepSeek ").replace(/-/g, " ")
-    .replace(/\b\w/g, c => c.toUpperCase());
+  return id
+    .replace(/^deepseek-/, "DeepSeek ")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function _deepSeekContextLength(id) {
@@ -1156,7 +1218,7 @@ function _anthropicDisplayName(id) {
     .replace(/^claude-/, "Claude ")
     .replace(/-(\d+)-(\d+)/, " $1.$2")
     .replace(/-/g, " ")
-    .replace(/\b\w/g, c => c.toUpperCase());
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function _anthropicContextLength(id) {
@@ -1179,22 +1241,22 @@ function _anthropicContextLength(id) {
 // If no entry matches, the fallback is DEFAULT_MAX_TOKENS (4096).
 const MODEL_OUTPUT_LIMITS = [
   // DeepSeek
-  { match: "deepseek-reasoner",    maxTokens: 32768,  omit: false },
-  { match: "deepseek-chat",        maxTokens: 8192,   omit: false },
-  { match: "deepseek",             maxTokens: 8192,   omit: false },
+  { match: "deepseek-reasoner", maxTokens: 32768, omit: false },
+  { match: "deepseek-chat", maxTokens: 8192, omit: false },
+  { match: "deepseek", maxTokens: 8192, omit: false },
   // Xiaomi MiMo — thinking tokens count against max_tokens
-  { match: "mimo-v2-pro",          maxTokens: 65536,  omit: false }, // ~16K thinking + 48K output
-  { match: "mimo-v2-omni",         maxTokens: 65536,  omit: false },
-  { match: "mimo-v2-flash",        maxTokens: 16384,  omit: false },
-  { match: "mimo",                 maxTokens: 16384,  omit: false }, // future MiMo variants
+  { match: "mimo-v2-pro", maxTokens: 65536, omit: false }, // ~16K thinking + 48K output
+  { match: "mimo-v2-omni", maxTokens: 65536, omit: false },
+  { match: "mimo-v2-flash", maxTokens: 16384, omit: false },
+  { match: "mimo", maxTokens: 16384, omit: false }, // future MiMo variants
   // StepFun — docs say not to set max_tokens for reasoning models
-  { match: "step-",                maxTokens: null,   omit: true  },
+  { match: "step-", maxTokens: null, omit: true },
   // Kimi — standard output, 8K is safe
-  { match: "moonshot",             maxTokens: 8192,   omit: false },
+  { match: "moonshot", maxTokens: 8192, omit: false },
   // Qwen / Alibaba
-  { match: "qwen",                 maxTokens: 8192,   omit: false },
+  { match: "qwen", maxTokens: 8192, omit: false },
   // Anthropic (via HTTP path — normally via native SDK)
-  { match: "claude",               maxTokens: 8192,   omit: false },
+  { match: "claude", maxTokens: 8192, omit: false },
 ];
 
 const DEFAULT_MAX_TOKENS = 4096;
@@ -1216,26 +1278,29 @@ function resolveMaxTokens(modelId) {
 }
 const MODEL_STREAMING_CONFIG = [
   // deepseek-reasoner must come before generic deepseek/
-  ["deepseek/deepseek-reasoner",  { reasoningField: "reasoning_content", supportsTools: false }],
-  ["deepseek/",                   { reasoningField: null,                 supportsTools: true  }],
+  [
+    "deepseek/deepseek-reasoner",
+    { reasoningField: "reasoning_content", supportsTools: false },
+  ],
+  ["deepseek/", { reasoningField: null, supportsTools: true }],
   // Xiaomi MiMo — uses delta.reasoning
-  ["xiaomi/mimo",                 { reasoningField: "reasoning",          supportsTools: true  }],
+  ["xiaomi/mimo", { reasoningField: "reasoning", supportsTools: true }],
   // StepFun — uses delta.reasoning
-  ["stepfun/",                    { reasoningField: "reasoning",          supportsTools: true  }],
+  ["stepfun/", { reasoningField: "reasoning", supportsTools: true }],
   // Z.ai GLM — thinks before tool calls, uses delta.reasoning
-  ["z-ai/glm",                    { reasoningField: "reasoning",          supportsTools: true  }],
+  ["z-ai/glm", { reasoningField: "reasoning", supportsTools: true }],
   // Kimi / Moonshot — standard content, no reasoning field
-  ["moonshot/",                   { reasoningField: null,                 supportsTools: true  }],
+  ["moonshot/", { reasoningField: null, supportsTools: true }],
   // Qwen3 Coder — standard content
-  ["qwen/qwen3-coder",            { reasoningField: null,                 supportsTools: true  }],
-  ["qwen/",                       { reasoningField: null,                 supportsTools: true  }],
+  ["qwen/qwen3-coder", { reasoningField: null, supportsTools: true }],
+  ["qwen/", { reasoningField: null, supportsTools: true }],
   // MiniMax — standard content
-  ["minimax/",                    { reasoningField: null,                 supportsTools: true  }],
+  ["minimax/", { reasoningField: null, supportsTools: true }],
   // Frontier providers via OR — standard content
-  ["anthropic/",                  { reasoningField: null,                 supportsTools: true  }],
-  ["google/",                     { reasoningField: null,                 supportsTools: true  }],
-  ["openai/",                     { reasoningField: null,                 supportsTools: true  }],
-  ["meta-llama/",                 { reasoningField: null,                 supportsTools: true  }],
+  ["anthropic/", { reasoningField: null, supportsTools: true }],
+  ["google/", { reasoningField: null, supportsTools: true }],
+  ["openai/", { reasoningField: null, supportsTools: true }],
+  ["meta-llama/", { reasoningField: null, supportsTools: true }],
 ];
 
 function getModelStreamingConfig(modelId) {
@@ -1280,22 +1345,59 @@ function validateMessageSequence(messages, provider) {
   const result = [];
   const pendingToolCallIds = new Set();
   // Stack of {index, ids: Set} per assistant that issued tool_calls.
-  // Used to correctly strip orphaned calls from the right assistant.
+  // Used to correctly synthesize results after the right assistant.
   const assistantStack = [];
+
+  const synthesizeToolResult = (id) => ({
+    role: "tool",
+    tool_call_id: id,
+    content:
+      "Error: Turn was interrupted before tool result could be processed.",
+    is_error: true,
+  });
+
+  const flushMissingToolResults = (label) => {
+    for (const entry of assistantStack.slice().reverse()) {
+      if (entry.ids.size > 0) {
+        const orphanIds = [...entry.ids];
+        console.warn(
+          `[http] validateMessageSequence${label}: assistant at index ${entry.index} has ${orphanIds.length} missing tool results — synthesizing`,
+        );
+        const assistantMsg = result[entry.index];
+        if (assistantMsg) {
+          const fakeResults = orphanIds.map(synthesizeToolResult);
+          result.splice(entry.index + 1, 0, ...fakeResults);
+        }
+        for (const id of orphanIds) {
+          pendingToolCallIds.delete(id);
+        }
+      }
+    }
+    assistantStack.length = 0;
+  };
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
 
+    // Before any non-tool boundary, synthesize missing tool results so DeepSeek
+    // never sees an assistant tool_calls message without matching tool messages.
+    if (
+      msg.role !== "tool" &&
+      assistantStack.some((entry) => entry.ids.size > 0)
+    ) {
+      flushMissingToolResults("");
+    }
+
     // ── Assistant messages ──
     if (msg.role === "assistant") {
       // Collect tool_call IDs from this assistant
-      const callIds = (msg.tool_calls || []).map(tc => tc.id).filter(Boolean);
+      const callIds = (msg.tool_calls || []).map((tc) => tc.id).filter(Boolean);
       // Also check content blocks (Anthropic-style tool_use, though rare in OpenAI path)
       let contentCallIds = [];
       if (Array.isArray(msg.content)) {
         contentCallIds = msg.content
-          .filter(c => c.type === "tool_use")
-          .map(c => c.id)
+          .filter((c) => c.type === "tool_use")
+          .map((c) => c.id)
           .filter(Boolean);
       }
       const allIds = [...callIds, ...contentCallIds];
@@ -1337,33 +1439,6 @@ function validateMessageSequence(messages, provider) {
 
     // ── User messages (boundary) ──
     if (msg.role === "user") {
-      // Before the user message, flush any assistants with unresolved tool calls.
-      // This catches sequences like: assistant(tool_calls) → user → (missing tool results)
-      for (const entry of assistantStack) {
-        if (entry.ids.size > 0) {
-          const orphanIds = [...entry.ids];
-          console.warn(
-            `[http] validateMessageSequence: assistant at index ${entry.index} has ${orphanIds.length} orphaned tool_calls — stripping`,
-          );
-          // Strip the orphaned tool_calls from the assistant message already in result
-          const assistantMsg = result[entry.index];
-          if (assistantMsg) {
-            const remainingCalls = (assistantMsg.tool_calls || []).filter(
-              tc => !orphanIds.includes(tc.id)
-            );
-            if (remainingCalls.length > 0) {
-              assistantMsg.tool_calls = remainingCalls;
-            } else {
-              delete assistantMsg.tool_calls;
-            }
-          }
-          for (const id of orphanIds) {
-            pendingToolCallIds.delete(id);
-          }
-        }
-      }
-      // Clear the stack — we've crossed a user boundary
-      assistantStack.length = 0;
       result.push(msg);
       continue;
     }
@@ -1372,25 +1447,9 @@ function validateMessageSequence(messages, provider) {
     result.push(msg);
   }
 
-  // End of array: flush any remaining unresolved tool calls
-  for (const entry of assistantStack) {
-    if (entry.ids.size > 0) {
-      const orphanIds = [...entry.ids];
-      console.warn(
-        `[http] validateMessageSequence (end): stripping ${orphanIds.length} orphaned tool_calls from assistant at index ${entry.index}`,
-      );
-      const assistantMsg = result[entry.index];
-      if (assistantMsg) {
-        const remainingCalls = (assistantMsg.tool_calls || []).filter(
-          tc => !orphanIds.includes(tc.id)
-        );
-        if (remainingCalls.length > 0) {
-          assistantMsg.tool_calls = remainingCalls;
-        } else {
-          delete assistantMsg.tool_calls;
-        }
-      }
-    }
+  // End of array: synthesize any remaining unresolved tool calls
+  if (assistantStack.length > 0) {
+    flushMissingToolResults(" (end)");
   }
 
   return result;
@@ -1403,18 +1462,22 @@ function validateMessageSequence(messages, provider) {
 // Produces a clean user↔assistant conversation that any OpenAI-compatible
 // model can process.
 function stripToolHistory(messages) {
-  return messages.map(msg => {
-    if (msg.role === "assistant" && msg.tool_calls) {
-      const cleaned = { ...msg };
-      delete cleaned.tool_calls;
-      return cleaned;
-    }
-    return msg;
-  }).filter(msg => msg.role !== "tool");
+  return messages
+    .map((msg) => {
+      if (msg.role === "assistant" && msg.tool_calls) {
+        const cleaned = { ...msg };
+        delete cleaned.tool_calls;
+        return cleaned;
+      }
+      return msg;
+    })
+    .filter((msg) => msg.role !== "tool");
 }
 
 export class ApiBackend extends PunkBackend {
-  get supportsToolCalling() { return true; }
+  get supportsToolCalling() {
+    return true;
+  }
 
   constructor(onEvent) {
     super(onEvent);
@@ -1433,6 +1496,20 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
+  setQuickCall(fn) {
+    this._quickCall = fn;
+    for (const executor of this.toolExecutors.values()) {
+      if (executor.setQuickCall) executor.setQuickCall(fn);
+    }
+  }
+
+  setAgentCall(fn) {
+    this._agentCall = fn;
+    for (const executor of this.toolExecutors.values()) {
+      if (executor.setAgentCall) executor.setAgentCall(fn);
+    }
+  }
+
   getToolExecutor(projectId, projectRoot) {
     let executor = this.toolExecutors.get(projectId);
     if (!executor) {
@@ -1441,6 +1518,12 @@ export class ApiBackend extends PunkBackend {
       );
       if (this._brainRequest && executor.setBrainRequest) {
         executor.setBrainRequest(this._brainRequest);
+      }
+      if (this._quickCall && executor.setQuickCall) {
+        executor.setQuickCall(this._quickCall);
+      }
+      if (this._agentCall && executor.setAgentCall) {
+        executor.setAgentCall(this._agentCall);
       }
       this.toolExecutors.set(projectId, executor);
     }
@@ -1460,7 +1543,8 @@ export class ApiBackend extends PunkBackend {
 
       // Normalize "-api" suffixed providers to base name for key lookup and API calls.
       // "anthropic-api" → "anthropic", "gemini-api" → "gemini"
-      const rawProvider = providerOverride || settings.http_provider || "deepseek";
+      const rawProvider =
+        providerOverride || settings.http_provider || "deepseek";
       const provider = rawProvider.replace(/-api$/, "");
 
       let apiKey = settings.http_api_keys?.[provider] || "";
@@ -1544,7 +1628,11 @@ export class ApiBackend extends PunkBackend {
         // role: "tool" messages to satisfy strict tool_call→tool sequencing.
         // System messages with tool_results bypass the normal tool handler
         // below, so we handle them here.
-        if (isOpenAI && Array.isArray(content) && content.some((c) => c.type === "tool_result")) {
+        if (
+          isOpenAI &&
+          Array.isArray(content) &&
+          content.some((c) => c.type === "tool_result")
+        ) {
           for (const c of content) {
             if (c.type === "tool_result") {
               const res = {
@@ -1604,8 +1692,15 @@ export class ApiBackend extends PunkBackend {
           }
 
           // 3. Handle tool calls (omitted for Reasoner, which doesn't support them)
-          if (!isReasoner && (msg.tool_calls || (Array.isArray(content) && content.some(c => c.type === "tool_use")))) {
-            const toolUses = Array.isArray(content) ? content.filter(c => c.type === "tool_use") : [];
+          if (
+            !isReasoner &&
+            (msg.tool_calls ||
+              (Array.isArray(content) &&
+                content.some((c) => c.type === "tool_use")))
+          ) {
+            const toolUses = Array.isArray(content)
+              ? content.filter((c) => c.type === "tool_use")
+              : [];
             const rawCalls =
               msg.tool_calls ||
               toolUses.map((tu) => ({
@@ -1793,6 +1888,7 @@ export class ApiBackend extends PunkBackend {
     // Reset healing flags for this new session — ensured fresh regardless
     // of previous spawn's state (e.g. auto-resume re-enters spawn).
     this._healAttemptedThisTurn = false;
+    this._contextHealAttemptedThisTurn = false;
     if (typeof this._sessionRetryCount !== "number") {
       this._sessionRetryCount = 0;
     }
@@ -1809,7 +1905,12 @@ export class ApiBackend extends PunkBackend {
     );
 
     // Auto-start: mark first pending todo as in_progress when turn begins
-    autoAdvanceTodos(request.projectId, "turn_start", this.onEvent.bind(this), request.requestId);
+    autoAdvanceTodos(
+      request.projectId,
+      "turn_start",
+      this.onEvent.bind(this),
+      request.requestId,
+    );
 
     try {
       const apiConfig = await this.getApiConfig(request.provider || null);
@@ -1839,16 +1940,25 @@ export class ApiBackend extends PunkBackend {
       try {
         const db = getPaneDb();
         if (db.stmts.getChanges) {
-          sqliteChanges = db.stmts.getChanges.all(request.projectId).slice(0, 10);
+          sqliteChanges = db.stmts.getChanges
+            .all(request.projectId)
+            .slice(0, 10);
         } else {
-          console.warn("[http] Database not fully initialized, skipping SQLite changes fetch");
+          console.warn(
+            "[http] Database not fully initialized, skipping SQLite changes fetch",
+          );
         }
       } catch (err) {
-        console.warn("[http] Failed to fetch SQLite changes for context:", err.message);
+        console.warn(
+          "[http] Failed to fetch SQLite changes for context:",
+          err.message,
+        );
       }
 
       // Budget-aware context assembly via orchestrator (single path)
-      const conversationTokens = estimateConversationTokens(request.history || []);
+      const conversationTokens = estimateConversationTokens(
+        request.history || [],
+      );
       const context = orchestrateContext(request.projectId, {
         intent: request.intent,
         historyLength,
@@ -1858,7 +1968,9 @@ export class ApiBackend extends PunkBackend {
         conversationTokens,
       });
       if (context.budget?.layersDropped > 0) {
-        console.log(`[http] Context budget: ${context.budget.systemUsed}/${context.budget.systemBudget} tokens (dropped: ${context.budget.droppedNames.join(", ")})`);
+        console.log(
+          `[http] Context budget: ${context.budget.systemUsed}/${context.budget.systemBudget} tokens (dropped: ${context.budget.droppedNames.join(", ")})`,
+        );
       }
 
       // ── Build system prompt with tier metadata for cache-aware providers ──
@@ -1873,14 +1985,16 @@ export class ApiBackend extends PunkBackend {
       if (request.systemPromptOverride) {
         systemPrompt = request.systemPromptOverride;
       } else {
-        const prepend = request._systemPrepend ? request._systemPrepend + "\n\n" : "";
+        const prepend = request._systemPrepend
+          ? request._systemPrepend + "\n\n"
+          : "";
         systemPrompt = prepend + context.full;
         // Expose tiers if the context produced them (orchestrator and compileContext both do)
         if (context.frozen !== undefined) {
           systemTiers = {
-            frozen:  prepend + context.frozen,
+            frozen: prepend + context.frozen,
             session: context.session || "",
-            turn:    context.turn || "",
+            turn: context.turn || "",
           };
         }
       }
@@ -1908,7 +2022,9 @@ export class ApiBackend extends PunkBackend {
       );
 
       // Attach tier metadata to the system message for prepareRequest() to consume
-      const messages = [{ role: "system", content: systemPrompt, _tiers: systemTiers }];
+      const messages = [
+        { role: "system", content: systemPrompt, _tiers: systemTiers },
+      ];
 
       // ── Session Resume: journal-first message loading ─────────────────────
       // Check if a previous session died mid-work. If a journal exists and is
@@ -1921,7 +2037,8 @@ export class ApiBackend extends PunkBackend {
       // hits on everything the model already saw. The system prompt is fresh
       // (it changes per-session), but frozen/session tiers still cache-hit
       // if content hasn't changed.
-      const isNewConversation = !request.history || request.history.length === 0;
+      const isNewConversation =
+        !request.history || request.history.length === 0;
       let journalResumed = false;
       let lastProgress = null;
 
@@ -1939,15 +2056,21 @@ export class ApiBackend extends PunkBackend {
             journalResumed = true;
             console.log(
               `[http] ⟲ RESUMED from journal: ${journalData.messages.length} messages, ` +
-              `last activity ${Math.round((Date.now() - resumeCheck.meta.lastAppendAt) / 1000)}s ago` +
-              (lastProgress ? `, progress: ${lastProgress.accomplishments?.length || 0} accomplishments` : ""),
+                `last activity ${Math.round((Date.now() - resumeCheck.meta.lastAppendAt) / 1000)}s ago` +
+                (lastProgress
+                  ? `, progress: ${lastProgress.accomplishments?.length || 0} accomplishments`
+                  : ""),
             );
 
             // Surface the resume to the UI
-            this.onEvent(request.projectId, {
-              event: "status",
-              data: { message: "resuming previous session..." },
-            }, request.requestId);
+            this.onEvent(
+              request.projectId,
+              {
+                event: "status",
+                data: { message: "resuming previous session..." },
+              },
+              request.requestId,
+            );
           }
         }
       }
@@ -1985,18 +2108,29 @@ export class ApiBackend extends PunkBackend {
       //   Phase 1: Prune old tool results (3k file reads → 30-token summaries)
       //   Phase 2: Drop oldest turns if still over budget
       // This replaces the old contextManager.shouldAutoCompact approach.
-      const systemTokens = context.budget?.systemUsed || Math.round((systemPrompt?.length || 0) / 4);
-      const windowResult = manageContextWindow(messages, systemTokens, request.projectId, request.model);
+      const systemTokens =
+        context.budget?.systemUsed ||
+        Math.round((systemPrompt?.length || 0) / 4);
+      const windowResult = manageContextWindow(
+        messages,
+        systemTokens,
+        request.projectId,
+        request.model,
+      );
       if (windowResult.action !== "none") {
-        this.onEvent(request.projectId, {
-          event: "window_managed",
-          data: {
-            action: windowResult.action,
-            tokensBefore: windowResult.tokensBefore,
-            tokensAfter: windowResult.tokensAfter,
-            messagesRemaining: messages.length,
+        this.onEvent(
+          request.projectId,
+          {
+            event: "window_managed",
+            data: {
+              action: windowResult.action,
+              tokensBefore: windowResult.tokensBefore,
+              tokensAfter: windowResult.tokensAfter,
+              messagesRemaining: messages.length,
+            },
           },
-        }, request.requestId);
+          request.requestId,
+        );
       }
 
       // Build the user prompt for this turn. If resuming from journal with
@@ -2004,17 +2138,27 @@ export class ApiBackend extends PunkBackend {
       // where it was when it dropped.
       if (journalResumed && lastProgress) {
         const resumeParts = [request.prompt];
-        resumeParts.push("\n\n[Session resumed — your previous session was interrupted. Here is your progress:]");
+        resumeParts.push(
+          "\n\n[Session resumed — your previous session was interrupted. Here is your progress:]",
+        );
         if (lastProgress.accomplishments?.length > 0) {
-          resumeParts.push(`\n[Completed]\n${lastProgress.accomplishments.map(a => `- ${a}`).join("\n")}`);
+          resumeParts.push(
+            `\n[Completed]\n${lastProgress.accomplishments.map((a) => `- ${a}`).join("\n")}`,
+          );
         }
         if (lastProgress.decisions?.length > 0) {
-          resumeParts.push(`\n[Decisions locked — do not revisit]\n${lastProgress.decisions.map(d => `- ${d}`).join("\n")}`);
+          resumeParts.push(
+            `\n[Decisions locked — do not revisit]\n${lastProgress.decisions.map((d) => `- ${d}`).join("\n")}`,
+          );
         }
         if (lastProgress.pendingTodos?.length > 0) {
-          resumeParts.push(`\n[Remaining work]\n${lastProgress.pendingTodos.map(t => `- ${t}`).join("\n")}`);
+          resumeParts.push(
+            `\n[Remaining work]\n${lastProgress.pendingTodos.map((t) => `- ${t}`).join("\n")}`,
+          );
         }
-        resumeParts.push("\nPick up exactly where you left off. Do NOT re-explore files you already read.");
+        resumeParts.push(
+          "\nPick up exactly where you left off. Do NOT re-explore files you already read.",
+        );
 
         messages.push({
           role: "user",
@@ -2049,13 +2193,17 @@ export class ApiBackend extends PunkBackend {
 
       const MAX_TURN_RETRIES = 3;
       let turnRetryCount = 0;
+      let _preCallMessageCount = 0; // Hoisted for post-turn archiving
 
       while (turn < maxTurns) {
         turn++;
 
         // Resolve model name first — state carries it so handleStreamEvent
         // can look up the model's streaming personality at parse time.
-        const resolvedModel = this.mapModelName(apiConfig.provider, request.model);
+        const resolvedModel = this.mapModelName(
+          apiConfig.provider,
+          request.model,
+        );
 
         const state = {
           accumulated: "",
@@ -2068,1008 +2216,1414 @@ export class ApiBackend extends PunkBackend {
         this.requestStates.set(request.projectId, state);
 
         try {
-        // deepseek-reasoner (R1) does not support function calling — sending tools
-        // returns HTTP 400. It also ignores sampling params (temperature etc.).
-        // We expand this to V4 and other thinking models that share this protocol.
-        const isDeepSeekReasoner =
-          apiConfig.provider === "deepseek" && 
-          (resolvedModel.includes("reasoner") || 
-           resolvedModel.includes("r1") || 
-           resolvedModel.includes("prover") || 
-           resolvedModel.includes("thinking"));
+          // deepseek-reasoner (R1) does not support function calling — sending tools
+          // returns HTTP 400. It also ignores sampling params (temperature etc.).
+          // We expand this to V4 and other thinking models that share this protocol.
+          const isDeepSeekReasoner =
+            apiConfig.provider === "deepseek" &&
+            (resolvedModel.includes("reasoner") ||
+              resolvedModel.includes("r1") ||
+              resolvedModel.includes("prover") ||
+              resolvedModel.includes("thinking"));
 
-        // Resolve max_tokens from the registry — no per-provider if/else chains.
-        // resolveMaxTokens checks the model ID against MODEL_OUTPUT_LIMITS and
-        // returns the right budget. omit=true means the field should be removed
-        // entirely (e.g. StepFun reasoning models manage their own CoT budget).
-        const { maxTokens, omit: omitMaxTokens } = resolveMaxTokens(resolvedModel);
+          // Resolve max_tokens from the registry — no per-provider if/else chains.
+          // resolveMaxTokens checks the model ID against MODEL_OUTPUT_LIMITS and
+          // returns the right budget. omit=true means the field should be removed
+          // entirely (e.g. StepFun reasoning models manage their own CoT budget).
+          const { maxTokens, omit: omitMaxTokens } =
+            resolveMaxTokens(resolvedModel);
 
-        // Phase 1: Normalize — convert frontend message format to API format
-        const normalizedMessages = this.normalizeMessages(messages, apiConfig.provider, resolvedModel);
-        // Phase 2: Validate — catch any remaining tool_call→tool_result sequence bugs
-        const validatedMessages = validateMessageSequence(normalizedMessages, apiConfig.provider);
-        const body = {
-          model: resolvedModel,
-          messages: validatedMessages,
-          stream: true,
-          max_tokens: maxTokens ?? DEFAULT_MAX_TOKENS,
-        };
-
-        if (omitMaxTokens) {
-          delete body.max_tokens;
-        }
-
-        // Request usage data in streaming response for OpenAI-compatible providers.
-        // Without this flag, some APIs (DeepSeek, Kimi, etc.) omit the usage object
-        // from the final SSE chunk, breaking cost and cache rate tracking entirely.
-        if (["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(apiConfig.provider)) {
-          body.stream_options = { include_usage: true };
-        }
-
-        if (apiConfig.provider === "openrouter") {
-          body.repetition_penalty = 1.1;
-        }
-
-        // Phase-based tool filtering — planning phase gets Plan tool, discovery gets read-only.
-        // deepseek-reasoner does NOT support function calling — skip entirely.
-        // For OpenRouter, consult the model personality registry — some OR-proxied
-        // models (e.g. deepseek/deepseek-reasoner) also don't support tools.
-        const phase = request.phase || "execution";
-        const orPersonality = apiConfig.provider === "openrouter"
-          ? getModelStreamingConfig(resolvedModel)
-          : null;
-        if (
-          (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
-          apiConfig.provider === "kimi" ||
-          apiConfig.provider === "stepfun" ||
-          apiConfig.provider === "xiaomi" ||
-          (apiConfig.provider === "openrouter" && orPersonality.supportsTools)
-        ) {
-          body.tools = getToolsForPhase(phase);
-        } else if (apiConfig.provider === "anthropic") {
-          body.tools = getAnthropicToolsForPhase(phase);
-        }
-
-        if (request.thinking && apiConfig.provider === "kimi") {
-          body.temperature = 1;
-          body.max_tokens = 8192;
-        }
-
-        if (request.thinking && apiConfig.provider === "openrouter") {
-          // OpenRouter standard reasoning toggle
-          body.include_reasoning = true;
-        }
-
-        if (request.thinking && apiConfig.provider === "xiaomi") {
-          // MiMo thinking mode — thinking tokens consume from the same max_tokens
-          // pool as output. Double the resolved budget to give the model room to
-          // reason without starving its output. The registry already sets a generous
-          // base for pro/omni; doubling it here accounts for heavy CoT sessions.
-          body.enable_thinking = true;
-          if (!omitMaxTokens) {
-            body.max_tokens = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
-          }
-        }
-
-        if (request.thinking && apiConfig.provider === "deepseek" && !isDeepSeekReasoner) {
-          // DeepSeek-chat (V3) thinking mode — returns reasoning_content in the response.
-          // reasoning_content MUST be passed back on every subsequent turn.
-          body.enable_thinking = true;
-        }
-
-        const { url, headers, finalBody } = await this.prepareRequest(
-          apiConfig,
-          body,
-          request,
-        );
-
-        const turnStartTime = Date.now();
-        // ============================================================================
-        // ENDURANCE RETRY LOGIC — Pane's resilience layer
-        // ============================================================================
-        // 
-        // Philosophy: API rejections are not failures — they're feedback.
-        // Pane should never give up on transient errors. Network hiccups,
-        // rate limits, and upstream server issues are expected in production.
-        // 
-        // Retry strategy by error type:
-        //   • 429 (Rate Limit):      7+ retries with jitter, respects Retry-After
-        //   • 5xx (Server Error):    7+ retries with exponential backoff + jitter
-        //   • Network failures:      7+ retries with progressive delays
-        //   • 400/401/403/422:       Immediate fail (client errors are not transient)
-        //   • 502/503/504:           Treated as network issues, 7+ retries
-        //
-        // Backoff formula: delay = base * 2^attempt + jitter
-        // Jitter prevents thundering herd when many clients retry simultaneously
-        // ============================================================================
-
-        let response;
-        let attempt = 0;
-        const MAX_RETRIES = 7; // Minimum per requirement
-        const BASE_DELAY_MS = 1000; // 1 second base
-        
-        // Track retry history for debugging
-        const retryHistory = [];
-        let lastErrorType = null;
-        // Preserves the error body across the retry loop boundary — the 400
-        // handler reads response.text() to check for "insufficient tool messages",
-        // which exhausts the body stream. If the error is NOT healable and we
-        // break, the code after the loop needs the body text for the error message.
-        let lastResponseBody = "";
-
-        // Lightweight pre-call checkpoint: save the last 6 messages instead of
-        // the full array. Avoids the 60GB memory spike from structuredClone on
-        // massive conversation arrays, but gives error recovery actual state to
-        // restore from (previously saved messages: null which was useless).
-        saveTurn(request.projectId, turn, {
-          messages: messages.slice(-6),
-          fullLength: messages.length,
-          turn,
-          timestamp: Date.now(),
-          phase: "pre-call"
-        });
-
-        while (true) {
-          try {
-            response = await fetch(url, {
-              method: "POST",
-              headers,
-              body: JSON.stringify(finalBody || body),
-              signal: abortController.signal,
-            });
-
-            if (!response.ok) {
-              const status = response.status;
-              
-              // 429 Rate Limit: 7+ retries with adaptive backoff
-              const isRateLimit = status === 429 || status === 430; // 430 is sometimes used by specialized providers
-              
-              // Transient 4xx errors that SHOULD be retried:
-              // 408: Request Timeout (upstream provider timed out)
-              // 409: Conflict (transient state conflict)
-              // 401: Unauthorized (ONLY for OpenRouter, occasionally transient sync issue)
-              const isTransientClientError = status === 408 || status === 409 || (status === 401 && apiConfig.provider === "openrouter");
-
-              // 400-series client errors: NOT retryable (except 429/408/409/OR-401)
-              if (status >= 400 && status < 500 && !isRateLimit && !isTransientClientError) {
-                // Explicitly categorize common client errors
-                if (status === 400) {
-                  lastErrorType = "bad_request";
-                  // ── HEALABLE 400: insufficient tool messages ──
-                  // Read the error body to check for sequence violations.
-                  // This catches cases where normalizeMessages + validateMessageSequence
-                  // didn't fully resolve the tool_call→tool_result chain.
-                  const errorBody = await response.text().catch(() => "");
-                  lastResponseBody = errorBody; // Preserve for error message after retry loop
-                  if (errorBody.includes("insufficient tool messages") && !this._healAttemptedThisTurn) {
-                    this._healAttemptedThisTurn = true;
-                    console.warn(`[http] auto-healing: stripping tool history (400: insufficient tool messages)`);
-                    // Notify the UI that Pane is handling it transparently
-                    this.onEvent(request.projectId, {
-                      event: "status",
-                      data: { message: "auto-healing message sequence..." },
-                    }, request.requestId);
-                    // Strip all tool_calls and tool-role messages from the body
-                    body.messages = stripToolHistory(body.messages);
-                    // finalBody may be a different object (prepareRequest creates a copy
-                    // for prefix-cache optimization). Sync it so the next fetch retry
-                    // uses the cleaned messages.
-                    if (finalBody && finalBody !== body && Array.isArray(finalBody.messages)) {
-                      finalBody.messages = body.messages;
-                    }
-                    // Clear status before retry
-                    this.onEvent(request.projectId, {
-                      event: "status",
-                      data: { message: null },
-                    }, request.requestId);
-                    continue; // Don't consume an attempt — heal is free
-                  }
-                  console.error(`[http] Bad request (400): ${errorBody.slice(0, 300)}`);
-                } else if (status === 401) {
-                  lastErrorType = "unauthorized";
-                  console.error(`[http] Unauthorized (401): Check API key configuration`);
-                } else if (status === 403) {
-                  lastErrorType = "forbidden";
-                  console.error(`[http] Forbidden (403): ${response.statusText}`);
-                } else if (status === 422) {
-                  lastErrorType = "validation_error";
-                  console.error(`[http] Validation error (422): ${response.statusText}`);
-                } else {
-                  lastErrorType = `client_error_${status}`;
-                  console.error(`[http] Client error (${status}): ${response.statusText}`);
-                }
-                break; // Don't retry fatal client errors
-              }
-
-              // Retryable 4xx (Rate Limit or Transient): 7+ retries with adaptive backoff
-              if ((isRateLimit || isTransientClientError) && attempt < MAX_RETRIES) {
-                lastErrorType = isRateLimit ? "rate_limit" : `transient_error_${status}`;
-                const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
-                
-                // Adaptive backoff: respect provider's recommended delay or exponential with jitter
-                let delay;
-                if (retryAfterSec > 0) {
-                  // Provider tells us exactly how long to wait
-                  delay = retryAfterSec * 1000;
-                } else {
-                  // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, 32s, 64s
-                  const exponential = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 60000);
-                  const jitter = Math.random() * 1000; // ±1s jitter
-                  delay = exponential + jitter;
-                }
-                
-                const delaySec = Math.round(delay / 1000);
-                retryHistory.push({ status, attempt: attempt + 1, delay: delaySec });
-                
-                const errorMsg = isRateLimit ? "rate limited" : `transient error ${status}`;
-                console.warn(`[http] ${errorMsg}. Waiting ${delaySec}s before retry ${attempt + 1}/${MAX_RETRIES}...`);
-                
-                // Surface the wait to the user so they know Pane is handling it
-                this.onEvent(request.projectId, {
-                  event: "status",
-                  data: { message: `${errorMsg} — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})` },
-                }, request.requestId);
-                
-                await new Promise((resolve) => setTimeout(resolve, delay));
-                
-                // Clear status before next attempt
-                this.onEvent(request.projectId, {
-                  event: "status",
-                  data: { message: null },
-                }, request.requestId);
-                
-                attempt++;
-                continue;
-              }
-
-              // 5xx server errors: 7+ retries with exponential backoff + jitter
-              if (status >= 500 && attempt < MAX_RETRIES) {
-                lastErrorType = `server_error_${status}`;
-                const jitter = Math.random() * 500;
-                const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
-                const delaySec = Math.round(delay / 1000);
-                
-                retryHistory.push({ status, attempt: attempt + 1, delay: delaySec });
-                
-                console.warn(`[http] Server error ${status}. Retrying in ${delaySec}s (attempt ${attempt + 1}/${MAX_RETRIES})...`);
-                this.onEvent(request.projectId, {
-                  event: "status",
-                  data: { message: `server error ${status} — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})` },
-                }, request.requestId);
-                
-                await new Promise((resolve) => setTimeout(resolve, delay));
-                
-                this.onEvent(request.projectId, {
-                  event: "status",
-                  data: { message: null },
-                }, request.requestId);
-                
-                attempt++;
-                continue;
-              }
-            }
-
-            // Success or unrecoverable error
-            break;
-          } catch (err) {
-            // Network-level failures: 7+ retries with progressive backoff
-            if (err.name === "AbortError") {
-              // User cancelled — don't retry
-              throw err;
-            }
-            
-            if (attempt < MAX_RETRIES) {
-              lastErrorType = "network_failure";
-              const jitter = Math.random() * 500;
-              const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
-              const delaySec = Math.round(delay / 1000);
-              
-              // Distinguish network error types for better diagnostics
-              let errorMsg = err.message || String(err);
-              let errorCategory = "network";
-              if (errorMsg.includes("ECONNREFUSED") || errorMsg.includes("connect")) {
-                errorCategory = "connection_refused";
-              } else if (errorMsg.includes("ETIMEDOUT") || errorMsg.includes("timeout")) {
-                errorCategory = "timeout";
-              } else if (errorMsg.includes("ENOTFOUND") || errorMsg.includes("DNS")) {
-                errorCategory = "dns";
-              }
-              
-              retryHistory.push({ error: errorCategory, attempt: attempt + 1, delay: delaySec });
-              
-              console.warn(`[http] ${errorCategory} failure: ${errorMsg}. Retrying in ${delaySec}s (attempt ${attempt + 1}/${MAX_RETRIES})...`);
-              this.onEvent(request.projectId, {
-                event: "status",
-                data: { message: `${errorCategory} — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})` },
-              }, request.requestId);
-              
-              await new Promise((resolve) => setTimeout(resolve, delay));
-              
-              this.onEvent(request.projectId, {
-                event: "status",
-                data: { message: null },
-              }, request.requestId);
-              
-              attempt++;
-              continue;
-            }
-            
-            // Max retries exceeded for network failure
-            console.error(`[http] Network failure after ${MAX_RETRIES} attempts: ${err.message}`);
-            throw err;
-          }
-        }
-        // --- END RETRY LOOP ---
-
-        // Log retry summary if retries were used
-        if (retryHistory.length > 0) {
-          console.log(`[http] Retry summary: ${retryHistory.length} attempts, history:`, JSON.stringify(retryHistory));
-        }
-
-        if (!response.ok) {
-          // If the 400 handler already consumed the response body reading errorBody,
-          // lastResponseBody has it. Otherwise read it fresh.
-          const errorText = lastResponseBody || await response
-            .text()
-            .catch(() => response.statusText);
-          console.error(`[http] API Error: ${response.status} - ${errorText}`);
-          throw new Error(`HTTP ${response.status}: ${errorText}`);
-        }
-
-        if (!response.body) throw new Error("Response body is null");
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || !trimmed.startsWith("data: ")) continue;
-            const data = trimmed.slice(6);
-            if (data === "[DONE]") break;
-
-            try {
-              const parsed = JSON.parse(data);
-              const emitted = this.handleStreamEvent(
-                request.projectId,
-                parsed,
-                apiConfig.provider,
-                request.requestId,
-              );
-              if (emitted) {
-                // Content was emitted
-              }
-            } catch (err) {
-              console.error("[punk] Failed to parse SSE data:", err, data);
-            }
-          }
-        }
-
-        // DeepSeek server-side resource exhaustion — retry the turn from scratch.
-        // "insufficient_system_resource" means the server couldn't complete the
-        // generation; treat it like a 503 and retry up to 2 times with a 2s delay.
-        if (state.finishReason === "insufficient_system_resource") {
-          if (turnRetryCount < 2) {
-            turnRetryCount++;
-            turn--; // don't count this as a used turn
-            const delay = 2000;
-            console.warn(
-              `[http] insufficient_system_resource — retrying turn in ${delay}ms (attempt ${turnRetryCount}/2)`,
-            );
-            await new Promise((resolve) => setTimeout(resolve, delay));
-            continue;
-          } else {
-            throw new Error(
-              "DeepSeek server resources exhausted after 2 retries (insufficient_system_resource). Try again in a moment.",
-            );
-          }
-        }
-        turnRetryCount = 0; // reset on a successful turn
-
-        // ─── Analytics Capture ─────────────────────────────────────────────
-        const { cost: turnCost, source: costSource, rateSnapshot } = calculateCost({
-          model: state.model,
-          provider: apiConfig.provider,
-          // input_tokens is now raw total (including cache). Subtract cache_read
-          // so calculateCost doesn't double-count cache at full input rate.
-          inputTokens: Math.max(0, (state.usage?.input_tokens || 0) - (state.usage?.cache_read_input_tokens || 0)),
-          outputTokens: state.usage?.output_tokens || 0,
-          cacheReadTokens: state.usage?.cache_read_input_tokens || 0,
-          cacheWriteTokens: state.usage?.cache_creation_input_tokens || 0,
-          apiReportedCost: state.usage?.cost,
-        });
-
-        this.onEvent(
-          request.projectId,
-          {
-            event: "token_usage",
-            data: {
-              provider: apiConfig.provider,
-              activity_type: request.activity_type || "conversation",
-              model: state.model,
-              input_tokens: state.usage?.input_tokens || 0,
-              output_tokens: state.usage?.output_tokens || 0,
-              cache_creation_input_tokens:
-                state.usage?.cache_creation_input_tokens || 0,
-              cache_read_input_tokens: state.usage?.cache_read_input_tokens || 0,
-              cost_usd: turnCost,
-              cost_source: costSource,
-              cost_rate_snapshot: rateSnapshot ? JSON.stringify(rateSnapshot) : null,
-              duration_ms: Date.now() - turnStartTime,
-            },
-          },
-          request.requestId,
-        );
-
-        // Log cache efficiency per provider — visibility into cost savings
-        const cacheRead = state.usage?.cache_read_input_tokens || 0;
-        const totalInput = state.usage?.input_tokens || 0;
-        if (cacheRead > 0 && totalInput > 0) {
-          const hitRate = ((cacheRead / totalInput) * 100).toFixed(0);
-          console.log(`[cache] ${apiConfig.provider}/${state.model}: ${hitRate}% hit (${cacheRead} cached / ${totalInput} total input tokens)`);
-        }
-
-        const finalContent = [];
-        if (state.accumulated) {
-          finalContent.push({ type: "text", text: state.accumulated });
-          // Accumulate text for pattern extraction in handoff
-          if (sessionOutput.length < SESSION_OUTPUT_CAP) {
-            sessionOutput += (sessionOutput ? "\n\n" : "") + state.accumulated;
-          }
-        }
-        for (const tool of state.toolUses.values()) {
-          let parsedInput = {};
-          try {
-            parsedInput = JSON.parse(tool.input);
-          } catch {
-            parsedInput = tool.input;
-          }
-          finalContent.push({
-            type: "tool_use",
-            id: tool.id,
-            name: tool.name,
-            input: parsedInput,
-          });
-        }
-
-        // Final assistant message for this turn
-        const parsedMessage = {
-          type: "assistant",
-          message: { content: finalContent },
-        };
-        const isDeepSeekModel = apiConfig.provider === "deepseek" || (apiConfig.provider === "openrouter" && resolvedModel.includes("deepseek"));
-        const deepseekThinking = isDeepSeekModel && (
-          isDeepSeekReasoner || 
-          (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
-          (apiConfig.provider === "openrouter" && body.include_reasoning)
-        ) && state.thinking;
-        
-        if (deepseekThinking) {
-          parsedMessage.message.reasoning_content = state.thinking;
-        }
-
-        this.onEvent(
-          request.projectId,
-          {
-            event: "message",
-            data: {
-              parsed: parsedMessage,
-            },
-          },
-          request.requestId,
-        );
-
-        const assistantEntry = { role: "assistant", content: finalContent };
-        if (deepseekThinking) {
-          assistantEntry.reasoning_content = state.thinking;
-        }
-        messages.push(assistantEntry);
-        journal.append(assistantEntry, { turn, phase: "response" });
-
-        // LOOP CONTROL
-        const hasTools = state.toolUses.size > 0;
-        const hasContent = state.accumulated.trim().length > 0;
-        const wasThinking = state.thinking.trim().length > 0;
-        const isLengthLimited = state.finishReason === "length";
-        const isToolCalls = state.finishReason === "tool_calls";
-
-        // Handle premature stream disconnects
-        // Detect two cases:
-        //   1. Stream died with nothing: finishReason null, no content, no tools
-        //   2. Stream died mid-output: finishReason null, but has partial content/thinking
-        // Both mean the API connection dropped before the model finished its turn.
-        const streamDiedEmpty = state.finishReason == null && !hasContent && !hasTools;
-        const streamDiedMidOutput = state.finishReason == null && (hasContent || wasThinking);
-
-        if ((streamDiedEmpty || streamDiedMidOutput) && !abortController.signal.aborted) {
-          if (disconnectRetryCount < 3) {
-            disconnectRetryCount++;
-            turn--; // Don't consume a turn
-
-            const diag = streamDiedMidOutput
-              ? `partial output (${state.accumulated.length} chars text, ${state.thinking.length} chars thinking)`
-              : wasThinking ? "abandoned thought" : "no data received";
-            console.warn(`[http] Stream closed prematurely (${diag}). Retrying turn ${turn + 1} (attempt ${disconnectRetryCount}/3)...`);
-
-            // Strip the assistant message — it's incomplete
-            messages.pop();
-
-            // If we had partial thinking/content, preserve it as context for the retry
-            // so the model doesn't lose its reasoning if the retry also partially fails
-            if (streamDiedMidOutput && disconnectRetryCount >= 2) {
-              const partialContext = [];
-              if (state.thinking.trim()) {
-                partialContext.push(`[Your partial reasoning from dropped connection — continue from here]\n...${state.thinking.slice(-400)}`);
-              }
-              if (state.accumulated.trim()) {
-                partialContext.push(`[Your partial output from dropped connection — continue from here]\n...${state.accumulated.slice(-300)}`);
-              }
-              if (partialContext.length > 0) {
-                const disconnectMsg = {
-                  role: "user",
-                  content: [{ type: "text", text: partialContext.join("\n\n") }]
-                };
-                messages.push(disconnectMsg);
-                journal.append(disconnectMsg, { turn, phase: "disconnect-recovery" });
-              }
-            }
-
-            // Surface the retry to the UI
-            this.onEvent(request.projectId, {
-              event: "status",
-              data: { message: `connection dropped — retrying turn (${disconnectRetryCount}/3)` },
-            }, request.requestId);
-
-            await new Promise((resolve) => setTimeout(resolve, 2000 * disconnectRetryCount));
-
-            // Clear status
-            this.onEvent(request.projectId, {
-              event: "status",
-              data: { message: null },
-            }, request.requestId);
-
-            continue;
-          } else {
-            console.error("[http] Stream closed prematurely 3 times in a row. Falling through.");
-          }
-        }
-        
-        disconnectRetryCount = 0; // Reset on success
-
-        // If no reason to continue, check for pending todos before breaking
-        if (!hasTools && !isLengthLimited && !isToolCalls) {
-          const todos = readState(request.projectId).todos || [];
-          const workLeft = todos.some(t => t.status === "pending" || t.status === "in_progress");
-
-          // MIMO-specific: also catch premature stops where the model ended
-          // with "stop" but the last output looks unfinished (e.g. ends mid-code,
-          // mid-sentence, or with an explicit "I'll continue" / "Next I will" signal).
-          // This happens when the model runs out of reasoning budget and wraps up
-          // too early even though max_tokens wasn't actually hit.
-          const isMimoProvider = request.provider === "xiaomi" ||
-            (request.provider === "openrouter" && (resolvedModel || "").includes("mimo"));
-          const lastOutput = state.accumulated.trimEnd();
-          const looksIncomplete = isMimoProvider && state.finishReason === "stop" && (
-            // Ends mid-code block (unclosed fence)
-            (lastOutput.match(/```/g) || []).length % 2 !== 0 ||
-            // Explicit continuation signal the model wrote
-            /(?:I(?:'ll| will| can) (?:now |continue|proceed|implement|write|add)|Next[,:]?\s+I|Let me (?:now |continue|proceed)|Moving on|Continuing)/i.test(lastOutput.slice(-300)) ||
-            // Ends with punctuation that implies more is coming
-            /[,:]\s*$/.test(lastOutput.slice(-50))
+          // Phase 1: Normalize — convert frontend message format to API format
+          const normalizedMessages = this.normalizeMessages(
+            messages,
+            apiConfig.provider,
+            resolvedModel,
           );
-
-          if ((workLeft || looksIncomplete) && turn < maxTurns) {
-            const remaining = todos.filter(t => t.status !== "completed");
-            const continueReason = looksIncomplete && !workLeft
-              ? "incomplete output detected"
-              : `work is pending (${remaining.length} todos)`;
-            console.log(`[http] Auto-continuing turn ${turn} - ${continueReason}`);
-
-            const continuationParts = [];
-
-            if (looksIncomplete && !workLeft) {
-              // ── Incomplete-output continuation (MIMO / reasoning model stopped early) ──
-              // The model issued finish_reason:stop but left its output unfinished.
-              // We don't inject todos (there are none) — just tell it to pick up
-              // exactly where it left off, mirroring what it last wrote so it doesn't
-              // re-explore from the top.
-              continuationParts.push("Your output was cut short. Continue exactly from where you left off — do NOT restart, re-explain, or repeat anything already written.");
-
-              // Mirror the model's last partial output so it has the exact tail to continue from
-              for (let i = messages.length - 1; i >= Math.max(0, messages.length - 4); i--) {
-                const m = messages[i];
-                if (m.role === "assistant") {
-                  // Last reasoning tail — helps reasoning models pick up their thought
-                  const thinkingBlock = Array.isArray(m.content)
-                    ? m.content.find(b => b.type === "thinking")
-                    : null;
-                  if (thinkingBlock?.thinking) {
-                    const tail = thinkingBlock.thinking.slice(-400);
-                    continuationParts.push(`\n[Your last reasoning — continue the thought]\n...${tail}`);
-                  }
-                  // Last output tail — the exact characters the model stopped after
-                  const textContent = Array.isArray(m.content)
-                    ? m.content.filter(b => b.type === "text").map(b => b.text).join("\n")
-                    : typeof m.content === "string" ? m.content : "";
-                  if (textContent.trim()) {
-                    const tail = textContent.slice(-500);
-                    continuationParts.push(`\n[Your last output — pick up from this exact point]\n...${tail}`);
-                  }
-                  break;
-                }
-              }
-            } else {
-              // ── Todo-based continuation (model stopped with pending work) ──────────
-              // The model stopped but there is tracked work remaining.
-              // Reconstruct what it already accomplished so it picks up where it left
-              // off rather than re-exploring from scratch.
-              continuationParts.push("You stopped before finishing. Here is your progress so far — pick up exactly where you left off, do NOT re-explore or re-read files you already examined.");
-
-              // Inject what the model already accomplished this session
-              const sessionState = readState(request.projectId);
-              const recentActions = sessionState.recentActions || [];
-              if (recentActions.length > 0) {
-                const actionSummary = recentActions.slice(-5).map(a => `- ${a.content}`).join("\n");
-                continuationParts.push(`\n[Actions completed so far]\n${actionSummary}`);
-              }
-
-              // Inject decisions locked this session
-              const decisions = sessionState.decisions || [];
-              if (decisions.length > 0) {
-                const decisionSummary = decisions.slice(-3).map(d => `- ${d.content}`).join("\n");
-                continuationParts.push(`\n[Decisions already made — do not revisit]\n${decisionSummary}`);
-              }
-
-              // Mirror the model's own last thinking/content
-              for (let i = messages.length - 1; i >= Math.max(0, messages.length - 4); i--) {
-                const m = messages[i];
-                if (m.role === "assistant") {
-                  const thinkingBlock = Array.isArray(m.content)
-                    ? m.content.find(b => b.type === "thinking")
-                    : null;
-                  if (thinkingBlock?.thinking) {
-                    const tail = thinkingBlock.thinking.slice(-500);
-                    continuationParts.push(`\n[Your last reasoning before dropping]\n...${tail}`);
-                  }
-                  const textContent = Array.isArray(m.content)
-                    ? m.content.filter(b => b.type === "text").map(b => b.text).join("\n")
-                    : typeof m.content === "string" ? m.content : "";
-                  if (textContent.trim()) {
-                    const tail = textContent.slice(-300);
-                    continuationParts.push(`\n[Your last output before dropping]\n...${tail}`);
-                  }
-                  break;
-                }
-              }
-
-              // Remaining work
-              if (remaining.length > 0) {
-                const todoList = remaining.map(t => `- [${t.status}] ${t.content}`).join("\n");
-                continuationParts.push(`\n[Remaining work]\n${todoList}`);
-              }
-
-              // Stall warning
-              if (arbiterChangedFiles.size === 0) {
-                continuationParts.push("\nWARNING: Your last turn made no file changes. Use tools (write_file, replace, bash) to actually implement — do not just discuss.");
-              }
-            }
-
-            const contMsg = {
-              role: "user",
-              content: [{ type: "text", text: continuationParts.join("\n") }]
-            };
-            messages.push(contMsg);
-            journal.append(contMsg, { turn, phase: "auto-continue" });
-
-            // Journal progress snapshot — if the session dies after this,
-            // the next resume will know exactly what was accomplished
-            const progressState = readState(request.projectId);
-            journal.writeProgress({
-              accomplishments: (progressState.recentActions || []).slice(-5).map(a => a.content),
-              decisions: (progressState.decisions || []).map(d => d.content),
-              pendingTodos: (progressState.todos || []).filter(t => t.status !== "completed").map(t => t.content),
-              turn,
-            });
-
-            continue;
-          }
-          break;
-        }
-
-        // If it was just a length limit without tools, we continue immediately
-        // BUT ONLY IF we actually got some content, otherwise we are likely in a loop
-        if (isLengthLimited && !hasTools) {
-          if (!hasContent) {
-            console.warn(
-              `[http] Stopping turn ${turn} - length limit hit but no content or tools produced.`,
-            );
-            break;
-          }
-          console.log(
-            `[http] Auto-continuing turn ${turn} due to length limit`,
+          // Phase 2: Validate — catch any remaining tool_call→tool_result sequence bugs
+          const validatedMessages = validateMessageSequence(
+            normalizedMessages,
+            apiConfig.provider,
           );
-          continue;
-        }
+          const body = {
+            model: resolvedModel,
+            messages: validatedMessages,
+            stream: true,
+            max_tokens: maxTokens ?? DEFAULT_MAX_TOKENS,
+          };
 
-        // Execute tools
-        const executor = this.getToolExecutor(
-          request.projectId,
-          request.workingDir,
-        );
-        const toolResults = [];
-        let toolSeq = 0; // sequence counter for tool-result-cache
-
-        for (const tool of state.toolUses.values()) {
-          let parsedInput = {};
-          try {
-            parsedInput = JSON.parse(tool.input);
-          } catch {
-            parsedInput = tool.input;
+          if (omitMaxTokens) {
+            delete body.max_tokens;
           }
 
-          let result;
-          if (tool.name === "evaluate_js") {
-            try {
-              const fn = new Function(
-                "getContextLimit",
-                "TOOL_DEFINITIONS",
-                `return (${parsedInput.code})`,
-              );
-              const val = fn(getContextLimit, TOOL_DEFINITIONS);
-              result = { success: true, output: JSON.stringify(val, null, 2) };
-            } catch (err) {
-              result = { success: false, error: err.message };
+          // Request usage data in streaming response for OpenAI-compatible providers.
+          // Without this flag, some APIs (DeepSeek, Kimi, etc.) omit the usage object
+          // from the final SSE chunk, breaking cost and cache rate tracking entirely.
+          if (
+            ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(
+              apiConfig.provider,
+            )
+          ) {
+            body.stream_options = { include_usage: true };
+          }
+
+          if (apiConfig.provider === "openrouter") {
+            body.repetition_penalty = 1.1;
+          }
+
+          // Phase-based tool filtering — planning phase gets Plan tool, discovery gets read-only.
+          // deepseek-reasoner does NOT support function calling — skip entirely.
+          // For OpenRouter, consult the model personality registry — some OR-proxied
+          // models (e.g. deepseek/deepseek-reasoner) also don't support tools.
+          const phase = request.phase || "execution";
+          const orPersonality =
+            apiConfig.provider === "openrouter"
+              ? getModelStreamingConfig(resolvedModel)
+              : null;
+          if (
+            (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
+            apiConfig.provider === "kimi" ||
+            apiConfig.provider === "stepfun" ||
+            apiConfig.provider === "xiaomi" ||
+            (apiConfig.provider === "openrouter" && orPersonality.supportsTools)
+          ) {
+            body.tools = getToolsForPhase(phase);
+          } else if (apiConfig.provider === "anthropic") {
+            body.tools = getAnthropicToolsForPhase(phase);
+          }
+
+          if (request.thinking && apiConfig.provider === "kimi") {
+            body.temperature = 1;
+            body.max_tokens = 8192;
+          }
+
+          if (request.thinking && apiConfig.provider === "openrouter") {
+            // OpenRouter standard reasoning toggle
+            body.include_reasoning = true;
+          }
+
+          if (request.thinking && apiConfig.provider === "xiaomi") {
+            // MiMo thinking mode — thinking tokens consume from the same max_tokens
+            // pool as output. Double the resolved budget to give the model room to
+            // reason without starving its output. The registry already sets a generous
+            // base for pro/omni; doubling it here accounts for heavy CoT sessions.
+            body.enable_thinking = true;
+            if (!omitMaxTokens) {
+              body.max_tokens = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
             }
-          } else {
-            result = await executor.executeTool(
-              tool.id,
-              tool.name,
-              parsedInput,
-            );
-          }
-          let isError = !result.success;
-          let content = result.output || result.error || "";
-
-          // ── Immediate Tool Verification (Reflex Gate) ──────────────────
-          // If a tool failed or was "hollow" (e.g. replace matched 0 lines),
-          // augment the result with an actionable correction directive.
-          // This keeps the model in the same "hot" context turn to fix it.
-          if (tool.name === "replace" && !isError && content.includes("0 replacements")) {
-            const filePath = parsedInput.file_path || parsedInput.path;
-            content = `Error: 0 replacements made in ${filePath}. ` +
-                      `The 'old_string' you provided did not match any text in the file. ` +
-                      `TIP: Read the file again to ensure you have the exact text, including all whitespace and indentation. ` +
-                      `The file content may have changed or your mental model of it is stale.`;
-            isError = true; // Treat hollow replacement as an error to trigger re-thinking
-          }
-          if (tool.name === "write_file" && isError) {
-            content = `Error writing file: ${content}. Ensure the path is correct and you have permission.`;
-          }
-
-          // ── Tool Result Enrichment ─────────────────────────────────────
-          // When the model uses exploration tools (read_file, grep, glob),
-          // enrich the result with project intelligence: design constraints,
-          // architecture briefs, memories, symbols. The model gets smarter
-          // results without calling special tools.
-          const ENRICHABLE_TOOLS = new Set(["read_file", "pane_read_files", "grep_search", "glob"]);
-          if (!isError && ENRICHABLE_TOOLS.has(tool.name)) {
-            try {
-              const { enrichToolResult } = await import("./tool-enrichment.mjs");
-              content = await enrichToolResult(
-                tool.name, parsedInput, content, request.projectId,
-                { brainRequest: this._brainRequest, projectRoot: request.workingDir },
-              );
-            } catch {} // enrichment failure is silent — raw result still works
           }
 
           if (
-            !isError &&
-            [
-              "run_shell_command",
-              "write_file",
-              "replace",
-              "bash",
-              "TodoWrite",
-              "Task",
-            ].includes(tool.name)
+            request.thinking &&
+            apiConfig.provider === "deepseek" &&
+            !isDeepSeekReasoner
           ) {
-            if (tool.name === "TodoWrite" && parsedInput.todos) {
-              // Normalize todos format - handle both string[] and Todo[] formats
-              let normalizedTodos;
-              if (Array.isArray(parsedInput.todos)) {
-                if (typeof parsedInput.todos[0] === "string") {
-                  // Convert string array to Todo objects with default status
-                  normalizedTodos = parsedInput.todos.map((content) => ({
-                    content,
-                    status: "pending",
-                    activeForm: content.split(" ").slice(0, 2).join(" ") + "...",
-                  }));
-                } else {
-                  // Already in correct format
-                  normalizedTodos = parsedInput.todos;
+            // DeepSeek-chat (V3) thinking mode — returns reasoning_content in the response.
+            // reasoning_content MUST be passed back on every subsequent turn.
+            body.enable_thinking = true;
+          }
+
+          const { url, headers, finalBody } = await this.prepareRequest(
+            apiConfig,
+            body,
+            request,
+          );
+
+          const turnStartTime = Date.now();
+          // ============================================================================
+          // ENDURANCE RETRY LOGIC — Pane's resilience layer
+          // ============================================================================
+          //
+          // Philosophy: API rejections are not failures — they're feedback.
+          // Pane should never give up on transient errors. Network hiccups,
+          // rate limits, and upstream server issues are expected in production.
+          //
+          // Retry strategy by error type:
+          //   • 429 (Rate Limit):      7+ retries with jitter, respects Retry-After
+          //   • 5xx (Server Error):    7+ retries with exponential backoff + jitter
+          //   • Network failures:      7+ retries with progressive delays
+          //   • 400/401/403/422:       Immediate fail (client errors are not transient)
+          //   • 502/503/504:           Treated as network issues, 7+ retries
+          //
+          // Backoff formula: delay = base * 2^attempt + jitter
+          // Jitter prevents thundering herd when many clients retry simultaneously
+          // ============================================================================
+
+          let response;
+          let attempt = 0;
+          const MAX_RETRIES = 7; // Minimum per requirement
+          const BASE_DELAY_MS = 1000; // 1 second base
+
+          // Track retry history for debugging
+          const retryHistory = [];
+          let lastErrorType = null;
+          // Preserves the error body across the retry loop boundary — the 400
+          // handler reads response.text() to check for "insufficient tool messages",
+          // which exhausts the body stream. If the error is NOT healable and we
+          // break, the code after the loop needs the body text for the error message.
+          let lastResponseBody = "";
+
+          // Lightweight pre-call checkpoint: save the last 6 messages instead of
+          // the full array. Avoids the 60GB memory spike from structuredClone on
+          // massive conversation arrays, but gives error recovery actual state to
+          // restore from (previously saved messages: null which was useless).
+          _preCallMessageCount = messages.length;
+          saveTurn(request.projectId, turn, {
+            messages: messages.slice(-6),
+            fullLength: _preCallMessageCount,
+            turn,
+            timestamp: Date.now(),
+            phase: "pre-call",
+          });
+
+          while (true) {
+            try {
+              // ── Pre-flight guardrail: context window overflow prevention ──
+              // Catches cases where token estimation was off or the conversation
+              // grew between pruning and sending. Checks the actual body messages
+              // against the model's hard limit minus output/tools overhead.
+              const sourceBody = finalBody || body;
+              if (sourceBody.messages?.length > 0) {
+                const modelLimit = request.model ? getModelLimit(request.model) : 128000;
+                const outputBudget = getDefaultOutputBudget(request.model);
+                const overheadBudget = 3000; // tools definitions + stop sequences + framing
+                const maxMessagesTokens = modelLimit - outputBudget - overheadBudget;
+                const currentMsgTokens = estimateTokens(JSON.stringify(sourceBody.messages));
+                if (currentMsgTokens > maxMessagesTokens) {
+                  console.warn(
+                    `[http] Pre-flight guardrail: ~${currentMsgTokens} msg tokens exceeds ${maxMessagesTokens} budget (model: ${modelLimit}, output: ${outputBudget}). Force-pruning...`
+                  );
+                  const result = forcePruneToBudget(
+                    sourceBody.messages,
+                    maxMessagesTokens,
+                    request.projectId,
+                  );
+                  console.log(
+                    `[http] Pre-flight force-prune: saved ${result.tokensSaved} tokens, ${result.messagesRemaining} messages remaining`
+                  );
+                  // If finalBody is separate from body, sync prune back to body
+                  // so retry logic works on the original reference
+                  if (finalBody && finalBody !== body && finalBody.messages) {
+                    body.messages = finalBody.messages;
+                  }
+                  this.onEvent(request.projectId, {
+                    event: "window_managed",
+                    data: {
+                      action: "force-prune",
+                      tokensSaved: result.tokensSaved,
+                      messagesRemaining: result.messagesRemaining,
+                    },
+                  }, request.requestId);
                 }
-              } else {
-                normalizedTodos = parsedInput.todos;
               }
-              
-              mergeState(request.projectId, { todos: normalizedTodos });
-              // Send updated todos to frontend
-              this.onEvent(
-                request.projectId,
-                {
-                  event: "todos_updated",
-                  data: { todos: normalizedTodos },
-                },
-                request.requestId,
-              );
-            }
-            if (
-              tool.name === "Task" &&
-              (parsedInput.task || parsedInput.description)
-            ) {
-              mergeState(request.projectId, {
-                activeTask: {
-                  description: parsedInput.task || parsedInput.description,
-                },
+
+              response = await fetch(url, {
+                method: "POST",
+                headers,
+                body: JSON.stringify(sourceBody),
+                signal: abortController.signal,
               });
-              // Send updated activeTask to frontend
-              this.onEvent(
-                request.projectId,
-                {
-                  event: "activeTask_updated",
-                  data: { activeTask: { description: parsedInput.task || parsedInput.description } },
-                },
-                request.requestId,
+
+              if (!response.ok) {
+                const status = response.status;
+
+                // 429 Rate Limit: 7+ retries with adaptive backoff
+                const isRateLimit = status === 429 || status === 430; // 430 is sometimes used by specialized providers
+
+                // Transient 4xx errors that SHOULD be retried:
+                // 408: Request Timeout (upstream provider timed out)
+                // 409: Conflict (transient state conflict)
+                // 401: Unauthorized (ONLY for OpenRouter, occasionally transient sync issue)
+                const isTransientClientError =
+                  status === 408 ||
+                  status === 409 ||
+                  (status === 401 && apiConfig.provider === "openrouter");
+
+                // 400-series client errors: NOT retryable (except 429/408/409/OR-401)
+                if (
+                  status >= 400 &&
+                  status < 500 &&
+                  !isRateLimit &&
+                  !isTransientClientError
+                ) {
+                  // Explicitly categorize common client errors
+                  if (status === 400) {
+                    lastErrorType = "bad_request";
+                    // ── HEALABLE 400: insufficient tool messages ──
+                    // Read the error body to check for sequence violations.
+                    // This catches cases where normalizeMessages + validateMessageSequence
+                    // didn't fully resolve the tool_call→tool_result chain.
+                    const errorBody = await response.text().catch(() => "");
+                    lastResponseBody = errorBody; // Preserve for error message after retry loop
+                    if (
+                      errorBody.includes("insufficient tool messages") &&
+                      !this._healAttemptedThisTurn
+                    ) {
+                      this._healAttemptedThisTurn = true;
+                      console.warn(
+                        `[http] auto-healing: stripping tool history (400: insufficient tool messages)`,
+                      );
+                      // Notify the UI that Pane is handling it transparently
+                      this.onEvent(
+                        request.projectId,
+                        {
+                          event: "status",
+                          data: { message: "auto-healing message sequence..." },
+                        },
+                        request.requestId,
+                      );
+                      // Strip all tool_calls and tool-role messages from the body
+                      body.messages = stripToolHistory(body.messages);
+                      // finalBody may be a different object (prepareRequest creates a copy
+                      // for prefix-cache optimization). Sync it so the next fetch retry
+                      // uses the cleaned messages.
+                      if (
+                        finalBody &&
+                        finalBody !== body &&
+                        Array.isArray(finalBody.messages)
+                      ) {
+                        finalBody.messages = body.messages;
+                      }
+                      // Clear status before retry
+                      this.onEvent(
+                        request.projectId,
+                        {
+                          event: "status",
+                          data: { message: null },
+                        },
+                        request.requestId,
+                      );
+                      continue; // Don't consume an attempt — heal is free
+                    }
+
+                    // ── HEALABLE 400: context window overflow ──
+                    // "maximum context length is X tokens. However, you requested Y tokens"
+                    // The pre-flight guardrail should catch most of these, but if estimation
+                    // is off or the tokenizer counts differently, the API will reject.
+                    // Drop oldest turns aggressively and retry.
+                    if (
+                      (errorBody.includes("maximum context length") ||
+                        errorBody.includes("context length") ||
+                        errorBody.includes("reduce the length of the messages")) &&
+                      !this._contextHealAttemptedThisTurn
+                    ) {
+                      this._contextHealAttemptedThisTurn = true;
+                      console.warn(
+                        `[http] auto-healing: context window overflow detected — force-pruning messages`,
+                      );
+                      this.onEvent(
+                        request.projectId,
+                        {
+                          event: "status",
+                          data: { message: "context window full — pruning old messages..." },
+                        },
+                        request.requestId,
+                      );
+                      // Force-prune the actual source body messages aggressively
+                      const modelLimit = request.model ? getModelLimit(request.model) : 128000;
+                      const outputBudget = getDefaultOutputBudget(request.model);
+                      const maxMessagesTokens = modelLimit - outputBudget - 3000;
+                      forcePruneToBudget(
+                        sourceBody.messages,
+                        maxMessagesTokens,
+                        request.projectId,
+                      );
+                      // Sync back to body.messages so retry uses the pruned state
+                      if (finalBody && finalBody !== body && Array.isArray(finalBody.messages)) {
+                        body.messages = finalBody.messages;
+                      } else if (!finalBody) {
+                        body.messages = sourceBody.messages;
+                      }
+                      this.onEvent(
+                        request.projectId,
+                        { event: "status", data: { message: null } },
+                        request.requestId,
+                      );
+                      console.log(`[http] Context-heal pruned to ${sourceBody.messages.length} messages`);
+                      continue; // Don't consume an attempt — heal is free
+                    }
+
+                    console.error(
+                      `[http] Bad request (400): ${errorBody.slice(0, 300)}`,
+                    );
+                  } else if (status === 401) {
+                    lastErrorType = "unauthorized";
+                    console.error(
+                      `[http] Unauthorized (401): Check API key configuration`,
+                    );
+                  } else if (status === 403) {
+                    lastErrorType = "forbidden";
+                    console.error(
+                      `[http] Forbidden (403): ${response.statusText}`,
+                    );
+                  } else if (status === 422) {
+                    lastErrorType = "validation_error";
+                    console.error(
+                      `[http] Validation error (422): ${response.statusText}`,
+                    );
+                  } else {
+                    lastErrorType = `client_error_${status}`;
+                    console.error(
+                      `[http] Client error (${status}): ${response.statusText}`,
+                    );
+                  }
+                  break; // Don't retry fatal client errors
+                }
+
+                // Retryable 4xx (Rate Limit or Transient): 7+ retries with adaptive backoff
+                if (
+                  (isRateLimit || isTransientClientError) &&
+                  attempt < MAX_RETRIES
+                ) {
+                  lastErrorType = isRateLimit
+                    ? "rate_limit"
+                    : `transient_error_${status}`;
+                  const retryAfterSec = parseInt(
+                    response.headers.get("retry-after") || "0",
+                    10,
+                  );
+
+                  // Adaptive backoff: respect provider's recommended delay or exponential with jitter
+                  let delay;
+                  if (retryAfterSec > 0) {
+                    // Provider tells us exactly how long to wait
+                    delay = retryAfterSec * 1000;
+                  } else {
+                    // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, 32s, 64s
+                    const exponential = Math.min(
+                      BASE_DELAY_MS * Math.pow(2, attempt),
+                      60000,
+                    );
+                    const jitter = Math.random() * 1000; // ±1s jitter
+                    delay = exponential + jitter;
+                  }
+
+                  const delaySec = Math.round(delay / 1000);
+                  retryHistory.push({
+                    status,
+                    attempt: attempt + 1,
+                    delay: delaySec,
+                  });
+
+                  const errorMsg = isRateLimit
+                    ? "rate limited"
+                    : `transient error ${status}`;
+                  console.warn(
+                    `[http] ${errorMsg}. Waiting ${delaySec}s before retry ${attempt + 1}/${MAX_RETRIES}...`,
+                  );
+
+                  // Surface the wait to the user so they know Pane is handling it
+                  this.onEvent(
+                    request.projectId,
+                    {
+                      event: "status",
+                      data: {
+                        message: `${errorMsg} — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})`,
+                      },
+                    },
+                    request.requestId,
+                  );
+
+                  await new Promise((resolve) => setTimeout(resolve, delay));
+
+                  // Clear status before next attempt
+                  this.onEvent(
+                    request.projectId,
+                    {
+                      event: "status",
+                      data: { message: null },
+                    },
+                    request.requestId,
+                  );
+
+                  attempt++;
+                  continue;
+                }
+
+                // 5xx server errors: 7+ retries with exponential backoff + jitter
+                if (status >= 500 && attempt < MAX_RETRIES) {
+                  lastErrorType = `server_error_${status}`;
+                  const jitter = Math.random() * 500;
+                  const delay =
+                    Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) +
+                    jitter;
+                  const delaySec = Math.round(delay / 1000);
+
+                  retryHistory.push({
+                    status,
+                    attempt: attempt + 1,
+                    delay: delaySec,
+                  });
+
+                  console.warn(
+                    `[http] Server error ${status}. Retrying in ${delaySec}s (attempt ${attempt + 1}/${MAX_RETRIES})...`,
+                  );
+                  this.onEvent(
+                    request.projectId,
+                    {
+                      event: "status",
+                      data: {
+                        message: `server error ${status} — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})`,
+                      },
+                    },
+                    request.requestId,
+                  );
+
+                  await new Promise((resolve) => setTimeout(resolve, delay));
+
+                  this.onEvent(
+                    request.projectId,
+                    {
+                      event: "status",
+                      data: { message: null },
+                    },
+                    request.requestId,
+                  );
+
+                  attempt++;
+                  continue;
+                }
+              }
+
+              // Success or unrecoverable error
+              break;
+            } catch (err) {
+              // Network-level failures: 7+ retries with progressive backoff
+              if (err.name === "AbortError") {
+                // User cancelled — don't retry
+                throw err;
+              }
+
+              if (attempt < MAX_RETRIES) {
+                lastErrorType = "network_failure";
+                const jitter = Math.random() * 500;
+                const delay =
+                  Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) +
+                  jitter;
+                const delaySec = Math.round(delay / 1000);
+
+                // Distinguish network error types for better diagnostics
+                let errorMsg = err.message || String(err);
+                let errorCategory = "network";
+                if (
+                  errorMsg.includes("ECONNREFUSED") ||
+                  errorMsg.includes("connect")
+                ) {
+                  errorCategory = "connection_refused";
+                } else if (
+                  errorMsg.includes("ETIMEDOUT") ||
+                  errorMsg.includes("timeout")
+                ) {
+                  errorCategory = "timeout";
+                } else if (
+                  errorMsg.includes("ENOTFOUND") ||
+                  errorMsg.includes("DNS")
+                ) {
+                  errorCategory = "dns";
+                }
+
+                retryHistory.push({
+                  error: errorCategory,
+                  attempt: attempt + 1,
+                  delay: delaySec,
+                });
+
+                console.warn(
+                  `[http] ${errorCategory} failure: ${errorMsg}. Retrying in ${delaySec}s (attempt ${attempt + 1}/${MAX_RETRIES})...`,
+                );
+                this.onEvent(
+                  request.projectId,
+                  {
+                    event: "status",
+                    data: {
+                      message: `${errorCategory} — retrying in ${delaySec}s (${attempt + 1}/${MAX_RETRIES})`,
+                    },
+                  },
+                  request.requestId,
+                );
+
+                await new Promise((resolve) => setTimeout(resolve, delay));
+
+                this.onEvent(
+                  request.projectId,
+                  {
+                    event: "status",
+                    data: { message: null },
+                  },
+                  request.requestId,
+                );
+
+                attempt++;
+                continue;
+              }
+
+              // Max retries exceeded for network failure
+              console.error(
+                `[http] Network failure after ${MAX_RETRIES} attempts: ${err.message}`,
               );
+              throw err;
             }
+          }
+          // --- END RETRY LOOP ---
 
-            // ── Auto-advance todos based on what actually happened ─────────
-            // write_file / replace: real work happened → advance first pending
-            if (!isError && (tool.name === "write_file" || tool.name === "replace")) {
-              autoAdvanceTodos(request.projectId, "write", this.onEvent.bind(this), request.requestId);
-              // Track changed file for Turn Sentinel
-              const changedPath = parsedInput.file_path || parsedInput.path || "";
-              if (changedPath) arbiterChangedFiles.add(changedPath);
-            }
+          // Log retry summary if retries were used
+          if (retryHistory.length > 0) {
+            console.log(
+              `[http] Retry summary: ${retryHistory.length} attempts, history:`,
+              JSON.stringify(retryHistory),
+            );
+          }
 
-            // run_shell_command: if it's a verify command and it passed → complete current step
-            if (!isError && tool.name === "run_shell_command") {
-              const cmd = (parsedInput.command || "").toLowerCase();
-              if (VERIFY_COMMANDS.test(cmd)) {
-                autoAdvanceTodos(request.projectId, "verify_pass", this.onEvent.bind(this), request.requestId);
+          if (!response.ok) {
+            // If the 400 handler already consumed the response body reading errorBody,
+            // lastResponseBody has it. Otherwise read it fresh.
+            const errorText =
+              lastResponseBody ||
+              (await response.text().catch(() => response.statusText));
+            console.error(
+              `[http] API Error: ${response.status} - ${errorText}`,
+            );
+            throw new Error(`HTTP ${response.status}: ${errorText}`);
+          }
+
+          if (!response.body) throw new Error("Response body is null");
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let buffer = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed || !trimmed.startsWith("data: ")) continue;
+              const data = trimmed.slice(6);
+              if (data === "[DONE]") break;
+
+              try {
+                const parsed = JSON.parse(data);
+                const emitted = this.handleStreamEvent(
+                  request.projectId,
+                  parsed,
+                  apiConfig.provider,
+                  request.requestId,
+                );
+                if (emitted) {
+                  // Content was emitted
+                }
+              } catch (err) {
+                console.error("[punk] Failed to parse SSE data:", err, data);
               }
             }
           }
 
-          // Emit tool_result as a "user" message to match CLI worker
+          // DeepSeek server-side resource exhaustion — retry the turn from scratch.
+          // "insufficient_system_resource" means the server couldn't complete the
+          // generation; treat it like a 503 and retry up to 2 times with a 2s delay.
+          if (state.finishReason === "insufficient_system_resource") {
+            if (turnRetryCount < 2) {
+              turnRetryCount++;
+              turn--; // don't count this as a used turn
+              const delay = 2000;
+              console.warn(
+                `[http] insufficient_system_resource — retrying turn in ${delay}ms (attempt ${turnRetryCount}/2)`,
+              );
+              await new Promise((resolve) => setTimeout(resolve, delay));
+              continue;
+            } else {
+              throw new Error(
+                "DeepSeek server resources exhausted after 2 retries (insufficient_system_resource). Try again in a moment.",
+              );
+            }
+          }
+          turnRetryCount = 0; // reset on a successful turn
+
+          // ─── Analytics Capture ─────────────────────────────────────────────
+          const {
+            cost: turnCost,
+            source: costSource,
+            rateSnapshot,
+          } = calculateCost({
+            model: state.model,
+            provider: apiConfig.provider,
+            // input_tokens is now raw total (including cache). Subtract cache_read
+            // so calculateCost doesn't double-count cache at full input rate.
+            inputTokens: Math.max(
+              0,
+              (state.usage?.input_tokens || 0) -
+                (state.usage?.cache_read_input_tokens || 0),
+            ),
+            outputTokens: state.usage?.output_tokens || 0,
+            cacheReadTokens: state.usage?.cache_read_input_tokens || 0,
+            cacheWriteTokens: state.usage?.cache_creation_input_tokens || 0,
+            apiReportedCost: state.usage?.cost,
+          });
+
           this.onEvent(
             request.projectId,
             {
-              event: "message",
+              event: "token_usage",
               data: {
-                parsed: {
-                  type: "user",
-                  message: {
-                    content: [
-                      {
-                        type: "tool_result",
-                        tool_use_id: tool.id,
-                        name: tool.name,
-                        content,
-                        is_error: isError,
-                      },
-                    ],
-                  },
-                },
+                provider: apiConfig.provider,
+                activity_type: request.activity_type || "conversation",
+                model: state.model,
+                input_tokens: state.usage?.input_tokens || 0,
+                output_tokens: state.usage?.output_tokens || 0,
+                cache_creation_input_tokens:
+                  state.usage?.cache_creation_input_tokens || 0,
+                cache_read_input_tokens:
+                  state.usage?.cache_read_input_tokens || 0,
+                cost_usd: turnCost,
+                cost_source: costSource,
+                cost_rate_snapshot: rateSnapshot
+                  ? JSON.stringify(rateSnapshot)
+                  : null,
+                duration_ms: Date.now() - turnStartTime,
               },
             },
             request.requestId,
           );
 
-          // --- PUSH AS CANONICAL TOOL ROLE ---
-          const toolMsg = {
-            role: "tool",
-            tool_call_id: tool.id,
-            name: tool.name,
-            content,
-            is_error: isError,
-          };
-          messages.push(toolMsg);
-          journal.append(toolMsg, { turn, phase: "tool-result" });
-
-          // Persist raw result to disk cache — survives pruning for future summarization
-          try {
-            storeRaw(request.projectId, turn, toolSeq++, {
-              toolName: tool.name,
-              args: parsedInput,
-              content,
-            });
-          } catch {} // cache write failure is non-blocking
-        }
-
-        // Always refresh context after tool execution — ensures every turn has fresh state
-        // (git status, working set, recent actions, session state, etc.)
-        const gitStatus = await this.getGitStatus(request.workingDir);
-        mergeState(request.projectId, { gitStatus });
-
-        // Fetch fresh SQLite changes
-        let loopSqliteChanges = [];
-        try {
-          const db = getPaneDb();
-          if (db.stmts.getChanges) {
-            loopSqliteChanges = db.stmts.getChanges.all(request.projectId).slice(0, 10);
-          } else {
-            console.warn("[http] Database not fully initialized, skipping SQLite changes fetch in loop");
+          // Log cache efficiency per provider — visibility into cost savings
+          const cacheRead = state.usage?.cache_read_input_tokens || 0;
+          const totalInput = state.usage?.input_tokens || 0;
+          if (cacheRead > 0 && totalInput > 0) {
+            const hitRate = ((cacheRead / totalInput) * 100).toFixed(0);
+            console.log(
+              `[cache] ${apiConfig.provider}/${state.model}: ${hitRate}% hit (${cacheRead} cached / ${totalInput} total input tokens)`,
+            );
           }
-        } catch (err) {
-          console.warn("[http] Failed to fetch SQLite changes in loop:", err.message);
-        }
 
-        // ── Frozen system prompt: DO NOT rebuild ──────────────────────────
-        // The system prompt was assembled at spawn time and is frozen for the
-        // duration of this conversation. Rebuilding it in the tool loop caused:
-        // - Intent directive flipping mid-conversation (DISCUSSION → EXECUTION)
-        // - Re-scored memories changing between tool calls
-        // - Prompt cache misses on every iteration (wasting tokens)
-        //
-        // Instead, inject tool-execution deltas as a context-update block.
-        // The model sees stable instructions + fresh operational context.
-        if (loopSqliteChanges.length > 0 || gitStatus) {
-          const deltaLines = ["[context update]"];
-          for (const c of loopSqliteChanges.slice(0, 5)) {
-            const type = (c.old_string || c.oldString) ? "edited" : "created";
-            deltaLines.push(`- ${type}: ${c.file_path || c.file}`);
-          }
-          if (gitStatus?.summary) {
-            deltaLines.push(`- git: ${gitStatus.branch} — ${gitStatus.summary.split("\n")[0]}`);
-          }
-          deltaLines.push("[end context update]");
-
-          // Inject as a system-role message before the next user turn, or
-          // append to the last tool_result message so the model sees it.
-          const lastMsg = messages[messages.length - 1];
-          if (lastMsg && lastMsg.role === "user") {
-            // Prepend to the user message content
-            const deltaText = deltaLines.join("\n");
-            if (Array.isArray(lastMsg.content)) {
-              lastMsg.content = [{ type: "text", text: deltaText }, ...lastMsg.content];
-            } else {
-              lastMsg.content = deltaText + "\n\n" + (lastMsg.content || "");
+          const finalContent = [];
+          if (state.accumulated) {
+            finalContent.push({ type: "text", text: state.accumulated });
+            // Accumulate text for pattern extraction in handoff
+            if (sessionOutput.length < SESSION_OUTPUT_CAP) {
+              sessionOutput +=
+                (sessionOutput ? "\n\n" : "") + state.accumulated;
             }
           }
-        }
+          for (const tool of state.toolUses.values()) {
+            let parsedInput = {};
+            try {
+              parsedInput = JSON.parse(tool.input);
+            } catch {
+              parsedInput = tool.input;
+            }
+            finalContent.push({
+              type: "tool_use",
+              id: tool.id,
+              name: tool.name,
+              input: parsedInput,
+            });
+          }
 
-        // Window management with stable system prompt
-        const loopSystemTokens = Math.round((messages[0]?.content?.length || 0) / 4);
-        manageContextWindow(messages, loopSystemTokens, request.projectId, request.model);
+          // Final assistant message for this turn
+          const parsedMessage = {
+            type: "assistant",
+            message: { content: finalContent },
+          };
+          const isDeepSeekModel =
+            apiConfig.provider === "deepseek" ||
+            (apiConfig.provider === "openrouter" &&
+              resolvedModel.includes("deepseek"));
+          const deepseekThinking =
+            isDeepSeekModel &&
+            (isDeepSeekReasoner ||
+              (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
+              (apiConfig.provider === "openrouter" &&
+                body.include_reasoning)) &&
+            state.thinking;
+
+          if (deepseekThinking) {
+            parsedMessage.message.reasoning_content = state.thinking;
+          }
+
+          this.onEvent(
+            request.projectId,
+            {
+              event: "message",
+              data: {
+                parsed: parsedMessage,
+              },
+            },
+            request.requestId,
+          );
+
+          const assistantEntry = { role: "assistant", content: finalContent };
+          if (deepseekThinking) {
+            assistantEntry.reasoning_content = state.thinking;
+          }
+          messages.push(assistantEntry);
+          journal.append(assistantEntry, { turn, phase: "response" });
+
+          // LOOP CONTROL
+          const hasTools = state.toolUses.size > 0;
+          const hasContent = state.accumulated.trim().length > 0;
+          const wasThinking = state.thinking.trim().length > 0;
+          const isLengthLimited = state.finishReason === "length";
+          const isToolCalls = state.finishReason === "tool_calls";
+
+          // Handle premature stream disconnects
+          // Detect two cases:
+          //   1. Stream died with nothing: finishReason null, no content, no tools
+          //   2. Stream died mid-output: finishReason null, but has partial content/thinking
+          // Both mean the API connection dropped before the model finished its turn.
+          const streamDiedEmpty =
+            state.finishReason == null && !hasContent && !hasTools;
+          const streamDiedMidOutput =
+            state.finishReason == null && (hasContent || wasThinking);
+
+          if (
+            (streamDiedEmpty || streamDiedMidOutput) &&
+            !abortController.signal.aborted
+          ) {
+            if (disconnectRetryCount < 3) {
+              disconnectRetryCount++;
+              turn--; // Don't consume a turn
+
+              const diag = streamDiedMidOutput
+                ? `partial output (${state.accumulated.length} chars text, ${state.thinking.length} chars thinking)`
+                : wasThinking
+                  ? "abandoned thought"
+                  : "no data received";
+              console.warn(
+                `[http] Stream closed prematurely (${diag}). Retrying turn ${turn + 1} (attempt ${disconnectRetryCount}/3)...`,
+              );
+
+              // Strip the assistant message — it's incomplete
+              messages.pop();
+
+              // If we had partial thinking/content, preserve it as context for the retry
+              // so the model doesn't lose its reasoning if the retry also partially fails
+              if (streamDiedMidOutput && disconnectRetryCount >= 2) {
+                const partialContext = [];
+                if (state.thinking.trim()) {
+                  partialContext.push(
+                    `[Your partial reasoning from dropped connection — continue from here]\n...${state.thinking.slice(-400)}`,
+                  );
+                }
+                if (state.accumulated.trim()) {
+                  partialContext.push(
+                    `[Your partial output from dropped connection — continue from here]\n...${state.accumulated.slice(-300)}`,
+                  );
+                }
+                if (partialContext.length > 0) {
+                  const disconnectMsg = {
+                    role: "user",
+                    content: [
+                      { type: "text", text: partialContext.join("\n\n") },
+                    ],
+                  };
+                  messages.push(disconnectMsg);
+                  journal.append(disconnectMsg, {
+                    turn,
+                    phase: "disconnect-recovery",
+                  });
+                }
+              }
+
+              // Surface the retry to the UI
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "status",
+                  data: {
+                    message: `connection dropped — retrying turn (${disconnectRetryCount}/3)`,
+                  },
+                },
+                request.requestId,
+              );
+
+              await new Promise((resolve) =>
+                setTimeout(resolve, 2000 * disconnectRetryCount),
+              );
+
+              // Clear status
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "status",
+                  data: { message: null },
+                },
+                request.requestId,
+              );
+
+              continue;
+            } else {
+              console.error(
+                "[http] Stream closed prematurely 3 times in a row. Falling through.",
+              );
+            }
+          }
+
+          disconnectRetryCount = 0; // Reset on success
+
+          // If no reason to continue, check for pending todos before breaking
+          if (!hasTools && !isLengthLimited && !isToolCalls) {
+            const todos = readState(request.projectId).todos || [];
+            const workLeft = todos.some(
+              (t) => t.status === "pending" || t.status === "in_progress",
+            );
+
+            // MIMO-specific: also catch premature stops where the model ended
+            // with "stop" but the last output looks unfinished (e.g. ends mid-code,
+            // mid-sentence, or with an explicit "I'll continue" / "Next I will" signal).
+            // This happens when the model runs out of reasoning budget and wraps up
+            // too early even though max_tokens wasn't actually hit.
+            const isMimoProvider =
+              request.provider === "xiaomi" ||
+              (request.provider === "openrouter" &&
+                (resolvedModel || "").includes("mimo"));
+            const lastOutput = state.accumulated.trimEnd();
+            const looksIncomplete =
+              isMimoProvider &&
+              state.finishReason === "stop" &&
+              // Ends mid-code block (unclosed fence)
+              ((lastOutput.match(/```/g) || []).length % 2 !== 0 ||
+                // Explicit continuation signal the model wrote
+                /(?:I(?:'ll| will| can) (?:now |continue|proceed|implement|write|add)|Next[,:]?\s+I|Let me (?:now |continue|proceed)|Moving on|Continuing)/i.test(
+                  lastOutput.slice(-300),
+                ) ||
+                // Ends with punctuation that implies more is coming
+                /[,:]\s*$/.test(lastOutput.slice(-50)));
+
+            if ((workLeft || looksIncomplete) && turn < maxTurns) {
+              const remaining = todos.filter((t) => t.status !== "completed");
+              const continueReason =
+                looksIncomplete && !workLeft
+                  ? "incomplete output detected"
+                  : `work is pending (${remaining.length} todos)`;
+              console.log(
+                `[http] Auto-continuing turn ${turn} - ${continueReason}`,
+              );
+
+              const continuationParts = [];
+
+              if (looksIncomplete && !workLeft) {
+                // ── Incomplete-output continuation (MIMO / reasoning model stopped early) ──
+                // The model issued finish_reason:stop but left its output unfinished.
+                // We don't inject todos (there are none) — just tell it to pick up
+                // exactly where it left off, mirroring what it last wrote so it doesn't
+                // re-explore from the top.
+                continuationParts.push(
+                  "Your output was cut short. Continue exactly from where you left off — do NOT restart, re-explain, or repeat anything already written.",
+                );
+
+                // Mirror the model's last partial output so it has the exact tail to continue from
+                for (
+                  let i = messages.length - 1;
+                  i >= Math.max(0, messages.length - 4);
+                  i--
+                ) {
+                  const m = messages[i];
+                  if (m.role === "assistant") {
+                    // Last reasoning tail — helps reasoning models pick up their thought
+                    const thinkingBlock = Array.isArray(m.content)
+                      ? m.content.find((b) => b.type === "thinking")
+                      : null;
+                    if (thinkingBlock?.thinking) {
+                      const tail = thinkingBlock.thinking.slice(-400);
+                      continuationParts.push(
+                        `\n[Your last reasoning — continue the thought]\n...${tail}`,
+                      );
+                    }
+                    // Last output tail — the exact characters the model stopped after
+                    const textContent = Array.isArray(m.content)
+                      ? m.content
+                          .filter((b) => b.type === "text")
+                          .map((b) => b.text)
+                          .join("\n")
+                      : typeof m.content === "string"
+                        ? m.content
+                        : "";
+                    if (textContent.trim()) {
+                      const tail = textContent.slice(-500);
+                      continuationParts.push(
+                        `\n[Your last output — pick up from this exact point]\n...${tail}`,
+                      );
+                    }
+                    break;
+                  }
+                }
+              } else {
+                // ── Todo-based continuation (model stopped with pending work) ──────────
+                // The model stopped but there is tracked work remaining.
+                // Reconstruct what it already accomplished so it picks up where it left
+                // off rather than re-exploring from scratch.
+                continuationParts.push(
+                  "You stopped before finishing. Here is your progress so far — pick up exactly where you left off, do NOT re-explore or re-read files you already examined.",
+                );
+
+                // Inject what the model already accomplished this session
+                const sessionState = readState(request.projectId);
+                const recentActions = sessionState.recentActions || [];
+                if (recentActions.length > 0) {
+                  const actionSummary = recentActions
+                    .slice(-5)
+                    .map((a) => `- ${a.content}`)
+                    .join("\n");
+                  continuationParts.push(
+                    `\n[Actions completed so far]\n${actionSummary}`,
+                  );
+                }
+
+                // Inject decisions locked this session
+                const decisions = sessionState.decisions || [];
+                if (decisions.length > 0) {
+                  const decisionSummary = decisions
+                    .slice(-3)
+                    .map((d) => `- ${d.content}`)
+                    .join("\n");
+                  continuationParts.push(
+                    `\n[Decisions already made — do not revisit]\n${decisionSummary}`,
+                  );
+                }
+
+                // Mirror the model's own last thinking/content
+                for (
+                  let i = messages.length - 1;
+                  i >= Math.max(0, messages.length - 4);
+                  i--
+                ) {
+                  const m = messages[i];
+                  if (m.role === "assistant") {
+                    const thinkingBlock = Array.isArray(m.content)
+                      ? m.content.find((b) => b.type === "thinking")
+                      : null;
+                    if (thinkingBlock?.thinking) {
+                      const tail = thinkingBlock.thinking.slice(-500);
+                      continuationParts.push(
+                        `\n[Your last reasoning before dropping]\n...${tail}`,
+                      );
+                    }
+                    const textContent = Array.isArray(m.content)
+                      ? m.content
+                          .filter((b) => b.type === "text")
+                          .map((b) => b.text)
+                          .join("\n")
+                      : typeof m.content === "string"
+                        ? m.content
+                        : "";
+                    if (textContent.trim()) {
+                      const tail = textContent.slice(-300);
+                      continuationParts.push(
+                        `\n[Your last output before dropping]\n...${tail}`,
+                      );
+                    }
+                    break;
+                  }
+                }
+
+                // Remaining work
+                if (remaining.length > 0) {
+                  const todoList = remaining
+                    .map((t) => `- [${t.status}] ${t.content}`)
+                    .join("\n");
+                  continuationParts.push(`\n[Remaining work]\n${todoList}`);
+                }
+
+                // Stall warning
+                if (arbiterChangedFiles.size === 0) {
+                  continuationParts.push(
+                    "\nWARNING: Your last turn made no file changes. Use tools (write_file, replace, bash) to actually implement — do not just discuss.",
+                  );
+                }
+              }
+
+              const contMsg = {
+                role: "user",
+                content: [{ type: "text", text: continuationParts.join("\n") }],
+              };
+              messages.push(contMsg);
+              journal.append(contMsg, { turn, phase: "auto-continue" });
+
+              // Journal progress snapshot — if the session dies after this,
+              // the next resume will know exactly what was accomplished
+              const progressState = readState(request.projectId);
+              journal.writeProgress({
+                accomplishments: (progressState.recentActions || [])
+                  .slice(-5)
+                  .map((a) => a.content),
+                decisions: (progressState.decisions || []).map(
+                  (d) => d.content,
+                ),
+                pendingTodos: (progressState.todos || [])
+                  .filter((t) => t.status !== "completed")
+                  .map((t) => t.content),
+                turn,
+              });
+
+              continue;
+            }
+            break;
+          }
+
+          // If it was just a length limit without tools, we continue immediately
+          // BUT ONLY IF we actually got some content, otherwise we are likely in a loop
+          if (isLengthLimited && !hasTools) {
+            if (!hasContent) {
+              console.warn(
+                `[http] Stopping turn ${turn} - length limit hit but no content or tools produced.`,
+              );
+              break;
+            }
+            console.log(
+              `[http] Auto-continuing turn ${turn} due to length limit`,
+            );
+            continue;
+          }
+
+          // Execute tools
+          const executor = this.getToolExecutor(
+            request.projectId,
+            request.workingDir,
+          );
+          const toolResults = [];
+          let toolSeq = 0; // sequence counter for tool-result-cache
+
+          for (const tool of state.toolUses.values()) {
+            let parsedInput = {};
+            try {
+              parsedInput = JSON.parse(tool.input);
+            } catch {
+              parsedInput = tool.input;
+            }
+
+            let result;
+            if (tool.name === "evaluate_js") {
+              try {
+                const fn = new Function(
+                  "getContextLimit",
+                  "TOOL_DEFINITIONS",
+                  `return (${parsedInput.code})`,
+                );
+                const val = fn(getContextLimit, TOOL_DEFINITIONS);
+                result = {
+                  success: true,
+                  output: JSON.stringify(val, null, 2),
+                };
+              } catch (err) {
+                result = { success: false, error: err.message };
+              }
+            } else {
+              result = await executor.executeTool(
+                tool.id,
+                tool.name,
+                parsedInput,
+              );
+            }
+            let isError = !result.success;
+            let content = result.output || result.error || "";
+
+            // ── Immediate Tool Verification (Reflex Gate) ──────────────────
+            // If a tool failed or was "hollow" (e.g. replace matched 0 lines),
+            // augment the result with an actionable correction directive.
+            // This keeps the model in the same "hot" context turn to fix it.
+            if (
+              tool.name === "replace" &&
+              !isError &&
+              content.includes("0 replacements")
+            ) {
+              const filePath = parsedInput.file_path || parsedInput.path;
+              content =
+                `Error: 0 replacements made in ${filePath}. ` +
+                `The 'old_string' you provided did not match any text in the file. ` +
+                `TIP: Read the file again to ensure you have the exact text, including all whitespace and indentation. ` +
+                `The file content may have changed or your mental model of it is stale.`;
+              isError = true; // Treat hollow replacement as an error to trigger re-thinking
+            }
+            if (tool.name === "write_file" && isError) {
+              content = `Error writing file: ${content}. Ensure the path is correct and you have permission.`;
+            }
+
+            // ── Tool Result Enrichment ─────────────────────────────────────
+            // When the model uses exploration tools (read_file, grep, glob),
+            // enrich the result with project intelligence: design constraints,
+            // architecture briefs, memories, symbols. The model gets smarter
+            // results without calling special tools.
+            const ENRICHABLE_TOOLS = new Set([
+              "read_file",
+              "pane_read_files",
+              "grep_search",
+              "glob",
+            ]);
+            if (!isError && ENRICHABLE_TOOLS.has(tool.name)) {
+              try {
+                const { enrichToolResult } =
+                  await import("./tool-enrichment.mjs");
+                content = await enrichToolResult(
+                  tool.name,
+                  parsedInput,
+                  content,
+                  request.projectId,
+                  {
+                    brainRequest: this._brainRequest,
+                    projectRoot: request.workingDir,
+                  },
+                );
+              } catch {} // enrichment failure is silent — raw result still works
+            }
+
+            if (
+              !isError &&
+              [
+                "run_shell_command",
+                "write_file",
+                "replace",
+                "bash",
+                "TodoWrite",
+                "Task",
+              ].includes(tool.name)
+            ) {
+              if (tool.name === "TodoWrite" && parsedInput.todos) {
+                // Normalize todos format - handle both string[] and Todo[] formats
+                let normalizedTodos;
+                if (Array.isArray(parsedInput.todos)) {
+                  if (typeof parsedInput.todos[0] === "string") {
+                    // Convert string array to Todo objects with default status
+                    normalizedTodos = parsedInput.todos.map((content) => ({
+                      content,
+                      status: "pending",
+                      activeForm:
+                        content.split(" ").slice(0, 2).join(" ") + "...",
+                    }));
+                  } else {
+                    // Already in correct format
+                    normalizedTodos = parsedInput.todos;
+                  }
+                } else {
+                  normalizedTodos = parsedInput.todos;
+                }
+
+                mergeState(request.projectId, { todos: normalizedTodos });
+                // Send updated todos to frontend
+                this.onEvent(
+                  request.projectId,
+                  {
+                    event: "todos_updated",
+                    data: { todos: normalizedTodos },
+                  },
+                  request.requestId,
+                );
+              }
+              if (
+                tool.name === "Task" &&
+                (parsedInput.task || parsedInput.description)
+              ) {
+                mergeState(request.projectId, {
+                  activeTask: {
+                    description: parsedInput.task || parsedInput.description,
+                  },
+                });
+                // Send updated activeTask to frontend
+                this.onEvent(
+                  request.projectId,
+                  {
+                    event: "activeTask_updated",
+                    data: {
+                      activeTask: {
+                        description:
+                          parsedInput.task || parsedInput.description,
+                      },
+                    },
+                  },
+                  request.requestId,
+                );
+              }
+
+              // ── Auto-advance todos based on what actually happened ─────────
+              // write_file / replace: real work happened → advance first pending
+              if (
+                !isError &&
+                (tool.name === "write_file" || tool.name === "replace")
+              ) {
+                autoAdvanceTodos(
+                  request.projectId,
+                  "write",
+                  this.onEvent.bind(this),
+                  request.requestId,
+                );
+                // Track changed file for Turn Sentinel
+                const changedPath =
+                  parsedInput.file_path || parsedInput.path || "";
+                if (changedPath) arbiterChangedFiles.add(changedPath);
+              }
+
+              // run_shell_command: if it's a verify command and it passed → complete current step
+              if (!isError && tool.name === "run_shell_command") {
+                const cmd = (parsedInput.command || "").toLowerCase();
+                if (VERIFY_COMMANDS.test(cmd)) {
+                  autoAdvanceTodos(
+                    request.projectId,
+                    "verify_pass",
+                    this.onEvent.bind(this),
+                    request.requestId,
+                  );
+                }
+              }
+            }
+
+            // Emit tool_result as a "user" message to match CLI worker
+            const resultMeta = result.metadata || undefined;
+            this.onEvent(
+              request.projectId,
+              {
+                event: "message",
+                data: {
+                  parsed: {
+                    type: "user",
+                    message: {
+                      content: [
+                        {
+                          type: "tool_result",
+                          tool_use_id: tool.id,
+                          name: tool.name,
+                          content,
+                          is_error: isError,
+                          ...(resultMeta ? { metadata: resultMeta } : {}),
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+              request.requestId,
+            );
+
+            // --- PUSH AS CANONICAL TOOL ROLE ---
+            const toolMsg = {
+              role: "tool",
+              tool_call_id: tool.id,
+              name: tool.name,
+              content,
+              is_error: isError,
+            };
+            messages.push(toolMsg);
+            journal.append(toolMsg, { turn, phase: "tool-result" });
+
+            // Persist raw result to disk cache — survives pruning for future summarization
+            try {
+              storeRaw(request.projectId, turn, toolSeq++, {
+                toolName: tool.name,
+                args: parsedInput,
+                content,
+              });
+            } catch {} // cache write failure is non-blocking
+          }
+
+          // Always refresh context after tool execution — ensures every turn has fresh state
+          // (git status, working set, recent actions, session state, etc.)
+          const gitStatus = await this.getGitStatus(request.workingDir);
+          mergeState(request.projectId, { gitStatus });
+
+          // Fetch fresh SQLite changes
+          let loopSqliteChanges = [];
+          try {
+            const db = getPaneDb();
+            if (db.stmts.getChanges) {
+              loopSqliteChanges = db.stmts.getChanges
+                .all(request.projectId)
+                .slice(0, 10);
+            } else {
+              console.warn(
+                "[http] Database not fully initialized, skipping SQLite changes fetch in loop",
+              );
+            }
+          } catch (err) {
+            console.warn(
+              "[http] Failed to fetch SQLite changes in loop:",
+              err.message,
+            );
+          }
+
+          // ── Frozen system prompt: DO NOT rebuild ──────────────────────────
+          // The system prompt was assembled at spawn time and is frozen for the
+          // duration of this conversation. Rebuilding it in the tool loop caused:
+          // - Intent directive flipping mid-conversation (DISCUSSION → EXECUTION)
+          // - Re-scored memories changing between tool calls
+          // - Prompt cache misses on every iteration (wasting tokens)
+          //
+          // Instead, inject tool-execution deltas as a context-update block.
+          // The model sees stable instructions + fresh operational context.
+          if (loopSqliteChanges.length > 0 || gitStatus) {
+            const deltaLines = ["[context update]"];
+            for (const c of loopSqliteChanges.slice(0, 5)) {
+              const type = c.old_string || c.oldString ? "edited" : "created";
+              deltaLines.push(`- ${type}: ${c.file_path || c.file}`);
+            }
+            if (gitStatus?.summary) {
+              deltaLines.push(
+                `- git: ${gitStatus.branch} — ${gitStatus.summary.split("\n")[0]}`,
+              );
+            }
+            deltaLines.push("[end context update]");
+
+            // Inject as a system-role message before the next user turn, or
+            // append to the last tool_result message so the model sees it.
+            const lastMsg = messages[messages.length - 1];
+            if (lastMsg && lastMsg.role === "user") {
+              // Prepend to the user message content
+              const deltaText = deltaLines.join("\n");
+              if (Array.isArray(lastMsg.content)) {
+                lastMsg.content = [
+                  { type: "text", text: deltaText },
+                  ...lastMsg.content,
+                ];
+              } else {
+                lastMsg.content = deltaText + "\n\n" + (lastMsg.content || "");
+              }
+            }
+          }
+
+          // Window management with stable system prompt
+          const loopSystemTokens = Math.round(
+            (messages[0]?.content?.length || 0) / 4,
+          );
+          manageContextWindow(
+            messages,
+            loopSystemTokens,
+            request.projectId,
+            request.model,
+          );
         } catch (turnError) {
           // Per-turn error handling — retry recoverable errors inside the loop
           if (turnError.name === "AbortError") throw turnError; // propagate to outer
           const isRecoverable = (err) => {
             const msg = (err.message || "").toLowerCase();
             return (
-              msg.includes("429") || msg.includes("500") || msg.includes("502") ||
-              msg.includes("503") || msg.includes("504") || msg.includes("econnreset") ||
-              msg.includes("etimedout") || msg.includes("insufficient_system_resource")
+              msg.includes("429") ||
+              msg.includes("500") ||
+              msg.includes("502") ||
+              msg.includes("503") ||
+              msg.includes("504") ||
+              msg.includes("econnreset") ||
+              msg.includes("etimedout") ||
+              msg.includes("insufficient_system_resource")
             );
           };
           if (isRecoverable(turnError) && turnRetryCount < MAX_TURN_RETRIES) {
             turnRetryCount++;
             const delay = Math.pow(2, turnRetryCount) * 1000;
-            console.warn(`[http] Recoverable error on turn ${turn}. Retrying in ${delay}ms (attempt ${turnRetryCount}/${MAX_TURN_RETRIES}). Error: ${turnError.message}`);
-            this.onEvent(request.projectId, {
-              event: "status",
-              data: { message: `error — retrying turn ${turn} in ${delay/1000}s (${turnRetryCount}/${MAX_TURN_RETRIES})` },
-            }, request.requestId);
-            await new Promise(r => setTimeout(r, delay));
+            console.warn(
+              `[http] Recoverable error on turn ${turn}. Retrying in ${delay}ms (attempt ${turnRetryCount}/${MAX_TURN_RETRIES}). Error: ${turnError.message}`,
+            );
+            this.onEvent(
+              request.projectId,
+              {
+                event: "status",
+                data: {
+                  message: `error — retrying turn ${turn} in ${delay / 1000}s (${turnRetryCount}/${MAX_TURN_RETRIES})`,
+                },
+              },
+              request.requestId,
+            );
+            await new Promise((r) => setTimeout(r, delay));
             // Try to restore from checkpoint. Pre-call checkpoints save
             // the last 6 messages (lightweight), post-turn saves the full array.
             const checkpoint = loadTurn(request.projectId, turn);
@@ -3077,17 +3631,26 @@ export class ApiBackend extends PunkBackend {
               if (checkpoint.phase === "pre-call" && checkpoint.fullLength) {
                 // Pre-call checkpoint only has tail — splice it back onto the
                 // messages array at the correct position to avoid losing earlier context
-                const keepFromCurrent = messages.slice(0, checkpoint.fullLength - checkpoint.messages.length);
+                const keepFromCurrent = messages.slice(
+                  0,
+                  checkpoint.fullLength - checkpoint.messages.length,
+                );
                 messages = [...keepFromCurrent, ...checkpoint.messages];
-                console.log(`[http] Restored turn ${turn} from pre-call checkpoint (${checkpoint.messages.length} tail msgs, ${messages.length} total)`);
+                console.log(
+                  `[http] Restored turn ${turn} from pre-call checkpoint (${checkpoint.messages.length} tail msgs, ${messages.length} total)`,
+                );
               } else {
                 messages = checkpoint.messages;
-                console.log(`[http] Restored turn ${turn} from full checkpoint (${messages.length} msgs)`);
+                console.log(
+                  `[http] Restored turn ${turn} from full checkpoint (${messages.length} msgs)`,
+                );
               }
               turn--;
               continue;
             } else {
-              console.warn(`[http] No usable checkpoint for turn ${turn}, retrying with current state`);
+              console.warn(
+                `[http] No usable checkpoint for turn ${turn}, retrying with current state`,
+              );
               turn--;
               continue;
             }
@@ -3096,187 +3659,300 @@ export class ApiBackend extends PunkBackend {
         }
 
         // Turn completed cleanly — mark boundary in journal and advance todos
-      journal.markTurn(turn);
-      autoAdvanceTodos(request.projectId, "turn_end", this.onEvent.bind(this), request.requestId);
+        journal.markTurn(turn);
+        autoAdvanceTodos(
+          request.projectId,
+          "turn_end",
+          this.onEvent.bind(this),
+          request.requestId,
+        );
 
-      // ── Turn Sentinel: independently verify the LLM's work ─────────────
-      // Runs tsc + eslint on changed files. Verdict persisted for the context
-      // orchestrator to inject as CRITICAL on the next turn.
-      if (arbiterChangedFiles.size > 0) {
-        try {
-          const { runTurnSentinel, recordQualityMetric, runDeepReview, saveDeepReview } = await import("./code-arbiter.mjs");
-          // Pass DB for architecture sentinel (circular deps, broken imports)
-          let arbiterDb = null;
-          try { arbiterDb = getPaneDb(); } catch {}
-          const verdict = await runTurnSentinel(
-            request.projectId,
-            request.workingDir,
-            [...arbiterChangedFiles],
-            { db: arbiterDb },
-          );
-
-          // Record behavioral fingerprint
-          if (arbiterDb) {
-            // Check if previous verdict had issues that are now resolved (self-correction)
-            let selfCorrected = undefined;
+        // ── Turn Sentinel: independently verify the LLM's work ─────────────
+        // Runs tsc + eslint on changed files. Verdict persisted for the context
+        // orchestrator to inject as CRITICAL on the next turn.
+        if (arbiterChangedFiles.size > 0) {
+          try {
+            const {
+              runTurnSentinel,
+              recordQualityMetric,
+              runDeepReview,
+              saveDeepReview,
+            } = await import("./code-arbiter.mjs");
+            // Pass DB for architecture sentinel (circular deps, broken imports)
+            let arbiterDb = null;
             try {
-              const prev = arbiterDb.stmts.getRecentVerdicts?.get(request.projectId, 1);
-              if (prev && prev.verdict_pass === 0 && verdict.pass) {
-                selfCorrected = true; // LLM fixed previous issues
-              } else if (prev && prev.verdict_pass === 0 && !verdict.pass) {
-                selfCorrected = false; // LLM didn't fix previous issues
-              }
+              arbiterDb = getPaneDb();
             } catch {}
-            recordQualityMetric(arbiterDb, {
-              projectId: request.projectId,
-              model: request.model,
-              provider: request.provider,
-              verdict,
-              selfCorrected,
-            });
-          }
+            const verdict = await runTurnSentinel(
+              request.projectId,
+              request.workingDir,
+              [...arbiterChangedFiles],
+              { db: arbiterDb },
+            );
 
-          // Emit verdict to renderer so UI can show quality indicator
-          this.onEvent(
-            request.projectId,
-            {
-              event: "arbiter_verdict",
-              data: verdict,
-            },
-            request.requestId,
-          );
-
-          // Deep Review: fire-and-forget on milestones or repeated failures
-          if (arbiterDb) {
-            const recent = arbiterDb.stmts.getRecentVerdicts?.all(request.projectId, 5) || [];
-            const recentFailures = recent.filter(r => r.verdict_pass === 0).length;
-            const isMilestone = arbiterChangedFiles.size >= 5;
-
-            if (recentFailures >= 3 || isMilestone) {
-              // Generate diff for review
-              const diffCmd = `cd "${request.workingDir}" && git diff HEAD --no-color 2>/dev/null || echo "(no git diff available)"`;
-              import("node:child_process").then(({ exec: execCb }) => {
-                execCb(diffCmd, { maxBuffer: 256 * 1024, timeout: 5000 }, (err, stdout) => {
-                  const diff = stdout || "";
-                  if (diff.length < 50) return; // No meaningful diff
-                  const quickCallFn = (sys, usr) => {
-                    const cheapReq = { provider: null, model: null, thinking: false };
-                    return this.planningCall(sys, usr, cheapReq);
-                  };
-                  runDeepReview({
-                    diff,
-                    intent: request.prompt?.slice(0, 500) || "",
-                    callFn: quickCallFn,
-                  }).then(review => {
-                    if (review && review.findings.length > 0) {
-                      saveDeepReview(request.projectId, review);
-                      this.onEvent(request.projectId, {
-                        event: "arbiter_verdict",
-                        data: { ...verdict, deepReview: review },
-                      }, request.requestId);
-                    }
-                  }).catch(() => {});
-                });
+            // Record behavioral fingerprint
+            if (arbiterDb) {
+              // Check if previous verdict had issues that are now resolved (self-correction)
+              let selfCorrected = undefined;
+              try {
+                const prev = arbiterDb.stmts.getRecentVerdicts?.get(
+                  request.projectId,
+                  1,
+                );
+                if (prev && prev.verdict_pass === 0 && verdict.pass) {
+                  selfCorrected = true; // LLM fixed previous issues
+                } else if (prev && prev.verdict_pass === 0 && !verdict.pass) {
+                  selfCorrected = false; // LLM didn't fix previous issues
+                }
+              } catch {}
+              recordQualityMetric(arbiterDb, {
+                projectId: request.projectId,
+                model: request.model,
+                provider: request.provider,
+                verdict,
+                selfCorrected,
               });
             }
-          }
-        } catch (err) {
-          console.warn(`[http] Turn Sentinel failed: ${err.message}`);
-        }
-      }
 
-      // Build handoff document then enrich with pattern extraction — single write at the end.
-      // Layer 3: extracted items carry confidence scores.
-      // Layer 4: LLM fallback fires when regex found < 2 high-confidence items.
-      // Layer 5: model corrections recorded against the previous session's handoff.
-      const previousHandoff = readHandoff(request.projectId);
-      let handoff = generateHandoff(request.projectId, { writeFile: false });
-      if (sessionOutput.length > 0) {
-        const extracted = extractFromModelOutput(sessionOutput, request.projectId);
-        handoff = mergeExtractedIntoHandoff(handoff, extracted);
-        // Layer 5: record corrections now, before writing the new handoff
-        if (extracted.corrections?.length > 0) {
-          recordCorrections(request.projectId, extracted.corrections, previousHandoff);
-        }
-        // Layer 4: async LLM fallback when regex yielded too little
-        if (countHighConfidence(extracted) < 2 && sessionOutput.length > 500) {
-          const quickCallFn = (sys, usr) => {
-            const cheapReq = { provider: null, model: null, thinking: false };
-            return this.planningCall(sys, usr, cheapReq);
-          };
-          const brainRequestRef = this._brainRequest;
-          const projectId = request.projectId;
-          // Fire-and-forget — initial handoff written below, LLM enrichment replaces it in-place
-          // via updateLatestHandoff (not writeHandoffWithHistory) to avoid a duplicate history entry
-          extractWithLLM(sessionOutput, quickCallFn).then(llmExtracted => {
-            if (Object.keys(llmExtracted).length > 0) {
-              const enriched = mergeExtractedIntoHandoff({ ...handoff }, llmExtracted);
-              updateLatestHandoff(projectId, enriched);
-              // Also index LLM-extracted items into brain
-              const llmEvents = [];
-              for (const item of (llmExtracted.accomplishments || [])) {
-                llmEvents.push({ type: "accomplishment", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
-              }
-              for (const item of (llmExtracted.blockers || [])) {
-                llmEvents.push({ type: "blocker", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
-              }
-              for (const item of (llmExtracted.nextSteps || [])) {
-                llmEvents.push({ type: "intent", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
-              }
-              for (const item of (llmExtracted.discoveries || [])) {
-                llmEvents.push({ type: "discovery", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
-              }
-              if (llmEvents.length > 0 && brainRequestRef) {
-                brainRequestRef("index_events", { projectId, events: llmEvents }).catch(() => {});
+            // Emit verdict to renderer so UI can show quality indicator
+            this.onEvent(
+              request.projectId,
+              {
+                event: "arbiter_verdict",
+                data: verdict,
+              },
+              request.requestId,
+            );
+
+            // Deep Review: fire-and-forget on milestones or repeated failures
+            if (arbiterDb) {
+              const recent =
+                arbiterDb.stmts.getRecentVerdicts?.all(request.projectId, 5) ||
+                [];
+              const recentFailures = recent.filter(
+                (r) => r.verdict_pass === 0,
+              ).length;
+              const isMilestone = arbiterChangedFiles.size >= 5;
+
+              if (recentFailures >= 3 || isMilestone) {
+                // Generate diff for review
+                const diffCmd = `cd "${request.workingDir}" && git diff HEAD --no-color 2>/dev/null || echo "(no git diff available)"`;
+                import("node:child_process").then(({ exec: execCb }) => {
+                  execCb(
+                    diffCmd,
+                    { maxBuffer: 256 * 1024, timeout: 5000 },
+                    (err, stdout) => {
+                      const diff = stdout || "";
+                      if (diff.length < 50) return; // No meaningful diff
+                      const quickCallFn = (sys, usr) => {
+                        const cheapReq = {
+                          provider: null,
+                          model: null,
+                          thinking: false,
+                        };
+                        return this.planningCall(sys, usr, cheapReq);
+                      };
+                      runDeepReview({
+                        diff,
+                        intent: request.prompt?.slice(0, 500) || "",
+                        callFn: quickCallFn,
+                      })
+                        .then((review) => {
+                          if (review && review.findings.length > 0) {
+                            saveDeepReview(request.projectId, review);
+                            this.onEvent(
+                              request.projectId,
+                              {
+                                event: "arbiter_verdict",
+                                data: { ...verdict, deepReview: review },
+                              },
+                              request.requestId,
+                            );
+                          }
+                        })
+                        .catch(() => {});
+                    },
+                  );
+                });
               }
             }
-          }).catch(() => {});
+          } catch (err) {
+            console.warn(`[http] Turn Sentinel failed: ${err.message}`);
+          }
         }
 
-        // ── Close the loop: wire extracted knowledge → brain engine ──────
-        // Send structured extraction output as index_events so it enters the
-        // knowledge graph, gets synthesized, and becomes searchable across
-        // sessions. Then prune the raw messages since they've been extracted.
-        const brainEvents = [];
-        for (const item of (extracted.accomplishments || [])) {
-          brainEvents.push({ type: "accomplishment", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
-        }
-        for (const item of (extracted.blockers || [])) {
-          brainEvents.push({ type: "blocker", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
-        }
-        for (const item of (extracted.nextSteps || [])) {
-          brainEvents.push({ type: "intent", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
-        }
-        for (const item of (extracted.discoveries || [])) {
-          brainEvents.push({ type: "discovery", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
-        }
-        for (const item of (extracted.corrections || [])) {
-          brainEvents.push({ type: "correction", content: item.text, metadata: { source: item.source, confidence: item.confidence } });
-        }
-        if (brainEvents.length > 0 && this._brainRequest) {
-          this._brainRequest("index_events", { projectId: request.projectId, events: brainEvents })
-            .then(result => {
-              // Only prune if brain indexing actually succeeded
-              if (result && result.type !== "error") {
-                pruneConversationMessages(request.projectId, 200);
-              }
+        // Build handoff document then enrich with pattern extraction — single write at the end.
+        // Layer 3: extracted items carry confidence scores.
+        // Layer 4: LLM fallback fires when regex found < 2 high-confidence items.
+        // Layer 5: model corrections recorded against the previous session's handoff.
+        const previousHandoff = readHandoff(request.projectId);
+        let handoff = generateHandoff(request.projectId, { writeFile: false });
+        if (sessionOutput.length > 0) {
+          const extracted = extractFromModelOutput(
+            sessionOutput,
+            request.projectId,
+          );
+          handoff = mergeExtractedIntoHandoff(handoff, extracted);
+          // Layer 5: record corrections now, before writing the new handoff
+          if (extracted.corrections?.length > 0) {
+            recordCorrections(
+              request.projectId,
+              extracted.corrections,
+              previousHandoff,
+            );
+          }
+          // Layer 4: async LLM fallback when regex yielded too little
+          if (
+            countHighConfidence(extracted) < 2 &&
+            sessionOutput.length > 500
+          ) {
+            const quickCallFn = (sys, usr) => {
+              const cheapReq = { provider: null, model: null, thinking: false };
+              return this.planningCall(sys, usr, cheapReq);
+            };
+            const brainRequestRef = this._brainRequest;
+            const projectId = request.projectId;
+            // Fire-and-forget — initial handoff written below, LLM enrichment replaces it in-place
+            // via updateLatestHandoff (not writeHandoffWithHistory) to avoid a duplicate history entry
+            extractWithLLM(sessionOutput, quickCallFn)
+              .then((llmExtracted) => {
+                if (Object.keys(llmExtracted).length > 0) {
+                  const enriched = mergeExtractedIntoHandoff(
+                    { ...handoff },
+                    llmExtracted,
+                  );
+                  updateLatestHandoff(projectId, enriched);
+                  // Also index LLM-extracted items into brain
+                  const llmEvents = [];
+                  for (const item of llmExtracted.accomplishments || []) {
+                    llmEvents.push({
+                      type: "accomplishment",
+                      content: item.text,
+                      metadata: {
+                        source: item.source,
+                        confidence: item.confidence,
+                      },
+                    });
+                  }
+                  for (const item of llmExtracted.blockers || []) {
+                    llmEvents.push({
+                      type: "blocker",
+                      content: item.text,
+                      metadata: {
+                        source: item.source,
+                        confidence: item.confidence,
+                      },
+                    });
+                  }
+                  for (const item of llmExtracted.nextSteps || []) {
+                    llmEvents.push({
+                      type: "intent",
+                      content: item.text,
+                      metadata: {
+                        source: item.source,
+                        confidence: item.confidence,
+                      },
+                    });
+                  }
+                  for (const item of llmExtracted.discoveries || []) {
+                    llmEvents.push({
+                      type: "discovery",
+                      content: item.text,
+                      metadata: {
+                        source: item.source,
+                        confidence: item.confidence,
+                      },
+                    });
+                  }
+                  if (llmEvents.length > 0 && brainRequestRef) {
+                    brainRequestRef("index_events", {
+                      projectId,
+                      events: llmEvents,
+                    }).catch(() => {});
+                  }
+                }
+              })
+              .catch(() => {});
+          }
+
+          // ── Close the loop: wire extracted knowledge → brain engine ──────
+          // Send structured extraction output as index_events so it enters the
+          // knowledge graph, gets synthesized, and becomes searchable across
+          // sessions. Then prune the raw messages since they've been extracted.
+          const brainEvents = [];
+          for (const item of extracted.accomplishments || []) {
+            brainEvents.push({
+              type: "accomplishment",
+              content: item.text,
+              metadata: { source: item.source, confidence: item.confidence },
+            });
+          }
+          for (const item of extracted.blockers || []) {
+            brainEvents.push({
+              type: "blocker",
+              content: item.text,
+              metadata: { source: item.source, confidence: item.confidence },
+            });
+          }
+          for (const item of extracted.nextSteps || []) {
+            brainEvents.push({
+              type: "intent",
+              content: item.text,
+              metadata: { source: item.source, confidence: item.confidence },
+            });
+          }
+          for (const item of extracted.discoveries || []) {
+            brainEvents.push({
+              type: "discovery",
+              content: item.text,
+              metadata: { source: item.source, confidence: item.confidence },
+            });
+          }
+          for (const item of extracted.corrections || []) {
+            brainEvents.push({
+              type: "correction",
+              content: item.text,
+              metadata: { source: item.source, confidence: item.confidence },
+            });
+          }
+          if (brainEvents.length > 0 && this._brainRequest) {
+            this._brainRequest("index_events", {
+              projectId: request.projectId,
+              events: brainEvents,
             })
-            .catch(err => console.warn(`[http] brain index_events failed (non-fatal): ${err.message}`));
+              .then((result) => {
+                // Only prune if brain indexing actually succeeded
+                if (result && result.type !== "error") {
+                  pruneConversationMessages(request.projectId, 200);
+                }
+              })
+              .catch((err) =>
+                console.warn(
+                  `[http] brain index_events failed (non-fatal): ${err.message}`,
+                ),
+              );
+          }
         }
-      }
-      try {
-        writeHandoffWithHistory(request.projectId, handoff);
-      } catch (err) {
-        console.warn(`[http] Failed to write handoff: ${err.message}`);
-      }
+        try {
+          writeHandoffWithHistory(request.projectId, handoff);
+        } catch (err) {
+          console.warn(`[http] Failed to write handoff: ${err.message}`);
+        }
 
-      // Archive after each successful turn (end-of-turn checkpoint)
-      saveTurn(request.projectId, turn, {
-        messages: structuredClone(messages),
-        turn,
-        timestamp: Date.now(),
-        phase: "post-turn"
-      });
+        // Archive after each successful turn (end-of-turn checkpoint)
+        // IMPORTANT: Only save the messages added THIS turn (the delta), NOT a
+        // full deep clone of the entire conversation. structuredClone(messages)
+        // on a 100-200MB+ array allocated 3x copies per turn (structuredClone →
+        // JSON.stringify → gzipSync), causing 80GB RSS growth at 500+ turns.
+        // The pre-call checkpoint already captures recovery context; the journal
+        // handles crash-safe persistence. This archive is a lightweight reference.
+        saveTurn(request.projectId, turn, {
+          messages: messages.slice(_preCallMessageCount),
+          fullLength: messages.length,
+          turn,
+          timestamp: Date.now(),
+          phase: "post-turn",
+        });
       }
 
       // Signal successful completion — mirrors cli-worker's "result" event so the
@@ -3293,7 +3969,11 @@ export class ApiBackend extends PunkBackend {
               result: "",
               total_cost_usd: 0,
               duration_ms: Date.now() - spawnStartTime,
-              usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+              usage: {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+              },
               num_turns: turn,
             },
           },
@@ -3329,10 +4009,11 @@ export class ApiBackend extends PunkBackend {
       //   • AbortError — user explicitly cancelled
       //   • 401/403 — auth failures won't fix on retry
       //   • 422 — validation errors require code changes
-      const isAuthError = error.message?.includes("401") ||
-                          error.message?.includes("403") ||
-                          error.message?.includes("unauthorized") ||
-                          error.message?.includes("forbidden");
+      const isAuthError =
+        error.message?.includes("401") ||
+        error.message?.includes("403") ||
+        error.message?.includes("unauthorized") ||
+        error.message?.includes("forbidden");
       const isRecoverable = error.name !== "AbortError" && !isAuthError;
 
       if (isRecoverable && this._sessionRetryCount < 2) {
@@ -3344,33 +4025,47 @@ export class ApiBackend extends PunkBackend {
 
         // Preserve discoveries before cleanup
         try {
-          const crashHandoff = generateHandoff(request.projectId, { writeFile: false });
+          const crashHandoff = generateHandoff(request.projectId, {
+            writeFile: false,
+          });
           crashHandoff._exitReason = "auto-resume";
           crashHandoff._errorMessage = error.message;
           writeHandoffWithHistory(request.projectId, crashHandoff);
         } catch {}
 
         // Close the old journal so the re-spawn can open it fresh
-        try { journal?.close(); } catch {}
+        try {
+          journal?.close();
+        } catch {}
 
         // Clean up state so the re-spawn doesn't collide with stale registrations
         this.activeRequests.delete(request.projectId);
         this.requestStates.delete(request.projectId);
 
         // Tell the UI we're recovering
-        this.onEvent(request.projectId, {
-          event: "status",
-          data: { message: `connection lost — resuming session (${attempt}/2)...` },
-        }, request.requestId);
+        this.onEvent(
+          request.projectId,
+          {
+            event: "status",
+            data: {
+              message: `connection lost — resuming session (${attempt}/2)...`,
+            },
+          },
+          request.requestId,
+        );
 
         // Brief settle window for any in-flight operations to drain
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, 2000));
 
         // Clear status before re-spawn
-        this.onEvent(request.projectId, {
-          event: "status",
-          data: { message: null },
-        }, request.requestId);
+        this.onEvent(
+          request.projectId,
+          {
+            event: "status",
+            data: { message: null },
+          },
+          request.requestId,
+        );
 
         // Re-spawn the entire session from scratch. The journal on disk has
         // all messages; this.spawn() detects it via canResume() and replays.
@@ -3393,11 +4088,16 @@ export class ApiBackend extends PunkBackend {
       // ── Emergency handoff: persist discoveries even on crash/abort ──────
       // Without this, everything the model learned this session is lost.
       try {
-        const crashHandoff = generateHandoff(request.projectId, { writeFile: false });
-        crashHandoff._exitReason = error.name === "AbortError" ? "aborted" : "error";
+        const crashHandoff = generateHandoff(request.projectId, {
+          writeFile: false,
+        });
+        crashHandoff._exitReason =
+          error.name === "AbortError" ? "aborted" : "error";
         crashHandoff._errorMessage = error.message;
         writeHandoffWithHistory(request.projectId, crashHandoff);
-        console.log(`[http] Emergency handoff written on ${crashHandoff._exitReason}`);
+        console.log(
+          `[http] Emergency handoff written on ${crashHandoff._exitReason}`,
+        );
       } catch (handoffErr) {
         console.warn(`[http] Emergency handoff failed: ${handoffErr.message}`);
       }
@@ -3426,7 +4126,11 @@ export class ApiBackend extends PunkBackend {
                 error: error.message || "HTTP backend error",
                 total_cost_usd: 0,
                 duration_ms: Date.now() - spawnStartTime,
-                usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+                usage: {
+                  input_tokens: 0,
+                  output_tokens: 0,
+                  cache_read_input_tokens: 0,
+                },
                 num_turns: 0,
               },
             },
@@ -3453,13 +4157,19 @@ export class ApiBackend extends PunkBackend {
     } finally {
       // Close journal on any exit path — on success it's already cleared,
       // on error/abort it persists on disk for resume
-      try { journal?.close(); } catch {}
+      try {
+        journal?.close();
+      } catch {}
 
       // Clear status if we're done or failing
-      this.onEvent(request.projectId, {
-        event: "status",
-        data: { message: null },
-      }, request.requestId);
+      this.onEvent(
+        request.projectId,
+        {
+          event: "status",
+          data: { message: null },
+        },
+        request.requestId,
+      );
 
       this.activeRequests.delete(request.projectId);
       this.requestStates.delete(request.projectId);
@@ -3500,7 +4210,8 @@ export class ApiBackend extends PunkBackend {
       // System message = frozen tier only (guaranteed stable)
       let frozenPrompt = tiers.frozen.trim();
       const aligned = Math.ceil(frozenPrompt.length / 256) * 256;
-      if (aligned > frozenPrompt.length) frozenPrompt += " ".repeat(aligned - frozenPrompt.length);
+      if (aligned > frozenPrompt.length)
+        frozenPrompt += " ".repeat(aligned - frozenPrompt.length);
       result[0] = { role: "system", content: frozenPrompt };
 
       // Session + turn tiers go as preamble on the last user message
@@ -3513,7 +4224,8 @@ export class ApiBackend extends PunkBackend {
         let inserted = false;
         for (let i = result.length - 1; i >= 0; i--) {
           if (result[i].role === "user") {
-            const orig = typeof result[i].content === "string" ? result[i].content : "";
+            const orig =
+              typeof result[i].content === "string" ? result[i].content : "";
             result[i] = { ...result[i], content: preamble + orig };
             inserted = true;
             break;
@@ -3545,7 +4257,9 @@ export class ApiBackend extends PunkBackend {
         // still works.
         finalBody = {
           ...body,
-          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
+          messages: systemTiers
+            ? applyPrefixCacheOptimization(body.messages, systemTiers)
+            : body.messages,
           transforms: [],
           data_collection: "allow",
           zdr: false,
@@ -3563,7 +4277,9 @@ export class ApiBackend extends PunkBackend {
         // Prefix-cache: frozen-only system message + dynamic preamble on user message
         finalBody = {
           ...body,
-          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
+          messages: systemTiers
+            ? applyPrefixCacheOptimization(body.messages, systemTiers)
+            : body.messages,
           user: userTag,
         };
         break;
@@ -3578,7 +4294,9 @@ export class ApiBackend extends PunkBackend {
         };
         finalBody = {
           ...body,
-          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
+          messages: systemTiers
+            ? applyPrefixCacheOptimization(body.messages, systemTiers)
+            : body.messages,
           user: userTag,
         };
         break;
@@ -3588,7 +4306,9 @@ export class ApiBackend extends PunkBackend {
           apiConfig.baseUrl || "https://api.moonshot.cn/v1/chat/completions";
         // Session affinity: route to same model instance within a project
         // for maximum prefix cache hit rates on multi-turn conversations.
-        const kimiSessionId = request?.projectId ? `pane-${request.projectId.slice(0, 16)}` : undefined;
+        const kimiSessionId = request?.projectId
+          ? `pane-${request.projectId.slice(0, 16)}`
+          : undefined;
         headers = {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
@@ -3596,15 +4316,22 @@ export class ApiBackend extends PunkBackend {
         };
         finalBody = {
           ...body,
-          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
+          messages: systemTiers
+            ? applyPrefixCacheOptimization(body.messages, systemTiers)
+            : body.messages,
           user: userTag,
         };
         break;
       }
 
       case "xiaomi": {
-        const base = apiConfig.baseUrl ? apiConfig.baseUrl.replace(/\/$/, "") : "https://api.xiaomimimo.com/v1";
-        url = (base.includes("/chat/completions") || base.includes("/messages")) ? base : `${base}/chat/completions`;
+        const base = apiConfig.baseUrl
+          ? apiConfig.baseUrl.replace(/\/$/, "")
+          : "https://api.xiaomimimo.com/v1";
+        url =
+          base.includes("/chat/completions") || base.includes("/messages")
+            ? base
+            : `${base}/chat/completions`;
         headers = {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiConfig.apiKey}`,
@@ -3612,7 +4339,9 @@ export class ApiBackend extends PunkBackend {
         // Prefix-cache: free writes → every token cached is pure savings
         finalBody = {
           ...body,
-          messages: systemTiers ? applyPrefixCacheOptimization(body.messages, systemTiers) : body.messages,
+          messages: systemTiers
+            ? applyPrefixCacheOptimization(body.messages, systemTiers)
+            : body.messages,
           user: userTag,
         };
         break;
@@ -3681,7 +4410,7 @@ export class ApiBackend extends PunkBackend {
             }
             anthropicBody.system = blocks;
             console.log(
-              `[http] Anthropic cache: tools=cached frozen=${tiers.frozen.length}c(1h) session=${tiers.session.length}c(5m) turn=${tiers.turn.length}c`
+              `[http] Anthropic cache: tools=cached frozen=${tiers.frozen.length}c(1h) session=${tiers.session.length}c(5m) turn=${tiers.turn.length}c`,
             );
           } else {
             anthropicBody.system = sysMsg.content;
@@ -3745,14 +4474,23 @@ export class ApiBackend extends PunkBackend {
         // in the first user message instead.
         // Gemini 2.5+: 90% discount on cached tokens.
         let geminiCachedContent = null;
-        const stableSysContent = systemTiers ? (systemTiers.frozen + "\n\n" + (systemTiers.session || "")).trim() : null;
+        const stableSysContent = systemTiers
+          ? (systemTiers.frozen + "\n\n" + (systemTiers.session || "")).trim()
+          : null;
 
-        if (stableSysContent && stableSysContent.length > 4000 && apiConfig.apiKey) {
+        if (
+          stableSysContent &&
+          stableSysContent.length > 4000 &&
+          apiConfig.apiKey
+        ) {
           // Cache key uses a hash of the actual content — not just length.
           // Session tier changes re-score relevant files/memories, producing
           // different content at similar lengths. A hash catches real changes.
           const { createHash } = await import("node:crypto");
-          const contentHash = createHash("md5").update(stableSysContent).digest("hex").slice(0, 12);
+          const contentHash = createHash("md5")
+            .update(stableSysContent)
+            .digest("hex")
+            .slice(0, 12);
           const cacheKey = `gemini:${body.model}:${contentHash}`;
           if (!this._geminiCacheRefs) this._geminiCacheRefs = new Map();
 
@@ -3786,10 +4524,14 @@ export class ApiBackend extends PunkBackend {
                   expiresAt: Date.now() + 1800 * 1000,
                 });
                 geminiCachedContent = cacheData.name;
-                console.log(`[http] Gemini cache created: ${cacheData.name} (stable=${stableSysContent.length}c, 30min TTL)`);
+                console.log(
+                  `[http] Gemini cache created: ${cacheData.name} (stable=${stableSysContent.length}c, 30min TTL)`,
+                );
               }
             } catch (err) {
-              console.warn(`[http] Gemini cache creation failed: ${err.message}`);
+              console.warn(
+                `[http] Gemini cache creation failed: ${err.message}`,
+              );
             }
           }
         }
@@ -3802,22 +4544,30 @@ export class ApiBackend extends PunkBackend {
           // Stable tiers are in the cache. Prepend turn tier to the first user message.
           if (systemTiers?.turn) {
             const turnPreamble = `[Context update]\n${systemTiers.turn}\n[End context update]\n\n`;
-            const firstUser = contents.find(c => c.role === "user");
+            const firstUser = contents.find((c) => c.role === "user");
             if (firstUser?.parts?.[0]?.text) {
-              firstUser.parts[0] = { text: turnPreamble + firstUser.parts[0].text };
+              firstUser.parts[0] = {
+                text: turnPreamble + firstUser.parts[0].text,
+              };
             } else {
               // No user message yet — insert one with the turn context
-              contents.unshift({ role: "user", parts: [{ text: turnPreamble.trim() }] });
+              contents.unshift({
+                role: "user",
+                parts: [{ text: turnPreamble.trim() }],
+              });
             }
           }
         } else {
           const sysMsgs = body.messages.filter((m) => m.role === "system");
-          for (const m of sysMsgs) sysInstructionParts.push({ text: m.content });
+          for (const m of sysMsgs)
+            sysInstructionParts.push({ text: m.content });
         }
 
         finalBody = {
           contents,
-          ...(geminiCachedContent ? { cachedContent: geminiCachedContent } : {}),
+          ...(geminiCachedContent
+            ? { cachedContent: geminiCachedContent }
+            : {}),
           tools: [
             {
               functionDeclarations: TOOL_DEFINITIONS.map((td) => ({
@@ -3828,7 +4578,9 @@ export class ApiBackend extends PunkBackend {
             },
           ],
           // When using cachedContent, systemInstruction is in the cache — don't send it again.
-          ...(sysInstructionParts.length > 0 ? { systemInstruction: { parts: sysInstructionParts } } : {}),
+          ...(sysInstructionParts.length > 0
+            ? { systemInstruction: { parts: sysInstructionParts } }
+            : {}),
           safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
             { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -3955,22 +4707,25 @@ export class ApiBackend extends PunkBackend {
     if (event.usage) {
       // Normalize cache_read first — needed for input_tokens normalization below.
       const _cacheRead =
-        event.usage.cache_read_input_tokens ||                    // Anthropic (handled separately, but harmless)
-        event.usage.prompt_cache_hit_tokens ||                     // DeepSeek
-        event.usage.cached_tokens ||                               // Kimi
-        event.usage.cached_token ||                                // StepFun (singular)
-        event.usage.prompt_tokens_details?.cached_tokens ||        // Xiaomi / OpenAI-compatible
+        event.usage.cache_read_input_tokens || // Anthropic (handled separately, but harmless)
+        event.usage.prompt_cache_hit_tokens || // DeepSeek
+        event.usage.cached_tokens || // Kimi
+        event.usage.cached_token || // StepFun (singular)
+        event.usage.prompt_tokens_details?.cached_tokens || // Xiaomi / OpenAI-compatible
         0;
       // OpenAI-compatible providers (DeepSeek, Kimi, Xiaomi, etc.) report prompt_tokens
       // as the TOTAL — cached + non-cached. Anthropic reports input_tokens as non-cached
       // only (overwritten below). Normalize all providers to raw total here so the DB
       // consistently stores total tokens (including cache). Cache breakdown lives in
       // cache_read_input_tokens. Cost calculation subtracts cache before billing.
-      const _rawInput = event.usage.prompt_tokens || event.usage.input_tokens || 0;
+      const _rawInput =
+        event.usage.prompt_tokens || event.usage.input_tokens || 0;
       state.usage = {
         input_tokens: _rawInput,
-        output_tokens: event.usage.completion_tokens || event.usage.output_tokens || 0,
-        cache_creation_input_tokens: event.usage.cache_creation_input_tokens || 0,
+        output_tokens:
+          event.usage.completion_tokens || event.usage.output_tokens || 0,
+        cache_creation_input_tokens:
+          event.usage.cache_creation_input_tokens || 0,
         cache_read_input_tokens: _cacheRead,
         cost: event.usage.cost || null,
       };
@@ -3980,10 +4735,14 @@ export class ApiBackend extends PunkBackend {
     if (provider === "anthropic") {
       if (event.type === "message_start" && event.message?.usage) {
         state.usage = {
-          input_tokens: (event.message.usage.input_tokens || 0) + (event.message.usage.cache_read_input_tokens || 0),
+          input_tokens:
+            (event.message.usage.input_tokens || 0) +
+            (event.message.usage.cache_read_input_tokens || 0),
           output_tokens: event.message.usage.output_tokens || 0,
-          cache_creation_input_tokens: event.message.usage.cache_creation_input_tokens || 0,
-          cache_read_input_tokens: event.message.usage.cache_read_input_tokens || 0,
+          cache_creation_input_tokens:
+            event.message.usage.cache_creation_input_tokens || 0,
+          cache_read_input_tokens:
+            event.message.usage.cache_read_input_tokens || 0,
         };
       } else if (event.type === "message_delta" && event.usage) {
         if (!state.usage) state.usage = { input_tokens: 0, output_tokens: 0 };
@@ -4015,7 +4774,7 @@ export class ApiBackend extends PunkBackend {
         // tool_calls. Emitting both causes letter-by-letter JSON rendering.
         // Fix: only extract content when there are NO tool_calls in this chunk
         // AND no tool call has started building in this turn yet.
-        const hasDeltaToolCalls = !!(delta?.tool_calls?.length);
+        const hasDeltaToolCalls = !!delta?.tool_calls?.length;
 
         if (!hasDeltaToolCalls && state.toolUses.size === 0) {
           if (delta?.content) content = delta.content;
@@ -4094,7 +4853,7 @@ export class ApiBackend extends PunkBackend {
       case "kimi":
       case "stepfun": {
         const delta = event.choices?.[0]?.delta;
-        const hasDeltaToolCalls = !!(delta?.tool_calls?.length);
+        const hasDeltaToolCalls = !!delta?.tool_calls?.length;
 
         if (!hasDeltaToolCalls && state.toolUses.size === 0) {
           if (delta?.content) content = delta.content;
@@ -4109,7 +4868,7 @@ export class ApiBackend extends PunkBackend {
         // Fallback for known fields if personality check failed
         if (!thinking) {
           if (delta?.reasoning_content) thinking = delta.reasoning_content;
-          if (delta?.reasoning)         thinking = delta.reasoning;
+          if (delta?.reasoning) thinking = delta.reasoning;
         }
 
         if (hasDeltaToolCalls) {
@@ -4119,11 +4878,37 @@ export class ApiBackend extends PunkBackend {
             const toolName = tc.function?.name || "";
             const toolArgs = tc.function?.arguments || "";
             if (toolId) {
-              this.onEvent(projectId, { event: "message", data: { parsed: { type: "stream_event", event: { type: "content_block_start", index: state.toolUses.size + 1, content_block: { type: "tool_use", id: toolId, name: toolName, input: {} } } } } }, requestId);
-              state.toolUses.set(toolId, { id: toolId, name: toolName, input: "" });
+              this.onEvent(
+                projectId,
+                {
+                  event: "message",
+                  data: {
+                    parsed: {
+                      type: "stream_event",
+                      event: {
+                        type: "content_block_start",
+                        index: state.toolUses.size + 1,
+                        content_block: {
+                          type: "tool_use",
+                          id: toolId,
+                          name: toolName,
+                          input: {},
+                        },
+                      },
+                    },
+                  },
+                },
+                requestId,
+              );
+              state.toolUses.set(toolId, {
+                id: toolId,
+                name: toolName,
+                input: "",
+              });
             }
             if (toolArgs) {
-              const activeToolId = toolId || Array.from(state.toolUses.keys()).pop();
+              const activeToolId =
+                toolId || Array.from(state.toolUses.keys()).pop();
               if (activeToolId) {
                 const tool = state.toolUses.get(activeToolId);
                 tool.input += toolArgs;
@@ -4430,7 +5215,10 @@ export class ApiBackend extends PunkBackend {
       const json = await response.json();
       if (!json.data) return [];
 
-      return json.data.filter(_isPaneModel).map(_normalizeModel).sort(_byRelevance);
+      return json.data
+        .filter(_isPaneModel)
+        .map(_normalizeModel)
+        .sort(_byRelevance);
     } catch (err) {
       console.error("[http] Failed to fetch OpenRouter models:", err);
       return [];
@@ -4458,7 +5246,9 @@ export class ApiBackend extends PunkBackend {
       if (!json.data) return [];
 
       return json.data
-        .filter((m) => m.id && !m.id.includes("embed") && !m.id.includes("whisper"))
+        .filter(
+          (m) => m.id && !m.id.includes("embed") && !m.id.includes("whisper"),
+        )
         .map((m) => ({
           id: m.id,
           name: _deepSeekDisplayName(m.id),
@@ -4483,9 +5273,16 @@ export class ApiBackend extends PunkBackend {
     if (!apiConfig.apiKey) return [];
 
     try {
-      const base = apiConfig.baseUrl ? apiConfig.baseUrl.replace(/\/$/, "") : "https://api.xiaomimimo.com/v1";
-      const baseUrlClean = base.replace(/\/(chat\/completions|messages)\/?$/, "");
-      const url = baseUrlClean.endsWith("/models") ? baseUrlClean : `${baseUrlClean}/models`;
+      const base = apiConfig.baseUrl
+        ? apiConfig.baseUrl.replace(/\/$/, "")
+        : "https://api.xiaomimimo.com/v1";
+      const baseUrlClean = base.replace(
+        /\/(chat\/completions|messages)\/?$/,
+        "",
+      );
+      const url = baseUrlClean.endsWith("/models")
+        ? baseUrlClean
+        : `${baseUrlClean}/models`;
       const response = await fetch(url, {
         headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
         signal: AbortSignal.timeout(12_000),
@@ -4505,7 +5302,9 @@ export class ApiBackend extends PunkBackend {
         .filter((m) => m.id && m.id.includes("mimo"))
         .map((m) => {
           const id = m.id;
-          const name = id.replace(/^mimo-/, "MiMo ").replace(/-/g, " ")
+          const name = id
+            .replace(/^mimo-/, "MiMo ")
+            .replace(/-/g, " ")
             .replace(/\b\w/g, (c) => c.toUpperCase());
           const ctxKey = Object.keys(MIMO_CONTEXT).find((k) => id.includes(k));
           return {
@@ -4609,9 +5408,9 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
-// ==========================================================================
-// Task Runner Support — Planning Call & Step Execution (class methods)
-// ==========================================================================
+  // ==========================================================================
+  // Task Runner Support — Planning Call & Step Execution (class methods)
+  // ==========================================================================
 
   /**
    * Make a lightweight API call with no tools — used for task decomposition.
@@ -4625,20 +5424,31 @@ export class ApiBackend extends PunkBackend {
 
     const body = {
       model,
-      messages: this.normalizeMessages([
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ], apiConfig.provider),
+      messages: this.normalizeMessages(
+        [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        apiConfig.provider,
+      ),
       stream: true,
       // No tools — pure text generation for planning
     };
 
     // Request usage data in streaming response for OpenAI-compatible providers
-    if (["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(apiConfig.provider)) {
+    if (
+      ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(
+        apiConfig.provider,
+      )
+    ) {
       body.stream_options = { include_usage: true };
     }
 
-    const { url, headers, finalBody } = await this.prepareRequest(apiConfig, body, request);
+    const { url, headers, finalBody } = await this.prepareRequest(
+      apiConfig,
+      body,
+      request,
+    );
 
     const cleanBody = { ...(finalBody || body), stream: true };
     delete cleanBody.tools;
@@ -4661,31 +5471,46 @@ export class ApiBackend extends PunkBackend {
 
         if (!response.ok) {
           const status = response.status;
-          
+
           // Client errors (4xx except 429) are not retryable — propagate immediately
           if (status >= 400 && status < 500 && status !== 429) {
-            const errorText = await response.text().catch(() => response.statusText);
-            const fatal = new Error(`Planning call failed: HTTP ${status}: ${errorText}`);
+            const errorText = await response
+              .text()
+              .catch(() => response.statusText);
+            const fatal = new Error(
+              `Planning call failed: HTTP ${status}: ${errorText}`,
+            );
             fatal._noRetry = true;
             throw fatal;
           }
 
           // Rate limit or server error: retry with backoff
           if (attempt < MAX_RETRIES) {
-            const retryAfterSec = status === 429 ? parseInt(response.headers.get("retry-after") || "0", 10) : 0;
+            const retryAfterSec =
+              status === 429
+                ? parseInt(response.headers.get("retry-after") || "0", 10)
+                : 0;
             const jitter = Math.random() * 500;
-            const delay = retryAfterSec > 0
-              ? retryAfterSec * 1000
-              : Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
-            
-            console.warn(`[http] Planning call ${status}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
+            const delay =
+              retryAfterSec > 0
+                ? retryAfterSec * 1000
+                : Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) +
+                  jitter;
+
+            console.warn(
+              `[http] Planning call ${status}. Retrying in ${Math.round(delay / 1000)}s (${attempt + 1}/${MAX_RETRIES})...`,
+            );
             await new Promise((resolve) => setTimeout(resolve, delay));
             attempt++;
             continue;
           }
 
-          const errorText = await response.text().catch(() => response.statusText);
-          throw new Error(`Planning call failed after ${MAX_RETRIES} attempts: HTTP ${status}: ${errorText}`);
+          const errorText = await response
+            .text()
+            .catch(() => response.statusText);
+          throw new Error(
+            `Planning call failed after ${MAX_RETRIES} attempts: HTTP ${status}: ${errorText}`,
+          );
         }
 
         // Stream the response — extract text deltas and call onChunk as they arrive
@@ -4721,11 +5546,15 @@ export class ApiBackend extends PunkBackend {
             if (apiConfig.provider === "anthropic") {
               if (parsed.type === "message_start") usage = parsed.message.usage;
               if (parsed.type === "message_delta") usage = parsed.usage;
-            } else if (apiConfig.provider === "gemini" && parsed.usageMetadata) {
+            } else if (
+              apiConfig.provider === "gemini" &&
+              parsed.usageMetadata
+            ) {
               usage = {
                 prompt_tokens: parsed.usageMetadata.promptTokenCount,
                 completion_tokens: parsed.usageMetadata.candidatesTokenCount,
-                prompt_cache_hit_tokens: parsed.usageMetadata.cachedContentTokenCount || 0,
+                prompt_cache_hit_tokens:
+                  parsed.usageMetadata.cachedContentTokenCount || 0,
               };
             }
 
@@ -4761,17 +5590,23 @@ export class ApiBackend extends PunkBackend {
         const _rawInput = usage?.prompt_tokens || usage?.input_tokens || 0;
         const cacheRead =
           usage?.cache_read_input_tokens || usage?.prompt_cache_hit_tokens || 0;
-        const totalInput = apiConfig.provider === "anthropic"
-          ? _rawInput + cacheRead
-          : _rawInput;
-        const costInput = apiConfig.provider === "anthropic"
-          ? _rawInput
-          : Math.max(0, _rawInput - cacheRead);
+        const totalInput =
+          apiConfig.provider === "anthropic"
+            ? _rawInput + cacheRead
+            : _rawInput;
+        const costInput =
+          apiConfig.provider === "anthropic"
+            ? _rawInput
+            : Math.max(0, _rawInput - cacheRead);
         const totalOutput =
           usage?.completion_tokens || usage?.output_tokens || 0;
         const cacheWrite = usage?.cache_creation_input_tokens || 0;
 
-        const { cost: callCost, source: costSource, rateSnapshot } = calculateCost({
+        const {
+          cost: callCost,
+          source: costSource,
+          rateSnapshot,
+        } = calculateCost({
           model,
           provider: apiConfig.provider,
           inputTokens: costInput,
@@ -4795,7 +5630,9 @@ export class ApiBackend extends PunkBackend {
               cache_read_input_tokens: cacheRead,
               cost_usd: callCost,
               cost_source: costSource,
-              cost_rate_snapshot: rateSnapshot ? JSON.stringify(rateSnapshot) : null,
+              cost_rate_snapshot: rateSnapshot
+                ? JSON.stringify(rateSnapshot)
+                : null,
               duration_ms: Date.now() - callStartTime,
             },
           },
@@ -4803,21 +5640,25 @@ export class ApiBackend extends PunkBackend {
         );
 
         return fullText;
-
       } catch (err) {
         if (err.name === "AbortError" || err._noRetry) throw err;
 
         if (attempt < MAX_RETRIES) {
           const jitter = Math.random() * 500;
-          const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
+          const delay =
+            Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
 
-          console.warn(`[http] Planning call network error: ${err.message}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
+          console.warn(
+            `[http] Planning call network error: ${err.message}. Retrying in ${Math.round(delay / 1000)}s (${attempt + 1}/${MAX_RETRIES})...`,
+          );
           await new Promise((resolve) => setTimeout(resolve, delay));
           attempt++;
           continue;
         }
 
-        throw new Error(`Planning call failed after ${MAX_RETRIES} attempts: ${err.message}`);
+        throw new Error(
+          `Planning call failed after ${MAX_RETRIES} attempts: ${err.message}`,
+        );
       }
     }
   }
@@ -4838,15 +5679,27 @@ export class ApiBackend extends PunkBackend {
       ...messages,
     ];
 
+    const normalizedMessages = this.normalizeMessages(
+      fullMessages,
+      apiConfig.provider,
+    );
+    const validatedMessages = validateMessageSequence(
+      normalizedMessages,
+      apiConfig.provider,
+    );
     const body = {
       model,
-      messages: this.normalizeMessages(fullMessages, apiConfig.provider),
+      messages: validatedMessages,
       stream: false,
       max_tokens: 2048,
       // No tools — pure conversation for discovery
     };
 
-    const { url, headers, finalBody } = await this.prepareRequest(apiConfig, body, request);
+    const { url, headers, finalBody } = await this.prepareRequest(
+      apiConfig,
+      body,
+      request,
+    );
 
     // Strip tools from finalBody if prepareRequest added them
     const cleanBody = { ...(finalBody || body) };
@@ -4869,31 +5722,46 @@ export class ApiBackend extends PunkBackend {
 
         if (!response.ok) {
           const status = response.status;
-          
+
           // Client errors (4xx except 429) are not retryable — propagate immediately
           if (status >= 400 && status < 500 && status !== 429) {
-            const errorText = await response.text().catch(() => response.statusText);
-            const fatal = new Error(`Conversation call failed: HTTP ${status}: ${errorText}`);
+            const errorText = await response
+              .text()
+              .catch(() => response.statusText);
+            const fatal = new Error(
+              `Conversation call failed: HTTP ${status}: ${errorText}`,
+            );
             fatal._noRetry = true;
             throw fatal;
           }
 
           // Rate limit or server error: retry with backoff
           if (attempt < MAX_RETRIES) {
-            const retryAfterSec = status === 429 ? parseInt(response.headers.get("retry-after") || "0", 10) : 0;
+            const retryAfterSec =
+              status === 429
+                ? parseInt(response.headers.get("retry-after") || "0", 10)
+                : 0;
             const jitter = Math.random() * 500;
-            const delay = retryAfterSec > 0
-              ? retryAfterSec * 1000
-              : Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
-            
-            console.warn(`[http] Conversation call ${status}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
+            const delay =
+              retryAfterSec > 0
+                ? retryAfterSec * 1000
+                : Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) +
+                  jitter;
+
+            console.warn(
+              `[http] Conversation call ${status}. Retrying in ${Math.round(delay / 1000)}s (${attempt + 1}/${MAX_RETRIES})...`,
+            );
             await new Promise((resolve) => setTimeout(resolve, delay));
             attempt++;
             continue;
           }
 
-          const errorText = await response.text().catch(() => response.statusText);
-          throw new Error(`Conversation call failed after ${MAX_RETRIES} attempts: HTTP ${status}: ${errorText}`);
+          const errorText = await response
+            .text()
+            .catch(() => response.statusText);
+          throw new Error(
+            `Conversation call failed after ${MAX_RETRIES} attempts: HTTP ${status}: ${errorText}`,
+          );
         }
 
         const json = await response.json();
@@ -4907,23 +5775,26 @@ export class ApiBackend extends PunkBackend {
         }
         // OpenAI-compatible (DeepSeek, OpenRouter, Kimi)
         return json.choices?.[0]?.message?.content || "";
-
       } catch (err) {
         if (err.name === "AbortError" || err._noRetry) throw err;
 
         if (attempt < MAX_RETRIES) {
           const jitter = Math.random() * 500;
-          const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
+          const delay =
+            Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) + jitter;
 
-          console.warn(`[http] Conversation call network error: ${err.message}. Retrying in ${Math.round(delay/1000)}s (${attempt + 1}/${MAX_RETRIES})...`);
+          console.warn(
+            `[http] Conversation call network error: ${err.message}. Retrying in ${Math.round(delay / 1000)}s (${attempt + 1}/${MAX_RETRIES})...`,
+          );
           await new Promise((resolve) => setTimeout(resolve, delay));
           attempt++;
           continue;
         }
 
-        throw new Error(`Conversation call failed after ${MAX_RETRIES} attempts: ${err.message}`);
+        throw new Error(
+          `Conversation call failed after ${MAX_RETRIES} attempts: ${err.message}`,
+        );
       }
     }
   }
-
 }

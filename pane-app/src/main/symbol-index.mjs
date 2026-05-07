@@ -25,6 +25,10 @@ import { isSignalNoise } from "./signal-filters.mjs";
 // Constants
 // ---------------------------------------------------------------------------
 
+const PARSER_VERSION = 2; // Increment when parseTS/parsePY logic changes.
+                          // v1: module-level exports only
+                          // v2: added class method detection (line 71)
+
 const PARSEABLE_EXTENSIONS = new Set([
   ".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx", ".py",
 ]);
@@ -67,15 +71,78 @@ const PY_PATTERNS = [
 
 /**
  * Parse TypeScript / JavaScript → symbol records.
+ *
+ * Captures:
+ *   - Module-level exports (existing logic)
+ *   - Class methods (new): tracks class body brace-depth to find method
+ *     declarations inside exported and non-exported classes alike.
  */
 function parseTS(content) {
   const lines = content.split("\n");
   const symbols = [];
 
+  // ── Pre-scan: find class body ranges via brace-depth tracking ──────
+  // Each range runs from the class declaration line up to (inclusive)
+  // the line containing the matching closing brace.
+  const classRanges = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^(?:export\s+)?(?:abstract\s+)?class\s+\w+/.test(lines[i])) {
+      let depth = 0;
+      let opened = false;
+      let j = i;
+      while (j < lines.length) {
+        const l = lines[j];
+        for (const ch of l) {
+          if (ch === '{') { depth++; opened = true; }
+          else if (ch === '}') { depth--; }
+        }
+        if (opened && depth === 0) break;
+        j++;
+      }
+      classRanges.push({ start: i, end: j });
+    }
+  }
+
+  /** True when lineIdx is inside any class body (not on the class declaration itself). */
+  function insideClassBody(lineIdx) {
+    return classRanges.some(r => lineIdx > r.start && lineIdx <= r.end);
+  }
+
+  // Method-like signature patterns checked against lines inside a class body.
+  // Captures regular methods, async, get/set, static, constructor, arrow properties.
+  const METHOD_RE = /^(?:(?:public|protected|private|static|readonly|abstract|async|get|set|#)\s+)*(?:constructor|\w+)\s*\(/;
+
+  // Keywords that can appear before `(` but are NOT method declarations.
+  const EXPRESSION_KEYWORDS = new Set([
+    'if', 'for', 'while', 'switch', 'catch', 'return', 'throw',
+    'delete', 'typeof', 'instanceof', 'new', 'import', 'export', 'super',
+  ]);
+
+  /** Extract the method/function name from a line containing `name(`. */
+  function extractMethodName(trimmedLine) {
+    const m = trimmedLine.match(/(\w+)\s*\(/);
+    return m ? m[1] : null;
+  }
+
+  // ── Main loop ───────────────────────────────────────────────────────
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-    if (!line.startsWith("export")) continue;
+    if (!line) continue;
 
+    // ── Non-export lines: check for class methods ─────────────────────
+    if (!line.startsWith("export")) {
+      if (insideClassBody(i) && METHOD_RE.test(line)) {
+        const name = extractMethodName(line);
+        if (name && !EXPRESSION_KEYWORDS.has(name) && !line.startsWith('}') && !line.startsWith('this.')) {
+          const signature = lines.slice(i, Math.min(i + 3, lines.length))
+            .join(" ").replace(/\s+/g, " ").trim().slice(0, 200);
+          symbols.push({ name, kind: "method", signature, line: i + 1, doc: null });
+        }
+      }
+      continue;
+    }
+
+    // ── Export lines (existing logic) ─────────────────────────────────
     // Multi-line signature: join up to 3 lines
     const signature = lines.slice(i, Math.min(i + 3, lines.length))
       .join(" ").replace(/\s+/g, " ").trim().slice(0, 200);
@@ -246,6 +313,7 @@ function extractRelationships(content, filePath, projectRoot) {
 function fileHash(content) {
   return crypto.createHash("md5")
     .update(content.slice(0, 8192))
+    .update(`\x00parser-v${PARSER_VERSION}`)
     .digest("hex")
     .slice(0, 16);
 }

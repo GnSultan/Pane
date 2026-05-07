@@ -259,7 +259,7 @@ export interface UserSettings {
   project_roots: string[];
   project_ids?: Record<string, string>;
   active_project_root: string | null;
-  control_panel_visible: boolean;
+  thread_panel_visible: boolean;
   project_states: Record<string, ProjectSessionState>;
   font_size: number | null;
   panel_font_size: number | null;

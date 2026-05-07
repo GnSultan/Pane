@@ -190,7 +190,7 @@ function getKeywords(language: string): string[] {
   return languageKeywords[normalizedLang] || baseKeywords;
 }
 
-function renderHighlightedCode(code: string, language: string): React.JSX.Element[] {
+export function renderHighlightedCode(code: string, language: string): React.JSX.Element[] {
   const tokens = highlightSyntax(code, language);
   
   return tokens.map((token, index) => {
@@ -599,7 +599,7 @@ export const LazyHighlightedCode = memo(function LazyHighlightedCode({
 
 // --- Block rendering ---
 
-const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|codebase_investigator|cli_help|generalist|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
+const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|pane_investigate|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
 const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|[\\w.@-]+\\.[a-zA-Z0-9]{2,10}|${TOOL_NAMES})(?::)?)`, "g");
 const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^\\.[a-zA-Z][a-zA-Z0-9_.-]*$|^(?:${TOOL_NAMES})(?::)?$`);
 

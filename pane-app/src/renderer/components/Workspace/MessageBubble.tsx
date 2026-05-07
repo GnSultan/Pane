@@ -291,7 +291,7 @@ export function MessageBubble({
     return (
       <div className="mb-10 group flex flex-col items-end">
         <div
-          className="rounded-xl ring-1 ring-pane-border/40 relative"
+          className="rounded-md ring-1 ring-pane-border/40 relative"
           style={{ maxWidth: "65ch" }}
         >
           <p

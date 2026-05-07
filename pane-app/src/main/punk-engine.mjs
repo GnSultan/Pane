@@ -621,6 +621,20 @@ class PunkEngine {
     }
   }
 
+  setQuickCall(fn) {
+    this._quickCall = fn;
+    if (this.backends.api) {
+      this.backends.api.setQuickCall(fn);
+    }
+  }
+
+  setAgentCall(fn) {
+    this._agentCall = fn;
+    if (this.backends.api) {
+      this.backends.api.setAgentCall(fn);
+    }
+  }
+
   setBrainIndexer(fn) {    this._brainIndexer = fn;
   }
 

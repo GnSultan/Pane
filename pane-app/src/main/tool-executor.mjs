@@ -601,6 +601,14 @@ export class ToolExecutor {
     this._brainRequest = fn;
   }
 
+  setQuickCall(fn) {
+    this._quickCall = fn;
+  }
+
+  setAgentCall(fn) {
+    this._agentCall = fn;
+  }
+
   /**
    * Record a change in the change history.
    */
@@ -1054,6 +1062,12 @@ export class ToolExecutor {
         };
       }
 
+      // Compute start line from file position
+      const matchIndex = currentContent.indexOf(oldString);
+      const startLine = matchIndex >= 0
+        ? currentContent.substring(0, matchIndex).split("\n").length
+        : 1;
+
       // Replace
       const newContent = currentContent.replace(oldString, newString);
       await fsPromises.writeFile(resolvedPath, newContent, DEFAULT_ENCODING);
@@ -1085,7 +1099,7 @@ export class ToolExecutor {
         success: true,
         output: gate.summary ? baseOutput + gate.summary : baseOutput,
         toolId,
-        metadata: gate.violations.length > 0 ? { violations: gate.violations } : undefined,
+        metadata: { startLine, ...(gate.violations.length > 0 ? { violations: gate.violations } : {}) },
       };
     } catch (error) {
       return {
@@ -1111,54 +1125,113 @@ export class ToolExecutor {
         ".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".py", ".rb", ".java", ".cpp", ".c", ".h", ".hpp", ".go", ".rs", ".php", ".html", ".css", ".scss", ".less", ".json", ".yml", ".yaml", ".toml", ".md", ".txt", ".sh", ".bash",
       ];
 
-      const includeRegex = includePattern 
+      // Build matcher: try regex first (since tool is called grep_search), fall back to substring
+      let matchFn;
+      try {
+        const re = new RegExp(query, "m");
+        matchFn = (line) => re.test(line);
+      } catch {
+        // Not valid regex — use substring match
+        matchFn = (line) => line.includes(query);
+      }
+
+      const includeRegex = includePattern
         ? new RegExp(includePattern.replace(/\*/g, ".*").replace(/\?/g, "."))
         : null;
 
-      const walk = async (dir) => {
-        let files = [];
-        try {
-          const items = await fsPromises.readdir(dir, { withFileTypes: true });
-          for (const item of items) {
-            const fullPath = path.join(dir, item.name);
-            if (item.isDirectory()) {
-              if (![ "node_modules", ".git", ".next", ".nuxt", ".output", "dist", "build", "coverage", ".cache", ].includes(item.name)) {
-                files = files.concat(await walk(fullPath));
-              }
-            } else {
-              const ext = path.extname(item.name).toLowerCase();
-              if (includeRegex) {
-                if (includeRegex.test(item.name) || includeRegex.test(fullPath)) {
-                  files.push(fullPath);
-                }
-              } else if (commonExtensions.includes(ext)) {
-                files.push(fullPath);
-              }
-            }
-          }
-        } catch (error) {}
-        return files;
+      const shouldIncludeFile = (filePath) => {
+        const name = path.basename(filePath);
+        if (includeRegex) {
+          return includeRegex.test(name) || includeRegex.test(filePath);
+        }
+        const ext = path.extname(name).toLowerCase();
+        return commonExtensions.includes(ext);
       };
 
-      const allFiles = await walk(resolvedSearchPath);
-      const filesToSearch = allFiles.slice(0, 100);
-
-      for (const file of filesToSearch) {
+      const searchFile = async (filePath) => {
         try {
-          const content = await fsPromises.readFile(file, DEFAULT_ENCODING);
+          const content = await fsPromises.readFile(filePath, DEFAULT_ENCODING);
           const lines = content.split("\n");
           for (let i = 0; i < lines.length; i++) {
-            if (lines[i].includes(query)) {
+            if (matchFn(lines[i])) {
               results.push({
-                file: path.relative(this.projectRoot, file),
+                file: path.relative(this.projectRoot, filePath),
                 line: i + 1,
                 content: lines[i].trim(),
               });
-              if (results.length >= 50) break;
+              if (results.length >= 50) return true; // signal to stop
             }
           }
-          if (results.length >= 50) break;
-        } catch (error) { continue; }
+        } catch {
+          // skip unreadable files
+        }
+        return false;
+      };
+
+      // Check if path is a file or directory
+      const stat = await fsPromises.stat(resolvedSearchPath).catch(() => null);
+      if (stat && stat.isFile()) {
+        // Single file search — no extension filtering needed
+        await searchFile(resolvedSearchPath);
+      } else if (stat && stat.isDirectory()) {
+        // Directory walk — collect matching files up to a cap
+        const walk = async (dir) => {
+          const files = [];
+          try {
+            const items = await fsPromises.readdir(dir, { withFileTypes: true });
+            for (const item of items) {
+              if (files.length >= 1000) break;
+              const fullPath = path.join(dir, item.name);
+              if (item.isDirectory()) {
+                if (!["node_modules", ".git", ".next", ".nuxt", ".output", "dist", "build", "coverage", ".cache"].includes(item.name)) {
+                  files.push(...await walk(fullPath));
+                }
+              } else if (shouldIncludeFile(fullPath)) {
+                files.push(fullPath);
+              }
+            }
+          } catch {
+            // skip unreadable dirs
+          }
+          return files;
+        };
+
+        const allFiles = await walk(resolvedSearchPath);
+        for (const file of allFiles) {
+          const shouldStop = await searchFile(file);
+          if (shouldStop) break;
+        }
+      } else {
+        // Path doesn't exist or can't be stated
+        if (resolvedSearchPath === this.projectRoot || searchPath === ".") {
+          // Fallback: walk project root
+          const walk = async (dir) => {
+            const files = [];
+            try {
+              const items = await fsPromises.readdir(dir, { withFileTypes: true });
+              for (const item of items) {
+                if (files.length >= 1000) break;
+                const fullPath = path.join(dir, item.name);
+                if (item.isDirectory()) {
+                  if (!["node_modules", ".git", ".next", ".nuxt", ".output", "dist", "build", "coverage", ".cache"].includes(item.name)) {
+                    files.push(...await walk(fullPath));
+                  }
+                } else if (shouldIncludeFile(fullPath)) {
+                  files.push(fullPath);
+                }
+              }
+            } catch {}
+            return files;
+          };
+
+          const allFiles = await walk(resolvedSearchPath);
+          for (const file of allFiles) {
+            const shouldStop = await searchFile(file);
+            if (shouldStop) break;
+          }
+        } else {
+          return { success: false, error: `Search path does not exist: ${searchPath}`, toolId };
+        }
       }
 
       if (results.length === 0) {
@@ -2165,19 +2238,36 @@ export class ToolExecutor {
           }
         }
 
-        case "codebase_investigator": {
-          const objective = input.objective || "none";
-          return { success: true, output: `Delegating investigation to codebase_investigator: ${objective}\n(Note: Sub-agent execution is simulated in this environment. Please use available tools like grep_search and read_file directly.)`, toolId };
-        }
+        case "pane_investigate": {
+          const objective = (input?.objective || "").trim();
+          if (!objective) return { success: false, error: "Research objective is required.", toolId };
+          if (!this._agentCall) return { success: false, error: "Sub-agent engine not available (agentCall not wired).", toolId };
 
-        case "generalist": {
-          const request = input.request || "none";
-          return { success: true, output: `Delegating to generalist: ${request}\n(Note: Sub-agent execution is simulated.)`, toolId };
-        }
+          const systemPrompt = `You are pane_investigate, a specialized sub-agent for deep codebase analysis.
 
-        case "cli_help": {
-          const question = input.question || "";
-          return { success: true, output: `Gemini CLI Help for: ${question}\n(Note: Help system is simulated. Refer to project documentation.)`, toolId };
+Your job: investigate the codebase to answer a research objective. You have access to read-only tools — read files, grep/search, explore, find symbols, list directories.
+
+Approach:
+1. Start broad — use explore() to understand the codebase architecture relevant to the objective
+2. Trace data flows — find how data moves between modules, what imports what
+3. Dive deep on specific files — read the actual implementation of key functions
+4. Check connections — use pane_find_references and pane_codebase_navigator to understand blast radius
+5. Look at tests if they exist
+
+Return your findings as a structured report with:
+- Summary of findings
+- Root causes or key insights
+- Specific file locations with line numbers
+- Concrete recommendations
+
+Be thorough. Trace through the full call chain. Check test files for expected behavior.`;
+
+          try {
+            const output = await this._agentCall(systemPrompt, `## Research Objective\n\n${objective}`, this.projectRoot);
+            return { success: true, output, toolId };
+          } catch (err) {
+            return { success: false, error: `Investigation failed: ${err.message}`, toolId };
+          }
         }
 
         case "explore": {

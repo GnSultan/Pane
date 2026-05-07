@@ -18,6 +18,7 @@ export interface ToolResultBlock {
   name?: string;
   content: string;
   is_error?: boolean;
+  metadata?: Record<string, unknown>;
 }
 
 export interface ThinkingBlock {

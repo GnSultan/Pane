@@ -107,7 +107,7 @@ export function TokenAnalytics({ projectId, isExpanded }: { projectId: string | 
   const [data, setData] = useState<TokenAnalyticsRow[]>([]);
   const [timeSeries, setTimeSeries] = useState<TokenTimeSeriesRow[]>([]);
   const [rates, setRates] = useState<Record<string, { input: number; output: number; cache_read?: number } | null>>({});
-  const [range, setRange] = useState<TimeRange>("month");
+  const [range, setRange] = useState<TimeRange>("all");
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastFetchedAt, setLastFetchedAt] = useState<number>(0);

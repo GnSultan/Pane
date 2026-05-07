@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { setWindowTitle, destroyPty } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
-import { ControlPanel } from "./components/ControlPanel/ControlPanel";
+import { ThreadPanel } from "./components/ThreadPanel/ThreadPanel";
 import { Workspace } from "./components/Workspace/Workspace";
 import { TaskNotification } from "./components/shared/TaskNotification";
 import { useWorkspaceStore } from "./stores/workspace";
@@ -178,7 +178,7 @@ function App() {
             ? projects.get(activeProjectId)
             : undefined;
           const target = e.target as HTMLElement;
-          const isInPanel = target.closest('[data-panel="control"]');
+          const isInPanel = target.closest('[data-panel="thread"]');
 
           if (isInPanel) {
             useWorkspaceStore.getState().increasePanelFontSize();
@@ -195,7 +195,7 @@ function App() {
             ? projects.get(activeProjectId)
             : undefined;
           const target = e.target as HTMLElement;
-          const isInPanel = target.closest('[data-panel="control"]');
+          const isInPanel = target.closest('[data-panel="thread"]');
 
           if (isInPanel) {
             useWorkspaceStore.getState().decreasePanelFontSize();
@@ -212,7 +212,7 @@ function App() {
             ? projects.get(activeProjectId)
             : undefined;
           const target = e.target as HTMLElement;
-          const isInPanel = target.closest('[data-panel="control"]');
+          const isInPanel = target.closest('[data-panel="thread"]');
 
           if (isInPanel) {
             useWorkspaceStore.getState().resetPanelFontSize();
@@ -307,7 +307,7 @@ function App() {
       <div className="flex h-full pt-2 pb-2 pl-2 gap-1">
         {sidebarVisible && (
           <div className="shrink-0 w-80">
-            <ControlPanel />
+            <ThreadPanel />
           </div>
         )}
         <div className="flex-1 min-w-0 pr-2 h-full relative">

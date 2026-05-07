@@ -369,75 +369,95 @@ function registerCommandHandlers() {
     files.sort();
     return files;
   });
+  // Track active ripgrep processes per root — auto-kill previous search
+  // when a new one starts, preventing stacked searches from piling up.
+  const activeRgSearches = new Map(); // root -> ChildProcess
+
   ipcMain.handle("search_in_files", async (_event, args) => {
     const max = args.maxResults ?? 200;
-    const queryLower = args.query.toLowerCase();
-    const results = [];
-    const ig = ignore();
-    try {
-      const gitignore = await fs.promises.readFile(
-        path.join(args.root, ".gitignore"),
-        "utf-8",
-      );
-      ig.add(gitignore);
-    } catch {}
-    ig.add(".git");
-    async function walk(dir, depth) {
-      if (depth > 20 || results.length >= max) return;
-      let entries;
-      try {
-        entries = await fs.promises.readdir(dir, { withFileTypes: true });
-      } catch {
-        return;
+    const { root, query } = args;
+
+    // Kill any existing ripgrep for this root before starting a new one
+    const existing = activeRgSearches.get(root);
+    if (existing) {
+      try { existing.kill("SIGTERM"); } catch (killErr) {
+        console.warn("[search] Failed to kill previous rg process:", killErr.message);
       }
-      for (const entry of entries) {
-        if (results.length >= max) break;
-        const fullPath = path.join(dir, entry.name);
-        const relativePath = path.relative(args.root, fullPath);
-        if (ig.ignores(relativePath)) continue;
-        if (entry.isDirectory()) {
-          if (ig.ignores(`${relativePath}/`)) continue;
-          await walk(fullPath, depth + 1);
-        } else if (entry.isFile()) {
-          try {
-            const stat = await fs.promises.stat(fullPath);
-            if (stat.size > 2 * 1024 * 1024) continue;
-          } catch {
-            continue;
-          }
-          let content;
-          try {
-            content = await fs.promises.readFile(fullPath);
-          } catch {
-            continue;
-          }
-          const checkLen = Math.min(content.length, 512);
-          let isBinary = false;
-          for (let i = 0; i < checkLen; i++) {
-            if (content[i] === 0) {
-              isBinary = true;
-              break;
-            }
-          }
-          if (isBinary) continue;
-          const text = content.toString("utf-8");
-          const lines = text.split("\n");
-          for (let i = 0; i < lines.length; i++) {
-            if (results.length >= max) break;
-            if (lines[i].toLowerCase().includes(queryLower)) {
-              results.push({
-                file_path: relativePath,
-                absolute_path: fullPath,
-                line_number: i + 1,
-                line_content: lines[i].slice(0, 200),
-              });
-            }
-          }
-        }
-      }
+      activeRgSearches.delete(root);
     }
-    await walk(args.root, 0);
-    return results;
+
+    // Dynamic import: @vscode/ripgrep provides the binary path
+    const { rgPath } = await import("@vscode/ripgrep");
+
+    return new Promise((resolve) => {
+      const child = execFile(
+        rgPath,
+        [
+          "--line-number",
+          "--no-heading",
+          "--smart-case",
+          "--max-count", "5",     // max matches per file — avoids flooding from one file
+          "--max-filesize", "2M", // skip files >2MB (binary/large)
+          "--",
+          query,
+          root,
+        ],
+        {
+          maxBuffer: 10 * 1024 * 1024, // 10MB stdout buffer
+          timeout: 30000,              // 30s safety timeout
+        },
+        (err, stdout, stderr) => {
+          activeRgSearches.delete(root);
+
+          // ripgrep exits with code 1 when no matches found
+          if ((err && err.code === 1 && !stdout) || !stdout) {
+            resolve([]);
+            return;
+          }
+
+          // Killed by us (new search superseded this one) — return empty
+          if (err && err.killed) {
+            resolve([]);
+            return;
+          }
+
+          // Other error
+          if (err) {
+            resolve([]);
+            return;
+          }
+
+          const results = [];
+          const lines = stdout.trim().split("\n").filter(Boolean);
+
+          for (const line of lines) {
+            if (results.length >= max) break;
+            // rg output: path:line:content
+            // Parse by finding first colon (path separator) and second colon (line/content separator)
+            const firstColon = line.indexOf(":");
+            if (firstColon === -1) continue;
+            const rest = line.slice(firstColon + 1);
+            const lineEnd = rest.indexOf(":");
+            if (lineEnd === -1) continue;
+
+            const relativePath = line.slice(0, firstColon);
+            const lineNum = parseInt(rest.slice(0, lineEnd), 10);
+            const content = rest.slice(lineEnd + 1);
+
+            results.push({
+              file_path: relativePath,
+              absolute_path: path.join(root, relativePath),
+              line_number: lineNum,
+              line_content: content.slice(0, 200),
+            });
+          }
+
+          resolve(results);
+        },
+      );
+
+      activeRgSearches.set(root, child);
+    });
   });
   ipcMain.handle("get_git_status", async (_event, args) => {
     let branch;
@@ -929,7 +949,7 @@ function settingsPath() {
 const defaultSettings = {
   project_roots: [],
   active_project_root: null,
-  control_panel_visible: true,
+  thread_panel_visible: true,
   project_states: {},
   font_size: null,
   editor_font_size: null,
@@ -2615,6 +2635,9 @@ app.whenReady().then(async () => {
   });
 
   punkEngine.setBrainRequest((type, data) => brainRequest(type, data));
+
+  punkEngine.setQuickCall((sys, usr) => punkEngine.quickCall(sys, usr));
+  punkEngine.setAgentCall((sys, prompt, workingDir) => punkEngine.agentCall(sys, prompt, workingDir));
 
   punkEngine.setBrainIndexer((projectId, events) =>
     brainRequest("index_events", { projectId, events })

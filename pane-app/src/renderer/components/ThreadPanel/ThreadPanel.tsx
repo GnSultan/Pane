@@ -3,9 +3,9 @@ import { ProjectList } from "./ProjectList";
 import { useProjectsStore } from "../../stores/projects";
 import { Menu, type PaneMode } from "./Menu";
 
-// --- ControlPanel ---
+// --- ThreadPanel ---
 
-export function ControlPanel() {
+export function ThreadPanel() {
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const setMode = useProjectsStore((s) => s.setMode);
 
@@ -44,7 +44,7 @@ export function ControlPanel() {
   return (
     <div
       className="no-select flex flex-col h-full bg-pane-bg rounded-xl font-panel outline-none ring-1 ring-pane-border/40 relative"
-      data-panel="control"
+      data-panel="thread"
       tabIndex={0}
     >
       {/* Spacer for macOS traffic lights — enough room so they sit inside the panel */}

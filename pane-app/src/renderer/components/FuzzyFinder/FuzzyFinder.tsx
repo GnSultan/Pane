@@ -35,10 +35,12 @@ export function FuzzyFinder() {
   const isLoading = useProjectsStore((s) => s.projects.get(s.activeProjectId ?? "")?.fileIndex.isLoading ?? false);
   const lastIndexed = useProjectsStore((s) => s.projects.get(s.activeProjectId ?? "")?.fileIndex.lastIndexed ?? 0);
 
-  // Load file index if stale
+  // Load file index if stale — 5 minute staleness window (file listings don't
+  // change without explicit file operations). The previous 30s window caused
+  // the index to be constantly invalidated on rapid mode switches.
   useEffect(() => {
     if (!projectRoot || !activeProjectId) return;
-    const isStale = Date.now() - lastIndexed > 30000;
+    const isStale = Date.now() - lastIndexed > 300000;
     if (isStale && !isLoading) {
       useProjectsStore.getState().setFileIndexLoading(activeProjectId, true);
       walkProjectFiles(projectRoot)
@@ -60,7 +62,10 @@ export function FuzzyFinder() {
     }
   }, [mode]);
 
-  // Search for code content when query changes
+  // Search for code content when query changes.
+  // Debounce increased to 250ms to avoid redundant searches on fast typing.
+  // Backend auto-aborts in-flight searches via ripgrep process kill, so
+  // multiple searches don't stack server-side.
   useEffect(() => {
     if (!projectRoot || query.length < 2) {
       setCodeResults([]);
@@ -76,7 +81,7 @@ export function FuzzyFinder() {
         })
         .catch(console.error)
         .finally(() => setIsSearchingCode(false));
-    }, 150);
+    }, 250);
     
     return () => clearTimeout(debounceTimer);
   }, [query, projectRoot]);
@@ -103,7 +108,11 @@ export function FuzzyFinder() {
       path: r.file_path,
       line: r.line_number,
       lineContent: r.line_content,
-      score: 50, // Give code results lower priority than exact file matches
+      // Score code results by query length: short/ambiguous queries get lower
+      // scores (20-40) so exact filename matches rank higher. Long/specific
+      // queries get higher scores (60-80) since the user is clearly searching
+      // for code content, not a file name.
+      score: Math.min(80, Math.max(20, query.length * 8)),
     }));
     
     // Combine and sort by score

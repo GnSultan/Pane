@@ -1319,20 +1319,14 @@ function _buildHandoff(projectId) {
 
 const _GEMINI_SUBAGENTS = [
   "",
-  "# Available Sub-Agents",
+  "# Available Sub-Agent",
   "",
-  "Sub-agents are specialized expert agents. Each sub-agent is available as a tool of the same name. Delegate to the sub-agent with the most relevant expertise.",
+  "A specialized sub-agent is available as a tool for deep codebase analysis. Delegate to it when the task requires methodically tracing through the codebase.",
   "",
-  "<available_subagents>",
-  "  <subagent>",
-  "    <name>codebase_investigator</name>",
-  "    <description>Specialized for codebase analysis, architectural mapping, and system-wide dependencies. Use for vague requests, bug root-cause analysis, refactoring, or comprehensive feature implementation.</description>",
-  "  </subagent>",
-  "  <subagent>",
-  "    <name>generalist</name>",
-  "    <description>General-purpose agent with all tools. Use for turn-intensive tasks, batch operations, high-volume output, and speculative investigations.</description>",
-  "  </subagent>",
-  "</available_subagents>",
+  "<available_subagent>",
+  "  <name>pane_investigate</name>",
+  "  <description>Specialized for codebase analysis, architectural mapping, and system-wide dependencies. Use for vague requests, bug root-cause analysis, refactoring, or comprehensive feature implementation.</description>",
+  "</available_subagent>",
 ].join("\n");
 
 function _buildSystemPromptFromAtoms(unifiedAtoms, taskType, complexity, backend, conversationPhase = null, historyLength = 0) {

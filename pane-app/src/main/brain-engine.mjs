@@ -25,6 +25,10 @@ import {
 } from "./symbol-index.mjs";
 import { ALL_SYSTEM_ATOMS, FACET_WEIGHTS } from "./system-atoms.mjs";
 
+// Local embedding model via @huggingface/transformers + onnxruntime-node.
+// onnxruntime-node is auto-detected by transformers.js when both are installed.
+import { pipeline } from "@huggingface/transformers";
+
 const BRAIN_DIR = path.join(os.homedir(), ".pane", "brain");
 const MEMORY_DIR = path.join(os.homedir(), ".pane", "memory");
 const PROFILE_DIR = path.join(os.homedir(), ".pane", "profile");
@@ -45,12 +49,14 @@ function _readSessionState(projectId) {
 let db = null;
 let embedderLoading = false;
 let embedderReady = false;
-let _embeddingApiKey = null;
+let _embedPipeline = null; // pipeline('feature-extraction') instance
 
-// Jina AI embedding API config
-const EMBEDDING_DIM = 1024; // jina-embeddings-v3 output dimension
-const JINA_API_URL = "https://api.jina.ai/v1/embeddings";
-const JINA_MODEL = "jina-embeddings-v3";
+// Local embedding model: bge-base-en-v1.5 via ONNX Runtime
+// 768-dim, ~63 MTEB, ~30ms on Apple Silicon, ~80ms on Intel Mac.
+// Model auto-downloads from HuggingFace on first pipeline() call.
+const EMBEDDING_DIM = 768; // bge-base-en-v1.5 output dimension
+const EMBED_MODEL = "Xenova/bge-base-en-v1.5";
+const EMBED_CACHE_DIR = path.join(BRAIN_DIR, "models");
 
 
 // Tracks which projects have completed a full initial index this session.
@@ -657,7 +663,7 @@ function initDatabase() {
     `),
     getNodesByProject: db.prepare(`SELECT * FROM nodes WHERE project_id = ?`),
     getNodesByType: db.prepare(`SELECT * FROM nodes WHERE entity_type = ? AND project_id = ?`),
-    getAllProjectNodes: db.prepare(`SELECT * FROM nodes WHERE project_id = ? AND embedding IS NOT NULL`),
+    getAllProjectNodes: db.prepare(`SELECT * FROM nodes WHERE project_id = ?`),
     getEdgesFor: db.prepare(`
       SELECT e.*, n1.name as source_name, n2.name as target_name
       FROM edges e
@@ -704,105 +710,75 @@ function initDatabase() {
   };
 }
 
-// --- Embedder (Jina AI Cloud API) ---
+// --- Embedder (Local ONNX via @huggingface/transformers) ---
 //
-// Replaces the local ONNX-based @huggingface/transformers embedder with
-// Jina AI's cloud embedding API. No local model files, no WASM threads,
-// no disk usage. API key is read from ~/.pane/settings.json (http_api_keys.jina).
-
-function _readEmbeddingApiKey() {
-  // Try settings.json first (same pattern as other API keys)
-  try {
-    const settingsPath = path.join(os.homedir(), ".pane", "settings.json");
-    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
-    const key = settings.http_api_keys?.jina;
-    if (key && key.length > 10) return key;
-  } catch {}
-  // Fallback: brain config
-  try {
-    const configPath = path.join(BRAIN_DIR, "config.json");
-    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    return config.embeddingApiKey || null;
-  } catch {}
-  return null;
-}
+// Uses bge-base-en-v1.5 via @huggingface/transformers + onnxruntime-node.
+// First call downloads the model (~40MB) from HuggingFace to ~/.pane/brain/models/.
+// Subsequent calls load from disk in ~50ms. Inference: ~30ms on Apple Silicon, ~80ms on Intel.
+// No API keys, no network, no rate limits.
 
 async function loadEmbedder() {
   if (embedderReady || embedderLoading) return;
   embedderLoading = true;
 
-  _embeddingApiKey = _readEmbeddingApiKey();
-
-  if (!_embeddingApiKey) {
-    console.warn("[brain] No Jina AI API key found. Set http_api_keys.jina in ~/.pane/settings.json");
-    embedderLoading = false;
-    return;
-  }
-
-  // Verify key works with a quick test embed
   try {
-    const test = await _jinaEmbed(["test"]);
-    if (!test || !test[0]) throw new Error("Empty response from Jina API");
-    console.log(`[brain] Jina AI embedding API ready (${EMBEDDING_DIM} dim, model: ${JINA_MODEL})`);
+    // Ensure model cache directory exists
+    fs.mkdirSync(EMBED_CACHE_DIR, { recursive: true });
+
+    console.log(`[brain] Loading embedding model (${EMBED_MODEL})...`);
+
+    // Create feature-extraction pipeline.
+    // First call downloads model files from HuggingFace (~40MB).
+    // Subsequent calls load from EMIT_CACHE_DIR.
+    // onnxruntime-node is auto-detected and used for native inference.
+    _embedPipeline = await pipeline("feature-extraction", EMBED_MODEL, {
+      quantized: false, // Full precision for best quality
+      cache_dir: EMBED_CACHE_DIR,
+    });
+
+    // Verify with a test embed
+    const test = await embed("test");
+    if (!test || test.length !== EMBEDDING_DIM) {
+      throw new Error(`Expected ${EMBEDDING_DIM}-dim embedding, got ${test?.length ?? 0}`);
+    }
+
+    console.log(`[brain] Local embedding model ready (${EMBED_MODEL}, ${EMBEDDING_DIM} dim)`);
     embedderReady = true;
     sendToMain({ type: "embedder_ready" });
 
-    // Index atoms + migrate old embeddings in background
+    // Index atoms + migrate old embeddings + fill null embeddings in background
     Promise.all([
       indexSystemAtoms().catch(err => console.error("[brain] System atom indexing failed:", err.message)),
       indexProfileAtoms().catch(err => console.error("[brain] Profile atom indexing failed:", err.message)),
       migrateEmbeddings().catch(err => console.error("[brain] Embedding migration failed:", err.message)),
+      fillNullEmbeddings().catch(err => console.error("[brain] Null embedding fill failed:", err.message)),
     ]);
   } catch (err) {
-    console.error("[brain] Jina API verification failed:", err.message);
+    console.error("[brain] Local embedding model failed to load:", err.message);
     console.warn("[brain] Brain still works — semantic search will use keyword fallback");
     embedderLoading = false;
   }
 }
 
 /**
- * Low-level Jina API call. Accepts array of texts, returns array of Float32Array embeddings.
- * Handles batch requests efficiently — Jina supports multiple inputs per call.
+ * Embed a single text string using the local ONNX model.
+ * Returns a Float32Array of EMBEDDING_DIM dimensions, or null on failure.
+ * Uses mean pooling + L2 normalization for cosine-similarity-ready vectors.
  */
-async function _jinaEmbed(inputs) {
-  if (!_embeddingApiKey) return null;
+async function embed(text) {
+  if (!embedderReady || !_embedPipeline) return null;
   try {
-    const response = await fetch(JINA_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${_embeddingApiKey}`,
-      },
-      body: JSON.stringify({
-        model: JINA_MODEL,
-        input: inputs,
-        normalized: true,
-        embedding_type: "float",
-      }),
+    const result = await _embedPipeline(text, {
+      pooling: "mean",
+      normalize: true,
     });
-
-    if (!response.ok) {
-      const errorBody = await response.text().catch(() => "");
-      console.warn(`[brain] Jina API error (${response.status}): ${errorBody.slice(0, 200)}`);
-      return null;
-    }
-
-    const data = await response.json();
-    if (!data?.data) return null;
-
-    // Sort by index to maintain input order
-    data.data.sort((a, b) => a.index - b.index);
-    return data.data.map(item => new Float32Array(item.embedding));
+    // result is a Tensor with shape [1, EMBEDDING_DIM]
+    // Access the underlying Float32Array data
+    return new Float32Array(result.data);
   } catch (err) {
-    console.warn(`[brain] Jina API request failed: ${err.message}`);
+    console.warn(`[brain] Embedding failed: ${err.message}`);
     return null;
   }
-}
-
-async function embed(text) {
-  if (!embedderReady || !_embeddingApiKey) return null;
-  const results = await _jinaEmbed([text]);
-  return results ? results[0] : null;
 }
 
 function cosineSimilarity(a, b) {
@@ -813,76 +789,54 @@ function cosineSimilarity(a, b) {
 }
 
 /**
- * Migrate old 384-dim embeddings to new 1024-dim Jina embeddings.
- * Runs once on startup after embedder is ready. Only migrates nodes
- * with 1536-byte embeddings (384 floats × 4 bytes).
+ * Migrate old-dimension embeddings to current EMBEDDING_DIM.
+ * Handles 384-dim (all-MiniLM-L6-v2, 1536 bytes) and 1024-dim (Jina v3, 4096 bytes).
+ * Also handles any other non-matching dimension as a catch-all.
+ * Runs once on startup after embedder is ready.
  */
 async function migrateEmbeddings() {
   if (!db || !embedderReady) return;
 
+  const currentBytes = EMBEDDING_DIM * 4; // 3072 bytes for 768-dim
+
   const oldNodes = db.prepare(`
     SELECT id, content, name FROM nodes
-    WHERE embedding IS NOT NULL AND LENGTH(embedding) = 1536
+    WHERE embedding IS NOT NULL AND LENGTH(embedding) != ?
     ORDER BY updated_at DESC
-  `).all();
+  `).all(currentBytes);
 
   if (oldNodes.length === 0) {
-    console.log("[brain] No old embeddings to migrate");
+    console.log("[brain] All embeddings match current dimension");
     return;
   }
 
-  console.log(`[brain] Migrating ${oldNodes.length} old embeddings to ${EMBEDDING_DIM} dim...`);
+  console.log(`[brain] Migrating ${oldNodes.length} embeddings to ${EMBEDDING_DIM} dim (${currentBytes} bytes)...`);
 
   let migrated = 0;
   let failed = 0;
-  const batchSize = 25; // Jina supports batching — send 25 texts per call
 
-  for (let i = 0; i < oldNodes.length; i += batchSize) {
-    const batch = oldNodes.slice(i, i + batchSize);
-    const texts = batch.map(node => {
+  for (const node of oldNodes) {
+    const text = (() => {
       try {
         const content = JSON.parse(node.content || "{}");
         return content.text || node.name;
       } catch {
         return node.name;
       }
-    });
+    })();
 
-    const results = await _jinaEmbed(texts);
-    if (!results) {
-      failed += batch.length;
-      console.warn(`[brain] Migration batch ${i / batchSize} failed — retrying individually...`);
-      // Fall back to individual requests
-      for (const node of batch) {
-        const text = texts[batch.indexOf(node)];
-        const embedding = await embed(text);
-        if (embedding) {
-          const embeddingBuffer = Buffer.from(embedding.buffer);
-          db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, node.id);
-          migrated++;
-        } else {
-          failed++;
-        }
-      }
-      continue;
-    }
-
-    for (let j = 0; j < batch.length; j++) {
-      const embedding = results[j];
-      if (!embedding) { failed++; continue; }
+    const embedding = await embed(text);
+    if (embedding) {
       const embeddingBuffer = Buffer.from(embedding.buffer);
       try {
-        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, batch[j].id);
+        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, node.id);
         migrated++;
       } catch (err) {
-        console.warn(`[brain] Migration DB update failed for ${batch[j].id}: ${err.message}`);
+        console.warn(`[brain] Migration DB update failed for ${node.id}: ${err.message}`);
         failed++;
       }
-    }
-
-    // Small delay between batches to stay under rate limits (100 RPM)
-    if (i + batchSize < oldNodes.length) {
-      await new Promise(r => setTimeout(r, 200));
+    } else {
+      failed++;
     }
   }
 
@@ -895,6 +849,61 @@ async function migrateEmbeddings() {
       if (p.project_id) writeSearchExport(p.project_id);
     }
   }
+}
+
+/**
+ * Retroactively create embeddings for nodes indexed before the embedder was ready.
+ * These nodes have NULL embeddings and are invisible to semantic search. After the
+ * embedder loads, this function finds all such nodes and generates embeddings for them.
+ * IDEMPOTENT: skips nodes that already have embeddings.
+ */
+async function fillNullEmbeddings() {
+  if (!db || !embedderReady) return;
+
+  const nullNodes = db.prepare(`
+    SELECT id, content, name FROM nodes
+    WHERE embedding IS NULL
+      AND entity_type NOT IN ('project', 'version')
+    ORDER BY updated_at DESC
+    LIMIT 500
+  `).all();
+
+  if (nullNodes.length === 0) {
+    console.log("[brain] No null-embedding nodes to fill");
+    return;
+  }
+
+  console.log(`[brain] Filling ${nullNodes.length} null-embedding nodes...`);
+
+  let filled = 0;
+  let failed = 0;
+
+  for (const node of nullNodes) {
+    const text = (() => {
+      try {
+        const content = JSON.parse(node.content || "{}");
+        return (content.text || node.name).slice(0, 500);
+      } catch {
+        return node.name.slice(0, 500);
+      }
+    })();
+
+    const embedding = await embed(text);
+    if (embedding) {
+      const embeddingBuffer = Buffer.from(embedding.buffer);
+      try {
+        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, node.id);
+        filled++;
+      } catch (err) {
+        console.warn(`[brain] Null-fill DB update failed for ${node.id}: ${err.message}`);
+        failed++;
+      }
+    } else {
+      failed++;
+    }
+  }
+
+  console.log(`[brain] Null-embedding fill complete: ${filled} embedded, ${failed} failed`);
 }
 
 function nodeId(type, content) {
@@ -1136,33 +1145,35 @@ async function search(query, projectId, limit = 10) {
   if (embedderReady) {
     const queryEmbedding = await embed(query);
     if (queryEmbedding) {
+      const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
       for (const node of nodes) {
+        const content = JSON.parse(node.content || "{}").text || node.name;
+        const contentLower = content.toLowerCase();
+        const keywordScore = queryWords.length > 0
+          ? queryWords.filter(w => contentLower.includes(w)).length / queryWords.length
+          : 0;
+
+        let score;
         if (node.embedding) {
           const nodeEmbedding = new Float32Array(node.embedding.buffer, node.embedding.byteOffset, node.embedding.byteLength / 4);
           const similarity = cosineSimilarity(queryEmbedding, nodeEmbedding);
-
-          // Also compute keyword score
-          const content = JSON.parse(node.content || "{}").text || node.name;
-          const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-          const contentLower = content.toLowerCase();
-          const keywordScore = queryWords.length > 0
-            ? queryWords.filter(w => contentLower.includes(w)).length / queryWords.length
-            : 0;
-
           // Hybrid score: 60% semantic + 40% keyword
-          const score = 0.6 * similarity + 0.4 * keywordScore;
+          score = 0.6 * similarity + 0.4 * keywordScore;
+        } else {
+          // No embedding (backfilled before embedder was ready): keyword-only
+          score = keywordScore * 0.8; // Discount slightly compared to hybrid
+        }
 
-          if (score > 0.25) {
-            results.push({
-              id: node.id,
-              name: node.name,
-              type: node.entity_type,
-              content: content.slice(0, 300),
-              confidence: node.confidence,
-              score,
-              age: node.created_at,
-            });
-          }
+        if (score > 0.25) {
+          results.push({
+            id: node.id,
+            name: node.name,
+            type: node.entity_type,
+            content: content.slice(0, 300),
+            confidence: node.confidence,
+            score,
+            age: node.created_at,
+          });
         }
       }
     }
@@ -2493,6 +2504,11 @@ process.parentPort.on("message", async ({ data }) => {
         // Fire-and-forget: respond immediately, index in background
         sendToMain({ type: "index_project_files_ack", requestId: data.requestId });
 
+        // Backfill events.jsonl for this project on first access.
+        // backfillAll() only runs on startup when the DB is empty; new projects
+        // added later need their pre-existing events indexed here.
+        backfillProject(data.projectId).catch(() => {});
+
         // Symbol indexing runs first (fast, no LLM) — file summarization runs in parallel
         Promise.all([
           // Layer 1: Symbol index (regex, no LLM, fast)
@@ -3215,15 +3231,14 @@ try {
   initProfile();
   console.log("[brain] Database + profile initialized");
 
-  // Check if backfill needed (empty DB but events exist)
-  const stats = db._stmts.getStats.get();
-  if (stats.node_count === 0) {
-    // Backfill in background — don't block startup
-    backfillAll().catch(err => console.error("[brain] Backfill error:", err));
-  }
-
-  // Start loading embedding model (async, doesn't block anything)
-  loadEmbedder();
+  // Start loading embedding model first — backfill needs it to generate embeddings
+  loadEmbedder().then(() => {
+    // Check if backfill needed (empty DB but events exist)
+    const stats = db._stmts.getStats.get();
+    if (stats.node_count === 0) {
+      backfillAll().catch(err => console.error("[brain] Backfill error:", err));
+    }
+  });
 } catch (err) {
   console.error("[brain] Startup error:", err);
 }
