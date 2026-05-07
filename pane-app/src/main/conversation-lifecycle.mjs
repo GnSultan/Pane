@@ -135,13 +135,88 @@ function computeTotalTokens(messages, systemTokens) {
 }
 
 /**
+ * Build an extractive summary marker from a dropped turn's messages.
+ * Extracts the user request, tool calls made, and key assistant conclusion
+ * — all from the raw messages, no LLM call needed. This gives the model
+ * real context about what was discussed instead of a one-line void.
+ *
+ * @param {Array} messages
+ * @param {number} startIdx - first message in the turn
+ * @param {number} endIdx - last message in the turn
+ * @param {number} turnIndex - sequential turn number
+ * @returns {{ marker: { role: string, content: string }, extracted: { turnIndex: number, request: string, tools: string[], conclusion: string } }}
+ */
+function buildTurnSummaryMarker(messages, startIdx, endIdx, turnIndex) {
+  // ── Extract user request ──────────────────────────────────────────────
+  const userMsg = messages[startIdx];
+  let requestText = "(system/init)";
+  if (userMsg?.role === "user") {
+    const content =
+      typeof userMsg.content === "string"
+        ? userMsg.content
+        : JSON.stringify(userMsg.content || "");
+    requestText = content.length > 160 ? content.slice(0, 157) + "..." : content;
+  }
+
+  // ── Collect tool calls + assistant texts ──────────────────────────────
+  const toolNames = [];
+  const assistantTexts = [];
+  for (let i = startIdx + 1; i <= endIdx; i++) {
+    const msg = messages[i];
+    if (!msg) continue;
+    if (msg.role === "assistant" && msg.content) {
+      const text = typeof msg.content === "string" ? msg.content.trim() : "";
+      if (text) assistantTexts.push(text);
+    }
+    if (msg.role === "tool" && msg.name) {
+      toolNames.push(msg.name);
+    }
+  }
+
+  // ── Extract key conclusion ────────────────────────────────────────────
+  let conclusion = "";
+  if (assistantTexts.length > 0) {
+    // Take the last substantial assistant text as the "result"
+    const last = assistantTexts[assistantTexts.length - 1];
+    conclusion = last.length > 250 ? last.slice(0, 247) + "..." : last;
+  }
+
+  const uniqueTools = [...new Set(toolNames)];
+  const toolLine =
+    uniqueTools.length > 0
+      ? `Tools used: ${uniqueTools.slice(0, 10).join(", ")}${uniqueTools.length > 10 ? ` +${uniqueTools.length - 10} more` : ""}`
+      : "(conversation only — no tools)";
+
+  // ── Assemble summary ──────────────────────────────────────────────────
+  const lines = [`[Context archived — turn ${turnIndex}]`, `Request: ${requestText}`, toolLine];
+
+  if (conclusion) {
+    lines.push(`Result: ${conclusion}`);
+  }
+
+  const marker = {
+    role: "user",
+    content: lines.join("\n"),
+  };
+
+  const extracted = {
+    turnIndex,
+    request: requestText,
+    tools: uniqueTools,
+    conclusion,
+  };
+
+  return { marker, extracted };
+}
+
+/**
  * Drop the oldest non-fresh, non-system turn entirely and replace
- * the user message with a short archival marker. Mutates messages in place.
+ * it with an extractive summary marker. Mutates messages in place.
  *
  * @param {Array} messages - mutated in place
  * @param {Array} turns - turn boundaries (from detectTurns)
  * @param {number} freshDepth - how many recent turns to protect
- * @returns {number} tokens saved (negative = messages got shorter)
+ * @returns {{ tokensSaved: number, droppedTurn: { turnIndex, request, tools, conclusion } | null }}
  */
 function dropOldestTurn(messages, turns, freshDepth) {
   // Find the oldest turn that isn't fresh and isn't the system prompt
@@ -162,23 +237,30 @@ function dropOldestTurn(messages, turns, freshDepth) {
       turnTokens += estimateTokens(content);
     }
 
+    // Build extractive summary BEFORE removing messages
+    const { marker, extracted } = buildTurnSummaryMarker(
+      messages,
+      turn.start,
+      turn.end,
+      turn.turnIndex,
+    );
+
     // Remove all messages in this turn (splice in reverse order to preserve indices)
     for (let i = turn.end; i >= turn.start; i--) {
       messages.splice(i, 1);
     }
 
-    // Insert a single archival summary marker at the start position
-    const archivalMsg = {
-      role: "user",
-      content: `[Archived turn ${turn.turnIndex} — summarized to fit context window. Original content available on disk.]`,
-    };
-    messages.splice(turn.start, 0, archivalMsg);
+    // Insert the extractive summary marker at the start position
+    messages.splice(turn.start, 0, marker);
 
-    const archivalTokens = estimateTokens(archivalMsg.content);
-    return turnTokens - archivalTokens; // positive = saved
+    const archivalTokens = estimateTokens(marker.content);
+    return {
+      tokensSaved: turnTokens - archivalTokens, // positive = saved
+      droppedTurn: extracted,
+    };
   }
 
-  return 0;
+  return { tokensSaved: 0, droppedTurn: null };
 }
 
 /**
@@ -216,7 +298,7 @@ export function manageConversation(messages, options = {}) {
 
   // No pressure — nothing to do
   if (totalTokens <= triggerThreshold) {
-    return { action: "none", tokensSaved: 0, details: "under 50% of hard limit" };
+    return { action: "none", tokensSaved: 0, details: "under 50% of hard limit", droppedTurns: [] };
   }
 
   // Detect turns
@@ -225,6 +307,8 @@ export function manageConversation(messages, options = {}) {
   let actionsSummary = [];
   let iterations = 0;
   const MAX_ITERATIONS = 50; // Safety valve
+  /** @type {Array<{ turnIndex: number, request: string, tools: string[], conclusion: string }>} */
+  const droppedTurns = [];
 
   // Progressive pruning loop: keep going until under hard limit
   while (totalTokens > hardLimit && iterations < MAX_ITERATIONS) {
@@ -261,11 +345,14 @@ export function manageConversation(messages, options = {}) {
     if (totalTokens > hardLimit) {
       // Refresh turn boundaries (they changed due to splicing)
       turns = detectTurns(messages);
-      const dropped = dropOldestTurn(messages, turns, FRESH_DEPTH);
-      if (dropped > 0) {
-        totalSaved += dropped;
-        savedThisRound += dropped;
-        actionsSummary.push(`dropped turn: -${dropped} tokens`);
+      const result = dropOldestTurn(messages, turns, FRESH_DEPTH);
+      if (result.tokensSaved > 0) {
+        totalSaved += result.tokensSaved;
+        savedThisRound += result.tokensSaved;
+        actionsSummary.push(`dropped turn ${result.droppedTurn?.turnIndex}: -${result.tokensSaved} tokens`);
+        if (result.droppedTurn) {
+          droppedTurns.push(result.droppedTurn);
+        }
         totalTokens = computeTotalTokens(messages, systemTokens);
       } else {
         // Can't save any more — break to avoid infinite loop
@@ -300,6 +387,7 @@ export function manageConversation(messages, options = {}) {
     tokensAfter: finalTokens,
     underLimit,
     details: actionsSummary.join("; ") || "no pruning needed",
+    droppedTurns,
   };
 }
 
@@ -346,9 +434,9 @@ export function forcePruneToBudget(messages, maxTokens, projectId = "unknown") {
     // Phase 2: Drop oldest turns if still over budget
     if (totalTokens > maxTokens) {
       const refreshedTurns = detectTurns(messages);
-      const dropped = dropOldestTurn(messages, refreshedTurns, FRESH_DEPTH);
-      if (dropped > 0) {
-        totalSaved += dropped;
+      const result = dropOldestTurn(messages, refreshedTurns, FRESH_DEPTH);
+      if (result.tokensSaved > 0) {
+        totalSaved += result.tokensSaved;
         totalTokens = estimateTokens(JSON.stringify(messages));
       } else {
         break; // nothing more to drop

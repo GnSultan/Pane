@@ -51,6 +51,15 @@ interface PersistedConversation {
   startIndex?: number;
 }
 
+// --- Delta tracking for conversation persistence ---
+//
+// Tracks the last persisted message ID per project so we only send new/modified
+// messages over IPC, instead of the entire conversation array every time.
+// Combined with debouncing, this eliminates main-process event loop blocking
+// that causes 15-second UI freezes in deep sessions.
+const lastPersistedMessageId = new Map<string, string | null>();
+const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const DEBOUNCE_MS = 500;
 
 async function saveConversation(
   projectId: string,
@@ -58,6 +67,53 @@ async function saveConversation(
 ): Promise<void> {
   // Passes projectId directly — main process owns storage (SQLite).
   await saveConversationToMain(projectId, conversation);
+}
+
+/**
+ * Save only messages that have changed since the last persist.
+ *
+ * Computes a delta by finding the last persisted message in the current array
+ * and sending everything from that point forward (inclusive — re-saves the
+ * last known message to cover in-place streaming updates).
+ *
+ * If the last persisted ID is not found (messages were trimmed by context
+ * window management), falls back to sending the entire array.
+ */
+function saveConversationDelta(projectId: string): void {
+  const ps = useProjectsStore.getState();
+  const p = ps.projects.get(projectId);
+  if (!p) return;
+
+  const messages = p.conversation.messages;
+  const lastId = lastPersistedMessageId.get(projectId) ?? null;
+
+  // Find where to start the delta slice
+  let sliceStart = 0;
+  if (lastId) {
+    const idx = messages.findIndex((m) => m.id === lastId);
+    if (idx !== -1) {
+      // Start from the last persisted message (inclusive) to cover in-place
+      // streaming updates to the assistant message.
+      sliceStart = idx;
+    }
+    // If idx === -1, messages were trimmed from the front — send everything.
+  }
+
+  const delta = messages.slice(sliceStart);
+  if (delta.length === 0) return;
+
+  saveConversation(projectId, {
+    model: p.conversation.model,
+    messages: delta,
+    startIndex: p.conversation.historyStartIndex,
+  })
+    .then(() => {
+      const last = delta[delta.length - 1];
+      if (last?.id) {
+        lastPersistedMessageId.set(projectId, last.id);
+      }
+    })
+    .catch(() => {});
 }
 
 
@@ -464,32 +520,57 @@ export function useSettingsPersistence() {
         // startTransition fires and cleared after the store update completes.
         if (restoringProjects.has(id)) continue;
 
-        // Save when message count changes or session finishes
+        // Save when message count changes or session finishes.
+        // Uses delta persistence (only new/modified messages) + debounce
+        // to avoid blocking the main process event loop for seconds at a time.
         const countChanged =
           p.conversation.messages.length !== pp?.conversation.messages.length;
         const finished =
           !p.conversation.isProcessing && pp?.conversation.isProcessing;
 
         if (countChanged || finished) {
-          saveConversation(id, {
-            model: p.conversation.model,
-            messages: p.conversation.messages,
-            startIndex: p.conversation.historyStartIndex,
-          }).catch(() => {});
+          // Cancel any pending debounced save for this project
+          const existing = debounceTimers.get(id);
+          if (existing) clearTimeout(existing);
+
+          if (finished) {
+            // Flush immediately — the turn is done, persist final state now
+            saveConversationDelta(id);
+          } else {
+            // Debounce: accumulate changes within the window, save once
+            debounceTimers.set(
+              id,
+              setTimeout(() => saveConversationDelta(id), DEBOUNCE_MS),
+            );
+          }
         }
       }
     });
 
-    window.addEventListener("beforeunload", save);
+    const handleBeforeUnload = () => {
+      // Flush workspace state
+      save();
+      // Flush any pending conversation deltas
+      for (const [projectId, timer] of debounceTimers) {
+        clearTimeout(timer);
+        saveConversationDelta(projectId);
+      }
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
     const interval = setInterval(save, 60000);
 
     return () => {
       unsubWorkspace();
       unsubProjects();
       unsubConversation();
-      window.removeEventListener("beforeunload", save);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
       clearInterval(interval);
       if (debounceTimer) clearTimeout(debounceTimer);
+      // Clear debounce timers
+      for (const [, timer] of debounceTimers) {
+        clearTimeout(timer);
+      }
+      debounceTimers.clear();
       if (loadedRef.current) save();
     };
   }, []);

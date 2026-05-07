@@ -37,6 +37,7 @@ import { detectPhase, filterAtomsForPhase } from "./conversation-phase.mjs";
 import { readVerdict, formatVerdictForContext, formatQualityStatsForContext, formatGuidanceForContext } from "./code-arbiter.mjs";
 import { getPaneDb } from "./pane-db.mjs";
 import { getIdentity } from "./identity.mjs";
+import { readDigest, formatDigestForContext } from "./context-digest.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -174,6 +175,11 @@ function computeRelevanceAdjustments(contextShape, brainCtx, intent, historyLeng
     adjustments.set("handoff", +2);
     adjustments.set("orientation", +1);
     adjustments.set("recent_actions", (adjustments.get("recent_actions") || 0) - 1);
+  }
+  if (historyLength >= 15) {
+    // Very deep session — model has likely lost early turns. Promote the
+    // context digest so it knows what's been done and decided.
+    adjustments.set("context_digest", (adjustments.get("context_digest") || 0) - 2); // useful → important
   }
 
   // ── Brain richness: if brain has good data, promote its layers ────────
@@ -797,6 +803,24 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
         priority: PRIORITY.USEFUL,
         placement: "dynamic",
         text: handoffText,
+      });
+    }
+  }
+
+  // ── 3. CONTEXT DIGEST (useful → important under pressure) ─────────────
+  // Living summary of dropped turns — injected on turn 5+ when the model
+  // has likely lost early conversation history. Priority bumped to IMPORTANT
+  // by the relevance engine when context pressure is high.
+  if (historyLength >= 5) {
+    const digest = readDigest(projectId);
+    const digestText = formatDigestForContext(digest);
+    if (digestText) {
+      layers.push({
+        name: "context_digest",
+        priority: PRIORITY.USEFUL,
+        placement: "dynamic",
+        tier: "session",
+        text: digestText,
       });
     }
   }

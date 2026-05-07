@@ -40,6 +40,7 @@ import {
   replay,
   clearJournal,
 } from "./session-journal.mjs";
+import { createDigest, updateDigest } from "./context-digest.mjs";
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 
 // ============================================================================
@@ -2133,6 +2134,22 @@ export class ApiBackend extends PunkBackend {
         );
       }
 
+      // ── Context Digest: maintain living session summary ──────────────────
+      // Create digest on first turn so deep-session has continuity when
+      // turns are inevitably dropped. Update it whenever turns are pruned.
+      try {
+        if (isNewConversation && !journalResumed) {
+          const sessionId = `http-${Date.now()}`;
+          const objective = request.prompt?.slice(0, 300) || "(new session)";
+          createDigest(request.projectId, sessionId, objective);
+        }
+        if (windowResult.droppedTurns?.length > 0) {
+          updateDigest(request.projectId, windowResult.droppedTurns, null);
+        }
+      } catch (err) {
+        console.warn(`[http] digest update failed: ${err.message}`);
+      }
+
       // Build the user prompt for this turn. If resuming from journal with
       // progress data, inject the progress context so the model knows exactly
       // where it was when it dropped.
@@ -3585,12 +3602,19 @@ export class ApiBackend extends PunkBackend {
           const loopSystemTokens = Math.round(
             (messages[0]?.content?.length || 0) / 4,
           );
-          manageContextWindow(
+          const loopWindowResult = manageContextWindow(
             messages,
             loopSystemTokens,
             request.projectId,
             request.model,
           );
+          if (loopWindowResult.droppedTurns?.length > 0) {
+            try {
+              updateDigest(request.projectId, loopWindowResult.droppedTurns, null);
+            } catch (err) {
+              console.warn(`[http] digest update failed (loop): ${err.message}`);
+            }
+          }
         } catch (turnError) {
           // Per-turn error handling — retry recoverable errors inside the loop
           if (turnError.name === "AbortError") throw turnError; // propagate to outer
@@ -3937,6 +3961,19 @@ export class ApiBackend extends PunkBackend {
           writeHandoffWithHistory(request.projectId, handoff);
         } catch (err) {
           console.warn(`[http] Failed to write handoff: ${err.message}`);
+        }
+
+        // ── Handoff enrichment: fire-and-forget LLM pass over the journal ──
+        // Runs after the basic handoff is written. Enriches the handoff with
+        // reasoning chains, failed approaches, patterns, and preferences so
+        // the next session's model doesn't start from zero.
+        try {
+          const { enrichHandoff } = await import("./handoff-enricher.mjs");
+          enrichHandoff(request.projectId, updateLatestHandoff).catch((err) =>
+            console.warn(`[http] Handoff enrichment failed (non-fatal): ${err.message}`),
+          );
+        } catch (err) {
+          console.warn(`[http] Failed to load handoff enricher: ${err.message}`);
         }
 
         // Archive after each successful turn (end-of-turn checkpoint)

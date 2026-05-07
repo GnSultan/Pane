@@ -206,76 +206,6 @@ function getToolLabel(name: string): string {
 }
 
 /**
- * Compute a simple line-level diff by scanning prefix and suffix for common lines.
- * Returns the minimal set of changed lines: old lines (removed) and new lines (added).
- * Context lines (unchanged) immediately adjacent to changes are included for orientation.
- */
-interface DiffLine {
-  type: "same" | "removed" | "added";
-  text: string;
-  /** 1-based line number from the old file (undefined for added lines) */
-  lineNum?: number;
-}
-
-function computeLineDiff(
-  oldLines: string[],
-  newLines: string[],
-  contextLines: number = 2,
-  fileStartLine: number = 1,
-): DiffLine[] {
-  // Find common prefix
-  let prefixLen = 0;
-  while (
-    prefixLen < oldLines.length &&
-    prefixLen < newLines.length &&
-    oldLines[prefixLen] === newLines[prefixLen]
-  ) {
-    prefixLen++;
-  }
-
-  // Find common suffix
-  let suffixLen = 0;
-  while (
-    suffixLen < oldLines.length - prefixLen &&
-    suffixLen < newLines.length - prefixLen &&
-    oldLines[oldLines.length - 1 - suffixLen] === newLines[newLines.length - 1 - suffixLen]
-  ) {
-    suffixLen++;
-  }
-
-  // Slice out the changed region
-  const oldChanged = oldLines.slice(prefixLen, oldLines.length - suffixLen);
-  const newChanged = newLines.slice(prefixLen, newLines.length - suffixLen);
-
-  const result: DiffLine[] = [];
-
-  // Context before changes
-  const contextStart = Math.max(0, prefixLen - contextLines);
-  for (let i = contextStart; i < prefixLen; i++) {
-    result.push({ type: "same", text: oldLines[i]!, lineNum: fileStartLine + i });
-  }
-
-  // Removed lines — line numbers from old file
-  for (let j = 0; j < oldChanged.length; j++) {
-    result.push({ type: "removed", text: oldChanged[j]!, lineNum: fileStartLine + prefixLen + j });
-  }
-
-  // Added lines — line number from the new file position
-  for (let j = 0; j < newChanged.length; j++) {
-    result.push({ type: "added", text: newChanged[j]!, lineNum: fileStartLine + prefixLen + j });
-  }
-
-  // Context after changes — line numbers from old file
-  const suffixStart = oldLines.length - suffixLen;
-  const contextEnd = Math.min(suffixStart + contextLines, oldLines.length);
-  for (let i = suffixStart; i < contextEnd; i++) {
-    result.push({ type: "same", text: oldLines[i]!, lineNum: fileStartLine + i });
-  }
-
-  return result;
-}
-
-/**
  * Detect syntax highlighting language from a file path.
  */
 function detectLanguage(filePath: string): string {
@@ -310,6 +240,27 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
   // Phase 2: new_string is streaming → old code struck through, new code streams in
   const isReplacing = newStr.length > 0;
 
+  // ── Phase 1 debounce: old code should materialize fully formed ──
+  // Without this, old_string streams in character by character via the
+  // partial_json_delta pipeline, creating a "writing in" effect that looks
+  // fake. Debounce the display until old_string stabilizes.
+  const [displayOldStr, setDisplayOldStr] = useState(oldStr);
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+
+  useEffect(() => {
+    if (isReplacing) {
+      // Phase 2: old code is complete — show it immediately (struck through)
+      setDisplayOldStr(oldStr);
+    } else {
+      // Phase 1: debounce — old code is still streaming in via partial JSON
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      debounceRef.current = setTimeout(() => setDisplayOldStr(oldStr), 150);
+    }
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, [oldStr, isReplacing]);
+
   // Scroll to bottom as new replacement code streams in (Phase 2 only)
   useEffect(() => {
     if (isReplacing && containerRef.current) {
@@ -317,17 +268,22 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
     }
   }, [newStr, isReplacing]);
 
+  // Compute lines for both phases (must be before any early return — Rules of Hooks)
+  const oldLines = useMemo(() => (oldStr ? oldStr.split("\n") : []), [oldStr]);
+  const newLines = useMemo(() => (newStr ? newStr.split("\n") : []), [newStr]);
+
   // ── Phase 1: Old code rendered as it appears in the actual document ──
+  // Uses debounced displayOldStr — code appears fully formed, not typed out
   if (!isReplacing) {
-    if (!oldStr) return null;
-    const lines = oldStr.split("\n");
+    if (!displayOldStr) return null;
+    const displayLines = displayOldStr.split("\n");
     return (
       <div
         className="font-mono overflow-x-auto max-h-[400px] overflow-y-auto leading-[1.6]"
         style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
       >
         <div className="px-4 py-4 space-y-0">
-          {lines.map((line, i) => (
+          {displayLines.map((line, i) => (
             <div key={i} className="whitespace-pre-wrap break-words flex gap-3">
               {/* Line number — matches file viewer style */}
               <span
@@ -353,16 +309,10 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
     );
   }
 
-  // ── Phase 2: Replacement streaming — full diff with strikethrough ──
-  const diffLines = useMemo(() => {
-    if (!oldStr && !newStr) return [];
-    if (!oldStr) {
-      return newStr.split("\n").map((line) => ({ type: "added" as const, text: line, lineNum: undefined }));
-    }
-    return computeLineDiff(oldStr.split("\n"), newStr.split("\n"), 2, fileStartLine);
-  }, [oldStr, newStr, fileStartLine]);
-
-  if (diffLines.length === 0) return null;
+  // ── Phase 2: Replacement streaming ──
+  // Old lines: instantly struck through, full opacity — they're in the file, always there
+  // New lines: stream in below, full opacity — the replacement arriving
+  if (oldLines.length === 0 && newLines.length === 0) return null;
 
   return (
     <div
@@ -371,15 +321,13 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
     >
       <div className="px-4 py-4 space-y-0">
-        {diffLines.map((line, i) => (
+        {/* Struck-through old lines — always there, full opacity */}
+        {oldLines.map((line, i) => (
           <div
-            key={i}
+            key={`old-${i}`}
             className="whitespace-pre-wrap break-words flex gap-3"
-            style={{
-              opacity: line.type === "same" ? 0.35 : line.type === "removed" ? 0.75 : 1,
-            }}
+            style={{ opacity: 0.75 }}
           >
-            {/* Line number — right-aligned in fixed width, dimmed */}
             <span
               className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
               style={{
@@ -388,18 +336,37 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
                 fontSize: "calc(var(--pane-font-size) - 2px)",
               }}
             >
-              {line.lineNum}
+              {fileStartLine + i}
             </span>
-            {/* Code content — syntax highlighted */}
             <span
-              className={line.type === "removed" ? "line-through" : ""}
+              className="line-through"
+              style={{ textDecorationColor: "var(--pane-error)" }}
+            >
+              {line.length > 0
+                ? renderHighlightedCode(line, lang)
+                : <>&nbsp;</>}
+            </span>
+          </div>
+        ))}
+        {/* Streaming new lines — full opacity, sequential line numbers from start position */}
+        {newLines.map((line, i) => (
+          <div
+            key={`new-${i}`}
+            className="whitespace-pre-wrap break-words flex gap-3"
+          >
+            <span
+              className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
               style={{
-                textDecorationColor: line.type === "removed" ? "var(--pane-error)" : undefined,
-                opacity: line.type === "removed" ? 0.7 : 1,
+                width: "3em",
+                opacity: 0.4,
+                fontSize: "calc(var(--pane-font-size) - 2px)",
               }}
             >
-              {line.text.length > 0
-                ? renderHighlightedCode(line.text, lang)
+              {fileStartLine + i}
+            </span>
+            <span>
+              {line.length > 0
+                ? renderHighlightedCode(line, lang)
                 : <>&nbsp;</>}
             </span>
           </div>

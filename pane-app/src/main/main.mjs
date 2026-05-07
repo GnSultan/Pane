@@ -1708,9 +1708,10 @@ function registerStateHandlers(db) {
   });
 
   // save_conversation: accepts projectId instead of filePath.
-  // Upserts the renderer's in-memory slice — INSERT OR REPLACE handles both
-  // new messages and streaming updates. Rows in the DB outside the renderer's
-  // slice (the history prefix) are untouched; no prefix-merge needed.
+  // Renderer sends only delta messages (new/modified since last persist) via
+  // debounced delta persistence. INSERT OR REPLACE handles both re-persisting
+  // an updated message (content streaming updates) and inserting new messages.
+  // Rows in the DB outside the delta slice are untouched; no prefix-merge needed.
   ipcMain.handle("save_conversation", (_event, args) => {
     const { projectId, conversation } = args;
     const { model, messages } = conversation;
