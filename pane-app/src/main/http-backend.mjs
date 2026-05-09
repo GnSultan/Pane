@@ -760,7 +760,7 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "pane_investigate",
+      name: "pane_ora",
       description:
         "Delegate complex codebase analysis, architectural mapping, or bug root-cause investigation to a specialized sub-agent. Use this for tasks that require methodically tracing through the codebase, reading multiple files, and returning structured findings.",
       parameters: {

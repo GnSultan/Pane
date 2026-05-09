@@ -2238,12 +2238,12 @@ export class ToolExecutor {
           }
         }
 
-        case "pane_investigate": {
+        case "pane_ora": {
           const objective = (input?.objective || "").trim();
           if (!objective) return { success: false, error: "Research objective is required.", toolId };
           if (!this._agentCall) return { success: false, error: "Sub-agent engine not available (agentCall not wired).", toolId };
 
-          const systemPrompt = `You are pane_investigate, a specialized sub-agent for deep codebase analysis.
+          const systemPrompt = `You are pane_ora, a specialized sub-agent for deep codebase analysis.
 
 Your job: investigate the codebase to answer a research objective. You have access to read-only tools — read files, grep/search, explore, find symbols, list directories.
 

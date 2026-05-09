@@ -222,7 +222,7 @@ export const GUIDELINE_ATOMS = [
 export const GEMINI_ATOMS = [
   {
     id: "gemini-subagents",
-    text: `A specialized sub-agent is available as a tool for deep codebase analysis: pane_investigate (codebase analysis, architectural mapping, bug root-cause analysis, system-wide dependencies).`,
+    text: `A specialized sub-agent is available as a tool for deep codebase analysis: pane_ora (codebase analysis, architectural mapping, bug root-cause analysis, system-wide dependencies).`,
     facet: "guideline",
     priority: 0.6,
     sortOrder: 0,

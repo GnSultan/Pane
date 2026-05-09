@@ -13,6 +13,12 @@ import type { PowerCombo } from "../lib/models";
 import { DEFAULT_POWER_COMBO } from "../lib/models";
 import { useWorkspaceStore } from "./workspace";
 
+// Maximum messages kept in-memory per conversation. Full history lives in
+// SQLite — the store is a display-only cache. 300 messages ≈ ~15K DOM nodes,
+// which is well within browser limits. Beyond this, oldest messages are
+// trimmed from the front; the "load older" button fetches them from disk.
+const MAX_STORE_MESSAGES = 300;
+
 export interface ProjectGit {
   branch: string | null;
   fileStatuses: Map<string, string>;
@@ -632,10 +638,16 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => {
           if (p.conversation.messages.some((m) => m.id === message.id)) return p;
+          const messages = [...p.conversation.messages, message];
+          // Cap to most recent N messages to prevent unbounded heap growth.
+          // Full history lives in SQLite; the store is a display-only cache.
+          const capped = messages.length > MAX_STORE_MESSAGES
+            ? messages.slice(messages.length - MAX_STORE_MESSAGES)
+            : messages;
           return {
             conversation: {
               ...p.conversation,
-              messages: [...p.conversation.messages, message],
+              messages: capped,
             },
           };
         }),
@@ -1048,13 +1060,26 @@ function createProjectsStore() {
 
     prependOlderMessages: (projectId, olderMessages, newStartIndex) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: {
-            ...p.conversation,
-            messages: [...olderMessages.map((m) => ({ ...m, isHistorical: true })), ...p.conversation.messages],
-            historyStartIndex: newStartIndex,
-          },
-        })),
+        updateProject(state, projectId, (p) => {
+          const merged = [
+            ...olderMessages.map((m) => ({ ...m, isHistorical: true })),
+            ...p.conversation.messages,
+          ];
+          // Cap to most recent N, adjusting start index for trimmed front
+          const trimmed = merged.length > MAX_STORE_MESSAGES
+            ? merged.length - MAX_STORE_MESSAGES
+            : 0;
+          const capped = trimmed > 0
+            ? merged.slice(trimmed)
+            : merged;
+          return {
+            conversation: {
+              ...p.conversation,
+              messages: capped,
+              historyStartIndex: newStartIndex + trimmed,
+            },
+          };
+        }),
       ),
 
     // Terminal tabs

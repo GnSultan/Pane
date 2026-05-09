@@ -75,15 +75,15 @@ function highlightSyntax(code: string, language: string): SyntaxToken[] {
   // Build regex patterns with priorities
   const patterns = [
     // Comments (highest priority)
-    { pattern: /(\/\/.*$|\/\*[\s\S]*?\*\/|#.*$)/gm, type: "comment" as const },
+    { pattern: /(?:\/\/.*$|\/\*[\s\S]*?\*\/|#.*$)/gm, type: "comment" as const },
     // Strings (with escape handling)
-    { pattern: /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, type: "string" as const },
+    { pattern: /(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, type: "string" as const },
     // Numbers
-    { pattern: /\b(\d+\.?\d*)\b/g, type: "number" as const },
+    { pattern: /\b(?:\d+\.?\d*)\b/g, type: "number" as const },
     // Keywords (language-specific)
-    { pattern: new RegExp(`\\b(${getKeywords(language).map(escapeRegExp).join('|')})\\b`, "g"), type: "keyword" as const },
+    { pattern: new RegExp(`\\b(?:${getKeywords(language).map(escapeRegExp).join('|')})\\b`, "g"), type: "keyword" as const },
     // Function calls
-    { pattern: /\b([a-zA-Z_]\w*)\s*\(/g, type: "function" as const },
+    { pattern: /\b(?:[a-zA-Z_]\w*)\s*\(/g, type: "function" as const },
     // Operators
     { pattern: /[+\-*/%=<>!&|^~?:]+/g, type: "operator" as const },
     // Punctuation
@@ -599,7 +599,7 @@ export const LazyHighlightedCode = memo(function LazyHighlightedCode({
 
 // --- Block rendering ---
 
-const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|pane_investigate|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
+const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|pane_ora|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
 const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|[\\w.@-]+\\.[a-zA-Z0-9]{2,10}|${TOOL_NAMES})(?::)?)`, "g");
 const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^\\.[a-zA-Z][a-zA-Z0-9_.-]*$|^(?:${TOOL_NAMES})(?::)?$`);
 

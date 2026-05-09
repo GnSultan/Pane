@@ -1348,7 +1348,7 @@ const _GEMINI_SUBAGENTS = [
   "A specialized sub-agent is available as a tool for deep codebase analysis. Delegate to it when the task requires methodically tracing through the codebase.",
   "",
   "<available_subagent>",
-  "  <name>pane_investigate</name>",
+  "  <name>pane_ora</name>",
   "  <description>Specialized for codebase analysis, architectural mapping, and system-wide dependencies. Use for vague requests, bug root-cause analysis, refactoring, or comprehensive feature implementation.</description>",
   "</available_subagent>",
 ].join("\n");

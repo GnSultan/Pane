@@ -585,13 +585,7 @@ function ExpandedBashInput({ input }: { input: Record<string, unknown> }) {
   );
 }
 
-function ExpandedMcpInput({ input, toolName }: { input: Record<string, unknown>; toolName: string }) {
-  const mcp = parseMcpName(toolName);
-  // Resolve display labels for both bare pane_* names and mcp__ prefixed names
-  const displayServer = toolName.startsWith("pane_") ? "pane" : mcp?.server ?? null;
-  const displayTool = toolName.startsWith("pane_")
-    ? toolName.slice(5).replace(/_/g, " ")
-    : mcp?.tool ?? null;
+function ExpandedMcpInput({ input }: { input: Record<string, unknown> }) {
   const entries = Object.entries(input).filter(
     ([, v]) => v !== null && v !== undefined && v !== "",
   );
@@ -600,21 +594,14 @@ function ExpandedMcpInput({ input, toolName }: { input: Record<string, unknown>;
       className="font-mono leading-[1.6]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
-      {displayServer && displayTool && (
-        <div className="px-4 py-4 text-pane-text-secondary border-b border-pane-text-secondary/10">
-          {displayServer} / {displayTool}
+      {entries.map(([key, val]) => (
+        <div key={key} className="flex gap-2 px-4 py-4 border-b border-pane-border/5 last:border-b-0">
+          <span className="text-pane-text-secondary shrink-0">{key.replace(/_/g, " ")}</span>
+          <span className="text-pane-text-secondary truncate">
+            {typeof val === "string" ? val : JSON.stringify(val)}
+          </span>
         </div>
-      )}
-      <div>
-        {entries.map(([key, val]) => (
-          <div key={key} className="flex gap-2 px-4 py-4 border-b border-pane-border/5 last:border-b-0">
-            <span className="text-pane-text-secondary shrink-0">{key.replace(/_/g, " ")}</span>
-            <span className="text-pane-text-secondary truncate">
-              {typeof val === "string" ? val : JSON.stringify(val)}
-            </span>
-          </div>
-        ))}
-      </div>
+      ))}
     </div>
   );
 }
@@ -677,7 +664,7 @@ function ExpandedPlanInput({ input }: { input: Record<string, unknown> }) {
 
 function renderExpandedInput(name: string, input: Record<string, unknown>, result?: ToolResultBlock) {
   if (name.startsWith("pane_") || parseMcpName(name)) {
-    return <ExpandedMcpInput input={input} toolName={name} />;
+    return <ExpandedMcpInput input={input} />;
   }
   switch (name) {
     case "Edit":

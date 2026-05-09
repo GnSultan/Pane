@@ -2046,7 +2046,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       requestId,
       todos: null,
       // Full read-only toolkit for punk analysis.
-      // For HTTP backends: phase="planning" gives all tools except writes — this
+      // For HTTP backends: phase="think" gives all tools except writes — this
       // list is decorative. For CLI backends: this list filters SDK built-in tools,
       // and pane_ tools come via MCP server regardless.
       tools: [
@@ -2066,7 +2066,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         // Verification
         'pane_run_in_terminal',
       ],
-      phase: 'planning',              // read-only: blocks write_file, replace, run_shell_command
+      phase: 'think',                 // read-only, uses thinking model slot (thinker, not builder)
       maxTurns: 50,
       systemPromptOverride: systemPrompt,
       _systemOverride: true,
