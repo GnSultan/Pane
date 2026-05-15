@@ -63,10 +63,6 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       case "pane_set_about": return "set about";
       case "pane_set_philosophy": return "set philosophy";
       case "pane_set_rule": return "set rule";
-      case "pane_synthesize": {
-        const q = (input.query as string) || "";
-        return q ? `synthesize ${q}` : "synthesize";
-      }
       case "pane_cross_project": {
         const q = (input.query as string) || "";
         return q ? `cross project ${q}` : "cross project";

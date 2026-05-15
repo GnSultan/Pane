@@ -11,14 +11,11 @@ import fs from "node:fs/promises";
 import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { execFileSync } from "node:child_process";
 import { ipcMain, BrowserWindow } from "electron";
 
 import { isLoggedIn, getAuthToken, getUserSecret, getCloudUser, getCloudApiUrl } from "./cloud-auth.mjs";
 import { deriveKey, encryptFile, decryptFile, checksumFile } from "./cloud-crypto.mjs";
-
-const execFileAsync = promisify(execFile);
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const TEMP_DIR = path.join(PANE_DIR, "tmp");
 
@@ -50,7 +47,9 @@ export async function uploadBackup(backupDir) {
     emitProgress("compressing");
 
     // Compress backup directory
-    await execFileAsync("tar", ["czf", tarPath, "-C", backupDir, "."]);
+    // execFileSync avoids libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak).
+    // NOTE: tar may block the main process for several seconds during backup.
+    execFileSync("tar", ["czf", tarPath, "-C", backupDir, "."], { encoding: "utf-8" });
 
     emitProgress("encrypting");
 
@@ -195,7 +194,7 @@ export async function restoreFromCloud() {
     // Extract into a temp dir first, then move to avoid partial restores
     const restoreDir = path.join(TEMP_DIR, "restore-staging");
     mkdirSync(restoreDir, { recursive: true });
-    await execFileAsync("tar", ["xzf", tarPath, "-C", restoreDir]);
+    execFileSync("tar", ["xzf", tarPath, "-C", restoreDir], { encoding: "utf-8" });
 
     // Move restored contents into ~/.pane/
     const entries = await fs.readdir(restoreDir);

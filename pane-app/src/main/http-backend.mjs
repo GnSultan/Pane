@@ -1,10 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
-
-const execAsync = promisify(exec);
+import { execSync } from "node:child_process";
 
 // Node.js globals for utility process
 const { AbortController, fetch, TextDecoder, console } = globalThis;
@@ -29,10 +26,12 @@ import {
   countHighConfidence,
   recordCorrections,
 } from "./extraction-tuning.mjs";
-import contextManager from "./context-manager.mjs";
+
 import { calculateCost } from "./pricing.mjs";
 import { summarize, storeRaw } from "./tool-result-cache.mjs";
-import { manageConversation, forcePruneToBudget } from "./conversation-lifecycle.mjs";
+import { manageConversation, forcePruneToBudget, storeTurnSummary } from "./conversation-lifecycle.mjs";
+import { contextStore } from "./context-store.mjs";
+import { scoreTurnsByRelevance, selectTurns, base64ToFloat32Array } from "./semantic-turn-selector.mjs";
 import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
 import {
   openJournal,
@@ -72,12 +71,15 @@ function manageContextWindow(
   systemTokens = 0,
   projectId = null,
   model = null,
+  turnSelection = null, // optional TurnSelection for semantic pruning
 ) {
   const maxContextTokens = model ? getModelLimit(model) : 128000;
   return manageConversation(messages, {
     projectId,
+    model,
     systemTokens,
     maxContextTokens,
+    turnSelection,
   });
 }
 
@@ -595,15 +597,6 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "pane_synthesize",
-      description:
-        "Get the project's accumulated memory — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
-      parameters: { type: "object", properties: {} },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "pane_profile",
       description:
         "View the user's profile — learned preferences, explicit rules, design philosophy, and known anti-patterns.",
@@ -944,6 +937,7 @@ const TOOL_DEFINITIONS = [
 // execution — all tools: model implements the plan
 const WRITE_TOOL_NAMES = new Set([
   "run_shell_command",
+  "pane_run_in_terminal",
   "write_file",
   "replace",
   "pane_revert_change",
@@ -1156,7 +1150,12 @@ function _isPaneModel(m) {
 }
 
 function _normalizeModel(m) {
-  const family = _familyFor(m.id);
+  const family = _familyFor(m.id) || {
+    provider: (m.id.split("/")[0] || "unknown")
+      .replace(/-/g, " ")
+      .replace(/\b\w/g, (c) => c.toUpperCase()),
+    tier: 2,
+  };
   // Strip OpenRouter noise from display names: "(self-moderated)", "(extended)",
   // ":nitro", ":floor", ":free" suffixes, and trailing date stamps like " 2024-11"
   const name = (m.name ?? m.id)
@@ -1868,18 +1867,17 @@ export class ApiBackend extends PunkBackend {
     return normalized;
   }
 
-  async getGitStatus(workingDir) {
+  getGitStatus(workingDir) {
     try {
-      const { stdout: branchOut } = await execAsync(
+      const branch = execSync(
         "git symbolic-ref --short HEAD || git rev-parse --abbrev-ref HEAD",
-        { cwd: workingDir },
-      );
-      const branch = branchOut.trim();
-      const { stdout: statusOut } = await execAsync(
+        { cwd: workingDir, encoding: "utf-8" },
+      ).trim();
+      const summary = execSync(
         "git status --porcelain=v1 -unormal",
-        { cwd: workingDir },
-      );
-      return { branch, summary: statusOut.trim() || "(clean)" };
+        { cwd: workingDir, encoding: "utf-8" },
+      ).trim() || "(clean)";
+      return { branch, summary };
     } catch {
       return null;
     }
@@ -1956,6 +1954,20 @@ export class ApiBackend extends PunkBackend {
         );
       }
 
+      // ── V4 Semantic: pre-compute query embedding for relevance-scored context ──
+      // Computed once, reused for both the semantic turn pool (in orchestrateContext)
+      // and turn selection (in manageConversation). Gated behind PANE_V4_SEMANTIC.
+      let queryEmbB64 = null;
+      if (process.env.PANE_V4_SEMANTIC === "1" && this._brainRequest) {
+        try {
+          const userQuery = request.prompt || "";
+          const embedResult = await this._brainRequest("embed_texts", { texts: [userQuery] });
+          queryEmbB64 = embedResult?.embeddings?.[userQuery] || null;
+        } catch (err) {
+          console.warn(`[http] V4 semantic embedding failed (falling back to chronological): ${err.message}`);
+        }
+      }
+
       // Budget-aware context assembly via orchestrator (single path)
       const conversationTokens = estimateConversationTokens(
         request.history || [],
@@ -1967,6 +1979,7 @@ export class ApiBackend extends PunkBackend {
         model: request.model,
         sqliteChanges,
         conversationTokens,
+        queryEmbeddingBase64: queryEmbB64,
       });
       if (context.budget?.layersDropped > 0) {
         console.log(
@@ -2107,16 +2120,52 @@ export class ApiBackend extends PunkBackend {
       // Pane owns the context window. Instead of emergency compaction when
       // full, the window is continuously managed:
       //   Phase 1: Prune old tool results (3k file reads → 30-token summaries)
-      //   Phase 2: Drop oldest turns if still over budget
-      // This replaces the old contextManager.shouldAutoCompact approach.
+      //   Phase 2: Drop turns (chronological by default, semantic when available)
+      // Managed by conversation-lifecycle.mjs — three-tier progressive summarization.
+      //
+      // When PANE_V4_SEMANTIC is enabled, semantic turn selection computes which
+      // turns to keep/drop based on relevance to the current query.
       const systemTokens =
         context.budget?.systemUsed ||
         Math.round((systemPrompt?.length || 0) / 4);
+
+      // ── Semantic turn selection (pre-compute for Phase 2) ────────────
+      // Gated behind PANE_V4_SEMANTIC env var during phased rollout.
+      // Reuses queryEmbB64 computed earlier for the orchestrator.
+      let turnSelection = null;
+      if (process.env.PANE_V4_SEMANTIC === "1" && this._brainRequest) {
+        try {
+          const summaries = contextStore.getTurnSummaries(request.projectId);
+          if (summaries && summaries.length > 0) {
+            // Embed any unembedded turn summaries (query already embedded above)
+            const unembedded = summaries.filter(s => !s.embedding);
+            if (unembedded.length > 0) {
+              const texts = unembedded.map(s => s.compressedText);
+              const result = await this._brainRequest("embed_texts", { texts });
+              if (result?.embeddings) {
+                for (const s of unembedded) {
+                  const b64 = result.embeddings[s.compressedText];
+                  if (b64) s.embedding = base64ToFloat32Array(b64);
+                }
+                contextStore.updateTurnSummaries(request.projectId, summaries);
+              }
+            }
+
+            // Score and select turns by relevance
+            const scored = scoreTurnsByRelevance(queryEmbB64, summaries);
+            turnSelection = selectTurns(scored);
+          }
+        } catch (err) {
+          console.warn(`[http] semantic turn selection failed (falling back to chronological): ${err.message}`);
+        }
+      }
+
       const windowResult = manageContextWindow(
         messages,
         systemTokens,
         request.projectId,
         request.model,
+        turnSelection, // optional — passed to manageConversation for Phase 2
       );
       if (windowResult.action !== "none") {
         this.onEvent(
@@ -2402,7 +2451,7 @@ export class ApiBackend extends PunkBackend {
               if (sourceBody.messages?.length > 0) {
                 const modelLimit = request.model ? getModelLimit(request.model) : 128000;
                 const outputBudget = getDefaultOutputBudget(request.model);
-                const overheadBudget = 3000; // tools definitions + stop sequences + framing
+                const overheadBudget = 5000; // tools definitions + [Pane context] + formatting
                 const maxMessagesTokens = modelLimit - outputBudget - overheadBudget;
                 const currentMsgTokens = estimateTokens(JSON.stringify(sourceBody.messages));
                 if (currentMsgTokens > maxMessagesTokens) {
@@ -2538,7 +2587,7 @@ export class ApiBackend extends PunkBackend {
                       // Force-prune the actual source body messages aggressively
                       const modelLimit = request.model ? getModelLimit(request.model) : 128000;
                       const outputBudget = getDefaultOutputBudget(request.model);
-                      const maxMessagesTokens = modelLimit - outputBudget - 3000;
+                      const maxMessagesTokens = modelLimit - outputBudget - 5000;
                       forcePruneToBudget(
                         sourceBody.messages,
                         maxMessagesTokens,
@@ -3174,7 +3223,7 @@ export class ApiBackend extends PunkBackend {
                 // Reconstruct what it already accomplished so it picks up where it left
                 // off rather than re-exploring from scratch.
                 continuationParts.push(
-                  "You stopped before finishing. Here is your progress so far — pick up exactly where you left off, do NOT re-explore or re-read files you already examined.",
+                  "You stopped before finishing. Here is your progress so far — pick up exactly where you left off.",
                 );
 
                 // Inject what the model already accomplished this session
@@ -3607,6 +3656,7 @@ export class ApiBackend extends PunkBackend {
             loopSystemTokens,
             request.projectId,
             request.model,
+            turnSelection,
           );
           if (loopWindowResult.droppedTurns?.length > 0) {
             try {
@@ -5253,7 +5303,6 @@ export class ApiBackend extends PunkBackend {
       if (!json.data) return [];
 
       return json.data
-        .filter(_isPaneModel)
         .map(_normalizeModel)
         .sort(_byRelevance);
     } catch (err) {
@@ -5835,3 +5884,5 @@ export class ApiBackend extends PunkBackend {
     }
   }
 }
+
+// base64ToFloat32Array is now imported from ./semantic-turn-selector.mjs

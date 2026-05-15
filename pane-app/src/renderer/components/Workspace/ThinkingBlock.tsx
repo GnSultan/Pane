@@ -44,8 +44,8 @@ export function ThinkingBlockDisplay({
     >
       <button
         onClick={() => setUserToggle(!isExpanded)}
-        className="flex items-center gap-2.5 h-12 leading-none px-6 hover:text-pane-text transition-colors w-full text-left"
-        style={{ minHeight: '3rem' }}
+        className="flex items-center gap-2.5 h-10 leading-none px-4 hover:text-pane-text transition-colors w-full text-left group"
+        style={{ minHeight: '2.5rem' }}
       >
         <MicroIndicator
           variant={isStreaming ? "strong" : "subtle"}
@@ -78,7 +78,7 @@ export function ThinkingBlockDisplay({
       {isExpanded && (
         <div
           ref={contentRef}
-          className="px-10 py-8 space-y-3
+          className="px-4 py-8 space-y-3
                      text-pane-text-secondary/60 leading-[1.8]
                      max-h-[500px] overflow-y-auto selection:bg-pane-text-secondary/10"
           style={{

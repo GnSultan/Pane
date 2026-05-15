@@ -7,8 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import { execSync } from "node:child_process";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 
 import { createRequire } from "node:module";
@@ -24,8 +23,6 @@ try {
 } catch {
   // DB-dependent tools will return a graceful error; all others work fine.
 }
-
-const execAsync = promisify(exec);
 
 const PANE_DIR = process.env.PANE_DATA_DIR || path.join(os.homedir(), ".pane");
 const PROJECT_ID = process.env.PANE_PROJECT_ID || "";
@@ -254,7 +251,7 @@ async function semanticSearch(query, projectId, limit = 20) {
 const TOOLS = [
   {
     name: "pane_project_context",
-    description: "Get project name, root path, git branch, and top-level file list. Use when you need the physical layout or git state. For deeper orientation, prefer pane_synthesize or pane_brief first.",
+    description: "Get project name, root path, git branch, and top-level file list. Use when you need the physical layout or git state. For deeper orientation, prefer pane_brief first.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -318,7 +315,7 @@ const TOOLS = [
   },
   {
     name: "pane_brief",
-    description: "Read the project's accumulated memory brief — top decisions, lessons, frequently modified files, and the last session summary. Good starting point when resuming work or when you need a quick read on project history without the full architecture narrative. For deeper causal understanding, use pane_synthesize.",
+    description: "Read the project's accumulated memory brief — top decisions, lessons, frequently modified files, and the last session summary. Good starting point when resuming work or when you need a quick read on project history.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -355,7 +352,7 @@ const TOOLS = [
   },
   {
     name: "pane_knowledge_graph",
-    description: "View the project's knowledge graph — how decisions, patterns, lessons, and errors connect to each other, including cross-project links. Use when you need to understand the relationships between architectural choices, or when pane_synthesize gives you the narrative but you want to see the structure. Complements pane_synthesize: synthesize for the story, graph for the connections.",
+    description: "View the project's knowledge graph — how decisions, patterns, lessons, and errors connect to each other, including cross-project links. Use when you need to understand the relationships between architectural choices. Complements pane_brief: brief for the summary, graph for the connections.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -513,11 +510,6 @@ const TOOLS = [
       },
       required: ["subsystem", "decision", "rationale"],
     },
-  },
-  {
-    name: "pane_synthesize",
-    description: "Get the project's accumulated memory — a compact narrative of why things are the way they are: key decisions, established patterns, lessons learned, known anti-patterns. This is causal memory, not just facts. Use at the start of a session or whenever you need deep architectural context before making structural changes. Pair with pane_knowledge_graph when you want the connections, not just the narrative.",
-    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "pane_read_files",
@@ -767,16 +759,19 @@ async function handleToolCall(name, args) {
       let output = "";
       let exitCode = 0;
       try {
-        const { stdout, stderr } = await execAsync(command, {
+        // execSync avoids libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak).
+        // Append 2>&1 to merge stderr into stdout for capture.
+        const result = execSync(`${command} 2>&1`, {
           cwd,
           env: getEnvWithPath(),
           timeout: timeoutSecs * 1000,
+          encoding: "utf-8",
           maxBuffer: 10 * 1024 * 1024,
         });
-        output = [stdout, stderr].filter(Boolean).join("\n").trimEnd();
+        output = (result || "").trimEnd();
       } catch (err) {
-        exitCode = err.code ?? 1;
-        const partial = [err.stdout, err.stderr].filter(Boolean).join("\n").trimEnd();
+        exitCode = err.status ?? 1;
+        const partial = (err.stdout?.toString?.() || err.stderr?.toString?.() || "").trimEnd();
         output = partial
           ? `Exit ${exitCode}\n${partial}`
           : (err.killed ? `Error: command timed out after ${timeoutSecs}s` : `Error: ${err.message}`);
@@ -1253,51 +1248,6 @@ async function handleToolCall(name, args) {
       const projectId = args?.projectId || PROJECT_ID;
       const { byFile, totalMatches, filesSearched } = await findReferences(symbol, projectRoot, { projectId });
       return text(formatReferencesOutput(symbol, byFile, totalMatches, filesSearched));
-    }
-
-    case "pane_synthesize": {
-      // Read synthesis from contextual export (written by brain-engine)
-      const contextPath = path.join(PANE_DIR, "brain", "context", `${PROJECT_ID}.json`);
-      const ctx = await readJson(contextPath);
-
-      if (ctx?.synthesis) {
-        return text(`## Project Memory\n\n${ctx.synthesis}`);
-      }
-
-      // Fallback: check if brain export has enough nodes to build one
-      const exported = await readBrainExport(PROJECT_ID);
-      if (!exported || exported.length === 0) {
-        return text("Project memory not available yet — it builds as decisions and lessons accumulate through your work.");
-      }
-
-      const decisions = exported.filter(n => n.type === "decision" && n.confidence >= 0.70).slice(0, 12);
-      const patterns  = exported.filter(n => n.type === "pattern"  && n.confidence >= 0.70).slice(0, 8);
-      const lessons   = exported.filter(n => n.type === "lesson"   && n.confidence >= 0.72).slice(0, 8);
-      const fixes     = exported.filter(n => n.type === "error_fix"&& n.confidence >= 0.70).slice(0, 6);
-
-      if (decisions.length + patterns.length + lessons.length + fixes.length === 0) {
-        return text("Project memory not available yet — confidence is still building.");
-      }
-
-      const parts = ["## Project Memory\n"];
-      if (decisions.length > 0) {
-        parts.push("Architectural decisions:");
-        for (const d of decisions) parts.push(`- ${d.content}`);
-      }
-      if (patterns.length > 0) {
-        parts.push("\nEstablished patterns:");
-        for (const p of patterns) parts.push(`- ${p.content}`);
-      }
-      if (lessons.length > 0) {
-        parts.push("\nLessons learned:");
-        for (const l of lessons) parts.push(`- ${l.content}`);
-      }
-      if (fixes.length > 0) {
-        parts.push("\nKnown anti-patterns:");
-        for (const f of fixes) parts.push(`- ${f.content}`);
-      }
-
-      return text(parts.join("\n"));
     }
 
     case "pane_read_files": {

@@ -4,16 +4,9 @@
  * Regex parse of exports → SQLite.
  * No LLM. No embeddings. Fast lookup, always current.
  *
- * Layer 1 of the intelligence stack:
- *   "Where is the function that handles IPC routing?" → answered in <1ms.
- *
- * Layer 3 (Synthesis) is also here:
- *   synthesizeProjectMemory() → compact narrative from decisions/lessons/patterns.
- *   No LLM. Pure DB extraction. Called by brain-engine after indexing.
- *
  * Tables owned:
- *   symbols   — one row per exported symbol (name, kind, file, line, signature, doc)
- *   syntheses — cached project DNA narratives keyed by (projectId, kind)
+ *   symbols            — one row per exported symbol (name, kind, file, line, signature, doc)
+ *   file_relationships — import/export/reference edges between files
  */
 
 import fs from "node:fs";
@@ -358,16 +351,6 @@ export function initSymbolTables(db) {
 
     CREATE INDEX IF NOT EXISTS idx_rel_source ON file_relationships(project_id, source_file);
     CREATE INDEX IF NOT EXISTS idx_rel_target ON file_relationships(project_id, target_file);
-
-    CREATE TABLE IF NOT EXISTS syntheses (
-      id           TEXT PRIMARY KEY,
-      project_id   TEXT NOT NULL,
-      kind         TEXT NOT NULL,
-      content      TEXT NOT NULL,
-      source_hash  TEXT NOT NULL,
-      generated_at INTEGER DEFAULT (unixepoch()),
-      UNIQUE(project_id, kind)
-    );
   `);
 }
 
@@ -628,147 +611,4 @@ export function writeSymbolExport(db, projectId, exportDir) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Synthesis — Layer 3: Causal Memory
-// ---------------------------------------------------------------------------
 
-/**
- * Synthesize project DNA from brain nodes.
- *
- * Pure DB extraction — no LLM, no embeddings.
- * Pulls high-confidence decisions, lessons, patterns, error_fixes and
- * formats them into a compact narrative (<400 tokens).
- *
- * This is the "prefrontal cortex" layer:
- *   "We rejected Redux because Zustand Map references cause enough pain already."
- *   "Design rules forbid borders on inputs — decided after 3 iterations."
- *
- * @returns Synthesis text, or null if nothing to synthesize.
- */
-export function synthesizeProjectMemory(db, projectId) {
-  if (!db) return null;
-
-  const extract = row => {
-    try { return JSON.parse(row.content)?.text || row.content; }
-    catch { return row.content; }
-  };
-
-  const decisions = db.prepare(`
-    SELECT content, confidence FROM nodes
-    WHERE project_id = ? AND entity_type = 'decision' AND confidence >= 0.70
-    ORDER BY confidence DESC, access_count DESC LIMIT 12
-  `).all(projectId);
-
-  const patterns = db.prepare(`
-    SELECT content, confidence FROM nodes
-    WHERE project_id = ? AND entity_type = 'pattern' AND confidence >= 0.70
-    ORDER BY confidence DESC LIMIT 8
-  `).all(projectId);
-
-  const lessons = db.prepare(`
-    SELECT content, confidence FROM nodes
-    WHERE project_id = ? AND entity_type = 'lesson' AND confidence >= 0.72
-    ORDER BY confidence DESC LIMIT 8
-  `).all(projectId);
-
-  const fixes = db.prepare(`
-    SELECT content, confidence FROM nodes
-    WHERE project_id = ? AND entity_type = 'error_fix' AND confidence >= 0.70
-    ORDER BY confidence DESC LIMIT 6
-  `).all(projectId);
-
-  const total = decisions.length + patterns.length + lessons.length + fixes.length;
-  if (total === 0) return null;
-
-  const parts = [];
-
-  if (decisions.length > 0) {
-    parts.push("Architectural decisions:");
-    for (const d of decisions) {
-      const text = extract(d);
-      if (text && !isSignalNoise(text)) parts.push(`- ${text}`);
-    }
-  }
-
-  if (patterns.length > 0) {
-    parts.push("\nEstablished patterns:");
-    for (const p of patterns) {
-      const text = extract(p);
-      if (text && !isSignalNoise(text)) parts.push(`- ${text}`);
-    }
-  }
-
-  if (lessons.length > 0) {
-    parts.push("\nLessons learned:");
-    for (const l of lessons) {
-      const text = extract(l);
-      if (text && !isSignalNoise(text)) parts.push(`- ${text}`);
-    }
-  }
-
-  if (fixes.length > 0) {
-    // Only emit the anti-patterns section if the majority of fix nodes contain
-    // genuine behavioral signal — not transient tool errors.
-    const fixTexts = fixes.map(f => extract(f)).filter(Boolean);
-    const noiseCount = fixTexts.filter(isSignalNoise).length;
-    const signalRatio = fixTexts.length > 0 ? (fixTexts.length - noiseCount) / fixTexts.length : 0;
-    if (signalRatio > 0.5) {
-      parts.push("\nKnown anti-patterns (do not repeat):");
-      for (const text of fixTexts) {
-        if (!isSignalNoise(text)) parts.push(`- ${text}`);
-      }
-    }
-  }
-
-  const joined = parts.join("\n");
-  // If the entire synthesis is predominantly noise (>50% of non-header lines match
-  // error/fix patterns), suppress it entirely rather than injecting it.
-  const contentLines = joined.split("\n").filter(l => l.startsWith("- "));
-  if (contentLines.length === 0) return null;
-  const noisy = contentLines.filter(l => isSignalNoise(l.slice(2)));
-  if (noisy.length / contentLines.length > 0.5) return null;
-
-  return joined;
-}
-
-/**
- * Regenerate and store synthesis if source nodes have changed.
- * Idempotent — only writes if content hash changes.
- *
- * @returns Synthesis text, or null.
- */
-export function updateSynthesis(db, projectId) {
-  const text = synthesizeProjectMemory(db, projectId);
-  if (!text) return null;
-
-  const hash = crypto.createHash("md5").update(text).digest("hex").slice(0, 16);
-
-  // Check if unchanged
-  const existing = db.prepare(
-    `SELECT source_hash FROM syntheses WHERE project_id = ? AND kind = 'about'`
-  ).get(projectId);
-
-  if (existing?.source_hash === hash) return text; // no change
-
-  db.prepare(`
-    INSERT OR REPLACE INTO syntheses (id, project_id, kind, content, source_hash, generated_at)
-    VALUES (?, ?, 'about', ?, ?, unixepoch())
-  `).run(`syn-${projectId}-about`, projectId, text, hash);
-
-  return text;
-}
-
-/**
- * Read cached synthesis. Returns null if not available.
- */
-export function readSynthesis(db, projectId) {
-  if (!db) return null;
-  try {
-    const row = db.prepare(
-      `SELECT content FROM syntheses WHERE project_id = ? AND kind = 'about'`
-    ).get(projectId);
-    return row?.content || null;
-  } catch {
-    return null;
-  }
-}

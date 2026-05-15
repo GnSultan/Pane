@@ -325,3 +325,49 @@ export function createRequestBudget(model, conversationTokens = 0) {
 
   return tracker;
 }
+
+// ---------------------------------------------------------------------------
+// Three-tier cache strategy constants (DeepSeek V4-inspired)
+// ---------------------------------------------------------------------------
+
+/**
+ * Cache budget for each tier of the three-tier context architecture.
+ * These constrain system prompt assembly and message selection to ensure
+ * the cache prefix remains stable and within budget.
+ *
+ * FROZEN_TIER: identity, rules, brief, DNA, authoritative decisions.
+ *   This forms the stable base of the cache prefix. Changes rarely.
+ *
+ * SESSION_TIER: intent directives, task context, recent work.
+ *   Changes at session boundaries. Still cacheable for Anthropic.
+ *
+ * TURN_TIER: arbiter findings, quality, guidance.
+ *   Changes every turn. NOT cached.
+ *
+ * TIER1_MESSAGE: sliding window messages (last N turns, exact).
+ *   Stable across queries within the sliding window. Cache breakpoint AFTER this.
+ *
+ * TIER2_MESSAGE: semantic pool messages (compressed, query-relevant).
+ *   Varies per query. NOT cached.
+ */
+export const CACHE_TIERS = {
+  FROZEN_TIER_MAX_TOKENS: 8000,    // Max for frozen (identity, rules, brief)
+  SESSION_TIER_MAX_TOKENS: 6000,   // Max for session (symbols, memories)
+  TURN_TIER_MAX_TOKENS: 3000,      // Max for per-turn dynamic content
+  TIER1_MESSAGE_TOKENS: 15000,     // Rough: ~5 turns × 3K avg
+  TIER2_MESSAGE_TOKENS: 20000,     // Semantic pool: ~8 compressed turns × 2.5K
+};
+
+/**
+ * Number of recent turns to keep in the sliding window (TIER 1).
+ * These turns are always exact, never compressed, and form the stable
+ * portion of the cache prefix alongside the system prompt.
+ */
+export const SLIDING_WINDOW_SIZE = 5;
+
+/**
+ * Number of compressed turns to include from the semantic pool (TIER 2).
+ * These compete by relevance score and vary per query.
+ */
+export const SEMANTIC_POOL_MAX_TURNS = 15;
+export const SEMANTIC_POOL_MIN_TURNS = 3;

@@ -14,10 +14,11 @@ import { DEFAULT_POWER_COMBO } from "../lib/models";
 import { useWorkspaceStore } from "./workspace";
 
 // Maximum messages kept in-memory per conversation. Full history lives in
-// SQLite — the store is a display-only cache. 300 messages ≈ ~15K DOM nodes,
-// which is well within browser limits. Beyond this, oldest messages are
-// trimmed from the front; the "load older" button fetches them from disk.
-const MAX_STORE_MESSAGES = 300;
+// SQLite — the store is a display-only cache. With virtual scrolling, only
+// ~20-30 messages are rendered as DOM at any time, so 100 in the store is
+// more than sufficient — old messages are trimmed from the front and the
+// "load older" button fetches them from disk.
+const MAX_STORE_MESSAGES = 100;
 
 export interface ProjectGit {
   branch: string | null;

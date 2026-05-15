@@ -3,14 +3,6 @@ import { useProjectsStore } from "../stores/projects";
 import { useWorkspaceStore } from "../stores/workspace";
 import type { Todo } from "../lib/punk-types";
 
-// ============================================================================
-// Model Execution Timeout Configuration
-// ============================================================================
-// These timeouts determine when to consider a model "hung" and force termination.
-// Increased values to prevent premature killing of long-running operations.
-// ============================================================================
-const MODEL_SAFETY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for silent stream
-const RESULT_PROCESSING_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes after result message
 const CHECKPOINT_TIMEOUT_MS = 3 * 1000; // 3 seconds for checkpoint creation
 
 // Simple djb2 hash — used for Jaccard comparison in the heuristic router.
@@ -55,7 +47,6 @@ import type {
   MemoryEvent,
   PanePhase,
 } from "../lib/punk-types";
-import { getContextLimit } from "../lib/models";
 
 // Mode-to-intent mapping: the mode pill is the single classification authority.
 // This replaces the three independent classifiers that could disagree.
@@ -890,10 +881,7 @@ export function usePunk(projectId: string) {
       resetStreamingState(projectId);
 
       const messageId = nextMessageId();
-      // Strip any leading slash directive (e.g. /discuss, /analyze) — these are system
-      // routing signals, not user-visible text. The backend strips them too before sending
-      // to the model, so the display text should match what the model actually sees.
-      const displayPrompt = prompt.replace(/^\/[\w]+\s*/, "").trim();
+      const displayPrompt = prompt.trim();
 
       // Resolve the phase early so we can stamp the message and update the store
       // before the backend responds — the pill and message metadata stay in sync
@@ -944,16 +932,11 @@ export function usePunk(projectId: string) {
 
       let assistantMessageAdded = false;
       let resultReceived = false;
-      let resultSafetyTimer: ReturnType<typeof setTimeout> | null = null;
-      let finishCalled = false; // guard against double-call (timer fires then processEnded arrives)
+      let finishCalled = false; // guard against double-call
 
       const finishProcessing = () => {
         if (finishCalled) return;
         finishCalled = true;
-        if (resultSafetyTimer) {
-          clearTimeout(resultSafetyTimer);
-          resultSafetyTimer = null;
-        }
         abortPunk(projectId).catch(() => {});
 
         const s = useProjectsStore.getState();
@@ -1024,30 +1007,8 @@ export function usePunk(projectId: string) {
       };
 
       const handleEvent = (event: PunkStreamEvent) => {
-        if (resultSafetyTimer) {
-          clearTimeout(resultSafetyTimer);
-          resultSafetyTimer = setTimeout(() => {
-            console.warn(
-              `[pane] resultSafetyTimer triggered — model stream went silent for ${MODEL_SAFETY_TIMEOUT_MS / 1000} seconds`,
-            );
-            finishProcessing();
-          }, MODEL_SAFETY_TIMEOUT_MS);
-        }
-
         switch (event.event) {
           case "processStarted":
-            // Start the safety watchdog immediately. If the SDK hangs before
-            // producing a result event (mid-tool-execution or on initial connect
-            // stall), there would otherwise be no timer to auto-recover.
-            // Every subsequent event resets this timer via the top of handleEvent.
-            if (!resultSafetyTimer) {
-              resultSafetyTimer = setTimeout(() => {
-                console.warn(
-                  `[pane] processStarted safety timer — stream silent for ${MODEL_SAFETY_TIMEOUT_MS / 1000}s, force-finishing`,
-                );
-                finishProcessing();
-              }, MODEL_SAFETY_TIMEOUT_MS);
-            }
             break;
 
           case "sdk_init_info": {
@@ -1098,19 +1059,8 @@ export function usePunk(projectId: string) {
           }
 
           case "token_usage": {
-            // Live context usage — update on every turn, not just end-of-response.
-            // Shows ctx% in the InputBar so the user always knows how much window is left.
-            const usage = event.data;
-            if (usage?.input_tokens) {
-              const model = store.projects.get(projectId)?.conversation.model ?? null;
-              const allModels = useWorkspaceStore.getState().allModels;
-              const limit = getContextLimit(model, allModels);
-              const ratio = usage.input_tokens / limit;
-              const pressure =
-                ratio >= 0.85 ? "high" : ratio >= 0.7 ? "building" : "none";
-              store.setContextPressure(projectId, usage.input_tokens, pressure);
-            }
-            // Signal analytics to refresh
+            // Signal analytics to refresh (ContextUsageIndicator removed; this timestamp
+            // still drives TokenAnalytics polling)
             useWorkspaceStore.setState({ lastTokenUsageAt: Date.now() });
             break;
           }
@@ -1177,14 +1127,6 @@ export function usePunk(projectId: string) {
               );
 
               if (msg.type === "result") resultReceived = true;
-              if (msg.type === "result" && !resultSafetyTimer) {
-                resultSafetyTimer = setTimeout(() => {
-                  console.warn(
-                    `[pane] Process hung after result message for ${RESULT_PROCESSING_TIMEOUT_MS / 1000} seconds — force-clearing processing state`,
-                  );
-                  finishProcessing();
-                }, RESULT_PROCESSING_TIMEOUT_MS);
-              }
             } catch (e) {
               console.error("Failed to parse claude message:", e);
             }
@@ -1333,13 +1275,7 @@ export function usePunk(projectId: string) {
           }
 
           case "error": {
-            // Clear the safety timer (started on processStarted) so it doesn't
-            // fire 5 minutes later after the error has already been handled.
             finishCalled = true;
-            if (resultSafetyTimer) {
-              clearTimeout(resultSafetyTimer);
-              resultSafetyTimer = null;
-            }
             const s = useProjectsStore.getState();
             s.setConversationError(projectId, event.data.message);
             s.setConversationProcessing(projectId, false);
@@ -1710,17 +1646,6 @@ function handlePunkMessage(
           msg.usage?.output_tokens,
           msg.num_turns,
         );
-
-        if (msg.usage?.input_tokens) {
-          const model =
-            store.projects.get(projectId)?.conversation.model ?? null;
-          const allModels = useWorkspaceStore.getState().allModels;
-          const limit = getContextLimit(model, allModels);
-          const ratio = msg.usage.input_tokens / limit;
-          const pressure =
-            ratio >= 0.85 ? "high" : ratio >= 0.7 ? "building" : "none";
-          store.setContextPressure(projectId, msg.usage.input_tokens, pressure);
-        }
 
       } else if (msg.subtype !== "success") {
         if (msg.subtype === "interrupted") return assistantMessageExists;

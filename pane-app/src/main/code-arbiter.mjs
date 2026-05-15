@@ -20,14 +20,11 @@
  *   context-orchestrator.mjs reads verdict → injects as CRITICAL turn layer
  */
 
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-
-const execAsync = promisify(exec);
 
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -55,17 +52,19 @@ async function runTypeCheck(workingDir) {
   try {
     // npx tsc --noEmit outputs diagnostics to stdout on failure (exit code 2)
     // We want the output even on failure, so we catch the error.
-    await execAsync("npx tsc --noEmit --incremental --pretty false 2>&1", {
+    // execSync avoids libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak in Electron 40).
+    execSync("npx tsc --noEmit --incremental --pretty false 2>&1", {
       cwd: workingDir,
       timeout: TSC_TIMEOUT_MS,
-      maxBuffer: 512 * 1024,
+      encoding: "utf-8",
       env: { ...process.env, FORCE_COLOR: "0" },
+      maxBuffer: 512 * 1024,
     });
     // Exit 0 — no errors
     return [];
   } catch (err) {
     // tsc exits non-zero when there are errors. The diagnostics are in stdout.
-    const output = err.stdout || err.stderr || "";
+    const output = err.stdout?.toString?.() || err.stderr?.toString?.() || "";
     if (!output) return [];
 
     return parseTscOutput(output, workingDir);
@@ -133,16 +132,17 @@ async function runEslint(workingDir, files) {
 
   try {
     const fileArgs = filesToLint.map(f => `"${f}"`).join(" ");
-    await execAsync(`npx eslint --format json --no-warn-ignored ${fileArgs} 2>/dev/null`, {
+    execSync(`npx eslint --format json --no-warn-ignored ${fileArgs} 2>/dev/null`, {
       cwd: workingDir,
       timeout: ESLINT_TIMEOUT_MS,
-      maxBuffer: 512 * 1024,
+      encoding: "utf-8",
       env: { ...process.env, FORCE_COLOR: "0" },
+      maxBuffer: 512 * 1024,
     });
     // Exit 0 — no errors
     return [];
   } catch (err) {
-    const output = err.stdout || "";
+    const output = err.stdout?.toString?.() || "";
     if (!output) return [];
 
     return parseEslintJson(output, workingDir);

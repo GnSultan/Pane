@@ -9,11 +9,39 @@ import {
   nativeImage,
 } from "electron";
 import windowStateKeeper from "electron-window-state";
-import { execFile } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
 
-import { promisify } from "node:util";
+// ── FD Repair for macOS packaged app ─────────────────────────────────────
+// When Pane is launched as a macOS .app bundle (even from terminal via
+// ./Pane.app/Contents/MacOS/Pane), stdin/stdout/stderr FDs 0/1/2 may be
+// invalid. This breaks ALL Node.js child_process spawn/execSync calls because
+// libuv tries to create pipes from or dup2 onto these bad FDs, failing with
+// EBADF (errno 9). We close and reopen them to /dev/null to guarantee valid
+// FDs before any other code can attempt a spawn.
+//
+// This fix is specifically for packaged macOS builds (Electron 40+).
+// Dev mode (run via `node scripts/dev.mjs` from terminal) is unaffected.
+try {
+  for (const fd of [0, 1, 2]) {
+    try {
+      // fstat succeeds if fd is valid
+      fs.fstatSync(fd);
+    } catch {
+      // fd is invalid — close it (might throw if -1 but we catch all)
+      try { fs.closeSync(fd); } catch {}
+      // Reopen /dev/null on the lowest available fd (which will be fd)
+      // stdin = read mode, stdout/stderr = write mode
+      fs.openSync("/dev/null", fd === 0 ? "r" : "w");
+    }
+  }
+} catch (fdRepairErr) {
+  // Best-effort: FD repair is a safety net, not critical. The cmd-worker
+  // approach handles command execution even if FD repair fails.
+  console.warn("[main] FD repair failed (expected in dev mode):", fdRepairErr.message);
+}
+
 import ignore from "ignore";
 import chokidar from "chokidar";
 import {
@@ -32,6 +60,7 @@ import { updateLastPrompt, updateLastResponse, readThreadState } from "./thread-
 import { contextStore } from "./context-store.mjs";
 import { getPaneDb, extractMessageText } from "./pane-db.mjs";
 import { loadRecentTurns } from "./session-turns.mjs";
+import { setCmdWorker } from "./tool-executor.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -147,7 +176,25 @@ async function registerClaudeHandlers() {
     }
   });
 }
-const execFileAsync = promisify(execFile);
+// execFileAsync now wraps execFileSync — bypasses libuv's uv_spawn/kqueue EVFILT_PROC path on macOS.
+// Same interface as before (returns { stdout, stderr } or throws), but blocks synchronously.
+// Git commands are fast (10-50ms) and IPC handlers run briefly — this is acceptable.
+function execFileAsync(cmd, args, options = {}) {
+  try {
+    const stdout = execFileSync(cmd, args, { encoding: "utf-8", ...options });
+    return { stdout: stdout || "", stderr: "" };
+  } catch (err) {
+    // Preserve the same error shape as execFileAsync would have thrown
+    const wrapped = new Error(err.message);
+    wrapped.stdout = err.stdout?.toString() || "";
+    wrapped.stderr = err.stderr?.toString() || "";
+    wrapped.code = err.status;     // exit code (execAsync compat)
+    wrapped.status = err.status;
+    wrapped.signal = err.signal;
+    wrapped.killed = err.killed;
+    throw wrapped;
+  }
+}
 
 // Build a PATH that includes common tool locations Electron strips out
 function getEnvWithPath() {
@@ -302,16 +349,16 @@ function registerCommandHandlers() {
     await fs.promises.rename(args.oldPath, args.newPath);
   });
   ipcMain.handle("delete_file", async (_event, args) => {
-    // Move to Trash instead of permanent deletion
-    const { exec } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
+    // Move to Trash instead of permanent deletion.
+    // execSync avoids libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak in Electron 40).
+    // This runs in the main process but AppleScript is fast (~100ms) and the action is rare.
+    const { execSync: execSync2 } = await import("node:child_process");
 
     const escapedPath = args.path.replace(/'/g, "'\\''");
     const script = `osascript -e 'tell application "Finder" to delete POSIX file "${escapedPath}"'`;
 
     try {
-      await execAsync(script);
+      execSync2(script, { encoding: "utf-8" });
     } catch (error) {
       // If AppleScript fails, fall back to permanent deletion with explicit confirmation
       throw new Error(
@@ -369,95 +416,66 @@ function registerCommandHandlers() {
     files.sort();
     return files;
   });
-  // Track active ripgrep processes per root — auto-kill previous search
-  // when a new one starts, preventing stacked searches from piling up.
-  const activeRgSearches = new Map(); // root -> ChildProcess
-
   ipcMain.handle("search_in_files", async (_event, args) => {
     const max = args.maxResults ?? 200;
     const { root, query } = args;
 
-    // Kill any existing ripgrep for this root before starting a new one
-    const existing = activeRgSearches.get(root);
-    if (existing) {
-      try { existing.kill("SIGTERM"); } catch (killErr) {
-        console.warn("[search] Failed to kill previous rg process:", killErr.message);
-      }
-      activeRgSearches.delete(root);
-    }
-
     // Dynamic import: @vscode/ripgrep provides the binary path
     const { rgPath } = await import("@vscode/ripgrep");
 
-    return new Promise((resolve) => {
-      const child = execFile(
+    try {
+      // execFileSync bypasses libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak).
+      // ripgrep exits code 1 when no matches found — catch that specifically.
+      const stdout = execFileSync(
         rgPath,
         [
           "--line-number",
           "--no-heading",
           "--smart-case",
-          "--max-count", "5",     // max matches per file — avoids flooding from one file
-          "--max-filesize", "2M", // skip files >2MB (binary/large)
+          "--max-count", "5",
+          "--max-filesize", "2M",
           "--",
           query,
           root,
         ],
         {
-          maxBuffer: 10 * 1024 * 1024, // 10MB stdout buffer
-          timeout: 30000,              // 30s safety timeout
-        },
-        (err, stdout, stderr) => {
-          activeRgSearches.delete(root);
-
-          // ripgrep exits with code 1 when no matches found
-          if ((err && err.code === 1 && !stdout) || !stdout) {
-            resolve([]);
-            return;
-          }
-
-          // Killed by us (new search superseded this one) — return empty
-          if (err && err.killed) {
-            resolve([]);
-            return;
-          }
-
-          // Other error
-          if (err) {
-            resolve([]);
-            return;
-          }
-
-          const results = [];
-          const lines = stdout.trim().split("\n").filter(Boolean);
-
-          for (const line of lines) {
-            if (results.length >= max) break;
-            // rg output: path:line:content
-            // Parse by finding first colon (path separator) and second colon (line/content separator)
-            const firstColon = line.indexOf(":");
-            if (firstColon === -1) continue;
-            const rest = line.slice(firstColon + 1);
-            const lineEnd = rest.indexOf(":");
-            if (lineEnd === -1) continue;
-
-            const relativePath = line.slice(0, firstColon);
-            const lineNum = parseInt(rest.slice(0, lineEnd), 10);
-            const content = rest.slice(lineEnd + 1);
-
-            results.push({
-              file_path: relativePath,
-              absolute_path: path.join(root, relativePath),
-              line_number: lineNum,
-              line_content: content.slice(0, 200),
-            });
-          }
-
-          resolve(results);
+          encoding: "utf-8",
+          maxBuffer: 10 * 1024 * 1024,
+          timeout: 30000,
         },
       );
 
-      activeRgSearches.set(root, child);
-    });
+      const results = [];
+      const lines = stdout.trim().split("\n").filter(Boolean);
+
+      for (const line of lines) {
+        if (results.length >= max) break;
+        // rg output: path:line:content
+        // Parse by finding first colon (path separator) and second colon (line/content separator)
+        const firstColon = line.indexOf(":");
+        if (firstColon === -1) continue;
+        const rest = line.slice(firstColon + 1);
+        const lineEnd = rest.indexOf(":");
+        if (lineEnd === -1) continue;
+
+        const relativePath = line.slice(0, firstColon);
+        const lineNum = parseInt(rest.slice(0, lineEnd), 10);
+        const content = rest.slice(lineEnd + 1);
+
+        results.push({
+          file_path: relativePath,
+          absolute_path: path.join(root, relativePath),
+          line_number: lineNum,
+          line_content: content.slice(0, 200),
+        });
+      }
+
+      return results;
+    } catch (err) {
+      // ripgrep exits code 1 when no matches found — not an error
+      // Other errors (timeout, killed, ENOENT) → empty results
+      return [];
+    }
   });
   ipcMain.handle("get_git_status", async (_event, args) => {
     let branch;
@@ -1087,6 +1105,24 @@ function registerPtyHandlers() {
       });
     }
   });
+}
+let cmdWorker = null;
+function getCmdWorker() {
+  if (cmdWorker && !cmdWorker.killed) return cmdWorker;
+  const workerPath = path.join(__dirname, "cmd-worker.mjs");
+  cmdWorker = utilityProcess.fork(workerPath);
+  // Register with tool-executor so executeBash routes commands through this worker.
+  // The worker runs in its own V8 isolate with a clean libuv loop, bypassing the
+  // main process's kqueue/uv_spawn EBADF issue in packaged macOS builds.
+  setCmdWorker(cmdWorker);
+  cmdWorker.on("exit", (code) => {
+    if (forceQuit) return;
+    console.warn(`[pane] CMD worker exited unexpectedly with code ${code}`);
+    cmdWorker = null;
+    setCmdWorker(null);
+    // Auto-restart on next request (lazy re-fork)
+  });
+  return cmdWorker;
 }
 // Both Claude and PTY run in UtilityProcesses — clean shutdown via postMessage.
 // node-pty's SIGABRT bug (vscode#243952) can't crash the main process anymore
@@ -2113,7 +2149,9 @@ function registerSessionHandlers(db) {
     };
 
     if (delta.activeTask !== undefined) {
-      current.activeTask = delta.activeTask ? { ...current.activeTask, ...delta.activeTask } : null;
+      current.activeTask = delta.activeTask
+        ? { ...current.activeTask, ...delta.activeTask, timestamp: delta.activeTask.timestamp || Date.now() }
+        : null;
     }
     if (delta.workingSet?.length) {
       for (const file of delta.workingSet) {
@@ -2170,22 +2208,21 @@ const brainPendingRequests = new Map();
 let brainRequestCounter = 0;
 let brainWorkerExitCount = 0;
 let brainWorkerLastExitTime = 0;
-let brainWorkerDisabled = false;
-const BRAIN_BACKOFF_WINDOW_MS = 30_000; // 30s
-const BRAIN_BACKOFF_THRESHOLD = 3;     // disable after 3 crashes in window
-const BRAIN_SURVIVE_RESET_MS  = 60_000; // reset counter if worker lives 60s
+let brainWorkerNextRetryMs = 5_000;    // Start at 5s, doubles each backoff cycle
+const BRAIN_BACKOFF_INITIAL_MS = 5_000;
+const BRAIN_BACKOFF_MAX_MS = 300_000;  // Cap at 5 minutes
+const BRAIN_BACKOFF_THRESHOLD = 3;     // Enter backoff after 3 crashes
+const BRAIN_SURVIVE_RESET_MS = 300_000; // Full reset after 5 min uptime
 
 function getBrainWorker() {
   if (brainWorker && !brainWorker.killed) return brainWorker;
 
-  // Backoff: if the worker has crashed repeatedly in a short window, stop
-  // re-forking — a rapid crash loop leaks memory and consumes CPU.
-  if (brainWorkerDisabled) {
+  // Exponential backoff: if worker keeps crashing, wait longer each cycle
+  if (brainWorkerExitCount >= BRAIN_BACKOFF_THRESHOLD) {
     const timeSince = Date.now() - brainWorkerLastExitTime;
-    if (timeSince < BRAIN_BACKOFF_WINDOW_MS) return null;
+    if (timeSince < brainWorkerNextRetryMs) return null;
     // Enough time has passed — try once more
-    console.log("[pane] Brain worker backoff elapsed, retrying...");
-    brainWorkerDisabled = false;
+    console.log(`[pane] Brain worker retry wait elapsed (${brainWorkerNextRetryMs / 1000}s), retrying...`);
     brainWorkerExitCount = 0;
   }
 
@@ -2193,11 +2230,11 @@ function getBrainWorker() {
   brainWorker = utilityProcess.fork(workerPath);
 
   // Track whether this instance survives long enough to reset the crash counter
-  const spawnTime = Date.now();
   const surviveTimer = setTimeout(() => {
     if (brainWorker && !brainWorker.killed) {
       brainWorkerExitCount = 0;
-      brainWorkerDisabled = false;
+      brainWorkerNextRetryMs = BRAIN_BACKOFF_INITIAL_MS;
+      console.log(`[pane] Brain worker survived ${BRAIN_SURVIVE_RESET_MS / 1000}s — crash counter reset`);
     }
   }, BRAIN_SURVIVE_RESET_MS);
   if (surviveTimer.unref) surviveTimer.unref();
@@ -2237,8 +2274,9 @@ function getBrainWorker() {
     brainWorkerLastExitTime = Date.now();
     brainWorkerExitCount++;
     if (brainWorkerExitCount >= BRAIN_BACKOFF_THRESHOLD) {
-      brainWorkerDisabled = true;
-      console.warn(`[pane] Brain worker disabled after ${brainWorkerExitCount} crashes — will retry in ${BRAIN_BACKOFF_WINDOW_MS / 1000}s`);
+      // Exponential backoff: double the wait, cap at 5 min
+      brainWorkerNextRetryMs = Math.min(brainWorkerNextRetryMs * 2, BRAIN_BACKOFF_MAX_MS);
+      console.warn(`[pane] Brain worker disabled after ${brainWorkerExitCount} crashes — retrying in ${brainWorkerNextRetryMs / 1000}s`);
     }
     // Reject pending requests
     for (const [id, resolve] of brainPendingRequests) {
@@ -2598,7 +2636,8 @@ app.whenReady().then(async () => {
   createWindow();
   preforkPunkWorker(); // Pre-fork to hide first-use latency
   getPtyWorker();
-  getBrainWorker(); // Pre-fork: start loading SQLite + embedding model
+  getBrainWorker(); // Pre-fork: start SQLite + profile (embedding model loads lazily on first embed)
+  getCmdWorker();   // Pre-fork: runs execSync in isolated libuv loop (avoids EBADF in packaged app)
 
   // Wire brain contextual search into punk-engine so it fires every turn.
   // This is the critical link: brain searches the knowledge graph for query-

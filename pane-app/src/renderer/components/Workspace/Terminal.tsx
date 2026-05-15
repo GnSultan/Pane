@@ -31,6 +31,7 @@ const CMD_END_MARKER = "___PANE_CMD_END___";
 const PWD_MARKER = "___PANE_PWD___";
 const LIVE_OUTPUT_MAX_LINES = 200;
 const OUTPUT_BUFFER_MAX = 500_000; // ~500KB, prevents unbounded memory growth
+const MAX_STORED_LINES = 200; // capped scrollback — old output evicted automatically
 
 // Process \r semantically: \r\n is a normal line ending (strip the \r),
 // while standalone \r (no following \n) means "overwrite current line" —
@@ -362,8 +363,8 @@ function TerminalTabContent({
         if (output.trim()) {
           setLines((prev) => [
             ...prev,
-            { type: "output", content: output, timestamp: Date.now() },
-          ]);
+            { type: "output" as const, content: output, timestamp: Date.now() },
+          ].slice(-MAX_STORED_LINES));
         }
 
         if (newCwd) {
@@ -457,11 +458,11 @@ function TerminalTabContent({
       setLines((prev) => [
         ...prev,
         {
-          type: "command",
+          type: "command" as const,
           content: `${displayPath} $ ${trimmedCmd}`,
           timestamp: Date.now(),
         },
-      ]);
+      ].slice(-MAX_STORED_LINES));
       setCommand("");
       cancelAnimationFrame(liveOutputRaf.current);
       setLiveOutput("");

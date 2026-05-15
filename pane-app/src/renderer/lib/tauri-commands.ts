@@ -279,6 +279,7 @@ export interface UserSettings {
   http_api_keys?: Record<string, string>;
   http_base_urls?: Record<string, string>;
   disabled_providers?: string[];
+  curated_models?: string[];
   intent_routing?: Record<string, unknown>;  // deprecated — migration only
   power_combo?: PowerCombo;
   intent_auto_route?: boolean;

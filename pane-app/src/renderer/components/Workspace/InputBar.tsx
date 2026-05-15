@@ -4,10 +4,7 @@ import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
 import type { Todo } from "../../lib/punk-types";
-import {
-  isThinkingModel,
-  getContextLimit,
-} from "../../lib/models";
+import { isThinkingModel } from "../../lib/models";
 import { showFilePicker, brainMindGetAll, type MindEntry } from "../../lib/tauri-commands";
 import { CaretTextArea } from "../shared";
 
@@ -140,39 +137,6 @@ function RateLimitIndicator() {
   }
 
   return null;
-}
-
-function ContextUsageIndicator({ projectId }: { projectId: string }) {
-  const contextTokens = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.contextTokens ?? 0,
-  );
-  const model = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.model ?? null,
-  );
-  const allModels = useWorkspaceStore((s) => s.allModels);
-
-  if (!contextTokens || contextTokens === 0) return null;
-
-  const limit = getContextLimit(model, allModels);
-  const pct = Math.round((contextTokens / limit) * 100);
-
-  // Only show when it carries signal — sub-50% is noise, warnings start at 70%.
-  if (pct < 50) return null;
-
-  const color =
-    pct >= 85 ? "text-pane-error" :
-    pct >= 70 ? "text-pane-status-modified" :
-    "text-pane-text-secondary/50";
-
-  return (
-    <span
-      className={`font-mono tabular-nums ${color}`}
-      style={{ fontSize: "var(--pane-font-size-xs)" }}
-      title={`${contextTokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`}
-    >
-      ctx {pct}%
-    </span>
-  );
 }
 
 // ─── Static caret (no-blink) ─────────────────────────────────────────────────
@@ -335,8 +299,10 @@ function ModelPickerExpanded({
 
   const fetchedModels = useWorkspaceStore((s) => s.allModels);
   const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
+  const curatedModels = useWorkspaceStore((s) => s.curatedModels);
 
   const allItems = useMemo<ModelItem[]>(() => {
+    const hasCurated = curatedModels.length > 0;
     // Group by provider, Claude first, then alphabetical
     const grouped = new Map<string, ModelItem[]>();
     for (const [providerKey, models] of Object.entries(fetchedModels)) {
@@ -344,6 +310,7 @@ function ModelPickerExpanded({
       if (disabledProviders.includes(providerKey)) continue;
       const group: ModelItem[] = [];
       for (const m of models) {
+        if (hasCurated && !curatedModels.includes(m.id)) continue;
         group.push({
           kind: "model",
           value: m.id,
@@ -353,7 +320,7 @@ function ModelPickerExpanded({
           thinking: isThinkingModel(m.id),
         });
       }
-      grouped.set(providerKey, group);
+      if (group.length > 0) grouped.set(providerKey, group);
     }
     const sortedKeys = Array.from(grouped.keys()).sort((a, b) => {
       if (a === "anthropic") return -1;
@@ -363,7 +330,7 @@ function ModelPickerExpanded({
     const items: ModelItem[] = [{ kind: "auto" }];
     for (const key of sortedKeys) items.push(...(grouped.get(key) ?? []));
     return items;
-  }, [fetchedModels, disabledProviders]);
+  }, [fetchedModels, disabledProviders, curatedModels]);
 
   const displayItems = useMemo<ModelItem[]>(() => {
     if (!searchQuery.trim()) return allItems;
@@ -1168,7 +1135,6 @@ export function InputBar({
                   </button>
                 );
               })()}
-              <ContextUsageIndicator projectId={projectId} />
               <RateLimitIndicator />
               <div className="pointer-events-auto">
                 <ModelPickerTrigger

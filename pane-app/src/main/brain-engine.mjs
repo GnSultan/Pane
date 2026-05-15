@@ -21,9 +21,8 @@ import {
   findRelevantSymbols,
   getFileSymbols,
   writeSymbolExport,
-  updateSynthesis,
 } from "./symbol-index.mjs";
-import { ALL_SYSTEM_ATOMS, FACET_WEIGHTS } from "./system-atoms.mjs";
+import { FACET_WEIGHTS } from "./system-atoms.mjs";
 
 // Local embedding model via @huggingface/transformers + onnxruntime-node.
 // onnxruntime-node is auto-detected by transformers.js when both are installed.
@@ -50,6 +49,7 @@ let db = null;
 let embedderLoading = false;
 let embedderReady = false;
 let _embedPipeline = null; // pipeline('feature-extraction') instance
+let _embedderLoadPromise = null; // Lazy init: shared promise so concurrent callers await the same load
 
 // Local embedding model: bge-base-en-v1.5 via ONNX Runtime
 // 768-dim, ~63 MTEB, ~30ms on Apple Silicon, ~80ms on Intel Mac.
@@ -736,10 +736,14 @@ async function loadEmbedder() {
       cache_dir: EMBED_CACHE_DIR,
     });
 
-    // Verify with a test embed
-    const test = await embed("test");
-    if (!test || test.length !== EMBEDDING_DIM) {
-      throw new Error(`Expected ${EMBEDDING_DIM}-dim embedding, got ${test?.length ?? 0}`);
+    // Verify with a test embed (direct pipeline call, not embed(), to avoid circular lazy-init)
+    const testResult = await _embedPipeline("test", {
+      pooling: "mean",
+      normalize: true,
+    });
+    const testArr = new Float32Array(testResult.data);
+    if (!testArr || testArr.length !== EMBEDDING_DIM) {
+      throw new Error(`Expected ${EMBEDDING_DIM}-dim embedding, got ${testArr?.length ?? 0}`);
     }
 
     console.log(`[brain] Local embedding model ready (${EMBED_MODEL}, ${EMBEDDING_DIM} dim)`);
@@ -748,7 +752,6 @@ async function loadEmbedder() {
 
     // Index atoms + migrate old embeddings + fill null embeddings in background
     Promise.all([
-      indexSystemAtoms().catch(err => console.error("[brain] System atom indexing failed:", err.message)),
       indexProfileAtoms().catch(err => console.error("[brain] Profile atom indexing failed:", err.message)),
       migrateEmbeddings().catch(err => console.error("[brain] Embedding migration failed:", err.message)),
       fillNullEmbeddings().catch(err => console.error("[brain] Null embedding fill failed:", err.message)),
@@ -757,8 +760,14 @@ async function loadEmbedder() {
     console.error("[brain] Local embedding model failed to load:", err.message);
     console.warn("[brain] Brain still works — semantic search will use keyword fallback");
     embedderLoading = false;
+    _embedderLoadPromise = null; // Allow retry on next embed() call
   }
 }
+
+// --- WASM heap hygiene ---
+let _embedCallCount = 0;
+const EMBED_RECYCLE_INTERVAL = 500; // Recreate pipeline every N calls to reset WASM heap
+const BATCH_SIZE = 32; // Texts per batch embed call
 
 /**
  * Embed a single text string using the local ONNX model.
@@ -766,8 +775,23 @@ async function loadEmbedder() {
  * Uses mean pooling + L2 normalization for cosine-similarity-ready vectors.
  */
 async function embed(text) {
-  if (!embedderReady || !_embedPipeline) return null;
+  // Lazy init: load embedder on first call instead of at startup
+  if (!embedderReady || !_embedPipeline) {
+    if (!_embedderLoadPromise) {
+      _embedderLoadPromise = loadEmbedder().catch(err => {
+        console.error(`[brain] Lazy embedder load failed: ${err.message}`);
+        _embedderLoadPromise = null; // Reset so next call retries
+      });
+    }
+    await _embedderLoadPromise;
+    if (!embedderReady || !_embedPipeline) return null;
+  }
   try {
+    _embedCallCount++;
+    if (_embedCallCount >= EMBED_RECYCLE_INTERVAL) {
+      _embedCallCount = 0;
+      await _recyclePipeline();
+    }
     const result = await _embedPipeline(text, {
       pooling: "mean",
       normalize: true,
@@ -778,6 +802,102 @@ async function embed(text) {
   } catch (err) {
     console.warn(`[brain] Embedding failed: ${err.message}`);
     return null;
+  }
+}
+
+/**
+ * Batch-embed many texts. Same model & params as embed(), but:
+ *  - Processes texts in batches of BATCH_SIZE for WASM efficiency
+ *  - Recycles the pipeline every EMBED_RECYCLE_INTERVAL calls to prevent heap growth
+ *  - Returns a Map<string, Float32Array | null> keyed by text
+ */
+async function embedBatch(texts) {
+  // Lazy init: load embedder on first call instead of at startup
+  if (!embedderReady || !_embedPipeline) {
+    if (!_embedderLoadPromise) {
+      _embedderLoadPromise = loadEmbedder().catch(err => {
+        console.error(`[brain] Lazy embedder load failed: ${err.message}`);
+        _embedderLoadPromise = null;
+      });
+    }
+    await _embedderLoadPromise;
+    if (!embedderReady || !_embedPipeline || !texts.length) return new Map();
+  }
+  const results = new Map();
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const batch = texts.slice(i, i + BATCH_SIZE);
+    _embedCallCount += batch.length;
+    if (_embedCallCount >= EMBED_RECYCLE_INTERVAL) {
+      _embedCallCount = 0;
+      await _recyclePipeline();
+    }
+    try {
+      // Pipeline accepts an array for batched inference — returns Tensor with shape [N, DIM]
+      const result = await _embedPipeline(batch, {
+        pooling: "mean",
+        normalize: true,
+      });
+      // result.data is a flat Float32Array of shape [batch.length, EMBEDDING_DIM]
+      const flat = result.data;
+      for (let j = 0; j < batch.length; j++) {
+        const offset = j * EMBEDDING_DIM;
+        if (offset + EMBEDDING_DIM <= flat.length) {
+          results.set(batch[j], new Float32Array(flat.slice(offset, offset + EMBEDDING_DIM)));
+        } else {
+          results.set(batch[j], null);
+        }
+      }
+    } catch (err) {
+      console.warn(`[brain] Batch embed failed (${batch.length} texts): ${err.message}`);
+      for (const t of batch) results.set(t, null);
+    }
+  }
+  return results;
+}
+
+/**
+ * Recreate the ONNX pipeline to release WASM heap memory.
+ * onnxruntime-node's WASM allocator (emmalloc) never returns memory to the OS,
+ * so intermediate tensor allocations accumulate and cannot be freed.
+ * Recreating the pipeline resets the WASM heap to a clean state.
+ */
+async function _recyclePipeline() {
+  if (!_embedPipeline) return;
+  try {
+    // Dispose old pipeline
+    if (typeof _embedPipeline.dispose === "function") {
+      await _embedPipeline.dispose();
+    }
+    // Remove references to allow GC
+    _embedPipeline = null;
+    // Recreate
+    _embedPipeline = await pipeline("feature-extraction", EMBED_MODEL, {
+      quantized: false,
+      cache_dir: EMBED_CACHE_DIR,
+    });
+  } catch (err) {
+    console.warn(`[brain] Pipeline recycle failed: ${err.message}`);
+    // If recycle fails, mark embedder as not ready — next call will recreate
+    embedderReady = false;
+    _embedPipeline = null;
+    _embedderLoadPromise = null; // Reset so embed() triggers a fresh lazy load
+    // Try to reload after a delay
+    setTimeout(() => {
+      if (!embedderReady && !embedderLoading) {
+        embedderLoading = false;
+        loadEmbedder().catch(e => console.error("[brain] Recovery load failed:", e.message));
+      }
+    }, 5000);
+  }
+}
+
+/** Force SQLite WAL checkpoint to release accumulated WAL pages. Call after batch DB writes. */
+function _walCheckpoint() {
+  if (!db) return;
+  try {
+    const info = db.pragma("wal_checkpoint(TRUNCATE)");
+  } catch {
+    // Non-critical — best-effort
   }
 }
 
@@ -812,27 +932,30 @@ async function migrateEmbeddings() {
 
   console.log(`[brain] Migrating ${oldNodes.length} embeddings to ${EMBEDDING_DIM} dim (${currentBytes} bytes)...`);
 
+  // Batch-embed all texts at once to minimize WASM allocator pressure
+  const texts = oldNodes.map(node => {
+    try {
+      const content = JSON.parse(node.content || "{}");
+      return content.text || node.name;
+    } catch {
+      return node.name;
+    }
+  });
+
+  const embeddings = await embedBatch(texts);
+
   let migrated = 0;
   let failed = 0;
 
-  for (const node of oldNodes) {
-    const text = (() => {
-      try {
-        const content = JSON.parse(node.content || "{}");
-        return content.text || node.name;
-      } catch {
-        return node.name;
-      }
-    })();
-
-    const embedding = await embed(text);
+  for (let i = 0; i < oldNodes.length; i++) {
+    const embedding = embeddings.get(texts[i]);
     if (embedding) {
       const embeddingBuffer = Buffer.from(embedding.buffer);
       try {
-        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, node.id);
+        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, oldNodes[i].id);
         migrated++;
       } catch (err) {
-        console.warn(`[brain] Migration DB update failed for ${node.id}: ${err.message}`);
+        console.warn(`[brain] Migration DB update failed for ${oldNodes[i].id}: ${err.message}`);
         failed++;
       }
     } else {
@@ -841,6 +964,9 @@ async function migrateEmbeddings() {
   }
 
   console.log(`[brain] Migration complete: ${migrated} re-embedded, ${failed} failed`);
+
+  // Force WAL checkpoint after batch writes — prevents WAL bloat on large migrations
+  _walCheckpoint();
 
   if (migrated > 0) {
     // Update project exports that had migrated nodes
@@ -875,27 +1001,30 @@ async function fillNullEmbeddings() {
 
   console.log(`[brain] Filling ${nullNodes.length} null-embedding nodes...`);
 
+  // Batch-embed all texts at once to minimize WASM allocator pressure
+  const texts = nullNodes.map(node => {
+    try {
+      const content = JSON.parse(node.content || "{}");
+      return (content.text || node.name).slice(0, 500);
+    } catch {
+      return node.name.slice(0, 500);
+    }
+  });
+
+  const embeddings = await embedBatch(texts);
+
   let filled = 0;
   let failed = 0;
 
-  for (const node of nullNodes) {
-    const text = (() => {
-      try {
-        const content = JSON.parse(node.content || "{}");
-        return (content.text || node.name).slice(0, 500);
-      } catch {
-        return node.name.slice(0, 500);
-      }
-    })();
-
-    const embedding = await embed(text);
+  for (let i = 0; i < nullNodes.length; i++) {
+    const embedding = embeddings.get(texts[i]);
     if (embedding) {
       const embeddingBuffer = Buffer.from(embedding.buffer);
       try {
-        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, node.id);
+        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, nullNodes[i].id);
         filled++;
       } catch (err) {
-        console.warn(`[brain] Null-fill DB update failed for ${node.id}: ${err.message}`);
+        console.warn(`[brain] Null-fill DB update failed for ${nullNodes[i].id}: ${err.message}`);
         failed++;
       }
     } else {
@@ -904,6 +1033,9 @@ async function fillNullEmbeddings() {
   }
 
   console.log(`[brain] Null-embedding fill complete: ${filled} embedded, ${failed} failed`);
+
+  // Force WAL checkpoint after batch writes
+  _walCheckpoint();
 }
 
 function nodeId(type, content) {
@@ -1035,12 +1167,13 @@ function updateSessionPins(projectId) {
   if (!db) return;
   try {
     // Pass 1: top decisions and lessons (confidence >= 0.65, up to 6)
+    // Recency bias: updated_at DESC breaks ties so old nodes fall out via LIMIT.
     const decisionRows = db.prepare(`
       SELECT id, name, entity_type, content, confidence, access_count
       FROM nodes
       WHERE project_id = ? AND entity_type IN ('decision', 'lesson')
         AND confidence >= 0.65
-      ORDER BY confidence DESC, access_count DESC
+      ORDER BY confidence DESC, updated_at DESC, access_count DESC
       LIMIT 6
     `).all(projectId);
 
@@ -1052,7 +1185,7 @@ function updateSessionPins(projectId) {
           FROM nodes
           WHERE project_id = ? AND entity_type = 'error_fix'
             AND confidence >= 0.78
-          ORDER BY confidence DESC, access_count DESC
+          ORDER BY confidence DESC, updated_at DESC, access_count DESC
           LIMIT ?
         `).all(projectId, remaining)
       : [];
@@ -1822,24 +1955,33 @@ async function indexProfileAtoms() {
       }
     }
 
+    // Batch-embed all atoms at once to minimize WASM allocator pressure
+    const validAtoms = atoms.filter(a => a.text.length >= 10);
+    const atomTexts = validAtoms.map(a => a.text);
+    const embeddings = await embedBatch(atomTexts);
+
+    const updateAtom = db.prepare(`
+      INSERT INTO nodes (id, name, entity_type, project_id, content, embedding, confidence, version, priority, facet)
+      VALUES (?, ?, ?, NULL, ?, ?, 1.0, 1, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `);
+
     let indexed = 0;
-    for (const atom of atoms) {
-      if (atom.text.length < 10) continue;
+    for (const atom of validAtoms) {
       const id = nodeId(PROFILE_ATOM_TYPE, atom.text);
-      const embedding = await embed(atom.text);
+      const embedding = embeddings.get(atom.text);
       const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
 
-      db.prepare(`
-        INSERT INTO nodes (id, name, entity_type, project_id, content, embedding, confidence, version, priority, facet)
-        VALUES (?, ?, ?, NULL, ?, ?, 1.0, 1, ?, ?)
-        ON CONFLICT(id) DO NOTHING
-      `).run(
+      updateAtom.run(
         id, atom.text.slice(0, 80), PROFILE_ATOM_TYPE,
         JSON.stringify({ text: atom.text, facet: atom.facet }),
         embeddingBuffer, atom.priority || 0.7, atom.facet,
       );
       indexed++;
     }
+
+    // Force WAL checkpoint after batch writes
+    _walCheckpoint();
 
     console.log(`[brain] Indexed ${indexed} profile atoms`);
   } catch (err) {
@@ -1848,51 +1990,9 @@ async function indexProfileAtoms() {
 }
 
 /**
- * Index all system atoms (method steps, rules, guidelines) from system-atoms.mjs.
- * These are the Pane workflow instructions — previously hardcoded in session-context.mjs,
- * now stored as embeddings in the unified atom pool alongside profile atoms.
- *
- * Uses entity_type = 'system_atom'. Deletes and rebuilds on each call (they're static).
+ * Index all system atoms — retired.
+ * ALL_SYSTEM_ATOMS is now an empty array. Lifecycle handled by profile atoms only.
  */
-async function indexSystemAtoms() {
-  if (!db || !embedderReady) return;
-
-  try {
-    db.prepare(`DELETE FROM nodes WHERE entity_type = 'system_atom'`).run();
-
-    let indexed = 0;
-    for (const atom of ALL_SYSTEM_ATOMS) {
-      const id = `system_atom-${atom.id}`;
-      const embedding = await embed(atom.text);
-      const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
-
-      db.prepare(`
-        INSERT INTO nodes (id, name, entity_type, project_id, content, embedding, confidence, version, priority, sort_order, facet)
-        VALUES (?, ?, 'system_atom', NULL, ?, ?, 1.0, 1, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          content = excluded.content,
-          embedding = excluded.embedding,
-          priority = excluded.priority,
-          sort_order = excluded.sort_order,
-          facet = excluded.facet,
-          updated_at = datetime('now')
-      `).run(
-        id,
-        atom.id,
-        JSON.stringify({ text: atom.text, facet: atom.facet }),
-        embeddingBuffer,
-        atom.priority,
-        atom.sortOrder,
-        atom.facet,
-      );
-      indexed++;
-    }
-
-    console.log(`[brain] Indexed ${indexed} system atoms`);
-  } catch (err) {
-    console.error("[brain] indexSystemAtoms error:", err.message);
-  }
-}
 
 /**
  * Unified atom pool search — replaces searchProfileAtoms().
@@ -2472,13 +2572,6 @@ process.parentPort.on("message", async ({ data }) => {
           extractPreferences();
         }
 
-        // Layer 3: Synthesis — regenerate when significant events indexed.
-        // updateSynthesis() is fast (4 SQL reads + hash check) so always run.
-        // The internal hash check makes it idempotent — no DB write if unchanged.
-        if (hasMeaningfulEvents) {
-          updateSynthesis(db, data.projectId);
-        }
-
         break;
       }
 
@@ -2491,6 +2584,27 @@ process.parentPort.on("message", async ({ data }) => {
       case "contextual_search": {
         const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null, data.taskType || null, data.atomHints || [], data.projectWhy || "");
         sendToMain({ type: "contextual_result", requestId: data.requestId, ...result });
+        break;
+      }
+
+      case "embed_texts": {
+        // Batch-embed arbitrary texts (turn summaries, query, etc.).
+        // Returns base64-encoded Float32Arrays for IPC transfer to main process.
+        if (!embedderReady || !_embedPipeline) {
+          sendToMain({ type: "embed_texts_result", requestId: data.requestId, embeddings: {} });
+          break;
+        }
+        const texts = data.texts || [];
+        const embeddings = await embedBatch(texts);
+        const result = {};
+        for (const [text, emb] of embeddings) {
+          if (emb) {
+            result[text] = Buffer.from(emb.buffer).toString("base64");
+          } else {
+            result[text] = null;
+          }
+        }
+        sendToMain({ type: "embed_texts_result", requestId: data.requestId, embeddings: result });
         break;
       }
 
@@ -2518,8 +2632,6 @@ process.parentPort.on("message", async ({ data }) => {
               const { added, files_changed } = indexProjectSymbols(db, data.projectId, data.projectRoot, walkProjectFiles);
               if (added > 0 || files_changed > 0) {
                 writeSymbolExport(db, data.projectId, BRAIN_DIR);
-                // Regenerate synthesis after symbol indexing (Layer 3)
-                updateSynthesis(db, data.projectId);
               }
             } catch (err) {
               console.error("[brain] symbol indexing error:", err.message);
@@ -2567,21 +2679,12 @@ process.parentPort.on("message", async ({ data }) => {
           const result = indexFileSymbols(db, data.projectId, data.filePath, data.projectRoot);
           if (!result.skipped) {
             writeSymbolExport(db, data.projectId, BRAIN_DIR);
-            updateSynthesis(db, data.projectId);
           }
           sendToMain({ type: "file_symbols_reindexed", requestId: data.requestId, ...result });
         } catch (err) {
           console.error("[brain] reindex_file_symbols error:", err.message);
           sendToMain({ type: "file_symbols_reindexed", requestId: data.requestId, skipped: true });
         }
-        break;
-      }
-
-      case "synthesize": {
-        // Regenerate synthesis on demand
-        if (!db) { sendToMain({ type: "synthesis_result", requestId: data.requestId, synthesis: null }); break; }
-        const synthesis = updateSynthesis(db, data.projectId);
-        sendToMain({ type: "synthesis_result", requestId: data.requestId, synthesis });
         break;
       }
 
@@ -3231,14 +3334,12 @@ try {
   initProfile();
   console.log("[brain] Database + profile initialized");
 
-  // Start loading embedding model first — backfill needs it to generate embeddings
-  loadEmbedder().then(() => {
-    // Check if backfill needed (empty DB but events exist)
-    const stats = db._stmts.getStats.get();
-    if (stats.node_count === 0) {
-      backfillAll().catch(err => console.error("[brain] Backfill error:", err));
-    }
-  });
+  // Embedding model loads lazily on first embed() call — no 500MB WASM heap at startup
+  // Check if backfill needed (empty DB but events exist)
+  const stats = db._stmts.getStats.get();
+  if (stats.node_count === 0) {
+    backfillAll().catch(err => console.error("[brain] Backfill error:", err));
+  }
 } catch (err) {
   console.error("[brain] Startup error:", err);
 }

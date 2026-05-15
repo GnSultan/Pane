@@ -83,7 +83,7 @@ export interface StrategyBlock {
   classifierRouted?: boolean;
   classifierConfidence?: number | null;
   classifierExploring?: boolean;
-  // classifier fields (null only on slash overrides or no API key)
+  // null when classifier didn't run (system override, no API key)
   localTaskType: string | null;
   localComplexity: string | null;
   localAtomHints: string[];

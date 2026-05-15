@@ -152,6 +152,7 @@ export function useSettingsPersistence() {
         ws.setHttpApiKeys(apiKeys);
         ws.setHttpBaseUrls(settings.http_base_urls || {});
         if (settings.disabled_providers) ws.setDisabledProviders(settings.disabled_providers);
+        if (settings.curated_models) ws.setCuratedModels(settings.curated_models);
 
         // Model restoration
         if (settings.selected_model) {
@@ -441,6 +442,7 @@ export function useSettingsPersistence() {
         http_api_keys: ws.httpApiKeys,
         http_base_urls: ws.httpBaseUrls,
         disabled_providers: ws.disabledProviders,
+        curated_models: ws.curatedModels,
         power_combo: ws.powerCombo,
         intent_auto_route: ws.autoEscalate,
       }).catch((err) => console.error("[persistence] Save failed:", err));
@@ -478,7 +480,8 @@ export function useSettingsPersistence() {
         routingChanged ||
         keysChanged ||
         urlsChanged ||
-        state.autoEscalate !== prev.autoEscalate
+        state.autoEscalate !== prev.autoEscalate ||
+        state.curatedModels !== prev.curatedModels
       ) {
         debouncedSave();
       }

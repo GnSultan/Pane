@@ -16,15 +16,29 @@
  * Replaces: manageContextWindow() binary pruning in http-backend.mjs
  */
 
-import { estimateTokens } from "./token-budget.mjs";
+import { estimateTokens, getDefaultOutputBudget, SLIDING_WINDOW_SIZE } from "./token-budget.mjs";
 import { buildSummary, restoreRaw, pruneOldTurns } from "./tool-result-cache.mjs";
+import { contextStore } from "./context-store.mjs";
 
 // Tier boundaries (by turn index from end of messages[])
-const FRESH_DEPTH = 3;   // last 3 turns stay raw
-const RECENT_DEPTH = 10;  // turns 3-10 get summarized
+export const FRESH_DEPTH = SLIDING_WINDOW_SIZE;  // last N turns stay raw (tied to V4 sliding window)
+const RECENT_DEPTH = FRESH_DEPTH + 7;  // next 7 turns get summarized
 
-// Output/reserve overhead: max_tokens + tools definitions + stop sequences + formatting
-const OUTPUT_RESERVE = 10000;
+
+
+// Tools/framing overhead on top of max_tokens (tool definitions, [Pane context] preamble, formatting)
+const TOOLS_FRAMING_OVERHEAD = 5000;
+
+/**
+ * Compute the output reserve for a model: max_tokens + tools/framing overhead.
+ * This is what must be reserved from the context window for non-conversation content.
+ * @param {string|null} model
+ * @returns {number}
+ */
+function getOutputReserve(model) {
+  const outputBudget = model ? getDefaultOutputBudget(model) : 8192;
+  return outputBudget + TOOLS_FRAMING_OVERHEAD;
+}
 
 /**
  * Extract turn boundaries from messages array.
@@ -131,6 +145,12 @@ export function summarizeTurn(messages, startIdx, endIdx, options = {}) {
  * @returns {number}
  */
 function computeTotalTokens(messages, systemTokens) {
+  // If messages[0] is already the system prompt, systemTokens double-counts it.
+  // Only add systemTokens separately when the system prompt is NOT in messages.
+  const hasSystemInMessages = messages.length > 0 && messages[0].role === "system";
+  if (hasSystemInMessages) {
+    return estimateTokens(JSON.stringify(messages));
+  }
   return systemTokens + estimateTokens(JSON.stringify(messages));
 }
 
@@ -194,9 +214,10 @@ function buildTurnSummaryMarker(messages, startIdx, endIdx, turnIndex) {
     lines.push(`Result: ${conclusion}`);
   }
 
+  const markerContent = lines.join("\n");
   const marker = {
     role: "user",
-    content: lines.join("\n"),
+    content: markerContent,
   };
 
   const extracted = {
@@ -204,21 +225,54 @@ function buildTurnSummaryMarker(messages, startIdx, endIdx, turnIndex) {
     request: requestText,
     tools: uniqueTools,
     conclusion,
+    compressedText: markerContent,
+    tokenCount: estimateTokens(markerContent),
+    rawTokenCount: 0, // filled by caller when available
   };
 
   return { marker, extracted };
 }
 
 /**
+ * Store a turn summary record for semantic retrieval.
+ * Writes to contextStore for in-memory access; persisted to disk via debounce.
+ * Fire-and-forget — never throws.
+ *
+ * @param {string} projectId
+ * @param {{ turnIndex: number, request: string, tools: string[], conclusion: string, compressedText: string, tokenCount: number, rawTokenCount: number }} summary
+ */
+export function storeTurnSummary(projectId, summary) {
+  try {
+    const existing = contextStore.getTurnSummaries(projectId) || [];
+    // Replace existing entry for this turn index, or append
+    const idx = existing.findIndex(s => s.turnIndex === summary.turnIndex);
+    const record = {
+      ...summary,
+      embedding: null, // filled lazily by semantic-turn-selector
+    };
+    if (idx >= 0) {
+      existing[idx] = record;
+    } else {
+      existing.push(record);
+    }
+    contextStore.updateTurnSummaries(projectId, existing);
+  } catch (err) {
+    console.warn(`[conversation-lifecycle] storeTurnSummary failed: ${err.message}`);
+  }
+}
+
+/**
  * Drop the oldest non-fresh, non-system turn entirely and replace
  * it with an extractive summary marker. Mutates messages in place.
+ * Stores the summary via contextStore for later semantic retrieval.
  *
  * @param {Array} messages - mutated in place
  * @param {Array} turns - turn boundaries (from detectTurns)
  * @param {number} freshDepth - how many recent turns to protect
+ * @param {string} [projectId] - project for turn summary persistence
  * @returns {{ tokensSaved: number, droppedTurn: { turnIndex, request, tools, conclusion } | null }}
  */
-function dropOldestTurn(messages, turns, freshDepth) {
+function dropOldestTurn(messages, turns, freshDepth, projectId) {
   // Find the oldest turn that isn't fresh and isn't the system prompt
   for (let t = 0; t < turns.length; t++) {
     const turn = turns[t];
@@ -245,6 +299,9 @@ function dropOldestTurn(messages, turns, freshDepth) {
       turn.turnIndex,
     );
 
+    // Fill raw token count and persist
+    extracted.rawTokenCount = turnTokens;
+
     // Remove all messages in this turn (splice in reverse order to preserve indices)
     for (let i = turn.end; i >= turn.start; i--) {
       messages.splice(i, 1);
@@ -252,6 +309,11 @@ function dropOldestTurn(messages, turns, freshDepth) {
 
     // Insert the extractive summary marker at the start position
     messages.splice(turn.start, 0, marker);
+
+    // Persist turn summary for semantic retrieval
+    if (projectId) {
+      storeTurnSummary(projectId, extracted);
+    }
 
     const archivalTokens = estimateTokens(marker.content);
     return {
@@ -264,33 +326,106 @@ function dropOldestTurn(messages, turns, freshDepth) {
 }
 
 /**
+ * Drop turns with the lowest relevance to the current query, preserving
+ * the sliding window. Mutates messages in place. This replaces the
+ * chronological dropOldestTurn() when semantic selection is available.
+ *
+ * Uses a pre-computed TurnSelection from semantic-turn-selector.mjs.
+ * Each dropped turn is replaced with an extractive summary marker
+ * (reuses buildTurnSummaryMarker) and persisted via contextStore.
+ *
+ * @param {Array} messages - mutated in place
+ * @param {Array} turns - from detectTurns()
+ * @param {import("./semantic-turn-selector.mjs").TurnSelection} selection - from selectTurns()
+ * @param {string} [projectId] - project for turn summary persistence
+ * @returns {{ tokensSaved: number, droppedTurns: Array }}
+ */
+export function dropIrrelevantTurns(messages, turns, selection, projectId) {
+  const droppedTurns = [];
+  let tokensSaved = 0;
+
+  // Map turnIndex → { start, end } for fast lookup
+  const turnByIndex = {};
+  for (const t of turns) {
+    turnByIndex[t.turnIndex] = t;
+  }
+
+  // Sort dropped turns by position descending (splice from end to preserve indices)
+  const toDrop = (selection.droppedTurnIndices || [])
+    .map(ti => turnByIndex[ti])
+    .filter(Boolean)
+    .sort((a, b) => b.start - a.start);
+
+  for (const turn of toDrop) {
+    // Calculate tokens before removal
+    let turnTokens = 0;
+    for (let i = turn.start; i <= turn.end; i++) {
+      const content = typeof messages[i]?.content === "string"
+        ? messages[i].content : JSON.stringify(messages[i]?.content || "");
+      turnTokens += estimateTokens(content);
+    }
+
+    // Build extractive summary BEFORE removing messages
+    const { marker, extracted } = buildTurnSummaryMarker(
+      messages, turn.start, turn.end, turn.turnIndex
+    );
+
+    // Fill raw token count
+    extracted.rawTokenCount = turnTokens;
+
+    // Remove all messages in this turn (reverse order preserves indices)
+    for (let i = turn.end; i >= turn.start; i--) {
+      messages.splice(i, 1);
+    }
+
+    // Insert summary marker at the start position
+    messages.splice(turn.start, 0, marker);
+
+    // Persist turn summary for semantic retrieval
+    if (projectId) {
+      storeTurnSummary(projectId, extracted);
+    }
+
+    const archivalTokens = estimateTokens(marker.content);
+    tokensSaved += turnTokens - archivalTokens;
+    droppedTurns.push(extracted);
+  }
+
+  return { tokensSaved, droppedTurns };
+}
+
+/**
  * Main entry point: manage conversation lifecycle.
  * Call this instead of manageContextWindow().
  *
  * Prunes to the model's HARD limit (maxContextTokens - outputReserve),
  * not a soft utilization target. Uses a progressive loop:
  *   Phase 1: Summarize tool results (archival → recent)
- *   Phase 2: Drop entire old user turns (oldest first)
+ *   Phase 2: Drop turns (chronological by default, or semantic when turnSelection provided)
  *   Stops as soon as the total is under the hard limit.
  *
  * @param {Array} messages - The messages[] array (mutated in place)
  * @param {object} options
  * @param {string} options.projectId
+ * @param {string|null} options.model - Model identifier for computing output budget
  * @param {number} options.systemTokens - Token count of system prompt
  * @param {number} options.maxContextTokens - Model's context window size
  * @param {number} options.currentTurnIndex - Current turn number in session
+ * @param {import("./semantic-turn-selector.mjs").TurnSelection} [options.turnSelection] - Pre-computed turn selection for semantic pruning
  * @returns {{ action: string, tokensSaved: number, details: string }}
  */
 export function manageConversation(messages, options = {}) {
   const {
     projectId = "unknown",
+    model = null,
     systemTokens = 0,
     maxContextTokens = 128000,
     currentTurnIndex = 0,
+    turnSelection = null, // Optional: pre-computed TurnSelection for semantic pruning
   } = options;
 
   // HARD limit: model's max minus what we need for output + tools + framing
-  const hardLimit = maxContextTokens - OUTPUT_RESERVE;
+  const hardLimit = maxContextTokens - getOutputReserve(model);
   // Soft trigger: start pruning when we exceed 50% of hard limit
   const triggerThreshold = Math.floor(hardLimit * 0.5);
 
@@ -341,23 +476,52 @@ export function manageConversation(messages, options = {}) {
       totalTokens = computeTotalTokens(messages, systemTokens);
     }
 
-    // If still over limit after Phase 1, drop entire turns (oldest first)
+    // If still over limit after Phase 1, drop entire turns
     if (totalTokens > hardLimit) {
       // Refresh turn boundaries (they changed due to splicing)
       turns = detectTurns(messages);
-      const result = dropOldestTurn(messages, turns, FRESH_DEPTH);
-      if (result.tokensSaved > 0) {
-        totalSaved += result.tokensSaved;
-        savedThisRound += result.tokensSaved;
-        actionsSummary.push(`dropped turn ${result.droppedTurn?.turnIndex}: -${result.tokensSaved} tokens`);
-        if (result.droppedTurn) {
-          droppedTurns.push(result.droppedTurn);
+
+      if (turnSelection && turnSelection.droppedTurnIndices?.length > 0) {
+        // NEW PATH: semantic turn selection — drop least relevant turns first
+        const result = dropIrrelevantTurns(messages, turns, turnSelection, projectId);
+        if (result.tokensSaved > 0) {
+          totalSaved += result.tokensSaved;
+          savedThisRound += result.tokensSaved;
+          actionsSummary.push(`semantic drop: ${result.droppedTurns.length} turns (-${result.tokensSaved}t)`);
+          droppedTurns.push(...result.droppedTurns);
+          totalTokens = computeTotalTokens(messages, systemTokens);
+        } else {
+          actionsSummary.push("semantic drop gave no savings — falling back to chronological");
+          // Fall through to chronological fallback
+          turns = detectTurns(messages);
+          const fallbackResult = dropOldestTurn(messages, turns, FRESH_DEPTH, projectId);
+          if (fallbackResult.tokensSaved > 0) {
+            totalSaved += fallbackResult.tokensSaved;
+            savedThisRound += fallbackResult.tokensSaved;
+            actionsSummary.push(`dropped turn ${fallbackResult.droppedTurn?.turnIndex}: -${fallbackResult.tokensSaved}t (fallback)`);
+            if (fallbackResult.droppedTurn) droppedTurns.push(fallbackResult.droppedTurn);
+            totalTokens = computeTotalTokens(messages, systemTokens);
+          } else {
+            actionsSummary.push("no more turns to drop — giving up");
+            break;
+          }
         }
-        totalTokens = computeTotalTokens(messages, systemTokens);
       } else {
-        // Can't save any more — break to avoid infinite loop
-        actionsSummary.push("no more turns to drop — giving up");
-        break;
+        // CHRONOLOGICAL PATH: drop oldest turns (existing behavior)
+        const result = dropOldestTurn(messages, turns, FRESH_DEPTH, projectId);
+        if (result.tokensSaved > 0) {
+          totalSaved += result.tokensSaved;
+          savedThisRound += result.tokensSaved;
+          actionsSummary.push(`dropped turn ${result.droppedTurn?.turnIndex}: -${result.tokensSaved} tokens`);
+          if (result.droppedTurn) {
+            droppedTurns.push(result.droppedTurn);
+          }
+          totalTokens = computeTotalTokens(messages, systemTokens);
+        } else {
+          // Can't save any more — break to avoid infinite loop
+          actionsSummary.push("no more turns to drop — giving up");
+          break;
+        }
       }
     }
 

@@ -5,13 +5,12 @@
 // Gemini backend: spawn + readline (stream-json JSONL)
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { spawn, exec } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
-import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { compileContext, mergeState, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, readHandoff, writeHandoffWithHistory, updateLatestHandoff, MODEL_CONTEXT_LIMITS } from "./pane-system-prompt.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
@@ -35,7 +34,6 @@ function getClaudeCliPath() {
 
 const CLAUDE_CLI_PATH = getClaudeCliPath();
 
-const execAsync = promisify(exec);
 const __dirname = import.meta.dirname;
 
 // Claude: projectId -> AbortController (for graceful cancellation)
@@ -51,18 +49,17 @@ const abortedProjects = new Set();
 const requestStates = new Map();
 
 
-async function getGitStatus(workingDir) {
+function getGitStatus(workingDir) {
   try {
-    const { stdout: branchOut } = await execAsync(
+    const branch = execSync(
       "git symbolic-ref --short HEAD || git rev-parse --abbrev-ref HEAD",
-      { cwd: workingDir },
-    );
-    const branch = branchOut.trim();
-    const { stdout: statusOut } = await execAsync(
+      { cwd: workingDir, encoding: "utf-8" },
+    ).trim();
+    const summary = execSync(
       "git status --porcelain=v1 -unormal",
-      { cwd: workingDir },
-    );
-    return { branch, summary: statusOut.trim() || "(clean)" };
+      { cwd: workingDir, encoding: "utf-8" },
+    ).trim() || "(clean)";
+    return { branch, summary };
   } catch {
     return null;
   }
@@ -631,7 +628,6 @@ ${phaseDirective}This project is managed by Pane. You have pane_ MCP tools that 
 
 - **pane_project_context** — project name, branch, file structure
 - **pane_brief** — project decisions, lessons, session history
-- **pane_synthesize** — architectural DNA, why things are the way they are
 - **pane_recall** — search project memory for past decisions and context
 - **pane_architecture_brief** — locked decisions and patterns for a subsystem
 - **pane_ui_constraints** — design rules for component types
@@ -996,9 +992,9 @@ ${PANE_END}`;
       try {
         const { runTurnSentinel } = await import("./code-arbiter.mjs");
         // git diff --name-only (no HEAD) catches both staged and unstaged changes
-        const { stdout } = await execAsync(
+        const stdout = execSync(
           'git diff --name-only 2>/dev/null || echo ""',
-          { cwd: workingDir, timeout: 5000 },
+          { cwd: workingDir, encoding: "utf-8", timeout: 5000 },
         );
         const changedFiles = stdout.trim().split("\n").filter(Boolean);
         if (changedFiles.length > 0) {
@@ -1166,7 +1162,6 @@ ${geminiPhaseDirective}This project is managed by Pane. You have pane_ MCP tools
 
 - **pane_project_context** — project name, branch, file structure
 - **pane_brief** — project decisions, lessons, session history
-- **pane_synthesize** — architectural DNA, why things are the way they are
 - **pane_recall** — search project memory for past decisions and context
 - **pane_architecture_brief** — locked decisions and patterns for a subsystem
 - **pane_ui_constraints** — design rules for component types
@@ -1359,9 +1354,9 @@ ${PANE_END}`;
     ;(async () => {
       try {
         const { runTurnSentinel } = await import("./code-arbiter.mjs");
-        const { stdout } = await execAsync(
+        const stdout = execSync(
           'git diff --name-only 2>/dev/null || echo ""',
-          { cwd: workingDir, timeout: 5000 },
+          { cwd: workingDir, encoding: "utf-8", timeout: 5000 },
         );
         const changedFiles = stdout.trim().split("\n").filter(Boolean);
         if (changedFiles.length > 0) {
@@ -1734,7 +1729,7 @@ process.parentPort.on("message", ({ data }) => {
  */
 async function findGeminiCliCore() {
   try {
-    const { stdout } = await execAsync("which gemini");
+    const stdout = execSync("which gemini", { encoding: "utf-8" });
     const binPath = stdout.trim();
     if (!binPath) return null;
     // Resolve symlink: gemini -> ../lib/node_modules/@google/gemini-cli/dist/index.js

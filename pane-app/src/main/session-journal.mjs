@@ -258,6 +258,14 @@ export function openJournal(projectId, options = {}) {
         }
       }
     } catch { /* journal doesn't exist yet — fine */ }
+
+    // Stale task retirement after replay — prevents timestamp-less tasks
+    // that were set without a timestamp (main.mjs bug) from surviving replay.
+    // Same 8-hour policy as context-orchestrator.mjs and tool-executor.mjs.
+    const STALE_THRESHOLD_MS = 8 * 60 * 60 * 1000;
+    if (initialState.activeTask && (!initialState.activeTask.timestamp || (Date.now() - initialState.activeTask.timestamp) > STALE_THRESHOLD_MS)) {
+      initialState.activeTask = null;
+    }
   }
 
   const journal = new SessionJournal(projectId, fd, journalPath, metaPath, meta, initialState);

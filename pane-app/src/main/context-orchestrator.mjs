@@ -27,17 +27,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
 import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
-import { MODEL_CONTEXT_LIMITS, readState } from "./pane-system-prompt.mjs";
-import { estimateTokens, getModelLimit, getDefaultOutputBudget, createRequestBudget } from "./token-budget.mjs";
+import { MODEL_CONTEXT_LIMITS, readState, mergeState } from "./pane-system-prompt.mjs";
+import { estimateTokens, getModelLimit, getDefaultOutputBudget, createRequestBudget, CACHE_TIERS } from "./token-budget.mjs";
 import { saveContextCheckpoint } from "./context-checkpoints.mjs";
 import { contextStore } from "./context-store.mjs";
-import { detectPhase, filterAtomsForPhase } from "./conversation-phase.mjs";
 import { readVerdict, formatVerdictForContext, formatQualityStatsForContext, formatGuidanceForContext } from "./code-arbiter.mjs";
 import { getPaneDb } from "./pane-db.mjs";
 import { getIdentity } from "./identity.mjs";
 import { readDigest, formatDigestForContext } from "./context-digest.mjs";
+import { getTopRelevantSummaries } from "./semantic-turn-selector.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -175,11 +174,15 @@ function computeRelevanceAdjustments(contextShape, brainCtx, intent, historyLeng
     adjustments.set("handoff", +2);
     adjustments.set("orientation", +1);
     adjustments.set("recent_actions", (adjustments.get("recent_actions") || 0) - 1);
+    // Semantic turn pool becomes more important than some symbols in deep sessions
+    adjustments.set("semantic_turn_pool", -1); // useful → important
   }
   if (historyLength >= 15) {
     // Very deep session — model has likely lost early turns. Promote the
-    // context digest so it knows what's been done and decided.
+    // context digest and turn pool so it knows what's been done and decided.
     adjustments.set("context_digest", (adjustments.get("context_digest") || 0) - 2); // useful → important
+    adjustments.set("semantic_turn_pool", -1); // already bumped at 8, reinforce
+    adjustments.set("brain_memories", -1); // reinforce memories too
   }
 
   // ── Brain richness: if brain has good data, promote its layers ────────
@@ -240,7 +243,7 @@ function _buildLeanContext(projectId, isResume) {
     parts.push(
       "Project context, memory, symbols, codebase structure, and intelligence are available via pane_ MCP tools. " +
       "Call pane_project_context to orient yourself. Use pane_find_symbol for code navigation, pane_recall for project memory, " +
-      "pane_brief for the project brief, and pane_synthesize for architectural overview."
+      "and pane_brief for the project brief."
     );
   }
 
@@ -301,7 +304,7 @@ function _buildLeanContext(projectId, isResume) {
  *   session — changes when files/scope change (relevant files)
  *   turn    — changes every turn (git, todos, actions, memories, symbols)
  */
-function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected = null) {
+function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected = null, queryEmbeddingBase64 = null) {
   const layers = [];
 
   // ── Read shared data sources once ──────────────────────────────────────
@@ -327,33 +330,23 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   }
   if (!brainCtx) brainCtx = { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [], authoritativeDecisions: [] };
 
-  let state;
-  try {
-    state = JSON.parse(fs.readFileSync(
-      path.join(SESSION_DIR, projectId, "state.json"), "utf-8"
-    ));
-  } catch {
-    state = {
-      activeTask: null, todos: [], workingSet: [], decisions: [],
-      recentActions: [], methodNotes: [], gitStatus: null,
-      turnCount: 0, lastProvider: null, lastIntent: null,
-      startedAt: Date.now(), phase: "idle",
-    };
-  }
+  // Use readState() — delegates to journal in-memory state when active,
+  // falls back to disk for cold start. This is the same source compileContext()
+  // uses, ensuring consistency between both context assembly paths.
+  let state = readState(projectId);
 
-  // ── Detect conversation phase for atom filtering ───────────────────────
-  const activeTodos = (state.todos || []).filter(t => t.status !== "completed");
-  const completedTodos = (state.todos || []).filter(t => t.status === "completed");
-  const lastActions = (state.recentActions || []).slice(0, 3).map(a => a.type || "");
-  const conversationPhase = detectPhase({
-    turnCount: historyLength,
-    lastToolActions: lastActions,
-    taskType: contextShape?.taskType || "other",
-    mode: contextShape?.mode || intent || "direct",
-    pendingTodos: activeTodos.length,
-    completedTodos: completedTodos.length,
-    hasNewFiles: false, // TODO: track working set changes between turns
-  });
+  // ── Stale task retirement — 8-hour threshold. Same policy as        ──
+  // pane-system-prompt.mjs:476 but runs here because orchestrateContext
+  // is the main entry point for HTTP backends (not compileContext).
+  // Uses mergeState() so the journal's in-memory state is updated too —
+  // writing to disk directly would be overwritten by the next journal flush.
+  const STALE_THRESHOLD_MS = 8 * 60 * 60 * 1000;
+  if (state.activeTask && (!state.activeTask.timestamp || (Date.now() - state.activeTask.timestamp) > STALE_THRESHOLD_MS)) {
+    state.activeTask = null;
+    mergeState(projectId, { activeTask: null });
+  }
+  // Refresh state after clearing so downstream code sees the clean version
+  state = readState(projectId);
 
   // ── Delta mode: on turn 2+, skip session-stable layers that the model ──
   // already has in its context window. Only inject genuine deltas.
@@ -361,14 +354,11 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   const isFullAssembly = !lastInjected || lastInjected.turnNumber === 0;
 
   // ── 0. CORE INSTRUCTIONS (critical) ────────────────────────────────────
-  const coreInstructions = _buildSystemPromptFromAtoms(
-    brainCtx.atoms || null,
-    contextShape?.taskType || null,
-    contextShape?.complexity || null,
-    backend,
-    conversationPhase,
-    historyLength,
-  );
+  // Behavioral guidance is provided by identity, profile rules, and project brief.
+  // On continuation turns, remind the model it has full context.
+  const coreInstructions = historyLength >= 2
+    ? "You have full project context from previous turns. Proceed directly with the task."
+    : "";
   layers.push({
     name: "core_instructions",
     priority: PRIORITY.CRITICAL,
@@ -642,7 +632,7 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
           name: "pre_read_files",
           priority: PRIORITY.IMPORTANT,
           placement: "dynamic",
-          text: "Pre-read file contents (Pane has read these — do not re-read unless they have changed since):\n" + preReadParts.join("\n\n"),
+          text: "Pre-read file contents (pre-loaded into context):\n" + preReadParts.join("\n\n"),
         });
       }
     }
@@ -713,8 +703,18 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   // already has them in context window). Only inject DELTAS — new symbols
   // or memories that appeared since last assembly.
   const relevantSymbols = (brainCtx.relevantSymbols || []).slice(0, 15);
-  const memories = (brainCtx.memories || []).filter(m => (m.confidence || 0) >= 0.75);
   const principles = brainCtx.principles || [];
+
+  // Sort brain memories by relevance score (descending) so the most relevant
+  // context is injected first. Brain's contextual_search already scores memories
+  // by hybrid (semantic + keyword). Primary sort: score, secondary: confidence.
+  const memories = (brainCtx.memories || [])
+    .filter(m => (m.confidence || 0) >= 0.75)
+    .sort((a, b) => {
+      const scoreDiff = (b.score || 0) - (a.score || 0);
+      if (Math.abs(scoreDiff) > 0.05) return scoreDiff;
+      return (b.confidence || 0) - (a.confidence || 0);
+    });
 
   if (isFullAssembly) {
     // Turn 1: full injection
@@ -756,6 +756,45 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
     // Principles don't change mid-conversation — skip entirely on turn 2+
   }
 
+  // ── TIER 2: Semantic Turn Pool — inject relevant past-turn summaries ───
+  // Reads from contextStore (populated by conversation-lifecycle's
+  // storeTurnSummary when turns are dropped). Shows the model which past
+  // conversations are most relevant to the current query, sorted by
+  // relevance score from the semantic selector.
+  // When queryEmbeddingBase64 is provided (V4 semantic mode), uses
+  // getTopRelevantSummaries for relevance-scored selection. Falls back to
+  // chronological (most recent first) when embedding isn't available.
+  // Injected as a "turn" layer since relevance changes with every query.
+  if (!projectId.startsWith("mind:")) {
+    const turnSummaries = contextStore.getTurnSummaries(projectId);
+    if (turnSummaries && turnSummaries.length > 0) {
+      let topSummaries;
+      if (queryEmbeddingBase64) {
+        topSummaries = getTopRelevantSummaries(queryEmbeddingBase64, turnSummaries, 8);
+      } else {
+        topSummaries = [...turnSummaries]
+          .sort((a, b) => (b.turnIndex || 0) - (a.turnIndex || 0))
+          .slice(0, 8);
+      }
+
+      const lines = ["## Prior Context"];
+      for (const s of topSummaries) {
+        const toolLabel = s.tools?.length > 0 ? ` [${s.tools.slice(0, 5).join(", ")}${s.tools.length > 5 ? "..." : ""}]` : "";
+        lines.push(`[Turn ${s.turnIndex}]${toolLabel}`);
+        if (s.request) lines.push(`  Request: ${s.request}`);
+        if (s.conclusion) lines.push(`  Result: ${s.conclusion}`);
+      }
+
+      layers.push({
+        name: "semantic_turn_pool",
+        priority: PRIORITY.USEFUL,
+        placement: "dynamic",
+        tier: "turn",
+        text: lines.join("\n"),
+      });
+    }
+  }
+
   // ── 2. ESCALATION (important when active) ─────────────────────────────
   if (contextShape?.escalationStage >= 2) {
     layers.push({
@@ -772,9 +811,13 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   const mindEntries = brainCtx.mindEntries || [];
   let sessionPins = [];
   try {
-    sessionPins = JSON.parse(fs.readFileSync(
-      path.join(MEMORY_DIR, projectId, "session-pins.json"), "utf-8"
-    ));
+    const pinsPath = path.join(MEMORY_DIR, projectId, "session-pins.json");
+    const pinsStat = fs.statSync(pinsPath);
+    // Skip stale pins — if the file hasn't been updated in 7 days, the
+    // commitments are likely resolved. The model can still use pane_recall.
+    if (Date.now() - pinsStat.mtimeMs < 7 * 24 * 60 * 60 * 1000) {
+      sessionPins = JSON.parse(fs.readFileSync(pinsPath, "utf-8"));
+    }
   } catch {}
 
   if (isFullAssembly) {
@@ -980,6 +1023,7 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
  * @param {*} options.sqliteChanges - recent file changes from SQLite
  * @param {number} options.conversationTokens - estimated tokens used by conversation history (default 0)
  * @param {number} options.outputBudget - tokens reserved for model output (default 8192)
+ * @param {string|null} options.queryEmbeddingBase64 - base64-encoded query embedding for relevance-scored turn pool (V4 semantic)
  * @returns {{ stable, dynamic, full, budget, layers }}
  */
 export function orchestrateContext(projectId, options = {}) {
@@ -993,6 +1037,7 @@ export function orchestrateContext(projectId, options = {}) {
     outputBudget = 8192,
     mode = "full",       // "full" (HTTP backends) or "lean" (CLI backends)
     isResume = false,     // true when resuming an existing CLI session
+    queryEmbeddingBase64 = null, // base64-encoded query embedding for V4 semantic turn pool
   } = options;
 
   // ── Lean mode: minimal context for CLI backends that manage their own context.
@@ -1015,7 +1060,7 @@ export function orchestrateContext(projectId, options = {}) {
 
   // Build all layers — pass lastInjected for delta-aware assembly on turn 2+
   const lastInjected = contextStore.getLastInjected(projectId);
-  const allLayers = buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected);
+  const allLayers = buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected, queryEmbeddingBase64);
 
   // ── Relevance Engine: adjust priorities based on intent, complexity, brain data ──
   // Read from in-memory ContextStore (updated by brain-engine via main.mjs).
@@ -1109,6 +1154,21 @@ export function orchestrateContext(projectId, options = {}) {
   const frozenText  = includedLayers.filter(l => l.tier === "frozen").map(l => l.text).join("\n\n");
   const sessionText = includedLayers.filter(l => l.tier === "session").map(l => l.text).join("\n\n");
   const turnText    = includedLayers.filter(l => l.tier === "turn").map(l => l.text).join("\n\n");
+
+  // ── Per-tier cache budget check (CACHE_TIERS from token-budget.mjs) ────
+  // Warns when a tier exceeds its cache-optimized budget. This helps diagnose
+  // prefix cache misses on Anthropic and Gemini — a tier that's too large
+  // won't fit in the cache prefix and defeats the purpose of tiered assembly.
+  const tierTokens = [
+    { name: "frozen", tokens: estimateTokens(frozenText), budget: CACHE_TIERS.FROZEN_TIER_MAX_TOKENS },
+    { name: "session", tokens: estimateTokens(sessionText), budget: CACHE_TIERS.SESSION_TIER_MAX_TOKENS },
+    { name: "turn", tokens: estimateTokens(turnText), budget: CACHE_TIERS.TURN_TIER_MAX_TOKENS },
+  ];
+  for (const t of tierTokens) {
+    if (t.tokens > t.budget && process.env.PANE_DEBUG_CONTEXT === "1") {
+      console.warn(`[context] ${t.name} tier exceeds cache budget: ${t.tokens} > ${t.budget} tokens (cache miss risk)`);
+    }
+  }
 
   // Backward compat: stable = frozen + session, dynamic = turn
   const stable  = [frozenText, sessionText].filter(Boolean).join("\n\n");
@@ -1338,88 +1398,10 @@ function _buildHandoff(projectId) {
 }
 
 // ---------------------------------------------------------------------------
-// System prompt builder — same as session-context.mjs
+// System prompt builder — retired. All behavioral guidance is now provided by
+// identity, profile rules, and project brief. The continuation instruction
+// is inlined at the call site in buildLayers().
 // ---------------------------------------------------------------------------
-
-const _GEMINI_SUBAGENTS = [
-  "",
-  "# Available Sub-Agent",
-  "",
-  "A specialized sub-agent is available as a tool for deep codebase analysis. Delegate to it when the task requires methodically tracing through the codebase.",
-  "",
-  "<available_subagent>",
-  "  <name>pane_ora</name>",
-  "  <description>Specialized for codebase analysis, architectural mapping, and system-wide dependencies. Use for vague requests, bug root-cause analysis, refactoring, or comprehensive feature implementation.</description>",
-  "</available_subagent>",
-].join("\n");
-
-function _buildSystemPromptFromAtoms(unifiedAtoms, taskType, complexity, backend, conversationPhase = null, historyLength = 0) {
-  const parts = [];
-
-  // On continuation turns (historyLength >= 2), swap ORIENT for CONTINUE.
-  // The model already has project context — don't tell it to re-orient.
-  const isContinuation = historyLength >= 2;
-
-  const systemAtoms = (unifiedAtoms || []).filter(a => a.entityType === "system_atom");
-
-  if (systemAtoms.length > 0) {
-    let methodAtoms = systemAtoms.filter(a => a.facet === "method").sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
-    const ruleAtoms = systemAtoms.filter(a => a.facet === "rule").sort((a, b) => (b.score || 0) - (a.score || 0));
-    const guideAtoms = systemAtoms.filter(a => a.facet === "guideline").sort((a, b) => (b.score || 0) - (a.score || 0));
-
-    // Phase-aware filtering: drop irrelevant method atoms based on conversation phase
-    if (conversationPhase) {
-      methodAtoms = filterAtomsForPhase(conversationPhase, methodAtoms);
-    }
-
-    // Continuation: replace orient with continue
-    if (isContinuation) {
-      const continueAtom = METHOD_ATOMS.find(a => a.id === "method-continue");
-      if (continueAtom) {
-        methodAtoms = methodAtoms.filter(a => (a.id || a.name) !== "method-orient");
-        methodAtoms.push({ ...continueAtom, content: continueAtom.text, sortOrder: continueAtom.sortOrder });
-        methodAtoms.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
-      }
-    }
-
-    if (methodAtoms.length > 0) parts.push(methodAtoms.map(a => a.content).join("\n\n"));
-    if (ruleAtoms.length > 0) {
-      parts.push("", "Constraints:");
-      for (const r of ruleAtoms) parts.push(`- ${r.content}`);
-    }
-    if (guideAtoms.length > 0) {
-      parts.push("");
-      for (const g of guideAtoms) parts.push(`- ${g.content}`);
-    }
-  } else {
-    let methodAtoms = [...METHOD_ATOMS].sort((a, b) => a.sortOrder - b.sortOrder);
-    if (conversationPhase) {
-      methodAtoms = filterAtomsForPhase(conversationPhase, methodAtoms);
-    }
-
-    // Continuation: replace orient with continue
-    if (isContinuation) {
-      methodAtoms = methodAtoms.filter(a => a.id !== "method-orient");
-      const continueAtom = METHOD_ATOMS.find(a => a.id === "method-continue");
-      if (continueAtom) methodAtoms.push(continueAtom);
-      methodAtoms.sort((a, b) => a.sortOrder - b.sortOrder);
-    }
-
-    if (methodAtoms.length > 0) parts.push(methodAtoms.map(a => a.text).join("\n\n"));
-    if (RULE_ATOMS.length > 0) {
-      parts.push("", "Constraints:");
-      for (const r of RULE_ATOMS) parts.push(`- ${r.text}`);
-    }
-    if (GUIDELINE_ATOMS.length > 0) {
-      parts.push("");
-      for (const g of GUIDELINE_ATOMS) parts.push(`- ${g.text}`);
-    }
-  }
-
-  if (backend === "gemini") parts.push(_GEMINI_SUBAGENTS);
-
-  return parts.join("\n");
-}
 
 const TASK_DIRECTIVES = {
   debug: {

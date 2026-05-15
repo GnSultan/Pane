@@ -9,13 +9,10 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
 import crypto from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { promisify } from "node:util";
 import { BrowserWindow, utilityProcess, ipcMain } from "electron";
 import { getPaneDb } from "./pane-db.mjs";
-
-const execFileAsync = promisify(execFile);
 
 // Enrich PATH for spawned CLIs — mirrors main.mjs and cli-worker.mjs.
 // Packaged Electron apps have a minimal PATH; this adds nvm, homebrew, etc.
@@ -148,6 +145,7 @@ import { routeHeuristic, detectFailureSignals, detectSuccessSignals, djb2Hash } 
 import { routeIntegrated, recordOutcome, getClassifierStats } from "./integrated-router.mjs";
 import { contextStore } from "./context-store.mjs";
 import { propagateCompletion } from "./completion-propagator.mjs";
+import { extractAndIndex } from "./memory-extractor.mjs";
 import { readThreadState, incrementFailure, recordSuccess, updateLastPrompt, updateLastResponse, recordApproach } from "./thread-state.mjs";
 
 // Node.js globals for utility process
@@ -988,12 +986,20 @@ class PunkEngine {
     if (requestId && this._activeOutcomes.has(requestId)) {
       const tracked = this._activeOutcomes.get(requestId);
 
-      // Accumulate response text length and full content for extraction
+      // Accumulate response text length and full content for extraction.
+      // responseText is capped at 200KB to prevent unbounded memory growth
+      // that caused 20GB+ runaway processes. The cap is sufficient for
+      // principle extraction and memory indexing (the only consumers).
       if (event.event === "message" && event.data?.parsed?.type === "stream_event") {
         const delta = event.data.parsed.data?.delta;
         if (delta?.type === "text_delta" && delta.text) {
           tracked.responseLength += delta.text.length;
-          tracked.responseText += delta.text;
+          if (tracked.responseText.length < 200_000) {
+            tracked.responseText += delta.text;
+            if (tracked.responseText.length > 200_000) {
+              tracked.responseText = tracked.responseText.slice(0, 200_000);
+            }
+          }
         }
       }
 
@@ -1091,6 +1097,23 @@ class PunkEngine {
         if (tracked.projectId && !tracked.projectId.startsWith("mind:") &&
             tracked.userPrompt && tracked.responseText) {
           this._extractPrincipleAsync(tracked.projectId, tracked.userPrompt, tracked.responseText).catch(() => {});
+        }
+
+        // ── Fire-and-forget memory extraction ──────────────────────────
+        // After each turn, ask "Did anything here matter?" and index
+        // findings into the brain knowledge graph. Uses the same quickCall
+        // path as principle extraction but asks a more general question:
+        // any decision, lesson, pattern, or error_fix discovered this turn.
+        if (tracked.projectId && !tracked.projectId.startsWith("mind:") &&
+            tracked.userPrompt && tracked.responseText && this.quickCall && this._brainIndexer) {
+          const turnMessages = [{ role: "assistant", content: tracked.responseText }];
+          extractAndIndex(
+            tracked.projectId,
+            (sys, usr) => this.quickCall(sys, usr),
+            (pid, events) => this._brainIndexer(pid, events),
+            turnMessages,
+            tracked.userPrompt,
+          ).catch(() => {});
         }
 
         // Save minimal metadata for retrospective scoring on next spawn.
@@ -1352,12 +1375,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // Qwen local model is the sole classifier — strategy + task type + context
     // shape in a single ~50-100ms inference pass. No heuristic fallback.
     //
-    // Explicit slash commands (/plan, /direct, /discuss, /exec, /orchestrate)
-    // bypass classification — they're user overrides, resolved inline.
     const sessionState = readState(resolvedRequest.projectId);
-    const promptText = (resolvedRequest.prompt || "").trim().toLowerCase();
-    const hasSlashOverride = /^\/(?:direct|raw|discuss|chat|exec|analyze)\b/.test(promptText);
-
     const pendingTodos = (resolvedRequest.todos || []).filter(t => t.status !== "completed").length;
 
     let localDecision = null;
@@ -1389,23 +1407,6 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       // Strip any leading slash directive the renderer may have prepended
       resolvedRequest.prompt = (resolvedRequest.prompt || "").replace(/^\/[\w]+\s*/, "").trim();
       console.log(`[punk] phase → ${resolvedRequest.phase} (strategy: ${strategy.mode}, intent: ${resolvedRequest.intent})`);
-    } else if (hasSlashOverride) {
-      // ── Slash overrides — user knows what they want ──
-      const slashStrategies = {
-        direct:      { mode: "direct",      discovery: false, reasoning: "shallow", verification: "none" },
-        raw:         { mode: "direct",      discovery: false, reasoning: "shallow", verification: "none" },
-        exec:        { mode: "direct",      discovery: false, reasoning: "shallow", verification: "none" },
-        discuss:     { mode: "discuss",     discovery: false, reasoning: "deep",    verification: "none" },
-        chat:        { mode: "discuss",     discovery: false, reasoning: "deep",    verification: "none" },
-        analyze:     { mode: "analyze",     discovery: true,  reasoning: "deep",    verification: "none" },
-      };
-      const cmd = promptText.match(/^\/([\w]+)/)?.[1] || "direct";
-      const override = slashStrategies[cmd] || slashStrategies.direct;
-      strategy = { ...override, confidence: 1.0, reason: `/${cmd}`, signals: [] };
-      // Strip the slash directive from the prompt — CLI backends (claude, gemini)
-      // interpret leading / as their own internal commands and will terminate.
-      resolvedRequest.prompt = (resolvedRequest.prompt || "").replace(/^\/[\w]+\s*/, "").trim();
-      console.log(`[punk] slash override → ${strategy.mode} (/${cmd})`);
     } else {
       // ── Heuristic routing — zero-latency deterministic classification ──
       // Replaces the LLM classifier call with a pure algorithmic approach.
@@ -1826,11 +1827,12 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     }
 
     // ── ANALYZE MODE ──────────────────────────────────────────────────────
-    // Think phase and /analyze slash — read-only deep investigation.
+    // Think phase — read-only deep investigation.
     // The model explores broadly, traces connections, and reports findings
     // without modifying any files.
     if (!resolvedRequest._systemOverride && strategy.mode === "analyze") {
       console.log("[punk] ANALYZE mode — deep reading, no execution");
+      resolvedRequest.phase = "analyze";
       resolvedRequest._systemPrepend =
         "ANALYZE: You are in analysis mode. Read broadly, trace connections across the codebase, " +
         "and report findings with structured implications and recommendations. " +
@@ -2057,7 +2059,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         'pane_find_symbol', 'pane_find_references', 'pane_codebase_compass',
         'pane_codebase_navigator', 'explore',
         // Project context & memory
-        'pane_project_context', 'pane_brief', 'pane_synthesize',
+        'pane_project_context', 'pane_brief',
         'pane_recall', 'pane_knowledge_graph', 'pane_profile',
         // Architecture & design constraints
         'pane_architecture_brief', 'pane_ui_constraints',

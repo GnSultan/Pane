@@ -19,10 +19,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
-
-const execAsync = promisify(exec);
+import { execSync } from "node:child_process";
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const PUNKS_DIR = path.join(PANE_DIR, "punks");
 
@@ -151,8 +148,7 @@ export class MindPunks {
     // 9. Get current HEAD for next review's base_ref
     let currentHead = null;
     try {
-      const { stdout } = await execAsync("git rev-parse HEAD 2>/dev/null", { cwd: workingDir, timeout: 5000 });
-      currentHead = stdout.trim() || null;
+      currentHead = execSync("git rev-parse HEAD 2>/dev/null", { cwd: workingDir, encoding: "utf-8", timeout: 5000 }).trim() || null;
     } catch {}
 
     // 10. Complete session
@@ -426,30 +422,30 @@ export class MindPunks {
     const ref = lastRef || "HEAD~20";
 
     try {
-      const [statResult, filesResult, logResult, diffResult] = await Promise.allSettled([
-        execAsync(`git diff --stat ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, timeout: 5000 }),
-        execAsync(`git diff --name-only ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, timeout: 5000 }),
-        execAsync(`git log --oneline ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, timeout: 5000 }),
-        execAsync(`git diff ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, timeout: 10000, maxBuffer: 512 * 1024 }),
-      ]);
-
-      if (statResult.status === "fulfilled") result.stat = statResult.value.stdout.trim();
-      if (filesResult.status === "fulfilled") result.files = filesResult.value.stdout.trim().split("\n").filter(Boolean);
-      if (logResult.status === "fulfilled") result.log = logResult.value.stdout.trim();
-      if (diffResult.status === "fulfilled") {
-        // Cap diff to avoid blowing context
-        const raw = diffResult.value.stdout;
-        result.diff = raw.length > 15000
-          ? raw.slice(0, 15000) + `\n\n... [diff truncated, ${raw.length - 15000} chars omitted]`
-          : raw;
-      }
+      const statOut = execSync(`git diff --stat ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, encoding: "utf-8", timeout: 5000 });
+      result.stat = statOut.trim();
+    } catch {}
+    try {
+      const filesOut = execSync(`git diff --name-only ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, encoding: "utf-8", timeout: 5000 });
+      result.files = filesOut.trim().split("\n").filter(Boolean);
+    } catch {}
+    try {
+      const logOut = execSync(`git log --oneline ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, encoding: "utf-8", timeout: 5000 });
+      result.log = logOut.trim();
+    } catch {}
+    try {
+      // Cap diff to avoid blowing context
+      const raw = execSync(`git diff ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, encoding: "utf-8", timeout: 10000 });
+      result.diff = raw.length > 15000
+        ? raw.slice(0, 15000) + `\n\n... [diff truncated, ${raw.length - 15000} chars omitted]`
+        : raw;
     } catch {}
 
     // Fallback: if no git history, include uncommitted changes
     if (result.files.length === 0) {
       try {
-        const { stdout } = await execAsync("git diff --name-only 2>/dev/null", { cwd: workingDir, timeout: 5000 });
-        result.files = stdout.trim().split("\n").filter(Boolean);
+        const filesOut = execSync("git diff --name-only 2>/dev/null", { cwd: workingDir, encoding: "utf-8", timeout: 5000 });
+        result.files = filesOut.trim().split("\n").filter(Boolean);
       } catch {}
     }
 

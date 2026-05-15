@@ -35,7 +35,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { METHOD_ATOMS, RULE_ATOMS, GUIDELINE_ATOMS } from "./system-atoms.mjs";
 import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
 import { getActiveJournal, applyMergeDelta } from "./session-journal.mjs";
 import { getIdentity } from "./identity.mjs";
@@ -326,17 +325,13 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
 
   // ── CORE BEHAVIOR ────────────────────────────────────────────────────────
   //
-  // Dynamic system prompt assembly. When the brain has run a contextual search
-  // its unified atom results (system + profile + learned, scored by cosine ×
-  // facetWeight × priority) are used directly. Falls back to ALL_SYSTEM_ATOMS
-  // when the brain hasn't produced results yet — zero regression.
+  // Behavioral guidance is provided by the "Working in Pane" section below,
+  // plus identity, profile rules, and project brief.
+  // On continuation turns, remind the model it has full context.
 
-  const coreInstructions = _buildSystemPromptFromAtoms(
-    brainCtx.atoms || null,
-    contextShape?.taskType || null,
-    contextShape?.complexity || null,
-    backend,
-  );
+  const coreInstructions = historyLength >= 2
+    ? "You have full project context from previous turns. Proceed directly with the task."
+    : "";
   stableParts.unshift(coreInstructions, "");
 
   // ── PANE OPERATING PRINCIPLES ───────────────────────────────────────────
@@ -702,89 +697,10 @@ const VERIFICATION_DIRECTIVES = {
 };
 
 // ---------------------------------------------------------------------------
-// System prompt builder — assembles core instructions from the brain's
-// unified atom results when available. Falls back to system-atoms.mjs imports
-// when the brain hasn't produced results yet (cold start, no embedder).
-//
-// The brain scores atoms by cosine × FACET_WEIGHTS × priority + hintBoost,
-// so the ranking is already task-aware. We just need to assemble them.
+// System prompt builder — retired. All behavioral guidance is now provided by
+// the "Working in Pane" section, identity, profile rules, and project brief.
+// The continuation instruction is inlined at the call site in compileContext().
 // ---------------------------------------------------------------------------
-
-const _GEMINI_SUBAGENTS = [
-  "",
-  "# Available Sub-Agent",
-  "",
-  "A specialized sub-agent is available as a tool for deep codebase analysis. Delegate to it when the task requires methodically tracing through the codebase.",
-  "",
-  "<available_subagent>",
-  "  <name>pane_ora</name>",
-  "  <description>Specialized for codebase analysis, architectural mapping, and system-wide dependencies. Use for vague requests, bug root-cause analysis, refactoring, or comprehensive feature implementation.</description>",
-  "</available_subagent>",
-].join("\n");
-
-function _buildSystemPromptFromAtoms(unifiedAtoms, taskType, complexity, backend) {
-  const parts = [];
-
-  // Extract system atoms from brain's unified results when available.
-  // These are already scored/filtered by the brain for this specific query.
-  const systemAtoms = (unifiedAtoms || []).filter(a => a.entityType === "system_atom");
-
-  if (systemAtoms.length > 0) {
-    // Brain-powered path: atoms are pre-scored, just assemble by facet
-    const methodAtoms = systemAtoms
-      .filter(a => a.facet === "method")
-      .sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
-
-    const ruleAtoms = systemAtoms
-      .filter(a => a.facet === "rule")
-      .sort((a, b) => (b.score || 0) - (a.score || 0));
-
-    const guideAtoms = systemAtoms
-      .filter(a => a.facet === "guideline")
-      .sort((a, b) => (b.score || 0) - (a.score || 0));
-
-    if (methodAtoms.length > 0) {
-      parts.push(methodAtoms.map(a => a.content).join("\n\n"));
-    }
-
-    if (ruleAtoms.length > 0) {
-      parts.push("");
-      parts.push("Constraints:");
-      for (const r of ruleAtoms) parts.push(`- ${r.content}`);
-    }
-
-    if (guideAtoms.length > 0) {
-      parts.push("");
-      for (const g of guideAtoms) parts.push(`- ${g.content}`);
-    }
-  } else {
-    // Fallback: no brain results — inject all system atoms from source of truth.
-    // Identical to the old behavior when no local model was available.
-    const methodAtoms = [...METHOD_ATOMS].sort((a, b) => a.sortOrder - b.sortOrder);
-
-    if (methodAtoms.length > 0) {
-      parts.push(methodAtoms.map(a => a.text).join("\n\n"));
-    }
-
-    if (RULE_ATOMS.length > 0) {
-      parts.push("");
-      parts.push("Constraints:");
-      for (const r of RULE_ATOMS) parts.push(`- ${r.text}`);
-    }
-
-    if (GUIDELINE_ATOMS.length > 0) {
-      parts.push("");
-      for (const g of GUIDELINE_ATOMS) parts.push(`- ${g.text}`);
-    }
-  }
-
-  // Gemini sub-agents
-  if (backend === "gemini") {
-    parts.push(_GEMINI_SUBAGENTS);
-  }
-
-  return parts.join("\n");
-}
 
 function _buildDirective(intent, taskType, complexity, reasoning, verification) {
   const parts = [];

@@ -48,6 +48,11 @@ interface WorkspaceState {
   setDisabledProviders: (providers: string[]) => void;
   toggleProvider: (provider: string) => void;
   isProviderEnabled: (provider: string) => boolean;
+  curatedModels: string[];
+  setCuratedModels: (models: string[]) => void;
+  addCuratedModel: (model: string) => void;
+  removeCuratedModel: (model: string) => void;
+  isCuratedModel: (model: string) => boolean;
   powerCombo: PowerCombo;
   autoEscalate: boolean;
   openRouterModels: OpenRouterModel[];
@@ -209,6 +214,17 @@ function createWorkspaceStore() {
       set({ disabledProviders: next });
     },
     isProviderEnabled: (provider) => !get().disabledProviders.includes(provider),
+    curatedModels: [],
+    setCuratedModels: (models) => set({ curatedModels: models }),
+    addCuratedModel: (model) => {
+      const current = get().curatedModels;
+      if (current.includes(model)) return;
+      set({ curatedModels: [...current, model] });
+    },
+    removeCuratedModel: (model) => {
+      set({ curatedModels: get().curatedModels.filter((m) => m !== model) });
+    },
+    isCuratedModel: (model) => get().curatedModels.includes(model),
     powerCombo: DEFAULT_POWER_COMBO,
     autoEscalate: true,
     openRouterModels: [],

@@ -204,6 +204,29 @@ class ContextStore extends EventEmitter {
     ctx.lastInjected = snapshot;
   }
 
+  /**
+   * Get stored turn summaries for a project.
+   * Returns an empty array if none exist yet.
+   * @param {string} projectId
+   * @returns {Array<TurnSummaryRecord>}
+   */
+  getTurnSummaries(projectId) {
+    const ctx = this._projects.get(projectId);
+    return ctx?.turnSummaries || [];
+  }
+
+  /**
+   * Replace all turn summaries for a project.
+   * @param {string} projectId
+   * @param {Array<TurnSummaryRecord>} summaries
+   */
+  updateTurnSummaries(projectId, summaries) {
+    const ctx = this._getOrCreate(projectId);
+    ctx.turnSummaries = summaries;
+    ctx.lastUpdated = Date.now();
+    ctx.version++;
+  }
+
   _getOrCreate(projectId) {
     let ctx = this._projects.get(projectId);
     if (!ctx) {
@@ -211,6 +234,7 @@ class ContextStore extends EventEmitter {
         brainExport: null,
         contextShape: null,
         lastInjected: null,
+        turnSummaries: null,
         lastUpdated: Date.now(),
         version: 0,
       };
@@ -250,6 +274,18 @@ class ContextStore extends EventEmitter {
  * @property {string} todoSnapshot - Serialized active todo state
  * @property {string} directiveText - The intent directive text that was set
  * @property {number} turnNumber - Turn this snapshot was taken on
+ */
+
+/**
+ * @typedef {object} TurnSummaryRecord
+ * @property {number} turnIndex - Sequential turn number
+ * @property {string} request - First 300 chars of user message
+ * @property {string[]} tools - Unique tool names used this turn
+ * @property {string} conclusion - Last assistant text, truncated to 250 chars
+ * @property {string} compressedText - Full extractive summary marker text
+ * @property {number} tokenCount - Estimated tokens in compressed text
+ * @property {number} rawTokenCount - Estimated tokens in original turn (before compression)
+ * @property {Float32Array|null} embedding - 768-dim embedding, lazily filled
  */
 
 // Singleton instance — shared across all modules in the main process

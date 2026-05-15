@@ -375,6 +375,7 @@ function EngineSelect({
   sdkModels = null,
   httpApiKeys = {},
   disabledProviders = [],
+  curatedModels = [],
 }: {
   value: string;
   onChange: (opt: EngineOption) => void;
@@ -382,6 +383,7 @@ function EngineSelect({
   sdkModels?: import("../../lib/punk-types").SdkModel[] | null;
   httpApiKeys?: Record<string, string>;
   disabledProviders?: string[];
+  curatedModels?: string[];
 }) {
   // Provider display labels
   const providerLabel = useCallback((provider: string): string => {
@@ -403,6 +405,7 @@ function EngineSelect({
     const groups: Record<string, EngineOption[]> = {};
     const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini";
     const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-code";
+    const hasCurated = curatedModels.length > 0;
 
     const isDisabled = (p: string) => disabledProviders.includes(p);
 
@@ -493,42 +496,108 @@ function EngineSelect({
       }
     }
 
+    // Filter by curated models when set
+    if (hasCurated) {
+      const valueParts = value.split("::");
+      const currentModel = valueParts[1]; // already-selected model is always visible
+      for (const providerKey of Object.keys(groups)) {
+        const opts = groups[providerKey];
+        if (!opts) continue;
+        const filtered = opts.filter(
+          (opt) => curatedModels.includes(opt.model) || opt.model === currentModel
+        );
+        if (filtered.length === 0) {
+          delete groups[providerKey];
+        } else {
+          groups[providerKey] = filtered;
+        }
+      }
+    }
+
     return groups;
-  }, [allModels, sdkModels, httpApiKeys, disabledProviders]);
+  }, [allModels, sdkModels, httpApiKeys, disabledProviders, curatedModels, value]);
+
+  const [isOpen, setIsOpen] = useState(false);
+
+  // Find currently selected option
+  const currentOption = useMemo(() => {
+    const parts = value.split("::");
+    const provider = parts[0];
+    const model = parts[1];
+    if (provider && model && groupedOptions[provider]) {
+      return groupedOptions[provider].find((o) => o.model === model) ?? null;
+    }
+    return null;
+  }, [value, groupedOptions]);
+
+  const handleSelect = (opt: EngineOption) => {
+    onChange(opt);
+    setIsOpen(false);
+  };
 
   return (
-    <select
-      value={value}
-      onChange={(e) => {
-        const parts = e.target.value.split("::");
-        const provider = parts[0];
-        const model = parts[1];
-        if (provider && model && provider in groupedOptions) {
-          const group = groupedOptions[provider];
-          if (group) {
-            const opt = group.find((o: EngineOption) => o.model === model);
-            if (opt) onChange(opt);
-          }
-        }
-      }}
-      className="px-3 py-1.5 rounded-xl font-mono bg-pane-surface text-pane-text border border-pane-border/40 hover:border-pane-border outline-none max-w-[220px]"
-      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    <div
+      className={`rounded-md border transition-all duration-200 w-96 ${
+        isOpen
+          ? 'border-[var(--pane-border-soft)] bg-pane-bg/60'
+          : 'border-transparent hover:border-[var(--pane-border-soft)]'
+      }`}
     >
-      {Object.entries(groupedOptions).map(([provider, opts]) => (
-        <optgroup key={provider} label={provider} className="bg-pane-bg">
-          {opts.map((opt: EngineOption) => {
-            const pricing = opt.inputCost != null && opt.outputCost != null
-              ? ` · $${opt.inputCost}/$${opt.outputCost}/M`
-              : "";
-            return (
-              <option key={engineKey(opt)} value={engineKey(opt)}>
-                [{providerLabel(opt.provider)}] {opt.label}{pricing}
-              </option>
-            );
-          })}
-        </optgroup>
-      ))}
-    </select>
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex items-center gap-1.5 text-pane-text-secondary font-mono hover:text-pane-text w-full text-left h-10 leading-none px-4"
+        style={{ fontSize: "var(--pane-font-size-sm)" }}
+      >
+        {currentOption ? (
+          <span className="flex-1 truncate flex items-center gap-1.5">
+            <span style={{ color: "var(--pane-accent)" }}>{providerLabel(currentOption.provider)}</span>
+            <span>{currentOption.label}</span>
+          </span>
+        ) : (
+          <span className="flex-1 truncate">select...</span>
+        )}
+      </button>
+
+      {isOpen && (
+        <div className="border-t border-[var(--pane-border-soft)] px-4 py-3 max-h-[400px] overflow-y-auto">
+          {Object.entries(groupedOptions).map(([provider, opts]) => (
+            <div key={provider}>
+              <div
+                className="font-mono text-pane-text-secondary/30 tracking-wider uppercase mb-1"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                {providerLabel(provider)}
+              </div>
+              {opts.map((opt: EngineOption) => {
+                const isSelected = engineKey(opt) === value;
+                const pricing = opt.inputCost != null && opt.outputCost != null
+                  ? ` · ${opt.inputCost}/${opt.outputCost}/M`
+                  : "";
+                return (
+                  <button
+                    key={engineKey(opt)}
+                    onClick={() => handleSelect(opt)}
+                    className={`w-full text-left px-4 py-1.5 font-mono transition-colors flex items-center gap-2 rounded-md ${
+                      isSelected
+                        ? "bg-pane-text/[0.08] text-pane-status-added"
+                        : "text-pane-text hover:bg-pane-text/[0.03]"
+                    }`}
+                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                  >
+                    <span className="truncate flex-1">{opt.label}</span>
+                    {pricing && (
+                      <span className="shrink-0 text-pane-text-secondary/30 whitespace-nowrap">
+                        {pricing}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -541,6 +610,7 @@ function PaneAutoSection({
   const allModels = useWorkspaceStore((s) => s.allModels);
   const sdkModels = useWorkspaceStore((s) => s.sdkModels);
   const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
+  const curatedModels = useWorkspaceStore((s) => s.curatedModels);
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
 
   const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
@@ -764,7 +834,7 @@ function PaneAutoSection({
         {autoRoute && (
           <>
             <div className="py-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
+              <div className="flex items-start justify-between">
                 <div className="flex flex-col gap-0.5">
                   <span
                     className="text-pane-text font-mono"
@@ -785,6 +855,7 @@ function PaneAutoSection({
                     sdkModels={sdkModels}
                     httpApiKeys={httpApiKeys}
                     disabledProviders={disabledProviders}
+                    curatedModels={curatedModels}
                     value={engineKey(thinkingEngine)}
                     onChange={handleThinkingChange}
                   />
@@ -823,7 +894,7 @@ function PaneAutoSection({
             </div>
 
             <div className="py-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
+              <div className="flex items-start justify-between">
                 <div className="flex flex-col gap-0.5">
                   <span
                     className="text-pane-text font-mono"
@@ -843,6 +914,7 @@ function PaneAutoSection({
                   sdkModels={sdkModels}
                   httpApiKeys={httpApiKeys}
                   disabledProviders={disabledProviders}
+                  curatedModels={curatedModels}
                   value={engineKey(buildingEngine)}
                   onChange={handleBuildingChange}
                 />
@@ -1202,6 +1274,242 @@ function ApiKeysSection({
       >
         saved automatically
       </span>
+    </div>
+  );
+}
+
+// ─── Curated Models Section ──────────────────────────────────────────────────
+
+function CuratedModelsSection() {
+  const curatedModels = useWorkspaceStore((s) => s.curatedModels);
+  const addCuratedModel = useWorkspaceStore((s) => s.addCuratedModel);
+  const removeCuratedModel = useWorkspaceStore((s) => s.removeCuratedModel);
+  const allModels = useWorkspaceStore((s) => s.allModels);
+  const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
+
+  const [search, setSearch] = useState("");
+  const [manualId, setManualId] = useState("");
+  const [added, setAdded] = useState(false);
+
+  // Build flat list of all available models (non-disabled providers)
+  const availableModels = useMemo(() => {
+    const list: { id: string; name: string; provider: string; label: string; inputCost: number | null; outputCost: number | null }[] = [];
+    for (const [providerKey, models] of Object.entries(allModels)) {
+      if (!models || models.length === 0) continue;
+      if (disabledProviders.includes(providerKey)) continue;
+      for (const m of models) {
+        list.push({
+          id: m.id,
+          name: m.name || m.id,
+          provider: providerKey,
+          label: providerKey === "anthropic" || providerKey === "anthropic-api" ? "Claude" :
+                 providerKey === "gemini" || providerKey === "gemini-api" ? "Gemini" :
+                 providerKey === "deepseek" ? "DeepSeek" :
+                 providerKey === "openrouter" ? "OpenRouter" :
+                 providerKey === "kimi" ? "Kimi" :
+                 providerKey === "stepfun" ? "StepFun" :
+                 providerKey === "xiaomi" ? "Xiaomi" : providerKey,
+          inputCost: m.input_cost,
+          outputCost: m.output_cost,
+        });
+      }
+    }
+    return list;
+  }, [allModels, disabledProviders]);
+
+  // Filter available by search
+  const filteredAvailable = useMemo(() => {
+    if (!search.trim()) return [];
+    const q = search.toLowerCase();
+    return availableModels.filter((m) =>
+      m.name.toLowerCase().includes(q) ||
+      m.id.toLowerCase().includes(q) ||
+      m.label.toLowerCase().includes(q)
+    ).slice(0, 50); // cap at 50 for performance
+  }, [availableModels, search]);
+
+  // Resolve curated model names from available data
+  const curatedWithDetails = useMemo(() => {
+    return curatedModels.map((id) => {
+      const found = availableModels.find((m) => m.id === id);
+      return found || { id, name: id, provider: "", label: "", inputCost: null, outputCost: null };
+    });
+  }, [curatedModels, availableModels]);
+
+  const handleAddManual = () => {
+    const id = manualId.trim();
+    if (!id) return;
+    addCuratedModel(id);
+    setManualId("");
+    setAdded(true);
+    setTimeout(() => setAdded(false), 1500);
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Your Models list */}
+      {curatedModels.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <span
+            className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            your models ({curatedModels.length})
+          </span>
+          <div className="flex flex-col gap-1">
+            {curatedWithDetails.map((m) => (
+              <div key={m.id} className="flex items-center justify-between py-1.5 px-2.5 rounded-lg bg-pane-bg/40 ring-1 ring-pane-border/20">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span
+                    className="text-pane-text-secondary/20 font-mono shrink-0"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {m.label || "—"}
+                  </span>
+                  <span
+                    className="font-mono text-pane-text truncate"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {m.name}
+                  </span>
+                </div>
+                <button
+                  onClick={() => removeCuratedModel(m.id)}
+                  className="text-pane-text-secondary/30 hover:text-pane-status-removed transition-colors shrink-0 ml-2"
+                  title="remove"
+                >
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                    <path d="M3 3l6 6M9 3l-6 6" />
+                  </svg>
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {curatedModels.length === 0 && (
+        <span
+          className="text-pane-text-secondary/30 font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          no models selected — all available models will show in the picker
+        </span>
+      )}
+
+      {/* Separator */}
+      <div className="border-t border-pane-border/20" />
+
+      {/* Browse all */}
+      <div className="flex flex-col gap-2">
+        <span
+          className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          browse all
+        </span>
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="search models..."
+          className="w-full px-2.5 py-1.5 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        />
+        {search && filteredAvailable.length > 0 && (
+          <div className="flex flex-col gap-1 max-h-60 overflow-y-auto">
+            {filteredAvailable.map((m) => {
+              const alreadyAdded = curatedModels.includes(m.id);
+              return (
+                <div
+                  key={m.id}
+                  className="flex items-center justify-between py-1.5 px-2.5 rounded-lg hover:bg-pane-bg/40 transition-colors"
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className="text-pane-text-secondary/20 font-mono shrink-0"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {m.label}
+                    </span>
+                    <span
+                      className="font-mono text-pane-text truncate"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {m.name}
+                    </span>
+                    {(m.inputCost != null && m.outputCost != null) && (
+                      <span
+                        className="text-pane-text-secondary/20 font-mono shrink-0"
+                        style={{ fontSize: "var(--pane-font-size-xs)" }}
+                      >
+                        ${m.inputCost}/M · ${m.outputCost}/M
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => alreadyAdded ? removeCuratedModel(m.id) : addCuratedModel(m.id)}
+                    className={`shrink-0 ml-2 transition-colors ${alreadyAdded ? 'text-pane-status-added hover:text-pane-status-removed' : 'text-pane-text-secondary/40 hover:text-pane-status-added'}`}
+                    title={alreadyAdded ? "remove" : "add"}
+                  >
+                    {alreadyAdded ? (
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                        <path d="M3 6h6" />
+                      </svg>
+                    ) : (
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                        <path d="M6 2v8M2 6h8" />
+                      </svg>
+                    )}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {search && filteredAvailable.length === 0 && (
+          <span
+            className="text-pane-text-secondary/30 font-mono"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            no models match "{search}"
+          </span>
+        )}
+      </div>
+
+      {/* Add by ID */}
+      <div className="flex flex-col gap-2">
+        <span
+          className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          add by id
+        </span>
+        <div className="flex items-center gap-2">
+          <input
+            value={manualId}
+            onChange={(e) => setManualId(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleAddManual(); }}
+            placeholder="e.g. anthropic/claude-sonnet-4-5-20250929"
+            className="flex-1 px-2.5 py-1.5 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          />
+          <button
+            onClick={handleAddManual}
+            disabled={!manualId.trim()}
+            className="px-3 py-1.5 rounded-lg font-mono text-pane-text-secondary bg-pane-bg/40 ring-1 ring-pane-border/30 hover:ring-pane-border/50 transition-colors disabled:opacity-30"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {added ? "added" : "add"}
+          </button>
+        </div>
+        <span
+          className="text-pane-text-secondary/25 font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          paste any model id — it'll appear in the picker even if it hasn't been fetched yet
+        </span>
+      </div>
     </div>
   );
 }
@@ -1692,6 +2000,11 @@ export function Profile() {
         <path d="M12 22v-6" />
       </svg>
     ),
+    models: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+      </svg>
+    ),
   };
 
   return (
@@ -1759,6 +2072,18 @@ export function Profile() {
               claudeCodeAvailable={claudeCodeAvailable}
               geminiAvailable={geminiAvailable}
             />
+          </AccordionSection>
+        )}
+
+        {/* Curate Models Section */}
+        {punkBackend === "api" && (
+          <AccordionSection
+            title="curate models"
+            icon={icons.models}
+            isExpanded={expandedSection === "curatedModels"}
+            onToggle={() => setExpandedSection(expandedSection === "curatedModels" ? null : "curatedModels")}
+          >
+            <CuratedModelsSection />
           </AccordionSection>
         )}
 

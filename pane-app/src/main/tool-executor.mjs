@@ -16,7 +16,6 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { spawn, exec, execSync } from "node:child_process";
-import { promisify } from "node:util";
 import os from "node:os";
 import crypto from "node:crypto";
 import vm from "node:vm";
@@ -26,7 +25,59 @@ import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 import { readState, readHandoff } from "./pane-system-prompt.mjs";
 import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
 
-const execAsync = promisify(exec);
+// ── CMD Worker (utility process for shell execution) ──────────────────────
+// In Electron 40's packaged macOS app, child_process.spawn/execSync fails with
+// EBADF because Chromium's integrated event loop conflicts with libuv's kqueue
+// EVFILT_PROC registration. The cmd-worker runs in its own V8 isolate via
+// utilityProcess.fork() with a clean libuv loop — execSync works there.
+// Set via setCmdWorker() from main.mjs after pre-forking the worker.
+let _cmdWorker = null;
+
+/**
+ * Register the cmd-worker instance from main.mjs.
+ * Called once at startup after utilityProcess.fork("cmd-worker.mjs").
+ */
+export function setCmdWorker(worker) {
+  _cmdWorker = worker;
+}
+
+/**
+ * Execute a command through the cmd-worker utility process.
+ * Returns a promise that resolves with { success, stdout, stderr, exitCode }.
+ */
+function execThroughWorker(command, options = {}) {
+  return new Promise((resolve) => {
+    if (!_cmdWorker || _cmdWorker.killed) {
+      resolve({ success: false, stdout: "", stderr: "", exitCode: -1, errorMessage: "cmd-worker not available" });
+      return;
+    }
+
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const handler = (response) => {
+      if (response.id === id) {
+        _cmdWorker.removeListener("message", handler);
+        resolve(response);
+      }
+    };
+    _cmdWorker.on("message", handler);
+
+    _cmdWorker.postMessage({
+      id,
+      command,
+      cwd: options.cwd,
+      env: options.env,
+      timeout: options.timeout || 120,
+    });
+
+    // Safety timeout — if worker never responds, reject
+    const safeTimeout = setTimeout(() => {
+      _cmdWorker.removeListener("message", handler);
+      resolve({ success: false, stdout: "", stderr: "", exitCode: -1, errorMessage: "cmd-worker timed out" });
+    }, (options.timeout || 120) * 1000 + 10000);
+    // Unref so it doesn't keep the process alive
+    if (safeTimeout.unref) safeTimeout.unref();
+  });
+}
 
 // ============================================================================
 // Semantic Search Helpers (Lazy-loaded)
@@ -680,25 +731,26 @@ export class ToolExecutor {
    * Execute a Bash command
    */
   async executeBash(toolId, command, background = false, cwd = null) {
+    // Validate command
+    const validation = this.validateCommand(command);
+    if (!validation.valid) {
+      return {
+        success: false,
+        error: `Command validation failed: ${validation.error}`,
+        toolId,
+      };
+    }
+
+    const execOptions = { ...this.executionContext };
+    if (cwd) {
+      const resolvedCwd = this.resolveProjectPath(cwd);
+      if (resolvedCwd) execOptions.cwd = resolvedCwd;
+    }
+
     try {
-      // Validate command
-      const validation = this.validateCommand(command);
-      if (!validation.valid) {
-        return {
-          success: false,
-          error: `Command validation failed: ${validation.error}`,
-          toolId,
-        };
-      }
-
-      const execOptions = { ...this.executionContext };
-      if (cwd) {
-        const resolvedCwd = this.resolveProjectPath(cwd);
-        if (resolvedCwd) execOptions.cwd = resolvedCwd;
-      }
-
       if (background) {
-        // Run in background
+        // Background spawn: single long-lived process — negligible kqueue leak.
+        // Use spawn (not execSync) because execSync blocks.
         const child = spawn(command, {
           ...execOptions,
           detached: true,
@@ -715,66 +767,76 @@ export class ToolExecutor {
           pid: child.pid,
         };
       } else {
-        // Run and capture output
+        // Use cmd-worker (utility process) — bypasses main process uv_spawn/kqueue issue.
+        // The cmd-worker runs in its own V8 isolate via utilityProcess.fork() and has
+        // a clean libuv loop where execSync works without EBADF.
         const startTime = Date.now();
 
-        const { stdout, stderr } = await execAsync(command, {
-          ...execOptions,
-          encoding: DEFAULT_ENCODING,
+        const result = await execThroughWorker(command, {
+          cwd: execOptions.cwd,
+          timeout: 120,
         });
 
         const duration = Date.now() - startTime;
 
-        // Combine stdout and stderr
-        let output = "";
-        if (stdout) output += stdout;
-        if (stderr) {
-          if (output) output += "\n";
-          output += `STDERR: ${stderr}`;
-        }
+        if (result.success) {
+          // Truncate if too large
+          let output = result.stdout || "";
+          if (output.length > MAX_OUTPUT_SIZE) {
+            output = output.substring(0, MAX_OUTPUT_SIZE) + "\n...[output truncated]";
+          }
 
-        // Truncate if too large
-        if (output.length > MAX_OUTPUT_SIZE) {
-          output =
-            output.substring(0, MAX_OUTPUT_SIZE) + "\n...[output truncated]";
-        }
+          return {
+            success: true,
+            output: output || "(no output)",
+            toolId,
+            duration,
+            exitCode: 0,
+          };
+        } else {
+          // Worker was unavailable (not forked yet) — try direct execSync as last resort
+          if (result.errorMessage === "cmd-worker not available") {
+            try {
+              const stdout = execSync(command, {
+                ...execOptions,
+                encoding: DEFAULT_ENCODING,
+                timeout: 30000,
+                stdio: ['pipe', 'pipe', 'pipe'],
+              });
+              let output = stdout || "";
+              if (output.length > MAX_OUTPUT_SIZE) {
+                output = output.substring(0, MAX_OUTPUT_SIZE) + "\n...[output truncated]";
+              }
+              return { success: true, output: output || "(no output)", toolId, duration: Date.now() - startTime, exitCode: 0 };
+            } catch (fallbackErr) {
+              // Both worker and direct execSync failed — report the worker's error
+              return {
+                success: false,
+                error: `Command failed: ${result.stderr || result.stdout || result.errorMessage}`,
+                output: result.stderr || result.stdout,
+                toolId,
+                exitCode: result.exitCode,
+              };
+            }
+          }
 
-        return {
-          success: true,
-          output: output || "(no output)",
-          toolId,
-          duration,
-          exitCode: 0,
-        };
+          // Command failed with non-zero exit code
+          return {
+            success: false,
+            error: `Command failed with exit code ${result.exitCode}: ${result.stderr || result.stdout || result.errorMessage}`,
+            output: result.stderr || result.stdout,
+            toolId,
+            exitCode: result.exitCode,
+          };
+        }
       }
     } catch (error) {
-      // execAsync throws on non-zero exit code
-      if (error.code && error.signal === null) {
-        // Command failed with exit code
-        return {
-          success: false,
-          error: `Command failed with exit code ${error.code}`,
-          output: error.stderr || error.stdout || error.message,
-          toolId,
-          exitCode: error.code,
-        };
-      } else if (error.signal) {
-        // Command killed by signal
-        return {
-          success: false,
-          error: `Command killed by signal: ${error.signal}`,
-          output: error.stderr || error.stdout || error.message,
-          toolId,
-          signal: error.signal,
-        };
-      } else {
-        // Other error
-        return {
-          success: false,
-          error: error.message,
-          toolId,
-        };
-      }
+      // Unexpected error in the orchestration itself (not command execution)
+      return {
+        success: false,
+        error: `Execution error: ${error.message}`,
+        toolId,
+      };
     }
   }
 
@@ -2108,55 +2170,6 @@ export class ToolExecutor {
           return { success: true, output: formatReferencesOutput(symbol, byFile, totalMatches, filesSearched), toolId };
         }
 
-        case "pane_synthesize": {
-          // Read synthesis from contextual export (written by brain-engine)
-          const contextPath = path.join(paneDir, "brain", "context", `${this.projectId}.json`);
-          let ctx = null;
-          try { ctx = JSON.parse(await fsPromises.readFile(contextPath, "utf-8")); } catch {}
-
-          if (ctx?.synthesis) {
-            return { success: true, output: `## Project Memory\n\n${ctx.synthesis}`, toolId };
-          }
-
-          // Fallback: check if brain export has enough nodes to build one
-          const brainExportPath = path.join(paneDir, "brain", "exports", `${this.projectId}.json`);
-          let exported = null;
-          try { exported = JSON.parse(await fsPromises.readFile(brainExportPath, "utf-8")); } catch {}
-
-          if (!exported || exported.length === 0) {
-            return { success: true, output: "Project memory not available yet — it builds as decisions and lessons accumulate through your work.", toolId };
-          }
-
-          const decisions = exported.filter(n => n.type === "decision" && (n.confidence || 0) >= 0.70).slice(0, 12);
-          const patterns  = exported.filter(n => n.type === "pattern"  && (n.confidence || 0) >= 0.70).slice(0, 8);
-          const lessons   = exported.filter(n => n.type === "lesson"   && (n.confidence || 0) >= 0.72).slice(0, 8);
-          const fixes     = exported.filter(n => n.type === "error_fix"&& (n.confidence || 0) >= 0.70).slice(0, 6);
-
-          if (decisions.length + patterns.length + lessons.length + fixes.length === 0) {
-            return { success: true, output: "Project memory not available yet — confidence is still building.", toolId };
-          }
-
-          const parts = ["## Project Memory\n"];
-          if (decisions.length > 0) {
-            parts.push("Architectural decisions:");
-            for (const d of decisions) parts.push(`- ${d.content}`);
-          }
-          if (patterns.length > 0) {
-            parts.push("\nEstablished patterns:");
-            for (const p of patterns) parts.push(`- ${p.content}`);
-          }
-          if (lessons.length > 0) {
-            parts.push("\nLessons learned:");
-            for (const l of lessons) parts.push(`- ${l.content}`);
-          }
-          if (fixes.length > 0) {
-            parts.push("\nKnown anti-patterns:");
-            for (const f of fixes) parts.push(`- ${f.content}`);
-          }
-
-          return { success: true, output: parts.join("\n"), toolId };
-        }
-
         case "pane_profile": {
           const profileDir = path.join(paneDir, "profile");
           const parts = [];
@@ -2410,12 +2423,15 @@ Be thorough. Trace through the full call chain. Check test files for expected be
           const state = readState(this.projectId);
           const parts = [];
 
-          // Active task
-          if (state.activeTask) {
-            const age = state.activeTask.timestamp
-              ? Math.round((Date.now() - state.activeTask.timestamp) / (1000 * 60 * 60))
-              : null;
-            parts.push(`Active task${age ? ` (set ${age}h ago)` : ""}: ${state.activeTask.description}`);
+          // Stale task retirement — 8-hour threshold. Same policy as context-orchestrator.mjs.
+          const STALE_THRESHOLD_MS = 8 * 60 * 60 * 1000;
+          if (state.activeTask && (!state.activeTask.timestamp || (Date.now() - state.activeTask.timestamp) > STALE_THRESHOLD_MS)) {
+            state.activeTask = null;
+            // PERSIST: the caller doesn't have projectId for mergeState here, so we just report it
+            parts.push("No active task set (previous task was stale and has been cleared).");
+          } else if (state.activeTask) {
+            const age = Math.round((Date.now() - state.activeTask.timestamp) / (1000 * 60 * 60));
+            parts.push(`Active task (set ${age}h ago): ${state.activeTask.description}`);
             if (state.activeTask.goal) parts.push(`Goal: ${state.activeTask.goal}`);
           } else {
             parts.push("No active task set.");
@@ -2482,9 +2498,9 @@ Be thorough. Trace through the full call chain. Check test files for expected be
 
           // Fallback: list files from working directory
           try {
-            const { stdout } = await execAsync(
+            const stdout = execSync(
               `find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' | head -200`,
-              { cwd: this.workingDir, timeout: 5000 }
+              { cwd: this.workingDir, encoding: 'utf-8', timeout: 5000 }
             );
             return { success: true, output: `Project files:\n${stdout}`, toolId };
           } catch {
@@ -2497,8 +2513,8 @@ Be thorough. Trace through the full call chain. Check test files for expected be
 
           // Git status
           try {
-            const { stdout: status } = await execAsync("git status --short", { cwd: this.workingDir, timeout: 5000 });
-            const { stdout: branch } = await execAsync("git branch --show-current", { cwd: this.workingDir, timeout: 3000 });
+            const status = execSync("git status --short", { cwd: this.workingDir, encoding: 'utf-8', timeout: 5000 });
+            const branch = execSync("git branch --show-current", { cwd: this.workingDir, encoding: 'utf-8', timeout: 3000 });
             parts.push(`Branch: ${branch.trim()}`);
             if (status.trim()) {
               parts.push(`\nChanged files:\n${status.trim()}`);
@@ -2511,7 +2527,7 @@ Be thorough. Trace through the full call chain. Check test files for expected be
 
           // Recent git log
           try {
-            const { stdout: log } = await execAsync("git log --oneline -5", { cwd: this.workingDir, timeout: 5000 });
+            const log = execSync("git log --oneline -5", { cwd: this.workingDir, encoding: 'utf-8', timeout: 5000 });
             if (log.trim()) {
               parts.push(`\nRecent commits:\n${log.trim()}`);
             }
@@ -2519,7 +2535,7 @@ Be thorough. Trace through the full call chain. Check test files for expected be
 
           // Git diff summary
           try {
-            const { stdout: diff } = await execAsync("git diff --stat HEAD 2>/dev/null || git diff --stat", { cwd: this.workingDir, timeout: 5000 });
+            const diff = execSync("git diff --stat HEAD 2>/dev/null || git diff --stat", { cwd: this.workingDir, encoding: 'utf-8', timeout: 5000 });
             if (diff.trim()) {
               parts.push(`\nDiff summary:\n${diff.trim()}`);
             }

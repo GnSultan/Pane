@@ -39,7 +39,7 @@ const MemoizedMessage = memo(
     projectId: string;
   }) {
     return (
-      <div>
+      <div style={{ contentVisibility: "auto", containIntrinsicSize: "auto 120px" }}>
         <MessageBubble
           message={message}
           toolResults={toolResults}
@@ -191,7 +191,9 @@ export const Conversation = memo(function Conversation({
 
   // Restore saved scroll position when messages first arrive from disk.
   useEffect(() => {
-    if (messages.length > 0) applyRestored();
+    if (messages.length > 0) {
+      applyRestored();
+    }
   }, [messages.length]);
 
   // Context refresh toast — shows briefly when proactive continuation fires
@@ -301,7 +303,7 @@ export const Conversation = memo(function Conversation({
     <div className="relative flex flex-col h-full w-full">
       <div
         ref={scrollRef}
-        className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto px-10 pb-8 pt-8 [overflow-anchor:none] bg-pane-bg will-change-transform [contain:layout_paint]"
+        className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto px-10 pb-8 pt-8 bg-pane-bg"
         data-conv-scroll
         data-no-drag
       >
@@ -336,7 +338,6 @@ export const Conversation = memo(function Conversation({
             projectId={projectId}
           />
         ))}
-
       </div>
 
       {showRefreshToast && (
