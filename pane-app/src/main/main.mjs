@@ -824,6 +824,7 @@ Improvements
         const tables = [
           "messages",
           "conversation_meta",
+          "conversations",
           "change_history",
           "checkpoints",
           "state_blobs",
@@ -1510,8 +1511,8 @@ function registerCheckpointHandlers(db) {
   });
 
   ipcMain.handle("resume_from_checkpoint", async (_event, args) => {
-    const { projectId, sessionId } = args;
-    const turns = loadRecentTurns(projectId, sessionId, 1);
+    const { projectId, sessionId, conversationId } = args;
+    const turns = loadRecentTurns(projectId, 1, conversationId || null);
     if (turns.length === 0) return null;
     return turns[0];
   });
@@ -1743,14 +1744,14 @@ function registerStateHandlers(db) {
     upsertBlob(args.projectId, "project", args.data);
   });
 
-  // save_conversation: accepts projectId instead of filePath.
-  // Renderer sends only delta messages (new/modified since last persist) via
-  // debounced delta persistence. INSERT OR REPLACE handles both re-persisting
-  // an updated message (content streaming updates) and inserting new messages.
-  // Rows in the DB outside the delta slice are untouched; no prefix-merge needed.
+  // save_conversation: accepts projectId and optional conversationId.
+  // When conversationId is provided, messages are scoped to that conversation.
+  // Renderer sends only delta messages via debounced delta persistence.
+  // Fall back to "main" conversationId for backward compat (pre-v7 data).
   ipcMain.handle("save_conversation", (_event, args) => {
-    const { projectId, conversation } = args;
+    const { projectId, conversationId, conversation } = args;
     const { model, messages } = conversation;
+    const convId = conversationId || null;
 
     const save = db.transaction(() => {
       for (const msg of messages) {
@@ -1763,6 +1764,7 @@ function registerStateHandlers(db) {
           msg.cost_usd ?? null, msg.duration_ms ?? null,
           msg.input_tokens ?? null, msg.output_tokens ?? null,
           msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
+          convId, // 13th param: conversation_id
         );
         // Keep FTS in sync: delete old entry (if any), insert fresh
         const text = extractMessageText(contentJson);
@@ -1772,6 +1774,36 @@ function registerStateHandlers(db) {
         }
       }
       db.stmts.upsertConvMeta.run(projectId, null, model ?? null, Date.now());
+      // Update conversations table if conversationId provided.
+      // Preserve existing label and phase — do NOT overwrite with empty strings.
+      // If the conversation row doesn't exist yet (e.g. 0-message project at migration
+      // time), INSERT it so the row is never orphaned.
+      if (convId) {
+        const existing = db.stmts.getConversation.get(convId);
+        if (existing) {
+          db.stmts.updateConversation.run(
+            existing.label,
+            existing.phase,
+            model ?? existing.model,
+            Date.now(),
+            convId,
+          );
+        } else {
+          // First save — conversation row doesn't exist. Create it using
+          // the label/phase from the renderer (passed via conversation object).
+          const now = Date.now();
+          db.stmts.insertConversation.run(
+            convId,
+            projectId,
+            conversation.label ?? "Conversation",   // default label
+            conversation.phase ?? "idle",           // default phase
+            model ?? null,
+            now,
+            now,
+            0,        // not archived
+          );
+        }
+      }
     });
 
     try {
@@ -1781,25 +1813,103 @@ function registerStateHandlers(db) {
     }
   });
 
-  // Returns a slice of messages from SQLite — sub-millisecond indexed query
-  // regardless of total conversation size.
-  ipcMain.handle("get_conversation_slice", (_event, { projectId, beforeIndex, count }) => {
-    const _t = Date.now();
+  // Returns a slice of messages from SQLite — scoped by conversationId when provided.
+  // Fall back to project-scoped query for backward compat (pre-v7 data).
+  ipcMain.handle("get_conversation_slice", (_event, { projectId, conversationId, beforeIndex, count }) => {
     try {
+      if (conversationId) {
+        const totalCount = db.stmts.countMessagesForConv.get(conversationId).cnt;
+        const end = (beforeIndex != null && beforeIndex >= 0) ? beforeIndex : totalCount;
+        const start = Math.max(0, end - count);
+        const rows = db.stmts.selectMessagesSliceForConv.all(conversationId, end - start, start);
+        const conv = db.stmts.getConversation.get(conversationId);
+        return {
+          messages: rows.map(r => JSON.parse(r.content)),
+          totalCount,
+          startIndex: start,
+          model: conv?.model ?? null,
+        };
+      }
+      // Fallback: project-scoped query for pre-v7 data
       const totalCount = db.stmts.countMessages.get(projectId).cnt;
       const end = (beforeIndex != null && beforeIndex >= 0) ? beforeIndex : totalCount;
       const start = Math.max(0, end - count);
       const rows = db.stmts.selectMessagesSlice.all(projectId, end - start, start);
       const meta = db.stmts.getConvMeta.get(projectId);
-      const result = {
+      return {
         messages: rows.map(r => JSON.parse(r.content)),
         totalCount,
         startIndex: start,
         model: meta?.model ?? null,
       };
-      return result;
     } catch {
       return { messages: [], totalCount: 0, startIndex: 0, model: null };
+    }
+  });
+
+  // ── Multi-conversation handlers ───────────────────────────────────────
+  // Create a new conversation. Accepts optional id for renderer-generated UUIDs.
+  ipcMain.handle("create_conversation", (_event, { projectId, label = "new", phase = "idle", model = null, id: providedId = null }) => {
+    try {
+      const id = providedId || crypto.randomUUID();
+      const now = Date.now();
+      db.stmts.insertConversation.run(id, projectId, label, phase, model, now, now, 0);
+      return { id };
+    } catch (e) {
+      console.error("[pane-db] create_conversation error:", e.message);
+      return { id: null };
+    }
+  });
+
+  // Get all non-archived conversations for a project.
+  ipcMain.handle("get_project_conversations", (_event, { projectId }) => {
+    try {
+      const rows = db.stmts.getProjectConversations.all(projectId);
+      return { conversations: rows };
+    } catch (e) {
+      console.error("[pane-db] get_project_conversations error:", e.message);
+      return { conversations: [] };
+    }
+  });
+
+  // Archive a conversation (soft delete — hidden from UI, data preserved).
+  ipcMain.handle("archive_conversation", (_event, { conversationId }) => {
+    try {
+      db.stmts.archiveConversation.run(Date.now(), conversationId);
+    } catch (e) {
+      console.error("[pane-db] archive_conversation error:", e.message);
+    }
+  });
+
+  // Restore an archived conversation (sets is_archived = 0).
+  ipcMain.handle("restore_conversation", (_event, { conversationId }) => {
+    try {
+      db.stmts.restoreConversation.run(Date.now(), conversationId);
+    } catch (e) {
+      console.error("[pane-db] restore_conversation error:", e.message);
+    }
+  });
+
+  // Rename a conversation.
+  ipcMain.handle("rename_conversation", (_event, { conversationId, label }) => {
+    try {
+      db.stmts.updateConversation.run(label, null, null, Date.now(), conversationId);
+    } catch (e) {
+      console.error("[pane-db] rename_conversation error:", e.message);
+    }
+  });
+
+  // Delete a conversation and all its messages.
+  ipcMain.handle("delete_conversation", (_event, { conversationId }) => {
+    try {
+      const del = db.transaction(() => {
+        // Must delete messages FIRST — FTS cleanup trigger fires on message deletion
+        db.stmts.deleteMessagesForConv.run(conversationId);
+        db.stmts.deleteConversation.run(conversationId);
+      });
+      del();
+    } catch (e) {
+      console.error("[pane-db] delete_conversation error:", e.message);
     }
   });
 

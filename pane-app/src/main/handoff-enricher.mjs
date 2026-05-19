@@ -46,7 +46,7 @@ function readSettings() {
  * @param {Function} updateLatestHandoffFn
  * @returns {Promise<boolean>}
  */
-export async function enrichHandoff(projectId, updateLatestHandoffFn) {
+export async function enrichHandoff(projectId, updateLatestHandoffFn, conversationId = null) {
   const settings = readSettings();
   const provider = settings.http_provider || "deepseek";
   const apiKey =
@@ -61,7 +61,7 @@ export async function enrichHandoff(projectId, updateLatestHandoffFn) {
     return false;
   }
 
-  const journalText = readJournal(projectId);
+  const journalText = readJournal(projectId, conversationId);
   if (!journalText) {
     console.log("[handoff-enricher] No journal found, skipping enrichment");
     return false;
@@ -69,12 +69,10 @@ export async function enrichHandoff(projectId, updateLatestHandoffFn) {
 
   let handoff = null;
   try {
-    handoff = JSON.parse(
-      fs.readFileSync(
-        path.join(SESSION_DIR, projectId, "handoff.json"),
-        "utf-8",
-      ),
-    );
+    const handoffPath = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`, "handoff.json")
+      : path.join(SESSION_DIR, projectId, "handoff.json");
+    handoff = JSON.parse(fs.readFileSync(handoffPath, "utf-8"));
   } catch {
     return false;
   }
@@ -88,7 +86,7 @@ export async function enrichHandoff(projectId, updateLatestHandoffFn) {
     const enrichment = parseEnrichmentResponse(result);
     if (!enrichment) return false;
 
-    mergeEnrichment(projectId, handoff, enrichment, updateLatestHandoffFn);
+    mergeEnrichment(projectId, handoff, enrichment, updateLatestHandoffFn, conversationId);
     console.log("[handoff-enricher] Handoff enriched successfully");
     return true;
   } catch (err) {
@@ -104,9 +102,11 @@ export async function enrichHandoff(projectId, updateLatestHandoffFn) {
 // Journal reading
 // ---------------------------------------------------------------------------
 
-function readJournal(projectId) {
+function readJournal(projectId, conversationId = null) {
   try {
-    const journalPath = path.join(SESSION_DIR, projectId, "journal.jsonl");
+    const journalPath = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`, "journal.jsonl")
+      : path.join(SESSION_DIR, projectId, "journal.jsonl");
     if (!fs.existsSync(journalPath)) return null;
 
     const raw = fs.readFileSync(journalPath, "utf-8");
@@ -318,7 +318,7 @@ function ensureArray(val, maxItems) {
 // Merge into handoff
 // ---------------------------------------------------------------------------
 
-function mergeEnrichment(projectId, handoff, enrichment, updateFn) {
+function mergeEnrichment(projectId, handoff, enrichment, updateFn, conversationId = null) {
   const enriched = { ...handoff };
 
   if (enrichment.reasoningChain.length > 0) {
@@ -370,13 +370,9 @@ function mergeEnrichment(projectId, handoff, enrichment, updateFn) {
   }
 
   if (updateFn) {
-    updateFn(projectId, enriched);
+    updateFn(projectId, enriched, conversationId);
   }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 function getDefaultModelForProvider(provider) {
   const defaults = {

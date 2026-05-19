@@ -49,68 +49,76 @@ interface PersistedConversation {
   model?: string | null;
   messages: ConversationMessage[];
   startIndex?: number;
+  label?: string;
+  phase?: string;
 }
 
 // --- Delta tracking for conversation persistence ---
 //
-// Tracks the last persisted message ID per project so we only send new/modified
-// messages over IPC, instead of the entire conversation array every time.
-// Combined with debouncing, this eliminates main-process event loop blocking
-// that causes 15-second UI freezes in deep sessions.
+// Tracks the last persisted message ID per conversation so we only send
+// new/modified messages over IPC, instead of the entire conversation array.
+// Keyed by `${projectId}:${conversationId}` for per-conversation tracking.
+// Combined with debouncing, this eliminates main-process event loop blocking.
 const lastPersistedMessageId = new Map<string, string | null>();
 const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const DEBOUNCE_MS = 500;
 
+function convDeltaKey(projectId: string, conversationId: string): string {
+  return `${projectId}:${conversationId}`;
+}
+
 async function saveConversation(
   projectId: string,
+  conversationId: string | null,
   conversation: PersistedConversation,
 ): Promise<void> {
-  // Passes projectId directly — main process owns storage (SQLite).
-  await saveConversationToMain(projectId, conversation);
+  await saveConversationToMain(projectId, conversationId, conversation);
 }
 
 /**
- * Save only messages that have changed since the last persist.
- *
- * Computes a delta by finding the last persisted message in the current array
- * and sending everything from that point forward (inclusive — re-saves the
- * last known message to cover in-place streaming updates).
- *
- * If the last persisted ID is not found (messages were trimmed by context
- * window management), falls back to sending the entire array.
+ * Save only messages that have changed since the last persist for a specific conversation.
+ * Uses the same delta logic as before but scoped by (projectId, conversationId).
  */
-function saveConversationDelta(projectId: string): void {
+function saveConversationDelta(projectId: string, conversationId: string | null): void {
   const ps = useProjectsStore.getState();
   const p = ps.projects.get(projectId);
   if (!p) return;
 
-  const messages = p.conversation.messages;
-  const lastId = lastPersistedMessageId.get(projectId) ?? null;
+  // If conversationId is null, fall back to project.conversation (backward compat)
+  const conv = conversationId
+    ? p.conversations.get(conversationId)?.state
+    : p.conversation;
+  if (!conv) return;
 
-  // Find where to start the delta slice
+  const messages = conv.messages;
+  const key = conversationId ? convDeltaKey(projectId, conversationId) : projectId;
+  const lastId = lastPersistedMessageId.get(key) ?? null;
+
   let sliceStart = 0;
   if (lastId) {
     const idx = messages.findIndex((m) => m.id === lastId);
     if (idx !== -1) {
-      // Start from the last persisted message (inclusive) to cover in-place
-      // streaming updates to the assistant message.
       sliceStart = idx;
     }
-    // If idx === -1, messages were trimmed from the front — send everything.
   }
 
   const delta = messages.slice(sliceStart);
   if (delta.length === 0) return;
 
-  saveConversation(projectId, {
-    model: p.conversation.model,
+  // Get conversation meta for label/phase passthrough to DB lazy creation
+  const convMeta = conversationId ? p.conversations.get(conversationId) : null;
+
+  saveConversation(projectId, conversationId, {
+    model: conv.model,
     messages: delta,
-    startIndex: p.conversation.historyStartIndex,
+    startIndex: conv.historyStartIndex,
+    label: convMeta?.label ?? undefined,
+    phase: convMeta?.phase ?? undefined,
   })
     .then(() => {
       const last = delta[delta.length - 1];
       if (last?.id) {
-        lastPersistedMessageId.set(projectId, last.id);
+        lastPersistedMessageId.set(key, last.id);
       }
     })
     .catch(() => {});
@@ -237,6 +245,74 @@ export function useSettingsPersistence() {
           }
 
           if (activeId) setActiveProject(activeId);
+
+          // ── Hydrate conversations from DB ──────────────────────────────
+          // Replace the in-memory "main" conversations (created with fresh UUIDs
+          // by createProject) with the actual conversations stored in SQLite.
+          // This prevents BUG-1: fresh UUID = no messages found on restart.
+          (async () => {
+            const { getProjectConversations, createConversation } = await import("../lib/tauri-commands");
+            const { createEmptyConversationMeta } = await import("../lib/punk-types");
+            for (const { id: projId } of projectEntries) {
+              try {
+                const result = await getProjectConversations(projId);
+                const ps = useProjectsStore.getState();
+                const proj = ps.projects.get(projId);
+                if (!proj) continue;
+
+                if (result.conversations?.length > 0) {
+                  // Build conversations Map from DB rows
+                  const nextConvs = new Map<string, import("../lib/punk-types").Conversation>();
+                  const nextOrder: string[] = [];
+
+                  for (const row of result.conversations) {
+                    const convRow = row as { id: string; label: string; phase: string; model: string | null };
+                    const conv = createEmptyConversationMeta(convRow.id, convRow.label);
+                    conv.phase = convRow.phase as import("../lib/punk-types").PanePhase;
+                    conv.state.model = convRow.model ?? null;
+                    nextConvs.set(convRow.id, conv);
+                    nextOrder.push(convRow.id);
+                  }
+
+                  // Auto-select the most recent conversation. With tab bar visible,
+                  // user can always click "+" to create new or navigate to picker.
+                  const firstDbConvId = nextOrder[0]!;
+                  const firstConv = nextConvs.get(firstDbConvId);
+                  useProjectsStore.setState((s) => {
+                    const nextProjs = new Map(s.projects);
+                    nextProjs.set(projId, {
+                      ...proj,
+                      conversations: nextConvs,
+                      activeConversationId: firstDbConvId,
+                      conversationOrder: nextOrder,
+                      conversation: firstConv?.state ?? proj.conversation,
+                    });
+                    return { projects: nextProjs };
+                  });
+                } else {
+                  // No conversations in DB — create a default one so the project
+                  // isn't blank (happens when all empty conversations were deleted).
+                  const convId = crypto.randomUUID();
+                  const defaultConv = createEmptyConversationMeta(convId, "Conversation");
+                  useProjectsStore.setState((s) => {
+                    const nextProjs = new Map(s.projects);
+                    nextProjs.set(projId, {
+                      ...proj,
+                      conversations: new Map([[convId, defaultConv]]),
+                      activeConversationId: convId,
+                      conversationOrder: [convId],
+                      conversation: defaultConv.state,
+                    });
+                    return { projects: nextProjs };
+                  });
+                  // Persist to DB
+                  createConversation(projId, "Conversation", "idle", null, convId).catch(() => {});
+                }
+              } catch (err) {
+                console.warn(`[persistence] Failed to hydrate conversations for ${projId}:`, err);
+              }
+            }
+          })();
 
           // Mark all as restored AFTER the loops
           for (const { id } of projectEntries) {
@@ -518,35 +594,50 @@ export function useSettingsPersistence() {
         const pp = prev.projects.get(id);
         if (!p) continue;
 
-        // Skip while conversation is being loaded from SQLite. The
-        // restoringProjects set is populated in Conversation.tsx before
-        // startTransition fires and cleared after the store update completes.
+        // Skip while conversation is being loaded from SQLite.
         if (restoringProjects.has(id)) continue;
 
-        // Save when message count changes or session finishes.
-        // Uses delta persistence (only new/modified messages) + debounce
-        // to avoid blocking the main process event loop for seconds at a time.
-        const countChanged =
-          p.conversation.messages.length !== pp?.conversation.messages.length;
-        const finished =
-          !p.conversation.isProcessing && pp?.conversation.isProcessing;
+        // Iterate ALL conversations for this project (both active and inactive).
+        // Inactive conversations may be streaming in the background.
+        const convIds = new Set([
+          ...p.conversations.keys(),
+          ...(pp?.conversations.keys() ?? []),
+        ]);
+        for (const convId of convIds) {
+          const conv = p.conversations.get(convId);
+          const prevConv = pp?.conversations.get(convId);
+          if (!conv) continue;
 
-        if (countChanged || finished) {
-          // Cancel any pending debounced save for this project
-          const existing = debounceTimers.get(id);
-          if (existing) clearTimeout(existing);
+          const countChanged =
+            conv.state.messages.length !== (prevConv?.state.messages.length ?? 0);
+          const finished =
+            !conv.state.isProcessing && prevConv?.state.isProcessing;
 
-          if (finished) {
-            // Flush immediately — the turn is done, persist final state now
-            saveConversationDelta(id);
-          } else {
-            // Debounce: accumulate changes within the window, save once
-            debounceTimers.set(
-              id,
-              setTimeout(() => saveConversationDelta(id), DEBOUNCE_MS),
-            );
+          if (countChanged || finished) {
+            const key = convDeltaKey(id, convId);
+            const existing = debounceTimers.get(key);
+            if (existing) clearTimeout(existing);
+
+            if (finished) {
+              // Flush immediately — the turn is done
+              saveConversationDelta(id, convId);
+            } else {
+              debounceTimers.set(
+                key,
+                setTimeout(() => saveConversationDelta(id, convId), DEBOUNCE_MS),
+              );
+            }
           }
         }
+
+        // BACKWARD COMPAT PATH REMOVED (2026-05-16)
+        // This previously saved `p.conversation` changes with `null` conversationId,
+        // which overwrote the correct per-conversation saves (INSERT OR REPLACE on
+        // message IDs) — all messages ended up with conversation_id=NULL in the DB,
+        // invisible to getConversationSlice which queries by conversation_id.
+        // All conversation mutations now route through getActiveConv/updateActiveConv
+        // which update both the Map AND the backward compat field. The per-conversation
+        // iteration above catches every change.
       }
     });
 
@@ -554,9 +645,16 @@ export function useSettingsPersistence() {
       // Flush workspace state
       save();
       // Flush any pending conversation deltas
-      for (const [projectId, timer] of debounceTimers) {
+      for (const [key, timer] of debounceTimers) {
         clearTimeout(timer);
-        saveConversationDelta(projectId);
+        const parts = key.split(":");
+        if (parts.length === 2) {
+          // Per-conversation key: "projectId:conversationId"
+          saveConversationDelta(parts[0]!, parts[1]!);
+        }
+        // Legacy key ("projectId") ignored — backward compat path was removed.
+        // These keys should never exist after the fix, but if they do, skip to
+        // avoid overwriting conversation_id with NULL.
       }
     };
     window.addEventListener("beforeunload", handleBeforeUnload);

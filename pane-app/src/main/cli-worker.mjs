@@ -567,6 +567,7 @@ async function handleClaudeSpawn({
   tools,
   maxTurns,
   noExec,
+  conversationId,
 }) {
   // Resolve aliases: "default" → "claude-opus-4-6", "opusplan" → "claude-opus-4-6"
   // The SDK accepts aliases but analytics should show the real model name.
@@ -998,7 +999,7 @@ ${PANE_END}`;
         );
         const changedFiles = stdout.trim().split("\n").filter(Boolean);
         if (changedFiles.length > 0) {
-          const verdict = await runTurnSentinel(projectId, workingDir, changedFiles);
+          const verdict = await runTurnSentinel(projectId, workingDir, changedFiles, { conversationId: conversationId || null });
 
           sendToMain({
             type: "event",
@@ -1006,7 +1007,7 @@ ${PANE_END}`;
             requestId,
             event: {
               event: "arbiter_verdict",
-              data: { ...verdict, model, provider: command === "claude" ? "anthropic" : "gemini" },
+              data: { ...verdict, model, provider: "anthropic" },
             },
           });
         }
@@ -1081,6 +1082,7 @@ async function handleGeminiSpawn({
   systemPrompt,
   history,
   mcpServerDest,
+  conversationId,
 }) {
   const home = os.homedir();
   const paneDir = path.join(home, ".pane");
@@ -1360,7 +1362,7 @@ ${PANE_END}`;
         );
         const changedFiles = stdout.trim().split("\n").filter(Boolean);
         if (changedFiles.length > 0) {
-          const verdict = await runTurnSentinel(projectId, workingDir, changedFiles);
+          const verdict = await runTurnSentinel(projectId, workingDir, changedFiles, { conversationId: conversationId || null });
           sendToMain({
             type: "event",
             projectId,
@@ -1468,6 +1470,7 @@ async function handleSpawn({
   escalationHint,
   noExec,
   sqliteChanges,
+  conversationId,
 }) {
   const command =
     messageCommand || process.env.PANE_CLI_COMMAND;
@@ -1495,7 +1498,7 @@ async function handleSpawn({
     turnCount: historyLength / 2 + 1,
     gitStatus,
     ...(todos ? { todos } : {}),
-  });
+  }, conversationId);
 
   const backend = command === "claude" ? "claude-code" : "gemini";
 
@@ -1520,12 +1523,13 @@ async function handleSpawn({
         isResume,
         intent,
         backend,
+        conversationId,
       });
       budgetInfo = context.budget;
       console.log(`[cli-worker] Lean context: ${budgetInfo.systemUsed} tokens (resume=${isResume})`);
     } catch (err) {
       console.warn(`[cli-worker] Lean context failed, falling back to full: ${err.message}`);
-      context = compileContext(projectId, intent, historyLength, backend, sqliteChanges);
+      context = compileContext(projectId, intent, historyLength, backend, sqliteChanges, conversationId);
     }
   } else {
     // Full mode: budget-aware assembly for HTTP-style backends
@@ -1538,6 +1542,7 @@ async function handleSpawn({
         model,
         sqliteChanges,
         conversationTokens,
+        conversationId,
       });
       context = result;
       budgetInfo = result.budget;
@@ -1547,7 +1552,7 @@ async function handleSpawn({
       }
     } catch (err) {
       console.warn(`[cli-worker] Orchestrator failed, falling back to compileContext: ${err.message}`);
-      context = compileContext(projectId, intent, historyLength, backend, sqliteChanges);
+      context = compileContext(projectId, intent, historyLength, backend, sqliteChanges, conversationId);
     }
   }
 
@@ -1587,6 +1592,7 @@ async function handleSpawn({
       tools,
       maxTurns,
       noExec,
+      conversationId,
     });
   } else {
     await handleGeminiSpawn({
@@ -1598,6 +1604,7 @@ async function handleSpawn({
       systemPrompt,
       history,
       mcpServerDest,
+      conversationId,
     });
   }
 }

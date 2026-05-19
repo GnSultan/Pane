@@ -62,8 +62,44 @@ const PHASE_TO_INTENT: Record<string, string> = {
 // Used to cancel a previous animation if the same tool is re-animated.
 const activeToolAnimations = new Map<string, { cancelled: boolean }>();
 
+/** Get messages from a specific conversation, bypassing streamingConvId routing. */
+function getConvMsgs(projectId: string, conversationId?: string | null): ConversationMessage[] {
+  if (!conversationId) return [];
+  const proj = useProjectsStore.getState().projects.get(projectId);
+  return proj?.conversations.get(conversationId)?.state.messages ?? [];
+}
+
+function updateToolInputByIdDirect(
+  store: ReturnType<typeof useProjectsStore.getState>,
+  projectId: string,
+  conversationId: string,
+  toolId: string,
+  input: Record<string, unknown>,
+) {
+  const msgs = getConvMsgs(projectId, conversationId);
+  for (let mi = msgs.length - 1; mi >= 0; mi--) {
+    const msg = msgs[mi]!;
+    if (msg.type === "assistant") {
+      const blocks = [...msg.content];
+      for (let i = 0; i < blocks.length; i++) {
+        if (
+          blocks[i]!.type === "tool_use" &&
+          (blocks[i] as ToolUseBlock).id === toolId
+        ) {
+          blocks[i] = { ...blocks[i]!, input } as ToolUseBlock;
+          const newMsgs = [...msgs];
+          newMsgs[mi] = { ...msg, content: blocks };
+          store.updateConversation(projectId, conversationId, { messages: newMsgs });
+          return;
+        }
+      }
+    }
+  }
+}
+
 function streamToolInputAnimate(
   projectId: string,
+  conversationId: string,
   toolId: string,
   completeInput: Record<string, unknown>,
 ) {
@@ -92,7 +128,8 @@ function streamToolInputAnimate(
     const partial = fixPartialJson(json.slice(0, pos));
     try {
       const parsed = JSON.parse(partial) as Record<string, unknown>;
-      useProjectsStore.getState().updateToolUseInputById(projectId, toolId, parsed);
+      const store = useProjectsStore.getState();
+      updateToolInputByIdDirect(store, projectId, conversationId, toolId, parsed);
     } catch {
       /* partial JSON not yet parseable — skip frame */
     }
@@ -101,9 +138,8 @@ function streamToolInputAnimate(
       requestAnimationFrame(tick);
     } else {
       // Final frame: guarantee complete input
-      useProjectsStore
-        .getState()
-        .updateToolUseInputById(projectId, toolId, completeInput);
+      const store = useProjectsStore.getState();
+      updateToolInputByIdDirect(store, projectId, conversationId, toolId, completeInput);
       activeToolAnimations.delete(key);
     }
   };
@@ -134,8 +170,13 @@ interface StreamingState {
 
 const streamingStates = new Map<string, StreamingState>();
 
-function getStreamingState(projectId: string): StreamingState {
-  let state = streamingStates.get(projectId);
+function streamKey(projectId: string, conversationId?: string | null): string {
+  return conversationId ? `${projectId}:${conversationId}` : projectId;
+}
+
+function getStreamingState(projectId: string, conversationId?: string | null): StreamingState {
+  const key = streamKey(projectId, conversationId);
+  let state = streamingStates.get(key);
   if (!state) {
     state = {
       pendingTextDelta: "",
@@ -152,26 +193,42 @@ function getStreamingState(projectId: string): StreamingState {
       currentStreamingToolId: null,
       currentToolDeltaCount: 0,
     };
-    streamingStates.set(projectId, state);
+    streamingStates.set(key, state);
   }
   return state;
 }
 
 const MAX_STREAMING_TOOL_JSON_CHARS = 100_000;
 
-function flushToolInput(projectId: string) {
-  const state = getStreamingState(projectId);
+function flushToolInput(projectId: string, conversationId?: string | null) {
+  const state = getStreamingState(projectId, conversationId);
   if (state.pendingToolInput) {
-    useProjectsStore
-      .getState()
-      .updateLastToolUseInput(projectId, state.pendingToolInput);
+    const store = useProjectsStore.getState();
+    if (conversationId) {
+      const msgs = getConvMsgs(projectId, conversationId);
+      const newMsgs = [...msgs];
+      const last = newMsgs[newMsgs.length - 1];
+      if (last && last.type === "assistant") {
+        const blocks = [...last.content];
+        for (let i = blocks.length - 1; i >= 0; i--) {
+          if (blocks[i]!.type === "tool_use") {
+            blocks[i] = { ...blocks[i]!, input: state.pendingToolInput } as ToolUseBlock;
+            break;
+          }
+        }
+        newMsgs[newMsgs.length - 1] = { ...last, content: blocks };
+        store.updateConversation(projectId, conversationId, { messages: newMsgs });
+      }
+    } else {
+      store.updateLastToolUseInput(projectId, state.pendingToolInput);
+    }
     state.pendingToolInput = null;
   }
   state.toolInputFlushRaf = 0;
 }
 
-function scheduleToolJsonParse(projectId: string) {
-  const state = getStreamingState(projectId);
+function scheduleToolJsonParse(projectId: string, conversationId?: string | null) {
+  const state = getStreamingState(projectId, conversationId);
   if (state.toolJsonParseRaf) return;
   state.toolJsonParseRaf = requestAnimationFrame(() => {
     state.toolJsonParseRaf = 0;
@@ -183,29 +240,25 @@ function scheduleToolJsonParse(projectId: string) {
     try {
       const parsed = JSON.parse(fixed) as Record<string, unknown>;
 
-      const store = useProjectsStore.getState();
-      const project = store.projects.get(projectId);
-      if (project) {
-        const msgs = project.conversation.messages;
-        const last = msgs[msgs.length - 1];
-        if (last && last.type === "assistant") {
-          // Check all tools in the last message, not just the last tool
-          // This ensures we capture TodoWrite even if there are multiple tools
-          const toolUses = last.content.filter(
-            (b) => b.type === "tool_use"
-          ) as ToolUseBlock[];
-          
-          // Find the TodoWrite tool and extract todos from parsed input
-          const todoWriteTool = toolUses.find((t) => t.name === "TodoWrite");
-          if (todoWriteTool && Array.isArray(parsed.todos)) {
-            state.pendingTodos = (
-              parsed.todos as import("../lib/punk-types").Todo[]
-            ).map((t) => ({ ...t }));
-            if (!state.todosFlushRaf) {
-              state.todosFlushRaf = requestAnimationFrame(() =>
-                flushTodos(projectId),
-              );
-            }
+      const msgs = getConvMsgs(projectId, conversationId);
+      const last = msgs[msgs.length - 1];
+      if (last && last.type === "assistant") {
+        // Check all tools in the last message, not just the last tool
+        // This ensures we capture TodoWrite even if there are multiple tools
+        const toolUses = last.content.filter(
+          (b) => b.type === "tool_use"
+        ) as ToolUseBlock[];
+        
+        // Find the TodoWrite tool and extract todos from parsed input
+        const todoWriteTool = toolUses.find((t) => t.name === "TodoWrite");
+        if (todoWriteTool && Array.isArray(parsed.todos)) {
+          state.pendingTodos = (
+            parsed.todos as import("../lib/punk-types").Todo[]
+          ).map((t) => ({ ...t }));
+          if (!state.todosFlushRaf) {
+            state.todosFlushRaf = requestAnimationFrame(() =>
+              flushTodos(projectId, conversationId),
+            );
           }
         }
       }
@@ -213,7 +266,7 @@ function scheduleToolJsonParse(projectId: string) {
       state.pendingToolInput = parsed;
       if (!state.toolInputFlushRaf) {
         state.toolInputFlushRaf = requestAnimationFrame(() =>
-          flushToolInput(projectId),
+          flushToolInput(projectId, conversationId),
         );
       }
     } catch {
@@ -222,45 +275,107 @@ function scheduleToolJsonParse(projectId: string) {
   });
 }
 
-function flushTodos(projectId: string) {
-  const state = getStreamingState(projectId);
+function flushTodos(projectId: string, conversationId?: string | null) {
+  const state = getStreamingState(projectId, conversationId);
   if (state.pendingTodos) {
-    useProjectsStore
-      .getState()
-      .setConversationTodos(projectId, state.pendingTodos);
+    const store = useProjectsStore.getState();
+    if (conversationId) {
+      store.updateConversation(projectId, conversationId, { todos: state.pendingTodos });
+    } else {
+      store.setConversationTodos(projectId, state.pendingTodos);
+    }
     state.pendingTodos = null;
   }
   state.todosFlushRaf = 0;
 }
 
-function flushTextDelta(projectId: string) {
-  const state = getStreamingState(projectId);
+function flushTextDelta(projectId: string, conversationId?: string | null) {
+  const state = getStreamingState(projectId, conversationId);
   if (state.pendingTextDelta) {
     // Flush the full buffer in one shot per frame — no character-drip throttle.
     // The typewriter bleed (1-4 chars/frame) caused visible lag: fast scrolls
     // landed on empty space while the buffer slowly caught up (~1s delay in dev).
     // Natural streaming cadence from the backend already produces smooth output.
-    useProjectsStore.getState().appendToLastAssistantText(projectId, state.pendingTextDelta);
+    const store = useProjectsStore.getState();
+    if (conversationId) {
+      const msgs = getConvMsgs(projectId, conversationId);
+      const newMsgs = [...msgs];
+      const last = newMsgs[newMsgs.length - 1];
+      if (last && last.type === "assistant") {
+        const blocks = [...last.content];
+        const lastBlock = blocks[blocks.length - 1];
+        if (lastBlock && lastBlock.type === "text") {
+          blocks[blocks.length - 1] = {
+            ...lastBlock,
+            text: (lastBlock as { type: "text"; text: string }).text + state.pendingTextDelta,
+          };
+        } else {
+          blocks.push({ type: "text", text: state.pendingTextDelta });
+        }
+        newMsgs[newMsgs.length - 1] = { ...last, content: blocks };
+        store.updateConversation(projectId, conversationId, { messages: newMsgs });
+      }
+    } else {
+      store.appendToLastAssistantText(projectId, state.pendingTextDelta);
+    }
     state.pendingTextDelta = "";
   }
   state.textFlushRaf = 0;
 }
 
-function resetStreamingState(projectId: string, flush = false) {
-  const state = getStreamingState(projectId);
+function resetStreamingState(projectId: string, flush = false, conversationId?: string | null) {
+  const state = getStreamingState(projectId, conversationId);
   if (flush) {
     if (state.pendingTextDelta) {
       cancelAnimationFrame(state.textFlushRaf);
-      useProjectsStore
-        .getState()
-        .appendToLastAssistantText(projectId, state.pendingTextDelta);
+      const store = useProjectsStore.getState();
+      if (conversationId) {
+        const msgs = getConvMsgs(projectId, conversationId);
+        const newMsgs = [...msgs];
+        const last = newMsgs[newMsgs.length - 1];
+        if (last && last.type === "assistant") {
+          const blocks = [...last.content];
+          const lastBlock = blocks[blocks.length - 1];
+          if (lastBlock && lastBlock.type === "text") {
+            blocks[blocks.length - 1] = {
+              ...lastBlock,
+              text: (lastBlock as { type: "text"; text: string }).text + state.pendingTextDelta,
+            };
+          } else {
+            blocks.push({ type: "text", text: state.pendingTextDelta });
+          }
+          newMsgs[newMsgs.length - 1] = { ...last, content: blocks };
+          store.updateConversation(projectId, conversationId, { messages: newMsgs });
+        }
+      } else {
+        store.appendToLastAssistantText(projectId, state.pendingTextDelta);
+      }
       state.pendingTextDelta = "";
     }
     if (state.pendingThinkingDelta) {
       cancelAnimationFrame(state.thinkingFlushRaf);
-      useProjectsStore
-        .getState()
-        .appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
+      const store = useProjectsStore.getState();
+      if (conversationId) {
+        const msgs = getConvMsgs(projectId, conversationId);
+        const newMsgs = [...msgs];
+        const last = newMsgs[newMsgs.length - 1];
+        if (last && last.type === "assistant") {
+          const blocks = [...last.content];
+          const lastBlock = blocks[blocks.length - 1];
+          if (lastBlock && lastBlock.type === "thinking") {
+            blocks[blocks.length - 1] = {
+              ...lastBlock,
+              thinking: (lastBlock as { type: "thinking"; thinking: string }).thinking + state.pendingThinkingDelta,
+            };
+          } else {
+            blocks.push({ type: "thinking", thinking: state.pendingThinkingDelta });
+          }
+          newMsgs[newMsgs.length - 1] = { ...last, content: blocks };
+          store.updateConversation(projectId, conversationId, { messages: newMsgs });
+        }
+      } else {
+        store.appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
+      }
       state.pendingThinkingDelta = "";
     }
     // Flush any pending tool JSON that didn't make it through the rAF pipeline.
@@ -277,11 +392,11 @@ function resetStreamingState(projectId: string, flush = false) {
     }
     if (state.pendingToolInput) {
       cancelAnimationFrame(state.toolInputFlushRaf);
-      flushToolInput(projectId);
+      flushToolInput(projectId, conversationId);
     }
     if (state.pendingTodos) {
       cancelAnimationFrame(state.todosFlushRaf);
-      flushTodos(projectId);
+      flushTodos(projectId, conversationId);
     }
   }
 
@@ -313,12 +428,31 @@ function resetStreamingState(projectId: string, flush = false) {
   }
 }
 
-function flushThinkingDelta(projectId: string) {
-  const state = getStreamingState(projectId);
+function flushThinkingDelta(projectId: string, conversationId?: string | null) {
+  const state = getStreamingState(projectId, conversationId);
   if (state.pendingThinkingDelta) {
-    useProjectsStore
-      .getState()
-      .appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
+    const store = useProjectsStore.getState();
+    if (conversationId) {
+      const msgs = getConvMsgs(projectId, conversationId);
+      const newMsgs = [...msgs];
+      const last = newMsgs[newMsgs.length - 1];
+      if (last && last.type === "assistant") {
+        const blocks = [...last.content];
+        const lastBlock = blocks[blocks.length - 1];
+        if (lastBlock && lastBlock.type === "thinking") {
+          blocks[blocks.length - 1] = {
+            ...lastBlock,
+            thinking: (lastBlock as { type: "thinking"; thinking: string }).thinking + state.pendingThinkingDelta,
+          };
+        } else {
+          blocks.push({ type: "thinking", thinking: state.pendingThinkingDelta });
+        }
+        newMsgs[newMsgs.length - 1] = { ...last, content: blocks };
+        store.updateConversation(projectId, conversationId, { messages: newMsgs });
+      }
+    } else {
+      store.appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
+    }
     state.pendingThinkingDelta = "";
   }
   state.thinkingFlushRaf = 0;
@@ -848,7 +982,7 @@ function extractMethodViolations(
   return violations;
 }
 
-export function usePunk(projectId: string) {
+export function usePunk(projectId: string, conversationId?: string) {
   const abortingRef = useRef(false);
   // Set to true when sendMessage aborts an in-flight session to replace it with a new one.
   // Prevents the old processEnded from calling finishProcessing (which would set isProcessing=false)
@@ -857,28 +991,44 @@ export function usePunk(projectId: string) {
   const retryAttemptRef = useRef<Record<string, number>>({});
   const messageQueueRef = useRef<Array<{ prompt: string; minds?: Array<{ id: string }>; phase?: string }>>([]);
 
+  const convId = conversationId || null;
+
   const sendMessage = useCallback(
     async (prompt: string, minds?: Array<{ id: string }>, phase?: string) => {
       const store = useProjectsStore.getState();
       const project = store.projects.get(projectId);
       if (!project) return;
 
-      // If already processing, queue the message instead of aborting.
-      // This prevents the "Hard Kill" where follow-up messages reset the model mid-task.
-      if (project.conversation.isProcessing) {
+      // Read isProcessing from the specific conversation
+      const isBusy = convId
+        ? project.conversations.get(convId)?.state.isProcessing
+        : project.conversation.isProcessing;
+      if (isBusy) {
         messageQueueRef.current.push({ prompt, minds, phase });
         store.setConversationStatusMessage(projectId, "Message queued (agent is busy)");
         setTimeout(() => {
           const current = useProjectsStore.getState().projects.get(projectId);
-          if (current && current.conversation.statusMessage === "Message queued (agent is busy)") {
+          const busy = convId
+            ? current?.conversations.get(convId)?.state.isProcessing
+            : current?.conversation.isProcessing;
+          const msg = convId
+            ? current?.conversations.get(convId)?.state.statusMessage
+            : current?.conversation.statusMessage;
+          if (current && !busy && msg === "Message queued (agent is busy)") {
             useProjectsStore.getState().setConversationStatusMessage(projectId, null);
           }
         }, 3000);
         return;
       }
 
-      await abortPunk(projectId).catch(() => {});
-      resetStreamingState(projectId);
+      await abortPunk(projectId, convId || undefined).catch(() => {});
+      resetStreamingState(projectId, false, convId);
+
+      // Route all store mutations during streaming to this specific conversation.
+      // Prevents streaming text from leaking when user switches tabs mid-stream.
+      if (convId) {
+        useProjectsStore.getState().setStreamingConvId(projectId, convId);
+      }
 
       const messageId = nextMessageId();
       const displayPrompt = prompt.trim();
@@ -937,17 +1087,34 @@ export function usePunk(projectId: string) {
       const finishProcessing = () => {
         if (finishCalled) return;
         finishCalled = true;
-        abortPunk(projectId).catch(() => {});
+        abortPunk(projectId, convId || undefined).catch(() => {});
 
         const s = useProjectsStore.getState();
-        s.setConversationProcessing(projectId, false);
-        s.setConversationRoutedModel(projectId, null);
-        s.setLastMessageStreamingDone(projectId);
-        s.setIsPlanning(projectId, false);
+        if (convId) {
+          s.updateConversation(projectId, convId, {
+            isProcessing: false,
+            routedModel: null,
+            isPlanning: false,
+          });
+          // Mark last message streaming done
+          const stateMsgs = getConvMsgs(projectId, convId);
+          const finalMsgs = stateMsgs.map((m, i) =>
+            i === stateMsgs.length - 1 && m.type === "assistant"
+              ? { ...m, isStreaming: false as const }
+              : m,
+          );
+          s.updateConversation(projectId, convId, { messages: finalMsgs });
+        } else {
+          s.setConversationProcessing(projectId, false);
+          s.setConversationRoutedModel(projectId, null);
+          s.setLastMessageStreamingDone(projectId);
+          s.setIsPlanning(projectId, false);
+        }
 
         // Fire-and-forget: persist response summary for thread list UI
-        const conversation = s.projects.get(projectId)?.conversation;
-        const msgs = conversation?.messages ?? [];
+        const msgs = convId
+          ? getConvMsgs(projectId, convId)
+          : (s.projects.get(projectId)?.conversation.messages ?? []);
         let summary = "";
         // Walk backwards to find the last assistant message with text content
         for (let i = msgs.length - 1; i >= 0; i--) {
@@ -975,10 +1142,15 @@ export function usePunk(projectId: string) {
 
         setTimeout(() => {
           const current = useProjectsStore.getState().projects.get(projectId);
-          if (current && !current.conversation.isProcessing) {
-            useProjectsStore
-              .getState()
-              .setConversationStatusMessage(projectId, null);
+          const isProcessing = convId
+            ? current?.conversations.get(convId)?.state.isProcessing ?? false
+            : current?.conversation.isProcessing ?? false;
+          if (current && !isProcessing) {
+            if (convId) {
+              useProjectsStore.getState().updateConversation(projectId, convId, { statusMessage: null });
+            } else {
+              useProjectsStore.getState().setConversationStatusMessage(projectId, null);
+            }
           }
         }, 1500);
 
@@ -993,6 +1165,12 @@ export function usePunk(projectId: string) {
             });
             window.dispatchEvent(evt);
           }
+        }
+
+        // Clear streaming conversation override — subsequent reads from
+        // proj.conversation will now point to the active conversation.
+        if (convId) {
+          useProjectsStore.getState().setStreamingConvId(projectId, null);
         }
 
         // Process next message in queue if any
@@ -1066,28 +1244,31 @@ export function usePunk(projectId: string) {
           }
 
           case "routing": {
-            // Legacy routing event — still handled for backwards compat
+            // Legacy routing event — still handled for backwards compat.
+            // Use convId-scoped writes to prevent cross-contamination when
+            // streamingConvId has been set by a different conversation.
             const { model, thinking, intent } = event.data;
-            store.setConversationRoutedModel(projectId, model);
-            if (thinking && intent === "plan") {
-              store.setIsPlanning(projectId, true);
+            if (convId) {
+              store.updateConversation(projectId, convId, {
+                routedModel: model,
+                ...(thinking && intent === "plan" ? { isPlanning: true } : {}),
+              });
+            } else {
+              store.setConversationRoutedModel(projectId, model);
+              if (thinking && intent === "plan") {
+                store.setIsPlanning(projectId, true);
+              }
             }
             break;
           }
 
           case "strategy": {
             const d = event.data;
-            // Update routing display (same as routing event)
-            store.setConversationRoutedModel(projectId, d.model);
-            if (d.thinking && d.intent === "plan") {
-              store.setIsPlanning(projectId, true);
-            }
-            // Inject a synthetic assistant message containing the strategy block.
-            // Appears between the user message and the LLM's response —
-            // collapsed by default in the UI.
-            store.addConversationMessage(projectId, {
+            // Use convId-scoped writes to prevent cross-contamination when
+            // streamingConvId has been set by a different conversation.
+            const strategyMsg = {
               id: `strategy-${Date.now()}`,
-              type: "assistant",
+              type: "assistant" as const,
               content: [{
                 type: "strategy",
                 mode:             d.mode,
@@ -1112,7 +1293,21 @@ export function usePunk(projectId: string) {
               }],
               timestamp: Date.now(),
               isStreaming: false,
-            });
+            };
+            if (convId) {
+              const currentMsgs = getConvMsgs(projectId, convId);
+              store.updateConversation(projectId, convId, {
+                messages: [...currentMsgs, strategyMsg],
+                routedModel: d.model,
+                ...(d.thinking && d.intent === "plan" ? { isPlanning: true } : {}),
+              });
+            } else {
+              store.setConversationRoutedModel(projectId, d.model);
+              if (d.thinking && d.intent === "plan") {
+                store.setIsPlanning(projectId, true);
+              }
+              store.addConversationMessage(projectId, strategyMsg);
+            }
             break;
           }
 
@@ -1124,6 +1319,7 @@ export function usePunk(projectId: string) {
                 msg,
                 projectId,
                 assistantMessageAdded,
+                convId,
               );
 
               if (msg.type === "result") resultReceived = true;
@@ -1135,7 +1331,13 @@ export function usePunk(projectId: string) {
 
           case "processEnded": {
             // Always clear any suspended tool input — the process is done.
-            useProjectsStore.getState().clearPendingInput(projectId);
+            // Use convId-scoped write to prevent clearing the wrong conversation's
+            // pending input when streamingConvId has been overridden by another tab.
+            if (convId) {
+              store.updateConversation(projectId, convId, { pendingInput: null });
+            } else {
+              useProjectsStore.getState().clearPendingInput(projectId);
+            }
 
             // This processEnded belongs to a session that was intentionally aborted
             // to make way for a new message. Skip all cleanup — isProcessing stays
@@ -1149,7 +1351,11 @@ export function usePunk(projectId: string) {
             // Ignore if aborted is true, which indicates an intentional abort/cancellation.
             if (!resultReceived && !event.data?.aborted) {
               const s = useProjectsStore.getState();
-              if (!s.projects.get(projectId)?.conversation.error) {
+              // Check error on the specific conversation
+              const hasError = convId
+                ? s.projects.get(projectId)?.conversations.get(convId)?.state.error
+                : s.projects.get(projectId)?.conversation.error;
+              if (!hasError) {
                 // --- Phase 3: Auto-Resume from Checkpoint ---
                 const sessionId = ""; // backend uses projectId for turn archives currently
                 resumeFromCheckpoint(projectId, sessionId).then(async (checkpoint) => {
@@ -1158,101 +1364,117 @@ export function usePunk(projectId: string) {
                     retryAttemptRef.current[projectId] = currentRetries + 1;
                     console.log(`[pane] Unexpected exit on turn ${checkpoint.turn}. Auto-resuming from checkpoint (attempt 1)...`);
                     
-                    s.setConversationStatusMessage(projectId, "recovering session...");
+                    if (convId) {
+                      s.updateConversation(projectId, convId, { statusMessage: "recovering session..." });
+                    } else {
+                      s.setConversationStatusMessage(projectId, "recovering session...");
+                    }
                     await new Promise(r => setTimeout(r, 2000));
                     
-                    resetStreamingState(projectId);
+                    resetStreamingState(projectId, false, convId);
                     // Re-trigger the same prompt that was in flight (or just continue from history)
                     sendMessage(prompt, minds, phase);
                   } else {
-                    s.setConversationError(
-                      projectId,
-                      "Process exited without responding — session may be invalid. Try again.",
-                    );
+                    const msg = "Process exited without responding — session may be invalid. Try again.";
+                    if (convId) {
+                      s.updateConversation(projectId, convId, { error: msg });
+                    } else {
+                      s.setConversationError(projectId, msg);
+                    }
                   }
                 }).catch(() => {
-                  s.setConversationError(
-                    projectId,
-                    "Process exited without responding — session may be invalid. Try again.",
-                  );
+                  const msg = "Process exited without responding — session may be invalid. Try again.";
+                  if (convId) {
+                    s.updateConversation(projectId, convId, { error: msg });
+                  } else {
+                    s.setConversationError(projectId, msg);
+                  }
                 });
               }
             }
+            // Save conversation messages BEFORE finishProcessing clears the
+            // streamingConvId override. Post-turn processing (memory events,
+            // change history, etc.) needs the streaming conversation's messages,
+            // but after streamingConvId is cleared, proj.conversation points to
+            // whatever activeConversationId is — which may be a DIFFERENT
+            // conversation if the user switched tabs mid-stream.
+            // Read directly from the conversations Map using convId for
+            // maximum robustness — bypasses any backward-compat field issues.
+            const projBefore = useProjectsStore.getState().projects.get(projectId);
+            const streamingConv = convId ? projBefore?.conversations.get(convId) : null;
+            const streamingMsgs = streamingConv?.state.messages ?? [];
+            const streamingTodos = streamingConv?.state.todos ?? [];
+
             finishProcessing();
 
-            try {
-              const proj = useProjectsStore.getState().projects.get(projectId);
-              if (proj && proj.conversation.messages.length > 1) {
-                // Record file changes to change history
-                recordChangeHistory(projectId, proj.conversation.messages);
+            // Use saved messages for post-turn processing — these are the
+            // messages from the conversation that actually just streamed.
+            if (streamingMsgs.length > 1) {
+              // Record file changes to change history
+              recordChangeHistory(projectId, streamingMsgs);
 
-                // LLM preference extraction — build a concise text of the last
-                // user message + assistant response for the model to analyse.
-                // Fire-and-forget: never blocks the UI.
-                try {
-                  const msgs = proj.conversation.messages;
-                  let turnStart = msgs.length - 1;
-                  for (let i = msgs.length - 1; i >= 0; i--) {
-                    if (msgs[i]!.type === "user") { turnStart = i; break; }
-                  }
-                  const turnMsgs = msgs.slice(turnStart, turnStart + 4); // user + up to 3 assistant blocks
-                  const turnLines: string[] = [];
-                  for (const m of turnMsgs) {
-                    const role = m.type === "user" ? "Developer" : "Assistant";
-                    for (const b of m.content) {
-                      if (b.type === "text") {
-                        turnLines.push(`${role}: ${(b as { text: string }).text.slice(0, 600)}`);
-                      }
+              // LLM preference extraction — build a concise text of the last
+              // user message + assistant response for the model to analyse.
+              // Fire-and-forget: never blocks the UI.
+              try {
+                const msgs = streamingMsgs;
+                let turnStart = msgs.length - 1;
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                  if (msgs[i]!.type === "user") { turnStart = i; break; }
+                }
+                const turnMsgs = msgs.slice(turnStart, turnStart + 4); // user + up to 3 assistant blocks
+                const turnLines: string[] = [];
+                for (const m of turnMsgs) {
+                  const role = m.type === "user" ? "Developer" : "Assistant";
+                  for (const b of m.content) {
+                    if (b.type === "text") {
+                      turnLines.push(`${role}: ${(b as { text: string }).text.slice(0, 600)}`);
                     }
                   }
-                  const turnText = turnLines.join("\n\n");
-                  if (turnText.length > 100) {
-                    extractPreferencesFromTurn(turnText).catch(() => {});
-                  }
-                } catch {
-                  // non-critical
                 }
-
-                const memEvents = extractMemoryEvents(
-                  proj.conversation.messages,
-                );
-                if (memEvents.length > 0) {
-                  recordMemoryEvents(projectId, memEvents).catch(() => {});
-                  brainIndexEvents(projectId, memEvents).catch(() => {});
+                const turnText = turnLines.join("\n\n");
+                if (turnText.length > 100) {
+                  extractPreferencesFromTurn(turnText).catch(() => {});
                 }
-                generateBrief(projectId)
-                  .then((brief) => {
-                    if (brief) {
-                      useProjectsStore
-                        .getState()
-                        .setCachedBrief(projectId, brief);
-                    }
-                  })
-                  .catch(() => {});
-
-                const sessionDelta = extractSessionDelta(
-                  proj.conversation.messages,
-                  proj.conversation.todos,
-                );
-
-                // Post-turn method compliance check
-                const methodViolations = extractMethodViolations(
-                  proj.conversation.messages,
-                );
-
-                if (sessionDelta) {
-                  sessionMergeState(projectId, {
-                    ...sessionDelta,
-                    methodNotes: methodViolations,
-                  }).catch(() => {});
-                } else if (methodViolations.length > 0) {
-                  sessionMergeState(projectId, {
-                    methodNotes: methodViolations,
-                  }).catch(() => {});
-                }
+              } catch {
+                // non-critical
               }
-            } catch {
-              // ignore
+
+              const memEvents = extractMemoryEvents(streamingMsgs);
+              if (memEvents.length > 0) {
+                recordMemoryEvents(projectId, memEvents).catch(() => {});
+                brainIndexEvents(projectId, memEvents).catch(() => {});
+              }
+              generateBrief(projectId)
+                .then((brief) => {
+                  if (brief) {
+                    useProjectsStore
+                      .getState()
+                      .setCachedBrief(projectId, brief);
+                  }
+                })
+                .catch(() => {});
+
+              const sessionDelta = extractSessionDelta(
+                streamingMsgs,
+                streamingTodos,
+              );
+
+              // Post-turn method compliance check
+              const methodViolations = extractMethodViolations(
+                streamingMsgs,
+              );
+
+              if (sessionDelta) {
+                sessionMergeState(projectId, {
+                  ...sessionDelta,
+                  methodNotes: methodViolations,
+                }).catch(() => {});
+              } else if (methodViolations.length > 0) {
+                sessionMergeState(projectId, {
+                  methodNotes: methodViolations,
+                }).catch(() => {});
+              }
             }
             break;
           }
@@ -1260,16 +1482,29 @@ export function usePunk(projectId: string) {
           case "status": {
             // Transient status from the backend (e.g. "rate limited — retrying in 30s").
             // null clears it. Does not affect isProcessing.
-            store.setConversationStatusMessage(projectId, event.data?.message ?? null);
+            const statusMsg = event.data?.message ?? null;
+            if (convId) {
+              store.updateConversation(projectId, convId, { statusMessage: statusMsg });
+            } else {
+              store.setConversationStatusMessage(projectId, statusMsg);
+            }
             break;
           }
 
           case "phase_changed": {
             // Backend (file watcher on session state) detected a phase transition.
             // Sync the store so the pill and next-message routing both reflect it.
+            // Use convId-scoped writes to prevent cross-talk — this event is
+            // broadcast on the project-wide channel (no requestId/conversationId),
+            // so ALL usePunk instances in this project receive it.
             const p = event.data?.phase;
             if (p === "think" || p === "build") {
-              useProjectsStore.getState().setConversationPhase(projectId, p as PanePhase);
+              const s = useProjectsStore.getState();
+              if (convId) {
+                s.updateConversation(projectId, convId, { phase: p as PanePhase });
+              } else {
+                s.setConversationPhase(projectId, p as PanePhase);
+              }
             }
             break;
           }
@@ -1277,9 +1512,19 @@ export function usePunk(projectId: string) {
           case "error": {
             finishCalled = true;
             const s = useProjectsStore.getState();
-            s.setConversationError(projectId, event.data.message);
-            s.setConversationProcessing(projectId, false);
-            s.setIsPlanning(projectId, false);
+            if (convId) {
+              s.updateConversation(projectId, convId, {
+                error: event.data.message,
+                isProcessing: false,
+                isPlanning: false,
+              });
+            } else {
+              s.setConversationError(projectId, event.data.message);
+              s.setConversationProcessing(projectId, false);
+              s.setIsPlanning(projectId, false);
+            }
+            // Clear streaming conversation override
+            if (convId) s.setStreamingConvId(projectId, null);
 
             // RETRY LOGIC: Restore the failed prompt to the InputBar
             // We use a custom event that InputBar listens to
@@ -1289,12 +1534,21 @@ export function usePunk(projectId: string) {
             window.dispatchEvent(retryEvt);
 
             // Also remove the failed user message from the history so it's not doubled on retry
-            const project = s.projects.get(projectId);
-            if (project) {
-              const msgs = project.conversation.messages;
-              const lastMsg = msgs[msgs.length - 1];
-              if (msgs.length > 0 && lastMsg && lastMsg.type === "user") {
-                s.removeLastConversationMessage(projectId);
+            if (convId) {
+              const msgs = getConvMsgs(projectId, convId);
+              if (msgs.length > 0 && msgs[msgs.length - 1]?.type === "user") {
+                s.updateConversation(projectId, convId, {
+                  messages: msgs.slice(0, -1),
+                });
+              }
+            } else {
+              const project = s.projects.get(projectId);
+              if (project) {
+                const msgs = project.conversation.messages;
+                const lastMsg = msgs[msgs.length - 1];
+                if (msgs.length > 0 && lastMsg && lastMsg.type === "user") {
+                  s.removeLastConversationMessage(projectId);
+                }
               }
             }
             break;
@@ -1304,12 +1558,12 @@ export function usePunk(projectId: string) {
             console.log(
               `[frontend] Starting conversation compaction: ${event.data.reason}`,
             );
-            // Optional: Show a brief indicator in the UI
             const s = useProjectsStore.getState();
-            s.setConversationStatusMessage(
-              projectId,
-              `Compressing conversation...`,
-            );
+            if (convId) {
+              s.updateConversation(projectId, convId, { statusMessage: "Compressing conversation..." });
+            } else {
+              s.setConversationStatusMessage(projectId, "Compressing conversation...");
+            }
             break;
           }
 
@@ -1319,44 +1573,80 @@ export function usePunk(projectId: string) {
               `[frontend] Compaction complete: ${originalCount} → ${compactedCount} messages, ` +
               `${tokensSaved} tokens saved, total compactions: ${totalCompactions}`,
             );
-            // Clear the compaction status message
             const s = useProjectsStore.getState();
-            s.setConversationStatusMessage(projectId, null);
+            if (convId) {
+              s.updateConversation(projectId, convId, { statusMessage: null });
+            } else {
+              s.setConversationStatusMessage(projectId, null);
+            }
             break;
           }
 
           case "todos_updated": {
             const { todos } = event.data;
             const s = useProjectsStore.getState();
-            s.setConversationTodos(projectId, todos);
+            if (convId) {
+              s.updateConversation(projectId, convId, { todos });
+            } else {
+              s.setConversationTodos(projectId, todos);
+            }
             break;
           }
 
           case "activeTask_updated": {
             const { activeTask } = event.data;
-            // Update the status message with the active task
             const s = useProjectsStore.getState();
-            s.setConversationStatusMessage(projectId, activeTask.description);
+            if (convId) {
+              s.updateConversation(projectId, convId, { statusMessage: activeTask.description });
+            } else {
+              s.setConversationStatusMessage(projectId, activeTask.description);
+            }
             break;
           }
 
           case "arbiter_verdict": {
+            // The verdict targets the last assistant message — use direct write when possible
             const s = useProjectsStore.getState();
-            s.setLastAssistantVerdict(projectId, event.data);
+            if (convId) {
+              const msgs = getConvMsgs(projectId, convId);
+              const newMsgs = [...msgs];
+              for (let i = newMsgs.length - 1; i >= 0; i--) {
+                if (newMsgs[i]!.type === "assistant") {
+                  newMsgs[i] = { ...newMsgs[i]!, verdict: event.data };
+                  break;
+                }
+              }
+              s.updateConversation(projectId, convId, { messages: newMsgs });
+            } else {
+              s.setLastAssistantVerdict(projectId, event.data);
+            }
             break;
           }
 
           case "awaiting_input": {
             // Tool execution is paused waiting for user input.
             // Store the pending state so the UI can render the appropriate prompt.
-            useProjectsStore.getState().setPendingInput(projectId, event.data);
+            if (convId) {
+              // pendingInput is part of ConversationState — write directly
+              useProjectsStore.getState().updateConversation(projectId, convId, {
+                pendingInput: event.data as any,
+              });
+            } else {
+              useProjectsStore.getState().setPendingInput(projectId, event.data);
+            }
             break;
           }
         }
       };
 
       try {
-        const conversation = project.conversation;
+        // Read from the specific conversation, not project.conversation (backward
+        // compat proxy). When another conversation is streaming, setActiveConversation
+        // freezes project.conversation to the streaming conversation's state, so
+        // reading it here would send the WRONG history and todos to the backend.
+        const conversation = convId
+          ? (project.conversations.get(convId)?.state ?? project.conversation)
+          : project.conversation;
         // Phase-based intent — single source of truth, no per-message re-classification.
         const effectivePhase = phase || "think";
         const intent = PHASE_TO_INTENT[effectivePhase] || "execute";
@@ -1400,6 +1690,7 @@ export function usePunk(projectId: string) {
             powerCombo: projectCombo,
             minds,
             phase: effectivePhase,
+            conversationId: convId || undefined,
           }
         );
       } catch (err) {
@@ -1416,16 +1707,17 @@ export function usePunk(projectId: string) {
     if (abortingRef.current) return;
     abortingRef.current = true;
     try {
-      await abortPunk(projectId);
+      await abortPunk(projectId, convId || undefined);
     } finally {
       abortingRef.current = false;
       const store = useProjectsStore.getState();
       store.setConversationProcessing(projectId, false);
       store.setLastMessageStreamingDone(projectId);
       store.setIsPlanning(projectId, false);
-      resetStreamingState(projectId);
+      if (convId) store.setStreamingConvId(projectId, null);
+      resetStreamingState(projectId, false, convId);
     }
-  }, [projectId]);
+  }, [projectId, convId]);
 
   const clearConversation = useCallback(() => {
     // Promote session state to long-term memory before wiping it.
@@ -1490,12 +1782,13 @@ function handlePunkMessage(
   msg: PunkStreamMessage,
   projectId: string,
   assistantMessageExists: boolean,
+  conversationId?: string | null,
 ): boolean {
   const store = useProjectsStore.getState();
-  const state = getStreamingState(projectId);
+  const state = getStreamingState(projectId, conversationId);
 
   if (msg.type !== "stream_event") {
-    resetStreamingState(projectId, true);
+    resetStreamingState(projectId, true, conversationId);
   }
 
   if ("skipped" in msg) {
@@ -1506,7 +1799,11 @@ function handlePunkMessage(
     case "system": {
       if (msg.subtype === "init" && msg.session_id) {
         if (msg.model) {
-          store.setConversationModel(projectId, msg.model);
+          if (conversationId) {
+            store.updateConversation(projectId, conversationId, { model: msg.model });
+          } else {
+            store.setConversationModel(projectId, msg.model);
+          }
         }
       }
       return assistantMessageExists;
@@ -1527,58 +1824,97 @@ function handlePunkMessage(
       const msgMsg = msg.message as { content: ContentBlock[]; reasoning_content?: string } | undefined;
 
       if (assistantMessageExists) {
-        const project = store.projects.get(projectId);
-        if (project) {
-          const msgs = project.conversation.messages;
-          const last = msgs[msgs.length - 1];
-          if (last && last.type === "assistant") {
-            const streamedTextBlocks = last.content.filter(
-              (b) => b.type === "text",
-            );
-            const streamedThinkingBlocks = last.content.filter(
-              (b) => b.type === "thinking",
-            );
-            const finalHasText = finalContent.some((b) => b.type === "text");
-            const finalHasThinking = finalContent.some(
-              (b) => b.type === "thinking",
-            );
+        const msgs = conversationId
+          ? getConvMsgs(projectId, conversationId)
+          : (store.projects.get(projectId)?.conversation.messages ?? []);
+        const last = msgs[msgs.length - 1];
+        if (last && last.type === "assistant") {
+          const streamedTextBlocks = last.content.filter(
+            (b) => b.type === "text",
+          );
+          const streamedThinkingBlocks = last.content.filter(
+            (b) => b.type === "thinking",
+          );
+          const finalHasText = finalContent.some((b) => b.type === "text");
+          const finalHasThinking = finalContent.some(
+            (b) => b.type === "thinking",
+          );
 
-            let merged = finalContent;
-            if (streamedThinkingBlocks.length > 0 && !finalHasThinking) {
-              merged = [...streamedThinkingBlocks, ...merged];
-            }
-            if (streamedTextBlocks.length > 0 && !finalHasText) {
-              const thinkingEnd = merged.findIndex(
-                (b) => b.type !== "thinking",
-              );
-              const insertAt = thinkingEnd === -1 ? merged.length : thinkingEnd;
-              merged = [
-                ...merged.slice(0, insertAt),
-                ...streamedTextBlocks,
-                ...merged.slice(insertAt),
-              ];
-            }
+          let merged = finalContent;
+          if (streamedThinkingBlocks.length > 0 && !finalHasThinking) {
+            merged = [...streamedThinkingBlocks, ...merged];
+          }
+          if (streamedTextBlocks.length > 0 && !finalHasText) {
+            const thinkingEnd = merged.findIndex(
+              (b) => b.type !== "thinking",
+            );
+            const insertAt = thinkingEnd === -1 ? merged.length : thinkingEnd;
+            merged = [
+              ...merged.slice(0, insertAt),
+              ...streamedTextBlocks,
+              ...merged.slice(insertAt),
+            ];
+          }
+
+          // Update last assistant content — target the specific conversation
+          const newMsgs = [...msgs];
+          newMsgs[newMsgs.length - 1] = { ...last, content: merged };
+          if (conversationId) {
+            store.updateConversation(projectId, conversationId, { messages: newMsgs });
+          } else {
             store.updateLastAssistantContent(projectId, merged);
-            
-            // Capture reasoning_content if present
-            const reasoning = msgMsg?.reasoning_content;
-            if (reasoning) {
+          }
+          
+          // Capture reasoning_content if present
+          const reasoning = msgMsg?.reasoning_content;
+          if (reasoning) {
+            if (conversationId) {
+              const withReasoning = [...newMsgs];
+              withReasoning[withReasoning.length - 1] = {
+                ...last,
+                content: merged,
+                reasoning_content: reasoning,
+              };
+              store.updateConversation(projectId, conversationId, { messages: withReasoning });
+            } else {
               store.updateMessageReasoning(projectId, last.id, reasoning);
             }
+          }
+        } else {
+          if (conversationId) {
+            const convMsgs = getConvMsgs(projectId, conversationId);
+            store.updateConversation(projectId, conversationId, {
+              messages: [...convMsgs.slice(0, -1), { ...convMsgs[convMsgs.length - 1]!, content: finalContent }],
+            });
           } else {
             store.updateLastAssistantContent(projectId, finalContent);
           }
-        } else {
-          store.updateLastAssistantContent(projectId, finalContent);
         }
-        store.setLastMessageStreamingDone(projectId);
 
-        if (project) {
-          const todos = project.conversation.todos;
-          if (
-            todos.length > 0 &&
-            todos.every((t) => t.status === "completed")
-          ) {
+        // Mark streaming done and check todos
+        if (conversationId) {
+          const convState = store.projects.get(projectId)?.conversations.get(conversationId)?.state;
+          if (convState) {
+            const updatedMsgs = convState.messages.map((m, i) =>
+              i === convState.messages.length - 1 && m.type === "assistant"
+                ? { ...m, isStreaming: false as const }
+                : m,
+            );
+            const partial: Partial<import("../lib/punk-types").ConversationState> = {
+              messages: updatedMsgs,
+            };
+            const allTodos = (convState.todos ?? []).length > 0
+              && (convState.todos ?? []).every((t: { status: string }) => t.status === "completed");
+            if (allTodos) {
+              partial.todos = [];
+            }
+            store.updateConversation(projectId, conversationId, partial);
+          }
+        } else {
+          store.setLastMessageStreamingDone(projectId);
+          const proj = store.projects.get(projectId);
+          const todos = proj?.conversation.todos;
+          if (todos && todos.length > 0 && todos.every((t) => t.status === "completed")) {
             store.setConversationTodos(projectId, []);
           }
         }
@@ -1591,20 +1927,29 @@ function handlePunkMessage(
           timestamp: Date.now(),
           isStreaming: false,
         };
-        store.addConversationMessage(projectId, assistantMsg);
+        if (conversationId) {
+          const currentMsgs = getConvMsgs(projectId, conversationId);
+          store.updateConversation(projectId, conversationId, {
+            messages: [...currentMsgs, assistantMsg],
+          });
+        } else {
+          store.addConversationMessage(projectId, assistantMsg);
+        }
       }
       return true;
     }
 
     case "user": {
-      const project = store.projects.get(projectId);
       const newContent = msg.message.content as ContentBlock[];
       const newToolResult = newContent.find((b) => b.type === "tool_result") as
         | ToolResultBlock
         | undefined;
 
-      if (project && newToolResult) {
-        const msgs = project.conversation.messages;
+      const msgs = conversationId
+        ? getConvMsgs(projectId, conversationId)
+        : (store.projects.get(projectId)?.conversation.messages ?? []);
+
+      if (newToolResult) {
         // Search backwards for a matching system message with this tool_use_id
         for (let i = msgs.length - 1; i >= 0; i--) {
           const m = msgs[i]!;
@@ -1616,7 +1961,14 @@ function handlePunkMessage(
                   newToolResult.tool_use_id,
             );
             if (hasMatch) {
-              store.updateMessageContent(projectId, m.id, newContent);
+              if (conversationId) {
+                const newMsgs = msgs.map((msg) =>
+                  msg.id === m.id ? { ...msg, content: newContent } : msg,
+                );
+                store.updateConversation(projectId, conversationId, { messages: newMsgs });
+              } else {
+                store.updateMessageContent(projectId, m.id, newContent);
+              }
               return false;
             }
           }
@@ -1632,44 +1984,93 @@ function handlePunkMessage(
         timestamp: Date.now(),
         isStreaming: false,
       };
-      store.addConversationMessage(projectId, toolResultMsg);
+      if (conversationId) {
+        store.updateConversation(projectId, conversationId, {
+          messages: [...msgs, toolResultMsg],
+        });
+      } else {
+        store.addConversationMessage(projectId, toolResultMsg);
+      }
       return false;
     }
 
     case "result": {
       if (msg.subtype === "success" && msg.total_cost_usd !== undefined) {
-        store.setLastAssistantMeta(
-          projectId,
-          msg.total_cost_usd,
-          msg.duration_ms ?? 0,
-          msg.usage?.input_tokens,
-          msg.usage?.output_tokens,
-          msg.num_turns,
-        );
-
+        if (conversationId) {
+          const currentMsgs = getConvMsgs(projectId, conversationId);
+          const msgs = [...currentMsgs];
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i]!.type === "assistant") {
+              msgs[i] = {
+                ...msgs[i]!,
+                costUsd: msg.total_cost_usd,
+                durationMs: msg.duration_ms ?? 0,
+                inputTokens: msg.usage?.input_tokens,
+                outputTokens: msg.usage?.output_tokens,
+                numTurns: msg.num_turns,
+              };
+              break;
+            }
+          }
+          store.updateConversation(projectId, conversationId, { messages: msgs });
+        } else {
+          store.setLastAssistantMeta(
+            projectId,
+            msg.total_cost_usd,
+            msg.duration_ms ?? 0,
+            msg.usage?.input_tokens,
+            msg.usage?.output_tokens,
+            msg.num_turns,
+          );
+        }
       } else if (msg.subtype !== "success") {
         if (msg.subtype === "interrupted") return assistantMessageExists;
 
         console.warn("[pane] Claude non-success result:", msg.subtype, msg);
 
-        const existing = store.projects.get(projectId)?.conversation.error;
-        if (!existing) {
-          const detail =
-            msg.subtype === "error_max_turns"
-              ? "Reached max turns — send a message to continue"
-              : msg.error?.trim() || msg.result?.trim();
-          store.setConversationError(
-            projectId,
-            detail ||
-              `Claude exited unexpectedly (${msg.subtype ?? "unknown"})`,
-          );
+        if (conversationId) {
+          const convState = store.projects.get(projectId)?.conversations.get(conversationId)?.state;
+          if (!convState?.error) {
+            const detail =
+              msg.subtype === "error_max_turns"
+                ? "Reached max turns — send a message to continue"
+                : msg.error?.trim() || msg.result?.trim();
+            store.updateConversation(projectId, conversationId, {
+              error: detail || `Claude exited unexpectedly (${msg.subtype ?? "unknown"})`,
+            });
+          }
+        } else {
+          const existing = store.projects.get(projectId)?.conversation.error;
+          if (!existing) {
+            const detail =
+              msg.subtype === "error_max_turns"
+                ? "Reached max turns — send a message to continue"
+                : msg.error?.trim() || msg.result?.trim();
+            store.setConversationError(
+              projectId,
+              detail ||
+                `Claude exited unexpectedly (${msg.subtype ?? "unknown"})`,
+            );
+          }
         }
       }
       // Gemini multi-tool turns leave the tool-use assistant message streaming
       // because setLastMessageStreamingDone only fires in case "assistant" (which
       // targets the post-tool text message, not the earlier tool-use message).
       // Sweep up any lingering isStreaming flags now that the session is done.
-      store.finalizeAllStreaming(projectId);
+      if (conversationId) {
+        const currentMsgs = getConvMsgs(projectId, conversationId);
+        const hasAny = currentMsgs.some((m) => m.isStreaming);
+        if (hasAny) {
+          store.updateConversation(projectId, conversationId, {
+            messages: currentMsgs.map((m) =>
+              m.isStreaming ? { ...m, isStreaming: false } : m,
+            ),
+          });
+        }
+      } else {
+        store.finalizeAllStreaming(projectId);
+      }
       return assistantMessageExists;
     }
 
@@ -1679,44 +2080,86 @@ function handlePunkMessage(
       if (evt.type === "content_block_start") {
         if (state.pendingTextDelta) {
           cancelAnimationFrame(state.textFlushRaf);
-          flushTextDelta(projectId);
+          flushTextDelta(projectId, conversationId);
         }
         if (state.pendingThinkingDelta) {
           cancelAnimationFrame(state.thinkingFlushRaf);
-          flushThinkingDelta(projectId);
+          flushThinkingDelta(projectId, conversationId);
         }
         if (state.pendingToolInput) {
           cancelAnimationFrame(state.toolInputFlushRaf);
-          flushToolInput(projectId);
+          flushToolInput(projectId, conversationId);
         }
         if (state.pendingTodos) {
           cancelAnimationFrame(state.todosFlushRaf);
-          flushTodos(projectId);
+          flushTodos(projectId, conversationId);
         }
       }
+
+      // ── Helper: add a new assistant message to the specific conversation ──
+      const addMsg = (content: ContentBlock[]) => {
+        const placeholder: ConversationMessage = {
+          id: nextMessageId(),
+          type: "assistant",
+          content,
+          timestamp: Date.now(),
+          isStreaming: true,
+        };
+        if (conversationId) {
+          const currentMsgs = getConvMsgs(projectId, conversationId);
+          store.updateConversation(projectId, conversationId, {
+            messages: [...currentMsgs, placeholder],
+          });
+        } else {
+          store.addConversationMessage(projectId, placeholder);
+        }
+      };
+
+      // ── Helper: update last assistant content in the specific conversation ──
+      const updateContent = (content: ContentBlock[]) => {
+        if (conversationId) {
+          const currentMsgs = getConvMsgs(projectId, conversationId);
+          const newMsgs = [...currentMsgs];
+          const last = newMsgs[newMsgs.length - 1];
+          if (last && last.type === "assistant") {
+            newMsgs[newMsgs.length - 1] = { ...last, content };
+            store.updateConversation(projectId, conversationId, { messages: newMsgs });
+          }
+        } else {
+          store.updateLastAssistantContent(projectId, content);
+        }
+      };
+
+      // ── Helper: set status message on the specific conversation ──
+      const setStatus = (message: string | null) => {
+        if (conversationId) {
+          store.updateConversation(projectId, conversationId, { statusMessage: message });
+        } else {
+          store.setConversationStatusMessage(projectId, message);
+        }
+      };
+
+      // ── Helper: read messages from the correct conversation ──
+      const getMsgs = (): ConversationMessage[] =>
+        conversationId
+          ? getConvMsgs(projectId, conversationId)
+          : (store.projects.get(projectId)?.conversation.messages ?? []);
 
       if (
         evt.type === "content_block_delta" &&
         evt.delta?.type === "text_delta" &&
         evt.delta.text
       ) {
-        store.setConversationStatusMessage(projectId, null);
+        setStatus(null);
 
         if (!assistantMessageExists) {
-          const placeholder: ConversationMessage = {
-            id: nextMessageId(),
-            type: "assistant",
-            content: [{ type: "text", text: evt.delta.text }],
-            timestamp: Date.now(),
-            isStreaming: true,
-          };
-          store.addConversationMessage(projectId, placeholder);
+          addMsg([{ type: "text", text: evt.delta.text }]);
           return true;
         } else {
           state.pendingTextDelta += evt.delta.text;
           if (!state.textFlushRaf) {
             state.textFlushRaf = requestAnimationFrame(() =>
-              flushTextDelta(projectId),
+              flushTextDelta(projectId, conversationId),
             );
           }
           return true;
@@ -1728,38 +2171,28 @@ function handlePunkMessage(
         evt.delta?.type === "thinking_delta" &&
         evt.delta.thinking
       ) {
-        store.setConversationStatusMessage(projectId, "thinking...");
+        setStatus("thinking...");
         if (!assistantMessageExists) {
-          const placeholder: ConversationMessage = {
-            id: nextMessageId(),
-            type: "assistant",
-            content: [{ type: "thinking", thinking: evt.delta.thinking }],
-            timestamp: Date.now(),
-            isStreaming: true,
-          };
-          store.addConversationMessage(projectId, placeholder);
+          addMsg([{ type: "thinking", thinking: evt.delta.thinking }]);
           return true;
         } else {
           // Ensure there's a thinking block to append to
-          const project = store.projects.get(projectId);
-          if (project) {
-            const msgs = project.conversation.messages;
-            const last = msgs[msgs.length - 1];
-            if (last && last.type === "assistant") {
-              const blocks = [...last.content];
-              const lastBlock = blocks[blocks.length - 1];
-              if (!lastBlock || lastBlock.type !== "thinking") {
-                // Add a new thinking block if the last block isn't thinking
-                blocks.push({ type: "thinking", thinking: "" });
-                store.updateLastAssistantContent(projectId, blocks);
-              }
+          const msgs = getMsgs();
+          const last = msgs[msgs.length - 1];
+          if (last && last.type === "assistant") {
+            const blocks = [...last.content];
+            const lastBlock = blocks[blocks.length - 1];
+            if (!lastBlock || lastBlock.type !== "thinking") {
+              // Add a new thinking block if the last block isn't thinking
+              blocks.push({ type: "thinking", thinking: "" });
+              updateContent(blocks);
             }
           }
           
           state.pendingThinkingDelta += evt.delta.thinking;
           if (!state.thinkingFlushRaf) {
             state.thinkingFlushRaf = requestAnimationFrame(() =>
-              flushThinkingDelta(projectId),
+              flushThinkingDelta(projectId, conversationId),
             );
           }
           return true;
@@ -1772,7 +2205,25 @@ function handlePunkMessage(
         evt.delta.signature
       ) {
         if (assistantMessageExists) {
-          store.setLastThinkingSignature(projectId, evt.delta.signature);
+          if (conversationId) {
+            const currentMsgs = getConvMsgs(projectId, conversationId);
+            const newMsgs = [...currentMsgs];
+            const last = newMsgs[newMsgs.length - 1];
+            if (last && last.type === "assistant") {
+              const blocks = [...last.content];
+              for (let i = blocks.length - 1; i >= 0; i--) {
+                const block = blocks[i]!;
+                if (block.type === "thinking") {
+                  blocks[i] = { ...block, signature: evt.delta.signature };
+                  break;
+                }
+              }
+              newMsgs[newMsgs.length - 1] = { ...last, content: blocks };
+              store.updateConversation(projectId, conversationId, { messages: newMsgs });
+            }
+          } else {
+            store.setLastThinkingSignature(projectId, evt.delta.signature);
+          }
         }
         return assistantMessageExists;
       }
@@ -1782,32 +2233,22 @@ function handlePunkMessage(
         evt.content_block?.type === "thinking"
       ) {
         if (!assistantMessageExists) {
-          const placeholder: ConversationMessage = {
-            id: nextMessageId(),
-            type: "assistant",
-            content: [evt.content_block as ThinkingBlock],
-            timestamp: Date.now(),
-            isStreaming: true,
-          };
-          store.addConversationMessage(projectId, placeholder);
+          addMsg([evt.content_block as ThinkingBlock]);
           return true;
         } else {
-          const project = store.projects.get(projectId);
-          if (project) {
-            const msgs = project.conversation.messages;
-            const last = msgs[msgs.length - 1];
-            if (last && last.type === "assistant") {
-              const blocks = [...last.content];
-              // Check if the last block is already a thinking block
-              const lastBlock = blocks[blocks.length - 1];
-              if (lastBlock && lastBlock.type === "thinking") {
-                // If so, reuse it instead of creating a new one
-                // This prevents multiple thinking blocks from being created
-              } else {
-                // Only add a new thinking block if the last one isn't already thinking
-                blocks.push(evt.content_block as ThinkingBlock);
-                store.updateLastAssistantContent(projectId, blocks);
-              }
+          const msgs = getMsgs();
+          const last = msgs[msgs.length - 1];
+          if (last && last.type === "assistant") {
+            const blocks = [...last.content];
+            // Check if the last block is already a thinking block
+            const lastBlock = blocks[blocks.length - 1];
+            if (lastBlock && lastBlock.type === "thinking") {
+              // If so, reuse it instead of creating a new one
+              // This prevents multiple thinking blocks from being created
+            } else {
+              // Only add a new thinking block if the last one isn't already thinking
+              blocks.push(evt.content_block as ThinkingBlock);
+              updateContent(blocks);
             }
           }
         }
@@ -1825,9 +2266,25 @@ function handlePunkMessage(
           state.toolJsonParseRaf = 0;
           const fixed = fixPartialJson(state.pendingToolJson);
           try {
-            useProjectsStore
-              .getState()
-              .updateLastToolUseInput(projectId, JSON.parse(fixed) as Record<string, unknown>);
+            const parsed = JSON.parse(fixed) as Record<string, unknown>;
+            if (conversationId) {
+              const currentMsgs = getConvMsgs(projectId, conversationId);
+              const newMsgs = [...currentMsgs];
+              const last = newMsgs[newMsgs.length - 1];
+              if (last && last.type === "assistant") {
+                const blocks = [...last.content];
+                for (let i = blocks.length - 1; i >= 0; i--) {
+                  if (blocks[i]!.type === "tool_use") {
+                    blocks[i] = { ...blocks[i]!, input: parsed } as ToolUseBlock;
+                    break;
+                  }
+                }
+                newMsgs[newMsgs.length - 1] = { ...last, content: blocks };
+                store.updateConversation(projectId, conversationId, { messages: newMsgs });
+              }
+            } else {
+              useProjectsStore.getState().updateLastToolUseInput(projectId, parsed);
+            }
           } catch { /* ignore */ }
         }
         state.pendingToolJson = "";
@@ -1851,43 +2308,38 @@ function handlePunkMessage(
           status = "searching...";
         if (toolBlock.name === "run_shell_command" || toolBlock.name === "Bash")
           status = "running command...";
-        store.setConversationStatusMessage(projectId, status);
+        setStatus(status);
 
         if (!assistantMessageExists) {
-          const placeholder: ConversationMessage = {
-            id: nextMessageId(),
-            type: "assistant",
-            content: [toolBlock],
-            timestamp: Date.now(),
-            isStreaming: true,
-          };
-          store.addConversationMessage(projectId, placeholder);
+          addMsg([toolBlock]);
         } else {
-          const project = store.projects.get(projectId);
-          if (project) {
-            const msgs = project.conversation.messages;
-            const last = msgs[msgs.length - 1];
-            if (last && last.type === "assistant") {
-              const alreadyExists = last.content.some(
-                (b) =>
-                  b.type === "tool_use" &&
-                  (b as ToolUseBlock).id === toolBlock.id,
-              );
-              if (!alreadyExists) {
-                store.updateLastAssistantContent(projectId, [
-                  ...last.content,
-                  toolBlock,
-                ]);
-              }
+          const msgs = getMsgs();
+          const last = msgs[msgs.length - 1];
+          if (last && last.type === "assistant") {
+            const alreadyExists = last.content.some(
+              (b) =>
+                b.type === "tool_use" &&
+                (b as ToolUseBlock).id === toolBlock.id,
+            );
+            if (!alreadyExists) {
+              updateContent([...last.content, toolBlock]);
             }
           }
         }
 
         if (toolBlock.name === "EnterPlanMode") {
-          store.setIsPlanning(projectId, true);
+          if (conversationId) {
+            store.updateConversation(projectId, conversationId, { isPlanning: true });
+          } else {
+            store.setIsPlanning(projectId, true);
+          }
         }
         if (toolBlock.name === "ExitPlanMode") {
-          store.setIsPlanning(projectId, false);
+          if (conversationId) {
+            store.updateConversation(projectId, conversationId, { isPlanning: false });
+          } else {
+            store.setIsPlanning(projectId, false);
+          }
         }
 
         return true;
@@ -1911,7 +2363,7 @@ function handlePunkMessage(
             const complete = JSON.parse(state.pendingToolJson) as Record<string, unknown>;
             if (Object.keys(complete).length > 0) {
               // Single-shot complete JSON → CLI → animate char-by-char
-              streamToolInputAnimate(projectId, state.currentStreamingToolId, complete);
+              streamToolInputAnimate(projectId, conversationId ?? projectId, state.currentStreamingToolId, complete);
               state.pendingToolJson = "";
               return assistantMessageExists;
             }
@@ -1930,13 +2382,13 @@ function handlePunkMessage(
           };
           if (!state.toolInputFlushRaf) {
             state.toolInputFlushRaf = requestAnimationFrame(() =>
-              flushToolInput(projectId),
+              flushToolInput(projectId, conversationId),
             );
           }
           return assistantMessageExists;
         }
 
-        scheduleToolJsonParse(projectId);
+        scheduleToolJsonParse(projectId, conversationId);
         return assistantMessageExists;
       }
 
@@ -1945,17 +2397,14 @@ function handlePunkMessage(
         evt.content_block?.type === "server_tool_use"
       ) {
         if (assistantMessageExists) {
-          const project = store.projects.get(projectId);
-          if (project) {
-            const msgs = project.conversation.messages;
-            const last = msgs[msgs.length - 1];
-            if (last && last.type === "assistant") {
-              const newContent = [
-                ...last.content,
-                evt.content_block as ServerToolUseBlock,
-              ];
-              store.updateLastAssistantContent(projectId, newContent);
-            }
+          const msgs = getMsgs();
+          const last = msgs[msgs.length - 1];
+          if (last && last.type === "assistant") {
+            const newContent = [
+              ...last.content,
+              evt.content_block as ServerToolUseBlock,
+            ];
+            updateContent(newContent);
           }
         }
         return assistantMessageExists;
@@ -1966,36 +2415,30 @@ function handlePunkMessage(
         evt.content_block?.type === "web_search_tool_result"
       ) {
         if (assistantMessageExists) {
-          const project = store.projects.get(projectId);
-          if (project) {
-            const msgs = project.conversation.messages;
-            const last = msgs[msgs.length - 1];
-            if (last && last.type === "assistant") {
-              const newContent = [
-                ...last.content,
-                evt.content_block as WebSearchToolResultBlock,
-              ];
-              store.updateLastAssistantContent(projectId, newContent);
-            }
+          const msgs = getMsgs();
+          const last = msgs[msgs.length - 1];
+          if (last && last.type === "assistant") {
+            const newContent = [
+              ...last.content,
+              evt.content_block as WebSearchToolResultBlock,
+            ];
+            updateContent(newContent);
           }
         }
         return assistantMessageExists;
       }
 
       if (evt.type === "content_block_stop") {
-        const project = store.projects.get(projectId);
-        if (project) {
-          const msgs = project.conversation.messages;
-          const last = msgs[msgs.length - 1];
-          if (last && last.type === "assistant") {
-            const lastBlock = last.content[last.content.length - 1];
-            if (
-              lastBlock &&
-              (lastBlock.type === "tool_use" ||
-                lastBlock.type === "server_tool_use")
-            ) {
-              store.setConversationStatusMessage(projectId, "thinking...");
-            }
+        const msgs = getMsgs();
+        const last = msgs[msgs.length - 1];
+        if (last && last.type === "assistant") {
+          const lastBlock = last.content[last.content.length - 1];
+          if (
+            lastBlock &&
+            (lastBlock.type === "tool_use" ||
+              lastBlock.type === "server_tool_use")
+          ) {
+            setStatus("thinking...");
           }
         }
         return assistantMessageExists;

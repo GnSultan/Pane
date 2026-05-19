@@ -40,13 +40,25 @@ const SESSION_DIR = path.join(os.homedir(), ".pane", "session");
 const activeJournals = new Map();
 
 /**
- * Get the active journal for a project, or null if no session is active.
+ * Get the active journal for a project or conversation, or null if no session is active.
  * Used by readState/mergeState to delegate transparently.
  *
+ * When conversationId is provided, tries conversation-scoped journal first,
+ * then falls back to project-scoped journal. This allows readState/mergeState
+ * to find the correct journal even when http-backend registers journals under
+ * conversationId for multi-conversation isolation.
+ *
  * @param {string} projectId
+ * @param {string|null} [conversationId] - optional conversation-scoped key
  * @returns {SessionJournal|null}
  */
-export function getActiveJournal(projectId) {
+export function getActiveJournal(projectId, conversationId = null) {
+  // Try conversation-scoped key first
+  if (conversationId) {
+    const convJournal = activeJournals.get(conversationId);
+    if (convJournal) return convJournal;
+  }
+  // Fall back to project-scoped
   return activeJournals.get(projectId) || null;
 }
 
@@ -188,25 +200,36 @@ export function applyMergeDelta(state, delta) {
  * Open a journal for a project session. Returns a writer object that manages
  * both the message log and the session state.
  *
+ * When conversationId is provided, the journal is registered under BOTH the
+ * conversationId and the projectId in the global registry. This ensures:
+ *   1. getActiveJournal(projectId, conversationId) finds it by conversation key
+ *   2. getActiveJournal(projectId) (without conversationId) finds it by project key
+ *   3. Old code paths that only pass projectId still work
+ *
  * @param {string} projectId
  * @param {object} options
  * @param {boolean} options.fresh - If true, truncate any existing journal (new session)
  * @param {string} options.model - Model name for metadata
  * @param {string} options.provider - Provider name for metadata
+ * @param {string|null} options.conversationId - conversation-scoped key (optional)
  * @returns {SessionJournal}
  */
 export function openJournal(projectId, options = {}) {
-  // Close any existing journal for this project
-  const existing = activeJournals.get(projectId);
+  const conversationId = options.conversationId || null;
+  const journalKey = conversationId || projectId;
+
+  // Close any existing journal for this key
+  const existing = activeJournals.get(journalKey);
   if (existing) {
     existing.close();
   }
 
-  const dir = getJournalDir(projectId);
+  // Use journalKey for directory path so each conversation has its own journal
+  const dir = getJournalDir(journalKey);
   fs.mkdirSync(dir, { recursive: true });
 
-  const journalPath = getJournalPath(projectId);
-  const metaPath = getMetaPath(projectId);
+  const journalPath = getJournalPath(journalKey);
+  const metaPath = getMetaPath(journalKey);
 
   if (options.fresh) {
     try { fs.unlinkSync(journalPath); } catch {}
@@ -219,6 +242,7 @@ export function openJournal(projectId, options = {}) {
   // Build metadata
   const meta = {
     projectId,
+    conversationId,
     model: options.model || null,
     provider: options.provider || null,
     createdAt: Date.now(),
@@ -227,7 +251,7 @@ export function openJournal(projectId, options = {}) {
     turnCount: 0,
   };
 
-  const existingMeta = readMeta(projectId);
+  const existingMeta = readMeta(journalKey);
   if (existingMeta && !options.fresh) {
     meta.createdAt = existingMeta.createdAt;
     meta.messageCount = existingMeta.messageCount;
@@ -242,7 +266,7 @@ export function openJournal(projectId, options = {}) {
   if (options.fresh) {
     initialState = defaultState();
   } else {
-    initialState = readStateFromDisk(projectId);
+    initialState = readStateFromDisk(journalKey);
     // Replay any state deltas from the journal
     try {
       if (fs.existsSync(journalPath)) {
@@ -268,17 +292,18 @@ export function openJournal(projectId, options = {}) {
     }
   }
 
-  const journal = new SessionJournal(projectId, fd, journalPath, metaPath, meta, initialState);
+  const journal = new SessionJournal(projectId, fd, journalPath, metaPath, meta, initialState, conversationId);
 
-  // Register in global registry
-  activeJournals.set(projectId, journal);
+  // Register in global registry under journalKey
+  activeJournals.set(journalKey, journal);
 
   return journal;
 }
 
 class SessionJournal {
-  constructor(projectId, fd, journalPath, metaPath, meta, initialState) {
+  constructor(projectId, fd, journalPath, metaPath, meta, initialState, conversationId = null) {
     this.projectId = projectId;
+    this.conversationId = conversationId;
     this._fd = fd;
     this._journalPath = journalPath;
     this._metaPath = metaPath;
@@ -345,7 +370,10 @@ class SessionJournal {
       this._stateFlushTimer = null;
     }
     try {
-      writeStateToDisk(this.projectId, this._state);
+      // Use conversation-scoped key when available, so each conversation
+      // has its own state.json file. Falls back to projectId for backward compat.
+      const stateKey = this.conversationId || this.projectId;
+      writeStateToDisk(stateKey, this._state);
     } catch (err) {
       console.warn(`[session-journal] Failed to flush state to disk: ${err.message}`);
     }
@@ -407,6 +435,7 @@ class SessionJournal {
 
   /**
    * Close the journal. Flushes state, writes meta, unregisters from global.
+   * Cleans up both conversationId and projectId registrations if present.
    */
   close() {
     if (this._closed) return;
@@ -414,7 +443,12 @@ class SessionJournal {
     this._flushStateToDisk();
     this._flushMeta();
     try { fs.closeSync(this._fd); } catch {}
+    // Clean up both registrations — journal may be registered under conversationId
+    // (via http-backend's requestKey) AND projectId (via openJournal's dual registration)
     activeJournals.delete(this.projectId);
+    if (this.conversationId) {
+      activeJournals.delete(this.conversationId);
+    }
   }
 
   /** @private */

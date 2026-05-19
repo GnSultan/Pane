@@ -246,7 +246,7 @@ class CliBackend extends PunkBackend {
     super(onEvent);
     this.worker = null;
     this.command = command;
-    this.activeRequests = new Map(); // requestId -> projectId
+    this.activeRequests = new Map(); // requestId -> { projectId, conversationId }
     this._requestResolvers = new Map(); // requestId -> resolve function
     this._loginResolver = null;
     this._idleTimer = null; // 15-min inactivity timeout
@@ -374,7 +374,10 @@ class CliBackend extends PunkBackend {
   async spawn(request) {
     this._resetIdleTimer(); // clear idle timer — we have activity
     const worker = this.getWorker();
-    this.activeRequests.set(request.requestId, request.projectId);
+    this.activeRequests.set(request.requestId, {
+      projectId: request.projectId,
+      conversationId: request.conversationId || null,
+    });
 
     // Create a promise that resolves when this request ends
     const completionPromise = new Promise((resolve) => {
@@ -397,6 +400,7 @@ class CliBackend extends PunkBackend {
     worker.postMessage({
       type: "spawn",
       projectId: request.projectId,
+      conversationId: request.conversationId || null,
       prompt: request.prompt,
       workingDir: request.workingDir,
       model: request.model,
@@ -419,13 +423,15 @@ class CliBackend extends PunkBackend {
     return completionPromise;
   }
 
-  async abort(projectId) {
+  async abort(projectId, conversationId = null) {
     if (this.worker && !this.worker.killed) {
       this.worker.postMessage({ type: "abort", projectId });
     }
-    // Clean up all requests for this project
-    for (const [rid, pid] of this.activeRequests.entries()) {
-      if (pid === projectId) this.activeRequests.delete(rid);
+    // Clean up requests scoped by projectId and conversationId
+    for (const [rid, meta] of this.activeRequests.entries()) {
+      if (meta.projectId === projectId && (!conversationId || meta.conversationId === conversationId)) {
+        this.activeRequests.delete(rid);
+      }
     }
     this._resetIdleTimer(); // may now be idle
   }
@@ -435,8 +441,8 @@ class CliBackend extends PunkBackend {
       this.worker.postMessage({ type: "terminate", projectId });
     }
     // Clean up all requests for this project
-    for (const [rid, pid] of this.activeRequests.entries()) {
-      if (pid === projectId) this.activeRequests.delete(rid);
+    for (const [rid, meta] of this.activeRequests.entries()) {
+      if (meta.projectId === projectId) this.activeRequests.delete(rid);
     }
     this._resetIdleTimer(); // may now be idle
   }
@@ -586,7 +592,7 @@ class PunkEngine {
 
   _sweepStaleOutcomes() {
     const now = Date.now();
-    const outcomeTTL   = 10 * 60 * 1000; // 10 min
+    const outcomeTTL   = 60 * 60 * 1000; // 60 min (was 10min — long HTTP conversations can exceed this)
     const lastOutcomeTTL = 30 * 60 * 1000; // 30 min
 
     for (const [id, tracked] of this._activeOutcomes) {
@@ -642,8 +648,14 @@ class PunkEngine {
       return;
     }
 
-    const onEvent = (projectId, event, requestId) =>
-      this.handleBackendEvent(projectId, event, requestId);
+    const onEvent = (projectId, event, requestId) => {
+      // Look up conversationId from active outcomes for per-conversation event routing
+      const outcome = requestId ? this._activeOutcomes.get(requestId) : null;
+      const enrichedEvent = outcome?.conversationId
+        ? { ...event, conversationId: outcome.conversationId }
+        : event;
+      this.handleBackendEvent(projectId, enrichedEvent, requestId);
+    };
 
     // Detect available backends
     const availability = await detectBackendAvailability();
@@ -976,7 +988,17 @@ class PunkEngine {
       }
     }
 
-    const channel = `punk-stream:${projectId}`;
+    // Determine conversation scope for channel naming.
+    // When conversationId is available, scope events to the conversation so
+    // multiple conversations in the same project don't receive each other's
+    // events. Priority: event.conversationId (enriched by onEvent wrapper) >
+    // _activeOutcomes lookup (may be swept for long-running requests).
+    // Fall back to project-scoped for backward compat.
+    const outcome = requestId ? this._activeOutcomes.get(requestId) : null;
+    const conversationId = event.conversationId || outcome?.conversationId || null;
+    const channel = conversationId
+      ? `punk-stream:${projectId}:${conversationId}`
+      : `punk-stream:${projectId}`;
 
     // Attach requestId to the event so the renderer can filter it
     const enrichedEvent = { ...event, requestId };
@@ -1647,43 +1669,9 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       ? _taskTypeToDomain(localDecision.taskType)
       : classifyDomain(resolvedRequest.prompt ?? "");
 
-    // Emit strategy event only when the router actually made a decision.
-    // When the user has pinned a specific model, stay silent — no UI noise.
-    if (!userExplicitOverride) {
-      this.handleBackendEvent(
-        request.projectId,
-        {
-          event: "strategy",
-          data: {
-            // strategy vector
-            mode:         strategy.mode,
-            discovery:    strategy.discovery,
-            reasoning:    strategy.reasoning,
-            verification: strategy.verification,
-            confidence:   strategy.confidence,
-            reason:       strategy.reason,
-            signals:      strategy.signals,
-            // routing fields (used by UI model display)
-            intent:       resolvedRequest.intent,
-            provider:     resolvedRequest.provider,
-            model:        resolvedRequest.model,
-            thinking:     resolvedRequest.thinking ?? false,
-            // heuristic metadata
-            routedBy:         localDecision?.routedBy ?? null,
-            heuristicTier:    localDecision?.modelTier ?? null,
-            complexityScore:  localDecision?.complexityScore ?? null,
-            localTaskType:    localDecision?.taskType ?? null,
-            localComplexity:  localDecision?.complexity ?? null,
-            localAtomHints:   localDecision?.atomHints ?? [],
-            // escalation (from heuristic router)
-            escalationLevel,
-            struggleCount,
-            preActions:       localDecision?.preActions ?? [],
-          },
-        },
-        request.requestId,
-      );
-    }
+    // Strategy event is emitted AFTER _activeOutcomes.set() below, so the
+    // IPC channel carries conversationId for per-conversation routing.
+    // (Moved from here — was emitted too early, before outcome was recorded.)
 
     console.log(
       `[punk] strategy=${strategy.mode} (${(strategy.confidence * 100).toFixed(0)}%) ` +
@@ -1813,6 +1801,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
           taskType:         strategy.mode,
           domain,
           projectId:        resolvedRequest.projectId,
+          conversationId:   resolvedRequest.conversationId || null,
           model:            resolvedRequest.model,
           provider:         resolvedRequest.provider,
           pendingTodoCount: (resolvedRequest.todos || []).filter(t => t.status !== "completed").length,
@@ -1821,6 +1810,47 @@ Respond with a single concise principle statement (one sentence, under 150 chara
           userPrompt:       resolvedRequest.prompt || "",
           responseText:     "",
         });
+
+        // Emit strategy event AFTER outcome is recorded so the IPC channel
+        // carries the conversationId for per-conversation routing.
+        // Previously emitted before _activeOutcomes.set() — strategy events
+        // went to the project-wide channel where no conversation-scoped
+        // listener was subscribed, silently dropping the event.
+        if (!userExplicitOverride) {
+          this.handleBackendEvent(
+            request.projectId,
+            {
+              event: "strategy",
+              data: {
+                // strategy vector
+                mode:         strategy.mode,
+                discovery:    strategy.discovery,
+                reasoning:    strategy.reasoning,
+                verification: strategy.verification,
+                confidence:   strategy.confidence,
+                reason:       strategy.reason,
+                signals:      strategy.signals,
+                // routing fields (used by UI model display)
+                intent:       resolvedRequest.intent,
+                provider:     resolvedRequest.provider,
+                model:        resolvedRequest.model,
+                thinking:     resolvedRequest.thinking ?? false,
+                // heuristic metadata
+                routedBy:         localDecision?.routedBy ?? null,
+                heuristicTier:    localDecision?.modelTier ?? null,
+                complexityScore:  localDecision?.complexityScore ?? null,
+                localTaskType:    localDecision?.taskType ?? null,
+                localComplexity:  localDecision?.complexity ?? null,
+                localAtomHints:   localDecision?.atomHints ?? [],
+                // escalation (from heuristic router)
+                escalationLevel,
+                struggleCount,
+                preActions:       localDecision?.preActions ?? [],
+              },
+            },
+            request.requestId,
+          );
+        }
       } catch (err) {
         console.warn("[punk] outcome record failed (non-fatal):", err.message);
       }
@@ -1865,11 +1895,11 @@ Respond with a single concise principle statement (one sentence, under 150 chara
   // The human-in-the-loop model (Think → review → Build) is more robust than
   // automated plan→execute→verify pipelines.
 
-  async abort(projectId) {
+  async abort(projectId, conversationId = null) {
     // Try all backends - the request could be in any of them
     for (const backend of Object.values(this.backends)) {
       if (backend) {
-        await backend.abort(projectId).catch(() => {});
+        await backend.abort(projectId, conversationId).catch(() => {});
       }
     }
   }
@@ -2101,6 +2131,7 @@ export async function registerPunkHandlers() {
   ipcMain.handle("send_to_punk", async (_event, args) => {
     const {
       projectId,
+      conversationId,
       prompt,
       workingDir,
       model,
@@ -2122,6 +2153,7 @@ export async function registerPunkHandlers() {
     } = args;
     await punkEngine.spawn({
       projectId,
+      conversationId: conversationId || null,
       prompt,
       workingDir,
       model,
@@ -2143,7 +2175,7 @@ export async function registerPunkHandlers() {
   });
 
   ipcMain.handle("abort_punk", async (_event, args) => {
-    await punkEngine.abort(args.projectId);
+    await punkEngine.abort(args.projectId, args.conversationId || null);
   });
 
   // Preview what model the router would pick — used by InputBar to show

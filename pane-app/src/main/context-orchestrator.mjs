@@ -228,7 +228,7 @@ function applyRelevanceAdjustments(layers, adjustments) {
 // identity + rules + arbiter findings + MCP orientation.
 // ---------------------------------------------------------------------------
 
-function _buildLeanContext(projectId, isResume) {
+function _buildLeanContext(projectId, isResume, conversationId = null) {
   const parts = [];
 
   // ── Developer Identity: condensed behavioral identity (~120 tokens) ──
@@ -247,8 +247,9 @@ function _buildLeanContext(projectId, isResume) {
     );
   }
 
-  // Arbiter findings — if unresolved errors exist, the model must see them immediately
-  const verdict = readVerdict(projectId);
+  // Arbiter findings — if unresolved errors exist, the model must see them immediately.
+  // Scoped by conversationId when provided.
+  const verdict = readVerdict(projectId, conversationId);
   const arbiterText = formatVerdictForContext(verdict);
   if (arbiterText) {
     parts.push("", arbiterText);
@@ -304,7 +305,7 @@ function _buildLeanContext(projectId, isResume) {
  *   session — changes when files/scope change (relevant files)
  *   turn    — changes every turn (git, todos, actions, memories, symbols)
  */
-function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected = null, queryEmbeddingBase64 = null) {
+function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected = null, queryEmbeddingBase64 = null, conversationId = null) {
   const layers = [];
 
   // ── Read shared data sources once ──────────────────────────────────────
@@ -333,7 +334,7 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   // Use readState() — delegates to journal in-memory state when active,
   // falls back to disk for cold start. This is the same source compileContext()
   // uses, ensuring consistency between both context assembly paths.
-  let state = readState(projectId);
+  let state = readState(projectId, conversationId);
 
   // ── Stale task retirement — 8-hour threshold. Same policy as        ──
   // pane-system-prompt.mjs:476 but runs here because orchestrateContext
@@ -343,10 +344,10 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   const STALE_THRESHOLD_MS = 8 * 60 * 60 * 1000;
   if (state.activeTask && (!state.activeTask.timestamp || (Date.now() - state.activeTask.timestamp) > STALE_THRESHOLD_MS)) {
     state.activeTask = null;
-    mergeState(projectId, { activeTask: null });
+    mergeState(projectId, { activeTask: null }, conversationId);
   }
   // Refresh state after clearing so downstream code sees the clean version
-  state = readState(projectId);
+  state = readState(projectId, conversationId);
 
   // ── Delta mode: on turn 2+, skip session-stable layers that the model ──
   // already has in its context window. Only inject genuine deltas.
@@ -766,7 +767,7 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   // chronological (most recent first) when embedding isn't available.
   // Injected as a "turn" layer since relevance changes with every query.
   if (!projectId.startsWith("mind:")) {
-    const turnSummaries = contextStore.getTurnSummaries(projectId);
+    const turnSummaries = contextStore.getTurnSummaries(projectId, conversationId);
     if (turnSummaries && turnSummaries.length > 0) {
       let topSummaries;
       if (queryEmbeddingBase64) {
@@ -838,8 +839,9 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   // Turn 2+: mind entries and pins already in context — skip
 
   // ── 3. HANDOFF (useful — session start only) ──────────────────────────
+  // Scoped by conversationId when provided.
   if (historyLength < 2) {
-    const handoffText = _buildHandoff(projectId);
+    const handoffText = _buildHandoff(projectId, conversationId);
     if (handoffText) {
       layers.push({
         name: "handoff",
@@ -854,8 +856,9 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   // Living summary of dropped turns — injected on turn 5+ when the model
   // has likely lost early conversation history. Priority bumped to IMPORTANT
   // by the relevance engine when context pressure is high.
+  // Scoped by conversationId when provided.
   if (historyLength >= 5) {
-    const digest = readDigest(projectId);
+    const digest = readDigest(projectId, conversationId);
     const digestText = formatDigestForContext(digest);
     if (digestText) {
       layers.push({
@@ -959,7 +962,8 @@ function buildLayers(projectId, intent, historyLength, backend, sqliteChanges, l
   // Turn Sentinel writes a verdict after each turn. If unresolved errors
   // exist, inject them at CRITICAL priority so the LLM must fix them
   // before taking on new work.
-  const verdict = readVerdict(projectId);
+  // Scoped by conversationId when provided.
+  const verdict = readVerdict(projectId, conversationId);
   const arbiterText = formatVerdictForContext(verdict);
   if (arbiterText) {
     layers.push({
@@ -1038,12 +1042,13 @@ export function orchestrateContext(projectId, options = {}) {
     mode = "full",       // "full" (HTTP backends) or "lean" (CLI backends)
     isResume = false,     // true when resuming an existing CLI session
     queryEmbeddingBase64 = null, // base64-encoded query embedding for V4 semantic turn pool
+    conversationId = null, // conversation-scoped key for isolating session state
   } = options;
 
   // ── Lean mode: minimal context for CLI backends that manage their own context.
   // Identity + rules + arbiter findings + MCP orientation. ~500 tokens.
   if (mode === "lean") {
-    return _buildLeanContext(projectId, isResume);
+    return _buildLeanContext(projectId, isResume, conversationId);
   }
 
   const contextLimit = getModelLimit(model);
@@ -1060,7 +1065,7 @@ export function orchestrateContext(projectId, options = {}) {
 
   // Build all layers — pass lastInjected for delta-aware assembly on turn 2+
   const lastInjected = contextStore.getLastInjected(projectId);
-  const allLayers = buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected, queryEmbeddingBase64);
+  const allLayers = buildLayers(projectId, intent, historyLength, backend, sqliteChanges, lastInjected, queryEmbeddingBase64, conversationId);
 
   // ── Relevance Engine: adjust priorities based on intent, complexity, brain data ──
   // Read from in-memory ContextStore (updated by brain-engine via main.mjs).
@@ -1219,7 +1224,7 @@ export function orchestrateContext(projectId, options = {}) {
   // On the FIRST full assembly, record what was injected so turn 2+ can diff.
   if (!lastInjected || lastInjected.turnNumber === 0) {
     try {
-      const state = readState(projectId);
+      const state = readState(projectId, conversationId);
       const memories = (brainCtx?.memories || []).filter(m => (m.confidence || 0) >= 0.75);
       const symbols = (brainCtx?.relevantSymbols || []).slice(0, 15);
       contextStore.updateLastInjected(projectId, {
@@ -1304,12 +1309,13 @@ function _buildEscalation(contextShape) {
   return parts.join("\n");
 }
 
-function _buildHandoff(projectId) {
+function _buildHandoff(projectId, conversationId = null) {
   let history;
   try {
-    history = JSON.parse(fs.readFileSync(
-      path.join(SESSION_DIR, projectId, "handoff-history.json"), "utf-8"
-    ));
+    const handoffPath = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`, "handoff-history.json")
+      : path.join(SESSION_DIR, projectId, "handoff-history.json");
+    history = JSON.parse(fs.readFileSync(handoffPath, "utf-8"));
   } catch { return null; }
 
   if (!history || history.length === 0) return null;

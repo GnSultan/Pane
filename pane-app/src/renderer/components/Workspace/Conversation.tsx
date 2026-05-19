@@ -8,6 +8,7 @@ import { getConversationSlice, listCheckpoints, readFile } from "../../lib/tauri
 import { restoringProjects } from "../../hooks/useSettingsPersistence";
 import type {
   ConversationMessage,
+  ConversationState,
   ToolResultBlock,
   ToolUseBlock,
 } from "../../lib/punk-types";
@@ -16,6 +17,20 @@ const EMPTY_MESSAGES: ConversationMessage[] = [];
 
 interface ConversationProps {
   projectId: string;
+  conversationId: string;
+}
+
+// Read a value from a specific conversation's state. Returns undefined when
+// the conversation doesn't exist (handled by default values at call sites).
+function useConvState<T>(
+  projectId: string,
+  conversationId: string,
+  selector: (state: ConversationState) => T,
+): T | undefined {
+  return useProjectsStore((s) => {
+    const conv = s.projects.get(projectId)?.conversations.get(conversationId);
+    return conv ? selector(conv.state) : undefined;
+  });
 }
 
 // MemoizedMessage uses a custom comparator to prevent re-renders of unchanged
@@ -68,23 +83,13 @@ const MemoizedMessage = memo(
 
 export const Conversation = memo(function Conversation({
   projectId,
+  conversationId,
 }: ConversationProps) {
-  const messages = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.messages ?? EMPTY_MESSAGES,
-  );
-  const isProcessing = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.isProcessing ?? false,
-  );
-  const isThinking = useProjectsStore(
-    (s) =>
-      s.projects.get(projectId)?.conversation.statusMessage === "thinking...",
-  );
-  const error = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.error ?? null,
-  );
-  const historyStartIndex = useProjectsStore(
-    (s) => s.projects.get(projectId)?.conversation.historyStartIndex ?? 0,
-  );
+  const messages = useConvState(projectId, conversationId, (s) => s.messages) ?? EMPTY_MESSAGES;
+  const isProcessing = useConvState(projectId, conversationId, (s) => s.isProcessing) ?? false;
+  const isThinking = useConvState(projectId, conversationId, (s) => s.statusMessage === "thinking...") ?? false;
+  const error = useConvState(projectId, conversationId, (s) => s.error) ?? null;
+  const historyStartIndex = useConvState(projectId, conversationId, (s) => s.historyStartIndex) ?? 0;
   const hasOlderMessages = historyStartIndex > 0;
 
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
@@ -93,17 +98,16 @@ export const Conversation = memo(function Conversation({
     if (!projectId || isLoadingOlder || !hasOlderMessages) return;
     setIsLoadingOlder(true);
     try {
-      const slice = await getConversationSlice(projectId, 30, historyStartIndex);
+      const slice = await getConversationSlice(projectId, conversationId, 30, historyStartIndex);
       if (slice.messages.length > 0) {
-        // Preserve scroll position: capture distance from top before prepend
         const container = scrollRef.current;
         const scrollHeightBefore = container?.scrollHeight ?? 0;
         useProjectsStore.getState().prependOlderMessages(
           projectId,
           slice.messages as ConversationMessage[],
           slice.startIndex,
+          conversationId,
         );
-        // After React re-renders, restore relative scroll position
         requestAnimationFrame(() => {
           if (container) {
             const added = container.scrollHeight - scrollHeightBefore;
@@ -116,7 +120,7 @@ export const Conversation = memo(function Conversation({
     } finally {
       setIsLoadingOlder(false);
     }
-  }, [projectId, isLoadingOlder, hasOlderMessages, historyStartIndex]);
+  }, [projectId, conversationId, isLoadingOlder, hasOlderMessages, historyStartIndex]);
 
   // toolResultMap: only recompute when the count of system messages changes,
   // not on every text delta. Text deltas only touch the last assistant message.
@@ -141,7 +145,7 @@ export const Conversation = memo(function Conversation({
     return map;
   }, [messages, systemMessageCount]);
 
-  const { sendMessage, abortMessage } = usePunk(projectId);
+  const { sendMessage, abortMessage } = usePunk(projectId, conversationId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
   const streamingRef = useRef(false);
@@ -152,13 +156,13 @@ export const Conversation = memo(function Conversation({
   const { applyRestored } = useScrollPosition(projectId, scrollRef, followRef, streamingRef);
 
   // Lazy load: fetch the last 30 messages from SQLite on mount.
-  // startTransition marks the store update as non-urgent so React can paint
-  // the empty shell first, preventing the main-thread hang on restoration.
+  // Uses conversationId to scope the query to this specific conversation.
   useEffect(() => {
     const ps = useProjectsStore.getState();
-    const hasMessages = (ps.projects.get(projectId)?.conversation.messages.length ?? 0) > 0;
+    const conv = ps.projects.get(projectId)?.conversations.get(conversationId);
+    const hasMessages = (conv?.state.messages.length ?? 0) > 0;
     if (hasMessages) return;
-    getConversationSlice(projectId, 30)
+    getConversationSlice(projectId, conversationId, 30)
       .then((slice) => {
         if (slice.messages.length === 0) return;
         const seen = new Set<string>();
@@ -167,19 +171,16 @@ export const Conversation = memo(function Conversation({
           seen.add(m.id);
           return true;
         });
-        // Mark as restoring before the transition so unsubConversation
-        // skips the save_conversation IPC triggered by countChanged (0→N).
         restoringProjects.add(projectId);
         startTransition(() => {
           const store = useProjectsStore.getState();
           store.restoreConversation(projectId, deduped, {
             totalCount: slice.totalCount,
             startIndex: slice.startIndex,
-          });
+          }, conversationId);
           if (slice.model) store.setConversationModel(projectId, slice.model);
           restoringProjects.delete(projectId);
         });
-        // Load checkpoint metadata after conversation is restored
         listCheckpoints(projectId)
           .then((metas) => {
             if (metas.length > 0) useProjectsStore.getState().setCheckpoints(projectId, metas);
@@ -187,7 +188,7 @@ export const Conversation = memo(function Conversation({
           .catch(() => {});
       })
       .catch(() => {});
-  }, [projectId]);
+  }, [projectId, conversationId]);
 
   // Restore saved scroll position when messages first arrive from disk.
   useEffect(() => {

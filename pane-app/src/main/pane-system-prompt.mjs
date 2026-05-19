@@ -207,27 +207,38 @@ function statePath(projectId) {
  * Read the current session state. When a journal is active for this project,
  * returns the in-memory state (fast, no disk I/O). Otherwise falls back to
  * reading state.json from disk (cold start, between sessions).
+ *
+ * When conversationId is provided, checks for a conversation-scoped journal
+ * first. This allows multi-conversation isolation: each conversation has its
+ * own journal and state file.
+ *
+ * @param {string} projectId
+ * @param {string|null} [conversationId] - optional conversation-scoped key
+ * @returns {object}
  */
-export function readState(projectId) {
-  const journal = getActiveJournal(projectId);
+export function readState(projectId, conversationId = null) {
+  const journal = getActiveJournal(projectId, conversationId);
   if (journal) return journal.getState();
 
   // Fallback: read from state.json (no active session)
+  // Use conversation-scoped state file when conversationId is provided
+  const stateKey = conversationId || projectId;
   try {
-    return JSON.parse(fs.readFileSync(statePath(projectId), "utf-8"));
+    return JSON.parse(fs.readFileSync(statePath(stateKey), "utf-8"));
   } catch {
     return defaultState();
   }
 }
 
-export function writeState(projectId, state) {
-  const dir = path.join(SESSION_DIR, projectId);
+export function writeState(projectId, state, conversationId = null) {
+  const stateKey = conversationId || projectId;
+  const dir = path.join(SESSION_DIR, stateKey);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(statePath(projectId), JSON.stringify(state, null, 2), "utf-8");
+  fs.writeFileSync(statePath(stateKey), JSON.stringify(state, null, 2), "utf-8");
 }
 
-export function clearState(projectId) {
-  writeState(projectId, defaultState());
+export function clearState(projectId, conversationId = null) {
+  writeState(projectId, defaultState(), conversationId);
 }
 
 /**
@@ -236,16 +247,25 @@ export function clearState(projectId) {
  * debounced state.json flush). Otherwise falls back to read-modify-write on
  * state.json directly.
  *
- * All 15+ callers across the codebase continue calling this unchanged.
+ * When conversationId is provided, the journal/state lookup is scoped to that
+ * conversation. This allows per-conversation state isolation.
+ *
+ * All 15+ callers across the codebase continue calling this unchanged when
+ * called without conversationId (backward compatible).
+ *
+ * @param {string} projectId
+ * @param {object} delta
+ * @param {string|null} [conversationId] - optional conversation-scoped key
+ * @returns {object}
  */
-export function mergeState(projectId, delta) {
-  const journal = getActiveJournal(projectId);
+export function mergeState(projectId, delta, conversationId = null) {
+  const journal = getActiveJournal(projectId, conversationId);
   if (journal) return journal.applyDelta(delta);
 
   // Fallback: read-modify-write state.json (no active session)
-  const state = readState(projectId);
+  const state = readState(projectId, conversationId);
   applyMergeDelta(state, delta);
-  writeState(projectId, state);
+  writeState(projectId, state, conversationId);
   return state;
 }
 
@@ -294,7 +314,7 @@ function normalizeHandoffItem(item) {
   return null;
 }
 
-export function compileContext(projectId, intent = "other", historyLength = 0, backend = "claude-code", sqliteChanges = null) {
+export function compileContext(projectId, intent = "other", historyLength = 0, backend = "claude-code", sqliteChanges = null, conversationId = null) {
   const frozenParts  = [];   // Tier 1: never changes within session — cacheable prefix
   const sessionParts = [];   // Tier 2: changes when files/scope change — extends cache when stable
   const turnParts    = [];   // Tier 3: changes every turn — never cached
@@ -458,8 +478,9 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   dynamicParts.push(`User: ${os.userInfo().username}`);
   dynamicParts.push("");
 
-  // Session state: what Pane knows is happening right now
-  const state = readState(projectId);
+  // Session state: what Pane knows is happening right now.
+  // Uses conversation-scoped state when conversationId is provided.
+  const state = readState(projectId, conversationId);
 
   // ── Task state: retired after 8 hours, never pre-loaded ────────────────
   // Stale objectives from previous sessions were the root cause of the
@@ -475,7 +496,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   // Retire stale objectives — clear them from state entirely
   if (state.activeTask?.timestamp && (nowMs - state.activeTask.timestamp) > STALE_THRESHOLD_MS) {
     state.activeTask = null;
-    mergeState(projectId, { activeTask: null });
+    mergeState(projectId, { activeTask: null }, conversationId);
   }
   if (state.todos?.length > 0) {
     const freshTodos = state.todos.filter(t => {
@@ -485,7 +506,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
     });
     if (freshTodos.length !== state.todos.length) {
       state.todos = freshTodos;
-      mergeState(projectId, { todos: freshTodos });
+      mergeState(projectId, { todos: freshTodos }, conversationId);
     }
   }
   // Retire stale decisions (older than 8h) — they're still in memory via pane_recall
@@ -800,8 +821,8 @@ function extractCompletedFromHandoff(handoff) {
   return items.slice(0, 3); // Max 3 completed items from history
 }
 
-export function generateHandoff(projectId, { writeFile = true } = {}) {
-  const state = readState(projectId);
+export function generateHandoff(projectId, { writeFile = true, conversationId = null } = {}) {
+  const state = readState(projectId, conversationId);
   const handoff = {
     timestamp: Date.now(),
     turn: state.turnCount,
@@ -835,7 +856,7 @@ export function generateHandoff(projectId, { writeFile = true } = {}) {
 
   // Extract completed items from previous sessions — tagged as completed_from_history
   // This separates previous session work from current session accomplishments
-  const history = readHandoffHistory(projectId);
+  const history = readHandoffHistory(projectId, conversationId);
   if (history?.length > 0) {
     const historyCompleted = [];
     for (const h of history) {
@@ -875,7 +896,7 @@ export function generateHandoff(projectId, { writeFile = true } = {}) {
   }
 
   if (writeFile) {
-    writeHandoffWithHistory(projectId, handoff);
+    writeHandoffWithHistory(projectId, handoff, conversationId);
   }
 
   return handoff;
@@ -887,17 +908,28 @@ export function generateHandoff(projectId, { writeFile = true } = {}) {
  * Writes two files:
  *   handoff.json         — current handoff (for quick reads by compileContext)
  *   handoff-history.json — array of last 3 handoffs (for trajectory display)
+ *
+ * When conversationId is provided, scopes handoff files to that conversation
+ * under ~/.pane/session/{projectId}/conv-{conversationId}/. This ensures each
+ * conversation has its own handoff history, preventing cross-conversation
+ * contamination when switching between conversations in the same project.
+ *
+ * @param {string} projectId
+ * @param {object} handoff
+ * @param {string|null} [conversationId]
  */
-export function writeHandoffWithHistory(projectId, handoff) {
+export function writeHandoffWithHistory(projectId, handoff, conversationId = null) {
   try {
-    const projectSessionDir = path.join(SESSION_DIR, projectId);
-    fs.mkdirSync(projectSessionDir, { recursive: true });
+    const scopedDir = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`)
+      : path.join(SESSION_DIR, projectId);
+    fs.mkdirSync(scopedDir, { recursive: true });
 
     // Read existing history
     let history = [];
     try {
       history = JSON.parse(
-        fs.readFileSync(path.join(projectSessionDir, "handoff-history.json"), "utf-8")
+        fs.readFileSync(path.join(scopedDir, "handoff-history.json"), "utf-8")
       );
     } catch {}
 
@@ -905,8 +937,8 @@ export function writeHandoffWithHistory(projectId, handoff) {
     history = [handoff, ...history].slice(0, 3);
 
     // Write both files
-    fs.writeFileSync(path.join(projectSessionDir, "handoff.json"), JSON.stringify(handoff, null, 2), "utf-8");
-    fs.writeFileSync(path.join(projectSessionDir, "handoff-history.json"), JSON.stringify(history, null, 2), "utf-8");
+    fs.writeFileSync(path.join(scopedDir, "handoff.json"), JSON.stringify(handoff, null, 2), "utf-8");
+    fs.writeFileSync(path.join(scopedDir, "handoff-history.json"), JSON.stringify(history, null, 2), "utf-8");
   } catch (err) {
     console.warn(`[context] Failed to write handoff: ${err.message}`);
   }
@@ -923,16 +955,22 @@ export function writeHandoffWithHistory(projectId, handoff) {
  * Match criterion: history[0].timestamp within 2 minutes of the new handoff.
  * If no match (edge case — shouldn't happen in normal flow), falls back to
  * a normal prepend so data is never lost.
+ *
+ * @param {string} projectId
+ * @param {object} handoff
+ * @param {string|null} [conversationId]
  */
-export function updateLatestHandoff(projectId, handoff) {
+export function updateLatestHandoff(projectId, handoff, conversationId = null) {
   try {
-    const projectSessionDir = path.join(SESSION_DIR, projectId);
-    fs.mkdirSync(projectSessionDir, { recursive: true });
+    const scopedDir = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`)
+      : path.join(SESSION_DIR, projectId);
+    fs.mkdirSync(scopedDir, { recursive: true });
 
     let history = [];
     try {
       history = JSON.parse(
-        fs.readFileSync(path.join(projectSessionDir, "handoff-history.json"), "utf-8")
+        fs.readFileSync(path.join(scopedDir, "handoff-history.json"), "utf-8")
       );
     } catch {}
 
@@ -948,34 +986,44 @@ export function updateLatestHandoff(projectId, handoff) {
       history = [handoff, ...history].slice(0, 3);
     }
 
-    fs.writeFileSync(path.join(projectSessionDir, "handoff.json"), JSON.stringify(handoff, null, 2), "utf-8");
-    fs.writeFileSync(path.join(projectSessionDir, "handoff-history.json"), JSON.stringify(history, null, 2), "utf-8");
+    fs.writeFileSync(path.join(scopedDir, "handoff.json"), JSON.stringify(handoff, null, 2), "utf-8");
+    fs.writeFileSync(path.join(scopedDir, "handoff-history.json"), JSON.stringify(history, null, 2), "utf-8");
   } catch (err) {
     console.warn(`[context] Failed to update handoff: ${err.message}`);
   }
 }
 
-export function readHandoff(projectId) {
+/**
+ * Read the latest handoff.
+ *
+ * @param {string} projectId
+ * @param {string|null} [conversationId]
+ * @returns {object|null}
+ */
+export function readHandoff(projectId, conversationId = null) {
   try {
-    return JSON.parse(
-      fs.readFileSync(
-        path.join(SESSION_DIR, projectId, "handoff.json"),
-        "utf-8"
-      )
-    );
+    const filePath = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`, "handoff.json")
+      : path.join(SESSION_DIR, projectId, "handoff.json");
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
   } catch {
     return null;
   }
 }
 
-function readHandoffHistory(projectId) {
+/**
+ * Read handoff history array.
+ *
+ * @param {string} projectId
+ * @param {string|null} [conversationId]
+ * @returns {Array|null}
+ */
+function readHandoffHistory(projectId, conversationId = null) {
   try {
-    return JSON.parse(
-      fs.readFileSync(
-        path.join(SESSION_DIR, projectId, "handoff-history.json"),
-        "utf-8"
-      )
-    );
+    const filePath = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`, "handoff-history.json")
+      : path.join(SESSION_DIR, projectId, "handoff-history.json");
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
   } catch {
     return null;
   }

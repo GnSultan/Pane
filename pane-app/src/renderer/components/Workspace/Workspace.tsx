@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, useCallback, memo, useTransition } from "react";
 import { Conversation } from "./Conversation";
+import { ConversationPicker } from "./ConversationPicker";
+import { ConversationTabBar } from "./ConversationTabBar";
 import { FileExplorer } from "./FileExplorer";
 import { Terminal } from "./Terminal";
 import { Profile } from "./Profile";
@@ -53,19 +55,51 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
     });
   }, [projectId]);
 
-  const store = useProjectsStore.getState();
-  const initiallyActive = store.activeProjectId === projectId;
+  const initiallyActive = useProjectsStore((s) => s.activeProjectId === projectId);
+  const activeConvId = useProjectsStore((s) => s.projects.get(projectId)?.activeConversationId ?? null);
+  const totalConvCount = useProjectsStore((s) => {
+    const p = s.projects.get(projectId);
+    if (!p) return 0;
+    let count = 0;
+    for (const c of p.conversations.values()) {
+      if (!c.isArchived) count++;
+    }
+    return count;
+  });
+
+  // Auto-create a default conversation when project has no conversation rows at all
+  // (e.g. brand new project, never created a conversation). Only fires when both
+  // the conversations map AND activeConversationId are empty.
+  useEffect(() => {
+    if (!mounted) return;
+    if (totalConvCount === 0 && !activeConvId) {
+      useProjectsStore.getState().addConversation(projectId, undefined, "idle");
+    }
+  }, [mounted, totalConvCount, activeConvId, projectId]);
+
+  // Show picker when no conversation is active and conversations exist
+  const showPicker = !activeConvId && totalConvCount > 0;
 
   return (
     <div
       ref={ref}
-      className="absolute inset-0 flex bg-pane-bg"
+      className="absolute inset-0 flex flex-col bg-pane-bg"
       style={{
         zIndex: initiallyActive ? 1 : 0,
         pointerEvents: initiallyActive ? "auto" : "none",
       }}
     >
-      {mounted && <Conversation projectId={projectId} />}
+      {mounted && (
+        <>
+          <div className="flex-1 min-h-0 flex flex-col">
+            {activeConvId ? (
+              <Conversation projectId={projectId} conversationId={activeConvId} />
+            ) : showPicker ? (
+              <ConversationPicker projectId={projectId} />
+            ) : null}
+          </div>
+        </>
+      )}
     </div>
   );
 });
@@ -197,14 +231,24 @@ export function Workspace() {
 
   return (
     <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
+      {/* Tab bar OUTSIDE page div — sits in the Workspace root stacking context
+           so its z-index resolves above the drag region (z-30 in App.tsx).
+           The page div's stacking context (z-20) would trap it underneath. */}
+      {activeProjectId && (
+        <ConversationTabBar projectId={activeProjectId} />
+      )}
+
       {/* Conversation page — participates in the same [data-page] CSS system as every other page.
            Page-level visibility (conversation vs mind vs profile) is CSS-driven.
-           Thread switching (project A vs project B) is JS-driven z-index 0/1 inside. */}
-      <div data-page="conversation" className="absolute inset-0 bg-pane-bg">
-        {projectOrder.length === 0 && <EmptyState />}
-        {projectOrder.map((id) => (
-          <ConversationLayer key={id} projectId={id} />
-        ))}
+           Thread switching (project A vs project B) is JS-driven z-index 0/1 inside.
+           Has pt-8 to account for the absolute tab bar above. */}
+      <div data-page="conversation" className="absolute inset-0 flex flex-col bg-pane-bg">
+        <div className="flex-1 min-h-0 relative pt-8">
+          {projectOrder.length === 0 && <EmptyState />}
+          {projectOrder.map((id) => (
+            <ConversationLayer key={id} projectId={id} />
+          ))}
+        </div>
       </div>
 
       <div data-page="viewer" className="absolute inset-0 flex flex-col bg-pane-bg">

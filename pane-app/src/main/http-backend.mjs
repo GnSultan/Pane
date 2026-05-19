@@ -72,6 +72,7 @@ function manageContextWindow(
   projectId = null,
   model = null,
   turnSelection = null, // optional TurnSelection for semantic pruning
+  conversationId = null,
 ) {
   const maxContextTokens = model ? getModelLimit(model) : 128000;
   return manageConversation(messages, {
@@ -80,6 +81,7 @@ function manageContextWindow(
     systemTokens,
     maxContextTokens,
     turnSelection,
+    conversationId,
   });
 }
 
@@ -997,9 +999,10 @@ const VERIFY_COMMANDS =
  * @param {'write'|'verify_pass'|'turn_end'} trigger
  * @param {Function} onEvent  — backend event emitter
  * @param {string} requestId
+ * @param {string|null} [conversationId=null]
  */
-function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
-  const state = readState(projectId);
+function autoAdvanceTodos(projectId, trigger, onEvent, requestId, conversationId = null) {
+  const state = readState(projectId, conversationId);
   const todos = state.todos;
   if (!todos || todos.length === 0) return;
 
@@ -1089,7 +1092,7 @@ function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
 
   if (!changed) return;
 
-  mergeState(projectId, { todos: updated });
+  mergeState(projectId, { todos: updated }, conversationId);
   onEvent(
     projectId,
     { event: "todos_updated", data: { todos: updated } },
@@ -1892,8 +1895,11 @@ export class ApiBackend extends PunkBackend {
       this._sessionRetryCount = 0;
     }
 
+    // Key active requests by conversationId when available, so multiple
+    // conversations in the same project don't overwrite each other's AbortController.
+    const requestKey = request.conversationId || request.projectId;
     const abortController = new AbortController();
-    this.activeRequests.set(request.projectId, abortController);
+    this.activeRequests.set(requestKey, abortController);
     const spawnStartTime = Date.now();
     let journal = null; // Hoisted — opened inside try, closed in finally
 
@@ -1909,6 +1915,7 @@ export class ApiBackend extends PunkBackend {
       "turn_start",
       this.onEvent.bind(this),
       request.requestId,
+      request.conversationId || null,
     );
 
     try {
@@ -1932,7 +1939,7 @@ export class ApiBackend extends PunkBackend {
       if (request.todos) {
         stateUpdate.todos = request.todos;
       }
-      mergeState(request.projectId, stateUpdate);
+      mergeState(request.projectId, stateUpdate, request.conversationId || null);
 
       // Fetch recent changes from SQLite to include in context
       let sqliteChanges = [];
@@ -1954,17 +1961,17 @@ export class ApiBackend extends PunkBackend {
         );
       }
 
-      // ── V4 Semantic: pre-compute query embedding for relevance-scored context ──
+      // ── Pre-compute query embedding for relevance-scored context ──
       // Computed once, reused for both the semantic turn pool (in orchestrateContext)
-      // and turn selection (in manageConversation). Gated behind PANE_V4_SEMANTIC.
+      // and turn selection (in manageConversation).
       let queryEmbB64 = null;
-      if (process.env.PANE_V4_SEMANTIC === "1" && this._brainRequest) {
+      if (this._brainRequest) {
         try {
           const userQuery = request.prompt || "";
           const embedResult = await this._brainRequest("embed_texts", { texts: [userQuery] });
           queryEmbB64 = embedResult?.embeddings?.[userQuery] || null;
         } catch (err) {
-          console.warn(`[http] V4 semantic embedding failed (falling back to chronological): ${err.message}`);
+          console.warn(`[http] query embedding failed (falling back to chronological): ${err.message}`);
         }
       }
 
@@ -1980,6 +1987,7 @@ export class ApiBackend extends PunkBackend {
         sqliteChanges,
         conversationTokens,
         queryEmbeddingBase64: queryEmbB64,
+        conversationId: request.conversationId || null,
       });
       if (context.budget?.layersDropped > 0) {
         console.log(
@@ -2057,9 +2065,9 @@ export class ApiBackend extends PunkBackend {
       let lastProgress = null;
 
       if (!isNewConversation) {
-        const resumeCheck = canResume(request.projectId);
+        const resumeCheck = canResume(requestKey);
         if (resumeCheck.resumable && resumeCheck.meta) {
-          const journalData = replay(request.projectId);
+          const journalData = replay(requestKey);
           if (journalData.messages.length > 0) {
             // Journal has more context than the renderer's slice(-20) —
             // use it as the source of truth
@@ -2120,22 +2128,24 @@ export class ApiBackend extends PunkBackend {
       // Pane owns the context window. Instead of emergency compaction when
       // full, the window is continuously managed:
       //   Phase 1: Prune old tool results (3k file reads → 30-token summaries)
-      //   Phase 2: Drop turns (chronological by default, semantic when available)
+      //   Phase 2: Drop turns (semantic by default, chronological fallback)
       // Managed by conversation-lifecycle.mjs — three-tier progressive summarization.
       //
-      // When PANE_V4_SEMANTIC is enabled, semantic turn selection computes which
-      // turns to keep/drop based on relevance to the current query.
+      // Semantic turn selection computes which turns to keep/drop based on
+      // relevance to the current query. Falls back to chronological if
+      // query embedding is unavailable.
       const systemTokens =
         context.budget?.systemUsed ||
         Math.round((systemPrompt?.length || 0) / 4);
 
       // ── Semantic turn selection (pre-compute for Phase 2) ────────────
-      // Gated behind PANE_V4_SEMANTIC env var during phased rollout.
-      // Reuses queryEmbB64 computed earlier for the orchestrator.
+      // Reuses queryEmbB64 computed earlier. When embedding is unavailable,
+      // manageContextWindow uses its own chronological fallback.
       let turnSelection = null;
-      if (process.env.PANE_V4_SEMANTIC === "1" && this._brainRequest) {
+      if (this._brainRequest && queryEmbB64) {
         try {
-          const summaries = contextStore.getTurnSummaries(request.projectId);
+          const convId = request.conversationId || null;
+          const summaries = contextStore.getTurnSummaries(request.projectId, convId);
           if (summaries && summaries.length > 0) {
             // Embed any unembedded turn summaries (query already embedded above)
             const unembedded = summaries.filter(s => !s.embedding);
@@ -2147,7 +2157,7 @@ export class ApiBackend extends PunkBackend {
                   const b64 = result.embeddings[s.compressedText];
                   if (b64) s.embedding = base64ToFloat32Array(b64);
                 }
-                contextStore.updateTurnSummaries(request.projectId, summaries);
+                contextStore.updateTurnSummaries(request.projectId, summaries, convId);
               }
             }
 
@@ -2166,6 +2176,7 @@ export class ApiBackend extends PunkBackend {
         request.projectId,
         request.model,
         turnSelection, // optional — passed to manageConversation for Phase 2
+        request.conversationId || null,
       );
       if (windowResult.action !== "none") {
         this.onEvent(
@@ -2190,10 +2201,10 @@ export class ApiBackend extends PunkBackend {
         if (isNewConversation && !journalResumed) {
           const sessionId = `http-${Date.now()}`;
           const objective = request.prompt?.slice(0, 300) || "(new session)";
-          createDigest(request.projectId, sessionId, objective);
+          createDigest(request.projectId, sessionId, objective, request.conversationId || null);
         }
         if (windowResult.droppedTurns?.length > 0) {
-          updateDigest(request.projectId, windowResult.droppedTurns, null);
+          updateDigest(request.projectId, windowResult.droppedTurns, null, request.conversationId || null);
         }
       } catch (err) {
         console.warn(`[http] digest update failed: ${err.message}`);
@@ -2241,10 +2252,11 @@ export class ApiBackend extends PunkBackend {
       // Open the journal for this session. If resuming, we append to the
       // existing journal (preserving the full history). If new, we start fresh.
       // The journal is the crash-safe source of truth for the messages array.
-      journal = openJournal(request.projectId, {
+      journal = openJournal(requestKey, {
         fresh: isNewConversation && !journalResumed,
         model: request.model,
         provider: request.provider,
+        conversationId: request.conversationId || null,
       });
 
       // Journal the new user message (the one we just pushed)
@@ -2279,7 +2291,7 @@ export class ApiBackend extends PunkBackend {
           model: resolvedModel,
           usage: null,
         };
-        this.requestStates.set(request.projectId, state);
+        this.requestStates.set(requestKey, state);
 
         try {
           // deepseek-reasoner (R1) does not support function calling — sending tools
@@ -2433,7 +2445,7 @@ export class ApiBackend extends PunkBackend {
           // massive conversation arrays, but gives error recovery actual state to
           // restore from (previously saved messages: null which was useless).
           _preCallMessageCount = messages.length;
-          saveTurn(request.projectId, turn, {
+          saveTurn(requestKey, turn, {
             messages: messages.slice(-6),
             fullLength: _preCallMessageCount,
             turn,
@@ -2462,6 +2474,7 @@ export class ApiBackend extends PunkBackend {
                     sourceBody.messages,
                     maxMessagesTokens,
                     request.projectId,
+                    request.conversationId || null,
                   );
                   console.log(
                     `[http] Pre-flight force-prune: saved ${result.tokensSaved} tokens, ${result.messagesRemaining} messages remaining`
@@ -2592,6 +2605,7 @@ export class ApiBackend extends PunkBackend {
                         sourceBody.messages,
                         maxMessagesTokens,
                         request.projectId,
+                        request.conversationId || null,
                       );
                       // Sync back to body.messages so retry uses the pruned state
                       if (finalBody && finalBody !== body && Array.isArray(finalBody.messages)) {
@@ -2878,6 +2892,7 @@ export class ApiBackend extends PunkBackend {
                   parsed,
                   apiConfig.provider,
                   request.requestId,
+                  requestKey,
                 );
                 if (emitted) {
                   // Content was emitted
@@ -3132,7 +3147,8 @@ export class ApiBackend extends PunkBackend {
 
           // If no reason to continue, check for pending todos before breaking
           if (!hasTools && !isLengthLimited && !isToolCalls) {
-            const todos = readState(request.projectId).todos || [];
+            const convId = request.conversationId || null;
+            const todos = readState(request.projectId, convId).todos || [];
             const workLeft = todos.some(
               (t) => t.status === "pending" || t.status === "in_progress",
             );
@@ -3227,7 +3243,7 @@ export class ApiBackend extends PunkBackend {
                 );
 
                 // Inject what the model already accomplished this session
-                const sessionState = readState(request.projectId);
+                const sessionState = readState(request.projectId, convId);
                 const recentActions = sessionState.recentActions || [];
                 if (recentActions.length > 0) {
                   const actionSummary = recentActions
@@ -3311,7 +3327,7 @@ export class ApiBackend extends PunkBackend {
 
               // Journal progress snapshot — if the session dies after this,
               // the next resume will know exactly what was accomplished
-              const progressState = readState(request.projectId);
+              const progressState = readState(request.projectId, convId);
               journal.writeProgress({
                 accomplishments: (progressState.recentActions || [])
                   .slice(-5)
@@ -3467,8 +3483,7 @@ export class ApiBackend extends PunkBackend {
                   normalizedTodos = parsedInput.todos;
                 }
 
-                mergeState(request.projectId, { todos: normalizedTodos });
-                // Send updated todos to frontend
+                mergeState(request.projectId, { todos: normalizedTodos }, request.conversationId || null);
                 this.onEvent(
                   request.projectId,
                   {
@@ -3486,7 +3501,7 @@ export class ApiBackend extends PunkBackend {
                   activeTask: {
                     description: parsedInput.task || parsedInput.description,
                   },
-                });
+                }, request.conversationId || null);
                 // Send updated activeTask to frontend
                 this.onEvent(
                   request.projectId,
@@ -3514,6 +3529,7 @@ export class ApiBackend extends PunkBackend {
                   "write",
                   this.onEvent.bind(this),
                   request.requestId,
+                  request.conversationId || null,
                 );
                 // Track changed file for Turn Sentinel
                 const changedPath =
@@ -3530,6 +3546,7 @@ export class ApiBackend extends PunkBackend {
                     "verify_pass",
                     this.onEvent.bind(this),
                     request.requestId,
+                    request.conversationId || null,
                   );
                 }
               }
@@ -3586,7 +3603,7 @@ export class ApiBackend extends PunkBackend {
           // Always refresh context after tool execution — ensures every turn has fresh state
           // (git status, working set, recent actions, session state, etc.)
           const gitStatus = await this.getGitStatus(request.workingDir);
-          mergeState(request.projectId, { gitStatus });
+          mergeState(request.projectId, { gitStatus }, request.conversationId || null);
 
           // Fetch fresh SQLite changes
           let loopSqliteChanges = [];
@@ -3657,10 +3674,11 @@ export class ApiBackend extends PunkBackend {
             request.projectId,
             request.model,
             turnSelection,
+            request.conversationId || null,
           );
           if (loopWindowResult.droppedTurns?.length > 0) {
             try {
-              updateDigest(request.projectId, loopWindowResult.droppedTurns, null);
+              updateDigest(request.projectId, loopWindowResult.droppedTurns, null, request.conversationId || null);
             } catch (err) {
               console.warn(`[http] digest update failed (loop): ${err.message}`);
             }
@@ -3700,7 +3718,7 @@ export class ApiBackend extends PunkBackend {
             await new Promise((r) => setTimeout(r, delay));
             // Try to restore from checkpoint. Pre-call checkpoints save
             // the last 6 messages (lightweight), post-turn saves the full array.
-            const checkpoint = loadTurn(request.projectId, turn);
+            const checkpoint = loadTurn(requestKey, turn);
             if (checkpoint && checkpoint.messages?.length > 0) {
               if (checkpoint.phase === "pre-call" && checkpoint.fullLength) {
                 // Pre-call checkpoint only has tail — splice it back onto the
@@ -3739,6 +3757,7 @@ export class ApiBackend extends PunkBackend {
           "turn_end",
           this.onEvent.bind(this),
           request.requestId,
+          request.conversationId || null,
         );
 
         // ── Turn Sentinel: independently verify the LLM's work ─────────────
@@ -3761,7 +3780,7 @@ export class ApiBackend extends PunkBackend {
               request.projectId,
               request.workingDir,
               [...arbiterChangedFiles],
-              { db: arbiterDb },
+              { db: arbiterDb, conversationId: request.conversationId || null },
             );
 
             // Record behavioral fingerprint
@@ -3859,8 +3878,9 @@ export class ApiBackend extends PunkBackend {
         // Layer 3: extracted items carry confidence scores.
         // Layer 4: LLM fallback fires when regex found < 2 high-confidence items.
         // Layer 5: model corrections recorded against the previous session's handoff.
-        const previousHandoff = readHandoff(request.projectId);
-        let handoff = generateHandoff(request.projectId, { writeFile: false });
+        const convId = request.conversationId || null;
+        const previousHandoff = readHandoff(request.projectId, convId);
+        let handoff = generateHandoff(request.projectId, { writeFile: false, conversationId: convId });
         if (sessionOutput.length > 0) {
           const extracted = extractFromModelOutput(
             sessionOutput,
@@ -3895,7 +3915,7 @@ export class ApiBackend extends PunkBackend {
                     { ...handoff },
                     llmExtracted,
                   );
-                  updateLatestHandoff(projectId, enriched);
+                  updateLatestHandoff(projectId, enriched, request.conversationId || null);
                   // Also index LLM-extracted items into brain
                   const llmEvents = [];
                   for (const item of llmExtracted.accomplishments || []) {
@@ -4008,7 +4028,7 @@ export class ApiBackend extends PunkBackend {
           }
         }
         try {
-          writeHandoffWithHistory(request.projectId, handoff);
+          writeHandoffWithHistory(request.projectId, handoff, convId);
         } catch (err) {
           console.warn(`[http] Failed to write handoff: ${err.message}`);
         }
@@ -4019,7 +4039,7 @@ export class ApiBackend extends PunkBackend {
         // the next session's model doesn't start from zero.
         try {
           const { enrichHandoff } = await import("./handoff-enricher.mjs");
-          enrichHandoff(request.projectId, updateLatestHandoff).catch((err) =>
+          enrichHandoff(request.projectId, updateLatestHandoff, request.conversationId || null).catch((err) =>
             console.warn(`[http] Handoff enrichment failed (non-fatal): ${err.message}`),
           );
         } catch (err) {
@@ -4033,7 +4053,7 @@ export class ApiBackend extends PunkBackend {
         // JSON.stringify → gzipSync), causing 80GB RSS growth at 500+ turns.
         // The pre-call checkpoint already captures recovery context; the journal
         // handles crash-safe persistence. This archive is a lightweight reference.
-        saveTurn(request.projectId, turn, {
+        saveTurn(requestKey, turn, {
           messages: messages.slice(_preCallMessageCount),
           fullLength: messages.length,
           turn,
@@ -4081,9 +4101,9 @@ export class ApiBackend extends PunkBackend {
       );
 
       // Cleanup turn archive and journal on successful completion
-      clearTurns(request.projectId);
+      clearTurns(requestKey);
       journal.close();
-      clearJournal(request.projectId);
+      clearJournal(requestKey);
     } catch (error) {
       // ── SESSION-LEVEL AUTO-RESUME ──────────────────────────────────────
       // Phase 3: Last resort recovery. When all turn-level retries (network,
@@ -4112,12 +4132,14 @@ export class ApiBackend extends PunkBackend {
 
         // Preserve discoveries before cleanup
         try {
+          const crashConvId = request.conversationId || null;
           const crashHandoff = generateHandoff(request.projectId, {
             writeFile: false,
+            conversationId: crashConvId,
           });
           crashHandoff._exitReason = "auto-resume";
           crashHandoff._errorMessage = error.message;
-          writeHandoffWithHistory(request.projectId, crashHandoff);
+          writeHandoffWithHistory(request.projectId, crashHandoff, crashConvId);
         } catch {}
 
         // Close the old journal so the re-spawn can open it fresh
@@ -4126,8 +4148,9 @@ export class ApiBackend extends PunkBackend {
         } catch {}
 
         // Clean up state so the re-spawn doesn't collide with stale registrations
-        this.activeRequests.delete(request.projectId);
-        this.requestStates.delete(request.projectId);
+        const cleanupKey = request.conversationId || request.projectId;
+        this.activeRequests.delete(cleanupKey);
+        this.requestStates.delete(cleanupKey);
 
         // Tell the UI we're recovering
         this.onEvent(
@@ -4175,13 +4198,15 @@ export class ApiBackend extends PunkBackend {
       // ── Emergency handoff: persist discoveries even on crash/abort ──────
       // Without this, everything the model learned this session is lost.
       try {
+        const crashConvId = request.conversationId || null;
         const crashHandoff = generateHandoff(request.projectId, {
           writeFile: false,
+          conversationId: crashConvId,
         });
         crashHandoff._exitReason =
           error.name === "AbortError" ? "aborted" : "error";
         crashHandoff._errorMessage = error.message;
-        writeHandoffWithHistory(request.projectId, crashHandoff);
+        writeHandoffWithHistory(request.projectId, crashHandoff, crashConvId);
         console.log(
           `[http] Emergency handoff written on ${crashHandoff._exitReason}`,
         );
@@ -4258,8 +4283,9 @@ export class ApiBackend extends PunkBackend {
         request.requestId,
       );
 
-      this.activeRequests.delete(request.projectId);
-      this.requestStates.delete(request.projectId);
+      const cleanupKey = request.conversationId || request.projectId;
+      this.activeRequests.delete(cleanupKey);
+      this.requestStates.delete(cleanupKey);
     }
   }
 
@@ -4773,8 +4799,9 @@ export class ApiBackend extends PunkBackend {
     return model;
   }
 
-  handleStreamEvent(projectId, event, provider, requestId) {
-    const state = this.requestStates.get(projectId);
+  handleStreamEvent(projectId, event, provider, requestId, requestKey) {
+    const stateKey = requestKey || projectId;
+    const state = this.requestStates.get(stateKey);
     if (!state) return false;
 
     let content = "";
@@ -5258,13 +5285,15 @@ export class ApiBackend extends PunkBackend {
     return emitted;
   }
 
-  async abort(projectId) {
-    const controller = this.activeRequests.get(projectId);
+  async abort(projectId, conversationId = null) {
+    // Try conversation-specific key first, fall back to project-level
+    const key = conversationId || projectId;
+    const controller = this.activeRequests.get(key);
     if (controller) {
       controller.abort();
-      this.activeRequests.delete(projectId);
+      this.activeRequests.delete(key);
     }
-    this.requestStates.delete(projectId);
+    this.requestStates.delete(key);
     // Kill any background processes spawned by tools for this project
     const executor = this.toolExecutors.get(projectId);
     if (executor) {

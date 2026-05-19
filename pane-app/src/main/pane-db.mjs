@@ -17,6 +17,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -65,19 +66,32 @@ function _createSchema(db) {
     );
 
     CREATE TABLE IF NOT EXISTS messages (
-      id            TEXT    PRIMARY KEY,
-      project_id    TEXT    NOT NULL,
-      type          TEXT    NOT NULL,
-      content       TEXT    NOT NULL,
-      created_at    INTEGER NOT NULL,
-      cost_usd      REAL,
-      duration_ms   INTEGER,
-      input_tokens  INTEGER,
-      output_tokens INTEGER,
-      checkpoint_id TEXT,
-      model         TEXT,
-      num_turns     INTEGER
+      id              TEXT    PRIMARY KEY,
+      project_id      TEXT    NOT NULL,
+      type            TEXT    NOT NULL,
+      content         TEXT    NOT NULL,
+      created_at      INTEGER NOT NULL,
+      cost_usd        REAL,
+      duration_ms     INTEGER,
+      input_tokens    INTEGER,
+      output_tokens   INTEGER,
+      checkpoint_id   TEXT,
+      model           TEXT,
+      num_turns       INTEGER,
+      conversation_id TEXT
     );
+    CREATE TABLE IF NOT EXISTS conversations (
+      id          TEXT    PRIMARY KEY,
+      project_id  TEXT    NOT NULL,
+      label       TEXT    NOT NULL DEFAULT '',
+      phase       TEXT    NOT NULL DEFAULT 'idle',
+      model       TEXT,
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL,
+      is_archived INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_conversations_project
+      ON conversations(project_id, updated_at);
     CREATE INDEX IF NOT EXISTS idx_messages_project
       ON messages(project_id, created_at);
 
@@ -227,9 +241,9 @@ function _prepareStatements(db) {
       INSERT OR REPLACE INTO messages
         (id, project_id, type, content, created_at,
          cost_usd, duration_ms, input_tokens, output_tokens,
-         checkpoint_id, model, num_turns)
+         checkpoint_id, model, num_turns, conversation_id)
       VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     countMessages: db.prepare("SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ?"),
     deleteAllMessages: db.prepare("DELETE FROM messages WHERE project_id = ?"),
@@ -251,6 +265,43 @@ function _prepareStatements(db) {
       VALUES (?, ?, ?, ?)
     `),
     getConvMeta: db.prepare("SELECT session_id, model FROM conversation_meta WHERE project_id = ?"),
+
+    // conversations — multi-conversation support
+    insertConversation: db.prepare(`
+      INSERT OR REPLACE INTO conversations
+        (id, project_id, label, phase, model, created_at, updated_at, is_archived)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    getConversation: db.prepare("SELECT * FROM conversations WHERE id = ?"),
+    getProjectConversations: db.prepare(`
+      SELECT * FROM conversations
+      WHERE project_id = ? AND is_archived = 0
+      ORDER BY updated_at DESC
+    `),
+    updateConversation: db.prepare(`
+      UPDATE conversations SET label = ?, phase = ?, model = ?, updated_at = ? WHERE id = ?
+    `),
+    archiveConversation: db.prepare(`
+      UPDATE conversations SET is_archived = 1, updated_at = ? WHERE id = ?
+    `),
+    restoreConversation: db.prepare(`
+      UPDATE conversations SET is_archived = 0, updated_at = ? WHERE id = ?
+    `),
+    deleteConversation: db.prepare("DELETE FROM conversations WHERE id = ?"),
+    deleteMessagesForConv: db.prepare("DELETE FROM messages WHERE conversation_id = ?"),
+    countMessagesForConv: db.prepare("SELECT COUNT(*) AS cnt FROM messages WHERE conversation_id = ?"),
+    selectMessagesSliceForConv: db.prepare(`
+      SELECT content FROM messages
+      WHERE conversation_id = ?
+      ORDER BY created_at ASC, rowid ASC
+      LIMIT ? OFFSET ?
+    `),
+    // Keep latest messages per conversation (not per project)
+    keepLatestMessagesForConv: db.prepare(`
+      DELETE FROM messages WHERE conversation_id = ? AND id NOT IN (
+        SELECT id FROM messages WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?
+      )
+    `),
 
     // cli_sessions — per-backend session IDs (survive app restarts without clobbering)
     upsertCliSession: db.prepare(`
@@ -516,12 +567,23 @@ export function extractMessageText(contentJson) {
 export function pruneConversationMessages(projectId, keepCount = 200) {
   try {
     const db = getPaneDb();
-    if (!db || !db.stmts.keepLatestMessages) return;
-    const before = db.stmts.countMessages.get(projectId)?.cnt ?? 0;
-    if (before <= keepCount) return; // Nothing to prune
-    db.stmts.keepLatestMessages.run(projectId, projectId, keepCount);
-    const after = db.stmts.countMessages.get(projectId)?.cnt ?? 0;
-    console.log(`[pane-db] Pruned messages for ${projectId}: ${before} -> ${after} (kept ${keepCount})`);
+    if (!db || !db.stmts.countMessagesForConv) return;
+    // Prune each conversation independently using the per-conversation statement.
+    // FTS cleanup is automatic via the messages_fts_delete trigger.
+    const conversations = db.prepare(
+      "SELECT DISTINCT conversation_id FROM messages WHERE project_id = ? AND conversation_id IS NOT NULL"
+    ).all(projectId);
+    let prunedTotal = 0;
+    for (const { conversation_id } of conversations) {
+      const before = db.stmts.countMessagesForConv.get(conversation_id)?.cnt ?? 0;
+      if (before <= keepCount) continue;
+      db.stmts.keepLatestMessagesForConv.run(conversation_id, conversation_id, keepCount);
+      const after = db.stmts.countMessagesForConv.get(conversation_id)?.cnt ?? 0;
+      prunedTotal += before - after;
+    }
+    if (prunedTotal > 0) {
+      console.log(`[pane-db] Pruned messages for ${projectId}: removed ${prunedTotal} across ${conversations.length} conversations`);
+    }
   } catch (err) {
     console.warn(`[pane-db] pruneConversationMessages failed: ${err.message}`);
   }
@@ -608,6 +670,93 @@ export async function runMigrationIfNeeded(db) {
     db.stmts.setMigrationVersion.run(6);
     console.log("[pane-db] Migration v6 complete.");
   }
+
+  if (version < 7) {
+    console.log("[pane-db] Running migration v7: multi-conversation support...");
+    // 1. Add conversation_id column to messages if not present
+    try {
+      db.exec("ALTER TABLE messages ADD COLUMN conversation_id TEXT");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at)");
+    } catch (e) {
+      if (!e.message.includes("duplicate column")) throw e;
+    }
+    // 2. Create conversations table (try/catch — may exist from partial migration)
+    try {
+      db.exec(`CREATE TABLE IF NOT EXISTS conversations (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',
+        phase TEXT NOT NULL DEFAULT 'idle', model TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        is_archived INTEGER NOT NULL DEFAULT 0
+      )`);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at)");
+    } catch (e) {
+      console.error("[pane-db] v7 conversations table error:", e.message);
+    }
+    // 3. Backfill: for each project with messages, create a "main" conversation
+    //    Check if a "main" conversation already exists for the project (idempotent).
+    const projects = db.prepare("SELECT DISTINCT project_id FROM messages").all();
+    const getMainConv = db.prepare("SELECT id FROM conversations WHERE project_id = ? AND label = 'main' LIMIT 1");
+    const insertConv = db.prepare(
+      "INSERT OR REPLACE INTO conversations (id, project_id, label, phase, model, created_at, updated_at, is_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    );
+    const updateMsg = db.prepare("UPDATE messages SET conversation_id = ? WHERE project_id = ? AND conversation_id IS NULL");
+    for (const { project_id } of projects) {
+      const existing = getMainConv.get(project_id);
+      if (existing) {
+        // Main conversation already exists — just backfill any messages without conversation_id
+        updateMsg.run(existing.id, project_id);
+      } else {
+        const convId = crypto.randomUUID();
+        const now = Date.now();
+        insertConv.run(convId, project_id, "main", "idle", null, now, now, 0);
+        updateMsg.run(convId, project_id);
+      }
+    }
+    db.stmts.setMigrationVersion.run(7);
+    console.log(`[pane-db] Migration v7 complete: ${projects.length} projects backfilled.`);
+  }
+
+  if (version < 8) {
+    console.log("[pane-db] Running migration v8: backfill NULL conversation_ids...");
+    // The backward compat save path in useSettingsPersistence.ts was saving
+    // messages with `null` conversationId, overwriting the correct per-conversation
+    // saves via INSERT OR REPLACE. This left messages invisible to
+    // getConversationSlice which queries by conversation_id.
+    //
+    // Backfill: for each project with NULL-conversation_id messages, assign them
+    // to an existing conversation (prefer "main" or the most recently updated).
+    // This restores visibility of historical messages.
+    const projectsWithNull = db.prepare(
+      "SELECT DISTINCT project_id FROM messages WHERE conversation_id IS NULL"
+    ).all();
+    const getExistingConv = db.prepare(
+      "SELECT id FROM conversations WHERE project_id = ? ORDER BY updated_at DESC LIMIT 1"
+    );
+    const getMainConv = db.prepare(
+      "SELECT id FROM conversations WHERE project_id = ? AND label = 'main' LIMIT 1"
+    );
+    const insertConv = db.prepare(
+      "INSERT OR REPLACE INTO conversations (id, project_id, label, phase, model, created_at, updated_at, is_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    );
+    const updateNullMsg = db.prepare(
+      "UPDATE messages SET conversation_id = ? WHERE project_id = ? AND conversation_id IS NULL"
+    );
+    let totalBackfilled = 0;
+    for (const { project_id } of projectsWithNull) {
+      // Prefer "main" label conv (from v7 backfill), then most recent, then create one
+      let conv = getMainConv.get(project_id) || getExistingConv.get(project_id);
+      if (!conv) {
+        const convId = crypto.randomUUID();
+        const now = Date.now();
+        insertConv.run(convId, project_id, "main", "idle", null, now, now, 0);
+        conv = { id: convId };
+      }
+      const result = updateNullMsg.run(conv.id, project_id);
+      totalBackfilled += result.changes ?? 0;
+    }
+    db.stmts.setMigrationVersion.run(8);
+    console.log(`[pane-db] Migration v8 complete: ${totalBackfilled} messages backfilled across ${projectsWithNull.length} projects.`);
+  }
 }
 
 async function _migrateConversations(db) {
@@ -635,6 +784,7 @@ async function _migrateConversations(db) {
             msg.cost_usd ?? null, msg.duration_ms ?? null,
             msg.input_tokens ?? null, msg.output_tokens ?? null,
             msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
+            null, // conversation_id — legacy migration, no conversation context
           );
           const text = extractMessageText(contentJson);
           if (text) {
@@ -718,6 +868,7 @@ async function _migrateArchivedConversations(db) {
               msg.cost_usd ?? null, msg.duration_ms ?? null,
               msg.input_tokens ?? null, msg.output_tokens ?? null,
               msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
+              null, // conversation_id — legacy migration, no conversation context
             );
             const text = extractMessageText(contentJson);
             if (text) {

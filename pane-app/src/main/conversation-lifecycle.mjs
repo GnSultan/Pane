@@ -97,7 +97,7 @@ export function classifyTier(turnFromEnd) {
  * @returns {number} tokensSaved
  */
 export function summarizeTurn(messages, startIdx, endIdx, options = {}) {
-  const { projectId, turnIndex, cache = false } = options;
+  const { projectId, turnIndex, cache = false, conversationId = null } = options;
   let tokensSaved = 0;
   let seq = 0;
 
@@ -241,9 +241,10 @@ function buildTurnSummaryMarker(messages, startIdx, endIdx, turnIndex) {
  * @param {string} projectId
  * @param {{ turnIndex: number, request: string, tools: string[], conclusion: string, compressedText: string, tokenCount: number, rawTokenCount: number }} summary
  */
-export function storeTurnSummary(projectId, summary) {
+export function storeTurnSummary(projectId, summary, conversationId = null) {
   try {
-    const existing = contextStore.getTurnSummaries(projectId) || [];
+    const key = conversationId || projectId;
+    const existing = contextStore.getTurnSummaries(key) || [];
     // Replace existing entry for this turn index, or append
     const idx = existing.findIndex(s => s.turnIndex === summary.turnIndex);
     const record = {
@@ -255,7 +256,7 @@ export function storeTurnSummary(projectId, summary) {
     } else {
       existing.push(record);
     }
-    contextStore.updateTurnSummaries(projectId, existing);
+    contextStore.updateTurnSummaries(key, existing);
   } catch (err) {
     console.warn(`[conversation-lifecycle] storeTurnSummary failed: ${err.message}`);
   }
@@ -272,7 +273,7 @@ export function storeTurnSummary(projectId, summary) {
  * @param {string} [projectId] - project for turn summary persistence
  * @returns {{ tokensSaved: number, droppedTurn: { turnIndex, request, tools, conclusion } | null }}
  */
-function dropOldestTurn(messages, turns, freshDepth, projectId) {
+function dropOldestTurn(messages, turns, freshDepth, projectId, conversationId = null) {
   // Find the oldest turn that isn't fresh and isn't the system prompt
   for (let t = 0; t < turns.length; t++) {
     const turn = turns[t];
@@ -312,7 +313,7 @@ function dropOldestTurn(messages, turns, freshDepth, projectId) {
 
     // Persist turn summary for semantic retrieval
     if (projectId) {
-      storeTurnSummary(projectId, extracted);
+      storeTurnSummary(projectId, extracted, conversationId);
     }
 
     const archivalTokens = estimateTokens(marker.content);
@@ -338,9 +339,10 @@ function dropOldestTurn(messages, turns, freshDepth, projectId) {
  * @param {Array} turns - from detectTurns()
  * @param {import("./semantic-turn-selector.mjs").TurnSelection} selection - from selectTurns()
  * @param {string} [projectId] - project for turn summary persistence
+ * @param {string|null} [conversationId] - conversation-scoped key for turn summary storage
  * @returns {{ tokensSaved: number, droppedTurns: Array }}
  */
-export function dropIrrelevantTurns(messages, turns, selection, projectId) {
+export function dropIrrelevantTurns(messages, turns, selection, projectId, conversationId = null) {
   const droppedTurns = [];
   let tokensSaved = 0;
 
@@ -383,7 +385,7 @@ export function dropIrrelevantTurns(messages, turns, selection, projectId) {
 
     // Persist turn summary for semantic retrieval
     if (projectId) {
-      storeTurnSummary(projectId, extracted);
+      storeTurnSummary(projectId, extracted, conversationId);
     }
 
     const archivalTokens = estimateTokens(marker.content);
@@ -422,6 +424,7 @@ export function manageConversation(messages, options = {}) {
     maxContextTokens = 128000,
     currentTurnIndex = 0,
     turnSelection = null, // Optional: pre-computed TurnSelection for semantic pruning
+    conversationId = null, // Optional: conversation-scoped key for turn summary storage
   } = options;
 
   // HARD limit: model's max minus what we need for output + tools + framing
@@ -463,6 +466,7 @@ export function manageConversation(messages, options = {}) {
         projectId,
         turnIndex: turn.turnIndex,
         cache: tier === "archival",
+        conversationId,
       });
 
       if (saved > 0) {
@@ -483,7 +487,7 @@ export function manageConversation(messages, options = {}) {
 
       if (turnSelection && turnSelection.droppedTurnIndices?.length > 0) {
         // NEW PATH: semantic turn selection — drop least relevant turns first
-        const result = dropIrrelevantTurns(messages, turns, turnSelection, projectId);
+        const result = dropIrrelevantTurns(messages, turns, turnSelection, projectId, conversationId);
         if (result.tokensSaved > 0) {
           totalSaved += result.tokensSaved;
           savedThisRound += result.tokensSaved;
@@ -494,7 +498,7 @@ export function manageConversation(messages, options = {}) {
           actionsSummary.push("semantic drop gave no savings — falling back to chronological");
           // Fall through to chronological fallback
           turns = detectTurns(messages);
-          const fallbackResult = dropOldestTurn(messages, turns, FRESH_DEPTH, projectId);
+          const fallbackResult = dropOldestTurn(messages, turns, FRESH_DEPTH, projectId, conversationId);
           if (fallbackResult.tokensSaved > 0) {
             totalSaved += fallbackResult.tokensSaved;
             savedThisRound += fallbackResult.tokensSaved;
@@ -508,7 +512,7 @@ export function manageConversation(messages, options = {}) {
         }
       } else {
         // CHRONOLOGICAL PATH: drop oldest turns (existing behavior)
-        const result = dropOldestTurn(messages, turns, FRESH_DEPTH, projectId);
+        const result = dropOldestTurn(messages, turns, FRESH_DEPTH, projectId, conversationId);
         if (result.tokensSaved > 0) {
           totalSaved += result.tokensSaved;
           savedThisRound += result.tokensSaved;
@@ -565,7 +569,7 @@ export function manageConversation(messages, options = {}) {
  * @param {string} projectId
  * @returns {{ tokensSaved: number, messagesRemaining: number }}
  */
-export function forcePruneToBudget(messages, maxTokens, projectId = "unknown") {
+export function forcePruneToBudget(messages, maxTokens, projectId = "unknown", conversationId = null) {
   let totalTokens = estimateTokens(JSON.stringify(messages));
   let totalSaved = 0;
   let iterations = 0;
@@ -586,6 +590,7 @@ export function forcePruneToBudget(messages, maxTokens, projectId = "unknown") {
         projectId,
         turnIndex: turn.turnIndex,
         cache: true,
+        conversationId,
       });
       if (saved > 0) savedThisRound += saved;
     }
@@ -598,7 +603,7 @@ export function forcePruneToBudget(messages, maxTokens, projectId = "unknown") {
     // Phase 2: Drop oldest turns if still over budget
     if (totalTokens > maxTokens) {
       const refreshedTurns = detectTurns(messages);
-      const result = dropOldestTurn(messages, refreshedTurns, FRESH_DEPTH);
+      const result = dropOldestTurn(messages, refreshedTurns, FRESH_DEPTH, projectId, conversationId);
       if (result.tokensSaved > 0) {
         totalSaved += result.tokensSaved;
         totalTokens = estimateTokens(JSON.stringify(messages));

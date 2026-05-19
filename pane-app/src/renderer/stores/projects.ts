@@ -2,13 +2,14 @@ import { create } from "zustand";
 import type { FileEntry } from "../lib/tauri-commands";
 import type {
   ConversationState,
+  Conversation,
   ConversationMessage,
   ContentBlock,
   ToolUseBlock,
   CheckpointMeta,
   ArbiterVerdict,
 } from "../lib/punk-types";
-import { createEmptyConversation } from "../lib/punk-types";
+import { createEmptyConversation, createEmptyConversationMeta } from "../lib/punk-types";
 import type { PowerCombo } from "../lib/models";
 import { DEFAULT_POWER_COMBO } from "../lib/models";
 import { useWorkspaceStore } from "./workspace";
@@ -52,7 +53,10 @@ export interface Project {
   activeFilePath: string | null;
   activeFileContent: string | null;
   mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
-  conversation: ConversationState;
+  conversation: ConversationState; // Backward compat — reads from active conversation
+  conversations: Map<string, Conversation>; // id → Conversation
+  activeConversationId: string | null;
+  conversationOrder: string[]; // ordered tab list
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
   hasUnreadCompletion: boolean; // true when background task completes, cleared when project becomes active
@@ -86,6 +90,12 @@ export interface Project {
    *  in a collapsible "Archived" section. Migrates to conversation-level
    *  is_archived when multi-conversation (Phase 0) lands. */
   archived?: boolean;
+  /** Temporary override for streaming routing. When set, getActiveConv /
+   *  updateActiveConv target this conversation instead of activeConversationId.
+   *  Prevents streaming text from one conversation leaking into another when
+   *  the user switches tabs mid-stream. Set by usePunk.ts at stream start,
+   *  cleared when streaming finishes. */
+  streamingConvId?: string;
 }
 
 /**
@@ -104,6 +114,13 @@ function generateProjectId(): string {
 function createProject(root: string, stableId?: string): Project {
   const name = root.split("/").filter(Boolean).pop() || root;
   const id = stableId ?? generateProjectId();
+
+  // When restoring from settings (stableId provided), skip the default conversation.
+  // DB hydration will populate it. For fresh projects (no stableId), create a default "main" conv.
+  const hasDefaultConv = !stableId;
+  const defaultConvId = hasDefaultConv ? crypto.randomUUID() : null;
+  const defaultConv = hasDefaultConv && defaultConvId ? createEmptyConversationMeta(defaultConvId, "Conversation") : null;
+
   return {
     id,
     root,
@@ -115,7 +132,10 @@ function createProject(root: string, stableId?: string): Project {
     activeFilePath: null,
     activeFileContent: null,
     mode: "conversation",
-    conversation: createEmptyConversation(),
+    conversation: defaultConv?.state ?? createEmptyConversation(),
+    conversations: defaultConv ? new Map([[defaultConvId!, defaultConv]]) : new Map(),
+    activeConversationId: defaultConvId,
+    conversationOrder: defaultConvId ? [defaultConvId] : [],
     git: {
       branch: null,
       fileStatuses: new Map(),
@@ -211,6 +231,15 @@ interface ProjectsState {
   invalidateFileIndex: (projectId: string) => void;
 
   // Per-project conversation
+  // Multi-conversation lifecycle
+  addConversation: (projectId: string, label?: string, phase?: import("../lib/punk-types").PanePhase) => string;
+  removeConversation: (projectId: string, conversationId: string) => void;
+  archiveConversation: (projectId: string, conversationId: string) => void;
+  unarchiveConversation: (projectId: string, conversationId: string) => void;
+  setActiveConversation: (projectId: string, conversationId: string | null) => void;
+  closeConversationTab: (projectId: string, conversationId: string) => void;
+  renameConversation: (projectId: string, conversationId: string, label: string) => void;
+
   addConversationMessage: (
     projectId: string,
     message: ConversationMessage,
@@ -261,11 +290,13 @@ interface ProjectsState {
     projectId: string,
     messages: ConversationMessage[],
     historyInfo?: { totalCount: number; startIndex: number },
+    conversationId?: string,
   ) => void;
   prependOlderMessages: (
     projectId: string,
     messages: ConversationMessage[],
     newStartIndex: number,
+    conversationId?: string,
   ) => void;
   setConversationTodos: (
     projectId: string,
@@ -275,9 +306,21 @@ interface ProjectsState {
   clearPendingInput: (projectId: string) => void;
   setIsPlanning: (projectId: string, isPlanning: boolean) => void;
   setConversationPhase: (projectId: string, phase: import("../lib/punk-types").ConversationState["phase"]) => void;
+  /** Set a temporary streaming conversation override — routes all getActiveConv /
+   *  updateActiveConv calls to this conversation instead of activeConversationId.
+   *  Pass null to clear. Prevents cross-conversation streaming leaks. */
+  setStreamingConvId: (projectId: string, conversationId: string | null) => void;
   updateLastToolUseInput: (
     projectId: string,
     input: Record<string, unknown>,
+  ) => void;
+  /** Directly update a specific conversation's state, bypassing streamingConvId routing.
+   *  Used by handlePunkMessage and streaming flush functions to write to the correct
+   *  conversation when multiple conversations may be streaming simultaneously. */
+  updateConversation: (
+    projectId: string,
+    conversationId: string,
+    partial: Partial<ConversationState>,
   ) => void;
   updateToolUseInputById: (
     projectId: string,
@@ -327,6 +370,71 @@ function updateProject(
   const next = new Map(state.projects);
   next.set(projectId, { ...project, ...updates });
   return { projects: next };
+}
+
+// ── Multi-conversation helpers ───────────────────────────────────────────
+// These helper functions handle reading/writing the active conversation's state
+// while dual-writing to both the backward compat `conversation` field and the
+// new `conversations` Map. Existing selectors reading `project.conversation.X`
+// continue to work unchanged during the transition.
+
+function getActiveConv(project: Project): ConversationState {
+  const targetId = project.streamingConvId ?? project.activeConversationId;
+  if (!targetId) return createEmptyConversation();
+  const conv = project.conversations.get(targetId);
+  return conv?.state ?? createEmptyConversation();
+}
+
+function updateActiveConv(
+  project: Project,
+  partial: Partial<ConversationState>,
+): { conversation?: ConversationState; conversations: Map<string, Conversation> } {
+  const targetId = project.streamingConvId ?? project.activeConversationId;
+  if (!targetId) {
+    const newState = { ...createEmptyConversation(), ...partial };
+    return { conversation: newState, conversations: project.conversations };
+  }
+  const conv = project.conversations.get(targetId);
+  if (!conv) {
+    const newState = { ...createEmptyConversation(), ...partial };
+    return { conversation: newState, conversations: project.conversations };
+  }
+  const updated: Conversation = {
+    ...conv,
+    state: { ...conv.state, ...partial },
+    updatedAt: Date.now(),
+  };
+  const next = new Map(project.conversations);
+  next.set(targetId, updated);
+  // Always update the backward-compat conversation field to reflect the
+  // conversation being mutated (streaming or active). This prevents
+  // cross-contamination when code reads project.conversation directly
+  // during streaming — e.g., handlePunkMessage, InputBar, MessageBubble.
+  return { conversation: updated.state, conversations: next };
+}
+
+/** Directly update a specific conversation's state, bypassing streamingConvId routing.
+ *  Unlike updateActiveConv which resolves through streamingConvId, this targets the
+ *  exact conversationId given. Used by streaming code to prevent cross-contamination
+ *  when multiple conversations stream simultaneously. */
+function directUpdateConv(
+  project: Project,
+  conversationId: string,
+  partial: Partial<ConversationState>,
+): { conversation?: ConversationState; conversations: Map<string, Conversation> } {
+  const conv = project.conversations.get(conversationId);
+  if (!conv) {
+    const newState = { ...createEmptyConversation(), ...partial };
+    return { conversation: newState, conversations: project.conversations };
+  }
+  const updated: Conversation = {
+    ...conv,
+    state: { ...conv.state, ...partial },
+    updatedAt: Date.now(),
+  };
+  const next = new Map(project.conversations);
+  next.set(conversationId, updated);
+  return { conversation: updated.state, conversations: next };
 }
 
 function createProjectsStore() {
@@ -634,82 +742,365 @@ function createProjectsStore() {
         })),
       ),
 
-    // Conversation
+    // ── Multi-conversation lifecycle ──────────────────────────────────────
+    addConversation: (projectId, label?: string, phase: import("../lib/punk-types").PanePhase = "idle") => {
+      const convId = crypto.randomUUID();
+      // Auto-generate a label that doesn't conflict with existing labels.
+      // Finds the highest "Conversation N" number among non-archived conversations
+      // and increments, avoiding the count-based approach which can create duplicates
+      // when conversations have been renamed.
+      const convLabel = label ?? (() => {
+        const p = useProjectsStore.getState().projects.get(projectId);
+        const existing = p ? [...p.conversations.values()].filter((c) => !c.isArchived) : [];
+        const existingLabels = new Set(existing.map((c) => c.label.toLowerCase()));
+        // Find the highest "Conversation N" number
+        let maxN = 0;
+        for (const c of existing) {
+          const match = c.label.match(/^Conversation (\d+)$/i);
+          if (match) maxN = Math.max(maxN, parseInt(match[1]!, 10));
+        }
+        // Increment until we find an unused label
+        let n = maxN + 1;
+        let candidate = `Conversation ${n}`;
+        while (existingLabels.has(candidate.toLowerCase())) {
+          n++;
+          candidate = `Conversation ${n}`;
+        }
+        return candidate;
+      })();
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const conv = createEmptyConversationMeta(convId, convLabel);
+          conv.phase = phase;
+          const next = new Map(p.conversations);
+          next.set(convId, conv);
+          return {
+            conversations: next,
+            conversationOrder: [...p.conversationOrder, convId],
+          };
+        }),
+      );
+      // Delegate to setActiveConversation to clean up the previous empty
+      // active conversation (if any) and set the new one as active.
+      get().setActiveConversation(projectId, convId);
+      return convId;
+    },
+
+    removeConversation: (projectId, conversationId) => {
+      // Persist deletion to DB (fire-and-forget). The IPC handler deletes
+      // both messages and the conversation row in a transaction.
+      import("../lib/tauri-commands").then(({ deleteConversation }) => {
+        deleteConversation(conversationId).catch(() => {});
+      });
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const conv = p.conversations.get(conversationId);
+          if (!conv) return {};
+
+          // Prevent removing the last non-archived conversation — would cause blank UI.
+          const nonArchivedCount = Array.from(p.conversations.values()).filter(
+            (c) => c.id !== conversationId && !c.isArchived,
+          ).length;
+          if (nonArchivedCount === 0) return {}; // Can't remove the last one
+
+          const next = new Map(p.conversations);
+          next.delete(conversationId);
+          const nextOrder = p.conversationOrder.filter((id) => id !== conversationId);
+          let nextActive = p.activeConversationId;
+          if (nextActive === conversationId) {
+            nextActive = nextOrder[0] || null;
+          }
+          const activeConv = nextActive ? next.get(nextActive) : null;
+          return {
+            conversations: next,
+            conversationOrder: nextOrder,
+            activeConversationId: nextActive,
+            conversation: activeConv?.state ?? createEmptyConversation(),
+          };
+        }),
+      );
+    },
+
+    archiveConversation: (projectId, conversationId) => {
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const conv = p.conversations.get(conversationId);
+          if (!conv) return {};
+
+          // Prevent archiving the last non-archived conversation — would cause blank UI.
+          const nonArchivedCount = Array.from(p.conversations.values()).filter(
+            (c) => c.id !== conversationId && !c.isArchived,
+          ).length;
+          if (nonArchivedCount === 0) return {}; // Can't archive the last one
+
+          const updated: Conversation = { ...conv, isArchived: true, updatedAt: Date.now() };
+          const next = new Map(p.conversations);
+          next.set(conversationId, updated);
+
+          // Remove from conversationOrder (archived → not in tabs)
+          const nextOrder = p.conversationOrder.filter((id) => id !== conversationId);
+
+          // If archiving the active conversation, switch to the next non-archived
+          let nextActive = p.activeConversationId;
+          if (nextActive === conversationId) {
+            const candidate = p.conversationOrder.find(
+              (id) => id !== conversationId && !next.get(id)?.isArchived,
+            );
+            nextActive = candidate || null;
+          }
+          const activeConv = nextActive ? next.get(nextActive) : null;
+          return {
+            conversations: next,
+            conversationOrder: nextOrder,
+            activeConversationId: nextActive,
+            conversation: activeConv?.state ?? createEmptyConversation(),
+          };
+        }),
+      );
+      // Persist to DB asynchronously
+      import("../lib/tauri-commands").then(({ archiveConversation }) => {
+        archiveConversation(conversationId).catch((err) =>
+          console.error("[projects] Failed to persist archive:", err.message),
+        );
+      });
+    },
+
+    unarchiveConversation: (projectId, conversationId) => {
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const conv = p.conversations.get(conversationId);
+          if (!conv) return {};
+          const updated: Conversation = { ...conv, isArchived: false, updatedAt: Date.now() };
+          const next = new Map(p.conversations);
+          next.set(conversationId, updated);
+          // Ensure it's in conversationOrder
+          const nextOrder = p.conversationOrder.includes(conversationId)
+            ? p.conversationOrder
+            : [...p.conversationOrder, conversationId];
+          return {
+            conversations: next,
+            conversationOrder: nextOrder,
+          };
+        }),
+      );
+      // Persist to DB asynchronously
+      import("../lib/tauri-commands").then((mod) => {
+        mod.restoreConversation(conversationId).catch((err) =>
+          console.error("[projects] Failed to persist restore:", err.message),
+        );
+      });
+    },
+
+    setActiveConversation: (projectId, conversationId) => {
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          let conversations = p.conversations;
+          let order = p.conversationOrder;
+
+          // Auto-remove the previous active conversation if it's empty (0 messages)
+          const prevActiveId = p.activeConversationId;
+          if (prevActiveId && prevActiveId !== conversationId) {
+            const prevConv = p.conversations.get(prevActiveId);
+            if (prevConv && prevConv.state.messages.length === 0) {
+              conversations = new Map(p.conversations);
+              conversations.delete(prevActiveId);
+              order = p.conversationOrder.filter((id) => id !== prevActiveId);
+              // Persist deletion to DB
+              import("../lib/tauri-commands").then(({ deleteConversation }) => {
+                deleteConversation(prevActiveId).catch(() => {});
+              });
+            }
+          }
+
+          // If conversationId is null, this is navigation to the picker
+          if (!conversationId) {
+            return {
+              activeConversationId: null,
+              conversations,
+              conversationOrder: order,
+            };
+          }
+
+          const conv = p.conversations.get(conversationId);
+          if (!conv) return { conversations, conversationOrder: order };
+
+          // Add to conversationOrder if not already there (opening a tab)
+          if (!order.includes(conversationId)) {
+            order = [...order, conversationId];
+          }
+
+          // Bump updatedAt
+          const updated: Conversation = { ...conv, updatedAt: Date.now() };
+          const next = new Map(conversations);
+          next.set(conversationId, updated);
+          return {
+            activeConversationId: conversationId,
+            conversation: p.streamingConvId ? p.conversation : updated.state,
+            conversations: next,
+            conversationOrder: order,
+          };
+        }),
+      );
+    },
+
+    closeConversationTab: (projectId, conversationId) => {
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const conv = p.conversations.get(conversationId);
+          if (!conv) return {};
+
+          // Just remove from conversationOrder (close tab) but keep in conversations Map
+          const nextOrder = p.conversationOrder.filter((id) => id !== conversationId);
+
+          // If closing the active tab, switch to another
+          let nextActive = p.activeConversationId;
+          if (nextActive === conversationId) {
+            nextActive = nextOrder[0] || null;
+          }
+
+          const activeConv = nextActive ? p.conversations.get(nextActive) : null;
+          return {
+            conversationOrder: nextOrder,
+            activeConversationId: nextActive,
+            conversation: p.streamingConvId ? p.conversation : (activeConv?.state ?? createEmptyConversation()),
+          };
+        }),
+      );
+    },
+
+    renameConversation: (projectId, conversationId, label) => {
+      const trimmed = label.trim();
+      if (!trimmed) return; // Empty label — no-op
+
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const conv = p.conversations.get(conversationId);
+          if (!conv) return {};
+
+          // WEAK-2: Reject duplicate labels (case-insensitive) against other non-archived conversations
+          const isDuplicate = Array.from(p.conversations.values()).some(
+            (c) => c.id !== conversationId && !c.isArchived && c.label.toLowerCase() === trimmed.toLowerCase(),
+          );
+          if (isDuplicate) return {}; // Silently reject duplicate label
+
+          const updated: Conversation = {
+            ...conv,
+            label: trimmed || conv.label,
+            updatedAt: Date.now(),
+          };
+          const next = new Map(p.conversations);
+          next.set(conversationId, updated);
+          const isActive = p.activeConversationId === conversationId;
+          return {
+            conversations: next,
+            conversation: isActive ? updated.state : p.conversation,
+          };
+        }),
+      );
+    },
+
+    // ── Conversation ────────────────────────────────────────────────────
     addConversationMessage: (projectId, message) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          if (p.conversation.messages.some((m) => m.id === message.id)) return p;
-          const messages = [...p.conversation.messages, message];
-          // Cap to most recent N messages to prevent unbounded heap growth.
-          // Full history lives in SQLite; the store is a display-only cache.
+          const conv = getActiveConv(p);
+          if (conv.messages.some((m) => m.id === message.id)) return {};
+
+          // Adaptive naming: update the conversation label on every user message.
+          // The label reflects the latest subject, helping the user identify which
+          // conversation to resume even after the topic shifts.
+          const convMeta = p.activeConversationId ? p.conversations.get(p.activeConversationId) : null;
+          let labelOverride: string | null = null;
+          if (message.type === "user") {
+            const textBlock = (message.content ?? []).find(
+              (b): b is { type: "text"; text: string } => b.type === "text",
+            );
+            if (textBlock?.text) {
+              labelOverride = textBlock.text.replace(/\s+/g, " ").trim().slice(0, 60);
+            }
+          }
+
+          const messages = [...conv.messages, message];
           const capped = messages.length > MAX_STORE_MESSAGES
             ? messages.slice(messages.length - MAX_STORE_MESSAGES)
             : messages;
-          return {
-            conversation: {
-              ...p.conversation,
-              messages: capped,
-            },
-          };
+
+          // If auto-labeling, update both the conversations map and active conv state
+          if (labelOverride && convMeta) {
+            const updatedConv: Conversation = {
+              ...convMeta,
+              label: labelOverride,
+              state: { ...convMeta.state, messages: capped },
+              updatedAt: Date.now(),
+            };
+            const nextConvs = new Map(p.conversations);
+            nextConvs.set(convMeta.id, updatedConv);
+            return {
+              conversations: nextConvs,
+              conversation: updatedConv.state,
+            };
+          }
+
+          return updateActiveConv(p, { messages: capped });
         }),
       ),
 
     removeLastConversationMessage: (projectId) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: {
-            ...p.conversation,
-            messages: p.conversation.messages.slice(0, -1),
-          },
-        })),
+        updateProject(state, projectId, (p) => {
+          const conv = getActiveConv(p);
+          return updateActiveConv(p, { messages: conv.messages.slice(0, -1) });
+        }),
       ),
 
     removeConversationMessageById: (projectId, messageId) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: {
-            ...p.conversation,
-            messages: p.conversation.messages.filter((m) => m.id !== messageId),
-          },
-        })),
+        updateProject(state, projectId, (p) => {
+          const conv = getActiveConv(p);
+          return updateActiveConv(p, { messages: conv.messages.filter((m) => m.id !== messageId) });
+        }),
       ),
 
     updateMessageContent: (projectId, messageId, content) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = p.conversation.messages.map((m) =>
+          const conv = getActiveConv(p);
+          const msgs = conv.messages.map((m) =>
             m.id === messageId ? { ...m, content } : m,
           );
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
     updateMessageReasoning: (projectId, messageId, reasoning) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = p.conversation.messages.map((m) =>
+          const conv = getActiveConv(p);
+          const msgs = conv.messages.map((m) =>
             m.id === messageId ? { ...m, reasoning_content: reasoning } : m,
           );
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
     updateLastAssistantContent: (projectId, content) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
+          const conv = getActiveConv(p);
+          const msgs = [...conv.messages];
           const last = msgs[msgs.length - 1];
           if (last && last.type === "assistant") {
             msgs[msgs.length - 1] = { ...last, content };
           }
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
     appendToLastAssistantText: (projectId, text) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
+          const conv = getActiveConv(p);
+          const msgs = [...conv.messages];
           const last = msgs[msgs.length - 1];
           if (last && last.type === "assistant") {
             const blocks = [...last.content];
@@ -724,14 +1115,15 @@ function createProjectsStore() {
             }
             msgs[msgs.length - 1] = { ...last, content: blocks };
           }
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
     appendToLastAssistantThinking: (projectId, thinking) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
+          const conv = getActiveConv(p);
+          const msgs = [...conv.messages];
           const last = msgs[msgs.length - 1];
           if (last && last.type === "assistant") {
             const blocks = [...last.content];
@@ -748,14 +1140,15 @@ function createProjectsStore() {
             }
             msgs[msgs.length - 1] = { ...last, content: blocks };
           }
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
     setLastThinkingSignature: (projectId, signature) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
+          const conv = getActiveConv(p);
+          const msgs = [...conv.messages];
           const last = msgs[msgs.length - 1];
           if (last && last.type === "assistant") {
             const blocks = [...last.content];
@@ -768,141 +1161,130 @@ function createProjectsStore() {
             }
             msgs[msgs.length - 1] = { ...last, content: blocks };
           }
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
     setConversationModel: (projectId, model) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, model },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { model }),
+        ),
       ),
 
     setConversationStatusMessage: (projectId, message) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, statusMessage: message },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { statusMessage: message }),
+        ),
       ),
 
     setConversationRoutedModel: (projectId, model) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, routedModel: model },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { routedModel: model }),
+        ),
       ),
 
     setConversationRestored: (projectId, isRestored) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, isRestored },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { isRestored }),
+        ),
       ),
 
     setConversationProcessing: (projectId, isProcessing) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, isProcessing },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { isProcessing }),
+        ),
       ),
 
     setConversationError: (projectId, error) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, error },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { error }),
+        ),
       ),
 
     setLastMessageStreamingDone: (projectId) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
+          const conv = getActiveConv(p);
+          const msgs = [...conv.messages];
           const last = msgs[msgs.length - 1];
           if (last) {
             msgs[msgs.length - 1] = { ...last, isStreaming: false };
           }
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
     // Stamps isStreaming: false on every message that's still streaming.
-    // Claude finalizes its own messages via setLastMessageStreamingDone in
-    // case "assistant". Gemini may leave earlier tool-use messages streaming
-    // when the final text response creates a new assistant message — this
-    // sweeps those up at session end (case "result").
     finalizeAllStreaming: (projectId) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const hasAny = p.conversation.messages.some((m) => m.isStreaming);
-          if (!hasAny) return p;
-          const msgs = p.conversation.messages.map((m) =>
+          const conv = getActiveConv(p);
+          const hasAny = conv.messages.some((m) => m.isStreaming);
+          if (!hasAny) return {};
+          const msgs = conv.messages.map((m) =>
             m.isStreaming ? { ...m, isStreaming: false } : m,
           );
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
-    setLastAssistantMeta: (
-      projectId,
-      costUsd,
-      durationMs,
-      inputTokens,
-      outputTokens,
-      numTurns,
-    ) =>
+    setLastAssistantMeta: (projectId, costUsd, durationMs, inputTokens, outputTokens, numTurns) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
+          const conv = getActiveConv(p);
+          const msgs = [...conv.messages];
           for (let i = msgs.length - 1; i >= 0; i--) {
             if (msgs[i]!.type === "assistant") {
               msgs[i] = {
                 ...msgs[i]!,
-                costUsd,
-                durationMs,
-                inputTokens,
-                outputTokens,
-                numTurns,
+                costUsd, durationMs, inputTokens, outputTokens, numTurns,
               };
               break;
             }
           }
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
     setLastAssistantVerdict: (projectId, verdict) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
+          const conv = getActiveConv(p);
+          const msgs = [...conv.messages];
           for (let i = msgs.length - 1; i >= 0; i--) {
             if (msgs[i]!.type === "assistant") {
               msgs[i] = { ...msgs[i]!, verdict };
               break;
             }
           }
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
       ),
 
     clearConversation: (projectId) =>
       set((state) =>
-        updateProject(state, projectId, () => ({
-          conversation: createEmptyConversation(),
-        })),
+        updateProject(state, projectId, (p) => {
+          const empty = createEmptyConversation();
+          return updateActiveConv(p, empty);
+        }),
       ),
 
     clearSessionContext: (projectId) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: {
-            ...p.conversation,
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, {
             todos: [],
             isPlanning: false,
             phase: "idle",
             isProcessing: false,
-          },
-        })),
+          }),
+        ),
       ),
 
     setHasUnreadCompletion: (projectId, hasUnread) =>
@@ -921,43 +1303,51 @@ function createProjectsStore() {
 
     setConversationTodos: (projectId, todos) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, todos },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { todos }),
+        ),
       ),
 
     setPendingInput: (projectId, pendingInput) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, pendingInput },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { pendingInput }),
+        ),
       ),
 
     clearPendingInput: (projectId) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, pendingInput: null },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { pendingInput: null }),
+        ),
       ),
 
     setIsPlanning: (projectId, isPlanning) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, isPlanning },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { isPlanning }),
+        ),
       ),
 
     setConversationPhase: (projectId, phase) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, phase },
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { phase }),
+        ),
+      ),
+
+    setStreamingConvId: (projectId, conversationId) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          streamingConvId: conversationId ?? undefined,
         })),
       ),
 
     updateLastToolUseInput: (projectId, input) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
+          const conv = getActiveConv(p);
+          const msgs = [...conv.messages];
           const last = msgs[msgs.length - 1];
           if (last && last.type === "assistant") {
             const blocks = [...last.content];
@@ -969,14 +1359,22 @@ function createProjectsStore() {
             }
             msgs[msgs.length - 1] = { ...last, content: blocks };
           }
-          return { conversation: { ...p.conversation, messages: msgs } };
+          return updateActiveConv(p, { messages: msgs });
         }),
+      ),
+
+    updateConversation: (projectId, conversationId, partial) =>
+      set((state) =>
+        updateProject(state, projectId, (p) =>
+          directUpdateConv(p, conversationId, partial),
+        ),
       ),
 
     updateToolUseInputById: (projectId, toolId, input) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const msgs = [...p.conversation.messages];
+          const conv = getActiveConv(p);
+          const msgs = [...conv.messages];
           for (let mi = msgs.length - 1; mi >= 0; mi--) {
             const msg = msgs[mi]!;
             if (msg.type === "assistant") {
@@ -988,97 +1386,115 @@ function createProjectsStore() {
                 ) {
                   blocks[i] = { ...blocks[i]!, input } as ToolUseBlock;
                   msgs[mi] = { ...msg, content: blocks };
-                  return { conversation: { ...p.conversation, messages: msgs } };
+                  return updateActiveConv(p, { messages: msgs });
                 }
               }
             }
           }
-          return { conversation: p.conversation };
+          return updateActiveConv(p, { messages: conv.messages });
         }),
       ),
 
     setContextPressure: (projectId, tokens, pressure) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: {
-            ...p.conversation,
-            contextTokens: tokens,
-            contextPressure: pressure,
-          },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { contextTokens: tokens, contextPressure: pressure }),
+        ),
       ),
 
     setCompactionStatus: (projectId, status) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: {
-            ...p.conversation,
-            isCompacting: status.isCompacting ?? p.conversation.isCompacting,
-            lastCompactionAt: status.lastCompactionAt ?? p.conversation.lastCompactionAt,
-            compactionCount: status.compactionCount ?? p.conversation.compactionCount,
-            tokensSaved: status.tokensSaved ?? p.conversation.tokensSaved,
-          },
-        })),
+        updateProject(state, projectId, (p) => {
+          const conv = getActiveConv(p);
+          return updateActiveConv(p, {
+            isCompacting: status.isCompacting ?? conv.isCompacting,
+            lastCompactionAt: status.lastCompactionAt ?? conv.lastCompactionAt,
+            compactionCount: status.compactionCount ?? conv.compactionCount,
+            tokensSaved: status.tokensSaved ?? conv.tokensSaved,
+          });
+        }),
       ),
 
     setCachedBrief: (projectId, brief) =>
       set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, cachedBrief: brief },
-        })),
+        updateProject(state, projectId, (p) =>
+          updateActiveConv(p, { cachedBrief: brief }),
+        ),
       ),
 
-    restoreConversation: (projectId, messages, historyInfo) =>
-      set((state) =>
-        updateProject(state, projectId, () => ({
-          conversation: {
-            messages: messages.map((m) => ({ ...m, isHistorical: true })),
-            model: null,
-            routedModel: null,
-            serviceTier: null,
-            isProcessing: false,
-            isPlanning: false,
-            phase: "idle",
-            isRestored: true,
-            error: null,
-            todos: [],
-            isProcessActive: false,
-            lastActivity: Date.now(),
-            contextTokens: 0,
-            contextPressure: "none",
-            cachedBrief: "",
-            statusMessage: null,
-            isCompacting: false,
-            lastCompactionAt: null,
-            compactionCount: 0,
-            tokensSaved: 0,
-            historyTotalCount: historyInfo?.totalCount ?? 0,
-            historyStartIndex: historyInfo?.startIndex ?? 0,
-            pendingInput: null,
-          },
-        })),
-      ),
-
-    prependOlderMessages: (projectId, olderMessages, newStartIndex) =>
+    restoreConversation: (projectId, messages, historyInfo, conversationId) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
+          const targetId = conversationId ?? p.activeConversationId;
+          if (!targetId) return {};
+          const conv = p.conversations.get(targetId);
+          if (!conv) return {};
+          const updated: Conversation = {
+            ...conv,
+            state: {
+              ...conv.state,
+              messages: messages.map((m) => ({ ...m, isHistorical: true })),
+              model: null,
+              routedModel: null,
+              serviceTier: null,
+              isProcessing: false,
+              isPlanning: false,
+              phase: "idle",
+              isRestored: true,
+              error: null,
+              todos: [],
+              isProcessActive: false,
+              lastActivity: Date.now(),
+              contextTokens: 0,
+              contextPressure: "none",
+              cachedBrief: "",
+              statusMessage: null,
+              isCompacting: false,
+              lastCompactionAt: null,
+              compactionCount: 0,
+              tokensSaved: 0,
+              historyTotalCount: historyInfo?.totalCount ?? 0,
+              historyStartIndex: historyInfo?.startIndex ?? 0,
+              pendingInput: null,
+            },
+            updatedAt: Date.now(),
+          };
+          const next = new Map(p.conversations);
+          next.set(targetId, updated);
+          return {
+            conversations: next,
+            conversation: targetId === p.activeConversationId ? updated.state : p.conversation,
+          };
+        }),
+      ),
+
+    prependOlderMessages: (projectId, olderMessages, newStartIndex, conversationId) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const targetId = conversationId ?? p.activeConversationId;
+          if (!targetId) return {};
+          const conv = p.conversations.get(targetId);
+          if (!conv) return {};
           const merged = [
             ...olderMessages.map((m) => ({ ...m, isHistorical: true })),
-            ...p.conversation.messages,
+            ...conv.state.messages,
           ];
-          // Cap to most recent N, adjusting start index for trimmed front
           const trimmed = merged.length > MAX_STORE_MESSAGES
             ? merged.length - MAX_STORE_MESSAGES
             : 0;
           const capped = trimmed > 0
             ? merged.slice(trimmed)
             : merged;
+          const updated: Conversation = {
+            ...conv,
+            state: { ...conv.state, messages: capped, historyStartIndex: newStartIndex + trimmed },
+            updatedAt: Date.now(),
+          };
+          const next = new Map(p.conversations);
+          next.set(targetId, updated);
           return {
-            conversation: {
-              ...p.conversation,
-              messages: capped,
-              historyStartIndex: newStartIndex + trimmed,
-            },
+            conversations: next,
+            conversation: targetId === p.activeConversationId ? updated.state : p.conversation,
           };
         }),
       ),

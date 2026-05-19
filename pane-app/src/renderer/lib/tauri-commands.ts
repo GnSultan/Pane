@@ -63,9 +63,10 @@ export async function saveScrollPositions(
 
 export async function saveConversationToMain(
   projectId: string,
-  conversation: { model?: string | null; messages: unknown[]; startIndex?: number },
+  conversationId: string | null,
+  conversation: { model?: string | null; messages: unknown[]; startIndex?: number; label?: string; phase?: string },
 ): Promise<void> {
-  return electronAPI.invoke("save_conversation", { projectId, conversation });
+  return electronAPI.invoke("save_conversation", { projectId, conversationId, conversation });
 }
 
 export interface TokenAnalyticsRow {
@@ -118,6 +119,7 @@ export async function getModelRates(models: string[]): Promise<Record<string, { 
 
 export async function getConversationSlice(
   projectId: string,
+  conversationId: string | null,
   count: number,
   beforeIndex?: number,
 ): Promise<{
@@ -126,7 +128,41 @@ export async function getConversationSlice(
   startIndex: number;
   model: string | null;
 }> {
-  return electronAPI.invoke("get_conversation_slice", { projectId, count, beforeIndex });
+  return electronAPI.invoke("get_conversation_slice", { projectId, conversationId, count, beforeIndex });
+}
+
+// ── Multi-conversation CRUD ─────────────────────────────────────────────
+
+export async function createConversation(
+  projectId: string,
+  label?: string,
+  phase?: string,
+  model?: string | null,
+  id?: string,
+): Promise<{ id: string | null }> {
+  return electronAPI.invoke("create_conversation", { projectId, label, phase, model, id });
+}
+
+export async function getProjectConversations(
+  projectId: string,
+): Promise<{ conversations: unknown[] }> {
+  return electronAPI.invoke("get_project_conversations", { projectId });
+}
+
+export async function archiveConversation(conversationId: string): Promise<void> {
+  return electronAPI.invoke("archive_conversation", { conversationId });
+}
+
+export async function restoreConversation(conversationId: string): Promise<void> {
+  return electronAPI.invoke("restore_conversation", { conversationId });
+}
+
+export async function renameConversation(conversationId: string, label: string): Promise<void> {
+  return electronAPI.invoke("rename_conversation", { conversationId, label });
+}
+
+export async function deleteConversation(conversationId: string): Promise<void> {
+  return electronAPI.invoke("delete_conversation", { conversationId });
 }
 
 export async function searchConversations(
@@ -306,10 +342,10 @@ export interface SendToPunkOptions {
   /** Per-project power combo: which model to use for each phase.
    *  When present, the backend uses this instead of reading from disk. */
   powerCombo?: PowerCombo;
-  /** Sticky phase from the phase pill — single source of truth for model routing.
-   *  "think" uses thinking model (plan+verify), "build" uses execution model.
-   *  When set, overrides heuristic router so routing stays consistent across turns. */
+  /** Sticky phase from the phase pill — single source of truth for model routing. */
   phase?: string;
+  /** Target conversation for this message — scopes event channel and backend. */
+  conversationId?: string;
   // Mind chat overrides — when projectId starts with "mind:", these control behavior
   systemPromptOverride?: string;
   _systemOverride?: boolean;
@@ -406,8 +442,14 @@ export async function sendToPunk(
     else draining = false;
   };
 
+  // Scope the event channel by conversationId when available to prevent
+  // multiple conversations in the same project from receiving each other's events.
+  const eventChannel = opts.conversationId
+    ? `punk-stream:${projectId}:${opts.conversationId}`
+    : `punk-stream:${projectId}`;
+
   cleanup = electronAPI.on(
-    `punk-stream:${projectId}`,
+    eventChannel,
     (event: PunkStreamEvent) => {
       // Ignore events tagged for a different request (e.g. a previous aborted
       // session whose processEnded arrives after the new session has started).
@@ -428,6 +470,7 @@ export async function sendToPunk(
   try {
     await electronAPI.invoke("send_to_punk", {
       projectId,
+      conversationId: opts.conversationId,
       prompt,
       workingDir,
       model,
@@ -455,8 +498,8 @@ export async function sendToPunk(
   }
 }
 
-export async function abortPunk(projectId: string): Promise<void> {
-  return electronAPI.invoke("abort_punk", { projectId });
+export async function abortPunk(projectId: string, conversationId?: string): Promise<void> {
+  return electronAPI.invoke("abort_punk", { projectId, conversationId: conversationId || null });
 }
 
 export interface RoutePreview {

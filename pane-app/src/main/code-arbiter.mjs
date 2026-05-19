@@ -563,12 +563,15 @@ export function runArchitectureSentinel(projectId, workingDir, changedFiles, db)
  * @returns {Promise<ArbiterVerdict>}
  */
 export async function runTurnSentinel(projectId, workingDir, changedFiles, options = {}) {
+  const conversationId = options.conversationId || null;
   if (!changedFiles || changedFiles.length === 0) {
     return { pass: true, score: 100, typeErrors: [], lintErrors: [], findings: [], changedFiles: [], timestamp: Date.now() };
   }
 
-  // Load baseline (captured on first sentinel run of this session)
-  const baselinePath = path.join(SESSION_DIR, projectId, "arbiter-baseline.json");
+  // Load baseline — scoped by conversationId when provided
+  const baselinePath = conversationId
+    ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`, "arbiter-baseline.json")
+    : path.join(SESSION_DIR, projectId, "arbiter-baseline.json");
   let baseline = [];
   try {
     baseline = JSON.parse(fs.readFileSync(baselinePath, "utf-8"));
@@ -592,6 +595,8 @@ export async function runTurnSentinel(projectId, workingDir, changedFiles, optio
 
   // If no baseline yet, write one now and use all diags (first run)
   if (baseline.length === 0 && tscDiags.length > 0) {
+    const baselineDir = path.dirname(baselinePath);
+    await fsPromises.mkdir(baselineDir, { recursive: true });
     await fsPromises.writeFile(baselinePath, JSON.stringify(tscDiags), "utf-8");
   }
 
@@ -636,17 +641,21 @@ export async function runTurnSentinel(projectId, workingDir, changedFiles, optio
   }
 
   // Persist verdict for context-orchestrator to read on next turn
+  // Scoped by conversationId when provided — each conversation has its own verdict
   try {
-    const sessionDir = path.join(SESSION_DIR, projectId);
-    await fsPromises.mkdir(sessionDir, { recursive: true });
+    const verdictDir = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`)
+      : path.join(SESSION_DIR, projectId);
+    const verdictPath = path.join(verdictDir, "arbiter-verdict.json");
+    await fsPromises.mkdir(verdictDir, { recursive: true });
     await fsPromises.writeFile(
-      path.join(sessionDir, "arbiter-verdict.json"),
+      verdictPath,
       JSON.stringify(verdict, null, 2),
       "utf-8",
     );
     if (verdict.pass) {
       // Explicitly clear so stale failing verdicts don't re-inject on read-only turns
-      try { await fsPromises.unlink(path.join(sessionDir, "arbiter-verdict.json")); } catch {}
+      try { await fsPromises.unlink(verdictPath); } catch { /* file may not exist — best-effort clear */ }
     }
   } catch (err) {
     console.warn(`[arbiter] Failed to persist verdict: ${err.message}`);
@@ -658,24 +667,33 @@ export async function runTurnSentinel(projectId, workingDir, changedFiles, optio
 /**
  * Clear the arbiter verdict (called when findings are resolved).
  */
-export async function clearVerdict(projectId) {
+export async function clearVerdict(projectId, conversationId = null) {
   try {
-    await fsPromises.unlink(path.join(SESSION_DIR, projectId, "arbiter-verdict.json"));
-  } catch {}
+    const verdictPath = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`, "arbiter-verdict.json")
+      : path.join(SESSION_DIR, projectId, "arbiter-verdict.json");
+    await fsPromises.unlink(verdictPath);
+  } catch { /* file may not exist — best-effort clear */ }
 }
 
 /**
  * Read the current verdict (used by context-orchestrator).
  *
+ * When conversationId is provided, reads the conversation-scoped verdict file.
+ * This ensures each conversation has its own arbiter verdict, preventing
+ * cross-conversation contamination where context from conversation A sees
+ * type errors from conversation B.
+ *
  * @param {string} projectId
+ * @param {string|null} [conversationId] - scope verdict storage by conversation
  * @returns {ArbiterVerdict|null}
  */
-export function readVerdict(projectId) {
+export function readVerdict(projectId, conversationId = null) {
   try {
-    const raw = fs.readFileSync(
-      path.join(SESSION_DIR, projectId, "arbiter-verdict.json"),
-      "utf-8",
-    );
+    const filePath = conversationId
+      ? path.join(SESSION_DIR, projectId, `conv-${conversationId}`, "arbiter-verdict.json")
+      : path.join(SESSION_DIR, projectId, "arbiter-verdict.json");
+    const raw = fs.readFileSync(filePath, "utf-8");
     return JSON.parse(raw);
   } catch {
     return null;

@@ -205,23 +205,36 @@ class ContextStore extends EventEmitter {
   }
 
   /**
-   * Get stored turn summaries for a project.
+   * Get stored turn summaries for a project or conversation.
    * Returns an empty array if none exist yet.
+   *
+   * When conversationId is provided, looks up conversation-scoped summaries.
+   * This enables per-conversation turn pool isolation: each conversation has
+   * its own set of turn summaries for semantic retrieval.
+   *
    * @param {string} projectId
+   * @param {string|null} [conversationId] - scope to a specific conversation
    * @returns {Array<TurnSummaryRecord>}
    */
-  getTurnSummaries(projectId) {
-    const ctx = this._projects.get(projectId);
+  getTurnSummaries(projectId, conversationId = null) {
+    const key = conversationId || projectId;
+    const ctx = this._projects.get(key);
     return ctx?.turnSummaries || [];
   }
 
   /**
-   * Replace all turn summaries for a project.
+   * Replace all turn summaries for a project or conversation.
+   *
+   * When conversationId is provided, stores summaries scoped to that
+   * conversation. This keeps each conversation's turn pool isolated.
+   *
    * @param {string} projectId
    * @param {Array<TurnSummaryRecord>} summaries
+   * @param {string|null} [conversationId] - scope to a specific conversation
    */
-  updateTurnSummaries(projectId, summaries) {
-    const ctx = this._getOrCreate(projectId);
+  updateTurnSummaries(projectId, summaries, conversationId = null) {
+    const key = conversationId || projectId;
+    const ctx = this._getOrCreate(key);
     ctx.turnSummaries = summaries;
     ctx.lastUpdated = Date.now();
     ctx.version++;

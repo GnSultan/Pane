@@ -508,6 +508,41 @@ export interface CheckpointTurn {
   phase?: string;
 }
 
+// ── Multi-conversation support ──────────────────────────────────────────
+
+export interface ConversationMeta {
+  id: string;
+  label: string;
+  phase: PanePhase;
+  model: string | null;
+  createdAt: number;
+  updatedAt: number;
+  isArchived: boolean;
+}
+
+/** Conversation wraps ConversationState with persistent metadata */
+export interface Conversation {
+  id: string;
+  label: string;
+  phase: PanePhase;
+  state: ConversationState;
+  createdAt: number;
+  updatedAt: number;
+  isArchived: boolean;
+}
+
+export function createEmptyConversationMeta(id: string, label: string): Conversation {
+  return {
+    id,
+    label,
+    phase: "idle",
+    state: createEmptyConversation(),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    isArchived: false,
+  };
+}
+
 export function createEmptyConversation(): ConversationState {
   return {
     messages: [],

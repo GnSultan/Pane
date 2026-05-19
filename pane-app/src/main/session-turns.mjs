@@ -27,17 +27,22 @@ const DEFAULT_MAX_TURNS = 20;
 const DEFAULT_MAX_TOKENS = 100000; // 100k token budget for archive
 
 /**
- * Get the directory path for session turns storage
+ * Get the directory path for session turns storage.
+ * When conversationId is provided, turns are scoped per-conversation.
+ * Falls back to project-level path for backward compat (pre-v7 data).
  */
-function getTurnsDir(projectId) {
+function getTurnsDir(projectId, conversationId = null) {
+  if (conversationId) {
+    return path.join(SESSION_DIR, projectId, "turns", conversationId);
+  }
   return path.join(SESSION_DIR, projectId, "turns");
 }
 
 /**
  * Get the metadata file path for the turn index
  */
-function getMetadataPath(projectId) {
-  return path.join(getTurnsDir(projectId), "metadata.json");
+function getMetadataPath(projectId, conversationId = null) {
+  return path.join(getTurnsDir(projectId, conversationId), "metadata.json");
 }
 
 /**
@@ -75,11 +80,11 @@ function defaultMetadata() {
 }
 
 /**
- * Read metadata for a project
+ * Read metadata for a project/conversation
  */
-function readMetadata(projectId) {
+function readMetadata(projectId, conversationId = null) {
   try {
-    const metaPath = getMetadataPath(projectId);
+    const metaPath = getMetadataPath(projectId, conversationId);
     if (fs.existsSync(metaPath)) {
       const data = fs.readFileSync(metaPath, "utf-8");
       return JSON.parse(data);
@@ -91,13 +96,13 @@ function readMetadata(projectId) {
 }
 
 /**
- * Write metadata for a project
+ * Write metadata for a project/conversation
  */
-function writeMetadata(projectId, metadata) {
+function writeMetadata(projectId, metadata, conversationId = null) {
   try {
-    const dir = getTurnsDir(projectId);
+    const dir = getTurnsDir(projectId, conversationId);
     fs.mkdirSync(dir, { recursive: true });
-    const metaPath = getMetadataPath(projectId);
+    const metaPath = getMetadataPath(projectId, conversationId);
     fs.writeFileSync(metaPath, JSON.stringify(metadata, null, 2), "utf-8");
   } catch (err) {
     console.warn(`[session-turns] Failed to write metadata: ${err.message}`);
@@ -107,8 +112,8 @@ function writeMetadata(projectId, metadata) {
 /**
  * Get the file path for a specific turn index
  */
-function getTurnPath(projectId, turnIndex) {
-  return path.join(getTurnsDir(projectId), `${turnIndex}.json.gz`);
+function getTurnPath(projectId, turnIndex, conversationId = null) {
+  return path.join(getTurnsDir(projectId, conversationId), `${turnIndex}.json.gz`);
 }
 
 /**
@@ -117,62 +122,49 @@ function getTurnPath(projectId, turnIndex) {
  * @param {string} projectId
  * @param {number} turnIndex - The turn number (0, 1, 2, ...)
  * @param {object} turn - The full turn object to archive
- * @param {object} options - { maxTurns, maxTokens }
+ * @param {object} options - { maxTurns, maxTokens, conversationId }
  */
 export function saveTurn(projectId, turnIndex, turn, options = {}) {
-  const maxTurns = options.maxTurns || DEFAULT_MAX_TURNS;
-  const maxTokens = options.maxTokens || DEFAULT_MAX_TOKENS;
+  const { maxTurns = DEFAULT_MAX_TURNS, maxTokens = DEFAULT_MAX_TOKENS, conversationId = null } = options;
 
   try {
-    const metadata = readMetadata(projectId);
+    const metadata = readMetadata(projectId, conversationId);
     const tokenEstimate = estimateTurnTokens(turn);
 
     // Compress and write the turn file
     const compressed = compressTurn(turn);
-    const turnPath = getTurnPath(projectId, turnIndex);
+    const turnPath = getTurnPath(projectId, turnIndex, conversationId);
     fs.mkdirSync(path.dirname(turnPath), { recursive: true });
     fs.writeFileSync(turnPath, compressed);
 
     // Update metadata
-    // Remove existing entry for this index if it exists (overwrite)
     metadata.turns = metadata.turns.filter(t => t.index !== turnIndex);
-
-    // Add new entry
     metadata.turns.push({
       index: turnIndex,
       tokenEstimate,
       timestamp: Date.now(),
       fileSize: compressed.length,
     });
-
-    // Recalculate total tokens
     metadata.totalTokens = metadata.turns.reduce((sum, t) => sum + t.tokenEstimate, 0);
 
     // Enforce retention limits
-    // 1. Remove oldest turns if we exceed maxTurns
     if (metadata.turns.length > maxTurns) {
       const excess = metadata.turns.length - maxTurns;
       const toRemove = metadata.turns.slice(0, excess);
       for (const entry of toRemove) {
-        try {
-          fs.unlinkSync(getTurnPath(projectId, entry.index));
-        } catch {}
+        try { fs.unlinkSync(getTurnPath(projectId, entry.index, conversationId)); } catch { /* turn file already deleted */ }
         metadata.turns = metadata.turns.filter(t => t.index !== entry.index);
       }
       metadata.totalTokens = metadata.turns.reduce((sum, t) => sum + t.tokenEstimate, 0);
     }
-
-    // 2. Remove oldest turns if we exceed maxTokens (after turn count check)
     while (metadata.turns.length > 0 && metadata.totalTokens > maxTokens) {
       const oldest = metadata.turns[0];
-      try {
-        fs.unlinkSync(getTurnPath(projectId, oldest.index));
-      } catch {}
+      try { fs.unlinkSync(getTurnPath(projectId, oldest.index, conversationId)); } catch { /* turn file already deleted */ }
       metadata.turns = metadata.turns.slice(1);
       metadata.totalTokens = metadata.turns.reduce((sum, t) => sum + t.tokenEstimate, 0);
     }
 
-    writeMetadata(projectId, metadata);
+    writeMetadata(projectId, metadata, conversationId);
   } catch (err) {
     console.warn(`[session-turns] Failed to save turn ${turnIndex}: ${err.message}`);
   }
@@ -181,12 +173,10 @@ export function saveTurn(projectId, turnIndex, turn, options = {}) {
 /**
  * Load a specific turn from the archive
  */
-export function loadTurn(projectId, turnIndex) {
+export function loadTurn(projectId, turnIndex, conversationId = null) {
   try {
-    const turnPath = getTurnPath(projectId, turnIndex);
-    if (!fs.existsSync(turnPath)) {
-      return null;
-    }
+    const turnPath = getTurnPath(projectId, turnIndex, conversationId);
+    if (!fs.existsSync(turnPath)) return null;
     const buffer = fs.readFileSync(turnPath);
     return decompressTurn(buffer);
   } catch (err) {
@@ -198,13 +188,11 @@ export function loadTurn(projectId, turnIndex) {
 /**
  * Load multiple turns by index array (in order)
  */
-export function loadTurns(projectId, turnIndices) {
+export function loadTurns(projectId, turnIndices, conversationId = null) {
   const result = [];
   for (const idx of turnIndices) {
-    const turn = loadTurn(projectId, idx);
-    if (turn) {
-      result.push(turn);
-    }
+    const turn = loadTurn(projectId, idx, conversationId);
+    if (turn) result.push(turn);
   }
   return result;
 }
@@ -212,29 +200,28 @@ export function loadTurns(projectId, turnIndices) {
 /**
  * Get the list of available turn indices from metadata
  */
-export function getAvailableTurns(projectId) {
-  const metadata = readMetadata(projectId);
+export function getAvailableTurns(projectId, conversationId = null) {
+  const metadata = readMetadata(projectId, conversationId);
   return metadata.turns.map(t => t.index).sort((a, b) => a - b);
 }
 
 /**
  * Get metadata summary for all turns
  */
-export function getTurnMetadata(projectId) {
-  return readMetadata(projectId);
+export function getTurnMetadata(projectId, conversationId = null) {
+  return readMetadata(projectId, conversationId);
 }
 
 /**
- * Clear all turns for a project (useful for testing or cleanup)
+ * Clear all turns for a project/conversation
  */
-export function clearTurns(projectId) {
+export function clearTurns(projectId, conversationId = null) {
   try {
-    const dir = getTurnsDir(projectId);
+    const dir = getTurnsDir(projectId, conversationId);
     if (fs.existsSync(dir)) {
       fs.rmSync(dir, { recursive: true });
     }
-    const metadata = defaultMetadata();
-    writeMetadata(projectId, metadata);
+    writeMetadata(projectId, defaultMetadata(), conversationId);
   } catch (err) {
     console.warn(`[session-turns] Failed to clear turns: ${err.message}`);
   }
@@ -243,47 +230,38 @@ export function clearTurns(projectId) {
 /**
  * Check if a session has archived turns available
  */
-export function hasArchivedTurns(projectId, sessionId) {
-  const turns = getAvailableTurns(projectId);
+export function hasArchivedTurns(projectId, conversationId = null) {
+  const turns = getAvailableTurns(projectId, conversationId);
   return turns.length > 0;
 }
 
 /**
  * Load the most recent N turns for a session
- * Returns array of turn objects sorted by index ascending (oldest first)
  */
-export function loadRecentTurns(projectId, sessionId, count = 10) {
-  const available = getAvailableTurns(projectId);
-  if (available.length === 0) {
-    return [];
-  }
-
-  // Take the most recent 'count' turns
+export function loadRecentTurns(projectId, count = 10, conversationId = null) {
+  const available = getAvailableTurns(projectId, conversationId);
+  if (available.length === 0) return [];
   const recentIndices = available.slice(-count);
-  return loadTurns(projectId, recentIndices);
+  return loadTurns(projectId, recentIndices, conversationId);
 }
 
 /**
  * Backfill archive from existing handoff history.
- * Called during migration to populate the archive from legacy handoff data.
  */
-export function backfillFromHandoff(projectId, handoffHistory) {
-  if (!handoffHistory || handoffHistory.length === 0) {
-    return;
-  }
+export function backfillFromHandoff(projectId, handoffHistory, conversationId = null) {
+  if (!handoffHistory || handoffHistory.length === 0) return;
 
   console.log(`[session-turns] Backfilling ${handoffHistory.length} turns from handoff history for ${projectId}`);
 
   for (const handoff of handoffHistory) {
     if (handoff.turn !== undefined) {
-      // Construct a minimal turn object from handoff data
       const turn = {
-        messages: [], // Handoff doesn't have full message history
-        handoff: handoff,
+        messages: [],
+        handoff,
         timestamp: handoff.timestamp,
         turn: handoff.turn,
       };
-      saveTurn(projectId, handoff.turn, turn, { maxTurns: DEFAULT_MAX_TURNS });
+      saveTurn(projectId, handoff.turn, turn, { maxTurns: DEFAULT_MAX_TURNS, conversationId });
     }
   }
 

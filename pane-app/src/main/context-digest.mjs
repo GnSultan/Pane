@@ -39,8 +39,11 @@ const SESSION_DIR = path.join(PANE_DIR, "session");
 // File I/O
 // ──────────────────────────────────────────────────────────────────────────
 
-function digestPath(projectId) {
-  return path.join(SESSION_DIR, projectId, "context-digest.json");
+function digestPath(projectId, conversationId = null) {
+  const fileName = conversationId
+    ? `context-digest-${conversationId}.json`
+    : "context-digest.json";
+  return path.join(SESSION_DIR, projectId, fileName);
 }
 
 function ensureSessionDir(projectId) {
@@ -57,11 +60,12 @@ function ensureSessionDir(projectId) {
 /**
  * Read the current context digest for a project session.
  * @param {string} projectId
+ * @param {string|null} [conversationId] - scope by conversation when available
  * @returns {object|null}
  */
-export function readDigest(projectId) {
+export function readDigest(projectId, conversationId = null) {
   try {
-    const filePath = digestPath(projectId);
+    const filePath = digestPath(projectId, conversationId);
     if (fs.existsSync(filePath)) {
       return JSON.parse(fs.readFileSync(filePath, "utf-8"));
     }
@@ -76,8 +80,9 @@ export function readDigest(projectId) {
  * @param {string} projectId
  * @param {string} sessionId
  * @param {string} originalObjective - first user message or task description
+ * @param {string|null} [conversationId] - scope by conversation when available
  */
-export function createDigest(projectId, sessionId, originalObjective) {
+export function createDigest(projectId, sessionId, originalObjective, conversationId = null) {
   ensureSessionDir(projectId);
 
   const digest = {
@@ -93,7 +98,7 @@ export function createDigest(projectId, sessionId, originalObjective) {
   };
 
   try {
-    fs.writeFileSync(digestPath(projectId), JSON.stringify(digest, null, 2), "utf-8");
+    fs.writeFileSync(digestPath(projectId, conversationId), JSON.stringify(digest, null, 2), "utf-8");
   } catch (err) {
     console.warn(`[context-digest] createDigest failed: ${err.message}`);
   }
@@ -108,17 +113,19 @@ export function createDigest(projectId, sessionId, originalObjective) {
  * @param {string} projectId
  * @param {Array<{ turnIndex: number, request: string, tools: string[], conclusion: string }>} droppedTurns
  * @param {object} state - optional session state for decisions/deeper context
+ * @param {string|null} [conversationId] - scope by conversation when available
  */
-export function updateDigest(projectId, droppedTurns, state = null) {
+export function updateDigest(projectId, droppedTurns, state = null, conversationId = null) {
   if (!droppedTurns || droppedTurns.length === 0) return;
 
-  let digest = readDigest(projectId);
+  let digest = readDigest(projectId, conversationId);
   if (!digest) {
     // No digest yet — create one from first dropped turn's request
     digest = createDigest(
       projectId,
       `auto-${Date.now()}`,
       droppedTurns[0]?.request || "(unknown)",
+      conversationId,
     );
   }
 
@@ -195,7 +202,7 @@ export function updateDigest(projectId, droppedTurns, state = null) {
 
   try {
     ensureSessionDir(projectId);
-    fs.writeFileSync(digestPath(projectId), JSON.stringify(updated, null, 2), "utf-8");
+    fs.writeFileSync(digestPath(projectId, conversationId), JSON.stringify(updated, null, 2), "utf-8");
   } catch (err) {
     console.warn(`[context-digest] updateDigest failed: ${err.message}`);
   }
@@ -268,10 +275,11 @@ export function formatDigestForContext(digest) {
 /**
  * Check if a digest exists and has meaningful content.
  * @param {string} projectId
+ * @param {string|null} [conversationId] - scope by conversation when available
  * @returns {boolean}
  */
-export function hasDigest(projectId) {
-  const digest = readDigest(projectId);
+export function hasDigest(projectId, conversationId = null) {
+  const digest = readDigest(projectId, conversationId);
   if (!digest) return false;
   return (
     digest.keyDecisions.length > 0 ||
