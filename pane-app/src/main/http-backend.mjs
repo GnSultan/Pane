@@ -28,8 +28,8 @@ import {
 } from "./extraction-tuning.mjs";
 
 import { calculateCost } from "./pricing.mjs";
-import { summarize, storeRaw } from "./tool-result-cache.mjs";
-import { manageConversation, forcePruneToBudget, storeTurnSummary } from "./conversation-lifecycle.mjs";
+import { storeRaw } from "./tool-result-cache.mjs";
+import { forcePruneToBudget, applyV4TurnSelection } from "./conversation-lifecycle.mjs";
 import { contextStore } from "./context-store.mjs";
 import { scoreTurnsByRelevance, selectTurns, base64ToFloat32Array } from "./semantic-turn-selector.mjs";
 import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
@@ -41,6 +41,12 @@ import {
 } from "./session-journal.mjs";
 import { createDigest, updateDigest } from "./context-digest.mjs";
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
+
+// Safety factor for token estimation — the 4-char/token heuristic systematically
+// underestimates actual model token counts for code-heavy content (tool results,
+// JSON structures, file reads common in Pane conversations). A 1.8x multiplier
+// ensures the pre-flight guardrail catches cases the heuristic misses.
+const TOKEN_ESTIMATE_SAFETY = 1.8;
 
 // ============================================================================
 // Context Window Manager — Pane-owned conversation lifecycle
@@ -54,34 +60,6 @@ import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 // Instead of emergency compaction when full, the window is continuously
 // managed: old tool results are pruned, oldest turns summarized, stale
 // content dropped. The model always has room to work.
-
-/**
- * Manage the context window: prune tool results, check size, summarize if needed.
- * Uses the model's actual context limit instead of a hardcoded cap.
- * Called after building the messages array, before sending to the API.
- *
- * @param {Array} messages - the full messages array
- * @param {number} systemTokens - estimated tokens in the system prompt
- * @param {string|null} projectId
- * @param {string|null} model - model identifier for context limit lookup
- * @returns {object} result from manageConversation
- */
-function manageContextWindow(
-  messages,
-  systemTokens = 0,
-  projectId = null,
-  model = null,
-  turnSelection = null, // optional TurnSelection for semantic pruning
-) {
-  const maxContextTokens = model ? getModelLimit(model) : 128000;
-  return manageConversation(messages, {
-    projectId,
-    model,
-    systemTokens,
-    maxContextTokens,
-    turnSelection,
-  });
-}
 
 // ============================================================================
 // HTTP Backend (Kimi/DeepSeek/Anthropic/etc.)
@@ -1954,17 +1932,17 @@ export class ApiBackend extends PunkBackend {
         );
       }
 
-      // ── V4 Semantic: pre-compute query embedding for relevance-scored context ──
+      // ── Pre-compute query embedding for relevance-scored context ──
       // Computed once, reused for both the semantic turn pool (in orchestrateContext)
-      // and turn selection (in manageConversation). Gated behind PANE_V4_SEMANTIC.
+      // and turn selection.
       let queryEmbB64 = null;
-      if (process.env.PANE_V4_SEMANTIC === "1" && this._brainRequest) {
+      if (this._brainRequest) {
         try {
           const userQuery = request.prompt || "";
           const embedResult = await this._brainRequest("embed_texts", { texts: [userQuery] });
           queryEmbB64 = embedResult?.embeddings?.[userQuery] || null;
         } catch (err) {
-          console.warn(`[http] V4 semantic embedding failed (falling back to chronological): ${err.message}`);
+          console.warn(`[http] query embedding failed (falling back to chronological): ${err.message}`);
         }
       }
 
@@ -2120,20 +2098,21 @@ export class ApiBackend extends PunkBackend {
       // Pane owns the context window. Instead of emergency compaction when
       // full, the window is continuously managed:
       //   Phase 1: Prune old tool results (3k file reads → 30-token summaries)
-      //   Phase 2: Drop turns (chronological by default, semantic when available)
+      //   Phase 2: Drop turns (semantic by default, chronological fallback)
       // Managed by conversation-lifecycle.mjs — three-tier progressive summarization.
       //
-      // When PANE_V4_SEMANTIC is enabled, semantic turn selection computes which
-      // turns to keep/drop based on relevance to the current query.
+      // Semantic turn selection computes which turns to keep/drop based on
+      // relevance to the current query. Falls back to chronological if
+      // query embedding is unavailable.
       const systemTokens =
         context.budget?.systemUsed ||
         Math.round((systemPrompt?.length || 0) / 4);
 
-      // ── Semantic turn selection (pre-compute for Phase 2) ────────────
-      // Gated behind PANE_V4_SEMANTIC env var during phased rollout.
-      // Reuses queryEmbB64 computed earlier for the orchestrator.
+      // ── Semantic turn selection ──────────────────────────────────────
+      // Reuses queryEmbB64 computed earlier. When unavailable, skip pruning.
+      // The pre-flight guardrail + healing path handle overflow.
       let turnSelection = null;
-      if (process.env.PANE_V4_SEMANTIC === "1" && this._brainRequest) {
+      if (this._brainRequest && queryEmbB64) {
         try {
           const summaries = contextStore.getTurnSummaries(request.projectId);
           if (summaries && summaries.length > 0) {
@@ -2160,13 +2139,12 @@ export class ApiBackend extends PunkBackend {
         }
       }
 
-      const windowResult = manageContextWindow(
-        messages,
-        systemTokens,
-        request.projectId,
-        request.model,
-        turnSelection, // optional — passed to manageConversation for Phase 2
-      );
+      // ── Context window management (V4-direct) ────────────────────────
+      // Semantic turn selection drives pruning directly. When unavailable
+      // (brain engine down), skip — the pre-flight guardrail handles overflow.
+      const windowResult = turnSelection
+        ? applyV4TurnSelection(messages, turnSelection, request.projectId)
+        : { action: "none", tokensSaved: 0, droppedTurns: [] };
       if (windowResult.action !== "none") {
         this.onEvent(
           request.projectId,
@@ -2174,8 +2152,8 @@ export class ApiBackend extends PunkBackend {
             event: "window_managed",
             data: {
               action: windowResult.action,
-              tokensBefore: windowResult.tokensBefore,
-              tokensAfter: windowResult.tokensAfter,
+              tokensSaved: windowResult.tokensSaved,
+              droppedTurns: windowResult.droppedTurns?.length || 0,
               messagesRemaining: messages.length,
             },
           },
@@ -2453,10 +2431,10 @@ export class ApiBackend extends PunkBackend {
                 const outputBudget = getDefaultOutputBudget(request.model);
                 const overheadBudget = 5000; // tools definitions + [Pane context] + formatting
                 const maxMessagesTokens = modelLimit - outputBudget - overheadBudget;
-                const currentMsgTokens = estimateTokens(JSON.stringify(sourceBody.messages));
+                const currentMsgTokens = Math.round(estimateTokens(JSON.stringify(sourceBody.messages)) * TOKEN_ESTIMATE_SAFETY);
                 if (currentMsgTokens > maxMessagesTokens) {
                   console.warn(
-                    `[http] Pre-flight guardrail: ~${currentMsgTokens} msg tokens exceeds ${maxMessagesTokens} budget (model: ${modelLimit}, output: ${outputBudget}). Force-pruning...`
+                    `[http] Pre-flight guardrail: ~${currentMsgTokens} msg tokens (${TOKEN_ESTIMATE_SAFETY}x safety) exceeds ${maxMessagesTokens} budget (model: ${modelLimit}, output: ${outputBudget}). Force-pruning...`
                   );
                   const result = forcePruneToBudget(
                     sourceBody.messages,
@@ -2584,13 +2562,18 @@ export class ApiBackend extends PunkBackend {
                         },
                         request.requestId,
                       );
-                      // Force-prune the actual source body messages aggressively
+                      // Force-prune the actual source body messages aggressively.
+                      // Use a tighter budget target (divided by safety factor) so that
+                      // even with the 4-char/token heuristic underestimating actual tokens,
+                      // we leave headroom. The heuristic says we're at target/1.8, but
+                      // actual tokens will be at approximately the target.
                       const modelLimit = request.model ? getModelLimit(request.model) : 128000;
                       const outputBudget = getDefaultOutputBudget(request.model);
                       const maxMessagesTokens = modelLimit - outputBudget - 5000;
+                      const targetBudget = Math.floor(maxMessagesTokens / TOKEN_ESTIMATE_SAFETY);
                       forcePruneToBudget(
                         sourceBody.messages,
-                        maxMessagesTokens,
+                        targetBudget,
                         request.projectId,
                       );
                       // Sync back to body.messages so retry uses the pruned state
@@ -3647,17 +3630,10 @@ export class ApiBackend extends PunkBackend {
             }
           }
 
-          // Window management with stable system prompt
-          const loopSystemTokens = Math.round(
-            (messages[0]?.content?.length || 0) / 4,
-          );
-          const loopWindowResult = manageContextWindow(
-            messages,
-            loopSystemTokens,
-            request.projectId,
-            request.model,
-            turnSelection,
-          );
+          // Window management — V4-direct when turn selection is available
+          const loopWindowResult = turnSelection
+            ? applyV4TurnSelection(messages, turnSelection, request.projectId)
+            : { action: "none", tokensSaved: 0, droppedTurns: [] };
           if (loopWindowResult.droppedTurns?.length > 0) {
             try {
               updateDigest(request.projectId, loopWindowResult.droppedTurns, null);

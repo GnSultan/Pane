@@ -9,7 +9,7 @@ import {
   nativeImage,
 } from "electron";
 import windowStateKeeper from "electron-window-state";
-import { execSync, execFileSync } from "node:child_process";
+import { execSync, execFileSync, execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
 
@@ -176,24 +176,31 @@ async function registerClaudeHandlers() {
     }
   });
 }
-// execFileAsync now wraps execFileSync — bypasses libuv's uv_spawn/kqueue EVFILT_PROC path on macOS.
-// Same interface as before (returns { stdout, stderr } or throws), but blocks synchronously.
-// Git commands are fast (10-50ms) and IPC handlers run briefly — this is acceptable.
+// Truly async child_process.execFile — does NOT block the main process.
+// FD repair at the top of this file handles the EBADF issue that previously
+// forced us to use execFileSync. Each IPC handler already awaits this, and
+// libuv schedules the callback on the next event loop tick.
 function execFileAsync(cmd, args, options = {}) {
-  try {
-    const stdout = execFileSync(cmd, args, { encoding: "utf-8", ...options });
-    return { stdout: stdout || "", stderr: "" };
-  } catch (err) {
-    // Preserve the same error shape as execFileAsync would have thrown
-    const wrapped = new Error(err.message);
-    wrapped.stdout = err.stdout?.toString() || "";
-    wrapped.stderr = err.stderr?.toString() || "";
-    wrapped.code = err.status;     // exit code (execAsync compat)
-    wrapped.status = err.status;
-    wrapped.signal = err.signal;
-    wrapped.killed = err.killed;
-    throw wrapped;
-  }
+  return new Promise((resolve, reject) => {
+    // Default to getEnvWithPath() so all child processes inherit the enhanced PATH
+    // that includes /opt/homebrew/bin, /usr/local/bin, etc. — without this, git
+    // and other Homebrew tools are invisible to Electron when launched from the
+    // app bundle (which strips PATH to /usr/bin:/bin:/usr/sbin:/sbin).
+    execFile(cmd, args, { encoding: "utf-8", env: getEnvWithPath(), ...options }, (error, stdout, stderr) => {
+      if (error) {
+        const wrapped = new Error(error.message);
+        wrapped.stdout = stdout || "";
+        wrapped.stderr = stderr || "";
+        wrapped.code = error.code;
+        wrapped.status = error.status ?? null;
+        wrapped.signal = error.signal || null;
+        wrapped.killed = error.killed || false;
+        reject(wrapped);
+      } else {
+        resolve({ stdout: stdout || "", stderr: stderr || "" });
+      }
+    });
+  });
 }
 
 // Build a PATH that includes common tool locations Electron strips out
@@ -499,7 +506,7 @@ function registerCommandHandlers() {
         );
         branch = stdout.trim();
       } catch {
-        branch = "master";
+        branch = "unknown";
       }
     }
     const files = {};
@@ -1745,14 +1752,18 @@ function registerStateHandlers(db) {
 
   // save_conversation: accepts projectId instead of filePath.
   // Renderer sends only delta messages (new/modified since last persist) via
-  // debounced delta persistence. INSERT OR REPLACE handles both re-persisting
-  // an updated message (content streaming updates) and inserting new messages.
+  // debounced delta persistence. Each SQLite statement auto-commits independently
+  // — no explicit db.transaction() wrapper, so the database lock is never held
+  // across multiple messages. This prevents blocking other IPC handlers (git
+  // status, change history, token analytics) for hundreds of milliseconds.
+  // INSERT OR REPLACE handles both re-persisting an updated message (content
+  // streaming updates) and inserting new messages.
   // Rows in the DB outside the delta slice are untouched; no prefix-merge needed.
   ipcMain.handle("save_conversation", (_event, args) => {
     const { projectId, conversation } = args;
     const { model, messages } = conversation;
 
-    const save = db.transaction(() => {
+    try {
       for (const msg of messages) {
         const id = msg.id || `msg-${projectId}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
         const contentJson = JSON.stringify(msg);
@@ -1772,10 +1783,6 @@ function registerStateHandlers(db) {
         }
       }
       db.stmts.upsertConvMeta.run(projectId, null, model ?? null, Date.now());
-    });
-
-    try {
-      save();
     } catch (e) {
       console.error("[pane-db] save_conversation error:", e.message);
     }

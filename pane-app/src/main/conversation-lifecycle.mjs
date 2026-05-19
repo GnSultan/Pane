@@ -1,23 +1,22 @@
 /**
- * Conversation Lifecycle — three-tier message management with budget integration.
+ * Conversation Lifecycle — semantic turn pruning with relevance scoring.
  *
- * Problem: The current system either keeps everything (expensive) or binary-prunes
- * tool results (loses context). We need a middle ground: progressively summarize
- * old content while keeping recent turns exact.
+ * Prunes conversation turns by relevance (V4 semantic selection), not by
+ * position or token budget heuristics. Turns scored as irrelevant are dropped
+ * and replaced with extractive summary markers for semantic retrieval.
+ * Remaining non-fresh turns get their tool results summarized.
  *
  * Three tiers:
- *   FRESH  — last 2-3 turns: full raw content (model needs these verbatim)
- *   RECENT — turns 3-10: tool results replaced with summaries, user/assistant kept
- *   ARCHIVAL — turns 10+: tool results cached on disk, messages[] only has summaries
+ *   FRESH  — last N turns: full raw content (model needs these verbatim)
+ *   RECENT — turns past fresh window: tool results replaced with summaries
+ *   ARCHIVAL — old cached turns pruned from disk, available via semantic recall
  *
- * Budget integration: token-budget.mjs tells us when we're under pressure.
- * This module responds by promoting messages from fresh→recent→archival.
- *
- * Replaces: manageContextWindow() binary pruning in http-backend.mjs
+ * Entry point: applyV4TurnSelection() — called from http-backend.mjs.
+ * Fallback: forcePruneToBudget() — pre-flight guardrail with safety multiplier.
  */
 
-import { estimateTokens, getDefaultOutputBudget, SLIDING_WINDOW_SIZE } from "./token-budget.mjs";
-import { buildSummary, restoreRaw, pruneOldTurns } from "./tool-result-cache.mjs";
+import { estimateTokens, SLIDING_WINDOW_SIZE } from "./token-budget.mjs";
+import { buildSummary, pruneOldTurns } from "./tool-result-cache.mjs";
 import { contextStore } from "./context-store.mjs";
 
 // Tier boundaries (by turn index from end of messages[])
@@ -25,20 +24,6 @@ export const FRESH_DEPTH = SLIDING_WINDOW_SIZE;  // last N turns stay raw (tied 
 const RECENT_DEPTH = FRESH_DEPTH + 7;  // next 7 turns get summarized
 
 
-
-// Tools/framing overhead on top of max_tokens (tool definitions, [Pane context] preamble, formatting)
-const TOOLS_FRAMING_OVERHEAD = 5000;
-
-/**
- * Compute the output reserve for a model: max_tokens + tools/framing overhead.
- * This is what must be reserved from the context window for non-conversation content.
- * @param {string|null} model
- * @returns {number}
- */
-function getOutputReserve(model) {
-  const outputBudget = model ? getDefaultOutputBudget(model) : 8192;
-  return outputBudget + TOOLS_FRAMING_OVERHEAD;
-}
 
 /**
  * Extract turn boundaries from messages array.
@@ -134,24 +119,6 @@ export function summarizeTurn(messages, startIdx, endIdx, options = {}) {
   }
 
   return tokensSaved;
-}
-
-/**
- * Compute total token estimate for the messages array.
- * Adds system prompt overhead and serialization framing.
- *
- * @param {Array} messages
- * @param {number} systemTokens
- * @returns {number}
- */
-function computeTotalTokens(messages, systemTokens) {
-  // If messages[0] is already the system prompt, systemTokens double-counts it.
-  // Only add systemTokens separately when the system prompt is NOT in messages.
-  const hasSystemInMessages = messages.length > 0 && messages[0].role === "system";
-  if (hasSystemInMessages) {
-    return estimateTokens(JSON.stringify(messages));
-  }
-  return systemTokens + estimateTokens(JSON.stringify(messages));
 }
 
 /**
@@ -395,169 +362,8 @@ export function dropIrrelevantTurns(messages, turns, selection, projectId) {
 }
 
 /**
- * Main entry point: manage conversation lifecycle.
- * Call this instead of manageContextWindow().
- *
- * Prunes to the model's HARD limit (maxContextTokens - outputReserve),
- * not a soft utilization target. Uses a progressive loop:
- *   Phase 1: Summarize tool results (archival → recent)
- *   Phase 2: Drop turns (chronological by default, or semantic when turnSelection provided)
- *   Stops as soon as the total is under the hard limit.
- *
- * @param {Array} messages - The messages[] array (mutated in place)
- * @param {object} options
- * @param {string} options.projectId
- * @param {string|null} options.model - Model identifier for computing output budget
- * @param {number} options.systemTokens - Token count of system prompt
- * @param {number} options.maxContextTokens - Model's context window size
- * @param {number} options.currentTurnIndex - Current turn number in session
- * @param {import("./semantic-turn-selector.mjs").TurnSelection} [options.turnSelection] - Pre-computed turn selection for semantic pruning
- * @returns {{ action: string, tokensSaved: number, details: string }}
- */
-export function manageConversation(messages, options = {}) {
-  const {
-    projectId = "unknown",
-    model = null,
-    systemTokens = 0,
-    maxContextTokens = 128000,
-    currentTurnIndex = 0,
-    turnSelection = null, // Optional: pre-computed TurnSelection for semantic pruning
-  } = options;
-
-  // HARD limit: model's max minus what we need for output + tools + framing
-  const hardLimit = maxContextTokens - getOutputReserve(model);
-  // Soft trigger: start pruning when we exceed 50% of hard limit
-  const triggerThreshold = Math.floor(hardLimit * 0.5);
-
-  let totalTokens = computeTotalTokens(messages, systemTokens);
-
-  // No pressure — nothing to do
-  if (totalTokens <= triggerThreshold) {
-    return { action: "none", tokensSaved: 0, details: "under 50% of hard limit", droppedTurns: [] };
-  }
-
-  // Detect turns
-  let turns = detectTurns(messages);
-  let totalSaved = 0;
-  let actionsSummary = [];
-  let iterations = 0;
-  const MAX_ITERATIONS = 50; // Safety valve
-  /** @type {Array<{ turnIndex: number, request: string, tools: string[], conclusion: string }>} */
-  const droppedTurns = [];
-
-  // Progressive pruning loop: keep going until under hard limit
-  while (totalTokens > hardLimit && iterations < MAX_ITERATIONS) {
-    iterations++;
-    let savedThisRound = 0;
-
-    // Phase 1: Summarize tool results (archival → recent)
-    // Skip fresh turns — model needs those verbatim
-    for (let t = 0; t < turns.length; t++) {
-      const turn = turns[t];
-      const turnFromEnd = turns.length - 1 - t;
-      const tier = classifyTier(turnFromEnd);
-
-      if (tier === "fresh") continue;
-
-      const saved = summarizeTurn(messages, turn.start, turn.end, {
-        projectId,
-        turnIndex: turn.turnIndex,
-        cache: tier === "archival",
-      });
-
-      if (saved > 0) {
-        savedThisRound += saved;
-        totalSaved += saved;
-      }
-    }
-
-    if (savedThisRound > 0) {
-      actionsSummary.push(`summarized tools: -${savedThisRound} tokens`);
-      totalTokens = computeTotalTokens(messages, systemTokens);
-    }
-
-    // If still over limit after Phase 1, drop entire turns
-    if (totalTokens > hardLimit) {
-      // Refresh turn boundaries (they changed due to splicing)
-      turns = detectTurns(messages);
-
-      if (turnSelection && turnSelection.droppedTurnIndices?.length > 0) {
-        // NEW PATH: semantic turn selection — drop least relevant turns first
-        const result = dropIrrelevantTurns(messages, turns, turnSelection, projectId);
-        if (result.tokensSaved > 0) {
-          totalSaved += result.tokensSaved;
-          savedThisRound += result.tokensSaved;
-          actionsSummary.push(`semantic drop: ${result.droppedTurns.length} turns (-${result.tokensSaved}t)`);
-          droppedTurns.push(...result.droppedTurns);
-          totalTokens = computeTotalTokens(messages, systemTokens);
-        } else {
-          actionsSummary.push("semantic drop gave no savings — falling back to chronological");
-          // Fall through to chronological fallback
-          turns = detectTurns(messages);
-          const fallbackResult = dropOldestTurn(messages, turns, FRESH_DEPTH, projectId);
-          if (fallbackResult.tokensSaved > 0) {
-            totalSaved += fallbackResult.tokensSaved;
-            savedThisRound += fallbackResult.tokensSaved;
-            actionsSummary.push(`dropped turn ${fallbackResult.droppedTurn?.turnIndex}: -${fallbackResult.tokensSaved}t (fallback)`);
-            if (fallbackResult.droppedTurn) droppedTurns.push(fallbackResult.droppedTurn);
-            totalTokens = computeTotalTokens(messages, systemTokens);
-          } else {
-            actionsSummary.push("no more turns to drop — giving up");
-            break;
-          }
-        }
-      } else {
-        // CHRONOLOGICAL PATH: drop oldest turns (existing behavior)
-        const result = dropOldestTurn(messages, turns, FRESH_DEPTH, projectId);
-        if (result.tokensSaved > 0) {
-          totalSaved += result.tokensSaved;
-          savedThisRound += result.tokensSaved;
-          actionsSummary.push(`dropped turn ${result.droppedTurn?.turnIndex}: -${result.tokensSaved} tokens`);
-          if (result.droppedTurn) {
-            droppedTurns.push(result.droppedTurn);
-          }
-          totalTokens = computeTotalTokens(messages, systemTokens);
-        } else {
-          // Can't save any more — break to avoid infinite loop
-          actionsSummary.push("no more turns to drop — giving up");
-          break;
-        }
-      }
-    }
-
-    // If nothing saved this round, break to avoid infinite loop
-    if (savedThisRound === 0) {
-      actionsSummary.push("no savings possible — giving up");
-      break;
-    }
-  }
-
-  // Prune old cached turns on disk (keep last 10)
-  if (totalSaved > 0) {
-    try {
-      pruneOldTurns(projectId, 10);
-    } catch (err) {
-      console.warn(`[conversation-lifecycle] pruneOldTurns failed: ${err.message}`);
-    }
-  }
-
-  const finalTokens = computeTotalTokens(messages, systemTokens);
-  const underLimit = finalTokens <= hardLimit;
-
-  return {
-    action: totalSaved > 0 ? "pruned" : "none",
-    tokensSaved: totalSaved,
-    tokensBefore: totalTokens + totalSaved,
-    tokensAfter: finalTokens,
-    underLimit,
-    details: actionsSummary.join("; ") || "no pruning needed",
-    droppedTurns,
-  };
-}
-
-/**
  * Force-prune messages to fit within a given token budget.
- * More aggressive than manageConversation — drops turns first, summarizes second.
+ * Drops oldest turns first, summarizes tool results second.
  * Used as pre-flight guardrail before API calls.
  *
  * @param {Array} messages - mutated in place
@@ -619,33 +425,63 @@ export function forcePruneToBudget(messages, maxTokens, projectId = "unknown") {
 }
 
 /**
- * Restore full content for a specific turn's tool results.
- * Use this when the model references something from an earlier turn
- * and needs the raw data back.
+ * Apply V4 semantic turn selection to prune conversation by relevance.
  *
- * @param {Array} messages
- * @param {number} turnIndex
+ * The old system gated on a 4-char/token heuristic that systematically
+ * underestimated actual tokens, causing the 400 error. This function skips
+ * token estimation entirely: V4 relevance scores determine what to drop.
+ *
+ *   1. Drop V4-selected irrelevant turns (inserts summary markers, persists for semantic retrieval)
+ *   2. Summarize tool results for remaining non-fresh turns
+ *   3. Prune old cached turns on disk
+ *
+ * @param {Array} messages - mutated in place
+ * @param {import("./semantic-turn-selector.mjs").TurnSelection} turnSelection - from selectTurns()
  * @param {string} projectId
- * @returns {boolean} true if any content was restored
+ * @returns {{ action: string, tokensSaved: number, droppedTurns: Array }}
  */
-export function restoreTurnContent(messages, turnIndex, projectId) {
+export function applyV4TurnSelection(messages, turnSelection, projectId) {
+  if (!turnSelection || !turnSelection.droppedTurnIndices?.length) {
+    return { action: "none", tokensSaved: 0, droppedTurns: [] };
+  }
+
+  // Detect turn boundaries for this message set
   const turns = detectTurns(messages);
-  const turn = turns.find((t) => t.turnIndex === turnIndex);
-  if (!turn) return false;
 
-  let seq = 0;
-  let restored = false;
+  // Step 1: Drop V4-selected irrelevant turns
+  // This inserts summary markers, persists turn summaries for semantic retrieval
+  const dropResult = dropIrrelevantTurns(messages, turns, turnSelection, projectId);
 
-  for (let i = turn.start; i <= turn.end; i++) {
-    const msg = messages[i];
-    if (msg.role !== "tool") continue;
+  // Step 2: Summarize tool results for remaining non-fresh turns
+  // Fresh turns (sliding window) keep full raw content — model needs them verbatim
+  const refreshedTurns = detectTurns(messages);
+  let summarySaved = 0;
+  for (let t = 0; t < refreshedTurns.length; t++) {
+    const turn = refreshedTurns[t];
+    const turnFromEnd = refreshedTurns.length - 1 - t;
+    if (turnFromEnd < FRESH_DEPTH) continue; // keep fresh turns raw
 
-    const raw = restoreRaw(projectId, turnIndex, seq++);
-    if (raw && raw.content) {
-      msg.content = raw.content;
-      restored = true;
+    summarySaved += summarizeTurn(messages, turn.start, turn.end, {
+      projectId,
+      turnIndex: turn.turnIndex,
+      cache: true, // cache archival-sized tool results to disk
+    });
+  }
+
+  // Prune old cached turns on disk (keep last 10)
+  if (dropResult.tokensSaved > 0 || summarySaved > 0) {
+    try {
+      pruneOldTurns(projectId, 10);
+    } catch (err) {
+      console.warn(`[conversation-lifecycle] pruneOldTurns failed: ${err.message}`);
     }
   }
 
-  return restored;
+  const totalSaved = dropResult.tokensSaved + summarySaved;
+
+  return {
+    action: totalSaved > 0 ? "v4_pruned" : "none",
+    tokensSaved: totalSaved,
+    droppedTurns: dropResult.droppedTurns,
+  };
 }

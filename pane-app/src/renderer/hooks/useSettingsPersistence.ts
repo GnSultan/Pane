@@ -53,11 +53,14 @@ interface PersistedConversation {
 
 // --- Delta tracking for conversation persistence ---
 //
-// Tracks the last persisted message ID per project so we only send new/modified
-// messages over IPC, instead of the entire conversation array every time.
+// Tracks the last persisted message array index per project so we only send
+// new/modified messages over IPC, instead of the entire conversation array
+// every time. Uses array index instead of message ID — avoids O(n) findIndex
+// scan and the fallback-to-full-array bug when context window trims messages
+// from the front (the index is adjusted naturally by array length changes).
 // Combined with debouncing, this eliminates main-process event loop blocking
 // that causes 15-second UI freezes in deep sessions.
-const lastPersistedMessageId = new Map<string, string | null>();
+const lastPersistedMessageIndex = new Map<string, number>();
 const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const DEBOUNCE_MS = 500;
 
@@ -72,12 +75,12 @@ async function saveConversation(
 /**
  * Save only messages that have changed since the last persist.
  *
- * Computes a delta by finding the last persisted message in the current array
- * and sending everything from that point forward (inclusive — re-saves the
- * last known message to cover in-place streaming updates).
+ * Tracks the array INDEX of the last persisted message. Starts from that
+ * index (inclusive) on the next save to cover in-place streaming updates.
  *
- * If the last persisted ID is not found (messages were trimmed by context
- * window management), falls back to sending the entire array.
+ * If the array was trimmed from the front (context window management) and
+ * the saved index is now >= messages.length, falls back to 0. This is rare
+ * — only happens once per context window edge, not on every save cycle.
  */
 function saveConversationDelta(projectId: string): void {
   const ps = useProjectsStore.getState();
@@ -85,20 +88,12 @@ function saveConversationDelta(projectId: string): void {
   if (!p) return;
 
   const messages = p.conversation.messages;
-  const lastId = lastPersistedMessageId.get(projectId) ?? null;
+  const lastIdx = lastPersistedMessageIndex.get(projectId) ?? -1;
 
-  // Find where to start the delta slice
-  let sliceStart = 0;
-  if (lastId) {
-    const idx = messages.findIndex((m) => m.id === lastId);
-    if (idx !== -1) {
-      // Start from the last persisted message (inclusive) to cover in-place
-      // streaming updates to the assistant message.
-      sliceStart = idx;
-    }
-    // If idx === -1, messages were trimmed from the front — send everything.
-  }
-
+  // Start from the last persisted index (inclusive) to cover in-place
+  // streaming updates. If index is out of range (trimming happened),
+  // start from the beginning of the current array.
+  const sliceStart = (lastIdx >= 0 && lastIdx < messages.length) ? lastIdx : 0;
   const delta = messages.slice(sliceStart);
   if (delta.length === 0) return;
 
@@ -108,10 +103,8 @@ function saveConversationDelta(projectId: string): void {
     startIndex: p.conversation.historyStartIndex,
   })
     .then(() => {
-      const last = delta[delta.length - 1];
-      if (last?.id) {
-        lastPersistedMessageId.set(projectId, last.id);
-      }
+      // Store the array index of the last message in this delta
+      lastPersistedMessageIndex.set(projectId, sliceStart + delta.length - 1);
     })
     .catch(() => {});
 }
