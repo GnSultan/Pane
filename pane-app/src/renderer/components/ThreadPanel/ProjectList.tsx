@@ -19,9 +19,32 @@ function formatRelativeTime(epochMs: number): string {
   });
 }
 
+/** Slow three-dot processing indicator — replaces the timestamp when a model is running. */
+function ProcessingDots() {
+  return (
+    <span
+      className="inline-flex items-center gap-[3px]"
+      style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
+    >
+      <span className="processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40" />
+      <span
+        className="processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40"
+        style={{ animationDelay: "0.4s" }}
+      />
+      <span
+        className="processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40"
+        style={{ animationDelay: "0.8s" }}
+      />
+    </span>
+  );
+}
+
 /** Active thread row — same as before with the addition of an archive icon. */
 function ProjectRow({ id }: { id: string }) {
   const name = useProjectsStore((s) => s.projects.get(id)?.name ?? "");
+  const isProcessing = useProjectsStore(
+    (s) => s.projects.get(id)?.conversation.isProcessing ?? false,
+  );
   const hasUnread = useProjectsStore(
     (s) => s.projects.get(id)?.hasUnreadCompletion ?? false,
   );
@@ -158,7 +181,8 @@ function ProjectRow({ id }: { id: string }) {
         )}
 
         <div className="flex items-center gap-1.5 shrink-0 ml-2">
-          {hasActivity && !editing && (
+          {!editing && isProcessing && <ProcessingDots />}
+          {hasActivity && !editing && !isProcessing && (
             <span
               className="text-pane-text-secondary/40 whitespace-nowrap"
               style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
@@ -255,6 +279,24 @@ function ArchivedRow({ id }: { id: string }) {
 }
 
 export function ProjectList() {
+  return (
+    <>
+      {/* @keyframes for the processing dot animation — defined once per mount */}
+      <style>{`
+        .processing-dot {
+          animation: pane-dot-pulse 2.4s ease-in-out infinite;
+        }
+        @keyframes pane-dot-pulse {
+          0%, 60%, 100% { opacity: 0.2; }
+          30% { opacity: 0.9; }
+        }
+      `}</style>
+      <ProjectListInner />
+    </>
+  );
+}
+
+function ProjectListInner() {
   const sortedOrder = useProjectsStore(
     useShallow((s) => {
       const order = s.projectOrder;
