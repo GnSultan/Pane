@@ -39,7 +39,7 @@ const MemoizedMessage = memo(
     projectId: string;
   }) {
     return (
-      <div style={{ contentVisibility: "auto", containIntrinsicSize: "auto 120px" }}>
+      <div>
         <MessageBubble
           message={message}
           toolResults={toolResults}
