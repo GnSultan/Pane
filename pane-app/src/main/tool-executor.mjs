@@ -39,13 +39,16 @@ let _cmdWorker = null;
  */
 export function setCmdWorker(worker) {
   _cmdWorker = worker;
+  if (_cmdWorker && typeof _cmdWorker.setMaxListeners === 'function') {
+    _cmdWorker.setMaxListeners(100);
+  }
 }
 
 /**
  * Execute a command through the cmd-worker utility process.
  * Returns a promise that resolves with { success, stdout, stderr, exitCode }.
  */
-function execThroughWorker(command, options = {}) {
+export function execThroughWorker(command, options = {}) {
   return new Promise((resolve) => {
     if (!_cmdWorker || _cmdWorker.killed) {
       resolve({ success: false, stdout: "", stderr: "", exitCode: -1, errorMessage: "cmd-worker not available" });

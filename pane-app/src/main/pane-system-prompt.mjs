@@ -94,16 +94,17 @@ export const MODEL_CONTEXT_LIMITS = {
   "gemini-3": 2000000,
   "gemini-2": 1000000,
   "gemini-1.5": 1000000,
-  "deepseek-v3": 128000,
-  "deepseek-chat": 128000,
-  "deepseek-reasoner": 128000,
+  "deepseek-v3": 1000000,
+  "deepseek-chat": 1000000,
+  "deepseek-reasoner": 1000000,
+  "deepseek/deepseek-v4-flash": 1000000,
   qwen3: 262144,
   "moonshot": 128000,
   openrouter: 128000,
   // Specific OpenRouter model context windows
   "anthropic/claude-3.5-sonnet": 200000,
-  "deepseek/deepseek-r1": 128000,
-  "deepseek/deepseek-chat": 128000,
+  "deepseek/deepseek-r1": 1000000,
+  "deepseek/deepseek-chat": 1000000,
   "qwen/qwen3-coder": 262144,
   "qwen/qwen3-coder:free": 262144,
   // Native StepFun model IDs (direct API, not via OpenRouter)
@@ -190,7 +191,7 @@ export function getContextLimit(model) {
   if (lower.includes("openrouter")) return MODEL_CONTEXT_LIMITS["openrouter"] ?? 200000;
   if (lower.includes("anthropic")) return MODEL_CONTEXT_LIMITS["sonnet"] ?? 200000;
   if (lower.includes("gemini")) return MODEL_CONTEXT_LIMITS["gemini-1.5"] ?? 200000;
-  if (lower.includes("deepseek")) return MODEL_CONTEXT_LIMITS["deepseek-chat"] ?? 200000;
+  if (lower.includes("deepseek")) return 1000000;
 
   return 200000; // Final fallback
 }

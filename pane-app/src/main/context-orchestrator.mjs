@@ -11,8 +11,10 @@
  * higher = optional). When the budget is tight, lower-priority layers are
  * truncated or dropped entirely.
  *
- * Token estimation: ~4 chars per token (same heuristic as session-turns.mjs).
- * Not exact, but consistent and fast — no external dependencies.
+ * Token estimation: structure-aware heuristic from token-budget.mjs.
+ * Classifies content by type (prose, code, JSON, markdown) and uses
+ * calibrated char/token ratios per type. Much more accurate than flat-4.
+ * Cross-validated periodically by token-calibration.mjs.
  *
  * Usage:
  *   import { orchestrateContext } from "./context-orchestrator.mjs";
@@ -29,7 +31,7 @@ import path from "node:path";
 import os from "node:os";
 import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs";
 import { MODEL_CONTEXT_LIMITS, readState, mergeState } from "./pane-system-prompt.mjs";
-import { estimateTokens, getModelLimit, getDefaultOutputBudget, createRequestBudget, CACHE_TIERS } from "./token-budget.mjs";
+import { estimateTokens, getModelLimit, getDefaultOutputBudget, createRequestBudget, CACHE_TIERS, TOKEN_ESTIMATE_SAFETY } from "./token-budget.mjs";
 import { saveContextCheckpoint } from "./context-checkpoints.mjs";
 import { contextStore } from "./context-store.mjs";
 import { readVerdict, formatVerdictForContext, formatQualityStatsForContext, formatGuidanceForContext } from "./code-arbiter.mjs";
@@ -1049,13 +1051,19 @@ export function orchestrateContext(projectId, options = {}) {
   const contextLimit = getModelLimit(model);
   const effectiveOutputBudget = outputBudget || getDefaultOutputBudget(model);
 
-  // Create a request budget tracker for diagnostics
-  const requestBudget = createRequestBudget(model, conversationTokens);
+  // Apply safety factor to conversation tokens: the 4-char heuristic
+  // underestimates actual tokens by ~1.8x for code-heavy Pane conversations.
+  // Budgeting against the raw estimate would allow the system prompt to fill
+  // space that actual tokens would overrun, causing context window overflow.
+  const adjustedConvTokens = Math.round(conversationTokens * TOKEN_ESTIMATE_SAFETY);
 
-  // Reserve space for conversation history + output
+  // Create a request budget tracker for diagnostics
+  const requestBudget = createRequestBudget(model, adjustedConvTokens);
+
+  // Reserve space for conversation history (safety-adjusted) + output
   const systemBudget = Math.max(
     4000, // absolute minimum — core instructions alone
-    contextLimit - conversationTokens - effectiveOutputBudget
+    contextLimit - adjustedConvTokens - effectiveOutputBudget
   );
 
   // Build all layers — pass lastInjected for delta-aware assembly on turn 2+
@@ -1124,7 +1132,10 @@ export function orchestrateContext(projectId, options = {}) {
       // Critical/high layers get truncated rather than dropped
       const remainingTokens = systemBudget - usedTokens;
       if (remainingTokens > 200) { // only truncate if meaningful space remains
-        const maxChars = remainingTokens * CHARS_PER_TOKEN;
+        // Approximate: use conservative 4 chars/token for truncation boundaries.
+        // Precision here doesn't matter — it's a rough chop to keep some content.
+        const TRUNCATION_RATIO = 4;
+        const maxChars = remainingTokens * TRUNCATION_RATIO;
         const truncated = layer.text.slice(0, maxChars);
         const lastNewline = truncated.lastIndexOf("\n");
         layer.text = (lastNewline > maxChars * 0.5 ? truncated.slice(0, lastNewline) : truncated) + "\n[...truncated — budget limit]";

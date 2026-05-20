@@ -210,10 +210,14 @@ export const Conversation = memo(function Conversation({
     return () => window.removeEventListener("pane:context-refreshed", handler);
   }, [projectId]);
 
-  // Error toast — persists until dismissed or cleared
+  // Error toast — auto-dismisses after 15s, or manual dismiss via × or click
   const [visibleError, setVisibleError] = useState<string | null>(null);
   useEffect(() => {
-    if (error) setVisibleError(error);
+    if (error) {
+      setVisibleError(error);
+      const timer = setTimeout(() => setVisibleError(null), 15000);
+      return () => clearTimeout(timer);
+    }
   }, [error]);
 
   // Wheel listener: disengage follow on scroll up, re-engage on scroll down to bottom.
@@ -348,25 +352,25 @@ export const Conversation = memo(function Conversation({
         </div>
       )}
 
-      <div className="relative z-10 shrink-0 flex flex-col">
-        {visibleError && (
-          <div className="px-4 pb-2">
-            <div className="flex items-start gap-3 font-mono text-[11px] text-pane-error bg-pane-bg ring-1 ring-pane-error/25 px-4 py-3 rounded-xl animate-fade-in leading-[1.6]">
-              <span
-                className="flex-1 overflow-y-auto max-h-[100px]"
-                style={{ overflowWrap: "anywhere" }}
-              >
-                {visibleError}
-              </span>
-              <button
-                onClick={() => setVisibleError(null)}
-                className="shrink-0 text-pane-error hover:text-pane-error/60 transition-colors text-base leading-none mt-0.5"
-              >
-                ×
-              </button>
-            </div>
+      {visibleError && (
+        <div className="absolute bottom-0 left-0 right-0 z-40 px-4 pb-4 pointer-events-none">
+          <div className="pointer-events-auto flex items-start gap-3 font-mono text-[11px] text-pane-error bg-pane-error-bg ring-1 ring-pane-error-border px-4 py-3 rounded-md animate-fade-in leading-[1.6]">
+            <span
+              className="flex-1 overflow-y-auto max-h-[100px] select-text"
+              style={{ overflowWrap: "anywhere" }}
+            >
+              {visibleError}
+            </span>
+            <button
+              onClick={() => setVisibleError(null)}
+              className="shrink-0 w-5 h-5 flex items-center justify-center text-pane-error hover:text-pane-error/60 transition-colors text-sm rounded"
+            >
+              ×
+            </button>
           </div>
-        )}
+        </div>
+      )}
+      <div className="relative z-10 shrink-0 flex flex-col">
         <InputBar
           projectId={projectId}
           onSend={handleSend}

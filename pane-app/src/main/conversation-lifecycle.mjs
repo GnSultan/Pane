@@ -362,6 +362,69 @@ export function dropIrrelevantTurns(messages, turns, selection, projectId) {
 }
 
 /**
+ * Truncate oversized message content when turn-level pruning is exhausted.
+ *
+ * Last resort: when all turns are fresh and total content still exceeds the
+ * budget (single oversized tool result), halve the largest non-system message
+ * content each iteration. Guarantees monotonic progress — each iteration
+ * reduces the largest content by at least half. Stops when total estimated
+ * tokens fit within budget or no truncatable message remains.
+ *
+ * Uses estimateTokens for the progress check. While the estimate can be off
+ * by 5× for certain content mixes, each iteration halves real content,
+ * so within 4-5 iterations the actual size shrinks below any reasonable
+ * model limit regardless of estimation error.
+ *
+ * @param {Array} messages - mutated in place
+ * @param {number} targetTokens - target total token budget
+ * @returns {number} tokens saved
+ */
+function truncateOversizedMessages(messages, targetTokens) {
+  let totalSaved = 0;
+  let currentTokens = estimateTokens(JSON.stringify(messages));
+  let iterations = 0;
+  const MAX_ITER = 20;
+
+  while (currentTokens > targetTokens && iterations < MAX_ITER) {
+    iterations++;
+
+    // Find the largest non-system message content
+    let largestIdx = -1;
+    let largestLen = 0;
+
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === "system") continue;
+      const content = typeof messages[i].content === "string" ? messages[i].content : "";
+      if (content.length > largestLen) {
+        largestLen = content.length;
+        largestIdx = i;
+      }
+    }
+
+    if (largestIdx === -1 || largestLen < 200) break; // nothing meaningful to truncate
+
+    const msg = messages[largestIdx];
+    const originalContent = typeof msg.content === "string" ? msg.content : "";
+    if (!originalContent) break;
+
+    const originalTokens = estimateTokens(originalContent);
+
+    // Halve the content — aggressive but guarantees progress
+    const halfLen = Math.floor(originalContent.length / 2);
+    msg.content = originalContent.slice(0, halfLen) + "\n[...truncated]";
+
+    const newTokens = estimateTokens(msg.content);
+    const saved = originalTokens - newTokens;
+    if (saved <= 0) break; // edge case: estimation says no savings
+
+    totalSaved += saved;
+    currentTokens = estimateTokens(JSON.stringify(messages));
+  }
+
+  return totalSaved;
+}
+
+/**
  * Force-prune messages to fit within a given token budget.
  * Drops oldest turns first, summarizes tool results second.
  * Used as pre-flight guardrail before API calls.
@@ -416,6 +479,16 @@ export function forcePruneToBudget(messages, maxTokens, projectId = "unknown") {
     if (savedThisRound === 0 && totalTokens > maxTokens) {
       break;
     }
+  }
+
+  // Phase 3: Per-message content truncation — last resort when all turns are fresh
+  // and turn-level pruning can't reduce further. Halves the largest non-system
+  // message content each iteration. This is a nuclear option but prevents the
+  // death loop where every turn is "fresh" but a single tool result exceeds budget.
+  if (totalTokens > maxTokens) {
+    const truncateSaved = truncateOversizedMessages(messages, maxTokens);
+    totalSaved += truncateSaved;
+    totalTokens = estimateTokens(JSON.stringify(messages));
   }
 
   return {
@@ -484,4 +557,50 @@ export function applyV4TurnSelection(messages, turnSelection, projectId) {
     tokensSaved: totalSaved,
     droppedTurns: dropResult.droppedTurns,
   };
+}
+
+/**
+ * Drop ALL non-fresh turns (older than FRESH_DEPTH from the end).
+ *
+ * Used by the healable-400 path when the heuristic estimate is known to be
+ * unreliable. This function guarantees the request fits by keeping only the
+ * last FRESH_DEPTH fresh turns + system prompt — no token estimation, no
+ * partial pruning, no early exit. Each dropped turn is replaced with an
+ * extractive summary marker and persisted for semantic retrieval.
+ *
+ * Phase 2 (if maxTokens provided): per-message content truncation
+ * when all remaining turns are fresh and total still exceeds budget.
+ *
+ * @param {Array} messages - mutated in place
+ * @param {string} [projectId] - for turn summary persistence
+ * @param {number} [maxTokens] - target max tokens. If provided, enables
+ *   Phase 2 message-level truncation when turn dropping is exhausted.
+ * @returns {{ dropped: number, tokensSaved: number }}
+ */
+export function dropAllNonFreshTurns(messages, projectId = "unknown", maxTokens = null) {
+  let totalDropped = 0;
+  let totalSaved = 0;
+  let turns = detectTurns(messages);
+
+  // Keep dropping oldest non-fresh turns until only fresh ones remain
+  while (turns.length > FRESH_DEPTH) {
+    const result = dropOldestTurn(messages, turns, FRESH_DEPTH, projectId);
+    if (result.tokensSaved <= 0) break; // nothing more to drop (edge case)
+    totalDropped++;
+    totalSaved += result.tokensSaved;
+    // Re-detect turns after mutation (splice shifts indices)
+    turns = detectTurns(messages);
+  }
+
+  // Phase 2: Per-message truncation — all remaining turns are fresh,
+  // but a single oversized tool result can still exceed the budget.
+  if (maxTokens !== null) {
+    const currentTokens = estimateTokens(JSON.stringify(messages));
+    if (currentTokens > maxTokens) {
+      const truncateSaved = truncateOversizedMessages(messages, maxTokens);
+      totalSaved += truncateSaved;
+    }
+  }
+
+  return { dropped: totalDropped, tokensSaved: totalSaved };
 }

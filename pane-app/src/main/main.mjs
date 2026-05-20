@@ -60,7 +60,7 @@ import { updateLastPrompt, updateLastResponse, readThreadState } from "./thread-
 import { contextStore } from "./context-store.mjs";
 import { getPaneDb, extractMessageText } from "./pane-db.mjs";
 import { loadRecentTurns } from "./session-turns.mjs";
-import { setCmdWorker } from "./tool-executor.mjs";
+import { setCmdWorker, execThroughWorker } from "./tool-executor.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -84,10 +84,11 @@ async function registerClaudeHandlers() {
           return;
         }
         const usage = event.data;
+        const effectiveProjectId = projectId || event.data?.project_id || "unknown";
         const id = `tu-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
         db.stmts.insertTokenUsage.run(
           id,
-          projectId,
+          effectiveProjectId,
           usage.provider,
           usage.activity_type,
           usage.model,
@@ -176,17 +177,16 @@ async function registerClaudeHandlers() {
     }
   });
 }
-// Truly async child_process.execFile — does NOT block the main process.
-// FD repair at the top of this file handles the EBADF issue that previously
-// forced us to use execFileSync. Each IPC handler already awaits this, and
-// libuv schedules the callback on the next event loop tick.
 function execFileAsync(cmd, args, options = {}) {
+  return _execFileViaWorker(cmd, args, options).catch(() =>
+    _execFileDirect(cmd, args, options)
+  );
+}
+
+function _execFileDirect(cmd, args, options = {}) {
   return new Promise((resolve, reject) => {
-    // Default to getEnvWithPath() so all child processes inherit the enhanced PATH
-    // that includes /opt/homebrew/bin, /usr/local/bin, etc. — without this, git
-    // and other Homebrew tools are invisible to Electron when launched from the
-    // app bundle (which strips PATH to /usr/bin:/bin:/usr/sbin:/sbin).
-    execFile(cmd, args, { encoding: "utf-8", env: getEnvWithPath(), ...options }, (error, stdout, stderr) => {
+    const execOpts = { encoding: "utf-8", env: getEnvWithPath(), ...options };
+    execFile(cmd, args, execOpts, (error, stdout, stderr) => {
       if (error) {
         const wrapped = new Error(error.message);
         wrapped.stdout = stdout || "";
@@ -201,6 +201,31 @@ function execFileAsync(cmd, args, options = {}) {
       }
     });
   });
+}
+
+async function _execFileViaWorker(cmd, args, options = {}) {
+  // Build a shell-safe command string from cmd + args
+  const commandStr = [cmd, ...args.map(a =>
+    a.includes(" ") ? `'${a.replace(/'/g, "'\\''")}'` : a,
+  )].join(" ");
+
+  const result = await execThroughWorker(commandStr, {
+    cwd: options.cwd,
+    env: options.env || getEnvWithPath(),
+    // execThroughWorker timeout is in seconds; execFile uses ms
+    timeout: Math.ceil((options.timeout || 30000) / 1000),
+  });
+
+  if (!result.success) {
+    const error = new Error(result.errorMessage || `Command failed: ${commandStr}`);
+    error.stdout = result.stdout || "";
+    error.stderr = result.stderr || "";
+    error.code = result.exitCode != null ? result.exitCode : -1;
+    error.status = result.exitCode;
+    throw error;
+  }
+
+  return { stdout: result.stdout || "", stderr: result.stderr || "" };
 }
 
 // Build a PATH that includes common tool locations Electron strips out

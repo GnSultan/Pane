@@ -879,6 +879,7 @@ async function _recyclePipeline() {
     console.warn(`[brain] Pipeline recycle failed: ${err.message}`);
     // If recycle fails, mark embedder as not ready — next call will recreate
     embedderReady = false;
+    embedderLoading = false; // Clear loading flag so lazy-init retries immediately
     _embedPipeline = null;
     _embedderLoadPromise = null; // Reset so embed() triggers a fresh lazy load
     // Try to reload after a delay

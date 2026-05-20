@@ -20,7 +20,7 @@ import {
   readHandoff,
 } from "./pane-system-prompt.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
-import { estimateConversationTokens, estimateTokens, getModelLimit, getDefaultOutputBudget } from "./token-budget.mjs";
+import { estimateConversationTokens, estimateTokens, getModelLimit, getDefaultOutputBudget, TOKEN_ESTIMATE_SAFETY } from "./token-budget.mjs";
 import {
   extractWithLLM,
   countHighConfidence,
@@ -29,7 +29,7 @@ import {
 
 import { calculateCost } from "./pricing.mjs";
 import { storeRaw } from "./tool-result-cache.mjs";
-import { forcePruneToBudget, applyV4TurnSelection } from "./conversation-lifecycle.mjs";
+import { forcePruneToBudget, applyV4TurnSelection, dropAllNonFreshTurns } from "./conversation-lifecycle.mjs";
 import { contextStore } from "./context-store.mjs";
 import { scoreTurnsByRelevance, selectTurns, base64ToFloat32Array } from "./semantic-turn-selector.mjs";
 import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
@@ -41,12 +41,6 @@ import {
 } from "./session-journal.mjs";
 import { createDigest, updateDigest } from "./context-digest.mjs";
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
-
-// Safety factor for token estimation — the 4-char/token heuristic systematically
-// underestimates actual model token counts for code-heavy content (tool results,
-// JSON structures, file reads common in Pane conversations). A 1.8x multiplier
-// ensures the pre-flight guardrail catches cases the heuristic misses.
-const TOKEN_ESTIMATE_SAFETY = 1.8;
 
 // ============================================================================
 // Context Window Manager — Pane-owned conversation lifecycle
@@ -2421,41 +2415,37 @@ export class ApiBackend extends PunkBackend {
 
           while (true) {
             try {
-              // ── Pre-flight guardrail: context window overflow prevention ──
-              // Catches cases where token estimation was off or the conversation
-              // grew between pruning and sending. Checks the actual body messages
-              // against the model's hard limit minus output/tools overhead.
+              // ── Pre-flight guardrail: last-resort context overflow check ──
+              // V4's context orchestrator now budgets with TOKEN_ESTIMATE_SAFETY
+              // baked in, so this should never fire. It exists as a tight assertion
+              // catching bugs or unexpected edge cases (new provider, new body format)
+              // where V4's budget didn't account for something.
               const sourceBody = finalBody || body;
               if (sourceBody.messages?.length > 0) {
                 const modelLimit = request.model ? getModelLimit(request.model) : 128000;
                 const outputBudget = getDefaultOutputBudget(request.model);
-                const overheadBudget = 5000; // tools definitions + [Pane context] + formatting
+                const overheadBudget = 5000;
                 const maxMessagesTokens = modelLimit - outputBudget - overheadBudget;
-                const currentMsgTokens = Math.round(estimateTokens(JSON.stringify(sourceBody.messages)) * TOKEN_ESTIMATE_SAFETY);
+                let msgEstimateTokens = estimateTokens(JSON.stringify(sourceBody.messages));
+                if (sourceBody.system) {
+                  const systemStr = typeof sourceBody.system === "string"
+                    ? sourceBody.system
+                    : JSON.stringify(sourceBody.system);
+                  msgEstimateTokens += estimateTokens(systemStr);
+                }
+                const currentMsgTokens = Math.round(msgEstimateTokens * TOKEN_ESTIMATE_SAFETY);
                 if (currentMsgTokens > maxMessagesTokens) {
                   console.warn(
-                    `[http] Pre-flight guardrail: ~${currentMsgTokens} msg tokens (${TOKEN_ESTIMATE_SAFETY}x safety) exceeds ${maxMessagesTokens} budget (model: ${modelLimit}, output: ${outputBudget}). Force-pruning...`
+                    `[http] GUARDRAIL FIRED: ~${currentMsgTokens} total tokens (${TOKEN_ESTIMATE_SAFETY}x safety) exceeds ${maxMessagesTokens} budget. V4 should have prevented this. Force-pruning...`
                   );
-                  const result = forcePruneToBudget(
-                    sourceBody.messages,
-                    maxMessagesTokens,
-                    request.projectId,
-                  );
-                  console.log(
-                    `[http] Pre-flight force-prune: saved ${result.tokensSaved} tokens, ${result.messagesRemaining} messages remaining`
-                  );
-                  // If finalBody is separate from body, sync prune back to body
-                  // so retry logic works on the original reference
+                  const pruneTarget = Math.floor(maxMessagesTokens / TOKEN_ESTIMATE_SAFETY);
+                  const result = forcePruneToBudget(sourceBody.messages, pruneTarget, request.projectId);
+                  console.log(`[http] Guardrail force-prune: saved ${result.tokensSaved} tokens`);
                   if (finalBody && finalBody !== body && finalBody.messages) {
                     body.messages = finalBody.messages;
                   }
                   this.onEvent(request.projectId, {
-                    event: "window_managed",
-                    data: {
-                      action: "force-prune",
-                      tokensSaved: result.tokensSaved,
-                      messagesRemaining: result.messagesRemaining,
-                    },
+                    event: "window_managed", data: { action: "guardrail-force-prune", tokensSaved: result.tokensSaved }
                   }, request.requestId);
                 }
               }
@@ -2562,20 +2552,43 @@ export class ApiBackend extends PunkBackend {
                         },
                         request.requestId,
                       );
-                      // Force-prune the actual source body messages aggressively.
-                      // Use a tighter budget target (divided by safety factor) so that
-                      // even with the 4-char/token heuristic underestimating actual tokens,
-                      // we leave headroom. The heuristic says we're at target/1.8, but
-                      // actual tokens will be at approximately the target.
-                      const modelLimit = request.model ? getModelLimit(request.model) : 128000;
-                      const outputBudget = getDefaultOutputBudget(request.model);
-                      const maxMessagesTokens = modelLimit - outputBudget - 5000;
-                      const targetBudget = Math.floor(maxMessagesTokens / TOKEN_ESTIMATE_SAFETY);
-                      forcePruneToBudget(
+                      // Drop ALL non-fresh turns — no heuristic estimation.
+                      // The structure-aware heuristic can be off by 5× or more for
+                      // certain content mixes (dense JSON tool results, CJK text, etc.),
+                      // which causes forcePruneToBudget to exit early thinking it's
+                      // under budget. This function drops by position alone, guaranteeing
+                      // only the last FRESH_DEPTH (5) turns + system prompt remain.
+                      // If all turns are already fresh (≤ 5) and a single tool result
+                      // exceeds budget, pass maxTokens for Phase 2 message truncation.
+                      const healModelLimit = request.model ? getModelLimit(request.model) : 128000;
+                      const healOutputBudget = getDefaultOutputBudget(request.model);
+                      const healOverheadBudget = 5000;
+                      const healMaxMsgTokens = healModelLimit - healOutputBudget - healOverheadBudget;
+                      const healResult = dropAllNonFreshTurns(
                         sourceBody.messages,
-                        targetBudget,
                         request.projectId,
+                        healMaxMsgTokens,
                       );
+                      console.log(
+                        `[http] Context-heal: dropped ${healResult.dropped} non-fresh turns (saved ~${healResult.tokensSaved} estimated tokens)`
+                      );
+
+                      // Also handle system prompt overflow for Anthropic: if the system
+                      // field exists and is too large, truncate highest-priority-last
+                      // blocks (turn tier) until it fits in a reasonable budget.
+                      if (sourceBody.system && Array.isArray(sourceBody.system)) {
+                        const systemBudget = 80000; // generous: 80K tokens max for system
+                        let sysEstimate = estimateTokens(JSON.stringify(sourceBody.system));
+                        while (sysEstimate > systemBudget && sourceBody.system.length > 1) {
+                          // Drop the last (turn) block — it's the lowest priority, changes every turn
+                          sourceBody.system.pop();
+                          sysEstimate = estimateTokens(JSON.stringify(sourceBody.system));
+                        }
+                        console.log(
+                          `[http] Context-heal pruned system prompt to ${sourceBody.system.length} blocks (estimated ${sysEstimate} tokens)`
+                        );
+                      }
+
                       // Sync back to body.messages so retry uses the pruned state
                       if (finalBody && finalBody !== body && Array.isArray(finalBody.messages)) {
                         body.messages = finalBody.messages;
