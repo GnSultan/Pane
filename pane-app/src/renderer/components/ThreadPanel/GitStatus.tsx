@@ -394,7 +394,7 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
           </span>
         ) : fileCount > 0 && !loading ? (
           <span
-            className="ml-auto font-mono text-pane-text-secondary/20"
+            className="ml-auto font-mono text-pane-text"
             style={{ fontSize: "10px" }}
           >
             {fileCount} {fileCount === 1 ? "change" : "changes"}
