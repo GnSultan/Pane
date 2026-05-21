@@ -20,7 +20,7 @@ import {
   readHandoff,
 } from "./pane-system-prompt.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
-import { estimateConversationTokens, estimateTokens, getModelLimit, getDefaultOutputBudget, TOKEN_ESTIMATE_SAFETY } from "./token-budget.mjs";
+import { estimateConversationTokens, estimateTokens, getModelLimit, getDefaultOutputBudget, TOKEN_ESTIMATE_SAFETY, SLIDING_WINDOW_SIZE } from "./token-budget.mjs";
 import {
   extractWithLLM,
   countHighConfidence,
@@ -28,7 +28,7 @@ import {
 } from "./extraction-tuning.mjs";
 
 import { calculateCost } from "./pricing.mjs";
-import { storeRaw } from "./tool-result-cache.mjs";
+import { buildSummary, toolResultCache } from "./tool-result-cache.mjs";
 import { forcePruneToBudget, applyV4TurnSelection, dropAllNonFreshTurns } from "./conversation-lifecycle.mjs";
 import { contextStore } from "./context-store.mjs";
 import { scoreTurnsByRelevance, selectTurns, base64ToFloat32Array } from "./semantic-turn-selector.mjs";
@@ -1549,7 +1549,7 @@ export class ApiBackend extends PunkBackend {
     return true;
   }
 
-  normalizeMessages(messages, provider, model = null) {
+  normalizeMessages(messages, provider, model = null, context = null) {
     const isAnthropic = provider === "anthropic";
     const isGemini = provider === "gemini";
     const isDeepSeek =
@@ -1574,6 +1574,43 @@ export class ApiBackend extends PunkBackend {
         model?.includes("r1") ||
         model?.includes("prover") || // deepseek-prover-v2 is math-only, no tool support
         model?.includes("thinking"));
+
+    // ── _resultRef resolution ──────────────────────────────────────────────
+    // Messages from the backend's messages[] array have _resultRef pointers
+    // instead of full tool result content. For fresh turns (within freshDepth
+    // of the current turn), resolve the pointer from ToolResultStore so the
+    // model sees the full content. Non-fresh turns use the summary already in
+    // msg.content, keeping memory bounded.
+    //
+    // context = { projectId, currentTurn, freshDepth }
+    //   freshDepth: turns within this distance from currentTurn are "fresh"
+    //   currentTurn: the current turn number in the spawn loop (1-indexed)
+    const resolveResultRef = (msg) => {
+      if (!msg._resultRef || !context) return msg;
+      const { projectId, currentTurn, freshDepth } = context;
+      if (!projectId || freshDepth == null) return msg;
+      const msgTurn = msg._resultRef.turn;
+      const turnFromEnd = currentTurn - msgTurn;
+      if (turnFromEnd <= freshDepth && turnFromEnd >= 0) {
+        try {
+          const resolved = toolResultCache.resolve(
+            projectId,
+            msgTurn,
+            msg._resultRef.seq,
+          );
+          if (resolved) {
+            const copy = { ...msg };
+            copy.content = resolved;
+            delete copy._resultRef;
+            delete copy._contentLength;
+            return copy;
+          }
+        } catch {
+          // Non-fatal — summary is sufficient for the API
+        }
+      }
+      return msg;
+    };
 
     const preFiltered = [];
     // COLLAPSE CONSECUTIVE USER MESSAGES (Retry inflation fix)
@@ -1753,7 +1790,7 @@ export class ApiBackend extends PunkBackend {
         if (isReasoner) continue;
         const results = [];
         if (role === "tool" && !Array.isArray(content)) {
-          results.push(msg);
+          results.push(resolveResultRef(msg));
         } else if (Array.isArray(content)) {
           content.forEach((c) => {
             if (c.type === "tool_result") {
@@ -1785,7 +1822,9 @@ export class ApiBackend extends PunkBackend {
             }
           }
         } else {
-          normalized.push(msg);
+          // Non-OpenAI (Anthropic, Gemini): resolve _resultRef before
+          // passing through — these providers don't support the envelope format
+          normalized.push(resolveResultRef(msg));
         }
         continue;
       }
@@ -2272,10 +2311,29 @@ export class ApiBackend extends PunkBackend {
             resolveMaxTokens(resolvedModel);
 
           // Phase 1: Normalize — convert frontend message format to API format
+          // Pass freshness context for _resultRef resolution: fresh turns get
+          // their full tool content inlined from ToolResultStore; non-fresh
+          // turns retain the summary that's already in the envelope.
+          //
+          // On session resume, existing messages have _resultRef.turn values
+          // from a previous session counter. We compute effectiveTurn so
+          // freshness is relative to the actual conversation position, not
+          // the loop counter restart. Without this, resumed messages never
+          // resolve to full content because currentTurn (1) < _resultRef.turn.
+          const maxRefTurn = messages.reduce(
+            (max, m) => (m._resultRef && m._resultRef.turn > max ? m._resultRef.turn : max),
+            0,
+          );
+          const effectiveTurn = Math.max(turn, maxRefTurn);
           const normalizedMessages = this.normalizeMessages(
             messages,
             apiConfig.provider,
             resolvedModel,
+            {
+              projectId: request.projectId,
+              currentTurn: effectiveTurn,
+              freshDepth: SLIDING_WINDOW_SIZE,
+            },
           );
           // Phase 2: Validate — catch any remaining tool_call→tool_result sequence bugs
           const validatedMessages = validateMessageSequence(
@@ -2331,7 +2389,16 @@ export class ApiBackend extends PunkBackend {
 
           if (request.thinking && apiConfig.provider === "kimi") {
             body.temperature = 1;
-            body.max_tokens = 8192;
+            // Kimi thinking — same pattern: compute from live context window.
+            // Kimi supports up to 128K context. No hardcoded ceiling.
+            if (!omitMaxTokens) {
+              const contextLimit = getModelLimit(resolvedModel);
+              const promptTokens = estimateConversationTokens(validatedMessages);
+              const safetyReserve = 4000;
+              const dynamicMax = contextLimit - promptTokens - safetyReserve;
+              const minimum = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
+              body.max_tokens = Math.max(dynamicMax, minimum);
+            }
           }
 
           if (request.thinking && apiConfig.provider === "openrouter") {
@@ -2341,12 +2408,17 @@ export class ApiBackend extends PunkBackend {
 
           if (request.thinking && apiConfig.provider === "xiaomi") {
             // MiMo thinking mode — thinking tokens consume from the same max_tokens
-            // pool as output. Double the resolved budget to give the model room to
-            // reason without starving its output. The registry already sets a generous
-            // base for pro/omni; doubling it here accounts for heavy CoT sessions.
+            // pool as output. Compute from the live context window so the model has
+            // room to reason without starving its output.
+            // MiMo Pro/Omni support up to 1M context. No hardcoded ceiling.
             body.enable_thinking = true;
             if (!omitMaxTokens) {
-              body.max_tokens = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
+              const contextLimit = getModelLimit(resolvedModel);
+              const promptTokens = estimateConversationTokens(validatedMessages);
+              const safetyReserve = 4000;
+              const dynamicMax = contextLimit - promptTokens - safetyReserve;
+              const minimum = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
+              body.max_tokens = Math.max(dynamicMax, minimum);
             }
           }
 
@@ -2355,9 +2427,23 @@ export class ApiBackend extends PunkBackend {
             apiConfig.provider === "deepseek" &&
             !isDeepSeekReasoner
           ) {
-            // DeepSeek-chat (V3) thinking mode — returns reasoning_content in the response.
+            // DeepSeek-chat thinking mode — returns reasoning_content in the response.
             // reasoning_content MUST be passed back on every subsequent turn.
+            //
+            // Thinking tokens share the same budget as output tokens. Don't cap at
+            // the static limit (8K for old deepseek-chat). Compute from the live
+            // context window: context_limit - prompt_tokens - safety_reserve.
+            // DeepSeek V4 models support up to 384K output tokens. No artificial
+            // ceiling — the API will clamp to whatever its actual limit is.
             body.enable_thinking = true;
+            if (!omitMaxTokens) {
+              const contextLimit = getModelLimit(resolvedModel);
+              const promptTokens = estimateConversationTokens(validatedMessages);
+              const safetyReserve = 4000;
+              const dynamicMax = contextLimit - promptTokens - safetyReserve;
+              const minimum = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
+              body.max_tokens = Math.max(dynamicMax, minimum);
+            }
           }
 
           const { url, headers, finalBody } = await this.prepareRequest(
@@ -3059,20 +3145,23 @@ export class ApiBackend extends PunkBackend {
               );
 
               // Strip the assistant message — it's incomplete
-              messages.pop();
+              const popped = messages.pop();
 
-              // If we had partial thinking/content, preserve it as context for the retry
-              // so the model doesn't lose its reasoning if the retry also partially fails
-              if (streamDiedMidOutput && disconnectRetryCount >= 2) {
+              // Preserve partial thinking/content as context for the retry on
+              // every attempt, not just the third. Without this, the model
+              // re-derives its reasoning from scratch on every retry, hitting
+              // the same failure mode repeatedly. The full thinking content is
+              // injected (not just tail) so the model doesn't repeat work.
+              if (streamDiedMidOutput) {
                 const partialContext = [];
                 if (state.thinking.trim()) {
                   partialContext.push(
-                    `[Your partial reasoning from dropped connection — continue from here]\n...${state.thinking.slice(-400)}`,
+                    `[Your partial reasoning from a dropped connection — continue from here]\n${state.thinking}`,
                   );
                 }
                 if (state.accumulated.trim()) {
                   partialContext.push(
-                    `[Your partial output from dropped connection — continue from here]\n...${state.accumulated.slice(-300)}`,
+                    `[Your partial output from a dropped connection — continue from here]\n${state.accumulated}`,
                   );
                 }
                 if (partialContext.length > 0) {
@@ -3326,14 +3415,37 @@ export class ApiBackend extends PunkBackend {
             break;
           }
 
-          // If it was just a length limit without tools, we continue immediately
-          // BUT ONLY IF we actually got some content, otherwise we are likely in a loop
+          // If it was just a length limit without tools, we continue immediately.
+          // BUT: if the model was thinking and ran out of tokens before producing
+          // visible content, don't kill the session — inject a continuation prompt.
+          // The model's partial reasoning is in state.thinking and was already pushed
+          // as reasoning_content in the assistant message, so it has continuity.
           if (isLengthLimited && !hasTools) {
-            if (!hasContent) {
+            if (!hasContent && !wasThinking) {
               console.warn(
                 `[http] Stopping turn ${turn} - length limit hit but no content or tools produced.`,
               );
               break;
+            }
+            if (!hasContent && wasThinking) {
+              console.log(
+                `[http] Length limit hit mid-thought (turn ${turn}). Continuing with continuation prompt so model can produce its response.`,
+              );
+              const continuationParts = [
+                `[Continue] You ran out of tokens while reasoning. Your partial thinking follows. Do NOT repeat any reasoning you already did. Pick up where your reasoning left off and produce the response you were working toward.`,
+              ];
+              if (state.thinking.trim()) {
+                continuationParts.push(
+                  `[Your reasoning so far]\n${state.thinking}`,
+                );
+              }
+              const contMsg = {
+                role: "user",
+                content: [{ type: "text", text: continuationParts.join("\n\n") }],
+              };
+              messages.push(contMsg);
+              journal.append(contMsg, { turn, phase: "thinking-continue" });
+              continue;
             }
             console.log(
               `[http] Auto-continuing turn ${turn} due to length limit`,
@@ -3558,25 +3670,36 @@ export class ApiBackend extends PunkBackend {
               request.requestId,
             );
 
-            // --- PUSH AS CANONICAL TOOL ROLE ---
+            // --- PUSH AS CANONICAL TOOL ROLE (with _resultRef) ---
+            // Full content goes to ToolResultStore (bounded LRU memory + disk).
+            // messages[] gets a lightweight envelope: summary + _resultRef pointer.
+            // Fresh turns resolve the pointer at API request time (normalizeMessages);
+            // non-fresh turns use the summary already in content. This keeps the
+            // messages[] array memory-bounded regardless of turn count.
+            const { summary } = buildSummary(
+              request.projectId,
+              turn,
+              toolSeq,
+              { toolName: tool.name, toolId: tool.id, content },
+              { cache: true },
+            );
+            toolResultCache.store(request.projectId, turn, toolSeq, {
+              toolName: tool.name,
+              toolId: tool.id,
+              content,
+            });
             const toolMsg = {
               role: "tool",
               tool_call_id: tool.id,
               name: tool.name,
-              content,
+              content: summary,
+              _resultRef: { turn, seq: toolSeq },
+              _contentLength: typeof content === "string" ? content.length : 0,
               is_error: isError,
             };
             messages.push(toolMsg);
             journal.append(toolMsg, { turn, phase: "tool-result" });
-
-            // Persist raw result to disk cache — survives pruning for future summarization
-            try {
-              storeRaw(request.projectId, turn, toolSeq++, {
-                toolName: tool.name,
-                args: parsedInput,
-                content,
-              });
-            } catch {} // cache write failure is non-blocking
+            toolSeq++;
           }
 
           // Always refresh context after tool execution — ensures every turn has fresh state

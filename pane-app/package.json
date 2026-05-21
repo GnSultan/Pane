@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.4.153",
+  "version": "0.4.158",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -10,7 +10,7 @@
     "dev": "node scripts/dev.mjs",
     "build": "electron-vite build && node scripts/copy-compiled.mjs",
     "preview": "electron-vite preview",
-    "build:mac": "npm update @anthropic-ai/claude-agent-sdk && npm run build && electron-builder --mac --arm64 && npm run version:patch",
+    "build:mac": "npm update @anthropic-ai/claude-agent-sdk && npm run version:patch && npm run build && electron-builder --mac --arm64",
     "build:all": "npm update @anthropic-ai/claude-agent-sdk && npm run build && electron-builder --mac --arm64 --x64",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",

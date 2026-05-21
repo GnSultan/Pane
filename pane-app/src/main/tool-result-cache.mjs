@@ -13,6 +13,11 @@
  *   1. After tool execution → storeRaw() caches the full result
  *   2. On context pressure → summarize() replaces messages[] content with summary
  *   3. On session resume → restore() can reload exact results if needed
+ *
+ * In-memory layer (ToolResultStore):
+ *   Messages[] stores lightweight envelopes (summary + _resultRef pointer).
+ *   ToolResultStore caches full content in a bounded LRU (50MB default),
+ *   falling back to disk on miss. Fresh turns resolve pointers at API request time.
  */
 
 import fs from "node:fs";
@@ -150,7 +155,7 @@ export function clearCache(projectId) {
 }
 
 /**
- * Clear cache older than N turns for a project.
+ * Prune old turns cache — keep only the most recent N.
  * @param {string} projectId
  * @param {number} keepTurns - Number of recent turns to keep
  */
@@ -168,3 +173,162 @@ export function pruneOldTurns(projectId, keepTurns = 10) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
+
+// ============================================================================
+// ToolResultStore — In-memory LRU cache for tool result content
+// ============================================================================
+//
+// The messages[] array in http-backend.mjs stores lightweight envelopes
+// (summaries + _resultRef pointers) instead of full raw content. Full content
+// lives here in a bounded in-memory cache, backed by the existing disk store.
+//
+// Fresh turns resolve pointers to full content at API request time.
+// Non-fresh turns use the summary that's already in the envelope.
+// Disk fallback ensures no data loss on cold start.
+//
+// Memory cap: 50MB by default — unbounded growth down to bounded LRU.
+
+const DEFAULT_MAX_BYTES = 50 * 1024 * 1024; // 50MB
+
+export class ToolResultStore {
+  constructor(maxMemoryBytes = DEFAULT_MAX_BYTES) {
+    this._maxBytes = maxMemoryBytes;
+    this._cache = new Map();
+    this._totalBytes = 0;
+    this._hits = 0;
+    this._misses = 0;
+  }
+
+  /** Internal: build cache key from projectId + turn + seq */
+  _key(projectId, turn, seq) {
+    return `${projectId}:t${turn}:s${seq}`;
+  }
+
+  /**
+   * Store a tool result in memory. Disk persistence is handled separately
+   * by the caller via buildSummary() — this only manages the LRU cache.
+   * @param {string} projectId
+   * @param {number} turn
+   * @param {number} seq
+   * @param {{ toolName: string, toolId: string, content: string }} entry
+   */
+  store(projectId, turn, seq, { toolName, toolId, content }) {
+    const key = this._key(projectId, turn, seq);
+    const size = typeof content === "string" ? content.length : JSON.stringify(content).length;
+
+    this._cache.set(key, {
+      toolName,
+      toolId,
+      content,
+      size,
+      lastAccess: Date.now(),
+    });
+    this._totalBytes += size;
+    this._evictIfNeeded();
+  }
+
+  /**
+   * Resolve full content for a _resultRef pointer.
+   * Memory hit → return from cache. Miss → fallback to disk (restoreRaw).
+   * @param {string} projectId
+   * @param {number} turn
+   * @param {number} seq
+   * @returns {string|null} The full raw content, or null if not found
+   */
+  resolve(projectId, turn, seq) {
+    const key = this._key(projectId, turn, seq);
+    const cached = this._cache.get(key);
+
+    if (cached) {
+      cached.lastAccess = Date.now();
+      this._hits++;
+      return cached.content;
+    }
+
+    this._misses++;
+    // Fallback to disk
+    try {
+      const raw = restoreRaw(projectId, turn, seq);
+      if (raw && typeof raw.content === "string") {
+        const size = raw.content.length;
+        this._cache.set(key, {
+          toolName: raw.toolName,
+          toolId: raw.toolId,
+          content: raw.content,
+          size,
+          lastAccess: Date.now(),
+        });
+        this._totalBytes += size;
+        this._evictIfNeeded();
+        return raw.content;
+      }
+    } catch {
+      // Non-fatal — summary in messages[] is sufficient for non-fresh turns
+    }
+    return null;
+  }
+
+  /**
+   * Evict a specific entry from memory (keeps disk copy intact).
+   */
+  evict(projectId, turn, seq) {
+    const key = this._key(projectId, turn, seq);
+    const entry = this._cache.get(key);
+    if (entry) {
+      this._cache.delete(key);
+      this._totalBytes -= entry.size;
+    }
+  }
+
+  /**
+   * Clear all in-memory entries for a project.
+   */
+  clearMemory(projectId) {
+    const prefix = `${projectId}:`;
+    for (const [key, entry] of this._cache) {
+      if (key.startsWith(prefix)) {
+        this._cache.delete(key);
+        this._totalBytes -= entry.size;
+      }
+    }
+  }
+
+  /** Evict oldest entries until under the memory cap (LRU). */
+  _evictIfNeeded() {
+    while (this._totalBytes > this._maxBytes && this._cache.size > 0) {
+      let oldestKey = null;
+      let oldestTime = Infinity;
+      for (const [key, entry] of this._cache) {
+        if (entry.lastAccess < oldestTime) {
+          oldestTime = entry.lastAccess;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey) {
+        const entry = this._cache.get(oldestKey);
+        this._totalBytes -= entry.size;
+        this._cache.delete(oldestKey);
+      }
+    }
+  }
+
+  /** Current memory usage in bytes */
+  get memoryBytes() { return this._totalBytes; }
+
+  /** Number of entries in the in-memory cache */
+  get entryCount() { return this._cache.size; }
+
+  /** Hit/miss stats for monitoring */
+  get stats() {
+    return {
+      hits: this._hits,
+      misses: this._misses,
+      entries: this._cache.size,
+      bytes: this._totalBytes,
+      maxBytes: this._maxBytes,
+    };
+  }
+}
+
+/** Singleton instance shared across all modules */
+export const toolResultCache = new ToolResultStore();

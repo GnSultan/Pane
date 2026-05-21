@@ -89,6 +89,10 @@ export function summarizeTurn(messages, startIdx, endIdx, options = {}) {
   for (let i = startIdx; i <= endIdx; i++) {
     const msg = messages[i];
     if (msg.role !== "tool") continue;
+    // Skip messages that already have _resultRef — they were summarized at
+    // push time in http-backend.mjs. Full content is in ToolResultStore.
+    // Re-summarizing would just replace the summary with the same value.
+    if (msg._resultRef) continue;
 
     const originalContent =
       typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
