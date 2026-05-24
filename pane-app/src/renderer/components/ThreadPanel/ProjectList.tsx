@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, memo } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useProjectsStore } from "../../stores/projects";
 import { NewThreadPicker } from "./NewThreadPicker";
@@ -40,7 +40,7 @@ function ProcessingDots() {
 }
 
 /** Active thread row — same as before with the addition of an archive icon. */
-function ProjectRow({ id }: { id: string }) {
+const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
   const name = useProjectsStore((s) => s.projects.get(id)?.name ?? "");
   const isProcessing = useProjectsStore(
     (s) => s.projects.get(id)?.conversation.isProcessing ?? false,
@@ -251,10 +251,10 @@ function ProjectRow({ id }: { id: string }) {
       )}
     </div>
   );
-}
+});
 
 /** Compact archived row — name + restore action only, no excerpt or timing. */
-function ArchivedRow({ id }: { id: string }) {
+const ArchivedRow = memo(function ArchivedRow({ id }: { id: string }) {
   const name = useProjectsStore((s) => s.projects.get(id)?.name ?? "");
   const restoreProject = useProjectsStore((s) => s.restoreProject);
 
@@ -276,7 +276,7 @@ function ArchivedRow({ id }: { id: string }) {
       </button>
     </div>
   );
-}
+});
 
 export function ProjectList() {
   return (
@@ -301,6 +301,8 @@ function ProjectListInner() {
     useShallow((s) => {
       const order = s.projectOrder;
       const map = s.projects;
+      // Precompute index lookup — O(n) once instead of O(n²) in sort
+      const idxMap = new Map(order.map((id, i) => [id, i]));
       return [...order].sort((a, b) => {
         const aTime = map.get(a)?.lastActivityAt ?? null;
         const bTime = map.get(b)?.lastActivityAt ?? null;
@@ -309,8 +311,8 @@ function ProjectListInner() {
         // Active threads come before inactive ones
         if (aTime !== null) return -1;
         if (bTime !== null) return 1;
-        // Both inactive: insertion order
-        return order.indexOf(a) - order.indexOf(b);
+        // Both inactive: insertion order (Map lookups are O(1) vs indexOf O(n))
+        return (idxMap.get(a) ?? 0) - (idxMap.get(b) ?? 0);
       });
     }),
   );

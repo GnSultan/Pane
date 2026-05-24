@@ -142,7 +142,7 @@ import { classifyDomain } from "./routing-oracle.mjs";
 import { ensurePriors } from "./benchmark-scout.mjs";
 // intent-classifier.mjs removed — LLM-based classifier was dead code (never called)
 import { routeHeuristic, detectFailureSignals, detectSuccessSignals, djb2Hash } from "./heuristic-router.mjs";
-import { routeIntegrated, recordOutcome, getClassifierStats } from "./integrated-router.mjs";
+import { routeIntegrated, recordOutcome, getClassifierStats } from "./heuristic-router.mjs";
 import { contextStore } from "./context-store.mjs";
 import { propagateCompletion } from "./completion-propagator.mjs";
 import { extractAndIndex } from "./memory-extractor.mjs";
@@ -565,7 +565,7 @@ class PunkEngine {
     this._workerAgentListeners = new Map();
 
     // Initialize learned classifier on startup (non-blocking)
-    import("./integrated-router.mjs").then(module => {
+    import("./heuristic-router.mjs").then(module => {
       module.getClassifierStats && console.log("[punk] learned classifier ready");
     }).catch(() => {
       console.log("[punk] learned classifier not available");
@@ -685,7 +685,7 @@ class PunkEngine {
     );
 
     // Initialize learned classifier (non-blocking, logs when ready)
-    const { getClassifierStats } = await import("./integrated-router.mjs");
+    const { getClassifierStats } = await import("./heuristic-router.mjs");
     const stats = getClassifierStats();
     if (stats) {
       console.log(`[punk] learned classifier ready (${stats.sampleCount} samples, ${stats.vocabSize} vocab)`);
@@ -1899,7 +1899,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     const combo = await this.loadPowerCombo();
 
     try {
-      const { routeIntegrated } = await import("./integrated-router.mjs");
+      const { routeIntegrated } = await import("./heuristic-router.mjs");
       const state = readState(projectId);
       const threadState = readThreadState(projectId);
 

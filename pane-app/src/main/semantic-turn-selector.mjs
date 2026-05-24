@@ -208,6 +208,42 @@ export function getTopRelevantSummaries(queryEmbeddingBase64, turnSummaries, top
     .sort((a, b) => b.relevanceScore - a.relevanceScore);
 }
 
+/**
+ * Format top relevant turn summaries into a compact system prompt layer.
+ * Designed for the session tier — concise enough to not dominate the
+ * system prompt budget, rich enough to give the model context.
+ *
+ * Auto-caching providers (DeepSeek, Kimi, etc.) benefit from prefix
+ * stability: the session tier changes per-query at the system/message
+ * boundary rather than mid-conversation, keeping the message body
+ * chronological and cache-friendly.
+ *
+ * @param {Array<{ turnIndex: number, request: string, conclusion: string, tools: string[], relevanceScore: number }>} summaries
+ * @param {number} [maxTokens=5000] — token budget cap (SESSION_TIER_MAX_TOKENS = 6000, leave headroom)
+ * @returns {string}
+ */
+export function formatSemanticPool(summaries, maxTokens = 5000) {
+  if (!summaries?.length) return "";
+
+  const lines = ["\n\n[Contextually relevant past turns]"];
+  let totalEstimate = estimateTokens(lines.join("\n"));
+
+  for (const s of summaries) {
+    const tools = s.tools?.length ? ` [tools: ${s.tools.join(", ")}]` : "";
+    const line = `Turn ${s.turnIndex}: ${s.request} → ${s.conclusion}${tools}`;
+    const lineTokens = estimateTokens(line);
+
+    if (totalEstimate + lineTokens > maxTokens) break;
+
+    lines.push(line);
+    totalEstimate += lineTokens;
+  }
+
+  if (lines.length <= 1) return ""; // no summaries fit
+  lines.push("[End relevant turns]\n");
+  return lines.join("\n");
+}
+
 // --- Fallback ---
 
 /**

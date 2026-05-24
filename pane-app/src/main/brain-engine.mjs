@@ -22,8 +22,6 @@ import {
   getFileSymbols,
   writeSymbolExport,
 } from "./symbol-index.mjs";
-import { FACET_WEIGHTS } from "./system-atoms.mjs";
-
 // Local embedding model via @huggingface/transformers + onnxruntime-node.
 // onnxruntime-node is auto-detected by transformers.js when both are installed.
 import { pipeline } from "@huggingface/transformers";
@@ -752,7 +750,6 @@ async function loadEmbedder() {
 
     // Index atoms + migrate old embeddings + fill null embeddings in background
     Promise.all([
-      indexProfileAtoms().catch(err => console.error("[brain] Profile atom indexing failed:", err.message)),
       migrateEmbeddings().catch(err => console.error("[brain] Embedding migration failed:", err.message)),
       fillNullEmbeddings().catch(err => console.error("[brain] Null embedding fill failed:", err.message)),
     ]);
@@ -1531,19 +1528,16 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
   const embeddingQuery = projectWhy ? `${projectWhy}\n\n${query}` : query;
   const queryEmbedding = embedderReady ? await embed(embeddingQuery) : null;
 
-  // Unified atom pool search: system atoms + profile atoms + learned atoms,
-  // scored by cosine × facetWeight × priority + hintBoost.
-  // Falls back to legacy profileAtoms when atom pool is empty.
-  const atoms = queryEmbedding ? searchAtomPool(queryEmbedding, taskType, atomHints, 16) : [];
-  // Legacy compat: also populate profileAtoms from the unified results
-  const profileAtoms = atoms.filter(a => a.entityType === "profile_atom").slice(0, 4);
+  // Atom pool has been removed — atoms/profileAtoms are always empty.
+  // Profile context is injected directly via pane-system-prompt.mjs from identity files.
+  const atoms = [];
+  const profileAtoms = [];
 
   // Relevant files: always retrieve if we have indexed files for this project
   const relevantFiles = projectRoot ? await findRelevantFiles(query, projectId, 5) : [];
 
-  // Short imperative prompts skip project memory (lessons/decisions/tensions)
-  // but ALWAYS include scored atoms — they drive system prompt assembly.
-  // Without atoms, session-context falls back to injecting ALL atoms unfiltered.
+  // Short imperative prompts skip project memory (lessons/decisions/tensions).
+  // Atom pool has been removed — atoms/profileAtoms are always empty.
   const trimmed = query.trim();
   const isDirective = trimmed.length < 65 && /^(add|remove|fix|update|change|delete|create|make|move|rename|refactor|run|install|build|deploy|write|edit|show|get|find|check|use|switch|enable|disable|set|reset|clear|open|close)/i.test(trimmed);
 
@@ -1691,7 +1685,7 @@ function writeSearchExport(projectId) {
       SELECT id, name, entity_type, content, confidence
       FROM nodes
       WHERE project_id = ?
-        AND entity_type IN ('decision','lesson','pattern','error','error_fix','file','profile_atom','system_atom','project')
+        AND entity_type IN ('decision','lesson','pattern','error','error_fix','file','project')
     `).all(projectId);
     const mindEntries = db.prepare(`SELECT id, content, completed FROM mind_entries`).all();
 
@@ -1869,266 +1863,7 @@ function getIntelligenceStats(projectId) {
   };
 }
 
-// --- Profile Atomization: index identity/philosophy/rules/anti-patterns as retrievable nodes ---
 
-const PROFILE_ATOM_TYPE = "profile_atom";
-
-/**
- * Parse all profile files into individual atomic nodes and embed them.
- * Each principle, rule, anti-pattern becomes its own searchable node.
- * Deletes old atoms first — profile changes are infrequent, rebuild is safe.
- */
-async function indexProfileAtoms() {
-  if (!db || !embedderReady) return;
-
-  try {
-    db.prepare(`DELETE FROM nodes WHERE entity_type = ?`).run(PROFILE_ATOM_TYPE);
-
-    const identity = readProfileJson("identity.json");
-    const philosophy = readProfileMd("philosophy.md");
-    const rules = readProfileMd("rules.md");
-    const antiPatterns = readProfileJson("anti-patterns.json");
-
-    const atoms = [];
-
-    // Identity bio as an atom — gives context on who this person is
-    if (identity?.bio && identity.bio.length > 10) {
-      atoms.push({ text: identity.bio, facet: "identity" });
-    }
-
-    // Philosophy: each double-newline-separated paragraph = one principle atom
-    if (philosophy) {
-      const paragraphs = philosophy.split(/\n\n+/).filter(p => p.trim().length > 20);
-      for (const p of paragraphs) {
-        atoms.push({ text: p.trim(), facet: "philosophy" });
-      }
-    }
-
-    // Rules: each non-empty line = one rule atom
-    if (rules) {
-      const lines = rules.split(/\n/).filter(l => l.trim().length > 10);
-      for (const l of lines) {
-        const text = l.trim().replace(/^[-*•]\s*/, "");
-        if (text.length > 10) atoms.push({ text, facet: "rule" });
-      }
-    }
-
-    // Anti-patterns: error + fix combined into one atom for semantic coherence
-    if (antiPatterns?.patterns) {
-      for (const ap of antiPatterns.patterns) {
-        if (ap.error && ap.fix) {
-          atoms.push({ text: `Avoid: ${ap.error} — Instead: ${ap.fix}`, facet: "anti_pattern", priority: 0.75 });
-        }
-      }
-    }
-
-    // Preferences: coding patterns as atoms
-    const preferences = readProfileJson("preferences.json");
-    if (preferences?.coding) {
-      for (const [, info] of Object.entries(preferences.coding)) {
-        if (info.content && info.content.length > 10) {
-          atoms.push({ text: info.content, facet: "preference", priority: 0.6 });
-        }
-      }
-    }
-
-    // Preferences: tool preferences as atoms
-    if (preferences?.tools) {
-      for (const [tool, info] of Object.entries(preferences.tools)) {
-        const label = info.prefers === false ? `Avoid ${info.avoids || tool}` : `Prefers ${tool}`;
-        const text = `${label}: ${info.content || ""}`.trim();
-        if (text.length > 10) {
-          atoms.push({ text, facet: "preference", priority: 0.55 });
-        }
-      }
-    }
-
-    // Style: verbosity and work style as atoms
-    const style = readProfileJson("style.json");
-    if (style) {
-      if (style.verbosity && style.verbosity !== "adaptive") {
-        atoms.push({ text: `Communication style: ${style.verbosity} verbosity.`, facet: "style", priority: 0.5 });
-      }
-      if (style.planFirst === true) {
-        atoms.push({ text: "Work style: plan before executing — think through the approach first.", facet: "style", priority: 0.5 });
-      } else if (style.planFirst === false) {
-        atoms.push({ text: "Work style: execute directly — skip planning for straightforward tasks.", facet: "style", priority: 0.5 });
-      }
-    }
-
-    // Batch-embed all atoms at once to minimize WASM allocator pressure
-    const validAtoms = atoms.filter(a => a.text.length >= 10);
-    const atomTexts = validAtoms.map(a => a.text);
-    const embeddings = await embedBatch(atomTexts);
-
-    const updateAtom = db.prepare(`
-      INSERT INTO nodes (id, name, entity_type, project_id, content, embedding, confidence, version, priority, facet)
-      VALUES (?, ?, ?, NULL, ?, ?, 1.0, 1, ?, ?)
-      ON CONFLICT(id) DO NOTHING
-    `);
-
-    let indexed = 0;
-    for (const atom of validAtoms) {
-      const id = nodeId(PROFILE_ATOM_TYPE, atom.text);
-      const embedding = embeddings.get(atom.text);
-      const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
-
-      updateAtom.run(
-        id, atom.text.slice(0, 80), PROFILE_ATOM_TYPE,
-        JSON.stringify({ text: atom.text, facet: atom.facet }),
-        embeddingBuffer, atom.priority || 0.7, atom.facet,
-      );
-      indexed++;
-    }
-
-    // Force WAL checkpoint after batch writes
-    _walCheckpoint();
-
-    console.log(`[brain] Indexed ${indexed} profile atoms`);
-  } catch (err) {
-    console.error("[brain] indexProfileAtoms error:", err.message);
-  }
-}
-
-/**
- * Index all system atoms — retired.
- * ALL_SYSTEM_ATOMS is now an empty array. Lifecycle handled by profile atoms only.
- */
-
-/**
- * Unified atom pool search — replaces searchProfileAtoms().
- *
- * Queries ALL atom types (system_atom, profile_atom, learned nodes above threshold),
- * applies facet-weighted scoring based on task type, and returns a single ranked list.
- *
- * Scoring: finalScore = (cosineSimilarity × facetWeight × priority) + hintBoost
- *
- * @param {Float32Array} queryEmbedding — embedded query vector
- * @param {string|null} taskType — from local-intel classification
- * @param {string[]} atomHints — keyword hints from local-intel
- * @param {number} limit — max atoms to return
- * @returns {Array<{id, facet, content, score, priority, sortOrder}>}
- */
-function searchAtomPool(queryEmbedding, taskType = null, atomHints = [], limit = 12) {
-  if (!db || !queryEmbedding) return [];
-
-  // Get facet weights for this task type
-  const weights = taskType ? (FACET_WEIGHTS[taskType] || FACET_WEIGHTS._default) : FACET_WEIGHTS._default;
-
-  // Build hint pattern for keyword boost
-  const hintPattern = atomHints.length > 0
-    ? new RegExp(atomHints.map(h => h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "i")
-    : null;
-
-  // Query all atom-type nodes with embeddings
-  const atoms = db.prepare(`
-    SELECT * FROM nodes
-    WHERE entity_type IN ('system_atom', 'profile_atom')
-      AND embedding IS NOT NULL
-  `).all();
-
-  // Also pull in high-confidence learned nodes (lessons, patterns, error_fix)
-  // that have crossed the promotion threshold — these become "learned atoms"
-  const learnedAtoms = db.prepare(`
-    SELECT * FROM nodes
-    WHERE entity_type IN ('lesson', 'pattern', 'error_fix')
-      AND confidence >= 0.78
-      AND embedding IS NOT NULL
-    ORDER BY confidence DESC
-    LIMIT 20
-  `).all();
-
-  const results = [];
-
-  for (const node of [...atoms, ...learnedAtoms]) {
-    const nodeEmbedding = new Float32Array(
-      node.embedding.buffer, node.embedding.byteOffset, node.embedding.byteLength / 4,
-    );
-    const cosine = cosineSimilarity(queryEmbedding, nodeEmbedding);
-    if (cosine < 0.20) continue; // below noise floor
-
-    const content = JSON.parse(node.content || "{}");
-    const text = content.text || node.name;
-    const facet = node.facet || content.facet || _inferFacet(node.entity_type);
-    const priority = node.priority || 0.5;
-    const sortOrder = node.sort_order || 0;
-
-    // Unified scoring: cosine × facetWeight × priority + hintBoost
-    const facetMul = weights[facet] || 1.0;
-    const hintBoost = hintPattern && hintPattern.test(text) ? 0.15 : 0;
-    const finalScore = (cosine * facetMul * priority) + hintBoost;
-
-    results.push({
-      id: node.id,
-      facet,
-      content: text,
-      score: finalScore,
-      cosine,
-      priority,
-      sortOrder,
-      entityType: node.entity_type,
-    });
-  }
-
-  // Sort: sequenced atoms (sortOrder > 0) by sortOrder, then by score descending
-  results.sort((a, b) => {
-    // Sequenced atoms (method steps) maintain their order when both are present
-    if (a.sortOrder > 0 && b.sortOrder > 0) return a.sortOrder - b.sortOrder;
-    // Sequenced atoms rank above unordered at equal score
-    if (a.sortOrder > 0 && b.sortOrder === 0 && a.score >= b.score * 0.8) return -1;
-    if (b.sortOrder > 0 && a.sortOrder === 0 && b.score >= a.score * 0.8) return 1;
-    // Default: score descending
-    return b.score - a.score;
-  });
-
-  return results.slice(0, limit);
-}
-
-/**
- * Infer facet from entity_type for learned nodes that don't have an explicit facet.
- */
-function _inferFacet(entityType) {
-  switch (entityType) {
-    case "lesson": return "learned";
-    case "pattern": return "learned";
-    case "error_fix": return "anti_pattern";
-    case "decision": return "learned";
-    default: return "learned";
-  }
-}
-
-/**
- * @deprecated Use searchAtomPool() instead. Kept for backward compatibility.
- * Semantic search over profile atoms only.
- * Returns atoms sorted by cosine similarity to the query embedding.
- */
-function searchProfileAtoms(queryEmbedding, limit = 5) {
-  if (!db || !queryEmbedding) return [];
-
-  const atoms = db.prepare(
-    `SELECT * FROM nodes WHERE entity_type = ? AND embedding IS NOT NULL`
-  ).all(PROFILE_ATOM_TYPE);
-
-  const results = [];
-  for (const atom of atoms) {
-    const atomEmbedding = new Float32Array(
-      atom.embedding.buffer, atom.embedding.byteOffset, atom.embedding.byteLength / 4
-    );
-    const similarity = cosineSimilarity(queryEmbedding, atomEmbedding);
-    if (similarity > 0.28) {
-      const content = JSON.parse(atom.content || "{}");
-      results.push({
-        id: atom.id,
-        facet: content.facet || "unknown",
-        content: content.text || atom.name,
-        score: similarity,
-      });
-    }
-  }
-
-  results.sort((a, b) => b.score - a.score);
-  return results.slice(0, limit);
-}
 
 // --- Profile System: learned + explicit preferences ---
 
@@ -2374,7 +2109,6 @@ function addExplicitRule(rule) {
   content += `\n- ${rule}`;
   fs.writeFileSync(rulesPath, content);
   writeProfileExport();
-  indexProfileAtoms().catch(() => {});
   return { added: true };
 }
 
@@ -2382,7 +2116,6 @@ function addExplicitRule(rule) {
 function updatePhilosophy(text) {
   fs.writeFileSync(path.join(PROFILE_DIR, "philosophy.md"), text);
   writeProfileExport();
-  indexProfileAtoms().catch(() => {});
   return { updated: true };
 }
 
@@ -2390,7 +2123,6 @@ function updatePhilosophy(text) {
 function updateRules(text) {
   fs.writeFileSync(path.join(PROFILE_DIR, "rules.md"), text);
   writeProfileExport();
-  indexProfileAtoms().catch(() => {});
   return { updated: true };
 }
 
@@ -2400,7 +2132,6 @@ function updateIdentityJson(identity) {
   const updated = { ...current, ...identity };
   fs.writeFileSync(path.join(PROFILE_DIR, "identity.json"), JSON.stringify(updated, null, 2));
   writeProfileExport();
-  indexProfileAtoms().catch(() => {});
   return { updated: true };
 }
 
@@ -2837,18 +2568,10 @@ process.parentPort.on("message", async ({ data }) => {
           writeProfileJson("preferences.json", prefs);
           writeProfileJson("anti-patterns.json", antiPatterns);
           writeProfileExport();
-          // Re-index profile atoms so new preferences are semantically searchable
-          indexProfileAtoms().catch(() => {});
           console.log(`[brain] LLM extraction merged: ${(extracted.tools||[]).length} tools, ${(extracted.patterns||[]).length} patterns, ${(extracted.corrections||[]).length} corrections`);
         }
 
         sendToMain({ type: "llm_preferences_updated", requestId: data.requestId, changed });
-        break;
-      }
-
-      case "reindex_profile_atoms": {
-        await indexProfileAtoms();
-        sendToMain({ type: "profile_atoms_indexed", requestId: data.requestId });
         break;
       }
 
@@ -3249,11 +2972,11 @@ process.parentPort.on("message", async ({ data }) => {
 
         const kgProjectId = data.projectId;
 
-        // Get type counts (exclude system atoms and profile atoms)
+        // Get type counts (atoms have been removed — no longer excluded)
         const typeCounts = db.prepare(`
           SELECT entity_type, COUNT(*) as count
           FROM nodes
-          WHERE project_id = ? AND entity_type NOT IN ('system_atom', 'profile_atom')
+          WHERE project_id = ?
           GROUP BY entity_type
           ORDER BY count DESC
         `).all(kgProjectId);
@@ -3262,7 +2985,7 @@ process.parentPort.on("message", async ({ data }) => {
         const topNodes = db.prepare(`
           SELECT id, name, entity_type, content, confidence, access_count, priority
           FROM nodes
-          WHERE project_id = ? AND entity_type NOT IN ('project', 'system_atom', 'profile_atom')
+          WHERE project_id = ? AND entity_type NOT IN ('project')
             AND content != '{}'
           ORDER BY confidence DESC, access_count DESC
           LIMIT 20

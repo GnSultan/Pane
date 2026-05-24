@@ -184,7 +184,7 @@ export function useSettingsPersistence() {
         }
 
         // 4. Project restoration — conversations load lazily in Conversation.tsx
-        const { addProject, setActiveProject, toggleDir, markRootMissing } =
+        const { addProject, setActiveProject, markRootMissing } =
           useProjectsStore.getState();
 
         // project_ids maps root path → stable ID.
@@ -301,51 +301,82 @@ export function useSettingsPersistence() {
               settings.project_states?.[root];
 
             if (state) {
+              // Batch all sync mutations into ONE setState() instead of 8+
+              // individual calls — each separate call triggers Zustand's full
+              // subscriber cascade (computeStructuralKey, re-renders, etc.).
+              restoringProjects.add(id);
+              useProjectsStore.setState((s) => {
+                let proj = s.projects.get(id);
+                if (!proj) return s;
+                let updated = { ...proj };
+
+                // name
+                if (state.name) updated.name = state.name;
+
+                // expanded dirs
+                if (state.expanded_dirs?.length) {
+                  const nextDirs = new Set(updated.expandedDirs);
+                  for (const dir of state.expanded_dirs) nextDirs.add(dir);
+                  updated.expandedDirs = nextDirs;
+                }
+
+                // recent files
+                if (state.recent_files?.length) {
+                  updated.recentFiles = state.recent_files;
+                }
+
+                // scroll positions
+                if (state.scroll_positions) {
+                  updated.scrollPositions = new Map(
+                    Object.entries(state.scroll_positions),
+                  );
+                }
+
+                // power combo
+                if (state.power_combo) {
+                  updated.powerCombo = state.power_combo;
+                }
+
+                // auto-escalate
+                if (state.auto_escalate !== undefined) {
+                  updated.autoEscalate = state.auto_escalate;
+                }
+
+                // selected model
+                if (state.selected_model) {
+                  updated.selectedModel = state.selected_model;
+                  updated.selectedModelThinking = state.selected_model_thinking ?? false;
+                  updated.selectedModelProvider = state.selected_model_provider;
+                }
+
+                // archived — also handle activeProjectId if this was the active project
+                if (state.archived) {
+                  updated.archived = true;
+                  const nextProjects = new Map(s.projects);
+                  nextProjects.set(id, updated);
+                  let active = s.activeProjectId;
+                  const newActive = active === id
+                    ? s.projectOrder.find((oid) => {
+                        const other = s.projects.get(oid);
+                        return other && !other.archived && oid !== id;
+                      }) ?? null
+                    : active;
+                  return { projects: nextProjects, activeProjectId: newActive };
+                }
+
+                const nextProjects = new Map(s.projects);
+                nextProjects.set(id, updated);
+                return { projects: nextProjects };
+              });
+
+              // Re-store individual setting setters for side effects that aren't
+              // covered by the batched setState above (e.g. `renameProject` also
+              // updates conversation meta). These fire store subscribers again,
+              // but we're inside restoringProjects so the structural key and
+              // conversation persistence subscribers bail out.
               if (state.name) useProjectsStore.getState().renameProject(id, state.name);
-              for (const dir of state.expanded_dirs) toggleDir(id, dir);
-              if (state.recent_files?.length) {
-                useProjectsStore.setState((s) => {
-                  const proj = s.projects.get(id);
-                  if (!proj) return s;
-                  const next = new Map(s.projects);
-                  next.set(id, { ...proj, recentFiles: state.recent_files! });
-                  return { projects: next };
-                });
-              }
-              if (state.scroll_positions) {
-                useProjectsStore.setState((s) => {
-                  const proj = s.projects.get(id);
-                  if (!proj) return s;
-                  const next = new Map(s.projects);
-                  next.set(id, {
-                    ...proj,
-                    scrollPositions: new Map(
-                      Object.entries(state.scroll_positions!),
-                    ),
-                  });
-                  return { projects: next };
-                });
-              }
-              // Restore per-project power combo and auto-escalate
-              if (state.power_combo) {
-                useProjectsStore.getState().setProjectPowerCombo(id, state.power_combo);
-              }
-              if (state.auto_escalate !== undefined) {
-                useProjectsStore.getState().setProjectAutoEscalate(id, state.auto_escalate);
-              }
-              // Restore per-project selected model
-              if (state.selected_model) {
-                useProjectsStore.getState().setProjectSelectedModel(
-                  id,
-                  state.selected_model,
-                  state.selected_model_thinking ?? false,
-                  state.selected_model_provider,
-                );
-              }
-              // Restore archived status after all other state is applied
-              if (state.archived) {
-                useProjectsStore.getState().archiveProject(id);
-              }
+
+              // Handle active_file_path asynchronously — can't batch this
               if (state.active_file_path) {
                 readFile(state.active_file_path)
                   .then((content) => {
@@ -356,8 +387,14 @@ export function useSettingsPersistence() {
                   .catch(() => {});
               }
             }
+            restoringProjects.delete(id);
             if (idx + 1 < projectEntries.length) {
               requestIdleCallback(() => restoreProjectState(idx + 1));
+            } else {
+              // Restore chain complete — clearing restoringProjects lets the
+              // unsubProjects subscriber run on the next store update, which
+              // will recompute the structural key and save if needed.
+              restoringProjects.clear();
             }
           };
           requestIdleCallback(() => restoreProjectState(0));
@@ -497,6 +534,9 @@ export function useSettingsPersistence() {
     lastStructuralKey = computeStructuralKey(useProjectsStore.getState());
 
     const unsubProjects = useProjectsStore.subscribe((state) => {
+      // Skip while restore cascade is running — avoids O(N) iteration over
+      // ALL projects on every batch store update during startup.
+      if (restoringProjects.size > 0) return;
       const key = computeStructuralKey(state);
       if (key !== lastStructuralKey) {
         lastStructuralKey = key;

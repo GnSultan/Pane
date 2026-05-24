@@ -812,3 +812,37 @@ function buildReason(mode, taskType, complexity, escalationStage) {
 
   return typeReasons[taskType] || "Processing request.";
 }
+
+// ── Integrated Router — thin wrapper for backward compat ─────────────────────
+// The learned classifier (Naive Bayes) and LLM classifier were removed in favor
+// of the heuristic router as the single authority. These exports keep callers
+// (punk-engine, previewRoute, outcome tracking) working without changes.
+
+/**
+ * Route a message via heuristic routing.
+ * Kept as a named export so callers don't need import changes.
+ * @param {object} input — same shape as routeHeuristic() expects
+ * @returns {Promise<object>} heuristic routing decision
+ */
+export async function routeIntegrated(input) {
+  const decision = await routeHeuristic(input);
+  decision.routedBy = decision.routedBy || "heuristic";
+  return decision;
+}
+
+/**
+ * Record a completed routing outcome.
+ * Feeds routing-store for outcome analytics. No classifier training anymore.
+ * @param {object} _params — routing outcome data (passed through to routing-store elsewhere)
+ */
+export function recordOutcome(_params) {
+  // No-op — outcome tracking is handled directly by punk-engine via routing-store
+}
+
+/**
+ * Get routing stats (stub — classifier was removed).
+ * @returns {{ status: string, routeCount: number }}
+ */
+export function getClassifierStats() {
+  return { status: "disabled", routeCount: 0 };
+}

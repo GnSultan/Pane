@@ -139,8 +139,6 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       const steps = (input.steps as Array<{ action: string }>) || [];
       return summary || `${steps.length} steps`;
     }
-    case "TodoWrite":
-      return "todos";
     case "pane_plan":
       return "plan";
     case "Task":
@@ -192,7 +190,6 @@ function getToolLabel(name: string): string {
     case "agent": return "agent";
     case "pane_plan": return "pane";
     case "Plan": return "plan";
-    case "TodoWrite": return "todo";
     case "WebSearch":
     case "google_web_search": return "search";
     case "EnterPlanMode": return "plan";
@@ -428,46 +425,6 @@ export function ExpandedWriteInput({ input }: { input: Record<string, unknown> }
   );
 }
 
-function ExpandedTodoInput({ input }: { input: Record<string, unknown> }) {
-  const todos = (input.todos as Array<{ content: string; status: string }>) || [];
-  return (
-    <div
-      className="font-mono overflow-y-auto max-h-[300px]
-                 leading-[1.6]"
-      style={{ fontSize: "var(--pane-font-size-sm)" }}
-    >
-      {todos.map((todo, i) => (
-        <div
-          key={i}
-          className="flex items-start gap-2 px-4 py-4"
-        >
-          <span className="shrink-0 mt-0.5">
-            {todo.status === "completed"
-              ? "\u2713"
-              : todo.status === "in_progress"
-                ? "\u25CB"
-                : "\u2022"}
-          </span>
-          <span
-            className={
-              "min-w-0 truncate " +
-              (todo.status === "completed"
-                ? "text-pane-text-secondary/60 line-through"
-                : todo.status === "in_progress"
-                  ? "text-pane-text"
-                  : "text-pane-text-secondary/60")
-            }
-          >
-            {todo.content.length > 60
-              ? todo.content.slice(0, 60) + "..."
-              : todo.content}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function ExpandedDefaultInput({ input }: { input: Record<string, unknown> }) {
   return (
     <div
@@ -671,8 +628,6 @@ function renderExpandedInput(name: string, input: Record<string, unknown>, resul
       return <ExpandedWriteInput input={input} />;
     case "Plan":
       return <ExpandedPlanInput input={input} />;
-    case "TodoWrite":
-      return <ExpandedTodoInput input={input} />;
     case "Read":
     case "read_file":
       return <ExpandedReadInput input={input} result={result} />;

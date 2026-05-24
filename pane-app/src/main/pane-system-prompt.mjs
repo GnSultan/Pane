@@ -330,11 +330,6 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   // plus identity, profile rules, and project brief.
   // On continuation turns, remind the model it has full context.
 
-  const coreInstructions = historyLength >= 2
-    ? "You have full project context from previous turns. Proceed directly with the task."
-    : "";
-  stableParts.unshift(coreInstructions, "");
-
   // ── PANE OPERATING PRINCIPLES ───────────────────────────────────────────
   // Compressed from the former ~1,276-token Pane Intelligence Guide.
   // Tool-specific behavioral guidance now lives in tool descriptions
@@ -355,28 +350,6 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   if (identity) {
     stableParts.push("Developer Identity:");
     stableParts.push(identity);
-    stableParts.push("");
-  }
-
-  // Project brief: accumulated cross-session wisdom.
-  // Local intelligence can suppress the brief on very short, scoped requests
-  // (complexity=low) to save context tokens. Medium+ always includes it.
-  const shouldIncludeBrief = contextShape?.includeBrief !== false
-    || (contextShape?.complexity !== "low");
-  let brief = "";
-  if (shouldIncludeBrief) {
-    try {
-      brief = fs.readFileSync(path.join(MEMORY_DIR, projectId, "brief.md"), "utf-8").trim();
-      if (brief.length > 4500) {
-        const truncated = brief.slice(0, 4500);
-        const lastSection = truncated.lastIndexOf("\n###");
-        brief = lastSection > 500 ? truncated.slice(0, lastSection) : truncated;
-      }
-    } catch {}
-  }
-
-  if (brief) {
-    stableParts.push(brief);
     stableParts.push("");
   }
 
@@ -424,40 +397,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   // This saves ~2-4k tokens from the session tier and makes the system prompt
   // nearly static — improving cache hit rates dramatically.
 
-  // Global Memory (Gemini CLI parity)
-  try {
-    const globalMemoryPath = path.join(os.homedir(), ".gemini", "memory.md");
-    if (fs.existsSync(globalMemoryPath)) {
-      const globalMemory = fs.readFileSync(globalMemoryPath, "utf-8").trim();
-      if (globalMemory) {
-        stableParts.push("## Global Memory");
-        stableParts.push(globalMemory);
-        stableParts.push("");
-      }
-    }
-  } catch {}
-
   // ── DYNAMIC ───────────────────────────────────────────────────────────────
-
-  // System Info
-  const now = new Date();
-  const dateStr = now.toLocaleDateString("en-US", {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-  const timeStr = now.toLocaleTimeString("en-US", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-
-  dynamicParts.push(`Current Time: ${dateStr}, ${timeStr}`);
-  dynamicParts.push(`OS: ${process.platform}`);
-  dynamicParts.push(`User: ${os.userInfo().username}`);
-  dynamicParts.push("");
 
   // Session state: what Pane knows is happening right now
   const state = readState(projectId);

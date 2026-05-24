@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.4.158",
+  "version": "0.4.168",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -18,6 +18,8 @@
     "lint": "eslint src/renderer/",
     "build:icon": "node scripts/build-icon.mjs",
     "download-models": "node scripts/download-models.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "postinstall": "electron-rebuild -f --only node-pty,better-sqlite3"
   },
   "build": {
@@ -139,6 +141,7 @@
     "tailwindcss": "^4.2.0",
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.56.1",
-    "vite": "^5.4.11"
+    "vite": "^5.4.11",
+    "vitest": "^4.1.7"
   }
 }

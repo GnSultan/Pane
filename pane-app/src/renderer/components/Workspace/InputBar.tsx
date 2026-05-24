@@ -5,7 +5,8 @@ import { useShallow } from "zustand/react/shallow";
 import { TodoPanel } from "./TodoPanel";
 import type { Todo } from "../../lib/punk-types";
 import { isThinkingModel } from "../../lib/models";
-import { showFilePicker, brainMindGetAll, type MindEntry } from "../../lib/tauri-commands";
+import { showFilePicker, brainMindGetAll, brainMindAdd, type MindEntry } from "../../lib/tauri-commands";
+import { useMindStore } from "../../stores/mind";
 import { CaretTextArea } from "../shared";
 
 const EMPTY_TODOS: Todo[] = [];
@@ -268,7 +269,7 @@ function ModelPickerTrigger({
       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md
         bg-pane-bg ring-1 ring-pane-border/25
         text-pane-text-secondary btn-press select-none"
-      style={{ fontSize: "var(--pane-font-size-xs)" }}
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
       <div className={`w-1.5 h-1.5 rounded-full transition-colors shrink-0 ${autoRoute ? "bg-pane-status-added" : "bg-pane-text-secondary"}`} />
       <span>{label}</span>
@@ -623,6 +624,9 @@ export function InputBar({
   // Attach menu: closed → menu → thoughts
   const [attachMenu, setAttachMenu] = useState<"closed" | "menu" | "thoughts">("closed");
 
+  // Mind mode — redirects Enter to mind store instead of conversation
+  const [isMindMode, setIsMindMode] = useState(false);
+
   // Phase system — sticky, derived from conversation store.
   // phaseOverride is a local tap (cleared after send to re-sync with store).
   const [phaseOverride, setPhaseOverride] = useState<PhaseName | null>(null);
@@ -769,6 +773,21 @@ export function InputBar({
     return () => window.removeEventListener("pane:focus-input", handler);
   }, []);
 
+  // Cmd+M — toggle mind mode from anywhere in conversation
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "m") {
+        if (!isConversationVisible()) return;
+        e.preventDefault();
+        if (!expanded) setExpanded(true);
+        setIsMindMode(prev => !prev);
+        requestAnimationFrame(() => textareaRef.current?.focus());
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [expanded]);
+
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
     const pos = e.target.selectionStart ?? next.length;
@@ -798,24 +817,59 @@ export function InputBar({
     });
   }, []);
 
+  // ─── Mind mode callbacks ────────────────────────────────────────────
+
+  // Save to mind store and exit mind mode
+  const handleMindSave = useCallback(async () => {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    try {
+      const result = await brainMindAdd(trimmed, projectId);
+      if (result?.entry) {
+        useMindStore.getState().addEntry(result.entry);
+      }
+    } catch { /* silent */ }
+    setValue("");
+    setIsMindMode(false);
+  }, [value, projectId]);
+
+  // Toggle mind mode — also expand if collapsed
+  const toggleMindMode = useCallback(() => {
+    if (!expanded) setExpanded(true);
+    setIsMindMode(prev => !prev);
+  }, [expanded]);
+
+  // ─────────────────────────────────────────────────────────────────────
+
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         const trimmed = value.trim();
         if (trimmed) {
-          onSend(buildPrompt(trimmed), undefined, currentPhase);
-          setValue("");
-          setExpanded(false);
-          setPhaseOverride(null); // re-sync with store phase after send
+          if (isMindMode) {
+            handleMindSave();
+          } else {
+            onSend(buildPrompt(trimmed), undefined, currentPhase);
+            setValue("");
+            setExpanded(false);
+            setPhaseOverride(null);
+          }
         }
       }
-      if (e.key === "Escape" && isProcessing) {
-        e.preventDefault();
-        onAbort();
+      if (e.key === "Escape") {
+        if (isMindMode) {
+          e.preventDefault();
+          setIsMindMode(false);
+          return;
+        }
+        if (isProcessing) {
+          e.preventDefault();
+          onAbort();
+        }
       }
     },
-    [value, isProcessing, onSend, onAbort, buildPrompt, currentPhase],
+    [value, isProcessing, isMindMode, onSend, onAbort, buildPrompt, currentPhase, handleMindSave],
   );
 
   return (
@@ -998,7 +1052,7 @@ export function InputBar({
       )}
 
       {/* One card. Textarea + thoughts picker + button bar in column. */}
-      {expanded && <div ref={cardRef} className="rounded-xl ring-1 ring-pane-border/40 relative flex flex-col">
+      {expanded && <div ref={cardRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40">
 
         {attachMenu !== "thoughts" && (
           <CaretTextArea
@@ -1006,7 +1060,7 @@ export function InputBar({
             value={value}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
-            placeholder="let's build..."
+            placeholder={isMindMode ? "what's on your mind?" : "let's build..."}
             minHeight={56}
             maxHeight={window.innerHeight * 0.4}
             autoResize
@@ -1023,16 +1077,28 @@ export function InputBar({
             onClick={() => {
               const trimmed = value.trim();
               if (!trimmed) return;
-              onSend(buildPrompt(trimmed), undefined, currentPhase);
-              setValue("");
-              setPhaseOverride(null);
+              if (isMindMode) {
+                handleMindSave();
+              } else {
+                onSend(buildPrompt(trimmed), undefined, currentPhase);
+                setValue("");
+                setPhaseOverride(null);
+              }
             }}
             className="absolute top-1.5 right-1.5 z-10 w-9 h-9 flex items-center justify-center rounded-lg text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.06] transition-all duration-150 btn-press ring-1 ring-pane-border/40"
-            title="Send (Enter)"
+            title={isMindMode ? "Save to mind (Enter)" : "Send (Enter)"}
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
-            </svg>
+            {isMindMode ? (
+              /* checkmark — save to mind */
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            ) : (
+              /* arrow — send to conversation */
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m5 9 7-7 7 7" /><path d="M12 16V2" /><circle cx="12" cy="21" r="1" />
+              </svg>
+            )}
           </button>
         )}
 
@@ -1045,7 +1111,7 @@ export function InputBar({
           />
         )}
 
-        {/* Button bar — attach (left) + mode + model (right), all in one row */}
+        {/* Button bar — attach (left) + mode + model (right), all in one row. */}
         <div
           className="flex items-center gap-2 p-1.5 font-mono pointer-events-none"
           style={{ fontSize: "var(--pane-font-size-xs)" }}
@@ -1060,42 +1126,43 @@ export function InputBar({
             />
           ) : (
             <>
-              {/* Attach — first item, inherits font-mono + font-size-xs from this row */}
-              {attachMenu === "menu" ? (
-                <>
-                  <button
-                    onClick={() => setAttachMenu("thoughts")}
-                    className="pointer-events-auto shrink-0 flex items-center px-3 py-0.5 opacity-35 hover:opacity-100 transition-opacity btn-press"
-                  >
-                    <span className="whitespace-nowrap" style={{ color: "var(--pane-text)", lineHeight: 1.5 }}>thoughts</span>
-                  </button>
-                  <button
-                    onClick={async () => {
-                      setAttachMenu("closed");
-                      try {
-                        const paths = await showFilePicker(projectRoot, projectRoot);
-                        if (!paths || paths.length === 0) return;
-                        const insertion = paths.map(p => `\`${p}\``).join(" ");
-                        setValue(prev => prev ? `${prev} ${insertion}` : insertion);
-                      } catch (err) { console.error('Failed to open file picker:', err); }
-                    }}
-                    className="pointer-events-auto shrink-0 flex items-center px-3 py-0.5 opacity-35 hover:opacity-100 transition-opacity btn-press"
-                  >
-                    <span className="whitespace-nowrap" style={{ color: "var(--pane-text)", lineHeight: 1.5 }}>path</span>
-                  </button>
-                  <button
-                    onClick={() => setAttachMenu("closed")}
-                    className="pointer-events-auto shrink-0 flex items-center px-2 py-0.5 opacity-35 hover:opacity-60 transition-opacity"
-                    style={{ lineHeight: 1 }}
-                  >
-                    ×
-                  </button>
-                </>
-              ) : (
-                <div className="self-stretch shrink-0 flex items-center">
+              {/* Left group: attach + mind toggle, side by side with explicit gap */}
+              <div className="shrink-0 flex items-center gap-3">
+                {/* Attach (+) button */}
+                {attachMenu === "menu" ? (
+                  <>
+                    <button
+                      onClick={() => setAttachMenu("thoughts")}
+                      className="pointer-events-auto shrink-0 flex items-center px-3 py-0.5 opacity-35 hover:opacity-100 transition-opacity btn-press"
+                    >
+                      <span className="whitespace-nowrap" style={{ color: "var(--pane-text)", lineHeight: 1.5 }}>thoughts</span>
+                    </button>
+                    <button
+                      onClick={async () => {
+                        setAttachMenu("closed");
+                        try {
+                          const paths = await showFilePicker(projectRoot, projectRoot);
+                          if (!paths || paths.length === 0) return;
+                          const insertion = paths.map(p => `\`${p}\``).join(" ");
+                          setValue(prev => prev ? `${prev} ${insertion}` : insertion);
+                        } catch (err) { console.error('Failed to open file picker:', err); }
+                      }}
+                      className="pointer-events-auto shrink-0 flex items-center px-3 py-0.5 opacity-35 hover:opacity-100 transition-opacity btn-press"
+                    >
+                      <span className="whitespace-nowrap" style={{ color: "var(--pane-text)", lineHeight: 1.5 }}>path</span>
+                    </button>
+                    <button
+                      onClick={() => setAttachMenu("closed")}
+                      className="pointer-events-auto shrink-0 flex items-center px-2 py-0.5 opacity-35 hover:opacity-60 transition-opacity"
+                      style={{ lineHeight: 1 }}
+                    >
+                      ×
+                    </button>
+                  </>
+                ) : (
                   <button
                     onClick={() => setAttachMenu(attachMenu === "thoughts" ? "closed" : "menu")}
-                    className="pointer-events-auto h-full aspect-square flex items-center justify-center rounded-md
+                    className="pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md
                       bg-pane-bg ring-1 ring-pane-border/25
                       text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
                   >
@@ -1107,11 +1174,40 @@ export function InputBar({
                       </svg>
                     )}
                   </button>
-                </div>
-              )}
+                )}
+
+                {/* Mind toggle — next to attach */}
+                <button
+                  onClick={toggleMindMode}
+                  className={`pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md btn-press transition-colors ring-1 ${
+                    isMindMode
+                      ? "text-pane-terminal bg-pane-bg ring-pane-border/25"
+                      : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
+                  }`}
+                  title={isMindMode ? "Exit mind mode (⌘M)" : "Save to mind (⌘M)"}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+                    style={isMindMode ? { filter: "drop-shadow(0 0 6px var(--pane-terminal))" } : undefined}
+                  >
+                    <circle cx="12" cy="12" r="9" fill={isMindMode ? "currentColor" : "none"} opacity={isMindMode ? 0.15 : 1} />
+                    <circle cx="12" cy="12" r="3" fill={isMindMode ? "currentColor" : "none"} />
+                  </svg>
+                </button>
+              </div>
 
               <div className="flex-1" />
+
               {(() => {
+                if (isMindMode) {
+                  return (
+                    <span
+                      className="font-mono shrink-0 px-3 py-1.5 rounded-md"
+                      style={{ fontSize: "var(--pane-font-size-sm)", color: "var(--pane-terminal)" }}
+                    >
+                      mind
+                    </span>
+                  );
+                }
                 const color = PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)";
                 if (isProcessing) {
                   return (
@@ -1129,7 +1225,7 @@ export function InputBar({
                     className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md shrink-0
                       bg-pane-bg ring-1 ring-pane-border/25
                       hover:text-pane-text btn-press transition-colors"
-                    style={{ color }}
+                    style={{ color, fontSize: "var(--pane-font-size-sm)" }}
                   >
                     <span>{currentPhase}</span>
                   </button>

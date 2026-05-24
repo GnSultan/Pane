@@ -31,7 +31,7 @@ import { calculateCost } from "./pricing.mjs";
 import { buildSummary, toolResultCache } from "./tool-result-cache.mjs";
 import { forcePruneToBudget, applyV4TurnSelection, dropAllNonFreshTurns } from "./conversation-lifecycle.mjs";
 import { contextStore } from "./context-store.mjs";
-import { scoreTurnsByRelevance, selectTurns, base64ToFloat32Array } from "./semantic-turn-selector.mjs";
+import { scoreTurnsByRelevance, selectTurns, base64ToFloat32Array, getTopRelevantSummaries, formatSemanticPool } from "./semantic-turn-selector.mjs";
 import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
 import {
   openJournal,
@@ -39,7 +39,7 @@ import {
   replay,
   clearJournal,
 } from "./session-journal.mjs";
-import { createDigest, updateDigest } from "./context-digest.mjs";
+
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 
 // ============================================================================
@@ -945,130 +945,8 @@ function getAnthropicToolsForPhase(phase) {
   }));
 }
 
-const ANTHROPIC_TOOLS = TOOL_DEFINITIONS.map((td) => ({
-  name: td.function.name,
-  description: td.function.description,
-  input_schema: td.function.parameters,
-}));
 
 // ---------------------------------------------------------------------------
-// Auto Todo Advancement — Pane drives status, model just sets content
-// ---------------------------------------------------------------------------
-
-const VERIFY_COMMANDS =
-  /\b(jest|vitest|pytest|mocha|karma|test|tsc|build|lint|eslint|check|cargo\s+check|go\s+vet|go\s+build|make)\b/i;
-
-/**
- * Advance todo statuses based on what Pane actually knows happened.
- *
- * Called after each significant tool result. Reads session state, mutates
- * statuses, persists, and emits todos_updated — without the model needing
- * to call TodoWrite.
- *
- * @param {string} projectId
- * @param {'write'|'verify_pass'|'turn_end'} trigger
- * @param {Function} onEvent  — backend event emitter
- * @param {string} requestId
- */
-function autoAdvanceTodos(projectId, trigger, onEvent, requestId) {
-  const state = readState(projectId);
-  const todos = state.todos;
-  if (!todos || todos.length === 0) return;
-
-  const hasPending = todos.some((t) => t.status === "pending");
-  const hasInProgress = todos.some((t) => t.status === "in_progress");
-  const allDone = todos.every((t) => t.status === "completed");
-
-  if (allDone) return;
-
-  let updated = todos.map((t) => ({ ...t })); // shallow clone
-  let changed = false;
-
-  switch (trigger) {
-    case "turn_start": {
-      // Turn is beginning. If nothing is in_progress, start the first pending.
-      // This gives immediate UI feedback that work is happening.
-      if (!hasInProgress) {
-        const firstPending = updated.findIndex((t) => t.status === "pending");
-        if (firstPending !== -1) {
-          updated[firstPending] = {
-            ...updated[firstPending],
-            status: "in_progress",
-          };
-          changed = true;
-        }
-      }
-      break;
-    }
-
-    case "write": {
-      // A real file change just happened.
-      // If nothing is in_progress, start the first pending.
-      // If something IS in_progress and a DIFFERENT file is being worked on,
-      // complete the current one and advance — heuristic: each write = one todo step.
-      if (!hasInProgress) {
-        const firstPending = updated.findIndex((t) => t.status === "pending");
-        if (firstPending !== -1) {
-          updated[firstPending] = {
-            ...updated[firstPending],
-            status: "in_progress",
-          };
-          changed = true;
-        }
-      }
-      break;
-    }
-
-    case "verify_pass": {
-      // A verification command (test/build/tsc) just succeeded.
-      // The current in_progress step is done — complete it and start the next.
-      const inProgressIdx = updated.findIndex(
-        (t) => t.status === "in_progress",
-      );
-      if (inProgressIdx !== -1) {
-        updated[inProgressIdx] = {
-          ...updated[inProgressIdx],
-          status: "completed",
-        };
-        changed = true;
-        // Advance to next pending
-        const nextPending = updated.findIndex((t) => t.status === "pending");
-        if (nextPending !== -1) {
-          updated[nextPending] = {
-            ...updated[nextPending],
-            status: "in_progress",
-          };
-        }
-      }
-      break;
-    }
-
-    case "turn_end": {
-      // Turn completed successfully. Mark all in_progress as completed —
-      // if the model finished the turn without errors, the work is done.
-      let anyCompleted = false;
-      updated = updated.map((t) => {
-        if (t.status === "in_progress") {
-          anyCompleted = true;
-          return { ...t, status: "completed" };
-        }
-        return t;
-      });
-      changed = anyCompleted;
-      break;
-    }
-  }
-
-  if (!changed) return;
-
-  mergeState(projectId, { todos: updated });
-  onEvent(
-    projectId,
-    { event: "todos_updated", data: { todos: updated } },
-    requestId,
-  );
-}
-
 // ============================================================================
 // OpenRouter model curation — Pane-aware filter + normalizer
 // ============================================================================
@@ -1111,14 +989,6 @@ function _familyFor(modelId) {
     if (lower.startsWith(prefix)) return { provider, tier };
   }
   return null;
-}
-
-function _isPaneModel(m) {
-  const params = m.supported_parameters || [];
-  const hasTools = params.includes("tools") || params.includes("tool_choice");
-  if (!hasTools) return false;
-  if ((m.context_length ?? 0) < 16_384) return false;
-  return _familyFor(m.id) !== null;
 }
 
 function _normalizeModel(m) {
@@ -1232,6 +1102,19 @@ const MODEL_OUTPUT_LIMITS = [
 ];
 
 const DEFAULT_MAX_TOKENS = 4096;
+
+/**
+ * Providers with explicit cache_control breakpoints that tolerate
+ * mid-conversation turn mutations without destroying the cache prefix.
+ *
+ * Auto-caching providers (DeepSeek, Kimi, Qwen, etc.) cache the
+ * conversation body by prefix stability — the first byte that differs
+ * from the cached prefix breaks the cache. Mid-body mutations destroy
+ * this. These providers skip V4 body-level pruning and rely on the
+ * semantic pool in the system prompt session tier + chronological
+ * forcePruneToBudget for overflow management.
+ */
+const PROVIDERS_WITH_EXPLICIT_CACHE = new Set(["anthropic"]);
 
 /**
  * Resolve the max_tokens value for a given model ID.
@@ -1550,8 +1433,6 @@ export class ApiBackend extends PunkBackend {
   }
 
   normalizeMessages(messages, provider, model = null, context = null) {
-    const isAnthropic = provider === "anthropic";
-    const isGemini = provider === "gemini";
     const isDeepSeek =
       provider === "deepseek" ||
       model?.toLowerCase().includes("deepseek") ||
@@ -1914,14 +1795,6 @@ export class ApiBackend extends PunkBackend {
       request.requestId,
     );
 
-    // Auto-start: mark first pending todo as in_progress when turn begins
-    autoAdvanceTodos(
-      request.projectId,
-      "turn_start",
-      this.onEvent.bind(this),
-      request.requestId,
-    );
-
     try {
       const apiConfig = await this.getApiConfig(request.provider || null);
       console.log(
@@ -1979,6 +1852,37 @@ export class ApiBackend extends PunkBackend {
         }
       }
 
+      // ── Fetch & embed turn summaries (needed for session tier semantic pool) ──
+      // Moved up to run before orchestrator so the semantic pool can be injected
+      // into systemTiers.session. Reuses the same queryEmbB64 computed above.
+      // Auto-caching providers (DeepSeek, Kimi, etc.) get their semantic context
+      // here in the system prompt — the conversation body stays chronological.
+      // Explicit-caching providers (Anthropic) also benefit: the session tier
+      // is breakpointed and cached for 5 minutes during tool-call loops.
+      let turnSummaries = [];
+      if (this._brainRequest && queryEmbB64) {
+        try {
+          turnSummaries = contextStore.getTurnSummaries(request.projectId);
+          if (turnSummaries && turnSummaries.length > 0) {
+            const unembedded = turnSummaries.filter(s => !s.embedding);
+            if (unembedded.length > 0) {
+              const texts = unembedded.map(s => s.compressedText);
+              const result = await this._brainRequest("embed_texts", { texts });
+              if (result?.embeddings) {
+                for (const s of unembedded) {
+                  const b64 = result.embeddings[s.compressedText];
+                  if (b64) s.embedding = base64ToFloat32Array(b64);
+                }
+                contextStore.updateTurnSummaries(request.projectId, turnSummaries);
+              }
+            }
+          }
+        } catch (err) {
+          turnSummaries = [];
+          console.warn(`[http] turn summary embedding failed: ${err.message}`);
+        }
+      }
+
       // Budget-aware context assembly via orchestrator (single path)
       const conversationTokens = estimateConversationTokens(
         request.history || [],
@@ -2026,6 +1930,32 @@ export class ApiBackend extends PunkBackend {
       if (request.escalationHint) {
         systemPrompt += `\n\n${request.escalationHint}`;
         if (systemTiers) systemTiers.turn += `\n\n${request.escalationHint}`;
+      }
+
+      // ── Inject semantic turn pool into session tier ──
+      // The pool surfaces the most relevant past turns for the current query.
+      // Injected into the session tier so auto-caching providers (DeepSeek, Kimi)
+      // get semantic context at the system/message boundary rather than through
+      // mid-body turn mutations that break prefix cache. Explicit-caching providers
+      // (Anthropic) also benefit — the session tier is breakpointed and cached
+      // for 5 minutes during tool-call loops.
+      //
+      // The pool is built from the turn summaries fetched & embedded above,
+      // using the same query embedding. When the brain engine is down or no
+      // summaries exist, the session tier remains empty.
+      if (queryEmbB64 && turnSummaries.length > 0) {
+        try {
+          const topSummaries = getTopRelevantSummaries(queryEmbB64, turnSummaries, 8);
+          if (topSummaries?.length > 0) {
+            const poolText = formatSemanticPool(topSummaries);
+            if (poolText) {
+              systemTiers.session = (systemTiers.session || "") + poolText;
+              systemPrompt += poolText;
+            }
+          }
+        } catch (err) {
+          console.warn(`[http] semantic pool injection failed: ${err.message}`);
+        }
       }
 
       // Emit synthetic init event after config is validated
@@ -2132,49 +2062,32 @@ export class ApiBackend extends PunkBackend {
       // full, the window is continuously managed:
       //   Phase 1: Prune old tool results (3k file reads → 30-token summaries)
       //   Phase 2: Drop turns (semantic by default, chronological fallback)
-      // Managed by conversation-lifecycle.mjs — three-tier progressive summarization.
       //
-      // Semantic turn selection computes which turns to keep/drop based on
-      // relevance to the current query. Falls back to chronological if
-      // query embedding is unavailable.
-      const systemTokens =
-        context.budget?.systemUsed ||
-        Math.round((systemPrompt?.length || 0) / 4);
-
-      // ── Semantic turn selection ──────────────────────────────────────
-      // Reuses queryEmbB64 computed earlier. When unavailable, skip pruning.
-      // The pre-flight guardrail + healing path handle overflow.
+      // ── Provider-aware V4 body mutation ──────────────────────────────
+      // Explicit-caching providers (Anthropic) tolerate mid-body mutations
+      // because they use cache_control breakpoints. Auto-caching providers
+      // (DeepSeek, Kimi, Qwen, etc.) cache by prefix stability — body
+      // mutations destroy the cache. For auto-caching providers:
+      //   • Semantic context → system prompt session tier (injected above)
+      //   • Overflow management → chronological forcePruneToBudget guardrail
+      //   • Body → chronological, prefix-stable
+      const canBodyMutate = PROVIDERS_WITH_EXPLICIT_CACHE.has(request.provider);
       let turnSelection = null;
-      if (this._brainRequest && queryEmbB64) {
+      if (canBodyMutate && this._brainRequest && queryEmbB64) {
         try {
-          const summaries = contextStore.getTurnSummaries(request.projectId);
-          if (summaries && summaries.length > 0) {
-            // Embed any unembedded turn summaries (query already embedded above)
-            const unembedded = summaries.filter(s => !s.embedding);
-            if (unembedded.length > 0) {
-              const texts = unembedded.map(s => s.compressedText);
-              const result = await this._brainRequest("embed_texts", { texts });
-              if (result?.embeddings) {
-                for (const s of unembedded) {
-                  const b64 = result.embeddings[s.compressedText];
-                  if (b64) s.embedding = base64ToFloat32Array(b64);
-                }
-                contextStore.updateTurnSummaries(request.projectId, summaries);
-              }
-            }
-
-            // Score and select turns by relevance
-            const scored = scoreTurnsByRelevance(queryEmbB64, summaries);
+          // turnSummaries already fetched & embedded above (for session tier)
+          if (turnSummaries.length > 0) {
+            const scored = scoreTurnsByRelevance(queryEmbB64, turnSummaries);
             turnSelection = selectTurns(scored);
           }
         } catch (err) {
-          console.warn(`[http] semantic turn selection failed (falling back to chronological): ${err.message}`);
+          console.warn(`[http] semantic turn selection failed: ${err.message}`);
         }
       }
 
       // ── Context window management (V4-direct) ────────────────────────
-      // Semantic turn selection drives pruning directly. When unavailable
-      // (brain engine down), skip — the pre-flight guardrail handles overflow.
+      // Only applies to explicit-caching providers. Auto-caching providers
+      // let the pre-flight forcePruneToBudget guardrail handle overflow.
       const windowResult = turnSelection
         ? applyV4TurnSelection(messages, turnSelection, request.projectId)
         : { action: "none", tokensSaved: 0, droppedTurns: [] };
@@ -2194,25 +2107,9 @@ export class ApiBackend extends PunkBackend {
         );
       }
 
-      // ── Context Digest: maintain living session summary ──────────────────
-      // Create digest on first turn so deep-session has continuity when
-      // turns are inevitably dropped. Update it whenever turns are pruned.
-      try {
-        if (isNewConversation && !journalResumed) {
-          const sessionId = `http-${Date.now()}`;
-          const objective = request.prompt?.slice(0, 300) || "(new session)";
-          createDigest(request.projectId, sessionId, objective);
-        }
-        if (windowResult.droppedTurns?.length > 0) {
-          updateDigest(request.projectId, windowResult.droppedTurns, null);
-        }
-      } catch (err) {
-        console.warn(`[http] digest update failed: ${err.message}`);
-      }
-
-      // Build the user prompt for this turn. If resuming from journal with
-      // progress data, inject the progress context so the model knows exactly
-      // where it was when it dropped.
+      // ── Session Resume: inject progress context ──────────────────────────
+      // When resuming from journal, stuff last session's progress into the
+      // user message so the model picks up exactly where it left off.
       if (journalResumed && lastProgress) {
         const resumeParts = [request.prompt];
         resumeParts.push(
@@ -2479,7 +2376,6 @@ export class ApiBackend extends PunkBackend {
 
           // Track retry history for debugging
           const retryHistory = [];
-          let lastErrorType = null;
           // Preserves the error body across the retry loop boundary — the 400
           // handler reads response.text() to check for "insufficient tool messages",
           // which exhausts the body stream. If the error is NOT healable and we
@@ -2567,7 +2463,6 @@ export class ApiBackend extends PunkBackend {
                 ) {
                   // Explicitly categorize common client errors
                   if (status === 400) {
-                    lastErrorType = "bad_request";
                     // ── HEALABLE 400: insufficient tool messages ──
                     // Read the error body to check for sequence violations.
                     // This catches cases where normalizeMessages + validateMessageSequence
@@ -2694,22 +2589,18 @@ export class ApiBackend extends PunkBackend {
                       `[http] Bad request (400): ${errorBody.slice(0, 300)}`,
                     );
                   } else if (status === 401) {
-                    lastErrorType = "unauthorized";
                     console.error(
                       `[http] Unauthorized (401): Check API key configuration`,
                     );
                   } else if (status === 403) {
-                    lastErrorType = "forbidden";
                     console.error(
                       `[http] Forbidden (403): ${response.statusText}`,
                     );
                   } else if (status === 422) {
-                    lastErrorType = "validation_error";
                     console.error(
                       `[http] Validation error (422): ${response.statusText}`,
                     );
                   } else {
-                    lastErrorType = `client_error_${status}`;
                     console.error(
                       `[http] Client error (${status}): ${response.statusText}`,
                     );
@@ -2722,9 +2613,6 @@ export class ApiBackend extends PunkBackend {
                   (isRateLimit || isTransientClientError) &&
                   attempt < MAX_RETRIES
                 ) {
-                  lastErrorType = isRateLimit
-                    ? "rate_limit"
-                    : `transient_error_${status}`;
                   const retryAfterSec = parseInt(
                     response.headers.get("retry-after") || "0",
                     10,
@@ -2789,7 +2677,6 @@ export class ApiBackend extends PunkBackend {
 
                 // 5xx server errors: 7+ retries with exponential backoff + jitter
                 if (status >= 500 && attempt < MAX_RETRIES) {
-                  lastErrorType = `server_error_${status}`;
                   const jitter = Math.random() * 500;
                   const delay =
                     Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) +
@@ -2842,7 +2729,6 @@ export class ApiBackend extends PunkBackend {
               }
 
               if (attempt < MAX_RETRIES) {
-                lastErrorType = "network_failure";
                 const jitter = Math.random() * 500;
                 const delay =
                   Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 30000) +
@@ -3145,7 +3031,7 @@ export class ApiBackend extends PunkBackend {
               );
 
               // Strip the assistant message — it's incomplete
-              const popped = messages.pop();
+              messages.pop();
 
               // Preserve partial thinking/content as context for the retry on
               // every attempt, not just the third. Without this, the model
@@ -3458,7 +3344,6 @@ export class ApiBackend extends PunkBackend {
             request.projectId,
             request.workingDir,
           );
-          const toolResults = [];
           let toolSeq = 0; // sequence counter for tool-result-cache
 
           for (const tool of state.toolUses.values()) {
@@ -3611,35 +3496,14 @@ export class ApiBackend extends PunkBackend {
                 );
               }
 
-              // ── Auto-advance todos based on what actually happened ─────────
-              // write_file / replace: real work happened → advance first pending
+              // Track changed file for Turn Sentinel
               if (
                 !isError &&
                 (tool.name === "write_file" || tool.name === "replace")
               ) {
-                autoAdvanceTodos(
-                  request.projectId,
-                  "write",
-                  this.onEvent.bind(this),
-                  request.requestId,
-                );
-                // Track changed file for Turn Sentinel
                 const changedPath =
                   parsedInput.file_path || parsedInput.path || "";
                 if (changedPath) arbiterChangedFiles.add(changedPath);
-              }
-
-              // run_shell_command: if it's a verify command and it passed → complete current step
-              if (!isError && tool.name === "run_shell_command") {
-                const cmd = (parsedInput.command || "").toLowerCase();
-                if (VERIFY_COMMANDS.test(cmd)) {
-                  autoAdvanceTodos(
-                    request.projectId,
-                    "verify_pass",
-                    this.onEvent.bind(this),
-                    request.requestId,
-                  );
-                }
               }
             }
 
@@ -3767,15 +3631,10 @@ export class ApiBackend extends PunkBackend {
           }
 
           // Window management — V4-direct when turn selection is available
-          const loopWindowResult = turnSelection
-            ? applyV4TurnSelection(messages, turnSelection, request.projectId)
-            : { action: "none", tokensSaved: 0, droppedTurns: [] };
-          if (loopWindowResult.droppedTurns?.length > 0) {
-            try {
-              updateDigest(request.projectId, loopWindowResult.droppedTurns, null);
-            } catch (err) {
-              console.warn(`[http] digest update failed (loop): ${err.message}`);
-            }
+          // Only for explicit-caching providers (Anthropic). Auto-caching
+          // providers skip body-level pruning to keep the cache prefix stable.
+          if (turnSelection && PROVIDERS_WITH_EXPLICIT_CACHE.has(request.provider)) {
+            applyV4TurnSelection(messages, turnSelection, request.projectId);
           }
         } catch (turnError) {
           // Per-turn error handling — retry recoverable errors inside the loop
@@ -3844,14 +3703,8 @@ export class ApiBackend extends PunkBackend {
           throw turnError; // non-recoverable — propagate to outer catch
         }
 
-        // Turn completed cleanly — mark boundary in journal and advance todos
+        // Turn completed cleanly — mark boundary in journal
         journal.markTurn(turn);
-        autoAdvanceTodos(
-          request.projectId,
-          "turn_end",
-          this.onEvent.bind(this),
-          request.requestId,
-        );
 
         // ── Turn Sentinel: independently verify the LLM's work ─────────────
         // Runs tsc + eslint on changed files. Verdict persisted for the context
@@ -5657,7 +5510,6 @@ export class ApiBackend extends PunkBackend {
     const MAX_RETRIES = 7;
     const BASE_DELAY_MS = 1000;
     let attempt = 0;
-    let lastError = null;
 
     while (true) {
       try {
