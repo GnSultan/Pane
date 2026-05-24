@@ -6,12 +6,42 @@ import {
   dialog,
   app,
   utilityProcess,
+  nativeImage,
 } from "electron";
 import windowStateKeeper from "electron-window-state";
-import { execFile } from "node:child_process";
+import { execSync, execFileSync, execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
-import { promisify } from "node:util";
+
+// ── FD Repair for macOS packaged app ─────────────────────────────────────
+// When Pane is launched as a macOS .app bundle (even from terminal via
+// ./Pane.app/Contents/MacOS/Pane), stdin/stdout/stderr FDs 0/1/2 may be
+// invalid. This breaks ALL Node.js child_process spawn/execSync calls because
+// libuv tries to create pipes from or dup2 onto these bad FDs, failing with
+// EBADF (errno 9). We close and reopen them to /dev/null to guarantee valid
+// FDs before any other code can attempt a spawn.
+//
+// This fix is specifically for packaged macOS builds (Electron 40+).
+// Dev mode (run via `node scripts/dev.mjs` from terminal) is unaffected.
+try {
+  for (const fd of [0, 1, 2]) {
+    try {
+      // fstat succeeds if fd is valid
+      fs.fstatSync(fd);
+    } catch {
+      // fd is invalid — close it (might throw if -1 but we catch all)
+      try { fs.closeSync(fd); } catch {}
+      // Reopen /dev/null on the lowest available fd (which will be fd)
+      // stdin = read mode, stdout/stderr = write mode
+      fs.openSync("/dev/null", fd === 0 ? "r" : "w");
+    }
+  }
+} catch (fdRepairErr) {
+  // Best-effort: FD repair is a safety net, not critical. The cmd-worker
+  // approach handles command execution even if FD repair fails.
+  console.warn("[main] FD repair failed (expected in dev mode):", fdRepairErr.message);
+}
+
 import ignore from "ignore";
 import chokidar from "chokidar";
 import {
@@ -21,21 +51,70 @@ import {
   punkEngine,
 } from "./punk-engine.mjs";
 import { modelManager } from "./model-manager.mjs";
+import { startBackupSchedule } from "./backup-engine.mjs";
+import { initCloudAuth } from "./cloud-auth.mjs";
+import { registerCloudSyncHandlers } from "./cloud-sync.mjs";
+import { MindPunks } from "./mind-punks.mjs";
+import { getModelRates } from "./pricing.mjs";
+import { updateLastPrompt, updateLastResponse, readThreadState } from "./thread-state.mjs";
+import { contextStore } from "./context-store.mjs";
+import { getPaneDb, extractMessageText } from "./pane-db.mjs";
+import { loadRecentTurns } from "./session-turns.mjs";
+import { setCmdWorker, execThroughWorker } from "./tool-executor.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
+let mindPunks = null;
 // Punk engine runs in a UtilityProcess to keep the main thread free.
 // Main process is a thin relay — never touches JSON.parse or model output.
-function registerClaudeHandlers() {
+async function registerClaudeHandlers() {
   // Punk is the default engine; keep these names for backwards compatibility.
-  registerPunkHandlers();
+  await registerPunkHandlers();
+
+  // ── Token Usage Persistence Hook ───────────────────────────────────────
+  // Intercept all token_usage events from backends (HTTP and CLI) and record
+  // them to SQLite for long-term analytics.
+  const origHandleBackendEvent = punkEngine.handleBackendEvent.bind(punkEngine);
+  punkEngine.handleBackendEvent = (projectId, event, requestId) => {
+    if (event.event === "token_usage") {
+      try {
+        const db = getPaneDb();
+        if (!db.stmts.insertTokenUsage) {
+          console.warn("[main] Database not initialized, skipping token usage recording");
+          return;
+        }
+        const usage = event.data;
+        const effectiveProjectId = projectId || event.data?.project_id || "unknown";
+        const id = `tu-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+        db.stmts.insertTokenUsage.run(
+          id,
+          effectiveProjectId,
+          usage.provider,
+          usage.activity_type,
+          usage.model,
+          usage.input_tokens,
+          usage.output_tokens,
+          usage.cache_creation_input_tokens || 0,
+          usage.cache_read_input_tokens || 0,
+          usage.cost_usd,
+          usage.cost_source || 'estimated',
+          usage.cost_rate_snapshot || null,
+          usage.duration_ms || 0,
+          Date.now(),
+        );
+      } catch (err) {
+        console.error("[main] Failed to record token usage:", err.message);
+      }
+    }
+    return origHandleBackendEvent(projectId, event, requestId);
+  };
+
   ipcMain.handle("send_to_claude", async (_event, args) => {
-    const { projectId, prompt, workingDir, sessionId, model, intent } = args;
+    const { projectId, prompt, workingDir, model, intent } = args;
     await punkEngine.spawn({
       projectId,
       prompt,
       workingDir,
-      sessionId,
       model,
       intent,
     });
@@ -46,6 +125,44 @@ function registerClaudeHandlers() {
   ipcMain.handle("terminate_claude_session", async (_event, args) => {
     await punkEngine.terminate(args.projectId);
   });
+  ipcMain.handle("get_token_analytics", async (_event, { projectId, sinceMs }) => {
+    try {
+      const db = getPaneDb();
+      if (!db.stmts.getTokenAnalytics) {
+        console.warn("[main] Database not fully initialized, returning empty analytics");
+        return [];
+      }
+      if (projectId) {
+        return db.stmts.getTokenAnalytics.all(projectId, sinceMs || 0);
+      } else {
+        return db.stmts.getGlobalTokenAnalytics.all(sinceMs || 0);
+      }
+    } catch (err) {
+      console.error("[main] get_token_analytics error:", err.message);
+      return [];
+    }
+  });
+  ipcMain.handle("get_token_timeseries", async (_event, { projectId, sinceMs }) => {
+    try {
+      const db = getPaneDb();
+      if (projectId) {
+        return db.stmts.getTokenTimeSeries?.all(projectId, sinceMs || 0) || [];
+      }
+      return db.stmts.getGlobalTokenTimeSeries?.all(sinceMs || 0) || [];
+    } catch (err) {
+      console.error("[main] get_token_timeseries error:", err.message);
+      return [];
+    }
+  });
+
+  ipcMain.handle("get_model_rates", async (_event, { models }) => {
+    const rates = {};
+    for (const m of models) {
+      rates[m] = getModelRates(m);
+    }
+    return rates;
+  });
+
   ipcMain.handle("check_claude_version", async () => {
     try {
       const { stdout } = await execFileAsync("claude", ["--version"], {
@@ -59,164 +176,57 @@ function registerClaudeHandlers() {
       return { current: null, error: error.message };
     }
   });
-  ipcMain.handle("check_claude_update", async () => {
-    try {
-      // Get current version from claude --version
-      const { stdout: versionOut } = await execFileAsync(
-        "claude",
-        ["--version"],
-        { env: getEnvWithPath() },
-      );
-      const currentMatch = versionOut.trim().match(/^([\d.]+)/);
-      const current = currentMatch?.[1] ?? null;
+}
+function execFileAsync(cmd, args, options = {}) {
+  return _execFileViaWorker(cmd, args, options).catch(() =>
+    _execFileDirect(cmd, args, options)
+  );
+}
 
-      // Get latest version from npm registry (no install, just metadata)
-      const { stdout: npmOut } = await execFileAsync(
-        "npm",
-        ["show", "@anthropic-ai/claude-code", "version"],
-        { timeout: 15000, env: getEnvWithPath() },
-      );
-      const latest = npmOut.trim() || null;
-
-      if (!current || !latest) {
-        return {
-          updateAvailable: false,
-          currentVersion: current,
-          newVersion: null,
-          error: null,
-        };
+function _execFileDirect(cmd, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const execOpts = { encoding: "utf-8", env: getEnvWithPath(), ...options };
+    execFile(cmd, args, execOpts, (error, stdout, stderr) => {
+      if (error) {
+        const wrapped = new Error(error.message);
+        wrapped.stdout = stdout || "";
+        wrapped.stderr = stderr || "";
+        wrapped.code = error.code;
+        wrapped.status = error.status ?? null;
+        wrapped.signal = error.signal || null;
+        wrapped.killed = error.killed || false;
+        reject(wrapped);
+      } else {
+        resolve({ stdout: stdout || "", stderr: stderr || "" });
       }
-
-      const updateAvailable = latest !== current;
-      return {
-        updateAvailable,
-        currentVersion: current,
-        newVersion: updateAvailable ? latest : null,
-        error: null,
-      };
-    } catch (error) {
-      return {
-        updateAvailable: false,
-        currentVersion: null,
-        newVersion: null,
-        error: error.message,
-      };
-    }
-  });
-  ipcMain.handle("update_claude", async () => {
-    try {
-      const env = getEnvWithPath();
-
-      // Find where claude is globally installed
-      const { stdout: prefixOut } = await execFileAsync("npm", ["root", "-g"], {
-        env,
-        timeout: 10000,
-      });
-      const globalRoot = prefixOut.trim(); // e.g. /Users/x/.nvm/.../lib/node_modules
-      const pkgDir = path.join(globalRoot, "@anthropic-ai", "claude-code");
-
-      // Remove existing install directory — npm ENOTEMPTY prevents in-place upgrade
-      await fs.promises.rm(pkgDir, { recursive: true, force: true });
-
-      // Fresh install
-      const { stdout, stderr } = await execFileAsync(
-        "npm",
-        ["install", "-g", "@anthropic-ai/claude-code@latest"],
-        { timeout: 120000, env },
-      );
-      return { success: true, output: stdout + stderr, error: null };
-    } catch (error) {
-      const output = (error.stdout || "") + (error.stderr || "");
-      return { success: false, output, error: error.message };
-    }
-  });
-
-  ipcMain.handle("check_gemini_version", async () => {
-    try {
-      const { stdout } = await execFileAsync("gemini", ["-v"], {
-        env: getEnvWithPath(),
-      });
-      const versionMatch = stdout.trim().match(/^([\d.]+)/);
-      if (!versionMatch)
-        return { current: null, error: "Could not parse version" };
-      return { current: versionMatch[1], error: null };
-    } catch (error) {
-      return { current: null, error: error.message };
-    }
-  });
-
-  ipcMain.handle("check_gemini_update", async () => {
-    try {
-      // Get current version from gemini -v
-      const { stdout: versionOut } = await execFileAsync("gemini", ["-v"], {
-        env: getEnvWithPath(),
-      });
-      const currentMatch = versionOut.trim().match(/^([\d.]+)/);
-      const current = currentMatch?.[1] ?? null;
-
-      // Get latest version from npm registry
-      const { stdout: npmOut } = await execFileAsync(
-        "npm",
-        ["show", "@google/gemini-cli", "version"],
-        { timeout: 15000, env: getEnvWithPath() },
-      );
-      const latest = npmOut.trim() || null;
-
-      if (!current || !latest) {
-        return {
-          updateAvailable: false,
-          currentVersion: current,
-          newVersion: null,
-          error: null,
-        };
-      }
-
-      const updateAvailable = latest !== current;
-      return {
-        updateAvailable,
-        currentVersion: current,
-        newVersion: updateAvailable ? latest : null,
-        error: null,
-      };
-    } catch (error) {
-      return {
-        updateAvailable: false,
-        currentVersion: null,
-        newVersion: null,
-        error: error.message,
-      };
-    }
-  });
-
-  ipcMain.handle("update_gemini", async () => {
-    try {
-      const env = getEnvWithPath();
-
-      // Find where gemini is globally installed
-      const { stdout: prefixOut } = await execFileAsync("npm", ["root", "-g"], {
-        env,
-        timeout: 10000,
-      });
-      const globalRoot = prefixOut.trim();
-      const pkgDir = path.join(globalRoot, "@google", "gemini-cli");
-
-      // Remove existing install directory
-      await fs.promises.rm(pkgDir, { recursive: true, force: true });
-
-      // Fresh install
-      const { stdout, stderr } = await execFileAsync(
-        "npm",
-        ["install", "-g", "@google/gemini-cli@latest"],
-        { timeout: 120000, env },
-      );
-      return { success: true, output: stdout + stderr, error: null };
-    } catch (error) {
-      const output = (error.stdout || "") + (error.stderr || "");
-      return { success: false, output, error: error.message };
-    }
+    });
   });
 }
-const execFileAsync = promisify(execFile);
+
+async function _execFileViaWorker(cmd, args, options = {}) {
+  // Build a shell-safe command string from cmd + args
+  const commandStr = [cmd, ...args.map(a =>
+    a.includes(" ") ? `'${a.replace(/'/g, "'\\''")}'` : a,
+  )].join(" ");
+
+  const result = await execThroughWorker(commandStr, {
+    cwd: options.cwd,
+    env: options.env || getEnvWithPath(),
+    // execThroughWorker timeout is in seconds; execFile uses ms
+    timeout: Math.ceil((options.timeout || 30000) / 1000),
+  });
+
+  if (!result.success) {
+    const error = new Error(result.errorMessage || `Command failed: ${commandStr}`);
+    error.stdout = result.stdout || "";
+    error.stderr = result.stderr || "";
+    error.code = result.exitCode != null ? result.exitCode : -1;
+    error.status = result.exitCode;
+    throw error;
+  }
+
+  return { stdout: result.stdout || "", stderr: result.stderr || "" };
+}
 
 // Build a PATH that includes common tool locations Electron strips out
 function getEnvWithPath() {
@@ -342,33 +352,45 @@ function registerCommandHandlers() {
     await fs.promises.writeFile(args.path, args.content, { encoding: "utf-8", flag: "w" });
   });
 
-  const SCROLL_POSITIONS_PATH = path.join(os.homedir(), ".pane", "scroll-positions.json");
-  ipcMain.handle("load_scroll_positions", async () => {
+  ipcMain.handle("load_scroll_positions", () => {
     try {
-      const content = await fs.promises.readFile(SCROLL_POSITIONS_PATH, "utf-8");
-      return JSON.parse(content);
+      const db = getPaneDb();
+      const rows = db.stmts.getAllScrolls.all();
+      return Object.fromEntries(rows.map(r => [
+        r.project_id,
+        r.position === "bottom" ? "bottom" : Number(r.position),
+      ]));
     } catch {
       return {};
     }
   });
-  ipcMain.handle("save_scroll_positions", async (_event, args) => {
-    await fs.promises.mkdir(path.dirname(SCROLL_POSITIONS_PATH), { recursive: true });
-    await fs.promises.writeFile(SCROLL_POSITIONS_PATH, JSON.stringify(args.positions), "utf-8");
+  ipcMain.handle("save_scroll_positions", (_event, args) => {
+    try {
+      const db = getPaneDb();
+      const insertAll = db.transaction((positions) => {
+        for (const [pid, pos] of Object.entries(positions)) {
+          db.stmts.upsertScroll.run(pid, String(pos), Date.now());
+        }
+      });
+      insertAll(args.positions);
+    } catch (e) {
+      console.error("[pane-db] save_scroll_positions error:", e.message);
+    }
   });
   ipcMain.handle("rename_file", async (_event, args) => {
     await fs.promises.rename(args.oldPath, args.newPath);
   });
   ipcMain.handle("delete_file", async (_event, args) => {
-    // Move to Trash instead of permanent deletion
-    const { exec } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const execAsync = promisify(exec);
+    // Move to Trash instead of permanent deletion.
+    // execSync avoids libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak in Electron 40).
+    // This runs in the main process but AppleScript is fast (~100ms) and the action is rare.
+    const { execSync: execSync2 } = await import("node:child_process");
 
     const escapedPath = args.path.replace(/'/g, "'\\''");
     const script = `osascript -e 'tell application "Finder" to delete POSIX file "${escapedPath}"'`;
 
     try {
-      await execAsync(script);
+      execSync2(script, { encoding: "utf-8" });
     } catch (error) {
       // If AppleScript fails, fall back to permanent deletion with explicit confirmation
       throw new Error(
@@ -428,73 +450,64 @@ function registerCommandHandlers() {
   });
   ipcMain.handle("search_in_files", async (_event, args) => {
     const max = args.maxResults ?? 200;
-    const queryLower = args.query.toLowerCase();
-    const results = [];
-    const ig = ignore();
+    const { root, query } = args;
+
+    // Dynamic import: @vscode/ripgrep provides the binary path
+    const { rgPath } = await import("@vscode/ripgrep");
+
     try {
-      const gitignore = await fs.promises.readFile(
-        path.join(args.root, ".gitignore"),
-        "utf-8",
+      // execFileSync bypasses libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak).
+      // ripgrep exits code 1 when no matches found — catch that specifically.
+      const stdout = execFileSync(
+        rgPath,
+        [
+          "--line-number",
+          "--no-heading",
+          "--smart-case",
+          "--max-count", "5",
+          "--max-filesize", "2M",
+          "--",
+          query,
+          root,
+        ],
+        {
+          encoding: "utf-8",
+          maxBuffer: 10 * 1024 * 1024,
+          timeout: 30000,
+        },
       );
-      ig.add(gitignore);
-    } catch {}
-    ig.add(".git");
-    async function walk(dir, depth) {
-      if (depth > 20 || results.length >= max) return;
-      let entries;
-      try {
-        entries = await fs.promises.readdir(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const entry of entries) {
+
+      const results = [];
+      const lines = stdout.trim().split("\n").filter(Boolean);
+
+      for (const line of lines) {
         if (results.length >= max) break;
-        const fullPath = path.join(dir, entry.name);
-        const relativePath = path.relative(args.root, fullPath);
-        if (ig.ignores(relativePath)) continue;
-        if (entry.isDirectory()) {
-          if (ig.ignores(`${relativePath}/`)) continue;
-          await walk(fullPath, depth + 1);
-        } else if (entry.isFile()) {
-          try {
-            const stat = await fs.promises.stat(fullPath);
-            if (stat.size > 2 * 1024 * 1024) continue;
-          } catch {
-            continue;
-          }
-          let content;
-          try {
-            content = await fs.promises.readFile(fullPath);
-          } catch {
-            continue;
-          }
-          const checkLen = Math.min(content.length, 512);
-          let isBinary = false;
-          for (let i = 0; i < checkLen; i++) {
-            if (content[i] === 0) {
-              isBinary = true;
-              break;
-            }
-          }
-          if (isBinary) continue;
-          const text = content.toString("utf-8");
-          const lines = text.split("\n");
-          for (let i = 0; i < lines.length; i++) {
-            if (results.length >= max) break;
-            if (lines[i].toLowerCase().includes(queryLower)) {
-              results.push({
-                file_path: relativePath,
-                absolute_path: fullPath,
-                line_number: i + 1,
-                line_content: lines[i].slice(0, 200),
-              });
-            }
-          }
-        }
+        // rg output: path:line:content
+        // Parse by finding first colon (path separator) and second colon (line/content separator)
+        const firstColon = line.indexOf(":");
+        if (firstColon === -1) continue;
+        const rest = line.slice(firstColon + 1);
+        const lineEnd = rest.indexOf(":");
+        if (lineEnd === -1) continue;
+
+        const relativePath = line.slice(0, firstColon);
+        const lineNum = parseInt(rest.slice(0, lineEnd), 10);
+        const content = rest.slice(lineEnd + 1);
+
+        results.push({
+          file_path: relativePath,
+          absolute_path: path.join(root, relativePath),
+          line_number: lineNum,
+          line_content: content.slice(0, 200),
+        });
       }
+
+      return results;
+    } catch (err) {
+      // ripgrep exits code 1 when no matches found — not an error
+      // Other errors (timeout, killed, ENOENT) → empty results
+      return [];
     }
-    await walk(args.root, 0);
-    return results;
   });
   ipcMain.handle("get_git_status", async (_event, args) => {
     let branch;
@@ -518,7 +531,7 @@ function registerCommandHandlers() {
         );
         branch = stdout.trim();
       } catch {
-        branch = "master";
+        branch = "unknown";
       }
     }
     const files = {};
@@ -691,11 +704,10 @@ function registerCommandHandlers() {
       // 5. Pane session change history — what the AI assistant actually did
       let changeDescriptions = [];
       try {
-        const historyFile = path.join(os.homedir(), ".pane", "change-history", projectId, "changes.json");
-        const changes = JSON.parse(await fs.promises.readFile(historyFile, "utf-8"));
-        for (const c of changes.slice(-40)) {
-          if (c.description) changeDescriptions.push(`- ${c.file}: ${c.description}`);
-          else if (c.file) changeDescriptions.push(`- modified ${c.file}`);
+        const rows = db.stmts.getChanges.all(projectId);
+        for (const c of rows.slice(0, 40)) {
+          if (c.description) changeDescriptions.push(`- ${c.file_path}: ${c.description}`);
+          else if (c.file_path) changeDescriptions.push(`- modified ${c.file_path}`);
         }
       } catch {}
 
@@ -712,17 +724,37 @@ function registerCommandHandlers() {
           : unstagedDiff;
       }
 
-      const systemPrompt = `You are writing a git commit message for a developer. Study the actual diff carefully — understand what changed at the code level, not just which files.
+      const systemPrompt = `Output only the raw git commit message text. No preamble, no explanation, no "Here is the commit message:", no markdown fences. Your entire response IS the commit message — nothing before it, nothing after it.
 
-Rules:
-- First line: conventional commit format — type(scope): description — all lowercase, max 72 chars
+Study the actual diff carefully — understand what changed at the code level, not just which files.
+
+Subject line rules:
+- Conventional commit format: type(scope): description — all lowercase, max 72 chars
 - Types: feat, fix, refactor, style, chore, docs, test, perf — pick the most accurate one
 - Scope: optional, short noun describing what area changed (e.g. git-panel, input-bar, terminal)
-- Description: imperative mood, specific ("add branch auto-stash on checkout", not "update git UI")
-- If there are multiple distinct changes, add a blank line then a tight bullet list (2-5 items max)
-- Bullets: lowercase, no trailing punctuation, lead with the verb
+- Description: outcome phrase, imperative mood ("add branch auto-stash on checkout", not "update git UI")
+
+Body rules (only include sections that apply — omit empty sections entirely):
+- After the subject line, add a blank line then organize changes into labeled sections
+- Use exactly these section headers (no bold, no markdown): "New features", "Bug fixes", "Improvements"
+- Under each section, write a tight bullet list (- item)
+- Each bullet: describes behavior/capability — what it IS and DOES, not which files changed
+- Lead with a verb: "add", "fix", "remove", "prevent", "expose", "allow"
+- Lowercase, no trailing punctuation
 - No emoji, no filler phrases ("this commit", "various improvements")
-- Write only the commit message — no preamble, no explanation`;
+
+Example format:
+feat(terminal): add persistent shell sessions with multi-tab support
+
+New features
+- add PTY-backed shell sessions that preserve env, cwd, and aliases across commands
+- add multi-tab support with Cmd+Shift+N/W/]/[ shortcuts
+
+Bug fixes
+- fix echo suppression so the first echoed line is not shown as output
+
+Improvements
+- strip ANSI codes for clean readable output without color artifacts`;
 
       const userPrompt = [
         statusSummary ? `Changed files:\n${statusSummary}` : "",
@@ -756,6 +788,10 @@ Rules:
     const win = BrowserWindow.getFocusedWindow();
     if (win) win.setTitle(args.title);
   });
+  ipcMain.handle("set_vibrancy", (_event, args) => {
+    if (!mainWindow) return;
+    mainWindow.setVibrancy(args.vibrancy ?? null);
+  });
   ipcMain.handle("open-directory-dialog", async () => {
     const win = BrowserWindow.getFocusedWindow();
     if (!win) return null;
@@ -764,6 +800,167 @@ Rules:
     });
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
+  });
+
+  // Generic file/folder picker used by the InputBar "add path" button.
+  // Returns an array of display strings — relative to projectRoot when the
+  // selection is inside it, absolute otherwise.
+  ipcMain.handle("show-file-picker", async (_event, { defaultPath, projectRoot } = {}) => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      defaultPath: defaultPath || undefined,
+      properties: ["openFile", "openDirectory", "multiSelections"],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths.map((p) => {
+      if (projectRoot && p.startsWith(projectRoot + path.sep)) {
+        return path.relative(projectRoot, p);
+      }
+      return p;
+    });
+  });
+  ipcMain.handle("create-directory", async (_event, dirPath) => {
+    const resolved = dirPath.startsWith("~/")
+      ? path.join(os.homedir(), dirPath.slice(2))
+      : dirPath;
+    await fs.promises.mkdir(resolved, { recursive: true });
+    return resolved;
+  });
+
+  ipcMain.handle("check-path-exists", async (_event, { path: p }) => {
+    try {
+      await fs.promises.access(p);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  /**
+   * One-time migration: rename all data from an old derived project ID to a
+   * new stable UUID. Covers every SQLite table with a project_id column and
+   * all on-disk directories keyed on project ID.
+   *
+   * Called at startup for each existing project that doesn't yet have a UUID
+   * in project_ids. Safe to retry — if the old ID has no data the UPDATE/rename
+   * no-ops cleanly.
+   */
+  ipcMain.handle("migrate-project-id", async (_event, { oldId, newId }) => {
+    const db = getPaneDb();
+    const PANE_DIR = path.join(os.homedir(), ".pane");
+
+    try {
+      // ── SQLite: migrate all tables in one transaction ──────────────────────
+      const migrate = db.transaction(() => {
+        const tables = [
+          "messages",
+          "conversation_meta",
+          "change_history",
+          "checkpoints",
+          "state_blobs",
+          "scroll_positions",
+          "token_usage",
+          "quality_metrics",
+          "correction_events",
+        ];
+        for (const table of tables) {
+          db.prepare(`UPDATE ${table} SET project_id = ? WHERE project_id = ?`).run(newId, oldId);
+        }
+        // cli_sessions has a composite primary key (project_id, backend) —
+        // UPDATE would violate uniqueness if a row with (newId, backend) already
+        // exists. Use INSERT OR REPLACE to handle that edge case.
+        const sessions = db.prepare("SELECT * FROM cli_sessions WHERE project_id = ?").all(oldId);
+        for (const row of sessions) {
+          db.prepare(
+            "INSERT OR REPLACE INTO cli_sessions (project_id, backend, session_id, updated_at) VALUES (?, ?, ?, ?)"
+          ).run(newId, row.backend, row.session_id, row.updated_at);
+          db.prepare("DELETE FROM cli_sessions WHERE project_id = ? AND backend = ?").run(oldId, row.backend);
+        }
+        // FTS5 virtual table — can't UPDATE UNINDEXED columns directly.
+        // Read by rowid, delete, re-insert with new project_id.
+        const ftsRows = db.prepare("SELECT rowid, message_id, text_content FROM messages_fts WHERE project_id = ?").all(oldId);
+        for (const row of ftsRows) {
+          db.prepare("DELETE FROM messages_fts WHERE rowid = ?").run(row.rowid);
+          db.prepare("INSERT INTO messages_fts(project_id, message_id, text_content) VALUES (?, ?, ?)").run(newId, row.message_id, row.text_content);
+        }
+      });
+      migrate();
+
+      // ── File system: rename all directories keyed on projectId ────────────
+      const dirs = [
+        [path.join(PANE_DIR, "memory", oldId),      path.join(PANE_DIR, "memory", newId)],
+        [path.join(PANE_DIR, "session", oldId),     path.join(PANE_DIR, "session", newId)],
+        [path.join(PANE_DIR, "checkpoints", oldId), path.join(PANE_DIR, "checkpoints", newId)],
+      ];
+      for (const [oldPath, newPath] of dirs) {
+        try {
+          await fs.promises.access(oldPath);
+          await fs.promises.rename(oldPath, newPath);
+        } catch {
+          // dir doesn't exist — nothing to rename
+        }
+      }
+
+      // Brain context is a single JSON file, not a directory
+      const brainCtxDir = path.join(PANE_DIR, "brain", "context");
+      const oldCtx = path.join(brainCtxDir, `${oldId}.json`);
+      const newCtx = path.join(brainCtxDir, `${newId}.json`);
+      try {
+        await fs.promises.access(oldCtx);
+        await fs.promises.rename(oldCtx, newCtx);
+      } catch {
+        // file doesn't exist — nothing to rename
+      }
+
+      console.log(`[pane] Migrated project ${oldId} → ${newId}`);
+      return { success: true };
+    } catch (err) {
+      console.error(`[pane] Migration failed for ${oldId}:`, err.message);
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("rebind-project", async (_event, { projectId, oldRoot, newRoot }) => {
+    const filePath = settingsPath();
+    try {
+      const content = await fs.promises.readFile(filePath, "utf-8");
+      const settings = JSON.parse(content);
+
+      // Update project_ids: remove old root mapping, add new root mapping
+      const projectIds = settings.project_ids ?? {};
+      if (oldRoot && projectIds[oldRoot]) {
+        delete projectIds[oldRoot];
+      }
+      projectIds[newRoot] = projectId;
+      settings.project_ids = projectIds;
+
+      // Update project_roots array to replace old root with new
+      if (settings.project_roots) {
+        settings.project_roots = settings.project_roots.map((r) =>
+          r === oldRoot ? newRoot : r
+        );
+      }
+
+      // Update active_project_root if it was the rebound project
+      if (settings.active_project_root === oldRoot) {
+        settings.active_project_root = newRoot;
+      }
+
+      // Update project_states: move state from old root key to new root key
+      if (settings.project_states?.[oldRoot]) {
+        settings.project_states[newRoot] = settings.project_states[oldRoot];
+        delete settings.project_states[oldRoot];
+      }
+
+      const json = JSON.stringify(settings, null, 2);
+      const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
+      await fs.promises.writeFile(tmpPath, json, "utf-8");
+      await fs.promises.rename(tmpPath, filePath);
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
   });
   ipcMain.handle("get_claude_plan_info", async () => {
     try {
@@ -802,7 +999,7 @@ function settingsPath() {
 const defaultSettings = {
   project_roots: [],
   active_project_root: null,
-  control_panel_visible: true,
+  thread_panel_visible: true,
   project_states: {},
   font_size: null,
   editor_font_size: null,
@@ -810,11 +1007,8 @@ const defaultSettings = {
   font_weight: null,
   keybindings: null,
   theme: null,
-  panel_width: null,
-  punk_backend: "http",
+  punk_backend: "api",
   http_provider: "deepseek",
-  http_api_key: "",
-  http_base_url: "",
   http_api_keys: {},
   http_base_urls: {},
   selected_model: null,
@@ -849,6 +1043,17 @@ function registerSettingsHandlers() {
     const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
     await fs.promises.writeFile(tmpPath, json, "utf-8");
     await fs.promises.rename(tmpPath, filePath);
+  });
+
+  // Dock icon switches with theme — clear (glass) = no bg, default = semi-transparent dark, dark = solid dark.
+  ipcMain.handle("set_app_theme", (_event, { theme }) => {
+    if (!app.dock) return; // non-macOS no-op
+    const iconName =
+      theme === "glass" ? "icon-glass.png" :
+      theme === "dark"  ? "icon-dark.png"  :
+                          "icon.png";
+    const iconPath = getAssetPath(iconName);
+    app.dock.setIcon(nativeImage.createFromPath(iconPath));
   });
 }
 // PTY runs in a UtilityProcess to isolate node-pty crashes from the main process.
@@ -933,6 +1138,24 @@ function registerPtyHandlers() {
     }
   });
 }
+let cmdWorker = null;
+function getCmdWorker() {
+  if (cmdWorker && !cmdWorker.killed) return cmdWorker;
+  const workerPath = path.join(__dirname, "cmd-worker.mjs");
+  cmdWorker = utilityProcess.fork(workerPath);
+  // Register with tool-executor so executeBash routes commands through this worker.
+  // The worker runs in its own V8 isolate with a clean libuv loop, bypassing the
+  // main process's kqueue/uv_spawn EBADF issue in packaged macOS builds.
+  setCmdWorker(cmdWorker);
+  cmdWorker.on("exit", (code) => {
+    if (forceQuit) return;
+    console.warn(`[pane] CMD worker exited unexpectedly with code ${code}`);
+    cmdWorker = null;
+    setCmdWorker(null);
+    // Auto-restart on next request (lazy re-fork)
+  });
+  return cmdWorker;
+}
 // Both Claude and PTY run in UtilityProcesses — clean shutdown via postMessage.
 // node-pty's SIGABRT bug (vscode#243952) can't crash the main process anymore
 // because node-pty lives in the PTY worker, not here.
@@ -952,6 +1175,22 @@ app.on("before-quit", () => {
       }
     }, 500);
   }
+  // Shut down brain worker — it holds ONNX embedder memory (~200-400MB)
+  // and was previously left to Electron's default cleanup (unreliable).
+  if (brainWorker && !brainWorker.killed) {
+    brainWorker.postMessage({ type: "shutdown" });
+    const brainRef = brainWorker;
+    brainWorker = null;
+    setTimeout(() => {
+      if (!brainRef.killed) brainRef.kill();
+    }, 500);
+  }
+  // Close all chokidar file watchers — persistent watchers keep event loops
+  // alive and each holds fs.stat polling intervals via awaitWriteFinish.
+  for (const [, watcher] of watchers) {
+    watcher.close().catch(() => {});
+  }
+  watchers.clear();
 });
 const watchers = /* @__PURE__ */ new Map();
 function sendToRenderer(channel, data) {
@@ -969,7 +1208,8 @@ function registerWatcherHandlers() {
     let debounceTimer = null;
     const flush = () => {
       if (pendingPaths.size > 0) {
-        sendToRenderer("pane://file-changed", Array.from(pendingPaths));
+        const paths = Array.from(pendingPaths);
+        sendToRenderer("pane://file-changed", paths);
         pendingPaths = /* @__PURE__ */ new Set();
       }
       debounceTimer = null;
@@ -1013,10 +1253,89 @@ function registerWatcherHandlers() {
     }
   });
 }
-function registerCheckpointHandlers() {
+/**
+ * Watch ~/.pane/projects and ~/.pane/session for changes written by the MCP
+ * server's pane_roadmap tool. When an external CLI agent (Gemini, Claude CLI)
+ * calls pane_roadmap, it writes files directly — no Electron IPC is involved.
+ * This watcher bridges the gap so the UI roadmap panel and phase indicator
+ * stay in sync regardless of which backend is driving the agent.
+ */
+function startMcpFileWatcher() {
+  const paneDir = path.join(os.homedir(), ".pane");
+  const projectsDir = path.join(paneDir, "projects");
+  const sessionDir  = path.join(paneDir, "session");
+
+  // Track last-seen phase per project to avoid spurious phase_changed events.
+  const lastPhase = new Map();
+
+  // Debounce map — avoid double-firing on rapid writes.
+  const timers = new Map();
+  function debounced(key, fn, ms = 300) {
+    if (timers.has(key)) clearTimeout(timers.get(key));
+    timers.set(key, setTimeout(() => { timers.delete(key); fn(); }, ms));
+  }
+
+  // Watch roadmap files — emit roadmap_updated when any roadmap.json changes.
+  try {
+    fs.mkdirSync(projectsDir, { recursive: true });
+    const roadmapWatcher = chokidar.watch(projectsDir, {
+      ignoreInitial: true,
+      depth: 2,
+      persistent: true,
+      usePolling: false,
+      awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+    });
+    roadmapWatcher.on("change", (filePath) => {
+      if (!filePath.endsWith("roadmap.json")) return;
+      const projectId = path.basename(path.dirname(filePath));
+      debounced(`roadmap:${projectId}`, () => {
+        try {
+          const roadmap = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+          punkEngine.handleBackendEvent(projectId, { event: "roadmap_updated", data: { roadmap } });
+        } catch { /* ignore parse errors during write */ }
+      });
+    });
+  } catch (err) {
+    console.warn("[mcp-watcher] Could not watch projects dir:", err.message);
+  }
+
+  // Watch session state files — emit phase_changed when phase field changes.
+  try {
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const stateWatcher = chokidar.watch(sessionDir, {
+      ignoreInitial: true,
+      depth: 2,
+      persistent: true,
+      usePolling: false,
+      awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+    });
+    stateWatcher.on("change", (filePath) => {
+      if (!filePath.endsWith("state.json")) return;
+      const projectId = path.basename(path.dirname(filePath));
+      debounced(`state:${projectId}`, () => {
+        try {
+          const state = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+          const phase = state.phase || "idle";
+          if (lastPhase.get(projectId) === phase) return; // no change
+          lastPhase.set(projectId, phase);
+          punkEngine.handleBackendEvent(projectId, { event: "phase_changed", data: { phase } });
+          // Also sync in-memory workflow manager so phase gates reflect the new phase.
+          // Dynamic import is fire-and-forget — mergeState will re-read from file
+          // on next access if this loses the race, so errors are safe to ignore.
+          import("./pane-system-prompt.mjs").then(({ mergeState }) => {
+            mergeState(projectId, { phase });
+          }).catch(() => {});
+        } catch { /* ignore parse errors */ }
+      });
+    });
+  } catch (err) {
+    console.warn("[mcp-watcher] Could not watch session dir:", err.message);
+  }
+}
+
+function registerCheckpointHandlers(db) {
   const CHECKPOINT_MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
   const CHECKPOINT_MAX_FILES = 200;
-  const CHECKPOINT_KEEP = 50;
 
   function checkpointDir(projectId) {
     return path.join(os.homedir(), ".pane", "checkpoints", projectId);
@@ -1107,48 +1426,26 @@ function registerCheckpointHandlers() {
       "utf-8",
     );
 
-    // Prune old checkpoints
-    try {
-      const all = (await fs.promises.readdir(dir))
-        .filter((f) => f.startsWith("cp-") && f.endsWith(".json"))
-        .sort();
-      if (all.length > CHECKPOINT_KEEP) {
-        const remove = all.slice(0, all.length - CHECKPOINT_KEEP);
-        await Promise.all(
-          remove.map((f) =>
-            fs.promises.unlink(path.join(dir, f)).catch(() => {}),
-          ),
-        );
-      }
-    } catch {}
+    // Insert metadata into SQLite
+    db.stmts.insertCheckpoint.run(
+      cpId, projectId, messageId ?? null,
+      checkpoint.timestamp, files.length, headCommit,
+    );
 
-    // Update manifest for external tools (punk-records reads this)
+    // Keep manifest.json in sync for tool-executor.mjs and pane-mcp-server.mjs
     try {
-      const remaining = (await fs.promises.readdir(dir))
-        .filter((f) => f.startsWith("cp-") && f.endsWith(".json"))
-        .sort();
-      const manifest = [];
-      for (const f of remaining) {
-        try {
-          const raw = await fs.promises.readFile(path.join(dir, f), "utf-8");
-          const cp = JSON.parse(raw);
-          manifest.push({
-            id: cp.id,
-            timestamp: cp.timestamp,
-            messageId: cp.messageId,
-            fileCount: cp.files.length,
-            headCommit: cp.headCommit,
-            workingDir,
-          });
-        } catch {}
-      }
+      const allMeta = db.stmts.listCheckpoints.all(projectId);
+      const manifest = allMeta.map(m => ({
+        id: m.id,
+        timestamp: m.created_at,
+        messageId: m.message_id,
+        fileCount: m.file_count,
+        headCommit: m.head_commit,
+        workingDir,
+      }));
       await fs.promises.writeFile(
         path.join(dir, "manifest.json"),
-        JSON.stringify({
-          projectId,
-          projectRoot: workingDir,
-          checkpoints: manifest,
-        }),
+        JSON.stringify({ projectId, projectRoot: workingDir, checkpoints: manifest }),
         "utf-8",
       );
     } catch {}
@@ -1231,32 +1528,24 @@ function registerCheckpointHandlers() {
     return { success: true, restoredFiles: restored };
   });
 
-  ipcMain.handle("list_checkpoints", async (_event, args) => {
-    const { projectId } = args;
+  ipcMain.handle("list_checkpoints", (_event, args) => {
     try {
-      const entries = await fs.promises.readdir(checkpointDir(projectId));
-      const metas = [];
-      for (const entry of entries) {
-        if (!entry.startsWith("cp-") || !entry.endsWith(".json")) continue;
-        try {
-          const raw = await fs.promises.readFile(
-            path.join(checkpointDir(projectId), entry),
-            "utf-8",
-          );
-          const cp = JSON.parse(raw);
-          metas.push({
-            id: cp.id,
-            timestamp: cp.timestamp,
-            messageId: cp.messageId,
-            fileCount: cp.files.length,
-          });
-        } catch {}
-      }
-      metas.sort((a, b) => a.timestamp - b.timestamp);
-      return metas;
+      return db.stmts.listCheckpoints.all(args.projectId).map(m => ({
+        id: m.id,
+        timestamp: m.created_at,
+        messageId: m.message_id,
+        fileCount: m.file_count,
+      }));
     } catch {
       return [];
     }
+  });
+
+  ipcMain.handle("resume_from_checkpoint", async (_event, args) => {
+    const { projectId, sessionId } = args;
+    const turns = loadRecentTurns(projectId, sessionId, 1);
+    if (turns.length === 0) return null;
+    return turns[0];
   });
 
   ipcMain.handle("get_checkpoint_diff", async (_event, args) => {
@@ -1320,140 +1609,104 @@ function registerCheckpointHandlers() {
 
   ipcMain.handle("delete_project_checkpoints", async (_event, args) => {
     try {
-      await fs.promises.rm(checkpointDir(args.projectId), {
-        recursive: true,
-        force: true,
-      });
+      db.stmts.deleteCheckpointsByProject.run(args.projectId);
+      await fs.promises.rm(checkpointDir(args.projectId), { recursive: true, force: true });
     } catch {}
   });
 
   // --- Change History Handlers ---
-  function changeHistoryDir(projectId) {
-    return path.join(os.homedir(), ".pane", "change-history", projectId);
-  }
-
-  function changeHistoryFile(projectId) {
-    return path.join(changeHistoryDir(projectId), "changes.json");
-  }
-
-  async function readChangeHistory(projectId) {
-    try {
-      const file = changeHistoryFile(projectId);
-      const data = await fs.promises.readFile(file, "utf-8");
-      return JSON.parse(data);
-    } catch {
-      return [];
-    }
-  }
-
-  async function writeChangeHistory(projectId, changes) {
-    const dir = changeHistoryDir(projectId);
-    await fs.promises.mkdir(dir, { recursive: true });
-    const file = changeHistoryFile(projectId);
-    await fs.promises.writeFile(file, JSON.stringify(changes, null, 2), "utf-8");
-  }
+  // Primary store: SQLite (change_history table).
 
   ipcMain.handle("record_change", async (_event, args) => {
-    const { projectId, filePath, oldString, newString, description, timestamp } = args;
-    
-    const changes = await readChangeHistory(projectId);
-    
-    const change = {
-      id: `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: timestamp || Date.now(),
-      file: filePath,
-      oldString,
-      newString,
-      description: description || "",
-    };
-    
-    changes.unshift(change); // Add to beginning (most recent first)
-    
-    // Keep only last 500 changes to prevent unbounded growth
-    const trimmed = changes.slice(0, 500);
-    
-    await writeChangeHistory(projectId, trimmed);
-    
-    return { id: change.id, success: true };
+    const { projectId, filePath, oldString, newString, description, timestamp, workingDir } = args;
+
+    // Normalize to relative path — Claude Code passes absolute paths
+    let relFile = filePath;
+    if (workingDir && path.isAbsolute(filePath) && filePath.startsWith(workingDir)) {
+      relFile = path.relative(workingDir, filePath);
+    }
+
+    const id = `ch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    db.stmts.insertChange.run(
+      id, projectId, relFile,
+      oldString ?? null, newString ?? "",
+      description ?? "", timestamp || Date.now(),
+      workingDir ?? null,
+    );
+
+    return { id, success: true };
   });
 
-  ipcMain.handle("get_change_history", async (_event, args) => {
-    const { projectId } = args;
-    const changes = await readChangeHistory(projectId);
+  ipcMain.handle("get_change_history", (_event, args) => {
+    const rows = db.stmts.getChanges.all(args.projectId);
+    // Return in legacy shape so ChangeHistoryPanel works without changes
+    const changes = rows.map(r => ({
+      id: r.id,
+      timestamp: r.timestamp,
+      file: r.file_path,
+      oldString: r.old_string,
+      newString: r.new_string,
+      description: r.description,
+    }));
     return { changes };
   });
 
   ipcMain.handle("revert_change", async (_event, args) => {
     const { projectId, changeId, workingDir } = args;
-    
-    const changes = await readChangeHistory(projectId);
-    const changeIndex = changes.findIndex((c) => c.id === changeId);
-    
-    if (changeIndex === -1) {
-      return { success: false, error: "Change not found" };
-    }
-    
-    const change = changes[changeIndex];
-    const resolvedPath = path.isAbsolute(change.file) 
-      ? change.file 
-      : path.join(workingDir, change.file);
-    
+
+    const row = db.stmts.getChangeById.get(changeId);
+    if (!row) return { success: false, error: "Change not found" };
+
+    const resolvedPath = path.isAbsolute(row.file_path)
+      ? row.file_path
+      : path.join(workingDir, row.file_path);
+
     try {
       const currentContent = await fs.promises.readFile(resolvedPath, "utf-8");
-      
-      // Verify the current content matches newString
-      if (!currentContent.includes(change.newString)) {
+
+      if (!currentContent.includes(row.new_string)) {
         return { success: false, error: "File content doesn't match expected change" };
       }
-      
-      // Revert: replace newString with oldString
-      const revertedContent = currentContent.replace(change.newString, change.oldString);
+
+      const revertedContent = currentContent.replace(row.new_string, row.old_string ?? "");
       await fs.promises.writeFile(resolvedPath, revertedContent, "utf-8");
-      
-      // Remove the change from history
-      changes.splice(changeIndex, 1);
-      await writeChangeHistory(projectId, changes);
-      
-      return { 
-        success: true, 
-        output: `Reverted change in ${change.file}`,
-        file: change.file,
-      };
+
+      db.stmts.deleteChangeById.run(changeId);
+
+      return { success: true, output: `Reverted change in ${row.file_path}`, file: row.file_path };
     } catch (error) {
       return { success: false, error: error.message };
     }
   });
 
-  ipcMain.handle("search_changes", async (_event, args) => {
+  ipcMain.handle("search_changes", (_event, args) => {
     const { projectId, query, filePath } = args;
-    
-    const changes = await readChangeHistory(projectId);
-    let filtered = changes;
-    
-    if (filePath) {
-      filtered = filtered.filter((c) => c.file === filePath);
+    let rows;
+    if (filePath && !query) {
+      rows = db.stmts.searchChangesByFile.all(projectId, filePath);
+    } else if (query) {
+      const like = `%${query}%`;
+      rows = filePath
+        ? db.stmts.searchChangesByFile.all(projectId, filePath).filter(r =>
+            r.description?.toLowerCase().includes(query.toLowerCase()) ||
+            r.new_string?.toLowerCase().includes(query.toLowerCase()) ||
+            r.old_string?.toLowerCase().includes(query.toLowerCase())
+          )
+        : db.stmts.searchChanges.all(projectId, like, like, like, like);
+    } else {
+      rows = db.stmts.getChanges.all(projectId);
     }
-    
-    if (query) {
-      const lowerQuery = query.toLowerCase();
-      filtered = filtered.filter((c) => 
-        c.description?.toLowerCase().includes(lowerQuery) ||
-        c.oldString?.toLowerCase().includes(lowerQuery) ||
-        c.newString?.toLowerCase().includes(lowerQuery) ||
-        c.file.toLowerCase().includes(lowerQuery)
-      );
-    }
-    
-    return { changes: filtered };
+    const changes = rows.map(r => ({
+      id: r.id, timestamp: r.timestamp, file: r.file_path,
+      oldString: r.old_string, newString: r.new_string, description: r.description,
+    }));
+    return { changes };
   });
 
   ipcMain.handle("delete_change_history", async (_event, args) => {
     const { projectId } = args;
     try {
-      await fs.promises.rm(changeHistoryDir(projectId), {
-        recursive: true,
-        force: true,
-      });
+      db.stmts.deleteAllChanges.run(projectId);
       return { success: true };
     } catch (error) {
       return { success: false, error: error.message };
@@ -1464,83 +1717,185 @@ function registerCheckpointHandlers() {
 // --- State + Memory handlers for Pane Intelligence Layer ---
 // Writes state to ~/.pane/state/{projectId}/ for the MCP server to read.
 // Writes memory to ~/.pane/memory/{projectId}/ for cross-session persistence.
-function registerStateHandlers() {
-  function stateDir(projectId) {
-    return path.join(os.homedir(), ".pane", "state", projectId);
+function registerStateHandlers(db) {
+  function upsertBlob(projectId, key, data) {
+    db.stmts.upsertBlob.run(projectId, key, JSON.stringify(data), Date.now());
   }
 
-  async function writeStateFile(projectId, filename, data) {
-    const dir = stateDir(projectId);
-    await fs.promises.mkdir(dir, { recursive: true });
-    await fs.promises.writeFile(
-      path.join(dir, filename),
-      JSON.stringify(data),
-      "utf-8",
+  function readBlob(projectId, key) {
+    const row = db.stmts.getBlob.get(projectId, key);
+    return row ? JSON.parse(row.data) : null;
+  }
+
+  ipcMain.handle("write_editor_state", (_event, args) => {
+    upsertBlob(args.projectId, "editor", args.data);
+  });
+
+  ipcMain.handle("write_terminal_state", (_event, args) => {
+    upsertBlob(args.projectId, "terminal", args.data);
+  });
+
+  // Atomically appends one completed command to the shared multi-tab terminal history.
+  // better-sqlite3 is synchronous — no concurrent write races possible.
+  ipcMain.handle("append_terminal_command", (_event, { projectId, entry }) => {
+    let data = readBlob(projectId, "terminal") ?? { commands: [] };
+    if (!Array.isArray(data.commands)) data.commands = [];
+    // Remove stale partial entry for this tab (command just finished)
+    data.commands = data.commands.filter(
+      (c) => !(c.tabId === entry.tabId && c.partial === true),
     );
-  }
-
-  ipcMain.handle("write_editor_state", async (_event, args) => {
-    await writeStateFile(args.projectId, "editor.json", args.data);
+    data.commands.push(entry);
+    data.commands = data.commands.slice(-50);
+    upsertBlob(projectId, "terminal", data);
   });
 
-  ipcMain.handle("write_terminal_state", async (_event, args) => {
-    await writeStateFile(args.projectId, "terminal.json", args.data);
+  // Returns the stored terminal history for a project (last 50 commands).
+  ipcMain.handle("get_terminal_history", (_event, { projectId }) => {
+    const data = readBlob(projectId, "terminal") ?? { commands: [] };
+    return { commands: Array.isArray(data.commands) ? data.commands.filter((c) => !c.partial) : [] };
   });
 
-  ipcMain.handle("write_project_state", async (_event, args) => {
-    await writeStateFile(args.projectId, "project.json", args.data);
-  });
-
-  ipcMain.handle("save_conversation", async (_event, args) => {
-    const { filePath, conversation } = args;
-    const MAX_FILE_SIZE = 5 * 1024 * 1024;
-    const THRESHOLD_SIZE = 4 * 1024 * 1024;
-
-    const data = {
-      sessionId: conversation.sessionId,
-      model: conversation.model,
-      messages: conversation.messages,
-    };
-
-    // All JSON.stringify/size-checking happens in Node.js, never the renderer.
-    let json = JSON.stringify(data);
-
-    if (json.length > THRESHOLD_SIZE) {
-      const originalCount = data.messages.length;
-      let keepCount = json.length > MAX_FILE_SIZE
-        ? Math.min(50, originalCount)
-        : Math.min(100, originalCount);
-
-      data.messages = data.messages.slice(-keepCount);
-      json = JSON.stringify(data);
-
-      if (json.length > MAX_FILE_SIZE) {
-        data.messages = data.messages.map((msg) => {
-          if (msg.content && typeof msg.content === "object") {
-            const content = Array.isArray(msg.content) ? msg.content : [msg.content];
-            return {
-              ...msg,
-              content: content.map((item) => {
-                if (item && typeof item === "object" && typeof item.text === "string" && item.text.length > 2000) {
-                  return { ...item, text: item.text.substring(0, 1500) + "\n\n... [truncated] ...\n\n" + item.text.substring(item.text.length - 500) };
-                }
-                return item;
-              }),
-            };
-          }
-          return msg;
-        });
-        json = JSON.stringify(data);
-      }
+  // Upserts a live snapshot for a long-running command.
+  ipcMain.handle("update_terminal_running", (_event, { projectId, entry }) => {
+    let data = readBlob(projectId, "terminal") ?? { commands: [] };
+    if (!Array.isArray(data.commands)) data.commands = [];
+    const idx = data.commands.findIndex(
+      (c) => c.tabId === entry.tabId && c.partial === true,
+    );
+    if (idx !== -1) {
+      data.commands[idx] = entry;
+    } else {
+      data.commands.push(entry);
+      data.commands = data.commands.slice(-50);
     }
+    upsertBlob(projectId, "terminal", data);
+  });
 
-    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-    // Unique tmp path per write — concurrent saves each get their own tmp file,
-    // so writeFile calls never interleave on the same file descriptor.
-    // The rename is atomic: last writer wins with a complete snapshot.
-    const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
-    await fs.promises.writeFile(tmpPath, json, { encoding: "utf-8" });
-    await fs.promises.rename(tmpPath, filePath);
+  ipcMain.handle("write_project_state", (_event, args) => {
+    upsertBlob(args.projectId, "project", args.data);
+  });
+
+  // save_conversation: accepts projectId instead of filePath.
+  // Renderer sends only delta messages (new/modified since last persist) via
+  // debounced delta persistence. Each SQLite statement auto-commits independently
+  // — no explicit db.transaction() wrapper, so the database lock is never held
+  // across multiple messages. This prevents blocking other IPC handlers (git
+  // status, change history, token analytics) for hundreds of milliseconds.
+  // INSERT OR REPLACE handles both re-persisting an updated message (content
+  // streaming updates) and inserting new messages.
+  // Rows in the DB outside the delta slice are untouched; no prefix-merge needed.
+  ipcMain.handle("save_conversation", (_event, args) => {
+    const { projectId, conversation } = args;
+    const { model, messages } = conversation;
+
+    try {
+      for (const msg of messages) {
+        const id = msg.id || `msg-${projectId}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+        const contentJson = JSON.stringify(msg);
+        db.stmts.insertMessage.run(
+          id, projectId, msg.type ?? "assistant",
+          contentJson,
+          msg.created_at ?? msg.timestamp ?? Date.now(),
+          msg.cost_usd ?? null, msg.duration_ms ?? null,
+          msg.input_tokens ?? null, msg.output_tokens ?? null,
+          msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
+        );
+        // Keep FTS in sync: delete old entry (if any), insert fresh
+        const text = extractMessageText(contentJson);
+        if (text) {
+          db.stmts.deleteFts.run(id);
+          db.stmts.insertFts.run(projectId, id, text);
+        }
+      }
+      db.stmts.upsertConvMeta.run(projectId, null, model ?? null, Date.now());
+    } catch (e) {
+      console.error("[pane-db] save_conversation error:", e.message);
+    }
+  });
+
+  // Returns a slice of messages from SQLite — sub-millisecond indexed query
+  // regardless of total conversation size.
+  ipcMain.handle("get_conversation_slice", (_event, { projectId, beforeIndex, count }) => {
+    const _t = Date.now();
+    try {
+      const totalCount = db.stmts.countMessages.get(projectId).cnt;
+      const end = (beforeIndex != null && beforeIndex >= 0) ? beforeIndex : totalCount;
+      const start = Math.max(0, end - count);
+      const rows = db.stmts.selectMessagesSlice.all(projectId, end - start, start);
+      const meta = db.stmts.getConvMeta.get(projectId);
+      const result = {
+        messages: rows.map(r => JSON.parse(r.content)),
+        totalCount,
+        startIndex: start,
+        model: meta?.model ?? null,
+      };
+      return result;
+    } catch {
+      return { messages: [], totalCount: 0, startIndex: 0, model: null };
+    }
+  });
+
+  // Full-text search across conversation messages using FTS5.
+  // projectId = null searches all projects. Results are ranked by relevance.
+  ipcMain.handle("search_conversations", (_event, { query, projectId = null, limit = 20 }) => {
+    try {
+      if (!query?.trim()) return { results: [] };
+      const rows = db.stmts.searchMessages.all({ query: query.trim(), projectId, limit });
+      return {
+        results: rows.map(r => ({
+          message: JSON.parse(r.content),
+          projectId: r.project_id,
+        })),
+      };
+    } catch (e) {
+      console.error("[pane-db] search_conversations error:", e.message);
+      return { results: [] };
+    }
+  });
+
+  // ── Thread State Handlers ────────────────────────────────────────────
+  // Persist prompt/response activity data for the thread list UI.
+  // Thread state lives in ~/.pane/session/{projectId}/thread.json,
+  // managed by thread-state.mjs.
+
+  ipcMain.handle("record_last_prompt", async (_event, { projectId, promptText, promptHash }) => {
+    try {
+      updateLastPrompt(projectId, promptText, promptHash);
+    } catch (err) {
+      console.error("[main] record_last_prompt error:", err.message);
+    }
+  });
+
+  ipcMain.handle("record_last_response", async (_event, { projectId, summary }) => {
+    try {
+      updateLastResponse(projectId, summary);
+    } catch (err) {
+      console.error("[main] record_last_response error:", err.message);
+    }
+  });
+
+  ipcMain.handle("get_thread_state", async (_event, { projectId }) => {
+    try {
+      return readThreadState(projectId);
+    } catch (err) {
+      console.error("[main] get_thread_state error:", err.message);
+      return null;
+    }
+  });
+
+  ipcMain.handle("get_all_thread_states", async (_event, { projectIds }) => {
+    try {
+      const result = {};
+      if (Array.isArray(projectIds)) {
+        for (const id of projectIds) {
+          result[id] = readThreadState(id);
+        }
+      }
+      return result;
+    } catch (err) {
+      console.error("[main] get_all_thread_states error:", err.message);
+      return {};
+    }
   });
 }
 
@@ -1555,27 +1910,39 @@ function registerMemoryHandlers() {
     const { projectId, events } = args;
     const dir = memoryDir(projectId);
     await fs.promises.mkdir(dir, { recursive: true });
-    const lines = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+
+    // Deduplicate against last 20 lines in the existing events file
+    const eventsFilePath = path.join(dir, "events.jsonl");
+    const recentKeys = new Set();
+    try {
+      const existing = await fs.promises.readFile(eventsFilePath, "utf-8");
+      const allLines = existing.trim().split("\n").filter(Boolean);
+      const last20 = allLines.slice(-20);
+      for (const line of last20) {
+        try {
+          const e = JSON.parse(line);
+          recentKeys.add(`${e.type}:${e.content}`);
+        } catch {}
+      }
+    } catch {}
+
+    const dedupedEvents = events.filter((e) => !recentKeys.has(`${e.type}:${e.content}`));
+    if (dedupedEvents.length === 0) return;
+
+    const lines = dedupedEvents.map((e) => JSON.stringify(e)).join("\n") + "\n";
     await fs.promises.appendFile(
-      path.join(dir, "events.jsonl"),
+      eventsFilePath,
       lines,
       "utf-8",
     );
 
     // Prune to last N events
     try {
-      const content = await fs.promises.readFile(
-        path.join(dir, "events.jsonl"),
-        "utf-8",
-      );
+      const content = await fs.promises.readFile(eventsFilePath, "utf-8");
       const allLines = content.trim().split("\n").filter(Boolean);
       if (allLines.length > MEMORY_MAX_EVENTS) {
         const pruned = allLines.slice(-MEMORY_MAX_EVENTS).join("\n") + "\n";
-        await fs.promises.writeFile(
-          path.join(dir, "events.jsonl"),
-          pruned,
-          "utf-8",
-        );
+        await fs.promises.writeFile(eventsFilePath, pruned, "utf-8");
       }
     } catch {}
   });
@@ -1692,7 +2059,7 @@ function registerMemoryHandlers() {
           const summary = recentSummaries[i].content;
           // Truncate each to ~200 chars to leave room
           parts.push(
-            `**${label}:** ${summary.length > 200 ? summary.slice(0, 200) + "..." : summary}`,
+            `**${label}:** ${summary.length > 400 ? summary.slice(0, 400) + "..." : summary}`,
           );
         }
       }
@@ -1700,9 +2067,9 @@ function registerMemoryHandlers() {
 
     let brief = parts.join("\n");
 
-    // Section-aware truncation: cap at 3500 chars, break at last ### boundary
-    if (brief.length > 3500) {
-      const truncated = brief.slice(0, 3500);
+    // Section-aware truncation: cap at 6000 chars, break at last ### boundary
+    if (brief.length > 6000) {
+      const truncated = brief.slice(0, 6000);
       const lastSection = truncated.lastIndexOf("\n###");
       if (lastSection > 500) {
         brief = truncated.slice(0, lastSection);
@@ -1729,29 +2096,95 @@ function registerMemoryHandlers() {
       return "";
     }
   });
+
+  ipcMain.handle("get_project_about", async (_event, args) => {
+    const { projectId } = args;
+    try {
+      const content = await fs.promises.readFile(
+        path.join(memoryDir(projectId), "about.md"),
+        "utf-8",
+      );
+      return content.trim() || null;
+    } catch {
+      return null;
+    }
+  });
+
+  // LLM-based preference extraction — runs after each conversation turn.
+  // Takes the last user+assistant exchange and asks the model to extract
+  // structured preferences: tools, patterns, corrections. Much richer than regex.
+  ipcMain.handle("brain_extract_preferences_llm", async (_event, args) => {
+    const { turnText } = args;
+    if (!turnText || turnText.length < 100) return null;
+
+    const system = `You extract preferences and patterns from conversations between a developer and an AI assistant.
+Focus on what the DEVELOPER prefers, values, or corrects — not the AI's suggestions.
+Return ONLY valid JSON. No explanation, no markdown, just the JSON object.`;
+
+    const prompt = `CONVERSATION TURN:
+${turnText.slice(0, 3000)}
+
+Extract preferences the developer expressed. Look for:
+- Tools, libraries, frameworks they chose or avoided
+- Coding/design patterns they enforce
+- Things they corrected the AI toward
+- Ways of working they clearly prefer
+
+Return JSON:
+{
+  "tools": [{"name": "string", "prefers": true/false, "evidence": "short quote"}],
+  "patterns": [{"pattern": "string", "evidence": "short quote"}],
+  "corrections": [{"toward": "string", "away_from": "string", "evidence": "short quote"}]
+}
+
+Only include items with clear evidence. Empty arrays if nothing found.`;
+
+    try {
+      const raw = await punkEngine.quickCall(system, prompt);
+      // Strip any markdown fences the model might add
+      const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+      const extracted = JSON.parse(cleaned);
+
+      // Forward to brain-engine to persist into preferences.json
+      if (extracted && (extracted.tools?.length || extracted.patterns?.length || extracted.corrections?.length)) {
+        await brainRequest("update_preferences_from_llm", { extracted });
+      }
+      return extracted;
+    } catch {
+      // LLM extraction is non-critical — never surface failures
+      return null;
+    }
+  });
 }
 
 // --- Session Context (per-project active state for context compilation) ---
-function registerSessionHandlers() {
+// Dual-write: SQLite (state_blobs key='session') + file on disk.
+// session-context.mjs runs in UtilityProcess workers and reads the file directly
+// with fs.readFileSync — we keep the file in sync so it never needs to change.
+function registerSessionHandlers(db) {
   const SESSION_DIR = path.join(os.homedir(), ".pane", "session");
 
-  ipcMain.handle("session_merge_state", async (_event, args) => {
-    const { projectId, delta } = args;
+  function writeSessionFile(projectId, state) {
     const stateDir = path.join(SESSION_DIR, projectId);
-    const statePath = path.join(stateDir, "state.json");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify(state, null, 2), "utf-8");
+  }
 
-    let current = {
+  ipcMain.handle("session_merge_state", (_event, args) => {
+    const { projectId, delta } = args;
+
+    const row = db.stmts.getBlob.get(projectId, "session");
+    let current = row ? JSON.parse(row.data) : {
       activeTask: null, workingSet: [], decisions: [],
       recentActions: [], turnCount: 0, lastProvider: null, lastIntent: null,
       startedAt: Date.now(),
     };
-    try { current = JSON.parse(await fs.promises.readFile(statePath, "utf-8")); } catch {}
 
-    // Active task
     if (delta.activeTask !== undefined) {
-      current.activeTask = delta.activeTask ? { ...current.activeTask, ...delta.activeTask } : null;
+      current.activeTask = delta.activeTask
+        ? { ...current.activeTask, ...delta.activeTask, timestamp: delta.activeTask.timestamp || Date.now() }
+        : null;
     }
-    // Working set: upsert by path, cap at 10
     if (delta.workingSet?.length) {
       for (const file of delta.workingSet) {
         const idx = current.workingSet.findIndex(f => f.path === file.path);
@@ -1764,7 +2197,6 @@ function registerSessionHandlers() {
       current.workingSet.sort((a, b) => (b.touches || 0) - (a.touches || 0));
       current.workingSet = current.workingSet.slice(0, 10);
     }
-    // Decisions: prepend new, deduplicate, cap at 8
     if (delta.decisions?.length) {
       for (const d of delta.decisions) {
         const key = d.content.slice(0, 60).toLowerCase();
@@ -1773,7 +2205,6 @@ function registerSessionHandlers() {
       }
       current.decisions = current.decisions.slice(0, 8);
     }
-    // Recent actions: prepend, cap at 8
     if (delta.recentActions?.length) {
       current.recentActions = [...delta.recentActions, ...current.recentActions].slice(0, 8);
     }
@@ -1781,26 +2212,25 @@ function registerSessionHandlers() {
     if (delta.lastProvider) current.lastProvider = delta.lastProvider;
     if (delta.lastIntent)   current.lastIntent = delta.lastIntent;
     if (delta.gitStatus !== undefined) current.gitStatus = delta.gitStatus;
+    if (delta.todos !== undefined)     current.todos = delta.todos;
 
-    await fs.promises.mkdir(stateDir, { recursive: true });
-    await fs.promises.writeFile(statePath, JSON.stringify(current, null, 2), "utf-8");
+    db.stmts.upsertBlob.run(projectId, "session", JSON.stringify(current), Date.now());
+    writeSessionFile(projectId, current); // keep file in sync for UtilityProcess readers
     return current;
   });
 
-  ipcMain.handle("session_clear_state", async (_event, args) => {
+  ipcMain.handle("session_clear_state", (_event, args) => {
     const { projectId } = args;
-    const statePath = path.join(SESSION_DIR, projectId, "state.json");
-    const blank = { activeTask: null, workingSet: [], decisions: [], recentActions: [],
+    const blank = { activeTask: null, todos: [], workingSet: [], decisions: [], recentActions: [],
       turnCount: 0, lastProvider: null, lastIntent: null, startedAt: Date.now() };
-    await fs.promises.mkdir(path.dirname(statePath), { recursive: true });
-    await fs.promises.writeFile(statePath, JSON.stringify(blank, null, 2), "utf-8");
+    db.stmts.upsertBlob.run(projectId, "session", JSON.stringify(blank), Date.now());
+    writeSessionFile(projectId, blank);
     return blank;
   });
 
-  ipcMain.handle("session_read_state", async (_event, args) => {
-    const statePath = path.join(SESSION_DIR, args.projectId, "state.json");
-    try { return JSON.parse(await fs.promises.readFile(statePath, "utf-8")); }
-    catch { return null; }
+  ipcMain.handle("session_read_state", (_event, args) => {
+    const row = db.stmts.getBlob.get(args.projectId, "session");
+    return row ? JSON.parse(row.data) : null;
   });
 }
 
@@ -1808,11 +2238,38 @@ function registerSessionHandlers() {
 let brainWorker = null;
 const brainPendingRequests = new Map();
 let brainRequestCounter = 0;
+let brainWorkerExitCount = 0;
+let brainWorkerLastExitTime = 0;
+let brainWorkerNextRetryMs = 5_000;    // Start at 5s, doubles each backoff cycle
+const BRAIN_BACKOFF_INITIAL_MS = 5_000;
+const BRAIN_BACKOFF_MAX_MS = 300_000;  // Cap at 5 minutes
+const BRAIN_BACKOFF_THRESHOLD = 3;     // Enter backoff after 3 crashes
+const BRAIN_SURVIVE_RESET_MS = 300_000; // Full reset after 5 min uptime
 
 function getBrainWorker() {
   if (brainWorker && !brainWorker.killed) return brainWorker;
+
+  // Exponential backoff: if worker keeps crashing, wait longer each cycle
+  if (brainWorkerExitCount >= BRAIN_BACKOFF_THRESHOLD) {
+    const timeSince = Date.now() - brainWorkerLastExitTime;
+    if (timeSince < brainWorkerNextRetryMs) return null;
+    // Enough time has passed — try once more
+    console.log(`[pane] Brain worker retry wait elapsed (${brainWorkerNextRetryMs / 1000}s), retrying...`);
+    brainWorkerExitCount = 0;
+  }
+
   const workerPath = path.join(__dirname, "brain-engine.mjs");
   brainWorker = utilityProcess.fork(workerPath);
+
+  // Track whether this instance survives long enough to reset the crash counter
+  const surviveTimer = setTimeout(() => {
+    if (brainWorker && !brainWorker.killed) {
+      brainWorkerExitCount = 0;
+      brainWorkerNextRetryMs = BRAIN_BACKOFF_INITIAL_MS;
+      console.log(`[pane] Brain worker survived ${BRAIN_SURVIVE_RESET_MS / 1000}s — crash counter reset`);
+    }
+  }, BRAIN_SURVIVE_RESET_MS);
+  if (surviveTimer.unref) surviveTimer.unref();
 
   brainWorker.on("message", (message) => {
     // Route responses back to pending IPC requests
@@ -1846,6 +2303,13 @@ function getBrainWorker() {
   brainWorker.on("exit", (code) => {
     console.warn(`[pane] Brain worker exited with code ${code}`);
     brainWorker = null;
+    brainWorkerLastExitTime = Date.now();
+    brainWorkerExitCount++;
+    if (brainWorkerExitCount >= BRAIN_BACKOFF_THRESHOLD) {
+      // Exponential backoff: double the wait, cap at 5 min
+      brainWorkerNextRetryMs = Math.min(brainWorkerNextRetryMs * 2, BRAIN_BACKOFF_MAX_MS);
+      console.warn(`[pane] Brain worker disabled after ${brainWorkerExitCount} crashes — retrying in ${brainWorkerNextRetryMs / 1000}s`);
+    }
     // Reject pending requests
     for (const [id, resolve] of brainPendingRequests) {
       resolve({ type: "error", error: "Brain worker exited" });
@@ -1858,10 +2322,16 @@ function getBrainWorker() {
 
 function brainRequest(type, data, timeout = 30000) {
   return new Promise((resolve) => {
+    const worker = getBrainWorker();
+    if (!worker) {
+      // Worker is in backoff — resolve immediately so callers don't hang
+      resolve({ type: "error", error: "Brain worker temporarily disabled (crash backoff)" });
+      return;
+    }
     const requestId = `brain-${++brainRequestCounter}`;
     brainPendingRequests.set(requestId, resolve);
-    getBrainWorker().postMessage({ type, requestId, ...data });
-    // Timeout to prevent hanging
+    worker.postMessage({ type, requestId, ...data });
+    // Timeout to prevent hanging if worker dies without clearing pending map
     setTimeout(() => {
       if (brainPendingRequests.has(requestId)) {
         brainPendingRequests.delete(requestId);
@@ -1883,13 +2353,13 @@ function registerBrainHandlers() {
   });
 
   ipcMain.handle("brain_contextual_search", async (_event, args) => {
-    const { projectId, query, fileContext, intent, projectRoot } = args;
+    const { projectId, query, fileContext, intent, projectRoot, taskType, atomHints, projectWhy } = args;
     // Auto-trigger file indexing fire-and-forget when projectRoot is known.
     // brain-engine deduplicates via indexedProjects Set — safe to call every time.
     if (projectRoot) {
       brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
     }
-    return brainRequest("contextual_search", { projectId, query, fileContext, intent, projectRoot: projectRoot || null });
+    return brainRequest("contextual_search", { projectId, query, fileContext, intent, projectRoot: projectRoot || null, taskType: taskType || null, atomHints: atomHints || [], projectWhy: projectWhy || "" });
   });
 
   ipcMain.handle("brain_session_pins_clear", async (_event, args) => {
@@ -1909,6 +2379,11 @@ function registerBrainHandlers() {
 
   ipcMain.handle("brain_get_stats", async () => {
     return brainRequest("get_stats", {});
+  });
+
+  ipcMain.handle("brain_prune", async (_event, args) => {
+    const { projectId } = args;
+    return brainRequest("prune", { projectId });
   });
 
   ipcMain.handle("brain_get_intelligence_stats", async (_event, args) => {
@@ -1940,6 +2415,10 @@ function registerBrainHandlers() {
     return brainRequest("update_identity", { identity: args.identity });
   });
 
+  ipcMain.handle("brain_update_dna", async (_event, args) => {
+    return brainRequest("update_dna", { dna: args.dna });
+  });
+
   ipcMain.handle("brain_save_avatar", async (_event, args) => {
     return brainRequest("save_avatar", {
       base64Data: args.base64Data,
@@ -1952,7 +2431,8 @@ function registerBrainHandlers() {
   });
 
   ipcMain.handle("brain_mind_add", async (_event, args) => {
-    return brainRequest("mind_add", { content: args.content });
+    const result = await brainRequest("mind_add", { content: args.content, projectId: args.projectId || null });
+    return result;
   });
 
   ipcMain.handle("brain_mind_get_all", async () => {
@@ -1966,18 +2446,141 @@ function registerBrainHandlers() {
   ipcMain.handle("brain_mind_delete", async (_event, args) => {
     return brainRequest("mind_delete", { id: args.id });
   });
+
+  ipcMain.handle('brain_mind_thread_create', async (_event, args) => brainRequest('mind_thread_create', {entry_id: args.entryId}));
+  ipcMain.handle('brain_mind_thread_get', async (_event, args) => brainRequest('mind_thread_get', {entry_id: args.entryId}));
+  ipcMain.handle('brain_mind_thread_list_entry_ids', async () => brainRequest('mind_thread_list_entry_ids', {}));
+  ipcMain.handle('brain_mind_thread_add_turn', async (_event, args) => brainRequest('mind_thread_add_turn', {thread_id: args.threadId, role: args.role, content_json: args.contentJson}));
+  ipcMain.handle('brain_mind_thread_set_session', async (_event, args) => brainRequest('mind_thread_set_session', {thread_id: args.threadId, session_id: args.sessionId}));
+  ipcMain.handle('brain_mind_thread_delete', async (_event, args) => brainRequest('mind_thread_delete', {id: args.id}));
+
+  // On-demand punk review: user triggers from Lens UI
+  ipcMain.handle('run_review', async (_event, args) => {
+    if (!mindPunks || !args.projectId) return { started: false };
+    // Fire-and-forget — results come via pane://review-complete event
+    mindPunks.runReview(args.projectId, args.workingDir).catch(err => {
+      console.error("[review] failed:", err.message);
+      sendToRenderer("pane://review-complete", {
+        projectId: args.projectId, sessionId: null, error: err.message, findings: [],
+      });
+    });
+    return { started: true };
+  });
+
+  // ── Lens v2: single punk execution ────────────────────────────────────────
+  ipcMain.handle('run_single_punk', async (_event, args) => {
+    if (!mindPunks || !args.punkName || !args.projectId) return { started: false };
+    const { punkName, projectId, workingDir, scope } = args;
+    mindPunks.runSinglePunk(punkName, projectId, workingDir, scope ?? null).catch(err => {
+      console.error(`[punks] ${punkName} failed:`, err.message);
+      sendToRenderer("pane://punk-progress", {
+        punk: punkName, projectId, status: "failed", error: err.message,
+      });
+    });
+    return { started: true };
+  });
+
+  ipcMain.handle('check_previous_findings', async (_event, args) => {
+    if (!mindPunks || !args.punkName || !args.projectId) return { started: false };
+    const { punkName, projectId, workingDir } = args;
+    mindPunks.checkPrevious(punkName, projectId, workingDir).catch(err => {
+      console.error(`[punks] ${punkName} check failed:`, err.message);
+      sendToRenderer("pane://punk-progress", {
+        punk: punkName, projectId, status: "failed", error: err.message,
+      });
+    });
+    return { started: true };
+  });
+
+  // ── Lens v2: finding queries ──────────────────────────────────────────────
+  ipcMain.handle('findings_list', async (_event, args) => {
+    return brainRequest('findings_list', { projectId: args.projectId, limit: args.limit ?? 50 });
+  });
+
+  ipcMain.handle('findings_by_punk', async (_event, args) => {
+    return brainRequest('findings_by_punk', { projectId: args.projectId, punk: args.punkName, limit: args.limit ?? 50 });
+  });
+
+  ipcMain.handle('dismiss_finding', async (_event, args) => {
+    return brainRequest('finding_dismiss', { findingId: args.findingId });
+  });
+
+  // ── Punk Management ────────────────────────────────────────────────────────
+  ipcMain.handle('list_punks', async () => {
+    if (!mindPunks) return [];
+    return mindPunks.listPunks();
+  });
+
+  ipcMain.handle('create_punk', async (_event, args) => {
+    if (!mindPunks) return { success: false, error: "MindPunks not initialized" };
+    return mindPunks.createPunk(args.name, args.personaContent);
+  });
+
+  // ── Review data queries (kept for backward compat with Lens v1) ───────────
+  ipcMain.handle('review_findings_list', async (_event, args) => {
+    return brainRequest('review_findings_list', { sessionId: args.sessionId });
+  });
+  ipcMain.handle('review_sessions_list', async (_event, args) => {
+    return brainRequest('review_sessions_list', { projectId: args.projectId });
+  });
+  ipcMain.handle('review_session_latest', async (_event, args) => {
+    return brainRequest('review_session_latest', { projectId: args.projectId });
+  });
+
+  ipcMain.handle('lens_post_add', async (_event, args) => {
+    const result = await brainRequest('lens_post_add', { contributor: args.contributor, content: args.content, projectId: args.projectId ?? null, entryId: args.entryId ?? null });
+    return result?.post ?? null;
+  });
+
+  ipcMain.handle('lens_posts_list', async (_event, args) => {
+    const result = await brainRequest('lens_posts_list', { projectId: args.projectId ?? null });
+    return result?.posts ?? [];
+  });
+
+  ipcMain.handle('lens_post_delete', async (_event, args) => {
+    await brainRequest('lens_post_delete', { postId: args.postId });
+    return { success: true };
+  });
+
+  ipcMain.handle('lens_comments_list', async (_event, args) => {
+    const result = await brainRequest('lens_comments_list', { postId: args.postId });
+    return result?.comments ?? [];
+  });
+
+  ipcMain.handle('lens_comment_add', async (_event, args) => {
+    const result = await brainRequest('lens_comment_add', { postId: args.postId, role: args.role, content: args.content });
+    return result?.comment ?? null;
+  });
+
+  ipcMain.handle('lens_comment_set_session', async (_event, args) => {
+    await brainRequest('lens_comment_set_session', { postId: args.postId, sessionId: args.sessionId });
+  });
+
 }
 
-function registerIpcHandlers() {
+async function registerIpcHandlers() {
+  let db = null;
+  try {
+    const { initPaneDb, runMigrationIfNeeded } = await import("./pane-db.mjs");
+    db = initPaneDb();
+    await runMigrationIfNeeded(db);
+    console.log("[main] Database initialized successfully");
+  } catch (err) {
+    console.error("[main] Failed to initialize database:", err.message);
+    console.error("[main] App will continue with limited functionality");
+    // Create a mock db object to prevent crashes
+    db = { stmts: {} };
+  }
+
   registerCommandHandlers();
   registerSettingsHandlers();
-  registerClaudeHandlers();
+  await registerClaudeHandlers();
   registerWatcherHandlers();
   registerPtyHandlers();
-  registerCheckpointHandlers();
-  registerStateHandlers();
+  registerCheckpointHandlers(db);
+  registerStateHandlers(db);
   registerMemoryHandlers();
-  registerSessionHandlers();
+  registerSessionHandlers(db);
   registerBrainHandlers();
 }
 let mainWindow = null;
@@ -2004,6 +2607,8 @@ function createWindow() {
     minHeight: 500,
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 16, y: 18 },
+    transparent: true,
+    backgroundColor: "#00000000",
     title: "Pane",
     icon: iconPath,
     show: false,
@@ -2024,6 +2629,7 @@ function createWindow() {
   });
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
+    // Auto-open DevTools in dev mode so you can see renderer errors
     mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
     mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
@@ -2038,20 +2644,154 @@ function createWindow() {
     mainWindow = null;
   });
 
-  mainWindow.webContents.on("render-process-gone", (event, details) => {
-    console.error(`[pane] Renderer process gone: ${details.reason} (${details.exitCode})`);
-    if (details.reason === "crashed" || details.reason === "oom") {
-      console.warn("[pane] Renderer crashed or OOM, reload might be needed.");
-    }
-  });
 }
-app.whenReady().then(() => {
-  registerIpcHandlers();
+// Single-instance lock — required for Windows deep link (second-instance event).
+// Skip in dev: the production app may already hold the lock, which would
+// cause the dev build to quit immediately with no visible error.
+if (!isDev) {
+  if (!app.requestSingleInstanceLock()) {
+    app.quit();
+  }
+}
+
+// GPU rasterization — hardware-accelerates tile rasterization so scroll stays
+// smooth even in content-heavy views (long conversation lists, code blocks).
+// Without this, Chromium falls back to CPU rasterization which can stall for
+// 1-2s per tile on complex DOM. Must be called before app.whenReady().
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
+app.commandLine.appendSwitch('num-raster-threads', '4');
+
+app.whenReady().then(async () => {
+  await registerIpcHandlers();
   modelManager.initialize();
   createWindow();
   preforkPunkWorker(); // Pre-fork to hide first-use latency
   getPtyWorker();
-  getBrainWorker(); // Pre-fork: start loading SQLite + embedding model
+  getBrainWorker(); // Pre-fork: start SQLite + profile (embedding model loads lazily on first embed)
+  getCmdWorker();   // Pre-fork: runs execSync in isolated libuv loop (avoids EBADF in packaged app)
+
+  // Wire brain contextual search into punk-engine so it fires every turn.
+  // This is the critical link: brain searches the knowledge graph for query-
+  // relevant context and writes it to disk BEFORE compileContext() reads it.
+  punkEngine.setBrainSearch(async args => {
+    const { projectId, query, taskType, atomHints, projectRoot, intent, projectWhy } = args;
+    if (projectRoot) {
+      brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
+    }
+    // Memory lifecycle: decay unused memories, consolidate patterns, graduate principles.
+    // Fire-and-forget — runs in the brain worker, doesn't block the context search.
+    // enableConsolidation: true only 10% of the time (LLM calls are expensive).
+    brainRequest("memory_lifecycle", {
+      projectId,
+      enableConsolidation: Math.random() < 0.1,
+    }).catch(() => {});
+
+    const result = await brainRequest("contextual_search", {
+      projectId,
+      query,
+      fileContext: null,
+      intent:      intent || null,
+      projectRoot: projectRoot || null,
+      taskType:    taskType || null,
+      atomHints:   atomHints || [],
+      projectWhy:  projectWhy || "",
+    });
+    // Update in-memory ContextStore — context-orchestrator reads from here
+    // instead of the stale JSON file. Disk write still happens in brain-engine
+    // as crash recovery backup.
+    if (result && result.type !== "error") {
+      contextStore.updateBrainExport(projectId, result);
+    }
+    return result;
+  });
+
+  punkEngine.setBrainRequest((type, data) => brainRequest(type, data));
+
+  punkEngine.setQuickCall((sys, usr) => punkEngine.quickCall(sys, usr));
+  punkEngine.setAgentCall((sys, prompt, workingDir) => punkEngine.agentCall(sys, prompt, workingDir));
+
+  punkEngine.setBrainIndexer((projectId, events) =>
+    brainRequest("index_events", { projectId, events })
+  );
+
+  // Mind punks: background intelligence with personality that acts on thoughts
+  // Variable is used by brain_mind_add handler declared earlier in this scope,
+  // but only called at runtime after this initialization completes.
+  /* eslint-disable-next-line no-use-before-define -- runtime order is safe */
+  mindPunks = new MindPunks({
+    brainRequest,
+    quickCall: (sys, usr) => punkEngine.quickCall(sys, usr),
+    agentCall: (sys, prompt, workingDir) => punkEngine.agentCall(sys, prompt, workingDir),
+    sendToRenderer,
+  });
+
+  // Watch ~/.pane/projects/*/roadmap.json and ~/.pane/session/*/state.json so
+  // the UI reacts when an external CLI agent (Gemini, Claude) writes via the
+  // MCP server's pane_roadmap tool. Without this the roadmap panel and phase
+  // indicator only update when the Electron-side ToolExecutor fires events.
+  startMcpFileWatcher();
+
+  // ── Startup cleanup: prune accumulated noise ───────────────────────────
+  // The extraction→brain loop was never closed, so raw messages and raw brain
+  // nodes accumulated indefinitely. On first startup after this fix, clean up
+  // existing data: keep only the latest 200 messages per project, prune low-
+  // confidence brain nodes (< 0.15), and reclaim disk via VACUUM.
+  (async () => {
+    try {
+      // Get all projects that have conversation data in pane.db
+      const db = getPaneDb();
+      const projectsWithMessages = db.prepare(
+        `SELECT DISTINCT project_id FROM messages`
+      ).all().map(r => r.project_id);
+
+      // Get all projects that have brain data
+      const brainResult = await brainRequest("get_all_projects", {});
+      const projectsWithBrain = (brainResult?.projects || []);
+
+      const allProjectIds = [...new Set([...projectsWithMessages, ...projectsWithBrain])];
+      if (allProjectIds.length === 0) return;
+
+      console.log(`[main] Startup cleanup: pruning ${allProjectIds.length} projects`);
+
+      for (const projectId of allProjectIds) {
+        // Prune old conversation messages — keep last 200
+        try {
+          const { pruneConversationMessages } = await import("./pane-db.mjs");
+          pruneConversationMessages(projectId, 200);
+        } catch {}
+
+        // Prune low-confidence brain nodes
+        try {
+          await brainRequest("prune", { projectId });
+        } catch {}
+      }
+
+      // VACUUM pane.db to reclaim freelist space
+      try {
+        db.pragma("auto_vacuum = INCREMENTAL");
+        db.exec("PRAGMA incremental_vacuum(10)");
+        console.log("[main] pane.db incremental vacuum complete");
+      } catch {}
+
+      // VACUUM brain.db
+      try {
+        await brainRequest("vacuum", {});
+      } catch {}
+
+      console.log("[main] Startup cleanup complete");
+    } catch (err) {
+      console.warn(`[main] Startup cleanup error (non-fatal): ${err.message}`);
+    }
+  })();
+
+  // Daily backup at midnight — silent, automatic, 7-day rotation + cloud push
+  startBackupSchedule();
+
+  // Pane Cloud — GitHub OAuth, encrypted backups, cross-device sync
+  initCloudAuth(mainWindow);
+  registerCloudSyncHandlers();
+
   app.on("activate", () => {
     if (mainWindow) {
       mainWindow.show();

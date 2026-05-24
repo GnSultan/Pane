@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import Fuse from "fuse.js";
-import { useWorkspaceStore } from "../../stores/workspace";
 import { useProjectsStore } from "../../stores/projects";
 import { useShallow } from "zustand/react/shallow";
 import { walkProjectFiles, readFile, searchInFiles, type SearchResult } from "../../lib/tauri-commands";
@@ -25,8 +24,6 @@ export function FuzzyFinder() {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  const closeFuzzyFinder = useWorkspaceStore((s) => s.closeFuzzyFinder);
-
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const projectRoot = useProjectsStore((s) => {
     if (!s.activeProjectId) return null;
@@ -38,10 +35,12 @@ export function FuzzyFinder() {
   const isLoading = useProjectsStore((s) => s.projects.get(s.activeProjectId ?? "")?.fileIndex.isLoading ?? false);
   const lastIndexed = useProjectsStore((s) => s.projects.get(s.activeProjectId ?? "")?.fileIndex.lastIndexed ?? 0);
 
-  // Load file index if stale
+  // Load file index if stale — 5 minute staleness window (file listings don't
+  // change without explicit file operations). The previous 30s window caused
+  // the index to be constantly invalidated on rapid mode switches.
   useEffect(() => {
     if (!projectRoot || !activeProjectId) return;
-    const isStale = Date.now() - lastIndexed > 30000;
+    const isStale = Date.now() - lastIndexed > 300000;
     if (isStale && !isLoading) {
       useProjectsStore.getState().setFileIndexLoading(activeProjectId, true);
       walkProjectFiles(projectRoot)
@@ -52,12 +51,21 @@ export function FuzzyFinder() {
     }
   }, [projectRoot, activeProjectId, lastIndexed, isLoading]);
 
-  // Auto-focus input
+  // Mode-driven auto-focus: focus input whenever mode becomes "search"
+  const mode = useProjectsStore((s) => {
+    if (!s.activeProjectId) return null;
+    return s.projects.get(s.activeProjectId)?.mode ?? null;
+  });
   useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
+    if (mode === "search") {
+      inputRef.current?.focus();
+    }
+  }, [mode]);
 
-  // Search for code content when query changes
+  // Search for code content when query changes.
+  // Debounce increased to 250ms to avoid redundant searches on fast typing.
+  // Backend auto-aborts in-flight searches via ripgrep process kill, so
+  // multiple searches don't stack server-side.
   useEffect(() => {
     if (!projectRoot || query.length < 2) {
       setCodeResults([]);
@@ -73,7 +81,7 @@ export function FuzzyFinder() {
         })
         .catch(console.error)
         .finally(() => setIsSearchingCode(false));
-    }, 150);
+    }, 250);
     
     return () => clearTimeout(debounceTimer);
   }, [query, projectRoot]);
@@ -100,7 +108,11 @@ export function FuzzyFinder() {
       path: r.file_path,
       line: r.line_number,
       lineContent: r.line_content,
-      score: 50, // Give code results lower priority than exact file matches
+      // Score code results by query length: short/ambiguous queries get lower
+      // scores (20-40) so exact filename matches rank higher. Long/specific
+      // queries get higher scores (60-80) since the user is clearly searching
+      // for code content, not a file name.
+      score: Math.min(80, Math.max(20, query.length * 8)),
     }));
     
     // Combine and sort by score
@@ -143,14 +155,14 @@ export function FuzzyFinder() {
       } catch (err) {
         console.error("Failed to open file:", err);
       }
-      closeFuzzyFinder();
+      if (activeProjectId) useProjectsStore.getState().setMode(activeProjectId, "viewer");
     },
-    [projectRoot, activeProjectId, closeFuzzyFinder],
+    [projectRoot, activeProjectId],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
-      closeFuzzyFinder();
+      if (activeProjectId) useProjectsStore.getState().setMode(activeProjectId, "conversation");
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
       setSelectedIndex((i) => Math.min(i + 1, allResults.length - 1));
@@ -166,15 +178,13 @@ export function FuzzyFinder() {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[12%]"
-      onClick={closeFuzzyFinder}
+      className="h-full w-full flex items-start justify-center pt-[12%]"
+      onKeyDown={handleKeyDown}
     >
       <div
-        className={`w-full max-w-[560px] mx-4 bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden flex flex-col animate-fadeSlideUp ${
+        className={`w-full max-w-4xl mx-4 bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden flex flex-col animate-fadeSlideUp ${
           hasResults ? "max-h-[420px]" : ""
         }`}
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={handleKeyDown}
       >
         <div className="px-5 py-4 shrink-0">
           <input

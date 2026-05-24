@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useWorkspaceStore } from "../../stores/workspace";
 import { useProjectsStore } from "../../stores/projects";
 import { searchInFiles, readFile } from "../../lib/tauri-commands";
 import type { SearchResult } from "../../lib/tauri-commands";
@@ -14,18 +13,22 @@ export function FileSearch() {
   const listRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const closeFileSearch = useWorkspaceStore((s) => s.closeFileSearch);
-
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const projectRoot = useProjectsStore((s) => {
     if (!s.activeProjectId) return null;
     return s.projects.get(s.activeProjectId)?.root ?? null;
   });
 
-  // Auto-focus input
+  // Mode-driven auto-focus: focus input whenever mode becomes "filesearch"
+  const mode = useProjectsStore((s) => {
+    if (!s.activeProjectId) return null;
+    return s.projects.get(s.activeProjectId)?.mode ?? null;
+  });
   useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
+    if (mode === "filesearch") {
+      inputRef.current?.focus();
+    }
+  }, [mode]);
 
   // Debounced search
   useEffect(() => {
@@ -69,14 +72,14 @@ export function FileSearch() {
       } catch (err) {
         console.error("Failed to open file:", err);
       }
-      closeFileSearch();
+      if (activeProjectId) useProjectsStore.getState().setMode(activeProjectId, "viewer");
     },
-    [activeProjectId, closeFileSearch],
+    [activeProjectId],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
-      closeFileSearch();
+      if (activeProjectId) useProjectsStore.getState().setMode(activeProjectId, "conversation");
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
       setSelectedIndex((i) => Math.min(i + 1, results.length - 1));
@@ -94,15 +97,13 @@ export function FileSearch() {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[12%]"
-      onClick={closeFileSearch}
+      className="h-full w-full flex items-start justify-center pt-[12%]"
+      onKeyDown={handleKeyDown}
     >
       <div
-        className={`w-full max-w-[640px] mx-4 bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden flex flex-col animate-fadeSlideUp ${
+        className={`w-full max-w-4xl mx-4 bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden flex flex-col animate-fadeSlideUp ${
           hasResults ? "max-h-[520px]" : ""
         }`}
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={handleKeyDown}
       >
         <div className="px-5 py-4 shrink-0">
           <div className="flex items-center gap-3">

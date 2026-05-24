@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { memo, useMemo, useState, useEffect } from "react";
 import type React from "react";
 
 /**
@@ -9,6 +9,50 @@ import type React from "react";
  *
  * All sizes scale with --pane-font-size CSS variable (Cmd+/- adjustable).
  */
+
+// Module-level time-budgeted parse queue.
+//
+// Problem: on restore, 30+ messages each schedule a setTimeout(0) for
+// parseBlocks, and each LazyHighlightedCode schedules another for
+// renderHighlightedCode. Even though no individual call exceeds 20ms,
+// they all fire in rapid succession (same macrotask batch) and
+// collectively block the main thread for 500ms+.
+//
+// Solution: funnel all deferred work through this queue. Each tick
+// processes jobs until the 14ms per-frame budget is consumed, then
+// yields via setTimeout(0) so the browser can paint/handle input
+// before the next batch. Jobs queued while a tick is running are
+// picked up automatically in the next tick.
+const _parseQueue = (() => {
+  const q: Array<() => void> = [];
+  let scheduled = false;
+
+  function tick() {
+    scheduled = false;
+    const deadline = performance.now() + 14; // ~one frame budget
+    while (q.length > 0 && performance.now() < deadline) {
+      q.shift()!();
+    }
+    if (q.length > 0) {
+      scheduled = true;
+      setTimeout(tick, 0);
+    }
+  }
+
+  return {
+    enqueue(job: () => void): () => void {
+      q.push(job);
+      if (!scheduled) {
+        scheduled = true;
+        setTimeout(tick, 0);
+      }
+      return () => {
+        const i = q.indexOf(job);
+        if (i !== -1) q.splice(i, 1);
+      };
+    },
+  };
+})();
 
 // --- Syntax Highlighting ---
 
@@ -31,15 +75,15 @@ function highlightSyntax(code: string, language: string): SyntaxToken[] {
   // Build regex patterns with priorities
   const patterns = [
     // Comments (highest priority)
-    { pattern: /(\/\/.*$|\/\*[\s\S]*?\*\/|#.*$)/gm, type: "comment" as const },
+    { pattern: /(?:\/\/.*$|\/\*[\s\S]*?\*\/|#.*$)/gm, type: "comment" as const },
     // Strings (with escape handling)
-    { pattern: /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, type: "string" as const },
+    { pattern: /(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, type: "string" as const },
     // Numbers
-    { pattern: /\b(\d+\.?\d*)\b/g, type: "number" as const },
+    { pattern: /\b(?:\d+\.?\d*)\b/g, type: "number" as const },
     // Keywords (language-specific)
-    { pattern: new RegExp(`\\b(${getKeywords(language).map(escapeRegExp).join('|')})\\b`, "g"), type: "keyword" as const },
+    { pattern: new RegExp(`\\b(?:${getKeywords(language).map(escapeRegExp).join('|')})\\b`, "g"), type: "keyword" as const },
     // Function calls
-    { pattern: /\b([a-zA-Z_]\w*)\s*\(/g, type: "function" as const },
+    { pattern: /\b(?:[a-zA-Z_]\w*)\s*\(/g, type: "function" as const },
     // Operators
     { pattern: /[+\-*/%=<>!&|^~?:]+/g, type: "operator" as const },
     // Punctuation
@@ -146,12 +190,29 @@ function getKeywords(language: string): string[] {
   return languageKeywords[normalizedLang] || baseKeywords;
 }
 
-function renderHighlightedCode(code: string, language: string): React.JSX.Element[] {
+export function renderHighlightedCode(code: string, language: string): React.JSX.Element[] {
   const tokens = highlightSyntax(code, language);
   
   return tokens.map((token, index) => {
+    // String tokens that contain a file path: keep quotes in string color, highlight the path in pane-error
+    if (token.type === "string" && token.content.length >= 3) {
+      const first = token.content[0];
+      const last = token.content[token.content.length - 1];
+      if ((first === '"' || first === "'" || first === "`") && last === first) {
+        const inner = token.content.slice(1, -1);
+        if (SPECIAL_REGEX.test(inner)) {
+          return (
+            <span key={index}>
+              <span className="text-pane-syn-string">{first}</span>
+              <span className="text-pane-error">{inner}</span>
+              <span className="text-pane-syn-string">{last}</span>
+            </span>
+          );
+        }
+      }
+    }
+
     let className = "";
-    
     switch (token.type) {
       case "keyword":
         className = "text-pane-syn-keyword font-semibold";
@@ -177,7 +238,7 @@ function renderHighlightedCode(code: string, language: string): React.JSX.Elemen
       default:
         className = "text-pane-text/85";
     }
-    
+
     return (
       <span key={index} className={className}>
         {token.content}
@@ -199,12 +260,14 @@ interface MarkdownTextProps {
   text: string;
   isStreaming?: boolean;
   isThinking?: boolean;
+  projectId?: string; // when provided, file paths become clickable
 }
 
 export const MarkdownText = memo(function MarkdownText({
   text,
   isStreaming,
   isThinking,
+  projectId,
 }: MarkdownTextProps) {
   if (!text) return null;
 
@@ -215,10 +278,19 @@ export const MarkdownText = memo(function MarkdownText({
   const shouldParseMarkdown = !isStreaming && text.length <= 30_000;
   const shouldParseIncremental = isStreaming;
 
-  const blocks = useMemo(
-    () => (shouldParseMarkdown ? parseBlocks(text) : null),
-    [text, shouldParseMarkdown],
-  );
+  // Defer full markdown parsing to after first paint. wrapBareJson uses a
+  // greedy regex that is slow on code-heavy messages, and parseBlocks running
+  // synchronously across 30 restored messages blocks the main thread.
+  // Initial render shows plain text; blocks fill in on the next idle frame.
+  const [blocks, setBlocks] = useState<Block[] | null>(null);
+  useEffect(() => {
+    if (!shouldParseMarkdown) { setBlocks(null); return; }
+    let cancelled = false;
+    const cancel = _parseQueue.enqueue(() => {
+      if (!cancelled) setBlocks(parseBlocks(text));
+    });
+    return () => { cancelled = true; cancel(); };
+  }, [text, shouldParseMarkdown]);
 
   const incrementalBlocks = useMemo(
     () => (shouldParseIncremental ? parseIncremental(text) : null),
@@ -286,7 +358,7 @@ export const MarkdownText = memo(function MarkdownText({
               >
                 {groupItem.blocks.map((b, bi) => (
                   <span key={bi}>
-                    {"content" in b && typeof b.content === "string" && renderInline(b.content, isThinking)}
+                    {"content" in b && typeof b.content === "string" && renderInline(b.content, isThinking, projectId)}
                   </span>
                 ))}
               </Tag>
@@ -325,27 +397,26 @@ export const MarkdownText = memo(function MarkdownText({
           }
           
           // For regular IncrementalBlock items
-          return renderIncrementalBlock(item as IncrementalBlock, i, isThinking);
+          return renderIncrementalBlock(item as IncrementalBlock, i, isThinking, projectId);
         })}
       </div>
     );
   }
 
   if (!blocks) {
+    // Plain text while parseBlocks is deferred — avoids running PATH_REGEX
+    // synchronously across all restored messages before the first paint.
     return (
       <p
         className={`${isThinking ? "whitespace-pre-wrap" : "text-pane-text leading-[1.75] whitespace-pre-wrap mb-5"}`}
-        style={{
-          fontSize: isThinking ? "inherit" : "var(--pane-font-size)",
-          maxWidth: "65ch",
-        }}
+        style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)", maxWidth: "65ch" }}
       >
-        {renderInline(text, isThinking)}
+        {text}
       </p>
     );
   }
 
-  return <>{blocks.map((block, i) => renderBlock(block, i, isThinking))}</>;
+  return <>{blocks.map((block, i) => renderBlock(block, i, isThinking, projectId))}</>;
 });
 
 // --- Block-level parsing ---
@@ -368,6 +439,7 @@ type IncrementalBlock =
   | { type: "paragraph_chunk"; content: string }
   | { type: "list_item"; content: string; ordered: boolean }
   | { type: "inline"; content: string };
+
 
 function parseBlocks(text: string): Block[] {
   const lines = text.split("\n");
@@ -489,19 +561,49 @@ function parseBlocks(text: string): Block[] {
     }
     if (paraLines.length > 0) {
       blocks.push({ type: "paragraph", content: paraLines.join("\n") });
+    } else {
+      // No lines were consumed — the current line matched a paragraph-break
+      // condition (e.g. starts with `|` but isn't a valid table) yet wasn't
+      // caught by any earlier outer guard. Treat it as a plain text line to
+      // prevent an infinite loop.
+      blocks.push({ type: "paragraph", content: lines[i]! });
+      i++;
     }
   }
 
   return blocks;
 }
 
+// Defers syntax highlighting to after first paint so initial render of restored
+// conversations doesn't block the main thread. Code blocks appear as plain text
+// first, then get colored after mount. Uses requestIdleCallback so each block
+// is spread across idle frames rather than all firing in one effect flush.
+export const LazyHighlightedCode = memo(function LazyHighlightedCode({
+  code,
+  lang,
+}: {
+  code: string;
+  lang: string;
+}) {
+  const [tokens, setTokens] = useState<React.JSX.Element[] | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const cancel = _parseQueue.enqueue(() => {
+      if (!cancelled) setTokens(renderHighlightedCode(code, lang));
+    });
+    return () => { cancelled = true; cancel(); };
+  }, [code, lang]);
+  if (!tokens) return <>{code}</>;
+  return <>{tokens}</>;
+});
+
 // --- Block rendering ---
 
-const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|codebase_investigator|cli_help|generalist|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
-const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|${TOOL_NAMES})(?::)?)`, "g");
-const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^(?:${TOOL_NAMES})(?::)?$`);
+const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|list_directory|activate_skill|save_memory|web_fetch|pane_ora|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
+const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|[\\w.@-]+\\.[a-zA-Z0-9]{2,10}|${TOOL_NAMES})(?::)?)`, "g");
+const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^\\.[a-zA-Z][a-zA-Z0-9_.-]*$|^(?:${TOOL_NAMES})(?::)?$`);
 
-function renderBlock(block: Block, key: number, isThinking?: boolean) {
+function renderBlock(block: Block, key: number, isThinking?: boolean, projectId?: string) {
   switch (block.type) {
     case "code": {
       const trimmedContent = block.content.trim();
@@ -524,7 +626,7 @@ function renderBlock(block: Block, key: number, isThinking?: boolean) {
           >
             <pre className="whitespace-pre-wrap break-words m-0">
               <code className={isSpecial ? "text-pane-error" : undefined}>
-                {isSpecial ? block.content : renderHighlightedCode(block.content, block.lang)}
+                {isSpecial ? block.content : <LazyHighlightedCode code={block.content} lang={block.lang} />}
               </code>
             </pre>
           </div>
@@ -558,7 +660,7 @@ function renderBlock(block: Block, key: number, isThinking?: boolean) {
           className={`${isThinking ? s.className : `text-pane-text ${s.className}`}`}
           style={{ fontSize: isThinking ? "inherit" : s.fontSize }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </div>
       );
     }
@@ -581,7 +683,7 @@ function renderBlock(block: Block, key: number, isThinking?: boolean) {
             className={`text-pane-text-secondary leading-[1.75] ${isThinking ? "" : "italic"}`}
             style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
           >
-            {renderInline(block.content, isThinking)}
+            {renderInline(block.content, isThinking, projectId)}
           </p>
         </div>
       );
@@ -654,7 +756,7 @@ function renderBlock(block: Block, key: number, isThinking?: boolean) {
             maxWidth: "65ch" 
           }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </p>
       );
   }
@@ -756,6 +858,7 @@ function renderIncrementalBlock(
   block: IncrementalBlock,
   key: number,
   isThinking?: boolean,
+  projectId?: string,
 ) {
   switch (block.type) {
     case "code_start": {
@@ -797,7 +900,7 @@ function renderIncrementalBlock(
           className={`${isThinking ? s.className : `text-pane-text ${s.className}`}`}
           style={{ fontSize: isThinking ? "inherit" : s.fontSize }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </div>
       );
     }
@@ -809,7 +912,7 @@ function renderIncrementalBlock(
           className={`${isThinking ? "leading-[1.7] my-1" : "text-pane-text leading-[1.7] my-1"}`}
           style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </li>
       );
 
@@ -821,7 +924,7 @@ function renderIncrementalBlock(
           className={`${isThinking ? "leading-[1.75] whitespace-pre-wrap break-words" : "text-pane-text leading-[1.75] whitespace-pre-wrap break-words"}`}
           style={{ fontSize: isThinking ? "inherit" : "var(--pane-font-size)" }}
         >
-          {renderInline(block.content, isThinking)}
+          {renderInline(block.content, isThinking, projectId)}
         </span>
       );
   }
@@ -829,11 +932,11 @@ function renderIncrementalBlock(
 
 // --- Inline parsing ---
 
-function renderInline(text: string, isThinking?: boolean): (string | React.JSX.Element)[] {
+export function renderInline(text: string, isThinking?: boolean, projectId?: string): (string | React.JSX.Element)[] {
   const cleaned = stripEmojis(text);
   const parts: (string | React.JSX.Element)[] = [];
-  // Match: [link](url), `code`, **bold**, *italic*
-  const regex = /(\[[^\]]+\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+  // Match: @mind:id, [link](url), `code`, 'single-quoted', **bold**, *italic*, [@thought]
+  const regex = /(@mind:[^\s]+|\[[^\]]+\]\([^)]+\)|`[^`]+`|'[^\s'][^\s']*'|\*\*[^*]+\*\*|\*[^*]+\*|\[@thought\])/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -853,14 +956,31 @@ function renderInline(text: string, isThinking?: boolean): (string | React.JSX.E
       if (matchStart > txtIdx) {
         result.push(txt.slice(txtIdx, matchStart));
       }
+      // Strip trailing colon from paths like "src/foo.ts:" (tool output formatting)
+      const cleanPath = matchPath.replace(/:$/, "");
       result.push(
-        <code
-          key={`path-${startIndex}-${matchStart}`}
-          className="font-mono text-pane-error"
-          style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
-        >
-          {matchPath}
-        </code>
+        projectId ? (
+          <button
+            key={`path-${startIndex}-${matchStart}`}
+            onClick={() =>
+              window.dispatchEvent(
+                new CustomEvent("pane:open-path", { detail: { path: cleanPath, projectId } }),
+              )
+            }
+            className="font-mono text-pane-error hover:opacity-70 hover:underline cursor-pointer transition-opacity"
+            style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
+          >
+            {cleanPath}
+          </button>
+        ) : (
+          <code
+            key={`path-${startIndex}-${matchStart}`}
+            className="font-mono text-pane-error"
+            style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
+          >
+            {cleanPath}
+          </code>
+        )
       );
       txtIdx = matchStart + matchPath.length;
     }
@@ -878,8 +998,36 @@ function renderInline(text: string, isThinking?: boolean): (string | React.JSX.E
 
     const token = match[0];
     const key = `inline-${match.index}`;
+    const fontMono = "ui-monospace, 'Cascadia Code', 'Cascadia Mono', 'Fira Code', Consolas, monospace";
 
-    if (token.startsWith("[")) {
+    if (token.startsWith("@mind:")) {
+      parts.push(
+        <span
+          key={key}
+          style={{
+            color: "var(--pane-status-modified)",
+            fontFamily: fontMono,
+            fontWeight: 500,
+          }}
+        >
+          thought
+        </span>
+      );
+    } else if (token === "[@thought]") {
+      parts.push(
+        <span
+          key={key}
+          style={{
+            color: "var(--pane-status-modified)",
+            fontFamily: fontMono,
+            fontWeight: 500,
+            textTransform: "lowercase",
+          }}
+        >
+          @thought
+        </span>
+      );
+    } else if (token.startsWith("[")) {
       const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       if (linkMatch) {
         parts.push(
@@ -922,8 +1070,24 @@ function renderInline(text: string, isThinking?: boolean): (string | React.JSX.E
           </code>,
         );
       }
-    }
- else if (token.startsWith("**")) {
+    } else if (token.startsWith("'") && token.endsWith("'")) {
+      const innerContent = token.slice(1, -1);
+      const isSpecial = SPECIAL_REGEX.test(innerContent.trim());
+      if (isSpecial) {
+        parts.push(
+          <code
+            key={key}
+            className="font-mono text-pane-error"
+            style={{ fontSize: `calc(${isThinking ? "inherit" : "var(--pane-font-size)"} - 2px)` }}
+          >
+            {innerContent}
+          </code>,
+        );
+      } else {
+        // Not a filename — preserve as plain text with quotes intact
+        parts.push(token);
+      }
+    } else if (token.startsWith("**")) {
       parts.push(
         <strong key={key} className={`font-semibold ${isThinking ? "" : "text-pane-text"}`}>
           {token.slice(2, -2)}

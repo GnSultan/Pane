@@ -96,6 +96,26 @@ class RoutingStore {
       CREATE INDEX IF NOT EXISTS idx_outcomes_ts
         ON routing_outcomes(timestamp);
     `);
+
+    // Version-gated migrations
+    const currentVersion = this._db.pragma("user_version", { simple: true });
+
+    if (currentVersion < 1) {
+      // v1: add project_id column to model_profiles for per-project routing
+      try {
+        this._db.exec(`ALTER TABLE model_profiles ADD COLUMN project_id TEXT NOT NULL DEFAULT ''`);
+      } catch (err) {
+        // Column may already exist if DB was manually altered — non-fatal
+        if (!err.message.includes("duplicate column")) throw err;
+      }
+      // Drop old unique index and recreate with project_id included
+      this._db.exec(`
+        DROP INDEX IF EXISTS model_profiles_model_provider_domain_task_type;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_model_profiles_unique
+          ON model_profiles(model, provider, domain, task_type, project_id);
+      `);
+      this._db.pragma("user_version = 1");
+    }
   }
 
   // ── Write ──────────────────────────────────────────────────────────────────
@@ -114,7 +134,7 @@ class RoutingStore {
       data.domain              ?? null,
       data.model               ?? null,
       data.provider            ?? null,
-      data.heuristicConfidence ?? null,
+      data.routingConfidence ?? data.heuristicConfidence ?? null,
       data.oracleUsed          ? 1 : 0,
       data.oracleConfidence    ?? null,
       data.promptLength        ?? null,
@@ -139,9 +159,9 @@ class RoutingStore {
     );
     if (score !== null) {
       const row = this.db.prepare(
-        "SELECT model, provider, domain, task_type FROM routing_outcomes WHERE id = ?"
+        "SELECT model, provider, domain, task_type, project_id FROM routing_outcomes WHERE id = ?"
       ).get(id);
-      if (row) this._updateProfile(row, score);
+      if (row) this._updateProfile(row, score, row.project_id ?? '');
     }
   }
 
@@ -175,10 +195,20 @@ class RoutingStore {
 
   // ── Read ───────────────────────────────────────────────────────────────────
 
-  getProfile(model, provider, domain, taskType) {
+  getProfile(model, provider, domain, taskType, projectId = '') {
+    if (projectId) {
+      // Try per-project profile first (require at least 5 samples for reliability)
+      const projectProfile = this.db.prepare(`
+        SELECT * FROM model_profiles
+        WHERE model = ? AND provider = ? AND domain = ? AND task_type = ? AND project_id = ?
+          AND sample_count >= 5
+      `).get(model, provider, domain, taskType, projectId);
+      if (projectProfile) return projectProfile;
+    }
+    // Fall back to global profile (project_id = '')
     return this.db.prepare(`
       SELECT * FROM model_profiles
-      WHERE model = ? AND provider = ? AND domain = ? AND task_type = ?
+      WHERE model = ? AND provider = ? AND domain = ? AND task_type = ? AND project_id = ''
     `).get(model, provider, domain, taskType);
   }
 
@@ -190,6 +220,59 @@ class RoutingStore {
 
   priorCount() {
     return this.db.prepare("SELECT COUNT(*) as n FROM benchmark_priors").get().n;
+  }
+
+  /**
+   * All benchmark priors — used by the unified classifier to build the model catalog.
+   * Returns one row per (model, provider) with scores, costs, and arena rank.
+   */
+  getAllPriors() {
+    return this.db.prepare("SELECT * FROM benchmark_priors ORDER BY arena_rank ASC NULLS LAST").all();
+  }
+
+  /**
+   * All model profiles — real outcome data aggregated per (model, provider, domain, task_type).
+   * Used by the unified classifier to show the model its own track record.
+   */
+  getAllProfiles() {
+    return this.db.prepare("SELECT * FROM model_profiles WHERE sample_count >= 1 ORDER BY avg_score DESC").all();
+  }
+
+  /**
+   * Recent scored outcomes for a project — used for struggle detection.
+   * Returns up to n rows ordered most-recent first.
+   */
+  getRecentProjectOutcomes(projectId, n = 6) {
+    if (!projectId) return [];
+    return this.db.prepare(`
+      SELECT * FROM routing_outcomes
+      WHERE project_id = ? AND score IS NOT NULL
+      ORDER BY timestamp DESC LIMIT ?
+    `).all(projectId, n);
+  }
+
+  /**
+   * Best model available for the given provider set.
+   * Ranks by composite benchmark score — used for struggle escalation.
+   * @param {Set<string>} providers — available provider names
+   * @returns {{ model: string, provider: string } | null}
+   */
+  getFrontierModel(providers) {
+    const rows = this.db.prepare(`
+      SELECT model, provider,
+        (COALESCE(coding_score, 0) + COALESCE(reasoning_score, 0) + COALESCE(general_score, 0)) /
+        MAX(1,
+          (CASE WHEN coding_score IS NOT NULL THEN 1 ELSE 0 END +
+           CASE WHEN reasoning_score IS NOT NULL THEN 1 ELSE 0 END +
+           CASE WHEN general_score IS NOT NULL THEN 1 ELSE 0 END)
+        ) AS composite
+      FROM benchmark_priors
+      ORDER BY composite DESC
+    `).all();
+    for (const row of rows) {
+      if (providers.has(row.provider)) return { model: row.model, provider: row.provider };
+    }
+    return null;
   }
 
   // Retrospective adjustment — applied when the next message reveals whether
@@ -207,15 +290,15 @@ class RoutingStore {
       "UPDATE routing_outcomes SET score = ? WHERE id = ?"
     ).run(newScore, outcomeId);
 
-    // Propagate delta to the running model profile
-    const profile = this.getProfile(row.model, row.provider, row.domain, row.task_type);
+    // Propagate delta to the running model profile (global profile only)
+    const profile = this.getProfile(row.model, row.provider, row.domain, row.task_type, '');
     if (profile) {
       const newTotal = profile.total_score + (newScore - oldScore);
       const newAvg   = newTotal / profile.sample_count;
       this.db.prepare(`
         UPDATE model_profiles
         SET total_score = ?, avg_score = ?, last_updated = ?
-        WHERE model = ? AND provider = ? AND domain = ? AND task_type = ?
+        WHERE model = ? AND provider = ? AND domain = ? AND task_type = ? AND project_id = ''
       `).run(newTotal, newAvg, Date.now(),
         row.model, row.provider, row.domain, row.task_type);
     }
@@ -242,8 +325,8 @@ class RoutingStore {
 
   _computeScore(signals) {
     // Composite 0–1 from outcome signals.
-    // Deliberately simple — more signal types get added over time as the system
-    // learns what correlates with good routing decisions.
+    // Negative signals penalize failures. Positive signals reward clean, substantive
+    // responses — so the system can learn genuine model affinity, not just avoidance.
     let score = 0.70; // optimistic prior
 
     if (signals.hadToolErrors)            score -= 0.25;
@@ -255,26 +338,39 @@ class RoutingStore {
                       signals.domain    === "architecture";
     if (isComplex && (signals.responseLength ?? 999) < 100) score -= 0.15;
 
+    // Positive: fast, clean response with no tool errors
+    if (!signals.hadToolErrors && (signals.responseTimeMs ?? 0) < 30_000) score += 0.05;
+
+    // Positive: substantive response length relative to task type
+    const len = signals.responseLength ?? 0;
+    if (len > 0 && (isComplex ? len >= 500 : len >= 200)) score += 0.05;
+
     return Math.max(0, Math.min(1, score));
   }
 
-  _updateProfile(row, score) {
-    const existing = this.getProfile(row.model, row.provider, row.domain, row.task_type);
+  _updateProfile(row, score, projectId = '') {
+    this._writeProfile(row.model, row.provider, row.domain, row.task_type, score, '');
+    if (projectId) {
+      this._writeProfile(row.model, row.provider, row.domain, row.task_type, score, projectId);
+    }
+  }
+
+  _writeProfile(model, provider, domain, taskType, score, projectId) {
+    const existing = this.getProfile(model, provider, domain, taskType, projectId);
     if (existing) {
       const n     = existing.sample_count + 1;
       const total = existing.total_score  + score;
       this.db.prepare(`
         UPDATE model_profiles
         SET sample_count = ?, total_score = ?, avg_score = ?, last_updated = ?
-        WHERE model = ? AND provider = ? AND domain = ? AND task_type = ?
-      `).run(n, total, total / n, Date.now(),
-        row.model, row.provider, row.domain, row.task_type);
+        WHERE model = ? AND provider = ? AND domain = ? AND task_type = ? AND project_id = ?
+      `).run(n, total, total / n, Date.now(), model, provider, domain, taskType, projectId);
     } else {
       this.db.prepare(`
-        INSERT INTO model_profiles
-          (model, provider, domain, task_type, sample_count, total_score, avg_score, last_updated)
-        VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-      `).run(row.model, row.provider, row.domain, row.task_type, score, score, Date.now());
+        INSERT OR IGNORE INTO model_profiles
+          (model, provider, domain, task_type, project_id, sample_count, total_score, avg_score, last_updated)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(model, provider, domain, taskType, projectId, score, score, Date.now());
     }
   }
 }

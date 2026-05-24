@@ -6,10 +6,9 @@ import { ExpandedEditInput, ExpandedWriteInput } from "./ToolActivity";
 
 interface ChangeHistoryPanelProps {
   projectId: string;
-  onCollapse: () => void;
 }
 
-export function ChangeHistoryPanel({ projectId, onCollapse }: ChangeHistoryPanelProps) {
+export function ChangeHistoryPanel({ projectId }: ChangeHistoryPanelProps) {
   const [changes, setChanges] = useState<ChangeEntry[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -31,7 +30,7 @@ export function ChangeHistoryPanel({ projectId, onCollapse }: ChangeHistoryPanel
   };
 
   return (
-    <div className="h-full flex flex-col bg-pane-bg relative z-20">
+    <div className="h-full flex flex-col bg-pane-bg relative">
       {/* Header */}
       <div className="flex-shrink-0 px-4 py-3 flex items-center justify-between border-b border-pane-border/10">
         <div className="flex items-center gap-3">
@@ -48,14 +47,6 @@ export function ChangeHistoryPanel({ projectId, onCollapse }: ChangeHistoryPanel
             {changes.length}
           </span>
         </div>
-        <button
-          onClick={onCollapse}
-          className="text-pane-text-secondary/30 hover:text-pane-text-secondary/70 transition-colors"
-        >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <path d="M6 18L18 6M6 6l12 12" />
-          </svg>
-        </button>
       </div>
 
       {/* Content */}
@@ -138,7 +129,7 @@ function ChangeItem({ change, projectId, onReverted }: ChangeItemProps) {
     <div
       className={`rounded-md border transition-all duration-200 mx-1 ${
         expanded
-          ? "border-[var(--pane-border-soft)] bg-pane-bg/60 backdrop-blur-sm mb-2"
+          ? "border-[var(--pane-border-soft)] bg-pane-bg/60 mb-2"
           : "border-transparent hover:border-[var(--pane-border-soft)] mb-0.5"
       }`}
     >

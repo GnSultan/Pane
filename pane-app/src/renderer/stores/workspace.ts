@@ -1,18 +1,23 @@
 import { create } from "zustand";
 import type { ActionId, KeyBinding } from "../lib/keybindings";
 import {
-  DEFAULT_BACKEND_ROUTING,
-  type IntentRouting,
-  type BackendRouting,
+  DEFAULT_POWER_COMBO,
+  type PowerCombo,
 } from "../lib/models";
 import type { OpenRouterModel } from "../lib/tauri-commands";
+import {
+  getOpenRouterModels,
+  getAllModels,
+  refreshAllModels,
+  setAppTheme,
+} from "../lib/tauri-commands";
 
 const DEFAULT_FONT_SIZE = 15;
 const DEFAULT_PANEL_FONT_SIZE = 13;
 const DEFAULT_EDITOR_FONT_SIZE = 14;
 const DEFAULT_FONT_WEIGHT = 400;
 
-export type Theme = "dark" | "light" | "pure" | "system";
+export type Theme = "dark" | "light" | "pure" | "glass" | "system";
 
 function getSystemTheme(): "dark" | "light" {
   return window.matchMedia("(prefers-color-scheme: dark)").matches
@@ -20,15 +25,11 @@ function getSystemTheme(): "dark" | "light" {
     : "light";
 }
 
-function resolveTheme(theme: Theme): "dark" | "light" | "pure" {
+function resolveTheme(theme: Theme): "dark" | "light" | "pure" | "glass" {
   return theme === "system" ? getSystemTheme() : theme;
 }
 
 interface WorkspaceState {
-  controlPanelVisible: boolean;
-  controlPanelWidth: number;
-  fuzzyFinderOpen: boolean;
-  fileSearchOpen: boolean;
   fontSize: number;
   panelFontSize: number;
   editorFontSize: number;
@@ -39,50 +40,42 @@ interface WorkspaceState {
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
   selectedModelProvider: string; // The provider for the current model
   selectedModelThinking: boolean;
-  punkBackend: string; // "http" | "gemini-cli" | "claude-cli"
+  punkBackend: string; // "api" | "claude-code" | "gemini" - kept for backward compatibility
   httpProvider: string; // "deepseek" | "kimi" | "anthropic" | etc.
   httpApiKeys: Record<string, string>;
   httpBaseUrls: Record<string, string>;
-  intentRouting: BackendRouting;
-  intentAutoRoute: boolean;
+  disabledProviders: string[];
+  setDisabledProviders: (providers: string[]) => void;
+  toggleProvider: (provider: string) => void;
+  isProviderEnabled: (provider: string) => boolean;
+  curatedModels: string[];
+  setCuratedModels: (models: string[]) => void;
+  addCuratedModel: (model: string) => void;
+  removeCuratedModel: (model: string) => void;
+  isCuratedModel: (model: string) => boolean;
+  powerCombo: PowerCombo;
+  autoEscalate: boolean;
   openRouterModels: OpenRouterModel[];
   allModels: Record<string, OpenRouterModel[]>;
   fetchOpenRouterModels: () => Promise<void>;
   fetchAllModels: () => Promise<void>;
   refreshAllModels: () => Promise<void>;
-  // Overlay — mutually exclusive workspace-level spaces (mind, profile, history)
-  overlay: "mind" | "profile" | "history" | null;
-  setOverlay: (overlay: "mind" | "profile" | "history" | null) => void;
-  toggleOverlay: (overlay: "mind" | "profile" | "history") => void;
+
+  // Backend availability for transparent routing
+  backendAvailability: {
+    claudeCode: boolean;
+    geminiCli: boolean;
+    api: boolean; // Always true
+  };
+  setBackendAvailability: (availability: { claudeCode: boolean; geminiCli: boolean }) => void;
+  // SDK metadata — populated after first backend session init
+  sdkModels: import("../lib/punk-types").SdkModel[] | null;
+  sdkAccount: import("../lib/punk-types").SdkAccount | null;
+  setSdkInfo: (models: import("../lib/punk-types").SdkModel[] | null, account: import("../lib/punk-types").SdkAccount | null) => void;
+  rateLimitInfo: import("../lib/punk-types").RateLimitInfo | null;
+  setRateLimitInfo: (info: import("../lib/punk-types").RateLimitInfo | null) => void;
+  lastTokenUsageAt: number;
   // Profile data
-  profileName: string;
-  profileBio: string;
-  profileRole: string;
-  profileAvatarDataUrl: string | null; // data:image/... URL for display
-  // Claude updates
-  claudeUpdateAvailable: boolean;
-  claudeUpdateState: "available" | "updating" | "updated" | "restart" | null;
-  claudeCurrentVersion: string | null;
-  claudeNewVersion: string | null;
-  checkForClaudeUpdate: () => Promise<void>;
-  triggerClaudeUpdate: () => Promise<void>;
-  // Gemini updates
-  geminiUpdateAvailable: boolean;
-  geminiUpdateState: "available" | "updating" | "updated" | "restart" | null;
-  geminiCurrentVersion: string | null;
-  geminiNewVersion: string | null;
-  checkForGeminiUpdate: () => Promise<void>;
-  triggerGeminiUpdate: () => Promise<void>;
-  setProfileName: (name: string) => void;
-  setProfileBio: (bio: string) => void;
-  setProfileRole: (role: string) => void;
-  setProfileAvatarDataUrl: (url: string | null) => void;
-  toggleControlPanel: () => void;
-  setControlPanelWidth: (width: number) => void;
-  toggleFuzzyFinder: () => void;
-  closeFuzzyFinder: () => void;
-  toggleFileSearch: () => void;
-  closeFileSearch: () => void;
   increaseFontSize: () => void;
   decreaseFontSize: () => void;
   resetFontSize: () => void;
@@ -116,9 +109,9 @@ interface WorkspaceState {
   setHttpProvider: (provider: string) => void;
   setHttpApiKeys: (keys: Record<string, string>) => void;
   setHttpBaseUrls: (urls: Record<string, string>) => void;
-  getEffectiveRouting: () => IntentRouting | undefined;
-  setIntentRouting: (routing: IntentRouting | null) => void;
-  setIntentAutoRoute: (autoRoute: boolean) => void;
+  getEffectiveCombo: () => PowerCombo | undefined;
+  setPowerCombo: (combo: PowerCombo | null) => void;
+  setAutoEscalate: (autoEscalate: boolean) => void;
 }
 
 function applyFontSize(size: number) {
@@ -154,19 +147,49 @@ function applyFontWeight(weight: number) {
 
 function applyTheme(theme: Theme) {
   const resolved = resolveTheme(theme);
-  if (resolved === "dark") {
-    document.documentElement.removeAttribute("data-theme");
+
+  const apply = () => {
+    // system+dark → :root (Dusk — softer default, no attribute)
+    // explicit dark → data-theme="dark" (Ink — the hard choice)
+    if (theme === "system" && resolved === "dark") {
+      document.documentElement.removeAttribute("data-theme");
+    } else if (resolved === "dark") {
+      document.documentElement.setAttribute("data-theme", "dark");
+    } else {
+      document.documentElement.setAttribute("data-theme", resolved);
+    }
+    // Toggle native vibrancy for Liquid Glass
+    const vibrancy = resolved === "glass" ? "under-window" : null;
+    window.electronAPI?.invoke("set_vibrancy", { vibrancy }).catch(() => {});
+    // Switch dock icon variant
+    setAppTheme(resolved);
+  };
+
+  // Use View Transitions API for a smooth crossfade between themes.
+  // Falls back to instant apply if the API isn't available.
+  if ("startViewTransition" in document) {
+    const transition = (document as Document & { startViewTransition(cb: () => void): { finished: Promise<void> } }).startViewTransition(apply);
+    // Style the transition: soft crossfade, no movement
+    const style = document.createElement("style");
+    style.textContent = `
+      ::view-transition-old(root) {
+        animation: 350ms ease-out both fade-out;
+      }
+      ::view-transition-new(root) {
+        animation: 350ms ease-in both fade-in;
+      }
+      @keyframes fade-out { to { opacity: 0; } }
+      @keyframes fade-in { from { opacity: 0; } }
+    `;
+    document.head.appendChild(style);
+    transition.finished.then(() => style.remove()).catch(() => style.remove());
   } else {
-    document.documentElement.setAttribute("data-theme", resolved);
+    apply();
   }
 }
 
 function createWorkspaceStore() {
   return create<WorkspaceState>()((set, get) => ({
-    controlPanelVisible: true,
-    controlPanelWidth: 240,
-    fuzzyFinderOpen: false,
-    fileSearchOpen: false,
     fontSize: DEFAULT_FONT_SIZE,
     panelFontSize: DEFAULT_PANEL_FONT_SIZE,
     editorFontSize: DEFAULT_EDITOR_FONT_SIZE,
@@ -177,16 +200,36 @@ function createWorkspaceStore() {
     selectedModel: "stepfun/step-3.5-flash:free",
     selectedModelProvider: "openrouter",
     selectedModelThinking: true,
-    punkBackend: "http",
+    punkBackend: "api",
     httpProvider: "openrouter",
     httpApiKeys: {},
     httpBaseUrls: {},
-    intentRouting: DEFAULT_BACKEND_ROUTING,
-    intentAutoRoute: true,
+    disabledProviders: [],
+    setDisabledProviders: (providers) => set({ disabledProviders: providers }),
+    toggleProvider: (provider) => {
+      const current = get().disabledProviders;
+      const next = current.includes(provider)
+        ? current.filter((p) => p !== provider)
+        : [...current, provider];
+      set({ disabledProviders: next });
+    },
+    isProviderEnabled: (provider) => !get().disabledProviders.includes(provider),
+    curatedModels: [],
+    setCuratedModels: (models) => set({ curatedModels: models }),
+    addCuratedModel: (model) => {
+      const current = get().curatedModels;
+      if (current.includes(model)) return;
+      set({ curatedModels: [...current, model] });
+    },
+    removeCuratedModel: (model) => {
+      set({ curatedModels: get().curatedModels.filter((m) => m !== model) });
+    },
+    isCuratedModel: (model) => get().curatedModels.includes(model),
+    powerCombo: DEFAULT_POWER_COMBO,
+    autoEscalate: true,
     openRouterModels: [],
     allModels: {},
     fetchOpenRouterModels: async () => {
-      const { getOpenRouterModels } = await import("../lib/tauri-commands");
       try {
         const models = await getOpenRouterModels();
         set({ 
@@ -198,7 +241,6 @@ function createWorkspaceStore() {
       }
     },
     fetchAllModels: async () => {
-      const { getAllModels } = await import("../lib/tauri-commands");
       try {
         const models = await getAllModels();
         set({ 
@@ -210,7 +252,6 @@ function createWorkspaceStore() {
       }
     },
     refreshAllModels: async () => {
-      const { refreshAllModels } = await import("../lib/tauri-commands");
       try {
         const models = await refreshAllModels();
         set({ 
@@ -221,106 +262,38 @@ function createWorkspaceStore() {
         console.error("Failed to refresh all models:", err);
       }
     },
-    // Overlay
-    overlay: null,
-    setOverlay: (o) => set({ overlay: o }),
-    toggleOverlay: (o) => set((state) => ({ overlay: state.overlay === o ? null : o })),
-    // Profile data
-    profileName: "",
-    profileBio: "",
-    profileRole: "",
-    profileAvatarDataUrl: null,
-    // Claude updates
-    claudeUpdateAvailable: false,
-    claudeUpdateState: null,
-    claudeCurrentVersion: null,
-    claudeNewVersion: null,
-    geminiUpdateAvailable: false,
-    geminiUpdateState: null,
-    geminiCurrentVersion: null,
-    geminiNewVersion: null,
-    setProfileName: (name: string) => set({ profileName: name }),
-    setProfileBio: (bio: string) => set({ profileBio: bio }),
-    setProfileRole: (role: string) => set({ profileRole: role }),
-    setProfileAvatarDataUrl: (url: string | null) =>
-      set({ profileAvatarDataUrl: url }),
-    checkForClaudeUpdate: async () => {
-      const { checkClaudeUpdate } = await import("../lib/tauri-commands");
-      const result = await checkClaudeUpdate();
-      if (!result.error && result.updateAvailable) {
-        set({
-          claudeUpdateAvailable: true,
-          claudeUpdateState: "available",
-          claudeCurrentVersion: result.currentVersion,
-          claudeNewVersion: result.newVersion,
-        });
-      } else {
-        set({
-          claudeUpdateAvailable: false,
-          claudeUpdateState: null,
-          claudeCurrentVersion: result.currentVersion,
-          claudeNewVersion: null,
-        });
-      }
+    // Backend availability for transparent routing
+    backendAvailability: {
+      claudeCode: false,
+      geminiCli: false,
+      api: true, // Always available
     },
-    triggerClaudeUpdate: async () => {
-      set({ claudeUpdateState: "updating" });
-      const { updateClaude } = await import("../lib/tauri-commands");
-      const result = await updateClaude();
-      if (result.success) {
-        set({ claudeUpdateState: "updated" });
-        setTimeout(() => {
-          set({ claudeUpdateState: "restart", claudeUpdateAvailable: false });
-        }, 2000);
-      } else {
-        // keep showing available so user can retry, but don't silently swallow the error
-        set({ claudeUpdateState: "available" });
-      }
+    setBackendAvailability: (availability) => 
+      set({ 
+        backendAvailability: { 
+          ...get().backendAvailability, 
+          ...availability 
+        } 
+      }),
+    // SDK metadata
+    sdkModels: null,
+    sdkAccount: null,
+    setSdkInfo: (models, account) => set({ sdkModels: models, sdkAccount: account }),
+    rateLimitInfo: null,
+    setRateLimitInfo: (info) => {
+      // Persist to localStorage so the Profile session bar survives app restarts.
+      // rate_limit_event only fires on message send — without this, the bar is
+      // always 0% on cold open until the first message goes out.
+      try {
+        if (info) {
+          localStorage.setItem("pane:rateLimitInfo", JSON.stringify(info));
+        } else {
+          localStorage.removeItem("pane:rateLimitInfo");
+        }
+      } catch {}
+      set({ rateLimitInfo: info });
     },
-    checkForGeminiUpdate: async () => {
-      const { checkGeminiUpdate } = await import("../lib/tauri-commands");
-      const result = await checkGeminiUpdate();
-      if (!result.error && result.updateAvailable) {
-        set({
-          geminiUpdateAvailable: true,
-          geminiUpdateState: "available",
-          geminiCurrentVersion: result.currentVersion,
-          geminiNewVersion: result.newVersion,
-        });
-      } else {
-        set({
-          geminiUpdateAvailable: false,
-          geminiUpdateState: null,
-          geminiCurrentVersion: result.currentVersion,
-          geminiNewVersion: null,
-        });
-      }
-    },
-    triggerGeminiUpdate: async () => {
-      set({ geminiUpdateState: "updating" });
-      const { updateGemini } = await import("../lib/tauri-commands");
-      const result = await updateGemini();
-      if (result.success) {
-        set({ geminiUpdateState: "updated" });
-        setTimeout(() => {
-          set({ geminiUpdateState: "restart", geminiUpdateAvailable: false });
-        }, 2000);
-      } else {
-        set({ geminiUpdateState: "available" });
-      }
-    },
-    toggleControlPanel: () =>
-      set((state) => ({
-        controlPanelVisible: !state.controlPanelVisible,
-      })),
-    setControlPanelWidth: (width: number) =>
-      set({ controlPanelWidth: Math.max(200, Math.min(480, width)) }),
-    toggleFuzzyFinder: () =>
-      set((state) => ({ fuzzyFinderOpen: !state.fuzzyFinderOpen })),
-    closeFuzzyFinder: () => set({ fuzzyFinderOpen: false }),
-    toggleFileSearch: () =>
-      set((state) => ({ fileSearchOpen: !state.fileSearchOpen })),
-    closeFileSearch: () => set({ fileSearchOpen: false }),
+    lastTokenUsageAt: 0,
     increaseFontSize: () =>
       set((state) => {
         const next = Math.max(1, state.fontSize + 1);
@@ -415,7 +388,8 @@ function createWorkspaceStore() {
           system: "dark",
           dark: "light",
           light: "pure",
-          pure: "system",
+          pure: "glass",
+          glass: "system",
         };
         const next = cycle[state.theme];
         applyTheme(next);
@@ -429,7 +403,7 @@ function createWorkspaceStore() {
     playCompletionSound: () => {
       const { completionSound } = get();
       if (completionSound === "none") return;
-      (window as any).electronAPI.invoke("play_sound", {
+      window.electronAPI.invoke("play_sound", {
         sound: completionSound,
       });
     },
@@ -454,53 +428,79 @@ function createWorkspaceStore() {
     },
     setHttpBaseUrls: (urls: Record<string, string>) =>
       set({ httpBaseUrls: urls }),
-    getEffectiveRouting: () => {
-      const { punkBackend, intentRouting } = get();
-      // Ensure we always have a valid routing object for the current backend
-      return (
-        intentRouting[punkBackend] ||
-        DEFAULT_BACKEND_ROUTING[punkBackend] ||
-        DEFAULT_BACKEND_ROUTING["http"]
-      );
+    getEffectiveCombo: () => get().powerCombo,
+    setPowerCombo: (combo) => {
+      if (!combo) return;
+      set({ powerCombo: combo });
     },
-    setIntentRouting: (routing) => {
-      if (!routing) return;
-      const { punkBackend, intentRouting } = get();
-      const defaultForBackend =
-        DEFAULT_BACKEND_ROUTING[punkBackend] || DEFAULT_BACKEND_ROUTING["http"];
-
-      set({
-        intentRouting: {
-          ...intentRouting,
-          [punkBackend]: {
-            ...defaultForBackend,
-            ...routing,
-          },
-        },
-      });
-    },
-    setIntentAutoRoute: (autoRoute) => set({ intentAutoRoute: autoRoute }),
+    setAutoEscalate: (autoEscalate) => set({ autoEscalate }),
   }));
+}
+
+// Vite HMR context — typed inline since the Vite types are optional at runtime
+interface ViteHotContext {
+  data: Record<string, unknown>;
+}
+interface ViteImportMeta {
+  hot?: ViteHotContext;
 }
 
 // Preserve store across HMR — prevents state loss and stale subscriptions
 export const useWorkspaceStore: ReturnType<typeof createWorkspaceStore> =
-  (import.meta as any).hot?.data?.__WORKSPACE_STORE__ ??
+  ((import.meta as unknown as ViteImportMeta).hot?.data?.__WORKSPACE_STORE__ as ReturnType<typeof createWorkspaceStore> | undefined) ??
   (() => {
     const store = createWorkspaceStore();
-    if ((import.meta as any).hot) {
-      (import.meta as any).hot.data.__WORKSPACE_STORE__ = store;
+    if ((import.meta as unknown as ViteImportMeta).hot) {
+      (import.meta as unknown as ViteImportMeta).hot!.data.__WORKSPACE_STORE__ = store;
     }
     return store;
   })();
 
 // Listen for background model updates from the main process
-(window as any).electronAPI.on("pane:models-updated", (models: any) => {
-  useWorkspaceStore.setState({ 
-    allModels: models,
-    openRouterModels: models.openrouter || []
+window.electronAPI.on("pane:models-updated", (raw: unknown) => {
+  const models = raw as Record<string, import("../lib/tauri-commands").OpenRouterModel[]> | undefined;
+  useWorkspaceStore.setState({
+    allModels: models ?? {},
+    openRouterModels: models?.openrouter ?? []
   });
 });
+
+// Listen for SDK auth info — arrives from prefetch before any project is active.
+// Also fires on logout (account: null) so the Profile UI reflects sign-out immediately.
+window.electronAPI.on("pane-sdk-auth", (raw: unknown) => {
+  const data = raw as { account?: Record<string, unknown> | null; models?: unknown[] | null } | null;
+  const hasAccount = data?.account != null;
+  const hasModels  = data?.models  != null;
+
+  if (hasAccount || hasModels) {
+    // New auth info arrived — update account/models only.
+    // Rate limit clearing is handled session-scoped in handleEvent's sdk_init_info case.
+    useWorkspaceStore.getState().setSdkInfo(
+      (data?.models as import("../lib/punk-types").SdkModel[] | null) ?? null,
+      (data?.account as import("../lib/punk-types").SdkAccount | null) ?? null
+    );
+  } else {
+    // Explicit null broadcast (logout) — clear account and stale usage indicators
+    useWorkspaceStore.getState().setSdkInfo(null, null);
+    useWorkspaceStore.getState().setRateLimitInfo(null);
+  }
+});
+
+// Hydrate rateLimitInfo from localStorage on startup — without this the
+// Profile session bar shows 0% until the first message fires a rate_limit_event.
+// Only restore if the reset window is still in the future; expired data is dropped.
+try {
+  const raw = localStorage.getItem("pane:rateLimitInfo");
+  if (raw) {
+    const stored = JSON.parse(raw) as import("../lib/punk-types").RateLimitInfo;
+    const resetsAt = stored?.resetsAt ?? stored?.overageResetsAt;
+    if (resetsAt && resetsAt * 1000 > Date.now()) {
+      useWorkspaceStore.getState().setRateLimitInfo(stored);
+    } else {
+      localStorage.removeItem("pane:rateLimitInfo");
+    }
+  }
+} catch {}
 
 // Listen for OS theme changes — re-apply when in system mode
 const systemMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");

@@ -7,17 +7,14 @@ import type {
   ServerToolUseBlock,
   WebSearchToolResultBlock,
   JsonBlock,
-  StrategyBlock,
-} from "../../lib/claude-types";
+} from "../../lib/punk-types";
 import { restoreCheckpoint, getCheckpointDiff } from "../../lib/tauri-commands";
 import type { CheckpointDiffFile } from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";
 import { setRestoreInProgress } from "../../hooks/useFileWatcher";
 import { ToolActivity, ServerToolActivity } from "./ToolActivity";
-import { MarkdownText } from "./MarkdownText";
+import { MarkdownText, LazyHighlightedCode, renderInline } from "./MarkdownText";
 import { ThinkingBlockDisplay } from "./ThinkingBlock";
-import { PlanBlock } from "./PlanBlock";
-import { StrategyBlockDisplay } from "./StrategyBlock";
 
 // No CSS containment — content-visibility: auto causes visible pop-in stutter
 // when messages scroll into view, which is worse than the layout cost it saves.
@@ -36,17 +33,8 @@ style.textContent = `
     to { opacity: 1; transform: translateY(0); }
   }
 
-  @keyframes fadeIn {
-    from { opacity: 0; filter: blur(1.5px); transform: translateY(1px); }
-    to { opacity: 1; filter: blur(0); transform: translateY(0); }
-  }
-
   .streaming-message {
     animation: slideIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1);
-  }
-
-  .streaming-text {
-    animation: fadeIn 2.5s cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   .thinking-pulse {
@@ -60,11 +48,6 @@ function getMessageText(message: ConversationMessage): string {
     .filter((b) => b.type === "text")
     .map((b) => (b as { type: "text"; text: string }).text)
     .join("\n");
-}
-
-function formatTokenCount(count: number): string {
-  if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
-  return String(count);
 }
 
 function CopyButton({
@@ -113,8 +96,8 @@ function CopyButton({
           strokeLinecap="round"
           strokeLinejoin="round"
         >
-          <rect x="5.5" y="5.5" width="8" height="8" rx="1" />
-          <path d="M10.5 5.5V3.5a1 1 0 00-1-1h-6a1 1 0 00-1 1v6a1 1 0 001 1h2" />
+          <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+          <path d="M10.5 5.5V3.5h-7v7h2" />
         </svg>
       )}
     </button>
@@ -242,22 +225,27 @@ interface MessageBubbleProps {
 }
 
 function JsonBlockDisplay({ block }: { block: JsonBlock }) {
-  const jsonStr = block.json ? JSON.stringify(block.json, null, 2) : block.raw;
+  const jsonStr = block.json ? JSON.stringify(block.json, null, 2) : block.raw ?? "";
   return (
     <div className="my-6">
-      <div className="text-[10px] font-mono text-pane-text-secondary/40 mb-2 uppercase tracking-[0.1em]">
+      <div className="flex items-center gap-2 text-[10px] font-mono text-pane-text-secondary/60 mb-2 uppercase tracking-[0.1em]">
+        <span className="w-2 h-2 rounded-full bg-pane-terminal/60" />
         json
       </div>
-      <pre
-        className="font-mono text-pane-text/85 bg-pane-bg/40
-                   px-5 py-4 overflow-x-auto leading-[1.75] rounded-sm"
+      <div
+        className="font-mono overflow-x-auto leading-[1.75]"
         style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
       >
-        {jsonStr}
-      </pre>
+        <pre className="whitespace-pre-wrap break-words m-0">
+          <code>
+            <LazyHighlightedCode code={jsonStr} lang="json" />
+          </code>
+        </pre>
+      </div>
     </div>
   );
 }
+
 
 export function MessageBubble({
   message,
@@ -265,12 +253,6 @@ export function MessageBubble({
   projectId,
 }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
-  // Only animate on first mount — not when scrolling through old messages
-  const isNewRef = useRef(true);
-  useEffect(() => {
-    isNewRef.current = false;
-  }, []);
-  const animClass = isNewRef.current ? "animate-fadeSlideUp" : "";
 
   // Graceful completion: track when streaming just ended to add settle animation
   const wasStreamingRef = useRef(message.isStreaming);
@@ -301,28 +283,18 @@ export function MessageBubble({
   if (message.type === "user") {
     const text = getMessageText(message);
     const [isExpanded, setIsExpanded] = useState(false);
-    const [showExpand, setShowExpand] = useState(false);
-    const textRef = useRef<HTMLParagraphElement>(null);
-
-    useEffect(() => {
-      if (textRef.current) {
-        const lineHeight = 24; // Approximate line height
-        const maxLines = 10; // Maximum lines before showing expand button
-        const maxHeight = lineHeight * maxLines;
-        setShowExpand(textRef.current.scrollHeight > maxHeight);
-      }
-    }, [text]);
+    // Text-based heuristic avoids scrollHeight DOM read (forces layout reflow on every user message)
+    const showExpand = text.split('\n').length > 10 || text.length > 600;
 
     const truncatedText = isExpanded || !showExpand ? text : text.split('\n').slice(0, 10).join('\n');
 
     return (
-      <div className={`mb-10 group flex flex-col items-end ${animClass}`}>
+      <div className="mb-10 group flex flex-col items-end">
         <div
-          className="bg-pane-bg/80 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 relative"
+          className="rounded-md ring-1 ring-pane-border/40 relative"
           style={{ maxWidth: "65ch" }}
         >
           <p
-            ref={textRef}
             className="text-pane-text font-mono leading-[1.75] whitespace-pre-wrap px-4 py-4"
             style={{
               fontSize: "var(--pane-font-size)",
@@ -331,7 +303,7 @@ export function MessageBubble({
               paddingBottom: showExpand ? '32px' : undefined,
             }}
           >
-            {truncatedText}
+            {renderInline(truncatedText)}
           </p>
           {showExpand && (
             <div className="absolute bottom-0 left-0 right-0 p-1.5 pointer-events-none">
@@ -364,11 +336,6 @@ export function MessageBubble({
   // System messages (tool results) are hidden — matched to their parent tool_use
   if (message.type === "system") {
     return null;
-  }
-
-  // Plan messages — the blueprint Pane produced before execution
-  if (message.type === "plan" && message.planData) {
-    return <PlanBlock planData={message.planData} />;
   }
 
   if (message.type === "assistant") {
@@ -432,7 +399,7 @@ export function MessageBubble({
 
     return (
       <div
-        className={`group ${animClass} ${hasVisibleContent ? "mb-12" : isStrategyOnly ? "mb-1" : "mb-4"} ${message.isStreaming ? "streaming-message" : ""}`}
+        className={`group ${hasVisibleContent ? "mb-12" : isStrategyOnly ? "mb-1" : "mb-4"} ${message.isStreaming ? "streaming-message" : ""}`}
       >
         {groups.map((group, gi) => {
           if (group.type === "thinking") {
@@ -450,12 +417,10 @@ export function MessageBubble({
           }
 
           if (group.type === "strategy") {
-            const block = group.blocks[0] as StrategyBlock;
-            return (
-              <div key={gi} className="my-0.5">
-                <StrategyBlockDisplay block={block} />
-              </div>
-            );
+            // Route preview is now shown in the InputBar as the user types.
+            // The strategy block in the conversation was redundant — it repeated
+            // what the user already saw before sending.
+            return null;
           }
 
           if (group.type === "text") {
@@ -469,13 +434,11 @@ export function MessageBubble({
                   const text = (block as { type: "text"; text: string }).text;
                   if (text == null) return null;
                   return (
-                    <div
-                      key={i}
-                      className={message.isStreaming ? "streaming-text" : ""}
-                    >
+                    <div key={i}>
                       <MarkdownText
                         text={text}
                         isStreaming={message.isStreaming}
+                        projectId={projectId}
                       />
                     </div>
                   );
@@ -501,7 +464,7 @@ export function MessageBubble({
             const result = toolResults.get(toolBlock.id);
             return (
               <div key={gi} className="my-0.5">
-                <ToolActivity toolUse={toolBlock} toolResult={result} />
+                <ToolActivity toolUse={toolBlock} toolResult={result} isHistorical={message.isHistorical} />
               </div>
             );
           }
@@ -518,6 +481,7 @@ export function MessageBubble({
                 <ServerToolActivity
                   block={serverBlock}
                   searchResult={searchResult}
+                  isHistorical={message.isHistorical}
                 />
               </div>
             );
@@ -526,37 +490,14 @@ export function MessageBubble({
           return null;
         })}
 
-        {/* Footer: cost/duration/tokens + copy */}
+        {/* Copy */}
         {!message.isStreaming && (
           <div
-            className={`mt-4 flex items-center gap-4 pl-6 transition-opacity duration-500 ${
+            className={`mt-4 flex items-center justify-end pl-6 transition-opacity duration-500 ${
               justCompleted ? "opacity-0" : "opacity-100"
             }`}
           >
-            {(message.costUsd !== undefined ||
-              message.durationMs !== undefined) && (
-              <div className="flex gap-4 text-[10px] font-mono text-pane-text-secondary tracking-wider">
-                {message.costUsd !== undefined && (
-                  <span>${message.costUsd.toFixed(4)}</span>
-                )}
-                {message.durationMs !== undefined && (
-                  <span>{(message.durationMs / 1000).toFixed(1)}s</span>
-                )}
-                {message.inputTokens !== undefined &&
-                  message.outputTokens !== undefined && (
-                    <span>
-                      {formatTokenCount(message.inputTokens)} in /{" "}
-                      {formatTokenCount(message.outputTokens)} out
-                    </span>
-                  )}
-                {message.numTurns !== undefined && message.numTurns > 1 && (
-                  <span>{message.numTurns} turns</span>
-                )}
-              </div>
-            )}
-            <div className="ml-auto">
-              <CopyButton onClick={handleCopy} copied={copied} />
-            </div>
+            <CopyButton onClick={handleCopy} copied={copied} />
           </div>
         )}
       </div>

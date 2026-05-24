@@ -34,6 +34,7 @@ export function useScrollPosition(
   projectId: string,
   scrollRef: RefObject<HTMLDivElement | null>,
   followRef: MutableRefObject<boolean>,
+  streamingRef?: MutableRefObject<boolean>,
 ) {
   const appliedRef = useRef(false);
 
@@ -63,7 +64,12 @@ export function useScrollPosition(
     const onScroll = () => {
       const { scrollTop, scrollHeight, clientHeight } = el;
       const atBottom = scrollHeight - scrollTop - clientHeight < 10;
-      followRef.current = atBottom;
+      // During streaming, only the wheel handler disengages follow.
+      // Never re-engage from scroll position — the rAF loop fighting
+      // the scroll listener is what makes scrolling up feel sticky.
+      if (!streamingRef?.current) {
+        followRef.current = atBottom;
+      }
       posMap.set(projectId, atBottom ? "bottom" : scrollTop);
       scheduleSave();
     };

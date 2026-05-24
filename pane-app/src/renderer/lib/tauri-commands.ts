@@ -1,7 +1,9 @@
-import type { ClaudeStreamEvent, ConversationMessage, Todo } from "./claude-types";
+import type { PunkStreamEvent, ConversationMessage, Todo } from "./punk-types";
 
 // Electron IPC bridge
-const electronAPI = (window as any).electronAPI;
+import type { ElectronAPI } from "./electron";
+const electronAPI: ElectronAPI = window.electronAPI;
+
 
 export interface FileEntry {
   name: string;
@@ -13,6 +15,25 @@ export interface FileEntry {
 
 export async function readDirectory(path: string): Promise<FileEntry[]> {
   return electronAPI.invoke("read_directory", { path });
+}
+
+export async function checkPathExists(path: string): Promise<boolean> {
+  return electronAPI.invoke("check-path-exists", { path });
+}
+
+export async function migrateProjectId(
+  oldId: string,
+  newId: string,
+): Promise<{ success: boolean; error?: string }> {
+  return electronAPI.invoke("migrate-project-id", { oldId, newId });
+}
+
+export async function rebindProject(
+  projectId: string,
+  oldRoot: string,
+  newRoot: string,
+): Promise<{ success: boolean; error?: string }> {
+  return electronAPI.invoke("rebind-project", { projectId, oldRoot, newRoot });
 }
 
 export async function readDirectoryTree(
@@ -41,10 +62,79 @@ export async function saveScrollPositions(
 }
 
 export async function saveConversationToMain(
-  filePath: string,
-  conversation: { sessionId: string | null; model?: string | null; messages: unknown[] },
+  projectId: string,
+  conversation: { model?: string | null; messages: unknown[]; startIndex?: number },
 ): Promise<void> {
-  return electronAPI.invoke("save_conversation", { filePath, conversation });
+  return electronAPI.invoke("save_conversation", { projectId, conversation });
+}
+
+export interface TokenAnalyticsRow {
+  model: string;
+  provider: string;
+  activity_type: string;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_creation: number;
+  total_cache_read: number;
+  total_cost_usd: number;
+  avg_duration_ms: number;
+  call_count: number;
+  last_used: number;
+  unknown_cost_count: number;
+  api_reported_count: number;
+  estimated_count: number;
+  latest_rate_snapshot: string | null;
+}
+
+export interface TokenTimeSeriesRow {
+  day: string;
+  daily_cost: number;
+  daily_input: number;
+  daily_output: number;
+  daily_cache_read: number;
+  daily_calls: number;
+  unknown_cost_count: number;
+  api_reported_count: number;
+  estimated_count: number;
+}
+
+export async function getTokenAnalytics(
+  projectId: string | null,
+  sinceMs: number = 0,
+): Promise<TokenAnalyticsRow[]> {
+  return electronAPI.invoke("get_token_analytics", { projectId, sinceMs });
+}
+
+export async function getTokenTimeSeries(
+  projectId: string | null,
+  sinceMs: number = 0,
+): Promise<TokenTimeSeriesRow[]> {
+  return electronAPI.invoke("get_token_timeseries", { projectId, sinceMs });
+}
+
+export async function getModelRates(models: string[]): Promise<Record<string, { input: number; output: number; cache_read?: number } | null>> {
+  return electronAPI.invoke("get_model_rates", { models });
+}
+
+export async function getConversationSlice(
+  projectId: string,
+  count: number,
+  beforeIndex?: number,
+): Promise<{
+  messages: unknown[];
+  totalCount: number;
+  startIndex: number;
+  model: string | null;
+}> {
+  return electronAPI.invoke("get_conversation_slice", { projectId, count, beforeIndex });
+}
+
+export async function searchConversations(
+  query: string,
+  projectId?: string | null,
+  limit = 20,
+): Promise<{ results: Array<{ message: unknown; projectId: string }> }> {
+  return electronAPI.invoke("search_conversations", { query, projectId: projectId ?? null, limit });
 }
 
 export async function getHomeDir(): Promise<string> {
@@ -57,6 +147,15 @@ export async function getCwd(): Promise<string> {
 
 export async function detectProjectRoot(startPath: string): Promise<string> {
   return electronAPI.invoke("detect_project_root", { startPath });
+}
+
+/** Opens a native file/folder picker (files + dirs, multi-select).
+ *  Paths inside projectRoot are returned relative; others are absolute. */
+export async function showFilePicker(
+  defaultPath: string,
+  projectRoot: string,
+): Promise<string[] | null> {
+  return electronAPI.invoke("show-file-picker", { defaultPath, projectRoot });
 }
 
 export async function watchDirectory(path: string): Promise<void> {
@@ -129,6 +228,8 @@ export async function getGitLog(
   return electronAPI.invoke("get_git_log", { path, count: count ?? 50 });
 }
 
+import type { PowerCombo } from "./models";
+
 export interface ProjectSessionState {
   expanded_dirs: string[];
   active_file_path: string | null;
@@ -137,14 +238,28 @@ export interface ProjectSessionState {
     string,
     { scrollTop: number; cursor: { row: number; column: number } }
   >;
+  name?: string;
+  /** Per-project power combo override. When set, this project uses
+   *  its own thinking/execution models instead of the global default. */
+  power_combo?: PowerCombo;
+  /** Per-project auto-route toggle. */
+  auto_escalate?: boolean;
+  /** Per-project explicit model pin. */
+  selected_model?: string;
+  /** Per-project model provider. */
+  selected_model_provider?: string;
+  /** Per-project thinking override. */
+  selected_model_thinking?: boolean;
+  /** When true, this thread is archived. Migrates to conversation-level
+   *  is_archived when multi-conversation (Phase 0) lands. */
+  archived?: boolean;
 }
-
-import type { BackendRouting } from "./models";
 
 export interface UserSettings {
   project_roots: string[];
+  project_ids?: Record<string, string>;
   active_project_root: string | null;
-  control_panel_visible: boolean;
+  thread_panel_visible: boolean;
   project_states: Record<string, ProjectSessionState>;
   font_size: number | null;
   panel_font_size: number | null;
@@ -161,11 +276,12 @@ export interface UserSettings {
   selected_model_provider?: string;
   punk_backend: string;
   http_provider?: string;
-  http_api_key?: string;
   http_api_keys?: Record<string, string>;
-  http_base_url?: string;
   http_base_urls?: Record<string, string>;
-  intent_routing?: BackendRouting;
+  disabled_providers?: string[];
+  curated_models?: string[];
+  intent_routing?: Record<string, unknown>;  // deprecated — migration only
+  power_combo?: PowerCombo;
   intent_auto_route?: boolean;
 }
 
@@ -173,34 +289,79 @@ export async function loadSettings(): Promise<UserSettings> {
   return electronAPI.invoke("load_settings");
 }
 
-export async function saveSettings(settings: UserSettings): Promise<void> {
+export async function saveSettings(settings: Partial<UserSettings>): Promise<void> {
   return electronAPI.invoke("save_settings", { settings });
 }
 
-// Claude process management
+// Punk engine process management
+
+export interface SendToPunkOptions {
+  intent?: string;
+  history?: ConversationMessage[];
+  thinking?: boolean;
+  provider?: string;
+  todos?: Todo[];
+  autoRoute?: boolean;
+  minds?: Array<{ id: string }>;
+  /** Per-project power combo: which model to use for each phase.
+   *  When present, the backend uses this instead of reading from disk. */
+  powerCombo?: PowerCombo;
+  /** Sticky phase from the phase pill — single source of truth for model routing.
+   *  "think" uses thinking model (plan+verify), "build" uses execution model.
+   *  When set, overrides heuristic router so routing stays consistent across turns. */
+  phase?: string;
+  // Mind chat overrides — when projectId starts with "mind:", these control behavior
+  systemPromptOverride?: string;
+  _systemOverride?: boolean;
+  tools?: string[];
+  maxTurns?: number;
+}
 
 export async function sendToPunk(
   projectId: string,
   prompt: string,
   workingDir: string,
-  sessionId: string | null,
   model: string | null,
-  onEvent: (event: ClaudeStreamEvent) => void,
-  intent?: string,
+  onEvent: (event: PunkStreamEvent) => void,
+  intentOrOptions?: string | SendToPunkOptions,
   history?: ConversationMessage[],
   thinking?: boolean,
   provider?: string,
   todos?: Todo[],
+  autoRoute?: boolean,
 ): Promise<void> {
+  // Support both old positional args and new options object
+  let opts: SendToPunkOptions;
+  if (typeof intentOrOptions === 'object' && intentOrOptions !== null && !Array.isArray(intentOrOptions)) {
+    opts = intentOrOptions;
+  } else {
+    opts = {
+      intent: intentOrOptions as string | undefined,
+      history,
+      thinking,
+      provider,
+      todos,
+      autoRoute,
+    };
+  }
+
   const requestId = Math.random().toString(36).slice(2, 11);
-  // Self-cleaning listener — stays active until processEnded or error
+  // Self-cleaning listener — stays active until processEnded/error (or
+  // orchestration_complete/orchestration_error when orchestration is active).
   let cleanup: (() => void) | null = null;
+
+  const closeListener = () => {
+    draining = false;
+    port1.close();
+    port2.close();
+    setTimeout(() => cleanup?.(), 0);
+  };
 
   // MessageChannel-based event yielding — same technique React's scheduler uses.
   // Instead of processing all IPC events synchronously (starving clicks/inputs),
   // we queue events and drain one-per-task via MessageChannel.postMessage
   // which yields to the browser between each event (zero-delay, no setTimeout 4ms minimum).
-  const queue: ClaudeStreamEvent[] = [];
+  const queue: PunkStreamEvent[] = [];
   let draining = false;
   const { port1, port2 } = new MessageChannel();
 
@@ -226,14 +387,17 @@ export async function sendToPunk(
     while (queue.length > 0) {
       const event = queue.shift()!;
       onEvent(event);
-      // Terminal events: clean up after processing, don't schedule another drain.
-      if (event.event === "processEnded" || event.event === "error") {
-        draining = false;
-        port1.close();
-        port2.close();
-        setTimeout(() => cleanup?.(), 0);
+
+      // Terminal events: close the listener and stop draining.
+      const isTerminal =
+        event.event === "error" ||
+        event.event === "processEnded";
+
+      if (isTerminal) {
+        closeListener();
         return;
       }
+
       // Yield to the browser if we've used up our time budget.
       if (performance.now() >= deadline) break;
     }
@@ -243,8 +407,12 @@ export async function sendToPunk(
   };
 
   cleanup = electronAPI.on(
-    `claude-stream:${projectId}`,
-    (event: ClaudeStreamEvent) => {
+    `punk-stream:${projectId}`,
+    (event: PunkStreamEvent) => {
+      // Ignore events tagged for a different request (e.g. a previous aborted
+      // session whose processEnded arrives after the new session has started).
+      if (event.requestId && event.requestId !== requestId) return;
+
       // All events go through the MessageChannel queue so the browser can
       // interleave paint/input between each one. The old pattern of
       // synchronously dumping the queue on processEnded caused UI freezes
@@ -262,14 +430,22 @@ export async function sendToPunk(
       projectId,
       prompt,
       workingDir,
-      sessionId,
       model,
-      intent,
-      history,
+      intent: opts.intent,
+      history: opts.history,
       requestId,
-      thinking,
-      provider,
-      todos,
+      thinking: opts.thinking,
+      provider: opts.provider,
+      todos: opts.todos,
+      autoRoute: opts.autoRoute,
+      powerCombo: opts.powerCombo,
+      minds: opts.minds,
+      phase: opts.phase,
+      // Mind chat overrides — forwarded when present
+      ...(opts.systemPromptOverride ? { systemPromptOverride: opts.systemPromptOverride } : {}),
+      ...(opts._systemOverride ? { _systemOverride: opts._systemOverride } : {}),
+      ...(opts.tools ? { tools: opts.tools } : {}),
+      ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
     });
   } catch (err) {
     port1.close();
@@ -279,31 +455,67 @@ export async function sendToPunk(
   }
 }
 
-// Backwards-compatible alias while we transition naming in the app.
-export const sendToClaude = sendToPunk;
-
 export async function abortPunk(projectId: string): Promise<void> {
   return electronAPI.invoke("abort_punk", { projectId });
 }
 
-export async function respondToDiscovery(projectId: string, response: string): Promise<void> {
-  return electronAPI.invoke("respond_to_discovery", { projectId, response });
+export interface RoutePreview {
+  model: string;
+  provider: string;
+  tier: string;
+  mode: string;
+  taskType: string;
+  confidence: number;
+  reason: string;
 }
 
-export async function approvePlan(projectId: string): Promise<void> {
-  return electronAPI.invoke("approve_plan", { projectId });
+export async function previewRoute(message: string, projectId: string): Promise<RoutePreview | null> {
+  return electronAPI.invoke("preview_route", { message, projectId });
 }
 
-export async function rejectPlan(projectId: string): Promise<void> {
-  return electronAPI.invoke("reject_plan", { projectId });
-}
-
-export async function terminateClaudeSession(projectId: string): Promise<void> {
+export async function terminatePunkSession(projectId: string): Promise<void> {
   return electronAPI.invoke("terminate_punk_session", { projectId });
 }
 
 export async function reinitializePunkBackend(backend?: string): Promise<void> {
   return electronAPI.invoke("reinitialize_punk_backend", { backend });
+}
+
+export async function getBackendAvailability(): Promise<{
+  claude: boolean;
+  gemini: boolean;
+  api: boolean;
+}> {
+  return electronAPI.invoke("get_backend_availability");
+}
+
+export interface ClaudeAuthAccount {
+  email: string | null;
+  displayName: string | null;
+  organizationName: string | null;
+  billingType: string | null;
+  hasExtraUsageEnabled: boolean;
+  subscriptionCreatedAt: string | null;
+}
+
+export interface ClaudeAuthState {
+  authenticated: boolean;
+  account: ClaudeAuthAccount | null;
+}
+
+/** Read Claude auth state directly from ~/.claude.json — no session needed. */
+export async function getClaudeAuthState(): Promise<ClaudeAuthState> {
+  return electronAPI.invoke("get_claude_auth_state");
+}
+
+/** Initiate Claude OAuth sign-in via the SDK's browser-based auth flow. */
+export async function claudeSignin(): Promise<{ success: boolean; account?: Record<string, unknown>; error?: string }> {
+  return electronAPI.invoke("claude_signin");
+}
+
+/** Sign out of Claude by removing oauthAccount from ~/.claude.json. */
+export async function claudeSignout(): Promise<{ success: boolean }> {
+  return electronAPI.invoke("claude_signout");
 }
 
 export interface OpenRouterModel {
@@ -324,6 +536,20 @@ export async function getAllModels(): Promise<
   Record<string, OpenRouterModel[]>
 > {
   return electronAPI.invoke("get_all_models");
+}
+
+// ── SDK session management ─────────────────────────────────────────────────
+
+export async function sdkListSessions(): Promise<unknown[]> {
+  return electronAPI.invoke("sdk_list_sessions");
+}
+
+export async function sdkGetSessionMessages(sessionId: string): Promise<unknown[]> {
+  return electronAPI.invoke("sdk_get_session_messages", { sessionId });
+}
+
+export async function sdkForkSession(sessionId: string): Promise<unknown> {
+  return electronAPI.invoke("sdk_fork_session", { sessionId });
 }
 
 export async function refreshAllModels(): Promise<
@@ -374,7 +600,7 @@ export function onPtyExit(
   return electronAPI.on(`pty-exit:${ptyId}`, cb);
 }
 
-export async function getClaudePlanInfo(): Promise<string | null> {
+export async function getPunkPlanInfo(): Promise<string | null> {
   return electronAPI.invoke("get_claude_plan_info");
 }
 
@@ -383,61 +609,8 @@ export interface ClaudeVersionInfo {
   error: string | null;
 }
 
-export interface ClaudeUpdateInfo {
-  updateAvailable: boolean;
-  currentVersion: string | null;
-  newVersion: string | null;
-  error: string | null;
-}
-
-export interface ClaudeUpdateResult {
-  success: boolean;
-  output: string;
-  error: string | null;
-}
-
 export async function checkClaudeVersion(): Promise<ClaudeVersionInfo> {
   return electronAPI.invoke("check_claude_version");
-}
-
-export async function checkClaudeUpdate(): Promise<ClaudeUpdateInfo> {
-  return electronAPI.invoke("check_claude_update");
-}
-
-export async function updateClaude(): Promise<ClaudeUpdateResult> {
-  return electronAPI.invoke("update_claude");
-}
-
-// Gemini process management
-
-export interface GeminiVersionInfo {
-  current: string | null;
-  error: string | null;
-}
-
-export interface GeminiUpdateInfo {
-  updateAvailable: boolean;
-  currentVersion: string | null;
-  newVersion: string | null;
-  error: string | null;
-}
-
-export interface GeminiUpdateResult {
-  success: boolean;
-  output: string;
-  error: string | null;
-}
-
-export async function checkGeminiVersion(): Promise<GeminiVersionInfo> {
-  return electronAPI.invoke("check_gemini_version");
-}
-
-export async function checkGeminiUpdate(): Promise<GeminiUpdateInfo> {
-  return electronAPI.invoke("check_gemini_update");
-}
-
-export async function updateGemini(): Promise<GeminiUpdateResult> {
-  return electronAPI.invoke("update_gemini");
 }
 
 // --- File Checkpoints ---
@@ -490,7 +663,7 @@ export async function restoreCheckpoint(
 
 export async function listCheckpoints(
   projectId: string,
-): Promise<import("./claude-types").CheckpointMeta[]> {
+): Promise<import("./punk-types").CheckpointMeta[]> {
   return electronAPI.invoke("list_checkpoints", { projectId });
 }
 
@@ -510,6 +683,13 @@ export async function deleteProjectCheckpoints(
   projectId: string,
 ): Promise<void> {
   return electronAPI.invoke("delete_project_checkpoints", { projectId });
+}
+
+export async function resumeFromCheckpoint(
+  projectId: string,
+  sessionId: string,
+): Promise<import("./punk-types").CheckpointTurn | null> {
+  return electronAPI.invoke("resume_from_checkpoint", { projectId, sessionId });
 }
 
 // --- Change History ---
@@ -642,6 +822,39 @@ export async function writeTerminalState(
   return electronAPI.invoke("write_terminal_state", { projectId, data });
 }
 
+export interface TerminalCommandEntry {
+  cmd: string;
+  output: string;
+  cwd: string;
+  timestamp: number;
+  tabId: string;
+  tabTitle: string;
+  partial?: boolean;
+}
+
+/** Atomically appends one completed command to the shared terminal history (all tabs merged). */
+export async function appendTerminalCommand(
+  projectId: string,
+  entry: TerminalCommandEntry,
+): Promise<void> {
+  return electronAPI.invoke("append_terminal_command", { projectId, entry });
+}
+
+/** Reads the persisted terminal command history for a project (last 50 completed commands). */
+export async function getTerminalHistory(
+  projectId: string,
+): Promise<{ commands: Array<{ cmd: string; output: string; cwd: string; timestamp: number; tabId: string }> }> {
+  return electronAPI.invoke("get_terminal_history", { projectId });
+}
+
+/** Upserts a live "partial" snapshot for a long-running command (replaces previous partial for this tab). */
+export async function updateTerminalRunning(
+  projectId: string,
+  entry: TerminalCommandEntry & { partial: true },
+): Promise<void> {
+  return electronAPI.invoke("update_terminal_running", { projectId, entry });
+}
+
 export async function writeProjectState(
   projectId: string,
   data: ProjectState,
@@ -651,7 +864,7 @@ export async function writeProjectState(
 
 export async function recordMemoryEvents(
   projectId: string,
-  events: import("./claude-types").MemoryEvent[],
+  events: import("./punk-types").MemoryEvent[],
 ): Promise<void> {
   return electronAPI.invoke("record_memory_events", { projectId, events });
 }
@@ -662,6 +875,16 @@ export async function generateBrief(projectId: string): Promise<string> {
 
 export async function readBrief(projectId: string): Promise<string> {
   return electronAPI.invoke("read_brief", { projectId });
+}
+
+export async function getProjectAbout(projectId: string): Promise<string | null> {
+  return electronAPI.invoke("get_project_about", { projectId });
+}
+
+export async function extractPreferencesFromTurn(
+  turnText: string,
+): Promise<void> {
+  return electronAPI.invoke("brain_extract_preferences_llm", { turnText });
 }
 
 // --- Pane Brain Engine ---
@@ -678,7 +901,7 @@ export interface BrainSearchResult {
 
 export async function brainIndexEvents(
   projectId: string,
-  events: import("./claude-types").MemoryEvent[],
+  events: import("./punk-types").MemoryEvent[],
 ): Promise<{ indexed: number; deduplicated: number }> {
   return electronAPI.invoke("brain_index_events", { projectId, events });
 }
@@ -771,10 +994,18 @@ export interface UserProfile {
   style: { verbosity: string; planFirst: boolean } | null;
   rules: string;
   philosophy: string;
+  dna: string;
 }
 
 export async function brainGetProfile(): Promise<{ profile: UserProfile }> {
   return electronAPI.invoke("brain_get_profile");
+}
+
+// Updates compiled identity directly (DNA string/bio text)
+export async function brainUpdateDNA(
+  dna: string,
+): Promise<{ updated: boolean }> {
+  return electronAPI.invoke("brain_update_dna", { dna });
 }
 
 export async function brainAddRule(
@@ -844,8 +1075,9 @@ export interface MindEntry {
 
 export async function brainMindAdd(
   content: string,
+  projectId?: string,
 ): Promise<{ entry: MindEntry }> {
-  return electronAPI.invoke("brain_mind_add", { content });
+  return electronAPI.invoke("brain_mind_add", { content, projectId });
 }
 
 export async function brainMindGetAll(): Promise<{ entries: MindEntry[] }> {
@@ -862,6 +1094,285 @@ export async function brainMindUpdate(
 
 export async function brainMindDelete(id: string): Promise<{ id: string }> {
   return electronAPI.invoke("brain_mind_delete", { id });
+}
+
+// --- Mind Threads ---
+
+export interface MindThread {
+  id: string;
+  entry_id: string;
+  session_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MindTurn {
+  id: string;
+  thread_id: string;
+  role: string;
+  content_json: string;
+  timestamp: string;
+}
+
+export async function mindThreadCreate(
+  entryId: string,
+): Promise<{ thread: MindThread }> {
+  return electronAPI.invoke("brain_mind_thread_create", { entryId });
+}
+
+export async function mindThreadGet(
+  entryId: string,
+): Promise<{ thread: MindThread | null; turns: MindTurn[] }> {
+  return electronAPI.invoke("brain_mind_thread_get", { entryId });
+}
+
+export async function mindThreadListEntryIds(): Promise<{ entryIds: string[] }> {
+  return electronAPI.invoke("brain_mind_thread_list_entry_ids");
+}
+
+export async function mindThreadAddTurn(
+  threadId: string,
+  role: string,
+  contentJson: string,
+): Promise<{ turn: MindTurn }> {
+  return electronAPI.invoke("brain_mind_thread_add_turn", {
+    threadId,
+    role,
+    contentJson,
+  });
+}
+
+export async function mindThreadSetSession(threadId: string, sessionId: string): Promise<void> {
+  return electronAPI.invoke("brain_mind_thread_set_session", { threadId, sessionId });
+}
+
+export async function mindThreadDelete(id: string): Promise<{ id: string }> {
+  return electronAPI.invoke("brain_mind_thread_delete", { id });
+}
+
+// --- Lens ---
+
+export interface LensPost {
+  id: string;
+  contributor: "user" | "bug" | "reflection" | "sentinel";
+  content: string;
+  project_id: string | null;
+  entry_id: string | null;
+  created_at: string;
+  comment_count?: number;
+}
+
+export async function lensPostAdd(
+  contributor: LensPost["contributor"],
+  content: string,
+  projectId: string | null,
+  entryId?: string | null,
+): Promise<LensPost> {
+  return electronAPI.invoke("lens_post_add", { contributor, content, projectId, entryId: entryId ?? null });
+}
+
+export async function lensPostsList(projectId: string): Promise<LensPost[]> {
+  return electronAPI.invoke("lens_posts_list", { projectId });
+}
+
+export async function lensPostDelete(postId: string): Promise<{ deleted: boolean }> {
+  return electronAPI.invoke("lens_post_delete", { postId });
+}
+
+
+export interface LensComment {
+  id: string;
+  post_id: string;
+  role: string;
+  content: string;
+  session_id: string | null;
+  timestamp: string;
+}
+
+export async function lensCommentsList(postId: string): Promise<LensComment[]> {
+  return electronAPI.invoke("lens_comments_list", { postId });
+}
+
+export async function lensCommentAdd(postId: string, role: string, content: string): Promise<LensComment> {
+  return electronAPI.invoke("lens_comment_add", { postId, role, content });
+}
+
+export async function lensCommentSetSession(postId: string, sessionId: string): Promise<void> {
+  return electronAPI.invoke("lens_comment_set_session", { postId, sessionId });
+}
+
+export async function abortLens(postId: string): Promise<void> {
+  return electronAPI.invoke("abort_lens", { postId });
+}
+
+export async function sendToLens(
+  postId: string,
+  prompt: string,
+  workingDir: string,
+  model: string | null,
+  provider: string | null,
+  thinking: boolean,
+  postContent: string,
+  onEvent: (event: PunkStreamEvent) => void,
+): Promise<void> {
+  const requestId = Math.random().toString(36).slice(2, 11);
+  let cleanup: (() => void) | null = null;
+
+  const closeListener = () => {
+    draining = false;
+    port1.close();
+    port2.close();
+    setTimeout(() => cleanup?.(), 0);
+  };
+
+  const queue: PunkStreamEvent[] = [];
+  let draining = false;
+  const { port1, port2 } = new MessageChannel();
+
+  port2.onmessage = () => {
+    if (queue.length === 0) {
+      draining = false;
+      return;
+    }
+
+    const BUDGET_MS = 4;
+    const deadline = performance.now() + BUDGET_MS;
+
+    while (queue.length > 0) {
+      const event = queue.shift()!;
+      onEvent(event);
+
+      const isTerminal =
+        event.event === "error" || event.event === "processEnded";
+
+      if (isTerminal) {
+        closeListener();
+        return;
+      }
+
+      if (performance.now() >= deadline) break;
+    }
+
+    if (queue.length > 0) port1.postMessage(null);
+    else draining = false;
+  };
+
+  cleanup = electronAPI.on(
+    `punk-stream:lens:${postId}`,
+    (event: PunkStreamEvent) => {
+      if (event.requestId && event.requestId !== requestId) return;
+      queue.push(event);
+      if (!draining) {
+        draining = true;
+        port1.postMessage(null);
+      }
+    },
+  );
+
+  try {
+    await electronAPI.invoke("send_to_lens", {
+      postId,
+      prompt,
+      workingDir,
+      model,
+      provider,
+      thinking,
+      requestId,
+      postContent,
+    });
+  } catch (err) {
+    port1.close();
+    port2.close();
+    cleanup?.();
+    throw err;
+  }
+}
+
+export async function sendToMind(
+  threadId: string,
+  prompt: string,
+  workingDir: string,
+  model: string | null,
+  provider: string | null,
+  thinking: boolean,
+  entryContent: string,
+  onEvent: (event: PunkStreamEvent) => void,
+): Promise<void> {
+  const requestId = Math.random().toString(36).slice(2, 11);
+  let cleanup: (() => void) | null = null;
+
+  const closeListener = () => {
+    draining = false;
+    port1.close();
+    port2.close();
+    setTimeout(() => cleanup?.(), 0);
+  };
+
+  const queue: PunkStreamEvent[] = [];
+  let draining = false;
+  const { port1, port2 } = new MessageChannel();
+
+  port2.onmessage = () => {
+    if (queue.length === 0) {
+      draining = false;
+      return;
+    }
+
+    const BUDGET_MS = 4;
+    const deadline = performance.now() + BUDGET_MS;
+
+    while (queue.length > 0) {
+      const event = queue.shift()!;
+      onEvent(event);
+
+      const isTerminal =
+        event.event === "error" || event.event === "processEnded";
+
+      if (isTerminal) {
+        closeListener();
+        return;
+      }
+
+      if (performance.now() >= deadline) break;
+    }
+
+    if (queue.length > 0) port1.postMessage(null);
+    else draining = false;
+  };
+
+  cleanup = electronAPI.on(
+    `punk-stream:mind:${threadId}`,
+    (event: PunkStreamEvent) => {
+      if (event.requestId && event.requestId !== requestId) return;
+      queue.push(event);
+      if (!draining) {
+        draining = true;
+        port1.postMessage(null);
+      }
+    },
+  );
+
+  try {
+    await electronAPI.invoke("send_to_mind", {
+      threadId,
+      prompt,
+      workingDir,
+      model,
+      provider,
+      thinking,
+      requestId,
+      entryContent,
+    });
+  } catch (err) {
+    port1.close();
+    port2.close();
+    cleanup?.();
+    throw err;
+  }
+}
+
+export async function abortMind(threadId: string): Promise<void> {
+  return electronAPI.invoke("abort_mind", { threadId });
 }
 
 // --- Session Context ---
@@ -907,4 +1418,203 @@ export async function sessionReadState(
   projectId: string,
 ): Promise<SessionState | null> {
   return electronAPI.invoke("session_read_state", { projectId });
+}
+
+// ---------------------------------------------------------------------------
+// Pane Cloud
+// ---------------------------------------------------------------------------
+
+export interface CloudUser {
+  github_login: string;
+  github_id: number;
+  avatar_url: string | null;
+  logged_in: boolean;
+}
+
+export interface CloudStatus {
+  last_backup: string | null;
+  storage_bytes: number;
+  storage_mb: number;
+  backup_count: number;
+}
+
+export interface CloudBackupEntry {
+  id: string;
+  size_bytes: number;
+  checksum: string;
+  device_name: string | null;
+  app_version: string | null;
+  created_at: string;
+}
+
+export async function cloudLogin(): Promise<CloudUser | null> {
+  return electronAPI.invoke("cloud_login");
+}
+
+export async function cloudLogout(): Promise<void> {
+  return electronAPI.invoke("cloud_logout");
+}
+
+export async function cloudGetUser(): Promise<CloudUser | null> {
+  return electronAPI.invoke("cloud_get_user");
+}
+
+export async function cloudGetStatus(): Promise<CloudStatus | null> {
+  return electronAPI.invoke("cloud_get_status");
+}
+
+export async function cloudTriggerBackup(): Promise<{ backup_id: string; size_bytes: number }> {
+  return electronAPI.invoke("cloud_trigger_backup");
+}
+
+export async function cloudRestore(): Promise<{ backup_id: string; created_at: string }> {
+  return electronAPI.invoke("cloud_restore");
+}
+
+export async function cloudListBackups(): Promise<{ backups: CloudBackupEntry[] }> {
+  return electronAPI.invoke("cloud_list_backups");
+}
+
+// Theme-aware dock icon — switches between default/glass/dark variants
+export function setAppTheme(theme: string): void {
+  electronAPI.invoke("set_app_theme", { theme }).catch(() => {});
+}
+
+// ── Punk Review System ──────────────────────────────────────────────────────
+
+export interface ReviewFinding {
+  id: string;
+  session_id: string;
+  project_id: string;
+  punk: string;
+  severity: "critical" | "warning" | "note";
+  finding: string;
+  structured: string;
+  location: string | null;
+  remediation: string | null;
+  created_at: string;
+}
+
+export interface ReviewSession {
+  id: string;
+  project_id: string;
+  status: "running" | "completed" | "failed";
+  diff_summary: string | null;
+  base_ref: string | null;
+  punk_count: number;
+  finding_count: number;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export async function runReview(projectId: string, workingDir: string): Promise<{ started: boolean }> {
+  return electronAPI.invoke("run_review", { projectId, workingDir });
+}
+
+export async function reviewFindingsList(sessionId: string): Promise<{ findings: ReviewFinding[] }> {
+  return electronAPI.invoke("review_findings_list", { sessionId });
+}
+
+export async function reviewSessionsList(projectId: string): Promise<{ sessions: ReviewSession[] }> {
+  return electronAPI.invoke("review_sessions_list", { projectId });
+}
+
+export async function reviewSessionLatest(projectId: string): Promise<{ session: ReviewSession | null; findings: ReviewFinding[] }> {
+  return electronAPI.invoke("review_session_latest", { projectId });
+}
+
+// ── Lens v2: Single Punk Execution ───────────────────────────────────────
+
+/**
+ * Run a single punk (ash, ghost, sage) on demand.
+ * Results arrive via pane://punk-progress and pane://punk-complete events.
+ */
+export async function runSinglePunk(
+  punkName: string,
+  projectId: string,
+  workingDir: string,
+  scope?: string | null,
+): Promise<{ started: boolean }> {
+  return electronAPI.invoke("run_single_punk", { punkName, projectId, workingDir, scope });
+}
+
+/**
+ * Re-check a punk's previous findings against the current codebase.
+ * Results arrive via pane://punk-progress and pane://punk-complete events.
+ */
+export async function checkPreviousFindings(
+  punkName: string,
+  projectId: string,
+  workingDir: string,
+): Promise<{ started: boolean }> {
+  return electronAPI.invoke("check_previous_findings", { punkName, projectId, workingDir });
+}
+
+// ── Lens v2: Finding Queries ─────────────────────────────────────────────
+
+export async function findingsList(
+  projectId: string,
+  limit?: number,
+): Promise<{ findings: ReviewFinding[] }> {
+  return electronAPI.invoke("findings_list", { projectId, limit });
+}
+
+export async function findingsByPunk(
+  punkName: string,
+  projectId: string,
+  limit?: number,
+): Promise<{ findings: ReviewFinding[] }> {
+  return electronAPI.invoke("findings_by_punk", { projectId, punkName, limit });
+}
+
+export async function dismissFinding(
+  findingId: string,
+): Promise<{ success: boolean }> {
+  return electronAPI.invoke("dismiss_finding", { findingId });
+}
+
+// ── Punk Management ──────────────────────────────────────────────────────
+
+/** List all available punks from disk with metadata (name, displayName, role). */
+export async function listPunks(): Promise<Array<{ name: string; displayName: string; role: string }>> {
+  return electronAPI.invoke("list_punks");
+}
+
+/** Create a new punk persona file on disk. */
+export async function createPunk(
+  name: string,
+  personaContent: string,
+): Promise<{ success: boolean; error?: string }> {
+  return electronAPI.invoke("create_punk", { name, personaContent });
+}
+
+// ── Thread State ─────────────────────────────────────────────────────────
+// Prompt/response activity data used for the thread list UI.
+
+export async function recordLastPrompt(projectId: string, promptText: string, promptHash: number): Promise<void> {
+  return electronAPI.invoke("record_last_prompt", { projectId, promptText, promptHash });
+}
+
+export async function recordLastResponse(projectId: string, summary: string): Promise<void> {
+  return electronAPI.invoke("record_last_response", { projectId, summary });
+}
+
+export async function getThreadState(projectId: string): Promise<Record<string, unknown> | null> {
+  return electronAPI.invoke("get_thread_state", { projectId });
+}
+
+export async function getAllThreadStates(projectIds: string[]): Promise<Record<string, unknown>> {
+  return electronAPI.invoke("get_all_thread_states", { projectIds });
+}
+
+/**
+ * Respond to a suspended tool call (plan approval or AskUserQuestion).
+ * Resolves the pending Promise in the backend, unblocking the model loop.
+ */
+export async function respondToTool(
+  projectId: string,
+  toolId: string,
+  response: string,
+): Promise<boolean> {
+  return electronAPI.invoke("punk:respond-to-tool", { projectId, toolId, response });
 }

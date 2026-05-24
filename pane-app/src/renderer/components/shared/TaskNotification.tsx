@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useProjectsStore } from "../../stores/projects";
 
 interface Notification {
@@ -8,9 +8,12 @@ interface Notification {
   timestamp: number;
 }
 
+
 export function TaskNotification() {
   const [notifications, setNotifications] = useState<Notification[]>([]);
+  const notifTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const setActiveProject = useProjectsStore((s) => s.setActiveProject);
+  const setHasUnreadCompletion = useProjectsStore((s) => s.setHasUnreadCompletion);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -23,19 +26,73 @@ export function TaskNotification() {
       };
 
       setNotifications((prev) => [...prev, notification]);
+
+      // Auto-dismiss the toast after 3s — dot persists until user activates the project
+      const timer = setTimeout(() => {
+        setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
+        notifTimers.current.delete(notification.id);
+      }, 3000);
+      notifTimers.current.set(notification.id, timer);
     };
 
     window.addEventListener("pane:task-complete", handler);
-    return () => window.removeEventListener("pane:task-complete", handler);
+    return () => {
+      window.removeEventListener("pane:task-complete", handler);
+      for (const timer of notifTimers.current.values()) clearTimeout(timer);
+      notifTimers.current.clear();
+    };
+  }, []);
+
+  // Listen for review completion — mark Lens as having unread findings
+  useEffect(() => {
+    const unlisten = window.electronAPI.on(
+      "pane://review-complete",
+      (data: unknown) => {
+        const ev = data as { projectId?: string; findings?: unknown[] } | undefined;
+        if (!ev?.projectId || !ev?.findings?.length) return;
+        const s = useProjectsStore.getState();
+        const isViewingLens =
+          s.activeProjectId === ev.projectId &&
+          s.projects.get(ev.projectId)?.mode === "lens";
+        if (!isViewingLens) {
+          s.setHasUnreadLens(ev.projectId, true);
+        }
+      }
+    );
+    return () => unlisten();
+  }, []);
+
+  // Listen for new Lens posts — set badge if user isn't already on Lens
+  useEffect(() => {
+    const unlisten = window.electronAPI.on(
+      "pane://lens-post",
+      (data: unknown) => {
+        const post = data as { project_id?: string } | undefined;
+        if (!post?.project_id) return;
+        const s = useProjectsStore.getState();
+        const isViewingLens =
+          s.activeProjectId === post.project_id &&
+          s.projects.get(post.project_id)?.mode === "lens";
+        if (!isViewingLens) {
+          s.setHasUnreadLens(post.project_id, true);
+        }
+      }
+    );
+    return () => unlisten();
   }, []);
 
   const handleClick = (notification: Notification) => {
-    setActiveProject(notification.projectId);
+    const timer = notifTimers.current.get(notification.id);
+    if (timer) { clearTimeout(timer); notifTimers.current.delete(notification.id); }
+    setActiveProject(notification.projectId); // setActiveProject already clears hasUnreadCompletion
     setNotifications((prev) => prev.filter((n) => n.id !== notification.id));
   };
 
-  const handleDismiss = (e: React.MouseEvent, notificationId: string) => {
+  const handleDismiss = (e: React.MouseEvent, notificationId: string, projectId: string) => {
     e.stopPropagation();
+    const timer = notifTimers.current.get(notificationId);
+    if (timer) { clearTimeout(timer); notifTimers.current.delete(notificationId); }
+    setHasUnreadCompletion(projectId, false);
     setNotifications((prev) => prev.filter((n) => n.id !== notificationId));
   };
 
@@ -47,9 +104,9 @@ export function TaskNotification() {
         <div
           key={notification.id}
           onClick={() => handleClick(notification)}
-          className="bg-pane-bg rounded-xl ring-1 ring-pane-border/40 px-4 py-3
+          className="bg-pane-bg/90 backdrop-blur-md rounded-xl ring-1 ring-pane-border/40 px-4 py-3
                      animate-fadeSlideUp pointer-events-auto cursor-pointer
-                     hover:bg-pane-text/[0.04] btn-press
+                     hover:bg-pane-surface/90 btn-press
                      flex items-center gap-3 min-w-[280px]"
         >
           <span className="w-2 h-2 rounded-full bg-pane-status-added shrink-0" />
@@ -62,7 +119,7 @@ export function TaskNotification() {
             </p>
           </div>
           <button
-            onClick={(e) => handleDismiss(e, notification.id)}
+            onClick={(e) => handleDismiss(e, notification.id, notification.projectId)}
             className="text-pane-text-secondary/40 hover:text-pane-text-secondary
                        w-5 h-5 flex items-center justify-center btn-press"
             style={{ fontSize: "var(--pane-panel-font-size)" }}
@@ -71,6 +128,7 @@ export function TaskNotification() {
           </button>
         </div>
       ))}
+
     </div>
   );
 }

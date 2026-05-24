@@ -20,6 +20,9 @@ release/
 *.log
 npm-debug.log*
 
+# Bundled ONNX models (~440MB, downloaded via `npm run download-models`)
+models/
+
 # Env
 .env
 .env.local

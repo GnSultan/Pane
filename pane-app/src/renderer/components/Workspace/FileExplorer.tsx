@@ -9,7 +9,7 @@ import {
   revealInFinder,
   type FileEntry,
 } from "../../lib/tauri-commands";
-import { getParentDir, getFileName } from "../../lib/file-utils";
+import { getParentDir } from "../../lib/file-utils";
 import { FileViewer } from "./FileViewer";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ function ExplorerHeader({
   );
 
   return (
-    <div className="relative z-20 h-9 flex items-center gap-0.5 px-3 shrink-0 border-b border-pane-border/20 overflow-x-auto no-scrollbar">
+    <div className="relative z-40 h-9 flex items-center gap-0.5 px-3 shrink-0 border-b border-pane-border/20 overflow-x-auto no-scrollbar" data-no-drag>
       {/* Back / up */}
       {inFile ? (
         <button

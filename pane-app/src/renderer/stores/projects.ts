@@ -6,8 +6,19 @@ import type {
   ContentBlock,
   ToolUseBlock,
   CheckpointMeta,
-} from "../lib/claude-types";
-import { createEmptyConversation } from "../lib/claude-types";
+  ArbiterVerdict,
+} from "../lib/punk-types";
+import { createEmptyConversation } from "../lib/punk-types";
+import type { PowerCombo } from "../lib/models";
+import { DEFAULT_POWER_COMBO } from "../lib/models";
+import { useWorkspaceStore } from "./workspace";
+
+// Maximum messages kept in-memory per conversation. Full history lives in
+// SQLite — the store is a display-only cache. With virtual scrolling, only
+// ~20-30 messages are rendered as DOM at any time, so 100 in the store is
+// more than sufficient — old messages are trimmed from the front and the
+// "load older" button fetches them from disk.
+const MAX_STORE_MESSAGES = 100;
 
 export interface ProjectGit {
   branch: string | null;
@@ -24,35 +35,75 @@ export interface ProjectFileIndex {
 
 export interface TerminalTab {
   id: string; // doubles as ptyId
-  title: string; // "zsh", "zsh (2)", etc.
+  title: string; // display label (path)
   isAlive: boolean; // false after PTY exit
+  cwd?: string; // current working directory, updated as user navigates
 }
 
 export interface Project {
   id: string;
   root: string;
   name: string;
+  rootMissing?: boolean; // true when the folder no longer exists at the stored path
   expandedDirs: Set<string>;
   dirContents: Map<string, FileEntry[]>;
   loadingDirs: Set<string>;
   selectedPath: string | null;
   activeFilePath: string | null;
   activeFileContent: string | null;
-  mode: "conversation" | "viewer" | "terminal" | "git";
+  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
   conversation: ConversationState;
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
   hasUnreadCompletion: boolean; // true when background task completes, cleared when project becomes active
+  hasUnreadLens: boolean; // true when a new Lens post/punk finding arrives while Lens is not open
   recentFiles: string[]; // last 20 opened files (FIFO)
   terminalTabs: TerminalTab[];
   activeTerminalTabId: string | null;
   checkpoints: CheckpointMeta[];
   scrollPositions: Map<string, { scrollTop: number; cursor: { row: number; column: number } }>;
+  /** Per-project power combo: which model serves each phase (think/build).
+   *  When set, overrides the global workspace powerCombo for this project.
+   *  Undefined means "use workspace default". */
+  powerCombo?: PowerCombo;
+  /** Per-project auto-route toggle. Undefined means "use workspace default". */
+  autoEscalate?: boolean;
+  /** Per-project explicit model pin. When set, this project always uses
+   *  this model when auto-route is off, regardless of workspace default.
+   *  Undefined means "use workspace default selectedModel". */
+  selectedModel?: string;
+  /** Per-project model provider. Undefined means "use workspace default". */
+  selectedModelProvider?: string;
+  /** Per-project thinking override. Undefined means "use workspace default". */
+  selectedModelThinking?: boolean;
+  /** Last user prompt text (max 500 chars) — for thread list preview. */
+  lastUserPromptText: string | null;
+  /** Last response summary (max 200 chars) — for thread list preview. */
+  lastResponseSummary: string | null;
+  /** Epoch ms of last user or model activity — for thread list sorting. */
+  lastActivityAt: number | null;
+  /** When true, this thread is archived — hidden from main list, visible
+   *  in a collapsible "Archived" section. Migrates to conversation-level
+   *  is_archived when multi-conversation (Phase 0) lands. */
+  archived?: boolean;
 }
 
-function createProject(root: string): Project {
+/**
+ * Generate a stable project ID.
+ * New projects get a UUID. Existing projects pass their stored ID so all
+ * memory/SQLite data (keyed on the old derived ID) stays intact.
+ */
+function generateProjectId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback for environments without crypto.randomUUID
+  return `proj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function createProject(root: string, stableId?: string): Project {
   const name = root.split("/").filter(Boolean).pop() || root;
-  const id = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
+  const id = stableId ?? generateProjectId();
   return {
     id,
     root,
@@ -73,15 +124,19 @@ function createProject(root: string): Project {
     },
     fileIndex: { files: [], lastIndexed: 0, isLoading: false },
     hasUnreadCompletion: false,
+    hasUnreadLens: false,
     recentFiles: [],
     terminalTabs: [],
     activeTerminalTabId: null,
     checkpoints: [],
     scrollPositions: new Map(),
+    lastUserPromptText: null,
+    lastResponseSummary: null,
+    lastActivityAt: null,
   };
 }
 
-// Ensure unique IDs by appending a counter if needed
+// Ensure unique IDs — UUIDs won't collide but derived IDs from old projects might
 function ensureUniqueId(id: string, existing: Map<string, Project>): string {
   if (!existing.has(id)) return id;
   let i = 2;
@@ -95,8 +150,14 @@ interface ProjectsState {
   projectOrder: string[]; // ordered list of project IDs for Cmd+1/2/3
 
   // Project lifecycle
-  addProject: (root: string) => string; // returns project ID
+  addProject: (root: string, stableId?: string) => string; // returns project ID
   removeProject: (id: string) => void;
+  archiveProject: (id: string) => void;
+  restoreProject: (id: string) => void;
+  renameProject: (id: string, name: string) => void;
+  rebindProject: (id: string, newRoot: string) => void; // update root binding after folder move/rename
+  markRootMissing: (id: string, missing: boolean) => void;
+  migrateProjectId: (oldId: string, newId: string) => void; // swap store entry from old derived ID to UUID
   setActiveProject: (id: string) => void;
 
   // Active project helpers
@@ -129,7 +190,7 @@ interface ProjectsState {
   // Per-project mode
   setMode: (
     projectId: string,
-    mode: "conversation" | "viewer" | "terminal" | "git",
+    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch",
   ) => void;
   toggleMode: (projectId: string) => void;
 
@@ -155,19 +216,23 @@ interface ProjectsState {
     message: ConversationMessage,
   ) => void;
   removeLastConversationMessage: (projectId: string) => void;
+  removeConversationMessageById: (projectId: string, messageId: string) => void;
   updateMessageContent: (
     projectId: string,
     messageId: string,
     content: ContentBlock[],
   ) => void;
+  updateMessageReasoning: (
+    projectId: string,
+    messageId: string,
+    reasoning: string,
+  ) => void;
   updateLastAssistantContent: (
     projectId: string,
     content: ContentBlock[],
-  ) => void;
-  appendToLastAssistantText: (projectId: string, text: string) => void;
+  ) => void;  appendToLastAssistantText: (projectId: string, text: string) => void;
   appendToLastAssistantThinking: (projectId: string, thinking: string) => void;
   setLastThinkingSignature: (projectId: string, signature: string) => void;
-  setConversationSessionId: (projectId: string, sessionId: string | null) => void;
   setConversationModel: (projectId: string, model: string) => void;
   setConversationStatusMessage: (
     projectId: string,
@@ -178,6 +243,7 @@ interface ProjectsState {
   setConversationProcessing: (projectId: string, isProcessing: boolean) => void;
   setConversationError: (projectId: string, error: string | null) => void;
   setLastMessageStreamingDone: (projectId: string) => void;
+  finalizeAllStreaming: (projectId: string) => void;
   setLastAssistantMeta: (
     projectId: string,
     costUsd: number,
@@ -186,20 +252,29 @@ interface ProjectsState {
     outputTokens?: number,
     numTurns?: number,
   ) => void;
+  setLastAssistantVerdict: (projectId: string, verdict: ArbiterVerdict) => void;
   clearConversation: (projectId: string) => void;
+  clearSessionContext: (projectId: string) => void;
   setHasUnreadCompletion: (projectId: string, hasUnread: boolean) => void;
+  setHasUnreadLens: (projectId: string, hasUnread: boolean) => void;
   restoreConversation: (
     projectId: string,
     messages: ConversationMessage[],
-    sessionId: string | null,
+    historyInfo?: { totalCount: number; startIndex: number },
+  ) => void;
+  prependOlderMessages: (
+    projectId: string,
+    messages: ConversationMessage[],
+    newStartIndex: number,
   ) => void;
   setConversationTodos: (
     projectId: string,
-    todos: import("../lib/claude-types").Todo[],
+    todos: import("../lib/punk-types").Todo[],
   ) => void;
-  setPendingPlanApproval: (projectId: string, pending: boolean) => void;
-  setDiscoveryActive: (projectId: string, active: boolean) => void;
+  setPendingInput: (projectId: string, pendingInput: import("../lib/punk-types").ConversationState["pendingInput"]) => void;
+  clearPendingInput: (projectId: string) => void;
   setIsPlanning: (projectId: string, isPlanning: boolean) => void;
+  setConversationPhase: (projectId: string, phase: import("../lib/punk-types").ConversationState["phase"]) => void;
   updateLastToolUseInput: (
     projectId: string,
     input: Record<string, unknown>,
@@ -212,7 +287,7 @@ interface ProjectsState {
   setContextPressure: (
     projectId: string,
     tokens: number,
-    pressure: import("../lib/claude-types").ContextPressure,
+    pressure: import("../lib/punk-types").ContextPressure,
   ) => void;
   setCompactionStatus: (
     projectId: string,
@@ -225,6 +300,15 @@ interface ProjectsState {
   removeTerminalTab: (projectId: string, tabId: string) => void;
   setActiveTerminalTab: (projectId: string, tabId: string) => void;
   markTerminalTabDead: (projectId: string, tabId: string) => void;
+  updateTerminalTabCwd: (projectId: string, tabId: string, cwd: string) => void;
+
+  // Per-project routing
+  setProjectPowerCombo: (projectId: string, combo: PowerCombo) => void;
+  setProjectAutoEscalate: (projectId: string, autoEscalate: boolean) => void;
+  setProjectSelectedModel: (projectId: string, model: string, thinking: boolean, provider?: string) => void;
+  getProjectEffectiveCombo: (projectId: string) => PowerCombo;
+  // Thread list activity
+  setThreadActivity: (projectId: string, fields: { lastUserPromptText?: string | null; lastResponseSummary?: string | null; lastActivityAt?: number | null }) => void;
 
   // Checkpoints
   addCheckpoint: (projectId: string, meta: CheckpointMeta) => void;
@@ -251,17 +335,23 @@ function createProjectsStore() {
     activeProjectId: null,
     projectOrder: [],
 
-    addProject: (root: string) => {
+    addProject: (root: string, stableId?: string) => {
       const state = get();
-      // Don't add duplicate roots
+      // Don't add duplicate roots — return existing project ID
       for (const p of state.projects.values()) {
         if (p.root === root) {
           set({ activeProjectId: p.id });
           return p.id;
         }
       }
-      const project = createProject(root);
-      project.id = ensureUniqueId(project.id, state.projects);
+      // If a stableId is provided and already exists (e.g. from a previous session),
+      // trust it — don't ensureUnique since it IS the canonical identity.
+      const project = createProject(root, stableId);
+      if (!stableId) {
+        project.id = ensureUniqueId(project.id, state.projects);
+      }
+      // Seed thread activity timestamp so newly added projects sort to top
+      project.lastActivityAt = Date.now();
       const next = new Map(state.projects);
       next.set(project.id, project);
       set({
@@ -270,6 +360,37 @@ function createProjectsStore() {
         projectOrder: [...state.projectOrder, project.id],
       });
       return project.id;
+    },
+
+    renameProject: (id: string, name: string) => {
+      set((state) => updateProject(state, id, () => ({ name: name.trim() || state.projects.get(id)?.name || "" })));
+    },
+
+    rebindProject: (id: string, newRoot: string) => {
+      set((state) =>
+        updateProject(state, id, () => ({
+          root: newRoot,
+          name: newRoot.split("/").filter(Boolean).pop() || newRoot,
+          rootMissing: false,
+        }))
+      );
+    },
+
+    markRootMissing: (id: string, missing: boolean) => {
+      set((state) => updateProject(state, id, () => ({ rootMissing: missing })));
+    },
+
+    migrateProjectId: (oldId: string, newId: string) => {
+      set((state) => {
+        const project = state.projects.get(oldId);
+        if (!project) return {}; // already migrated or doesn't exist
+        const next = new Map(state.projects);
+        next.delete(oldId);
+        next.set(newId, { ...project, id: newId });
+        const nextOrder = state.projectOrder.map((pid) => (pid === oldId ? newId : pid));
+        const nextActive = state.activeProjectId === oldId ? newId : state.activeProjectId;
+        return { projects: next, projectOrder: nextOrder, activeProjectId: nextActive };
+      });
     },
 
     removeProject: (id: string) => {
@@ -288,6 +409,31 @@ function createProjectsStore() {
       });
     },
 
+    archiveProject: (id: string) => {
+      set((state) => {
+        const project = state.projects.get(id);
+        if (!project) return {};
+
+        // If archiving the active project, switch to the next non-archived
+        let nextActive = state.activeProjectId;
+        if (state.activeProjectId === id) {
+          const candidates = state.projectOrder.filter(
+            (pid) => pid !== id && !state.projects.get(pid)?.archived,
+          );
+          nextActive = candidates[0] || null;
+        }
+
+        return {
+          ...updateProject(state, id, () => ({ archived: true })),
+          activeProjectId: nextActive,
+        };
+      });
+    },
+
+    restoreProject: (id: string) => {
+      set((state) => updateProject(state, id, () => ({ archived: false })));
+    },
+
     setActiveProject: (id: string) => {
       set((state) => {
         const project = state.projects.get(id);
@@ -299,12 +445,13 @@ function createProjectsStore() {
           ? state.projects.get(state.activeProjectId)
           : undefined;
         const carryMode = currentProject?.mode;
+        const isTransientMode = carryMode === "mind" || carryMode === "profile" || carryMode === "history" || carryMode === "lens";
 
         const updatedProjects = new Map(state.projects);
         const updatedProject = {
           ...project,
           hasUnreadCompletion: false,
-          ...(carryMode ? { mode: carryMode } : {}),
+          ...(carryMode && !isTransientMode ? { mode: carryMode } : {}),
         };
         updatedProjects.set(id, updatedProject);
         return { activeProjectId: id, projects: updatedProjects };
@@ -409,17 +556,23 @@ function createProjectsStore() {
 
     // Mode
     setMode: (projectId, mode) =>
-      set((state) => updateProject(state, projectId, () => ({ mode }))),
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          mode,
+          // Opening Lens clears the unread badge
+          ...(mode === "lens" ? { hasUnreadLens: false } : {}),
+        })),
+      ),
 
     toggleMode: (projectId) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
           // Toggle between Chat and Viewer (file explorer / directory browser)
-          let nextMode: "conversation" | "viewer" | "terminal" | "git";
+          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
           if (p.mode === "conversation") {
             nextMode = "viewer";
           } else {
-            // From git, terminal, or viewer — always go back to conversation
+            // From git, terminal, viewer, mind, profile, history, lens, fuzzy, or search — always go back to conversation
             nextMode = "conversation";
           }
           return { mode: nextMode };
@@ -486,10 +639,16 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => {
           if (p.conversation.messages.some((m) => m.id === message.id)) return p;
+          const messages = [...p.conversation.messages, message];
+          // Cap to most recent N messages to prevent unbounded heap growth.
+          // Full history lives in SQLite; the store is a display-only cache.
+          const capped = messages.length > MAX_STORE_MESSAGES
+            ? messages.slice(messages.length - MAX_STORE_MESSAGES)
+            : messages;
           return {
             conversation: {
               ...p.conversation,
-              messages: [...p.conversation.messages, message],
+              messages: capped,
             },
           };
         }),
@@ -505,11 +664,31 @@ function createProjectsStore() {
         })),
       ),
 
+    removeConversationMessageById: (projectId, messageId) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: {
+            ...p.conversation,
+            messages: p.conversation.messages.filter((m) => m.id !== messageId),
+          },
+        })),
+      ),
+
     updateMessageContent: (projectId, messageId, content) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
           const msgs = p.conversation.messages.map((m) =>
             m.id === messageId ? { ...m, content } : m,
+          );
+          return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
+    updateMessageReasoning: (projectId, messageId, reasoning) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const msgs = p.conversation.messages.map((m) =>
+            m.id === messageId ? { ...m, reasoning_content: reasoning } : m,
           );
           return { conversation: { ...p.conversation, messages: msgs } };
         }),
@@ -593,13 +772,6 @@ function createProjectsStore() {
         }),
       ),
 
-    setConversationSessionId: (projectId, sessionId) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, sessionId },
-        })),
-      ),
-
     setConversationModel: (projectId, model) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -654,6 +826,23 @@ function createProjectsStore() {
         }),
       ),
 
+    // Stamps isStreaming: false on every message that's still streaming.
+    // Claude finalizes its own messages via setLastMessageStreamingDone in
+    // case "assistant". Gemini may leave earlier tool-use messages streaming
+    // when the final text response creates a new assistant message — this
+    // sweeps those up at session end (case "result").
+    finalizeAllStreaming: (projectId) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const hasAny = p.conversation.messages.some((m) => m.isStreaming);
+          if (!hasAny) return p;
+          const msgs = p.conversation.messages.map((m) =>
+            m.isStreaming ? { ...m, isStreaming: false } : m,
+          );
+          return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
     setLastAssistantMeta: (
       projectId,
       costUsd,
@@ -682,10 +871,37 @@ function createProjectsStore() {
         }),
       ),
 
+    setLastAssistantVerdict: (projectId, verdict) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const msgs = [...p.conversation.messages];
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i]!.type === "assistant") {
+              msgs[i] = { ...msgs[i]!, verdict };
+              break;
+            }
+          }
+          return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
     clearConversation: (projectId) =>
       set((state) =>
         updateProject(state, projectId, () => ({
           conversation: createEmptyConversation(),
+        })),
+      ),
+
+    clearSessionContext: (projectId) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: {
+            ...p.conversation,
+            todos: [],
+            isPlanning: false,
+            phase: "idle",
+            isProcessing: false,
+          },
         })),
       ),
 
@@ -696,6 +912,13 @@ function createProjectsStore() {
         })),
       ),
 
+    setHasUnreadLens: (projectId, hasUnread) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          hasUnreadLens: hasUnread,
+        })),
+      ),
+
     setConversationTodos: (projectId, todos) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
@@ -703,17 +926,17 @@ function createProjectsStore() {
         })),
       ),
 
-    setPendingPlanApproval: (projectId, pending) =>
+    setPendingInput: (projectId, pendingInput) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, pendingPlanApproval: pending },
+          conversation: { ...p.conversation, pendingInput },
         })),
       ),
 
-    setDiscoveryActive: (projectId, active) =>
+    clearPendingInput: (projectId) =>
       set((state) =>
         updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, discoveryActive: active },
+          conversation: { ...p.conversation, pendingInput: null },
         })),
       ),
 
@@ -721,6 +944,13 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => ({
           conversation: { ...p.conversation, isPlanning },
+        })),
+      ),
+
+    setConversationPhase: (projectId, phase) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          conversation: { ...p.conversation, phase },
         })),
       ),
 
@@ -798,22 +1028,20 @@ function createProjectsStore() {
         })),
       ),
 
-    restoreConversation: (projectId, messages, sessionId) =>
+    restoreConversation: (projectId, messages, historyInfo) =>
       set((state) =>
         updateProject(state, projectId, () => ({
           conversation: {
-            messages,
-            sessionId,
+            messages: messages.map((m) => ({ ...m, isHistorical: true })),
             model: null,
             routedModel: null,
             serviceTier: null,
             isProcessing: false,
             isPlanning: false,
+            phase: "idle",
             isRestored: true,
             error: null,
             todos: [],
-            pendingPlanApproval: false,
-            discoveryActive: false,
             isProcessActive: false,
             lastActivity: Date.now(),
             contextTokens: 0,
@@ -824,8 +1052,35 @@ function createProjectsStore() {
             lastCompactionAt: null,
             compactionCount: 0,
             tokensSaved: 0,
+            historyTotalCount: historyInfo?.totalCount ?? 0,
+            historyStartIndex: historyInfo?.startIndex ?? 0,
+            pendingInput: null,
           },
         })),
+      ),
+
+    prependOlderMessages: (projectId, olderMessages, newStartIndex) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const merged = [
+            ...olderMessages.map((m) => ({ ...m, isHistorical: true })),
+            ...p.conversation.messages,
+          ];
+          // Cap to most recent N, adjusting start index for trimmed front
+          const trimmed = merged.length > MAX_STORE_MESSAGES
+            ? merged.length - MAX_STORE_MESSAGES
+            : 0;
+          const capped = trimmed > 0
+            ? merged.slice(trimmed)
+            : merged;
+          return {
+            conversation: {
+              ...p.conversation,
+              messages: capped,
+              historyStartIndex: newStartIndex + trimmed,
+            },
+          };
+        }),
       ),
 
     // Terminal tabs
@@ -865,6 +1120,52 @@ function createProjectsStore() {
         })),
       ),
 
+    updateTerminalTabCwd: (projectId, tabId, cwd) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => ({
+          terminalTabs: p.terminalTabs.map((t) =>
+            t.id === tabId ? { ...t, cwd } : t,
+          ),
+        })),
+      ),
+
+    // Per-project routing
+    setProjectPowerCombo: (projectId, combo) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({ powerCombo: combo })),
+      ),
+
+    setProjectAutoEscalate: (projectId, autoEscalate) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({ autoEscalate })),
+      ),
+
+    setProjectSelectedModel: (projectId, model, thinking, provider) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          selectedModel: model,
+          selectedModelThinking: thinking,
+          selectedModelProvider: provider,
+        })),
+      ),
+
+    getProjectEffectiveCombo: (projectId) => {
+      const state = get();
+      const project = state.projects.get(projectId);
+      if (project?.powerCombo) return project.powerCombo;
+      // Fall back to workspace store's global combo
+      return useWorkspaceStore.getState().powerCombo || DEFAULT_POWER_COMBO;
+    },
+
+    setThreadActivity: (projectId, fields) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          lastUserPromptText: fields.lastUserPromptText ?? state.projects.get(projectId)?.lastUserPromptText ?? null,
+          lastResponseSummary: fields.lastResponseSummary ?? state.projects.get(projectId)?.lastResponseSummary ?? null,
+          lastActivityAt: fields.lastActivityAt ?? state.projects.get(projectId)?.lastActivityAt ?? null,
+        })),
+      ),
+
     // Checkpoints
     addCheckpoint: (projectId, meta) =>
       set((state) =>
@@ -883,13 +1184,20 @@ function createProjectsStore() {
   }));
 }
 
+interface ViteHotContext {
+  data: Record<string, unknown>;
+}
+interface ViteImportMeta {
+  hot?: ViteHotContext;
+}
+
 // Preserve store across HMR — prevents state loss and stale subscriptions
 export const useProjectsStore: ReturnType<typeof createProjectsStore> =
-  (import.meta as any).hot?.data?.__PROJECTS_STORE__ ??
+  ((import.meta as unknown as ViteImportMeta).hot?.data?.__PROJECTS_STORE__ as ReturnType<typeof createProjectsStore> | undefined) ??
   (() => {
     const store = createProjectsStore();
-    if ((import.meta as any).hot) {
-      (import.meta as any).hot.data.__PROJECTS_STORE__ = store;
+    if ((import.meta as unknown as ViteImportMeta).hot) {
+      (import.meta as unknown as ViteImportMeta).hot!.data.__PROJECTS_STORE__ = store;
     }
     return store;
   })();

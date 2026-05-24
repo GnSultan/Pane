@@ -5,13 +5,13 @@
 //
 // See: https://github.com/microsoft/vscode/issues/243952
 
-import __cjs_mod__ from "node:module";
+import { createRequire } from "node:module";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 
-const require2 = __cjs_mod__.createRequire(import.meta.url);
-const nodePty = require2("node-pty");
+const require = createRequire(import.meta.url);
+const nodePty = require("node-pty");
 
 const activePtys = new Map();
 
@@ -81,12 +81,20 @@ function handleWrite({ ptyId, data }) {
   }
 }
 
+function killPtyEntry(entry) {
+  try { entry.dataDisposable.dispose(); } catch {}
+  try { entry.exitDisposable.dispose(); } catch {}
+  // Kill the entire process group (negative PID) so child processes of the shell
+  // (node servers, watchers, build tools) are also killed — not just the shell itself.
+  // Then call pty.kill() to tear down the native PTY fd and internal handles.
+  try { process.kill(-entry.pty.pid, "SIGKILL"); } catch {}
+  try { entry.pty.kill(); } catch {}
+}
+
 function handleDestroy({ ptyId }) {
   const entry = activePtys.get(ptyId);
   if (entry) {
-    try { entry.dataDisposable.dispose(); } catch {}
-    try { entry.exitDisposable.dispose(); } catch {}
-    try { process.kill(entry.pty.pid, "SIGKILL"); } catch {}
+    killPtyEntry(entry);
     activePtys.delete(ptyId);
   }
 }
@@ -94,9 +102,7 @@ function handleDestroy({ ptyId }) {
 function handleDestroyProject({ projectId }) {
   for (const [ptyId, entry] of activePtys) {
     if (entry.projectId === projectId) {
-      try { entry.dataDisposable.dispose(); } catch {}
-      try { entry.exitDisposable.dispose(); } catch {}
-      try { process.kill(entry.pty.pid, "SIGKILL"); } catch {}
+      killPtyEntry(entry);
       activePtys.delete(ptyId);
     }
   }
@@ -104,9 +110,7 @@ function handleDestroyProject({ projectId }) {
 
 function handleShutdown() {
   for (const [, entry] of activePtys) {
-    try { entry.dataDisposable.dispose(); } catch {}
-    try { entry.exitDisposable.dispose(); } catch {}
-    try { process.kill(entry.pty.pid, "SIGKILL"); } catch {}
+    killPtyEntry(entry);
   }
   activePtys.clear();
   // Let the event loop drain so node-pty's native ThreadSafeFunction callbacks

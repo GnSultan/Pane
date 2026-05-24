@@ -1,75 +1,71 @@
-import { useEffect, useRef, useState, useCallback, memo } from "react";
+import { useEffect, useRef, useState, useCallback, memo, useTransition } from "react";
 import { Conversation } from "./Conversation";
 import { FileExplorer } from "./FileExplorer";
 import { Terminal } from "./Terminal";
 import { Profile } from "./Profile";
 import { Mind } from "./Mind";
+import { Lens } from "./Lens";
 import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
-import { GitStatus } from "../ControlPanel/GitStatus";
+import { FuzzyFinder } from "../FuzzyFinder/FuzzyFinder";
+import { FileSearch } from "../FileSearch/FileSearch";
+import { GitStatus } from "../ThreadPanel/GitStatus";
+import { Menu, type PaneMode } from "../ThreadPanel/Menu";
 import { useProjectsStore } from "../../stores/projects";
-import { useWorkspaceStore } from "../../stores/workspace";
 import { detectProjectRoot } from "../../lib/tauri-commands";
 
 import type { ElectronAPI } from '../../lib/electron';
 
 const electronAPI = window.electronAPI as ElectronAPI;
 
-// Per-project scroll cache — measured while visible, restored before reveal.
-// Sentinel 1e9 means "pin to bottom": browser clamps to max scrollable.
-const scrollCache = new Map<string, number>();
-
-// Visibility is toggled via direct DOM manipulation — bypasses React entirely.
-// The Conversation inside is memo'd + never subscribes to activeProjectId,
-// so switching projects triggers zero re-renders in the conversation subtree.
+// z-index stacking for thread switching — zero-cost compositor operation.
+// All ConversationLayers are always visible and GPU-composited. Switching threads
+// just changes z-index (active=1, inactive=0) + pointer-events. No visibility toggle,
+// no layout read, no reflow, no layer teardown. The compositor reorders existing layers
+// without repainting — sub-millisecond at any refresh rate.
 const ConversationLayer = memo(function ConversationLayer({ projectId }: { projectId: string }) {
   const ref = useRef<HTMLDivElement>(null);
-  const initiallyActive = useProjectsStore.getState().activeProjectId === projectId;
 
+  // Always start unmounted. startTransition defers the heavy Conversation render
+  // so the initial paint (empty area) happens first, keeping the app responsive
+  // when restoring a conversation with many large code blocks.
+  const [mounted, setMounted] = useState(false);
+  const mountedRef = useRef(false);
+  const [, startTransition] = useTransition();
+
+  // Thread switching only — page visibility handled by parent [data-page="conversation"]
+  // container via CSS. This layer only manages which thread is on top.
   useEffect(() => {
-    let rafId = 0;
-
-    const hide = () => {
+    const apply = (state: ReturnType<typeof useProjectsStore.getState>) => {
       if (!ref.current) return;
-      const scrollEl = ref.current.querySelector<HTMLDivElement>("[data-conv-scroll]");
-      if (scrollEl) {
-        const { scrollTop, scrollHeight, clientHeight } = scrollEl;
-        scrollCache.set(projectId, scrollHeight - scrollTop - clientHeight < 10 ? 1e9 : scrollTop);
+      const isActive = state.activeProjectId === projectId;
+      if (isActive && !mountedRef.current) {
+        mountedRef.current = true;
+        startTransition(() => setMounted(true));
       }
-      // opacity bypasses paint — goes straight to compositor, disappears this frame.
-      // visibility:hidden queues a repaint, leaving the old layer visible for 1-2 extra frames.
-      ref.current.style.opacity = "0";
-      ref.current.style.pointerEvents = "none";
+      ref.current.style.zIndex = isActive ? "1" : "0";
+      ref.current.style.pointerEvents = isActive ? "auto" : "none";
+      ref.current.style.contentVisibility = isActive ? "visible" : "hidden";
     };
 
-    const show = () => {
-      if (!ref.current) return;
-      const scrollEl = ref.current.querySelector<HTMLDivElement>("[data-conv-scroll]");
-      if (scrollEl) scrollEl.scrollTop = scrollCache.get(projectId) ?? 1e9;
-      ref.current.style.opacity = "1";
-      ref.current.style.pointerEvents = "";
-    };
-
-    const apply = (activeId: string | null, instant: boolean) => {
-      cancelAnimationFrame(rafId);
-      if (activeId === projectId) {
-        if (instant) { show(); return; }
-        // Deliberate 1-frame blank: old layer hid this frame, new appears next frame.
-        // The brief workspace background visible between them reads as navigation, not replacement.
-        rafId = requestAnimationFrame(show);
-      } else {
-        hide();
-      }
-    };
-
-    apply(useProjectsStore.getState().activeProjectId, true);
+    apply(useProjectsStore.getState());
     return useProjectsStore.subscribe((state, prev) => {
-      if (state.activeProjectId !== prev.activeProjectId) apply(state.activeProjectId, false);
+      if (state.activeProjectId !== prev.activeProjectId) apply(state);
     });
   }, [projectId]);
 
+  const store = useProjectsStore.getState();
+  const initiallyActive = store.activeProjectId === projectId;
+
   return (
-    <div ref={ref} className="absolute inset-0 flex" style={{ opacity: initiallyActive ? 1 : 0, pointerEvents: initiallyActive ? "auto" : "none" }}>
-      <Conversation projectId={projectId} />
+    <div
+      ref={ref}
+      className="absolute inset-0 flex bg-pane-bg"
+      style={{
+        zIndex: initiallyActive ? 1 : 0,
+        pointerEvents: initiallyActive ? "auto" : "none",
+      }}
+    >
+      {mounted && <Conversation projectId={projectId} />}
     </div>
   );
 });
@@ -80,18 +76,6 @@ function ProjectTerminal({ projectId }: { projectId: string }) {
   return <Terminal projectId={projectId} workingDir={root} />;
 }
 
-// Lazy keep-alive: mounts on first open, stays mounted (hidden) after.
-// Avoids paying mount cost on every open, but doesn't burn hooks when never used.
-function LazyKeepAlive({ open, children }: { open: boolean; children: React.ReactNode }) {
-  const [everOpened, setEverOpened] = useState(false);
-  if (open && !everOpened) setEverOpened(true);
-  if (!everOpened) return null;
-  return (
-    <div className={`absolute inset-0 ${!open ? "hidden" : ""}`}>
-      {children}
-    </div>
-  );
-}
 
 // Empty state — shown when no threads exist.
 // Centered input: type what you're working on → directory picker → thread created → message sent.
@@ -165,71 +149,120 @@ function GitView({ projectId }: { projectId: string }) {
 export function Workspace() {
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const projectOrder = useProjectsStore((s) => s.projectOrder);
-  const overlay = useWorkspaceStore((s) => s.overlay);
-  const activeMode = useProjectsStore((s) => {
-    if (!s.activeProjectId) return "conversation" as const;
-    return s.projects.get(s.activeProjectId)?.mode ?? "conversation";
+  const wsRef = useRef<HTMLDivElement>(null);
+
+  // Single store subscription → single data-mode DOM write → CSS handles all page visibility.
+  // No React re-render on mode switch. All pages transition in one style recalc, one paint frame.
+  useEffect(() => {
+    const applyMode = (state: ReturnType<typeof useProjectsStore.getState>) => {
+      if (!wsRef.current) return;
+      const id = state.activeProjectId;
+      const mode = id ? state.projects.get(id)?.mode ?? "conversation" : "conversation";
+      wsRef.current.dataset.mode = mode;
+    };
+    applyMode(useProjectsStore.getState());
+    return useProjectsStore.subscribe((state, prev) => {
+      const activeChanged = state.activeProjectId !== prev.activeProjectId;
+      const modeChanged = state.activeProjectId
+        ? state.projects.get(state.activeProjectId)?.mode !==
+          prev.projects.get(state.activeProjectId ?? "")?.mode
+        : false;
+      if (activeChanged || modeChanged) applyMode(state);
+    });
+  }, []);
+
+  const mode = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.mode ?? "conversation" : "conversation";
   });
+  const isGitRepo = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.git.isGitRepo ?? false : false;
+  });
+  const hasUnreadLens = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.hasUnreadLens ?? false : false;
+  });
+  const setMode = useProjectsStore((s) => s.setMode);
+
+  const handleSelectMode = useCallback((newMode: PaneMode) => {
+    const id = useProjectsStore.getState().activeProjectId;
+    if (!id) return;
+    setMode(id, newMode);
+    if (newMode === "conversation") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-input")));
+    else if (newMode === "viewer") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-editor")));
+    else if (newMode === "search") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-search")));
+    else if (newMode === "filesearch") requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-filesearch")));
+  }, [setMode]);
 
   return (
-    <div className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
-      {/* Empty state — no threads yet */}
-      {projectOrder.length === 0 && overlay === null && (
-        <EmptyState />
-      )}
-
-      <div className={`absolute inset-0 ${overlay !== null || activeMode !== "conversation" ? "hidden" : ""}`}>
+    <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
+      {/* Conversation page — participates in the same [data-page] CSS system as every other page.
+           Page-level visibility (conversation vs mind vs profile) is CSS-driven.
+           Thread switching (project A vs project B) is JS-driven z-index 0/1 inside. */}
+      <div data-page="conversation" className="absolute inset-0 bg-pane-bg">
+        {projectOrder.length === 0 && <EmptyState />}
         {projectOrder.map((id) => (
           <ConversationLayer key={id} projectId={id} />
         ))}
       </div>
 
-      <div className={`absolute inset-0 flex flex-col ${overlay !== null || activeMode !== "viewer" ? "hidden" : ""}`}>
+      <div data-page="viewer" className="absolute inset-0 flex flex-col bg-pane-bg">
         <FileExplorer />
       </div>
 
-      <div className={`absolute inset-0 flex ${overlay !== null || activeMode !== "terminal" ? "hidden" : ""}`}>
-        {projectOrder.map((id) => (
-          <div
-            key={id}
-            className="flex-1 min-h-0 min-w-0 flex flex-col"
-            style={{ display: id === activeProjectId ? "flex" : "none" }}
-          >
-            <ProjectTerminal projectId={id} />
+      <div data-page="terminal" className="absolute inset-0 flex bg-pane-bg">
+        {activeProjectId && (
+          <div className="flex-1 min-h-0 min-w-0 flex flex-col">
+            <ProjectTerminal projectId={activeProjectId} />
           </div>
-        ))}
+        )}
       </div>
 
-      {/* Git — a proper workspace mode, not an overlay */}
-      <div className={`absolute inset-0 flex flex-col ${overlay !== null || activeMode !== "git" ? "hidden" : ""}`}>
-        {projectOrder.map((id) => (
-          <div
-            key={id}
-            className="absolute inset-0 flex flex-col"
-            style={{ display: id === activeProjectId ? "flex" : "none" }}
-          >
-            <GitView projectId={id} />
-          </div>
-        ))}
+      <div data-page="git" className="absolute inset-0 flex flex-col bg-pane-bg">
+        {activeProjectId && <GitView projectId={activeProjectId} />}
       </div>
 
-      <LazyKeepAlive open={overlay === "mind"}>
+      <div data-page="mind" className="absolute inset-0 bg-pane-bg">
         <Mind />
-      </LazyKeepAlive>
+      </div>
 
-      <LazyKeepAlive open={overlay === "profile"}>
+      <div data-page="lens" className="absolute inset-0 bg-pane-bg">
+        {activeProjectId && <Lens projectId={activeProjectId} />}
+      </div>
+
+      <div data-page="profile" className="absolute inset-0 bg-pane-bg">
         <Profile />
-      </LazyKeepAlive>
+      </div>
 
       {activeProjectId && (
-        <div className={`absolute inset-0 bg-pane-bg z-10 ${overlay !== "history" ? "hidden" : ""}`}>
-          <ChangeHistoryPanel
-            projectId={activeProjectId}
-            onCollapse={() => useWorkspaceStore.getState().setOverlay(null)}
-          />
+        <div data-page="history" className="absolute inset-0 bg-pane-bg">
+          <ChangeHistoryPanel projectId={activeProjectId} />
         </div>
       )}
 
+      {/* Search page — FuzzyFinder inline, visible when mode="search" */}
+      <div data-page="search" className="absolute inset-0 bg-pane-bg">
+        {activeProjectId && <FuzzyFinder />}
+      </div>
+
+      {/* Filesearch page — FileSearch inline, visible when mode="filesearch" */}
+      <div data-page="filesearch" className="absolute inset-0 bg-pane-bg">
+        {activeProjectId && <FileSearch />}
+      </div>
+
+      {/* Menu — shown in workspace when sidebar is hidden (non-conversation modes).
+           bottom-1.5 left-1.5 matches the InputBar '+' attach button padding (p-1.5). */}
+      {mode !== "conversation" && (
+        <div className="absolute bottom-1.5 left-1.5 z-50 w-80 pointer-events-none">
+          <Menu
+            currentMode={mode}
+            isGitRepo={isGitRepo}
+            hasUnreadLens={hasUnreadLens}
+            onSelectMode={handleSelectMode}
+          />
+        </div>
+      )}
     </div>
   );
 }

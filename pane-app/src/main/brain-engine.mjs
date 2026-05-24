@@ -2,14 +2,16 @@
 // Isolated V8 — if the brain crashes, Pane and Claude keep working.
 // Same pattern as claude-worker.mjs and pty-worker.mjs.
 
-import __cjs_mod__ from "node:module";
-const require2 = __cjs_mod__.createRequire(import.meta.url);
-const Database = require2("better-sqlite3");
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const Database = require("better-sqlite3");
 
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { runMemoryLifecycle, touchMemory, reinforceMemory } from "./memory-lifecycle.mjs";
+import { isSignalNoise } from "./signal-filters.mjs";
 
 import {
   initSymbolTables,
@@ -19,15 +21,16 @@ import {
   findRelevantSymbols,
   getFileSymbols,
   writeSymbolExport,
-  updateSynthesis,
-  readSynthesis,
 } from "./symbol-index.mjs";
+// Local embedding model via @huggingface/transformers + onnxruntime-node.
+// onnxruntime-node is auto-detected by transformers.js when both are installed.
+import { pipeline } from "@huggingface/transformers";
 
 const BRAIN_DIR = path.join(os.homedir(), ".pane", "brain");
 const MEMORY_DIR = path.join(os.homedir(), ".pane", "memory");
 const PROFILE_DIR = path.join(os.homedir(), ".pane", "profile");
+const IDENTITY_CACHE_PATH = path.join(PROFILE_DIR, "compiled-identity.txt");
 const EXPORTS_DIR = path.join(BRAIN_DIR, "exports");
-const MODEL_CACHE = path.join(BRAIN_DIR, "models");
 
 const SESSION_DIR = path.join(os.homedir(), ".pane", "session");
 /** Read session state for working set access. Returns null on any failure. */
@@ -41,9 +44,18 @@ function _readSessionState(projectId) {
 
 // --- State ---
 let db = null;
-let embedder = null;
 let embedderLoading = false;
 let embedderReady = false;
+let _embedPipeline = null; // pipeline('feature-extraction') instance
+let _embedderLoadPromise = null; // Lazy init: shared promise so concurrent callers await the same load
+
+// Local embedding model: bge-base-en-v1.5 via ONNX Runtime
+// 768-dim, ~63 MTEB, ~30ms on Apple Silicon, ~80ms on Intel Mac.
+// Model auto-downloads from HuggingFace on first pipeline() call.
+const EMBEDDING_DIM = 768; // bge-base-en-v1.5 output dimension
+const EMBED_MODEL = "Xenova/bge-base-en-v1.5";
+const EMBED_CACHE_DIR = path.join(BRAIN_DIR, "models");
+
 
 // Tracks which projects have completed a full initial index this session.
 const indexedProjects = new Set();
@@ -109,6 +121,91 @@ function walkProjectFiles(rootDir, maxFiles = 200) {
       } else if (entry.isFile()) {
         if (shouldIndexFile(fullPath)) results.push(fullPath);
       }
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Codebase Compass — the structural and semantic guide for Pane.
+ * 
+ * Combines Layer 1 (symbols), Layer 2 (embeddings), and Layer 1.5 (file relationships)
+ * to return a "neighborhood" of code relevant to the user's intent.
+ */
+async function findCodebaseCompass(query, projectId, projectRoot, limit = 8) {
+  if (!db) return [];
+
+  // 1. Semantic Hits (Layer 2)
+  const semanticHits = await findRelevantFiles(query, projectId, 10);
+  
+  // 2. Structural Hits (Layer 1)
+  const symbolHits = findRelevantSymbols(db, projectId, query);
+  
+  // 3. Spatial Expansion (Layer 1.5)
+  // Find files that are direct neighbors of our semantic/structural hits
+  const coreFiles = new Set([
+    ...semanticHits.map(h => h.path),
+    ...symbolHits.map(s => s.file_path || s.file)
+  ]);
+
+  const neighborhood = new Map(); // path -> { score, reasons }
+  
+  // Initialize neighborhood with core hits
+  for (const h of semanticHits) {
+    neighborhood.set(h.path, { score: h.score * 0.8, reasons: ["semantic match"] });
+  }
+  for (const s of symbolHits) {
+    const p = s.file_path || s.file;
+    const existing = neighborhood.get(p) || { score: 0, reasons: [] };
+    existing.score += 0.4;
+    existing.reasons.push(`contains symbol "${s.name}"`);
+    neighborhood.set(p, existing);
+  }
+
+  // Expand to neighbors (1 level deep)
+  const allCore = Array.from(coreFiles);
+  for (const file of allCore) {
+    const rels = db.prepare(`
+      SELECT target_file, type FROM file_relationships 
+      WHERE project_id = ? AND source_file = ?
+      UNION
+      SELECT source_file, type FROM file_relationships
+      WHERE project_id = ? AND target_file = ?
+    `).all(projectId, file, projectId, file);
+
+    for (const rel of rels) {
+      const neighbor = rel.target_file || rel.source_file;
+      if (neighborhood.has(neighbor)) {
+        neighborhood.get(neighbor).score += 0.15;
+        neighborhood.get(neighbor).reasons.push(`connected to core hit "${file}"`);
+      } else {
+        neighborhood.set(neighbor, { 
+          score: 0.25, 
+          reasons: [`neighbor of core hit "${file}"`] 
+        });
+      }
+    }
+  }
+
+  // Final ranking
+  const results = Array.from(neighborhood.entries())
+    .map(([path, data]) => ({
+      path,
+      score: data.score,
+      reasons: Array.from(new Set(data.reasons)).slice(0, 3)
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  // Add descriptions from DB
+  for (const res of results) {
+    const node = db.prepare(`SELECT content FROM nodes WHERE entity_type = 'file' AND name = ? AND project_id = ?`).get(res.path, projectId);
+    if (node) {
+      try {
+        const content = JSON.parse(node.content);
+        res.description = content.text?.split(".")[0] || "";
+      } catch {}
     }
   }
 
@@ -395,7 +492,10 @@ function initDatabase() {
       version INTEGER DEFAULT 1,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now')),
-      access_count INTEGER DEFAULT 0
+      access_count INTEGER DEFAULT 0,
+      priority REAL DEFAULT 0.5,
+      sort_order INTEGER DEFAULT 0,
+      facet TEXT DEFAULT NULL
     );
 
     CREATE TABLE IF NOT EXISTS edges (
@@ -423,6 +523,7 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(entity_type);
     CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_id);
     CREATE INDEX IF NOT EXISTS idx_nodes_confidence ON nodes(confidence);
+    CREATE INDEX IF NOT EXISTS idx_nodes_facet ON nodes(facet);
     CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
     CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
     CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
@@ -438,19 +539,99 @@ function initDatabase() {
       content TEXT NOT NULL,
       completed INTEGER DEFAULT 0,
       embedding BLOB,
+      project_id TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_mind_created ON mind_entries(created_at);
+    CREATE INDEX IF NOT EXISTS idx_mind_project ON mind_entries(project_id);
   `);
 
-  // Migrations for existing mind_entries table
-  try {
-    db.exec("ALTER TABLE mind_entries ADD COLUMN completed INTEGER DEFAULT 0");
-  } catch (err) { /* ignore if exists */ }
-  try {
-    db.exec("ALTER TABLE mind_entries ADD COLUMN embedding BLOB");
-  } catch (err) { /* ignore if exists */ }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS mind_threads (
+      id TEXT PRIMARY KEY,
+      entry_id TEXT NOT NULL,
+      session_id TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_mind_threads_entry ON mind_threads(entry_id);
+    CREATE TABLE IF NOT EXISTS mind_turns (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content_json TEXT NOT NULL,
+      timestamp TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_mind_turns_thread ON mind_turns(thread_id);
+  `);
+
+  // Lens posts — chronological feed for user + worker observations
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lens_posts (
+      id TEXT PRIMARY KEY,
+      contributor TEXT NOT NULL,
+      content TEXT NOT NULL,
+      project_id TEXT,
+      entry_id TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_lens_project ON lens_posts(project_id);
+  `);
+
+  // Lens comments — threaded replies per post
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lens_comments (
+      id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      session_id TEXT,
+      timestamp TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_lens_comments_post ON lens_comments(post_id);
+  `);
+
+  // Review sessions — on-demand punk analysis sessions
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS review_sessions (
+      id           TEXT    PRIMARY KEY,
+      project_id   TEXT    NOT NULL,
+      status       TEXT    NOT NULL DEFAULT 'running',
+      diff_summary TEXT,
+      base_ref     TEXT,
+      punk_count   INTEGER NOT NULL DEFAULT 0,
+      finding_count INTEGER NOT NULL DEFAULT 0,
+      created_at   TEXT    NOT NULL,
+      completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_review_sessions_project
+      ON review_sessions(project_id, created_at);
+  `);
+
+  // Punk findings — structured results from each punk per review session
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS punk_findings (
+      id         TEXT    PRIMARY KEY,
+      session_id TEXT    NOT NULL,
+      project_id TEXT    NOT NULL,
+      punk       TEXT    NOT NULL,
+      severity   TEXT    NOT NULL,
+      finding    TEXT    NOT NULL,
+      structured TEXT    NOT NULL,
+      location   TEXT,
+      dismissed  INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_findings_session ON punk_findings(session_id);
+    CREATE INDEX IF NOT EXISTS idx_findings_project ON punk_findings(project_id, created_at);
+  `);
+
+  // Safe migration: add dismissed column if missing (v1.2)
+  // ALTER TABLE ADD COLUMN fails with SQLITE_ERROR on fresh DBs where the column
+  // already exists as part of CREATE TABLE. That's expected — no migration needed.
+  try { db.exec(`ALTER TABLE punk_findings ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0`); } catch {}
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_findings_undismissed ON punk_findings(project_id, dismissed, created_at)`); } catch {}
 
   // Prepare statements for hot paths
   db._stmts = {
@@ -480,7 +661,7 @@ function initDatabase() {
     `),
     getNodesByProject: db.prepare(`SELECT * FROM nodes WHERE project_id = ?`),
     getNodesByType: db.prepare(`SELECT * FROM nodes WHERE entity_type = ? AND project_id = ?`),
-    getAllProjectNodes: db.prepare(`SELECT * FROM nodes WHERE project_id = ? AND embedding IS NOT NULL`),
+    getAllProjectNodes: db.prepare(`SELECT * FROM nodes WHERE project_id = ?`),
     getEdgesFor: db.prepare(`
       SELECT e.*, n1.name as source_name, n2.name as target_name
       FROM edges e
@@ -517,62 +698,204 @@ function initDatabase() {
       WHERE project_id = ? AND confidence > 0.2
       AND updated_at < datetime('now', ?)
     `),
+    pruneLowConfidence: db.prepare(`
+      DELETE FROM nodes WHERE project_id = ? AND confidence < ? AND entity_type NOT IN ('project', 'file')
+    `),
+    pruneOldVersions: db.prepare(`
+      DELETE FROM node_versions WHERE node_id NOT IN (SELECT id FROM nodes)
+    `),
+    countNodesByProject: db.prepare(`SELECT COUNT(*) AS cnt FROM nodes WHERE project_id = ?`),
   };
 }
 
-// --- Embedder (lazy-loaded, single-threaded WASM to avoid em-pthread leak) ---
+// --- Embedder (Local ONNX via @huggingface/transformers) ---
+//
+// Uses bge-base-en-v1.5 via @huggingface/transformers + onnxruntime-node.
+// First call downloads the model (~40MB) from HuggingFace to ~/.pane/brain/models/.
+// Subsequent calls load from disk in ~50ms. Inference: ~30ms on Apple Silicon, ~80ms on Intel.
+// No API keys, no network, no rate limits.
 
 async function loadEmbedder() {
   if (embedderReady || embedderLoading) return;
   embedderLoading = true;
 
   try {
-    // Dynamic import — @huggingface/transformers is pure ESM
-    const { pipeline, env } = await import("@huggingface/transformers");
+    // Ensure model cache directory exists
+    fs.mkdirSync(EMBED_CACHE_DIR, { recursive: true });
 
-    env.cacheDir = MODEL_CACHE;
+    console.log(`[brain] Loading embedding model (${EMBED_MODEL})...`);
 
-    // CRITICAL: prevent em-pthread thread accumulation.
-    //
-    // The default WASM backend (ort-wasm-simd-threaded) spawns Emscripten pthread
-    // workers via node:worker_threads. These workers accumulate across embed()
-    // calls and are never reaped. After ~minutes of use, the process hits macOS's
-    // 4095-thread limit and SIGABRTs, crashing the entire Electron app.
-    //
-    // proxy=false  → no proxy Worker spawned (the primary source of leaking threads)
-    // numThreads=1 → ONNX selects the non-threaded WASM binary (ort-wasm-simd.wasm)
-    //                instead of ort-wasm-simd-threaded.jsep.mjs, so zero em-pthread
-    //                workers are created regardless of how many embed() calls are made.
-    //
-    // NOTE: onnxruntime-node (native C++) was tried but fails in Electron UtilityProcess
-    // ("Unsupported device: cpu. Should be one of: .") — native EP not registered there.
-    env.backends.onnx.wasm.proxy = false;
-    env.backends.onnx.wasm.numThreads = 1;
-
-    embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
-      quantized: true,
-      revision: "main",
+    // Create feature-extraction pipeline.
+    // First call downloads model files from HuggingFace (~40MB).
+    // Subsequent calls load from EMIT_CACHE_DIR.
+    // onnxruntime-node is auto-detected and used for native inference.
+    _embedPipeline = await pipeline("feature-extraction", EMBED_MODEL, {
+      quantized: false, // Full precision for best quality
+      cache_dir: EMBED_CACHE_DIR,
     });
 
+    // Verify with a test embed (direct pipeline call, not embed(), to avoid circular lazy-init)
+    const testResult = await _embedPipeline("test", {
+      pooling: "mean",
+      normalize: true,
+    });
+    const testArr = new Float32Array(testResult.data);
+    if (!testArr || testArr.length !== EMBEDDING_DIM) {
+      throw new Error(`Expected ${EMBEDDING_DIM}-dim embedding, got ${testArr?.length ?? 0}`);
+    }
+
+    console.log(`[brain] Local embedding model ready (${EMBED_MODEL}, ${EMBEDDING_DIM} dim)`);
     embedderReady = true;
     sendToMain({ type: "embedder_ready" });
-    console.log("[brain] Embedding model loaded");
-    // Index profile atoms now that embedder is ready
-    indexProfileAtoms().catch(err => console.error("[brain] Profile atom indexing failed:", err.message));
+
+    // Index atoms + migrate old embeddings + fill null embeddings in background
+    Promise.all([
+      migrateEmbeddings().catch(err => console.error("[brain] Embedding migration failed:", err.message)),
+      fillNullEmbeddings().catch(err => console.error("[brain] Null embedding fill failed:", err.message)),
+    ]);
   } catch (err) {
-    console.error("[brain] Failed to load embedding model:", err.message);
-    // Brain still works without embeddings — just no semantic search
+    console.error("[brain] Local embedding model failed to load:", err.message);
+    console.warn("[brain] Brain still works — semantic search will use keyword fallback");
     embedderLoading = false;
+    _embedderLoadPromise = null; // Allow retry on next embed() call
   }
 }
 
+// --- WASM heap hygiene ---
+let _embedCallCount = 0;
+const EMBED_RECYCLE_INTERVAL = 500; // Recreate pipeline every N calls to reset WASM heap
+const BATCH_SIZE = 32; // Texts per batch embed call
+
+/**
+ * Embed a single text string using the local ONNX model.
+ * Returns a Float32Array of EMBEDDING_DIM dimensions, or null on failure.
+ * Uses mean pooling + L2 normalization for cosine-similarity-ready vectors.
+ */
 async function embed(text) {
-  if (!embedderReady || !embedder) return null;
+  // Lazy init: load embedder on first call instead of at startup
+  if (!embedderReady || !_embedPipeline) {
+    if (!_embedderLoadPromise) {
+      _embedderLoadPromise = loadEmbedder().catch(err => {
+        console.error(`[brain] Lazy embedder load failed: ${err.message}`);
+        _embedderLoadPromise = null; // Reset so next call retries
+      });
+    }
+    await _embedderLoadPromise;
+    if (!embedderReady || !_embedPipeline) return null;
+  }
   try {
-    const result = await embedder(text, { pooling: "mean", normalize: true });
+    _embedCallCount++;
+    if (_embedCallCount >= EMBED_RECYCLE_INTERVAL) {
+      _embedCallCount = 0;
+      await _recyclePipeline();
+    }
+    const result = await _embedPipeline(text, {
+      pooling: "mean",
+      normalize: true,
+    });
+    // result is a Tensor with shape [1, EMBEDDING_DIM]
+    // Access the underlying Float32Array data
     return new Float32Array(result.data);
-  } catch {
+  } catch (err) {
+    console.warn(`[brain] Embedding failed: ${err.message}`);
     return null;
+  }
+}
+
+/**
+ * Batch-embed many texts. Same model & params as embed(), but:
+ *  - Processes texts in batches of BATCH_SIZE for WASM efficiency
+ *  - Recycles the pipeline every EMBED_RECYCLE_INTERVAL calls to prevent heap growth
+ *  - Returns a Map<string, Float32Array | null> keyed by text
+ */
+async function embedBatch(texts) {
+  // Lazy init: load embedder on first call instead of at startup
+  if (!embedderReady || !_embedPipeline) {
+    if (!_embedderLoadPromise) {
+      _embedderLoadPromise = loadEmbedder().catch(err => {
+        console.error(`[brain] Lazy embedder load failed: ${err.message}`);
+        _embedderLoadPromise = null;
+      });
+    }
+    await _embedderLoadPromise;
+    if (!embedderReady || !_embedPipeline || !texts.length) return new Map();
+  }
+  const results = new Map();
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const batch = texts.slice(i, i + BATCH_SIZE);
+    _embedCallCount += batch.length;
+    if (_embedCallCount >= EMBED_RECYCLE_INTERVAL) {
+      _embedCallCount = 0;
+      await _recyclePipeline();
+    }
+    try {
+      // Pipeline accepts an array for batched inference — returns Tensor with shape [N, DIM]
+      const result = await _embedPipeline(batch, {
+        pooling: "mean",
+        normalize: true,
+      });
+      // result.data is a flat Float32Array of shape [batch.length, EMBEDDING_DIM]
+      const flat = result.data;
+      for (let j = 0; j < batch.length; j++) {
+        const offset = j * EMBEDDING_DIM;
+        if (offset + EMBEDDING_DIM <= flat.length) {
+          results.set(batch[j], new Float32Array(flat.slice(offset, offset + EMBEDDING_DIM)));
+        } else {
+          results.set(batch[j], null);
+        }
+      }
+    } catch (err) {
+      console.warn(`[brain] Batch embed failed (${batch.length} texts): ${err.message}`);
+      for (const t of batch) results.set(t, null);
+    }
+  }
+  return results;
+}
+
+/**
+ * Recreate the ONNX pipeline to release WASM heap memory.
+ * onnxruntime-node's WASM allocator (emmalloc) never returns memory to the OS,
+ * so intermediate tensor allocations accumulate and cannot be freed.
+ * Recreating the pipeline resets the WASM heap to a clean state.
+ */
+async function _recyclePipeline() {
+  if (!_embedPipeline) return;
+  try {
+    // Dispose old pipeline
+    if (typeof _embedPipeline.dispose === "function") {
+      await _embedPipeline.dispose();
+    }
+    // Remove references to allow GC
+    _embedPipeline = null;
+    // Recreate
+    _embedPipeline = await pipeline("feature-extraction", EMBED_MODEL, {
+      quantized: false,
+      cache_dir: EMBED_CACHE_DIR,
+    });
+  } catch (err) {
+    console.warn(`[brain] Pipeline recycle failed: ${err.message}`);
+    // If recycle fails, mark embedder as not ready — next call will recreate
+    embedderReady = false;
+    embedderLoading = false; // Clear loading flag so lazy-init retries immediately
+    _embedPipeline = null;
+    _embedderLoadPromise = null; // Reset so embed() triggers a fresh lazy load
+    // Try to reload after a delay
+    setTimeout(() => {
+      if (!embedderReady && !embedderLoading) {
+        embedderLoading = false;
+        loadEmbedder().catch(e => console.error("[brain] Recovery load failed:", e.message));
+      }
+    }, 5000);
+  }
+}
+
+/** Force SQLite WAL checkpoint to release accumulated WAL pages. Call after batch DB writes. */
+function _walCheckpoint() {
+  if (!db) return;
+  try {
+    const info = db.pragma("wal_checkpoint(TRUNCATE)");
+  } catch {
+    // Non-critical — best-effort
   }
 }
 
@@ -581,6 +904,136 @@ function cosineSimilarity(a, b) {
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
   return dot; // Vectors are already normalized, so dot product = cosine similarity
+}
+
+/**
+ * Migrate old-dimension embeddings to current EMBEDDING_DIM.
+ * Handles 384-dim (all-MiniLM-L6-v2, 1536 bytes) and 1024-dim (Jina v3, 4096 bytes).
+ * Also handles any other non-matching dimension as a catch-all.
+ * Runs once on startup after embedder is ready.
+ */
+async function migrateEmbeddings() {
+  if (!db || !embedderReady) return;
+
+  const currentBytes = EMBEDDING_DIM * 4; // 3072 bytes for 768-dim
+
+  const oldNodes = db.prepare(`
+    SELECT id, content, name FROM nodes
+    WHERE embedding IS NOT NULL AND LENGTH(embedding) != ?
+    ORDER BY updated_at DESC
+  `).all(currentBytes);
+
+  if (oldNodes.length === 0) {
+    console.log("[brain] All embeddings match current dimension");
+    return;
+  }
+
+  console.log(`[brain] Migrating ${oldNodes.length} embeddings to ${EMBEDDING_DIM} dim (${currentBytes} bytes)...`);
+
+  // Batch-embed all texts at once to minimize WASM allocator pressure
+  const texts = oldNodes.map(node => {
+    try {
+      const content = JSON.parse(node.content || "{}");
+      return content.text || node.name;
+    } catch {
+      return node.name;
+    }
+  });
+
+  const embeddings = await embedBatch(texts);
+
+  let migrated = 0;
+  let failed = 0;
+
+  for (let i = 0; i < oldNodes.length; i++) {
+    const embedding = embeddings.get(texts[i]);
+    if (embedding) {
+      const embeddingBuffer = Buffer.from(embedding.buffer);
+      try {
+        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, oldNodes[i].id);
+        migrated++;
+      } catch (err) {
+        console.warn(`[brain] Migration DB update failed for ${oldNodes[i].id}: ${err.message}`);
+        failed++;
+      }
+    } else {
+      failed++;
+    }
+  }
+
+  console.log(`[brain] Migration complete: ${migrated} re-embedded, ${failed} failed`);
+
+  // Force WAL checkpoint after batch writes — prevents WAL bloat on large migrations
+  _walCheckpoint();
+
+  if (migrated > 0) {
+    // Update project exports that had migrated nodes
+    const projects = db.prepare(`SELECT DISTINCT project_id FROM nodes WHERE project_id IS NOT NULL`).all();
+    for (const p of projects) {
+      if (p.project_id) writeSearchExport(p.project_id);
+    }
+  }
+}
+
+/**
+ * Retroactively create embeddings for nodes indexed before the embedder was ready.
+ * These nodes have NULL embeddings and are invisible to semantic search. After the
+ * embedder loads, this function finds all such nodes and generates embeddings for them.
+ * IDEMPOTENT: skips nodes that already have embeddings.
+ */
+async function fillNullEmbeddings() {
+  if (!db || !embedderReady) return;
+
+  const nullNodes = db.prepare(`
+    SELECT id, content, name FROM nodes
+    WHERE embedding IS NULL
+      AND entity_type NOT IN ('project', 'version')
+    ORDER BY updated_at DESC
+    LIMIT 500
+  `).all();
+
+  if (nullNodes.length === 0) {
+    console.log("[brain] No null-embedding nodes to fill");
+    return;
+  }
+
+  console.log(`[brain] Filling ${nullNodes.length} null-embedding nodes...`);
+
+  // Batch-embed all texts at once to minimize WASM allocator pressure
+  const texts = nullNodes.map(node => {
+    try {
+      const content = JSON.parse(node.content || "{}");
+      return (content.text || node.name).slice(0, 500);
+    } catch {
+      return node.name.slice(0, 500);
+    }
+  });
+
+  const embeddings = await embedBatch(texts);
+
+  let filled = 0;
+  let failed = 0;
+
+  for (let i = 0; i < nullNodes.length; i++) {
+    const embedding = embeddings.get(texts[i]);
+    if (embedding) {
+      const embeddingBuffer = Buffer.from(embedding.buffer);
+      try {
+        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, nullNodes[i].id);
+        filled++;
+      } catch (err) {
+        console.warn(`[brain] Null-fill DB update failed for ${nullNodes[i].id}: ${err.message}`);
+        failed++;
+      }
+    } else {
+      failed++;
+    }
+  }
+
+  console.log(`[brain] Null-embedding fill complete: ${filled} embedded, ${failed} failed`);
+
+  // Force WAL checkpoint after batch writes
+  _walCheckpoint();
 }
 
 function nodeId(type, content) {
@@ -649,15 +1102,18 @@ async function indexEvents(projectId, events) {
         if (isDuplicate) continue;
 
         // New node with embedding
+        const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
         const embeddingBuffer = Buffer.from(embedding.buffer);
-        db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), embeddingBuffer, 0.5);
+        db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), embeddingBuffer, seedConfidence);
       } else {
         // Embedding failed — insert without
-        db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, 0.5);
+        const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+        db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, seedConfidence);
       }
     } else {
       // Embedder not ready — insert without embedding
-      db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, 0.5);
+      const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+      db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, seedConfidence);
     }
 
     // Create applies-to edge to project
@@ -669,6 +1125,16 @@ async function indexEvents(projectId, events) {
       const errorId = nodeId("error", event.metadata.original_error);
       const fixEdgeId = `${errorId}-resolved-by-${id}`;
       db._stmts.insertEdge.run(fixEdgeId, errorId, id, "resolved-by", 1.0, "{}");
+    }
+
+    // Fix→decision causal edges ("this fix led to this architectural decision")
+    if (event.type === "decision" && event.metadata?.preceded_by_fix) {
+      const fixId = nodeId("error_fix", event.metadata.preceded_by_fix);
+      const fixNode = db._stmts.getNode.get(fixId);
+      if (fixNode) {
+        const causalEdgeId = `${fixId}-led-to-${id}`;
+        db._stmts.insertEdge.run(causalEdgeId, fixId, id, "led-to", 1.0, "{}");
+      }
     }
 
     indexed++;
@@ -698,14 +1164,39 @@ function sessionPinsPath(projectId) {
 function updateSessionPins(projectId) {
   if (!db) return;
   try {
-    const rows = db.prepare(`
+    // Pass 1: top decisions and lessons (confidence >= 0.65, up to 6)
+    // Recency bias: updated_at DESC breaks ties so old nodes fall out via LIMIT.
+    const decisionRows = db.prepare(`
       SELECT id, name, entity_type, content, confidence, access_count
       FROM nodes
-      WHERE project_id = ? AND entity_type IN ('decision', 'lesson', 'error_fix')
-        AND confidence >= 0.78
-      ORDER BY confidence DESC, access_count DESC
-      LIMIT 12
+      WHERE project_id = ? AND entity_type IN ('decision', 'lesson')
+        AND confidence >= 0.65
+      ORDER BY confidence DESC, updated_at DESC, access_count DESC
+      LIMIT 6
     `).all(projectId);
+
+    // Pass 2: fill remaining slots with high-confidence error fixes (confidence >= 0.78)
+    const remaining = 12 - decisionRows.length;
+    const fixRows = remaining > 0
+      ? db.prepare(`
+          SELECT id, name, entity_type, content, confidence, access_count
+          FROM nodes
+          WHERE project_id = ? AND entity_type = 'error_fix'
+            AND confidence >= 0.78
+          ORDER BY confidence DESC, updated_at DESC, access_count DESC
+          LIMIT ?
+        `).all(projectId, remaining)
+      : [];
+
+    // Combine and deduplicate by id
+    const seenIds = new Set();
+    const rows = [];
+    for (const r of [...decisionRows, ...fixRows]) {
+      if (!seenIds.has(r.id)) {
+        seenIds.add(r.id);
+        rows.push(r);
+      }
+    }
 
     if (rows.length === 0) return;
 
@@ -785,33 +1276,35 @@ async function search(query, projectId, limit = 10) {
   if (embedderReady) {
     const queryEmbedding = await embed(query);
     if (queryEmbedding) {
+      const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
       for (const node of nodes) {
+        const content = JSON.parse(node.content || "{}").text || node.name;
+        const contentLower = content.toLowerCase();
+        const keywordScore = queryWords.length > 0
+          ? queryWords.filter(w => contentLower.includes(w)).length / queryWords.length
+          : 0;
+
+        let score;
         if (node.embedding) {
           const nodeEmbedding = new Float32Array(node.embedding.buffer, node.embedding.byteOffset, node.embedding.byteLength / 4);
           const similarity = cosineSimilarity(queryEmbedding, nodeEmbedding);
-
-          // Also compute keyword score
-          const content = JSON.parse(node.content || "{}").text || node.name;
-          const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-          const contentLower = content.toLowerCase();
-          const keywordScore = queryWords.length > 0
-            ? queryWords.filter(w => contentLower.includes(w)).length / queryWords.length
-            : 0;
-
           // Hybrid score: 60% semantic + 40% keyword
-          const score = 0.6 * similarity + 0.4 * keywordScore;
+          score = 0.6 * similarity + 0.4 * keywordScore;
+        } else {
+          // No embedding (backfilled before embedder was ready): keyword-only
+          score = keywordScore * 0.8; // Discount slightly compared to hybrid
+        }
 
-          if (score > 0.25) {
-            results.push({
-              id: node.id,
-              name: node.name,
-              type: node.entity_type,
-              content: content.slice(0, 300),
-              confidence: node.confidence,
-              score,
-              age: node.created_at,
-            });
-          }
+        if (score > 0.25) {
+          results.push({
+            id: node.id,
+            name: node.name,
+            type: node.entity_type,
+            content: content.slice(0, 300),
+            confidence: node.confidence,
+            score,
+            age: node.created_at,
+          });
         }
       }
     }
@@ -997,28 +1490,61 @@ function decayStaleNodes(projectId) {
   return decayed;
 }
 
+// --- Explicit Pruning: remove low-confidence and orphaned nodes ---
+
+function pruneOldNodes(projectId) {
+  if (!db) return { pruned: 0, deletedEdges: 0 };
+
+  let pruned = 0;
+
+  // Remove nodes below 0.15 confidence (noise, contradictions, abandoned paths)
+  const result = db._stmts.pruneLowConfidence.run(projectId, 0.15);
+  pruned += result.changes;
+
+  // Remove orphan edge records (edges whose source or target no longer exists)
+  const orphanEdges = db.prepare(`
+    DELETE FROM edges WHERE id NOT IN (
+      SELECT e.id FROM edges e
+      JOIN nodes n1 ON e.source_id = n1.id
+      JOIN nodes n2 ON e.target_id = n2.id
+    )
+  `).run();
+
+  // Prune orphaned version history
+  db._stmts.pruneOldVersions.run();
+
+  console.log(`[brain] Pruned ${pruned} low-confidence nodes, ${orphanEdges.changes} orphan edges for ${projectId}`);
+  return { pruned, deletedEdges: orphanEdges.changes };
+}
+
 // --- Contextual Search (for proactive injection) ---
 
-async function contextualSearch(query, fileContext, projectId, intent, projectRoot) {
-  if (!db) return { memories: [], tensions: [], profileAtoms: [], relevantFiles: [] };
+async function contextualSearch(query, fileContext, projectId, intent, projectRoot, taskType = null, atomHints = [], projectWhy = "") {
+  if (!db) return { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [], principles: [] };
 
-  // Embed the query once — used for both project search and profile atom search
-  const queryEmbedding = embedderReady ? await embed(query) : null;
+  // Embed a why-augmented query — biases retrieval toward the project's purpose.
+  // The "why" is typically 2-4 sentences. Prepending it shifts the embedding vector
+  // so that memories/files relevant to the project's core purpose rank higher.
+  const embeddingQuery = projectWhy ? `${projectWhy}\n\n${query}` : query;
+  const queryEmbedding = embedderReady ? await embed(embeddingQuery) : null;
 
-  // Profile atoms: always retrieve regardless of intent or directive nature.
-  // These are about HOW to work, not WHAT to do — relevant to every request.
-  const profileAtoms = queryEmbedding ? searchProfileAtoms(queryEmbedding, 4) : [];
+  // Atom pool has been removed — atoms/profileAtoms are always empty.
+  // Profile context is injected directly via pane-system-prompt.mjs from identity files.
+  const atoms = [];
+  const profileAtoms = [];
 
-  // Short imperative prompts don't need project brain context — user is directing
-  const trimmed = query.trim();
-  const isDirective = trimmed.length < 65 && /^(add|remove|fix|update|change|delete|create|make|move|rename|refactor|run|install|build|deploy|write|edit|show|get|find|check|use|switch|enable|disable|set|reset|clear|open|close)/i.test(trimmed);
   // Relevant files: always retrieve if we have indexed files for this project
   const relevantFiles = projectRoot ? await findRelevantFiles(query, projectId, 5) : [];
 
-  if (isDirective) return { memories: [], tensions: [], profileAtoms, relevantFiles };
+  // Short imperative prompts skip project memory (lessons/decisions/tensions).
+  // Atom pool has been removed — atoms/profileAtoms are always empty.
+  const trimmed = query.trim();
+  const isDirective = trimmed.length < 65 && /^(add|remove|fix|update|change|delete|create|make|move|rename|refactor|run|install|build|deploy|write|edit|show|get|find|check|use|switch|enable|disable|set|reset|clear|open|close)/i.test(trimmed);
 
-  // Combine query + active file path for richer semantic search
-  const searchText = fileContext ? `${query} ${fileContext}` : query;
+  if (isDirective) return { memories: [], tensions: [], atoms, profileAtoms, relevantFiles, principles: [] };
+
+  // Combine query + active file + project why for richer semantic + keyword search
+  const searchText = [projectWhy, fileContext, query].filter(Boolean).join(" ");
   const candidates = await search(searchText, projectId, 8);
 
   // Intent-aware type and confidence filters
@@ -1102,7 +1628,51 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
     console.error("[brain] Mind entry query failed:", err.message);
   }
 
-  return { memories: valuable, tensions, profileAtoms, relevantFiles, mindEntries };
+  // ── Principles: standing project standards, surfaced separately ──────────
+  // Principles are intentionally excluded from `allowedTypes` above so they
+  // don't compete with general memories. They get their own retrieval path
+  // and their own section in the system prompt.
+  let principles = [];
+  try {
+    const principleNodes = db._stmts.getNodesByType.all("principle", projectId);
+    if (principleNodes.length > 0 && queryEmbedding) {
+      const scored = [];
+      for (const n of principleNodes) {
+        const content = JSON.parse(n.content || "{}").text || n.name;
+        if (isSignalNoise(content)) continue;
+        if (n.embedding) {
+          const nEmb = new Float32Array(n.embedding.buffer, n.embedding.byteOffset, n.embedding.byteLength / 4);
+          const sim = cosineSimilarity(queryEmbedding, nEmb);
+          // Lower threshold than general memories — principles are standing criteria
+          if (sim > 0.30 || (n.confidence || 0) >= 0.80) {
+            scored.push({ content, score: sim, confidence: n.confidence || 0 });
+          }
+        } else {
+          // No embedding — include high-confidence principles unconditionally
+          if ((n.confidence || 0) >= 0.80) {
+            scored.push({ content, score: 0.5, confidence: n.confidence || 0 });
+          }
+        }
+      }
+      scored.sort((a, b) => b.score - a.score);
+      principles = scored.slice(0, 6);
+    } else if (principleNodes.length > 0) {
+      // No embedder — include all high-confidence principles
+      principles = principleNodes
+        .filter(n => (n.confidence || 0) >= 0.80)
+        .slice(0, 6)
+        .map(n => ({
+          content: JSON.parse(n.content || "{}").text || n.name,
+          score: 0.5,
+          confidence: n.confidence || 0,
+        }))
+        .filter(p => !isSignalNoise(p.content));
+    }
+  } catch (err) {
+    console.error("[brain] Principle query failed:", err.message);
+  }
+
+  return { memories: valuable, tensions, atoms, profileAtoms, relevantFiles, mindEntries, principles };
 }
 
 // --- Search Export (for MCP server) ---
@@ -1110,40 +1680,32 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
 function writeSearchExport(projectId) {
   if (!db) return;
   try {
-    const nodes = db._stmts.getAllProjectNodes.all(projectId);
-    const mindEntries = db.prepare(`SELECT * FROM mind_entries`).all();
+    // Only export meaningful knowledge types — not transient noise like commands
+    const nodes = db.prepare(`
+      SELECT id, name, entity_type, content, confidence
+      FROM nodes
+      WHERE project_id = ?
+        AND entity_type IN ('decision','lesson','pattern','error','error_fix','file','project')
+    `).all(projectId);
+    const mindEntries = db.prepare(`SELECT id, content, completed FROM mind_entries`).all();
 
     const exported = nodes.map(n => {
       const content = JSON.parse(n.content || "{}").text || n.name;
-      let embeddingArray = null;
-      if (n.embedding) {
-        const floats = new Float32Array(n.embedding.buffer, n.embedding.byteOffset, n.embedding.byteLength / 4);
-        embeddingArray = Array.from(floats);
-      }
       return {
         id: n.id,
-        name: n.name,
         type: n.entity_type,
         content: content.slice(0, 500),
         confidence: n.confidence,
-        embedding: embeddingArray,
       };
     });
 
-    // Add global mind entries to the project export
+    // Add global mind entries (no embeddings — they're searched via keyword)
     for (const m of mindEntries) {
-      let embeddingArray = null;
-      if (m.embedding) {
-        const floats = new Float32Array(m.embedding.buffer, m.embedding.byteOffset, m.embedding.byteLength / 4);
-        embeddingArray = Array.from(floats);
-      }
       exported.push({
         id: m.id,
-        name: "Mind Thought",
         type: "mind",
         content: m.content,
-        confidence: 0.9, // Human-authored mind entries are high-confidence
-        embedding: embeddingArray,
+        confidence: 0.9,
         completed: !!m.completed,
       });
     }
@@ -1157,8 +1719,8 @@ function writeSearchExport(projectId) {
 
 // --- Contextual Export (for claude-worker brief injection) ---
 
-async function writeContextualExport(projectId, query, fileContext, intent, projectRoot) {
-  const result = await contextualSearch(query || "", fileContext || "", projectId, intent || "other", projectRoot || null);
+async function writeContextualExport(projectId, query, fileContext, intent, projectRoot, taskType = null, atomHints = [], projectWhy = "") {
+  const result = await contextualSearch(query || "", fileContext || "", projectId, intent || "other", projectRoot || null, taskType, atomHints, projectWhy);
 
   // Layer 1: Symbol map — resolve symbols mentioned in the query + working set exports.
   // The model sees key symbols pre-resolved so it doesn't grep for them.
@@ -1194,15 +1756,34 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
     }
   }
 
-  // Layer 3: Synthesis — cached project DNA narrative
+
+  // ── Authoritative decisions: high-confidence, outcome-proven constraints ──
+  // These are decisions the brain has accumulated enough evidence for (confidence >= 0.80)
+  // to treat as binding constraints. The orchestrator places them at CRITICAL priority
+  // with frozen tier so the model sees them every turn and cannot contradict them.
   if (db) {
     try {
-      result.synthesis = readSynthesis(db, projectId) || null;
+      const authNodes = db.prepare(`
+        SELECT id, name, content, confidence, created_at
+        FROM nodes
+        WHERE project_id = ? AND entity_type = 'decision' AND confidence >= 0.80
+        ORDER BY confidence DESC, access_count DESC
+        LIMIT 10
+      `).all(projectId);
+      result.authoritativeDecisions = authNodes.map(n => {
+        const parsed = JSON.parse(n.content || '{}');
+        return {
+          id: n.id,
+          content: parsed.text || n.name,
+          confidence: n.confidence,
+          age: n.created_at,
+        };
+      });
     } catch {
-      result.synthesis = null;
+      result.authoritativeDecisions = [];
     }
   } else {
-    result.synthesis = null;
+    result.authoritativeDecisions = [];
   }
 
   // Full codebase map — every indexed file with a one-line description.
@@ -1227,6 +1808,17 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
     }
   } else {
     result.codebaseMap = [];
+  }
+
+  // Touch all memories that made it into the context — prevents decay,
+  // records that these memories are actively used. Over time, frequently
+  // accessed memories get reinforced while unused ones fade.
+  if (db && result.memories?.length > 0) {
+    for (const mem of result.memories) {
+      if (mem.id) {
+        try { touchMemory(db, mem.id); } catch {}
+      }
+    }
   }
 
   try {
@@ -1271,110 +1863,7 @@ function getIntelligenceStats(projectId) {
   };
 }
 
-// --- Profile Atomization: index identity/philosophy/rules/anti-patterns as retrievable nodes ---
 
-const PROFILE_ATOM_TYPE = "profile_atom";
-
-/**
- * Parse all profile files into individual atomic nodes and embed them.
- * Each principle, rule, anti-pattern becomes its own searchable node.
- * Deletes old atoms first — profile changes are infrequent, rebuild is safe.
- */
-async function indexProfileAtoms() {
-  if (!db || !embedderReady) return;
-
-  try {
-    db.prepare(`DELETE FROM nodes WHERE entity_type = ?`).run(PROFILE_ATOM_TYPE);
-
-    const identity = readProfileJson("identity.json");
-    const philosophy = readProfileMd("philosophy.md");
-    const rules = readProfileMd("rules.md");
-    const antiPatterns = readProfileJson("anti-patterns.json");
-
-    const atoms = [];
-
-    // Identity bio as an atom — gives context on who this person is
-    if (identity?.bio && identity.bio.length > 10) {
-      atoms.push({ text: identity.bio, facet: "identity" });
-    }
-
-    // Philosophy: each double-newline-separated paragraph = one principle atom
-    if (philosophy) {
-      const paragraphs = philosophy.split(/\n\n+/).filter(p => p.trim().length > 20);
-      for (const p of paragraphs) {
-        atoms.push({ text: p.trim(), facet: "philosophy" });
-      }
-    }
-
-    // Rules: each non-empty line = one rule atom
-    if (rules) {
-      const lines = rules.split(/\n/).filter(l => l.trim().length > 10);
-      for (const l of lines) {
-        const text = l.trim().replace(/^[-*•]\s*/, "");
-        if (text.length > 10) atoms.push({ text, facet: "rule" });
-      }
-    }
-
-    // Anti-patterns: error + fix combined into one atom for semantic coherence
-    if (antiPatterns?.patterns) {
-      for (const ap of antiPatterns.patterns) {
-        if (ap.error && ap.fix) {
-          atoms.push({ text: `Avoid: ${ap.error} — Instead: ${ap.fix}`, facet: "anti_pattern" });
-        }
-      }
-    }
-
-    let indexed = 0;
-    for (const atom of atoms) {
-      if (atom.text.length < 10) continue;
-      const id = nodeId(PROFILE_ATOM_TYPE, atom.text);
-      const embedding = await embed(atom.text);
-      const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
-      db._stmts.insertNode.run(
-        id, atom.text.slice(0, 80), PROFILE_ATOM_TYPE, null,
-        JSON.stringify({ text: atom.text, facet: atom.facet }),
-        embeddingBuffer, 1.0
-      );
-      indexed++;
-    }
-
-    console.log(`[brain] Indexed ${indexed} profile atoms`);
-  } catch (err) {
-    console.error("[brain] indexProfileAtoms error:", err.message);
-  }
-}
-
-/**
- * Semantic search over profile atoms only.
- * Returns atoms sorted by cosine similarity to the query embedding.
- */
-function searchProfileAtoms(queryEmbedding, limit = 5) {
-  if (!db || !queryEmbedding) return [];
-
-  const atoms = db.prepare(
-    `SELECT * FROM nodes WHERE entity_type = ? AND embedding IS NOT NULL`
-  ).all(PROFILE_ATOM_TYPE);
-
-  const results = [];
-  for (const atom of atoms) {
-    const atomEmbedding = new Float32Array(
-      atom.embedding.buffer, atom.embedding.byteOffset, atom.embedding.byteLength / 4
-    );
-    const similarity = cosineSimilarity(queryEmbedding, atomEmbedding);
-    if (similarity > 0.28) {
-      const content = JSON.parse(atom.content || "{}");
-      results.push({
-        id: atom.id,
-        facet: content.facet || "unknown",
-        content: content.text || atom.name,
-        score: similarity,
-      });
-    }
-  }
-
-  results.sort((a, b) => b.score - a.score);
-  return results.slice(0, limit);
-}
 
 // --- Profile System: learned + explicit preferences ---
 
@@ -1448,43 +1937,139 @@ function extractPreferences() {
     const content = JSON.parse(node.content || "{}").text || node.name;
     const lower = content.toLowerCase();
 
-    // Tool preferences: library, framework, package mentions
-    const toolPatterns = /(?:use|using|prefer|chose|switched to|installed)\s+([\w@/-]+)/i;
-    const toolMatch = content.match(toolPatterns);
-    if (toolMatch) {
-      const tool = toolMatch[1];
-      if (!newTools[tool]) {
-        newTools[tool] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 150) };
-      }
-    }
-
-    // Coding style: naming, structure, patterns
-    if (lower.includes("naming") || lower.includes("convention") || lower.includes("style") ||
-        lower.includes("pattern") || lower.includes("structure") || lower.includes("architecture")) {
-      const key = content.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/\s+/g, "-").toLowerCase();
-      if (key.length > 5 && !newCoding[key]) {
-        newCoding[key] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 150) };
-      }
-    }
-
-    // Anti-patterns: things from error_fix or low-confidence-then-dropped decisions
+    // Skip error_fix nodes for tool/coding extraction — they only feed anti-patterns.
+    // Without this gate, tool error messages leak into coding patterns.
     if (node.entity_type === "error_fix") {
-      const original = JSON.parse(node.content || "{}").metadata?.original_error;
+      // Fall through to anti-pattern extraction below
+    } else {
+      // ── Tool preferences ─────────────────────────────────────────────────
+      // Positive: explicit and implicit tool choices
+      const positiveToolRe = /(?:use|using|prefer(?:ring)?|chose|choosing|switch(?:ed|ing)? to|install(?:ed|ing)|opted? for|going with|went with|stick(?:ing)? with|decided on|picked|selected|settled on|works? (?:well |better )?with|built? with|rely(?:ing)? on|depend(?:ing)? on)\s+([\w@/.-]{2,40})/gi;
+      for (const m of content.matchAll(positiveToolRe)) {
+        const tool = m[1].replace(/[.,;:!?]+$/, ""); // strip trailing punctuation
+        if (tool.length > 1 && !/^(the|a|an|it|to|on|in|for|of|be|is|was|are|this|that)$/i.test(tool)) {
+          if (!newTools[tool]) {
+            newTools[tool] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 150), prefers: true };
+          }
+        }
+      }
+
+      // Negative: things being avoided or replaced
+      const negativeToolRe = /(?:avoid(?:ing)?|not? (?:use|using)|stop(?:p(?:ed|ing))? using|drop(?:p(?:ed|ing))?|replac(?:ed|ing)|mov(?:ed|ing) away from|get rid of|removing|ditching)\s+([\w@/.-]{2,40})/gi;
+      for (const m of content.matchAll(negativeToolRe)) {
+        const tool = m[1].replace(/[.,;:!?]+$/, "");
+        if (tool.length > 1 && !/^(the|a|an|it|to|on|in|for|of|be|is|was|are|this|that)$/i.test(tool)) {
+          const key = `avoid:${tool}`;
+          if (!newTools[key]) {
+            newTools[key] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 150), prefers: false, avoids: tool };
+          }
+        }
+      }
+
+      // ── Coding patterns ───────────────────────────────────────────────────
+      // Broader keyword set — captures style, approach, and implicit preferences
+      const codingKeywords = [
+        "naming", "convention", "style", "pattern", "structure", "architecture",
+        "approach", "practice", "instead of", "rather than", "always ", "never ",
+        "consistent", "standard", "rule", "guideline", "principle", "prefer",
+        "should ", "must ", "avoid ", "don't ", "do not ", "keep ", "make sure",
+        "important", "critical", "key insight", "the reason", "because ",
+      ];
+      if (codingKeywords.some(kw => lower.includes(kw))) {
+        const key = content.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/\s+/g, "-").toLowerCase();
+        if (key.length > 5 && !newCoding[key]) {
+          newCoding[key] = { confidence: node.confidence, source: node.project_id, content: content.slice(0, 200) };
+        }
+      }
+
+      // ── Implicit corrections ──────────────────────────────────────────────
+      // "X, not Y" / "use X instead of Y" — strongest signal of preference
+      const correctionRe = /(?:use|with|prefer)\s+([\w@/.-]{2,30})\s+(?:instead of|not|over|rather than)\s+([\w@/.-]{2,30})/gi;
+      for (const m of content.matchAll(correctionRe)) {
+        const toward = m[1].replace(/[.,;:!?]+$/, "");
+        const away = m[2].replace(/[.,;:!?]+$/, "");
+        const key = `correction:${toward}-over-${away}`;
+        if (!newCoding[key]) {
+          newCoding[key] = { confidence: node.confidence, source: node.project_id, content: `Prefer ${toward} over ${away}: ${content.slice(0, 120)}` };
+        }
+      }
+    }
+
+    // Anti-patterns: things from error_fix — but only genuine behavioral patterns,
+    // NOT tool operational errors (file not found, string not matched, validation failures).
+    // Those are transient tool issues, not user anti-patterns worth remembering.
+    if (node.entity_type === "error_fix") {
+      const parsed = JSON.parse(node.content || "{}");
+      const original = parsed.metadata?.original_error;
       if (original && original.length > 10) {
-        const exists = antiPatterns.patterns.some(p => p.error === original.slice(0, 100));
-        if (!exists) {
-          newAntiPatterns.push({
-            error: original.slice(0, 100),
-            fix: content.slice(0, 150),
-            confidence: node.confidence,
-            source: node.project_id,
-          });
+        // Skip tool operational errors — these are not behavioral patterns
+        const isToolError =
+          /tool_use_error/i.test(original) ||
+          /could not find the specified string/i.test(original) ||
+          /file has not been read/i.test(original) ||
+          /file does not exist/i.test(original) ||
+          /failed to edit/i.test(original) ||
+          /command (?:validation )?failed/i.test(original) ||
+          /path does not exist/i.test(original) ||
+          /not writable/i.test(original) ||
+          /permission denied/i.test(original) ||
+          /no such file or directory/i.test(original) ||
+          /timed? ?out/i.test(original) ||
+          /ENOENT|EACCES|EPERM|EISDIR/i.test(original) ||
+          /found \d+ occurrences/i.test(original) ||
+          /dangerous pattern/i.test(original);
+
+        if (!isToolError) {
+          const exists = antiPatterns.patterns.some(p => p.error === original.slice(0, 100));
+          if (!exists) {
+            newAntiPatterns.push({
+              error: original.slice(0, 100),
+              fix: content.slice(0, 150),
+              confidence: node.confidence,
+              source: node.project_id,
+            });
+          }
         }
       }
     }
   }
 
-  // Merge into profile (don't overwrite existing)
+  // ── C1: Frequency-based tool promotion ─────────────────────────────────────
+  // Scan ALL high-confidence nodes (not just current batch) and count how many
+  // distinct node_ids mention each tool name. Tools appearing in 3+ separate
+  // nodes are genuine preferences — behavioural signal, not just one sentence.
+  const FREQUENCY_THRESHOLD = 3;
+  const allNodes = db.prepare(`
+    SELECT id, content FROM nodes
+    WHERE confidence >= ? AND entity_type IN ('decision', 'lesson', 'pattern')
+    ORDER BY updated_at DESC LIMIT 500
+  `).all(0.65); // lower threshold for frequency scan — recurrence is the signal
+
+  const toolFrequency = new Map(); // toolName → Set of node ids
+  const positiveFreqRe = /(?:use|using|prefer(?:ring)?|chose|choosing|switch(?:ed|ing)? to|going with|went with|stick(?:ing)? with|decided on|picked|settled on|built? with)\s+([\w@/.-]{2,40})/gi;
+
+  for (const node of allNodes) {
+    const text = JSON.parse(node.content || "{}").text || "";
+    for (const m of text.matchAll(positiveFreqRe)) {
+      const tool = m[1].replace(/[.,;:!?]+$/, "");
+      if (tool.length < 2 || /^(the|a|an|it|to|on|in|for|of|be|is|was|are|this|that)$/i.test(tool)) continue;
+      if (!toolFrequency.has(tool)) toolFrequency.set(tool, new Set());
+      toolFrequency.get(tool).add(node.id);
+    }
+  }
+
+  for (const [tool, nodeIds] of toolFrequency.entries()) {
+    if (nodeIds.size >= FREQUENCY_THRESHOLD && !newTools[tool] && !prefs.tools[tool]) {
+      newTools[tool] = {
+        confidence: 0.85,
+        source: "frequency",
+        content: `Appears in ${nodeIds.size} separate sessions — consistent usage pattern`,
+        frequency: nodeIds.size,
+      };
+    }
+  }
+
+  // ── Merge into profile (don't overwrite existing) ───────────────────────────
   let changed = false;
 
   for (const [key, val] of Object.entries(newTools)) {
@@ -1524,7 +2109,6 @@ function addExplicitRule(rule) {
   content += `\n- ${rule}`;
   fs.writeFileSync(rulesPath, content);
   writeProfileExport();
-  indexProfileAtoms().catch(() => {});
   return { added: true };
 }
 
@@ -1532,7 +2116,6 @@ function addExplicitRule(rule) {
 function updatePhilosophy(text) {
   fs.writeFileSync(path.join(PROFILE_DIR, "philosophy.md"), text);
   writeProfileExport();
-  indexProfileAtoms().catch(() => {});
   return { updated: true };
 }
 
@@ -1540,17 +2123,22 @@ function updatePhilosophy(text) {
 function updateRules(text) {
   fs.writeFileSync(path.join(PROFILE_DIR, "rules.md"), text);
   writeProfileExport();
-  indexProfileAtoms().catch(() => {});
   return { updated: true };
 }
 
-// Update identity (name, bio, role)
-function updateIdentity(identity) {
+// Update identity (name, bio, role) — merges into identity.json
+function updateIdentityJson(identity) {
   const current = readProfileJson("identity.json") || {};
   const updated = { ...current, ...identity };
   fs.writeFileSync(path.join(PROFILE_DIR, "identity.json"), JSON.stringify(updated, null, 2));
   writeProfileExport();
-  indexProfileAtoms().catch(() => {});
+  return { updated: true };
+}
+
+// Update identity DNA (compiled bio text) — writes directly to compiled-identity.txt
+function updateIdentityDna(dna) {
+  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  fs.writeFileSync(IDENTITY_CACHE_PATH, dna, "utf-8");
   return { updated: true };
 }
 
@@ -1648,6 +2236,8 @@ function writeProfileExport() {
 
 // Get full profile for MCP/display
 function getProfile() {
+  let identityStr = "";
+  try { identityStr = fs.readFileSync(IDENTITY_CACHE_PATH, "utf-8").trim(); } catch { /* identity not compiled yet */ }
   return {
     identity: readProfileJson("identity.json"),
     preferences: readProfileJson("preferences.json"),
@@ -1655,6 +2245,7 @@ function getProfile() {
     style: readProfileJson("style.json"),
     rules: readProfileMd("rules.md"),
     philosophy: readProfileMd("philosophy.md"),
+    dna: identityStr,
   };
 }
 
@@ -1703,19 +2294,14 @@ process.parentPort.on("message", async ({ data }) => {
           if (decayed > 0) console.log(`[brain] Decayed ${decayed} stale nodes in ${data.projectId}`);
         }
 
-        // Phase 6: Profile extraction (run occasionally — every ~5th indexing call)
-        if (Math.random() < 0.2) {
-          extractPreferences();
-        }
-
-        // Layer 3: Synthesis — regenerate when significant events indexed.
-        // updateSynthesis() is fast (4 SQL reads + hash check) so always run.
-        // The internal hash check makes it idempotent — no DB write if unchanged.
         const hasMeaningfulEvents = data.events.some(e =>
           ["decision", "lesson", "pattern", "error_fix"].includes(e.type)
         );
+
+        // Phase 6: Profile extraction — run whenever meaningful events exist.
+        // Cheap (SQLite reads + JSON writes), no reason to skip.
         if (hasMeaningfulEvents) {
-          updateSynthesis(db, data.projectId);
+          extractPreferences();
         }
 
         break;
@@ -1728,14 +2314,46 @@ process.parentPort.on("message", async ({ data }) => {
       }
 
       case "contextual_search": {
-        const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null);
+        const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null, data.taskType || null, data.atomHints || [], data.projectWhy || "");
         sendToMain({ type: "contextual_result", requestId: data.requestId, ...result });
+        break;
+      }
+
+      case "embed_texts": {
+        // Batch-embed arbitrary texts (turn summaries, query, etc.).
+        // Returns base64-encoded Float32Arrays for IPC transfer to main process.
+        if (!embedderReady || !_embedPipeline) {
+          sendToMain({ type: "embed_texts_result", requestId: data.requestId, embeddings: {} });
+          break;
+        }
+        const texts = data.texts || [];
+        const embeddings = await embedBatch(texts);
+        const result = {};
+        for (const [text, emb] of embeddings) {
+          if (emb) {
+            result[text] = Buffer.from(emb.buffer).toString("base64");
+          } else {
+            result[text] = null;
+          }
+        }
+        sendToMain({ type: "embed_texts_result", requestId: data.requestId, embeddings: result });
+        break;
+      }
+
+      case "codebase_compass": {
+        const result = await findCodebaseCompass(data.query, data.projectId, data.projectRoot, data.limit || 8);
+        sendToMain({ type: "codebase_compass_result", requestId: data.requestId, result });
         break;
       }
 
       case "index_project_files": {
         // Fire-and-forget: respond immediately, index in background
         sendToMain({ type: "index_project_files_ack", requestId: data.requestId });
+
+        // Backfill events.jsonl for this project on first access.
+        // backfillAll() only runs on startup when the DB is empty; new projects
+        // added later need their pre-existing events indexed here.
+        backfillProject(data.projectId).catch(() => {});
 
         // Symbol indexing runs first (fast, no LLM) — file summarization runs in parallel
         Promise.all([
@@ -1746,8 +2364,6 @@ process.parentPort.on("message", async ({ data }) => {
               const { added, files_changed } = indexProjectSymbols(db, data.projectId, data.projectRoot, walkProjectFiles);
               if (added > 0 || files_changed > 0) {
                 writeSymbolExport(db, data.projectId, BRAIN_DIR);
-                // Regenerate synthesis after symbol indexing (Layer 3)
-                updateSynthesis(db, data.projectId);
               }
             } catch (err) {
               console.error("[brain] symbol indexing error:", err.message);
@@ -1772,6 +2388,15 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
+      case "prune": {
+        // Explicitly prune low-confidence nodes and orphaned edges.
+        // Called on startup for all projects, or on-demand via brainRequest.
+        if (!db) { sendToMain({ type: "prune_result", requestId: data.requestId, pruned: 0, deletedEdges: 0 }); break; }
+        const result = pruneOldNodes(data.projectId);
+        sendToMain({ type: "prune_result", requestId: data.requestId, ...result });
+        break;
+      }
+
       case "get_file_symbols": {
         if (!db) { sendToMain({ type: "file_symbols_result", requestId: data.requestId, symbols: [] }); break; }
         const fileSyms = getFileSymbols(db, data.projectId, data.filePath);
@@ -1786,21 +2411,12 @@ process.parentPort.on("message", async ({ data }) => {
           const result = indexFileSymbols(db, data.projectId, data.filePath, data.projectRoot);
           if (!result.skipped) {
             writeSymbolExport(db, data.projectId, BRAIN_DIR);
-            updateSynthesis(db, data.projectId);
           }
           sendToMain({ type: "file_symbols_reindexed", requestId: data.requestId, ...result });
         } catch (err) {
           console.error("[brain] reindex_file_symbols error:", err.message);
           sendToMain({ type: "file_symbols_reindexed", requestId: data.requestId, skipped: true });
         }
-        break;
-      }
-
-      case "synthesize": {
-        // Regenerate synthesis on demand
-        if (!db) { sendToMain({ type: "synthesis_result", requestId: data.requestId, synthesis: null }); break; }
-        const synthesis = updateSynthesis(db, data.projectId);
-        sendToMain({ type: "synthesis_result", requestId: data.requestId, synthesis });
         break;
       }
 
@@ -1834,6 +2450,27 @@ process.parentPort.on("message", async ({ data }) => {
       case "get_intelligence_stats": {
         const intStats = getIntelligenceStats(data.projectId);
         sendToMain({ type: "intelligence_stats_result", requestId: data.requestId, stats: intStats });
+        break;
+      }
+
+      case "get_all_projects": {
+        // Return all project IDs that have nodes in the brain database
+        if (!db) { sendToMain({ type: "all_projects_result", requestId: data.requestId, projects: [] }); break; }
+        const rows = db._stmts.getAllProjects.all();
+        sendToMain({ type: "all_projects_result", requestId: data.requestId, projects: rows.map(r => r.project_id) });
+        break;
+      }
+
+      case "vacuum": {
+        // Reclaim disk space by rebuilding the database file
+        if (!db) break;
+        try {
+          db.exec("VACUUM");
+          console.log("[brain] Database vacuum complete");
+        } catch (err) {
+          console.warn(`[brain] Vacuum failed: ${err.message}`);
+        }
+        sendToMain({ type: "vacuum_result", requestId: data.requestId });
         break;
       }
 
@@ -1872,15 +2509,81 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
-      case "reindex_profile_atoms": {
-        await indexProfileAtoms();
-        sendToMain({ type: "profile_atoms_indexed", requestId: data.requestId });
+      case "update_preferences_from_llm": {
+        // Merge LLM-extracted preferences into profile files.
+        // Runs after each conversation turn — complements regex extraction.
+        const { extracted } = data;
+        if (!extracted) break;
+
+        const prefs = readProfileJson("preferences.json") || { coding: {}, communication: {}, tools: {}, _meta: {} };
+        const antiPatterns = readProfileJson("anti-patterns.json") || { patterns: [], _meta: {} };
+        let changed = false;
+
+        // Tools
+        for (const t of (extracted.tools || [])) {
+          if (!t.name || t.name.length < 2) continue;
+          const key = t.prefers === false ? `avoid:${t.name}` : t.name;
+          if (!prefs.tools[key]) {
+            prefs.tools[key] = {
+              confidence: 0.8,
+              source: "llm_extraction",
+              content: t.evidence?.slice(0, 150) || t.name,
+              prefers: t.prefers !== false,
+            };
+            changed = true;
+          }
+        }
+
+        // Patterns
+        for (const p of (extracted.patterns || [])) {
+          if (!p.pattern || p.pattern.length < 5) continue;
+          const key = p.pattern.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/\s+/g, "-").toLowerCase();
+          if (key.length > 4 && !prefs.coding[key]) {
+            prefs.coding[key] = {
+              confidence: 0.8,
+              source: "llm_extraction",
+              content: `${p.pattern}: ${p.evidence || ""}`.slice(0, 200),
+            };
+            changed = true;
+          }
+        }
+
+        // Corrections → anti-patterns
+        for (const c of (extracted.corrections || [])) {
+          if (!c.toward || !c.away_from) continue;
+          const error = `Using ${c.away_from} instead of ${c.toward}`.slice(0, 100);
+          const exists = antiPatterns.patterns.some(ap => ap.error === error);
+          if (!exists) {
+            antiPatterns.patterns.push({
+              error,
+              fix: `Prefer ${c.toward}. ${c.evidence || ""}`.slice(0, 150),
+              confidence: 0.8,
+              source: "llm_extraction",
+            });
+            changed = true;
+          }
+        }
+
+        if (changed) {
+          writeProfileJson("preferences.json", prefs);
+          writeProfileJson("anti-patterns.json", antiPatterns);
+          writeProfileExport();
+          console.log(`[brain] LLM extraction merged: ${(extracted.tools||[]).length} tools, ${(extracted.patterns||[]).length} patterns, ${(extracted.corrections||[]).length} corrections`);
+        }
+
+        sendToMain({ type: "llm_preferences_updated", requestId: data.requestId, changed });
         break;
       }
 
       case "update_identity": {
-        const result = updateIdentity(data.identity);
+        const result = updateIdentityJson(data.identity);
         sendToMain({ type: "identity_result", requestId: data.requestId, ...result });
+        break;
+      }
+
+      case "update_dna": {
+        const result = updateIdentityDna(data.dna);
+        sendToMain({ type: "dna_result", requestId: data.requestId, ...result });
         break;
       }
 
@@ -1912,7 +2615,8 @@ process.parentPort.on("message", async ({ data }) => {
         const id = `mind-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
         const embedding = await embed(data.content);
         const embeddingBuffer = embedding ? Buffer.from(embedding.buffer) : null;
-        db.prepare(`INSERT INTO mind_entries (id, content, embedding) VALUES (?, ?, ?)`).run(id, data.content, embeddingBuffer);
+        const projectId = data.projectId || null;
+        db.prepare(`INSERT INTO mind_entries (id, content, embedding, project_id) VALUES (?, ?, ?, ?)`).run(id, data.content, embeddingBuffer, projectId);
         const entry = db.prepare(`SELECT * FROM mind_entries WHERE id = ?`).get(id);
         sendToMain({ type: "mind_entry", requestId: data.requestId, entry });
         break;
@@ -1952,6 +2656,388 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
+      case "mind_thread_create": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const threadId = `mt-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+        db.prepare(`INSERT INTO mind_threads (id, entry_id) VALUES (?, ?)`).run(threadId, data.entry_id);
+        const thread = db.prepare(`SELECT * FROM mind_threads WHERE id = ?`).get(threadId);
+        sendToMain({ type: "mind_thread", requestId: data.requestId, thread });
+        break;
+      }
+
+      case "mind_thread_get": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const thread = db.prepare(`SELECT * FROM mind_threads WHERE entry_id = ? ORDER BY updated_at DESC LIMIT 1`).get(data.entry_id);
+        let turns = [];
+        if (thread) {
+          turns = db.prepare(`SELECT * FROM mind_turns WHERE thread_id = ? ORDER BY timestamp ASC`).all(thread.id);
+        }
+        sendToMain({ type: "mind_thread_data", requestId: data.requestId, thread: thread || null, turns: turns || [] });
+        break;
+      }
+
+      case "mind_thread_list_entry_ids": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const rows = db.prepare(`SELECT DISTINCT entry_id FROM mind_threads`).all();
+        sendToMain({ type: "mind_thread_entry_ids", requestId: data.requestId, entryIds: rows.map(r => r.entry_id) });
+        break;
+      }
+
+      case "mind_thread_add_turn": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const turnId = `mtu-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+        db.prepare(`INSERT INTO mind_turns (id, thread_id, role, content_json) VALUES (?, ?, ?, ?)`).run(turnId, data.thread_id, data.role, data.content_json);
+        db.prepare(`UPDATE mind_threads SET updated_at = datetime('now') WHERE id = ?`).run(data.thread_id);
+        const turn = db.prepare(`SELECT * FROM mind_turns WHERE id = ?`).get(turnId);
+        sendToMain({ type: "mind_turn", requestId: data.requestId, turn });
+        break;
+      }
+
+      case "mind_thread_set_session": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        db.prepare(`UPDATE mind_threads SET session_id = ?, updated_at = datetime('now') WHERE id = ?`).run(data.session_id, data.thread_id);
+        sendToMain({ type: "mind_thread_session_set", requestId: data.requestId });
+        break;
+      }
+
+      case "mind_thread_delete": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        db.prepare(`DELETE FROM mind_turns WHERE thread_id = ?`).run(data.id);
+        db.prepare(`DELETE FROM mind_threads WHERE id = ?`).run(data.id);
+        sendToMain({ type: "mind_thread_deleted", requestId: data.requestId, id: data.id });
+        break;
+      }
+
+      case "memory_lifecycle": {
+        // Run the full memory lifecycle: decay → consolidate → graduate
+        if (!db) { sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId }); break; }
+        try {
+          // Always enable consolidation — consolidateMemories() has internal guards
+          // (CONSOLIDATION_THRESHOLD, similarity clustering) and only calls the LLM
+          // when there are actually clusters to synthesize. The old caller-side
+          // Math.random() < 0.1 gate in main.mjs was pure waste.
+          const result = await runMemoryLifecycle(db, data.projectId, llmCall);
+          sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId, result });
+        } catch (err) {
+          console.error("[brain] memory lifecycle error:", err.message);
+          sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId, error: err.message });
+        }
+        break;
+      }
+
+      case "memory_touch": {
+        // Record that memories were accessed (prevents decay)
+        if (!db) break;
+        for (const nodeId of (data.nodeIds || [])) {
+          touchMemory(db, nodeId);
+        }
+        break;
+      }
+
+      case "memory_reinforce": {
+        // Boost a memory that proved useful
+        if (!db) break;
+        reinforceMemory(db, data.nodeId);
+        break;
+      }
+
+      case "decay_completed_task": {
+        // Completion propagation: decay brain nodes related to a finished task
+        // and mark matching mind entries as completed.
+        if (!db) {
+          sendToMain({ type: "decay_completed_task_result", requestId: data.requestId, nodesDecayed: 0, mindMarked: 0 });
+          break;
+        }
+
+        let nodesDecayed = 0;
+        let mindMarked = 0;
+        const decayAmount = data.decayAmount || 0.3;
+        const threshold = data.similarityThreshold || 0.7;
+
+        try {
+          const taskEmbedding = embedderReady ? await embed(data.taskDescription) : null;
+
+          if (taskEmbedding) {
+            // Find and decay matching brain nodes
+            const projectNodes = db.prepare(
+              `SELECT id, embedding, confidence FROM nodes WHERE project_id = ? AND embedding IS NOT NULL AND confidence > 0.2`
+            ).all(data.projectId);
+
+            for (const node of projectNodes) {
+              const nodeEmb = new Float32Array(new Uint8Array(node.embedding).buffer);
+              const similarity = cosineSimilarity(taskEmbedding, nodeEmb);
+              if (similarity >= threshold) {
+                db._stmts.lowerConfidence.run(decayAmount, node.id);
+                nodesDecayed++;
+              }
+            }
+
+            // Also check completed todos for additional matches
+            for (const todo of (data.completedTodos || [])) {
+              const todoEmbedding = await embed(todo);
+              if (!todoEmbedding) continue;
+              for (const node of projectNodes) {
+                const nodeEmb = new Float32Array(new Uint8Array(node.embedding).buffer);
+                const similarity = cosineSimilarity(todoEmbedding, nodeEmb);
+                if (similarity >= threshold) {
+                  // Only decay if not already decayed by task description
+                  const current = db.prepare(`SELECT confidence FROM nodes WHERE id = ?`).get(node.id);
+                  if (current && current.confidence > 0.2) {
+                    db._stmts.lowerConfidence.run(decayAmount * 0.5, node.id);
+                    nodesDecayed++;
+                  }
+                }
+              }
+            }
+
+            // Mark matching mind entries as completed
+            const mindEntries = db.prepare(
+              `SELECT id, content, embedding FROM mind_entries WHERE completed = 0 AND embedding IS NOT NULL`
+            ).all();
+
+            for (const entry of mindEntries) {
+              const entryEmb = new Float32Array(new Uint8Array(entry.embedding).buffer);
+              const similarity = cosineSimilarity(taskEmbedding, entryEmb);
+              if (similarity >= threshold) {
+                db.prepare(`UPDATE mind_entries SET completed = 1, updated_at = datetime('now') WHERE id = ?`).run(entry.id);
+                mindMarked++;
+              }
+            }
+          }
+        } catch (err) {
+          console.warn("[brain] decay_completed_task error (non-fatal):", err.message);
+        }
+
+        sendToMain({ type: "decay_completed_task_result", requestId: data.requestId, nodesDecayed, mindMarked });
+        break;
+      }
+
+      case "lens_post_add": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const id = `lp-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const created_at = new Date().toISOString();
+        db.prepare(`INSERT INTO lens_posts (id, contributor, content, project_id, entry_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`).run(id, data.contributor, data.content, data.projectId ?? null, data.entryId ?? null, created_at);
+        const post = { id, contributor: data.contributor, content: data.content, project_id: data.projectId ?? null, entry_id: data.entryId ?? null, created_at };
+        sendToMain({ type: "lens_post", requestId: data.requestId, post });
+        break;
+      }
+
+      case "lens_posts_list": {
+        if (!db) { sendToMain({ type: "lens_posts", requestId: data.requestId, posts: [] }); break; }
+        const posts = db.prepare(`
+          SELECT lp.*, COUNT(lc.id) as comment_count
+          FROM lens_posts lp
+          LEFT JOIN lens_comments lc ON lc.post_id = lp.id
+          WHERE lp.project_id = ?
+          GROUP BY lp.id
+          ORDER BY lp.created_at ASC
+        `).all(data.projectId ?? null);
+        sendToMain({ type: "lens_posts", requestId: data.requestId, posts });
+        break;
+      }
+
+      case "lens_post_get": {
+        if (!db) { sendToMain({ type: "lens_post", requestId: data.requestId, post: null }); break; }
+        const post = db.prepare(`SELECT * FROM lens_posts WHERE id = ?`).get(data.postId);
+        sendToMain({ type: "lens_post", requestId: data.requestId, post: post ?? null });
+        break;
+      }
+
+      case "lens_post_delete": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        // Delete post and cascade to all comments
+        const delPost = db.prepare(`DELETE FROM lens_posts WHERE id = ? RETURNING *`).get(data.postId);
+        const delComments = db.prepare(`DELETE FROM lens_comments WHERE post_id = ?`).run(data.postId);
+        sendToMain({ type: "lens_post_deleted", requestId: data.requestId, deleted: true });
+        break;
+      }
+
+      case "lens_comments_list": {
+        if (!db) { sendToMain({ type: "lens_comments", requestId: data.requestId, comments: [] }); break; }
+        const comments = db.prepare(`SELECT * FROM lens_comments WHERE post_id = ? ORDER BY timestamp ASC`).all(data.postId);
+        sendToMain({ type: "lens_comments", requestId: data.requestId, comments });
+        break;
+      }
+
+      case "lens_comment_add": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const commentId = `lc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const commentTimestamp = new Date().toISOString();
+        db.prepare(`INSERT INTO lens_comments (id, post_id, role, content, session_id, timestamp) VALUES (?, ?, ?, ?, NULL, ?)`).run(commentId, data.postId, data.role, data.content, commentTimestamp);
+        const comment = { id: commentId, post_id: data.postId, role: data.role, content: data.content, session_id: null, timestamp: commentTimestamp };
+        sendToMain({ type: "lens_comment", requestId: data.requestId, comment });
+        break;
+      }
+
+      case "lens_comment_set_session": {
+        if (!db) { sendToMain({ type: "lens_comment_session_set", requestId: data.requestId }); break; }
+        db.prepare(`UPDATE lens_comments SET session_id = ? WHERE post_id = ? AND session_id IS NULL`).run(data.sessionId, data.postId);
+        sendToMain({ type: "lens_comment_session_set", requestId: data.requestId });
+        break;
+      }
+
+      // ── Review session handlers ──────────────────────────────────────────
+      case "review_session_create": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const rsId = `rs-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const rsCreated = new Date().toISOString();
+        db.prepare(`INSERT INTO review_sessions (id, project_id, status, diff_summary, base_ref, punk_count, created_at) VALUES (?, ?, 'running', ?, ?, ?, ?)`).run(
+          rsId, data.projectId, data.diffSummary ?? null, data.baseRef ?? null, data.punkCount ?? 0, rsCreated
+        );
+        sendToMain({ type: "review_session", requestId: data.requestId, session: { id: rsId, project_id: data.projectId, status: "running", created_at: rsCreated } });
+        break;
+      }
+
+      case "review_session_complete": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const rsCompleted = new Date().toISOString();
+        db.prepare(`UPDATE review_sessions SET status = ?, completed_at = ?, base_ref = ?, finding_count = ? WHERE id = ?`).run(
+          data.status ?? "completed", rsCompleted, data.baseRef ?? null, data.findingCount ?? 0, data.sessionId
+        );
+        sendToMain({ type: "review_session_updated", requestId: data.requestId });
+        break;
+      }
+
+      case "review_finding_add": {
+        if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
+        const rfId = `rf-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const rfCreated = new Date().toISOString();
+        db.prepare(`INSERT INTO punk_findings (id, session_id, project_id, punk, severity, finding, structured, location, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          rfId, data.sessionId, data.projectId, data.punk, data.severity, data.finding, data.structured ?? "{}", data.location ?? null, rfCreated
+        );
+        sendToMain({ type: "review_finding", requestId: data.requestId, finding: { id: rfId, session_id: data.sessionId, project_id: data.projectId, punk: data.punk, severity: data.severity, finding: data.finding, structured: data.structured ?? "{}", location: data.location, created_at: rfCreated } });
+        break;
+      }
+
+      case "review_findings_list": {
+        if (!db) { sendToMain({ type: "review_findings", requestId: data.requestId, findings: [] }); break; }
+        const rfFindings = db.prepare(`SELECT * FROM punk_findings WHERE session_id = ? ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, punk, created_at`).all(data.sessionId);
+        sendToMain({ type: "review_findings", requestId: data.requestId, findings: rfFindings });
+        break;
+      }
+
+      case "review_sessions_list": {
+        if (!db) { sendToMain({ type: "review_sessions", requestId: data.requestId, sessions: [] }); break; }
+        const rsSessions = db.prepare(`SELECT * FROM review_sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 20`).all(data.projectId);
+        sendToMain({ type: "review_sessions", requestId: data.requestId, sessions: rsSessions });
+        break;
+      }
+
+      case "review_session_latest": {
+        if (!db) { sendToMain({ type: "review_session_latest", requestId: data.requestId, session: null, findings: [] }); break; }
+        const rsLatest = db.prepare(`SELECT * FROM review_sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 1`).get(data.projectId);
+        let rsFindings = [];
+        if (rsLatest) {
+          rsFindings = db.prepare(`SELECT * FROM punk_findings WHERE session_id = ? ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, punk`).all(rsLatest.id);
+        }
+        sendToMain({ type: "review_session_latest", requestId: data.requestId, session: rsLatest ?? null, findings: rsFindings });
+        break;
+      }
+
+      // ── Punk finding queries for Lens v2 ──────────────────────────────────
+      case "findings_list": {
+        if (!db) { sendToMain({ type: "findings_list_result", requestId: data.requestId, findings: [] }); break; }
+        const fList = db.prepare(`
+          SELECT * FROM punk_findings
+          WHERE project_id = ? AND dismissed = 0
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).all(data.projectId, data.limit ?? 50);
+        sendToMain({ type: "findings_list_result", requestId: data.requestId, findings: fList });
+        break;
+      }
+
+      case "findings_by_punk": {
+        if (!db) { sendToMain({ type: "findings_by_punk_result", requestId: data.requestId, findings: [] }); break; }
+        const fByPunk = db.prepare(`
+          SELECT * FROM punk_findings
+          WHERE project_id = ? AND punk = ? AND dismissed = 0
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).all(data.projectId, data.punk, data.limit ?? 50);
+        sendToMain({ type: "findings_by_punk_result", requestId: data.requestId, findings: fByPunk });
+        break;
+      }
+
+      case "finding_dismiss": {
+        if (!db) { sendToMain({ type: "finding_dismiss_result", requestId: data.requestId, success: false }); break; }
+        db.prepare(`UPDATE punk_findings SET dismissed = 1 WHERE id = ?`).run(data.findingId);
+        sendToMain({ type: "finding_dismiss_result", requestId: data.requestId, success: true });
+        break;
+      }
+
+      // ── Knowledge graph queries ──────────────────────────────────────────
+      case "knowledge_graph": {
+        if (!db) { sendToMain({ type: "knowledge_graph_result", requestId: data.requestId, error: "db not ready" }); break; }
+
+        const kgProjectId = data.projectId;
+
+        // Get type counts (atoms have been removed — no longer excluded)
+        const typeCounts = db.prepare(`
+          SELECT entity_type, COUNT(*) as count
+          FROM nodes
+          WHERE project_id = ?
+          GROUP BY entity_type
+          ORDER BY count DESC
+        `).all(kgProjectId);
+
+        // Get top nodes (highest confidence, most accessed)
+        const topNodes = db.prepare(`
+          SELECT id, name, entity_type, content, confidence, access_count, priority
+          FROM nodes
+          WHERE project_id = ? AND entity_type NOT IN ('project')
+            AND content != '{}'
+          ORDER BY confidence DESC, access_count DESC
+          LIMIT 20
+        `).all(kgProjectId);
+
+        // Parse node content from JSON storage format
+        const parsedNodes = topNodes.map(n => {
+          let content = n.content;
+          try {
+            const parsed = JSON.parse(n.content);
+            content = parsed.text || parsed.content || n.name;
+          } catch {
+            content = n.content || n.name;
+          }
+          return {
+            id: n.id,
+            name: n.name,
+            entity_type: n.entity_type,
+            content: typeof content === "string" ? content.slice(0, 500) : String(content).slice(0, 500),
+            confidence: n.confidence,
+            access_count: n.access_count,
+          };
+        });
+
+        // Get edge summary for this project's nodes
+        const edges = db.prepare(`
+          SELECT e.type, COUNT(*) as count
+          FROM edges e
+          WHERE e.source_id IN (SELECT id FROM nodes WHERE project_id = ?)
+             OR e.target_id IN (SELECT id FROM nodes WHERE project_id = ?)
+          GROUP BY e.type
+          ORDER BY count DESC
+        `).all(kgProjectId, kgProjectId);
+
+        const edgeTypes = {};
+        let totalEdges = 0;
+        for (const e of edges) {
+          edgeTypes[e.type] = e.count;
+          totalEdges += e.count;
+        }
+
+        sendToMain({
+          type: "knowledge_graph_result",
+          requestId: data.requestId,
+          typeCounts,
+          nodes: parsedNodes,
+          edgeTypes,
+          totalEdges,
+        });
+        break;
+      }
+
       case "shutdown": {
         if (db) db.close();
         process.exit(0);
@@ -1972,15 +3058,12 @@ try {
   initProfile();
   console.log("[brain] Database + profile initialized");
 
+  // Embedding model loads lazily on first embed() call — no 500MB WASM heap at startup
   // Check if backfill needed (empty DB but events exist)
   const stats = db._stmts.getStats.get();
   if (stats.node_count === 0) {
-    // Backfill in background — don't block startup
     backfillAll().catch(err => console.error("[brain] Backfill error:", err));
   }
-
-  // Start loading embedding model (async, doesn't block anything)
-  loadEmbedder();
 } catch (err) {
   console.error("[brain] Startup error:", err);
 }

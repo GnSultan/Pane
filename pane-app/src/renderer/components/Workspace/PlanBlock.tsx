@@ -1,52 +1,93 @@
 import { useState } from "react";
-import type { PlanData, PlanStep } from "../../lib/claude-types";
+import type { PlanBrief, PlanData } from "../../lib/punk-types";
 import { MicroIndicator } from "../shared";
 
-const TYPE_STYLES: Record<PlanStep["type"], { label: string; className: string }> = {
-  read:   { label: "read",   className: "text-[var(--pane-terminal)]" },
-  write:  { label: "write",  className: "text-pane-status-modified" },
-  verify: { label: "verify", className: "text-pane-status-added" },
-  plan:   { label: "plan",   className: "text-pane-text-secondary/60" },
-};
-
-function StepRow({ step }: { step: PlanStep }) {
-  const tag = TYPE_STYLES[step.type] ?? TYPE_STYLES.plan;
-
+function Section({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-start gap-3 py-1.5">
-      <span
-        className="shrink-0 text-pane-text-secondary/40 font-mono tabular-nums w-4 text-right mt-px"
-        style={{ fontSize: "11px" }}
+    <div className="space-y-2">
+      <div
+        className="font-mono uppercase tracking-widest"
+        style={{ fontSize: "9px", color: "var(--pane-terminal)", opacity: 0.7 }}
       >
-        {step.index}
-      </span>
-      <span
-        className={`shrink-0 font-mono uppercase tracking-wider mt-px ${tag.className}`}
-        style={{ fontSize: "10px", minWidth: "36px" }}
-      >
-        {tag.label}
-      </span>
-      <div className="flex-1 min-w-0">
-        <span
-          className="text-pane-text leading-relaxed"
-          style={{ fontSize: "var(--pane-font-size-sm)" }}
-        >
-          {step.action}
-        </span>
-        {step.files.length > 0 && (
-          <div className="flex flex-wrap gap-1 mt-1">
-            {step.files.map((f) => (
-              <span
-                key={f}
-                className="font-mono text-pane-text-secondary/50 truncate"
-                style={{ fontSize: "10px" }}
-              >
-                {f.split("/").pop()}
-              </span>
-            ))}
-          </div>
-        )}
+        {label}
       </div>
+      {children}
+    </div>
+  );
+}
+
+function Prose({ children }: { children: React.ReactNode }) {
+  return (
+    <p
+      className="text-pane-text leading-relaxed"
+      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    >
+      {children}
+    </p>
+  );
+}
+
+function FileList({ items }: { items: { file: string; detail: string }[] }) {
+  return (
+    <ul className="space-y-3">
+      {items.map((item, i) => (
+        <li key={i} className="grid gap-0.5" style={{ gridTemplateColumns: "1fr" }}>
+          <span
+            className="font-mono truncate"
+            style={{ fontSize: "var(--pane-font-size-sm)", color: "var(--pane-terminal)" }}
+          >
+            {item.file.includes("/") ? item.file.split("/").pop() : item.file}
+            {item.file.includes("/") && (
+              <span className="text-pane-text-secondary/30 ml-1">
+                {item.file.substring(0, item.file.lastIndexOf("/") + 1)}
+              </span>
+            )}
+          </span>
+          <span
+            className="text-pane-text-secondary/60 leading-snug"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {item.detail}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function PlanBriefView({ brief }: { brief: PlanBrief }) {
+  return (
+    <div className="space-y-6">
+      <Section label="what">
+        <Prose>{brief.what}</Prose>
+      </Section>
+
+      <Section label="architecture">
+        <Prose>{brief.architecture}</Prose>
+      </Section>
+
+      {brief.created.length > 0 && (
+        <Section label="creating">
+          <FileList items={brief.created.map(c => ({ file: c.file, detail: c.purpose }))} />
+        </Section>
+      )}
+
+      {brief.modified.length > 0 && (
+        <Section label="modifying">
+          <FileList items={brief.modified.map(m => ({ file: m.file, detail: m.change }))} />
+        </Section>
+      )}
+
+      {brief.result && (
+        <Section label="result">
+          <p
+            className="text-pane-text-secondary/70 leading-relaxed"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {brief.result}
+          </p>
+        </Section>
+      )}
     </div>
   );
 }
@@ -58,7 +99,6 @@ interface PlanBlockProps {
 export function PlanBlock({ planData }: PlanBlockProps) {
   const [expanded, setExpanded] = useState(false);
 
-  const stepCount = planData.steps.length;
   const summary = planData.task.length > 72
     ? planData.task.slice(0, 72) + "…"
     : planData.task;
@@ -71,7 +111,6 @@ export function PlanBlock({ planData }: PlanBlockProps) {
           : "border-transparent hover:border-[var(--pane-border-soft)] mb-0.5"
       }`}
     >
-      {/* Header row — always visible, collapses/expands on click */}
       <button
         onClick={() => setExpanded((e) => !e)}
         className="flex items-center gap-2.5 text-pane-text-secondary font-mono
@@ -84,9 +123,6 @@ export function PlanBlock({ planData }: PlanBlockProps) {
           plan
         </span>
         <span className="truncate">{summary}</span>
-        <span className="shrink-0 text-pane-text-secondary/40 ml-1">
-          {stepCount} {stepCount === 1 ? "step" : "steps"}
-        </span>
         {planData.planningModel && (
           <span className="shrink-0 text-pane-text-secondary/30 ml-1">
             {planData.planningModel.split("/").pop()}
@@ -100,20 +136,29 @@ export function PlanBlock({ planData }: PlanBlockProps) {
         </span>
       </button>
 
-      {/* Expanded content */}
       {expanded && (
-        <div className="border-t border-pane-text-secondary/10 px-4 py-3">
-          {/* Steps */}
-          <div className="border-l-2 border-pane-border/40 pl-3 space-y-0">
-            {planData.steps.map((step) => (
-              <StepRow key={step.index} step={step} />
-            ))}
-          </div>
+        <div className="border-t border-pane-text-secondary/10 px-5 pt-5 pb-6">
+          {planData.brief && typeof planData.brief === "object" ? (
+            <PlanBriefView brief={planData.brief} />
+          ) : planData.brief && typeof planData.brief === "string" ? (
+            <p
+              className="text-pane-text-secondary/70 leading-relaxed"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              {planData.brief}
+            </p>
+          ) : (
+            <p
+              className="text-pane-text-secondary/50 leading-relaxed"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              {planData.task}
+            </p>
+          )}
 
-          {/* Execution model */}
           {planData.executionModel && (
             <p
-              className="mt-3 text-pane-text-secondary/30 font-mono"
+              className="mt-6 font-mono text-pane-text-secondary/25"
               style={{ fontSize: "10px" }}
             >
               executing with {planData.executionModel}

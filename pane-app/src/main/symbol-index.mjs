@@ -4,25 +4,23 @@
  * Regex parse of exports → SQLite.
  * No LLM. No embeddings. Fast lookup, always current.
  *
- * Layer 1 of the intelligence stack:
- *   "Where is the function that handles IPC routing?" → answered in <1ms.
- *
- * Layer 3 (Synthesis) is also here:
- *   synthesizeProjectDNA() → compact narrative from decisions/lessons/patterns.
- *   No LLM. Pure DB extraction. Called by brain-engine after indexing.
- *
  * Tables owned:
- *   symbols   — one row per exported symbol (name, kind, file, line, signature, doc)
- *   syntheses — cached project DNA narratives keyed by (projectId, kind)
+ *   symbols            — one row per exported symbol (name, kind, file, line, signature, doc)
+ *   file_relationships — import/export/reference edges between files
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { isSignalNoise } from "./signal-filters.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+const PARSER_VERSION = 2; // Increment when parseTS/parsePY logic changes.
+                          // v1: module-level exports only
+                          // v2: added class method detection (line 71)
 
 const PARSEABLE_EXTENSIONS = new Set([
   ".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx", ".py",
@@ -66,15 +64,78 @@ const PY_PATTERNS = [
 
 /**
  * Parse TypeScript / JavaScript → symbol records.
+ *
+ * Captures:
+ *   - Module-level exports (existing logic)
+ *   - Class methods (new): tracks class body brace-depth to find method
+ *     declarations inside exported and non-exported classes alike.
  */
 function parseTS(content) {
   const lines = content.split("\n");
   const symbols = [];
 
+  // ── Pre-scan: find class body ranges via brace-depth tracking ──────
+  // Each range runs from the class declaration line up to (inclusive)
+  // the line containing the matching closing brace.
+  const classRanges = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^(?:export\s+)?(?:abstract\s+)?class\s+\w+/.test(lines[i])) {
+      let depth = 0;
+      let opened = false;
+      let j = i;
+      while (j < lines.length) {
+        const l = lines[j];
+        for (const ch of l) {
+          if (ch === '{') { depth++; opened = true; }
+          else if (ch === '}') { depth--; }
+        }
+        if (opened && depth === 0) break;
+        j++;
+      }
+      classRanges.push({ start: i, end: j });
+    }
+  }
+
+  /** True when lineIdx is inside any class body (not on the class declaration itself). */
+  function insideClassBody(lineIdx) {
+    return classRanges.some(r => lineIdx > r.start && lineIdx <= r.end);
+  }
+
+  // Method-like signature patterns checked against lines inside a class body.
+  // Captures regular methods, async, get/set, static, constructor, arrow properties.
+  const METHOD_RE = /^(?:(?:public|protected|private|static|readonly|abstract|async|get|set|#)\s+)*(?:constructor|\w+)\s*\(/;
+
+  // Keywords that can appear before `(` but are NOT method declarations.
+  const EXPRESSION_KEYWORDS = new Set([
+    'if', 'for', 'while', 'switch', 'catch', 'return', 'throw',
+    'delete', 'typeof', 'instanceof', 'new', 'import', 'export', 'super',
+  ]);
+
+  /** Extract the method/function name from a line containing `name(`. */
+  function extractMethodName(trimmedLine) {
+    const m = trimmedLine.match(/(\w+)\s*\(/);
+    return m ? m[1] : null;
+  }
+
+  // ── Main loop ───────────────────────────────────────────────────────
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-    if (!line.startsWith("export")) continue;
+    if (!line) continue;
 
+    // ── Non-export lines: check for class methods ─────────────────────
+    if (!line.startsWith("export")) {
+      if (insideClassBody(i) && METHOD_RE.test(line)) {
+        const name = extractMethodName(line);
+        if (name && !EXPRESSION_KEYWORDS.has(name) && !line.startsWith('}') && !line.startsWith('this.')) {
+          const signature = lines.slice(i, Math.min(i + 3, lines.length))
+            .join(" ").replace(/\s+/g, " ").trim().slice(0, 200);
+          symbols.push({ name, kind: "method", signature, line: i + 1, doc: null });
+        }
+      }
+      continue;
+    }
+
+    // ── Export lines (existing logic) ─────────────────────────────────
     // Multi-line signature: join up to 3 lines
     const signature = lines.slice(i, Math.min(i + 3, lines.length))
       .join(" ").replace(/\s+/g, " ").trim().slice(0, 200);
@@ -166,6 +227,78 @@ function parseFile(content, filePath) {
   return [];
 }
 
+/**
+ * Extract file relationships (imports / dependencies) from a file.
+ * Returns { target: string, type: string }[] where target is a relative path.
+ */
+function extractRelationships(content, filePath, projectRoot) {
+  const ext = path.extname(filePath).toLowerCase();
+  const rels = [];
+  const dir = path.dirname(filePath);
+
+  if ([".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx"].includes(ext)) {
+    // import { foo } from "./path"
+    const importFromRe = /from\s+["']([^"']+)["']/g;
+    // import "./path"
+    const importOnlyRe = /import\s+["']([^"']+)["']/g;
+    // require("./path")
+    const requireRe = /require\s*\(\s*["']([^"']+)["']\s*\)/g;
+    // export * from "./path"
+    const exportFromRe = /export\s+.*\s+from\s+["']([^"']+)["']/g;
+
+    const matches = [
+      ...content.matchAll(importFromRe),
+      ...content.matchAll(importOnlyRe),
+      ...content.matchAll(requireRe),
+      ...content.matchAll(exportFromRe),
+    ];
+
+    for (const m of matches) {
+      let target = m[1];
+      if (!target.startsWith(".")) continue; // skip node_modules/internal
+
+      // Resolve relative path
+      try {
+        let abs = path.resolve(dir, target);
+        // Try to add extensions if missing
+        if (!fs.existsSync(abs)) {
+          for (const e of [".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx"]) {
+            if (fs.existsSync(abs + e)) { abs += e; break; }
+            if (fs.existsSync(path.join(abs, "index" + e))) { abs = path.join(abs, "index" + e); break; }
+          }
+        }
+        
+        if (fs.existsSync(abs)) {
+          const rel = path.relative(projectRoot, abs);
+          rels.push({ target: rel, type: m[0].startsWith("export") ? "export_from" : "import" });
+        }
+      } catch { /* skip invalid paths */ }
+    }
+  } else if (ext === ".py") {
+    // from .path import foo
+    const pyFromRe = /^from\s+\.([\w.]+)\s+import/gm;
+    // import .path
+    const pyImportRe = /^import\s+\.([\w.]+)/gm;
+
+    for (const m of content.matchAll(pyFromRe)) {
+      const target = m[1].replace(/\./g, "/") + ".py";
+      rels.push({ target, type: "import" });
+    }
+    for (const m of content.matchAll(pyImportRe)) {
+      const target = m[1].replace(/\./g, "/") + ".py";
+      rels.push({ target, type: "import" });
+    }
+  }
+
+  // Deduplicate by target
+  const seen = new Set();
+  return rels.filter(r => {
+    if (seen.has(r.target)) return false;
+    seen.add(r.target);
+    return true;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Hash — fast file-change detection
 // ---------------------------------------------------------------------------
@@ -173,6 +306,7 @@ function parseFile(content, filePath) {
 function fileHash(content) {
   return crypto.createHash("md5")
     .update(content.slice(0, 8192))
+    .update(`\x00parser-v${PARSER_VERSION}`)
     .digest("hex")
     .slice(0, 16);
 }
@@ -205,15 +339,18 @@ export function initSymbolTables(db) {
     CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(project_id, file_path);
     CREATE INDEX IF NOT EXISTS idx_sym_kind ON symbols(project_id, kind);
 
-    CREATE TABLE IF NOT EXISTS syntheses (
+    CREATE TABLE IF NOT EXISTS file_relationships (
       id           TEXT PRIMARY KEY,
       project_id   TEXT NOT NULL,
-      kind         TEXT NOT NULL,
-      content      TEXT NOT NULL,
-      source_hash  TEXT NOT NULL,
-      generated_at INTEGER DEFAULT (unixepoch()),
-      UNIQUE(project_id, kind)
+      source_file  TEXT NOT NULL,
+      target_file  TEXT NOT NULL,
+      type         TEXT NOT NULL, -- 'import', 'export_from', 'reference'
+      metadata     TEXT DEFAULT '{}',
+      UNIQUE(project_id, source_file, target_file, type)
     );
+
+    CREATE INDEX IF NOT EXISTS idx_rel_source ON file_relationships(project_id, source_file);
+    CREATE INDEX IF NOT EXISTS idx_rel_target ON file_relationships(project_id, target_file);
   `);
 }
 
@@ -258,25 +395,41 @@ export function indexFileSymbols(db, projectId, filePath, projectRoot) {
 
   if (existing?.file_hash === hash) return { added: 0, removed: 0, skipped: true };
 
-  // Delete old symbols for this file
+  // Delete old symbols and relationships for this file
   const removed = db.prepare(
     `DELETE FROM symbols WHERE project_id = ? AND file_path = ?`
   ).run(projectId, relPath).changes;
 
+  db.prepare(
+    `DELETE FROM file_relationships WHERE project_id = ? AND source_file = ?`
+  ).run(projectId, relPath);
+
   const parsed = parseFile(content, filePath);
-  if (parsed.length === 0) return { added: 0, removed, skipped: false };
+  const rels = extractRelationships(content, filePath, projectRoot);
 
   const insert = getInsert(db);
-  const insertMany = db.transaction((syms) => {
+  const insertRel = db.prepare(`
+    INSERT OR REPLACE INTO file_relationships
+      (id, project_id, source_file, target_file, type, metadata)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  const insertMany = db.transaction((syms, relationships) => {
     for (const s of syms) {
       const id = `sym-${crypto.createHash("md5")
         .update(`${projectId}:${relPath}:${s.name}:${s.line}`)
         .digest("hex").slice(0, 16)}`;
       insert.run(id, projectId, relPath, s.name, s.kind, s.signature, s.line, s.doc || null, hash);
     }
+    for (const r of relationships) {
+      const id = `rel-${crypto.createHash("md5")
+        .update(`${projectId}:${relPath}:${r.target}:${r.type}`)
+        .digest("hex").slice(0, 16)}`;
+      insertRel.run(id, projectId, relPath, r.target, r.type, "{}");
+    }
   });
 
-  insertMany(parsed);
+  insertMany(parsed, rels);
   return { added: parsed.length, removed, skipped: false };
 }
 
@@ -458,133 +611,4 @@ export function writeSymbolExport(db, projectId, exportDir) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Synthesis — Layer 3: Causal Memory
-// ---------------------------------------------------------------------------
 
-/**
- * Synthesize project DNA from brain nodes.
- *
- * Pure DB extraction — no LLM, no embeddings.
- * Pulls high-confidence decisions, lessons, patterns, error_fixes and
- * formats them into a compact narrative (<400 tokens).
- *
- * This is the "prefrontal cortex" layer:
- *   "We rejected Redux because Zustand Map references cause enough pain already."
- *   "Design rules forbid borders on inputs — decided after 3 iterations."
- *
- * @returns Synthesis text, or null if nothing to synthesize.
- */
-export function synthesizeProjectDNA(db, projectId) {
-  if (!db) return null;
-
-  const extract = row => {
-    try { return JSON.parse(row.content)?.text || row.content; }
-    catch { return row.content; }
-  };
-
-  const decisions = db.prepare(`
-    SELECT content, confidence FROM nodes
-    WHERE project_id = ? AND entity_type = 'decision' AND confidence >= 0.70
-    ORDER BY confidence DESC, access_count DESC LIMIT 12
-  `).all(projectId);
-
-  const patterns = db.prepare(`
-    SELECT content, confidence FROM nodes
-    WHERE project_id = ? AND entity_type = 'pattern' AND confidence >= 0.70
-    ORDER BY confidence DESC LIMIT 8
-  `).all(projectId);
-
-  const lessons = db.prepare(`
-    SELECT content, confidence FROM nodes
-    WHERE project_id = ? AND entity_type = 'lesson' AND confidence >= 0.72
-    ORDER BY confidence DESC LIMIT 8
-  `).all(projectId);
-
-  const fixes = db.prepare(`
-    SELECT content, confidence FROM nodes
-    WHERE project_id = ? AND entity_type = 'error_fix' AND confidence >= 0.70
-    ORDER BY confidence DESC LIMIT 6
-  `).all(projectId);
-
-  const total = decisions.length + patterns.length + lessons.length + fixes.length;
-  if (total === 0) return null;
-
-  const parts = [];
-
-  if (decisions.length > 0) {
-    parts.push("Architectural decisions:");
-    for (const d of decisions) {
-      const text = extract(d);
-      if (text) parts.push(`- ${text}`);
-    }
-  }
-
-  if (patterns.length > 0) {
-    parts.push("\nEstablished patterns:");
-    for (const p of patterns) {
-      const text = extract(p);
-      if (text) parts.push(`- ${text}`);
-    }
-  }
-
-  if (lessons.length > 0) {
-    parts.push("\nLessons learned:");
-    for (const l of lessons) {
-      const text = extract(l);
-      if (text) parts.push(`- ${text}`);
-    }
-  }
-
-  if (fixes.length > 0) {
-    parts.push("\nKnown anti-patterns (do not repeat):");
-    for (const f of fixes) {
-      const text = extract(f);
-      if (text) parts.push(`- ${text}`);
-    }
-  }
-
-  return parts.join("\n");
-}
-
-/**
- * Regenerate and store synthesis if source nodes have changed.
- * Idempotent — only writes if content hash changes.
- *
- * @returns Synthesis text, or null.
- */
-export function updateSynthesis(db, projectId) {
-  const text = synthesizeProjectDNA(db, projectId);
-  if (!text) return null;
-
-  const hash = crypto.createHash("md5").update(text).digest("hex").slice(0, 16);
-
-  // Check if unchanged
-  const existing = db.prepare(
-    `SELECT source_hash FROM syntheses WHERE project_id = ? AND kind = 'dna'`
-  ).get(projectId);
-
-  if (existing?.source_hash === hash) return text; // no change
-
-  db.prepare(`
-    INSERT OR REPLACE INTO syntheses (id, project_id, kind, content, source_hash, generated_at)
-    VALUES (?, ?, 'dna', ?, ?, unixepoch())
-  `).run(`syn-${projectId}-dna`, projectId, text, hash);
-
-  return text;
-}
-
-/**
- * Read cached synthesis. Returns null if not available.
- */
-export function readSynthesis(db, projectId) {
-  if (!db) return null;
-  try {
-    const row = db.prepare(
-      `SELECT content FROM syntheses WHERE project_id = ? AND kind = 'dna'`
-    ).get(projectId);
-    return row?.content || null;
-  } catch {
-    return null;
-  }
-}

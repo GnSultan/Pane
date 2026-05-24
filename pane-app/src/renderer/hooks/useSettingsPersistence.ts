@@ -5,23 +5,27 @@ import {
   getCwd,
   detectProjectRoot,
   readFile,
-  getHomeDir,
-  listCheckpoints,
-  brainGetProfile,
-  brainGetAvatar,
   saveConversationToMain,
+  checkPathExists,
+  migrateProjectId,
+  getAllThreadStates,
 } from "../lib/tauri-commands";
 import type { ProjectSessionState } from "../lib/tauri-commands";
-import type { ConversationMessage } from "../lib/claude-types";
+import type { ConversationMessage } from "../lib/punk-types";
 import { useWorkspaceStore, type Theme } from "../stores/workspace";
 import { useProjectsStore } from "../stores/projects";
 import type { ActionId, KeyBinding } from "../lib/keybindings";
 import {
-  DEFAULT_BACKEND_ROUTING,
-  type IntentRouting,
-  type BackendRouting,
-  PROVIDER_MODELS,
+  DEFAULT_POWER_COMBO,
+  type PowerCombo,
 } from "../lib/models";
+
+/** Shape returned by thread-state.mjs — persisted per-project activity data. */
+interface ThreadStateData {
+  lastUserPromptText?: string | null;
+  lastResponseSummary?: string | null;
+  lastActivityAt?: number | null;
+}
 
 // App readiness gate — other hooks (git, watcher) wait for this before starting
 let resolveAppReady: () => void;
@@ -32,128 +36,79 @@ export const appReadyPromise = new Promise<void>((resolve) => {
 // Use a ref for settingsLoaded to avoid HMR resets if possible,
 // but for now let's just make sure it's reliable.
 let settingsLoadedGlobal = false;
-let paneDir = "";
+
+// Projects whose conversations are currently being loaded from SQLite.
+// Populated in Conversation.tsx before startTransition fires restoreConversation,
+// cleared inside the same transition after the store update. Prevents
+// unsubConversation from triggering save_conversation for data we just read.
+export const restoringProjects = new Set<string>();
 
 // --- Conversation persistence helpers ---
 
 interface PersistedConversation {
-  sessionId: string | null;
   model?: string | null;
   messages: ConversationMessage[];
+  startIndex?: number;
 }
 
-function precomputeProjectId(root: string): string {
-  const name = root.split("/").filter(Boolean).pop() || root;
-  return name.toLowerCase().replace(/[^a-z0-9]/g, "-");
-}
-
-function conversationPath(projectId: string): string {
-  return `${paneDir}/conversations/${projectId}.json`;
-}
+// --- Delta tracking for conversation persistence ---
+//
+// Tracks the last persisted message array index per project so we only send
+// new/modified messages over IPC, instead of the entire conversation array
+// every time. Uses array index instead of message ID — avoids O(n) findIndex
+// scan and the fallback-to-full-array bug when context window trims messages
+// from the front (the index is adjusted naturally by array length changes).
+// Combined with debouncing, this eliminates main-process event loop blocking
+// that causes 15-second UI freezes in deep sessions.
+const lastPersistedMessageIndex = new Map<string, number>();
+const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const DEBOUNCE_MS = 500;
 
 async function saveConversation(
   projectId: string,
   conversation: PersistedConversation,
 ): Promise<void> {
-  if (!paneDir) return;
-  // All JSON.stringify / compaction happens in the main process (Node.js),
-  // so the renderer main thread is never blocked.
-  await saveConversationToMain(conversationPath(projectId), conversation);
+  // Passes projectId directly — main process owns storage (SQLite).
+  await saveConversationToMain(projectId, conversation);
 }
 
-async function loadConversation(
-  projectId: string,
-): Promise<PersistedConversation | null> {
-  if (!paneDir) return null;
-  try {
-    const content = await readFile(conversationPath(projectId));
-    
-    // Check file size before parsing
-    const fileSize = content.length;
-    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
-    
-    if (fileSize > MAX_FILE_SIZE) {
-      console.warn(`[persistence] Conversation file is ${fileSize} bytes, exceeding 5MB limit`);
-      console.log(`[persistence] Attempting to compact before loading...`);
-      
-      // Try to parse and compact the conversation
-      try {
-        const parsed = JSON.parse(content.trim()) as PersistedConversation;
-        
-        if (parsed.messages && parsed.messages.length > 100) {
-          console.log(`[persistence] Compacting ${parsed.messages.length} messages to 100 most recent`);
-          parsed.messages = parsed.messages.slice(-100);
-          
-          // Save the compacted version
-          await saveConversation(projectId, parsed);
-          console.log(`[persistence] Compacted conversation saved`);
-          
-          return parsed;
-        }
-      } catch (parseErr) {
-        console.error(`[persistence] Failed to parse large conversation file:`, parseErr);
-        
-        // If we can't even parse it, try a more aggressive approach
-        console.log(`[persistence] Attempting emergency recovery by extracting messages...`);
-        
-        // Simple message extraction - find message objects in the file
-        const messageMatches = content.match(/\{"id":\s*"[^"]*"[^}]*"type":\s*"[^"]*"[^}]*"content":[^}]*\}/g);
-        if (messageMatches && messageMatches.length > 0) {
-          console.log(`[persistence] Found ${messageMatches.length} message objects`);
-          
-          // Try to parse and keep only the last 50
-          const messages: ConversationMessage[] = [];
-          const startIdx = Math.max(0, messageMatches.length - 50);
-          
-          for (let i = startIdx; i < messageMatches.length; i++) {
-            const match = messageMatches[i];
-            if (!match) continue; // Safety check
-            
-            try {
-              const msg = JSON.parse(match) as ConversationMessage;
-              messages.push(msg);
-            } catch {
-              // Skip invalid messages
-            }
-          }
-          
-          if (messages.length > 0) {
-            console.log(`[persistence] Recovered ${messages.length} messages`);
-            
-            // Try to extract model from the original content if possible
-            let model: string | null = null;
-            try {
-              const fullParse = JSON.parse(content.trim()) as { model?: string };
-              model = fullParse?.model || null;
-            } catch {
-              // Can't parse full content, model will be null
-            }
-            
-            const recovered: PersistedConversation = {
-              sessionId: null,
-              model: model,
-              messages: messages
-            };
-            
-            // Save the recovered version
-            await saveConversation(projectId, recovered);
-            console.log(`[persistence] Recovered conversation saved`);
-            
-            return recovered;
-          }
-        }
-        
-        return null;
-      }
-    }
-    
-    // File is within limits, parse normally
-    return JSON.parse(content.trim()) as PersistedConversation;
-  } catch (err) {
-    console.error(`[persistence] Failed to load conversation for ${projectId}:`, err);
-    return null;
-  }
+/**
+ * Save only messages that have changed since the last persist.
+ *
+ * Tracks the array INDEX of the last persisted message. Starts from that
+ * index (inclusive) on the next save to cover in-place streaming updates.
+ *
+ * If the array was trimmed from the front (context window management) and
+ * the saved index is now >= messages.length, falls back to 0. This is rare
+ * — only happens once per context window edge, not on every save cycle.
+ */
+function saveConversationDelta(projectId: string): void {
+  const ps = useProjectsStore.getState();
+  const p = ps.projects.get(projectId);
+  if (!p) return;
+
+  const messages = p.conversation.messages;
+  const lastIdx = lastPersistedMessageIndex.get(projectId) ?? -1;
+
+  // Start from the last persisted index (inclusive) to cover in-place
+  // streaming updates. If index is out of range (trimming happened),
+  // start from the beginning of the current array.
+  const sliceStart = (lastIdx >= 0 && lastIdx < messages.length) ? lastIdx : 0;
+  const delta = messages.slice(sliceStart);
+  if (delta.length === 0) return;
+
+  saveConversation(projectId, {
+    model: p.conversation.model,
+    messages: delta,
+    startIndex: p.conversation.historyStartIndex,
+  })
+    .then(() => {
+      // Store the array index of the last message in this delta
+      lastPersistedMessageIndex.set(projectId, sliceStart + delta.length - 1);
+    })
+    .catch(() => {});
 }
+
 
 export function useSettingsPersistence() {
   const loadedRef = useRef(false);
@@ -167,12 +122,6 @@ export function useSettingsPersistence() {
         const ws = useWorkspaceStore.getState();
 
         // 1. Core UI settings
-        if (
-          settings.control_panel_visible !== undefined &&
-          !settings.control_panel_visible
-        ) {
-          ws.toggleControlPanel();
-        }
         if (settings.font_size) ws.setFontSize(settings.font_size);
         if (settings.panel_font_size)
           ws.setPanelFontSize(settings.panel_font_size);
@@ -182,202 +131,252 @@ export function useSettingsPersistence() {
         if (settings.keybindings)
           ws.setKeybindingsRaw(settings.keybindings as Partial<Record<ActionId, KeyBinding>>);
         if (settings.theme) ws.setTheme(settings.theme as Theme);
-        if (settings.panel_width) ws.setControlPanelWidth(settings.panel_width);
         if (settings.completion_sound)
           ws.setCompletionSound(settings.completion_sound);
 
         // 2. Provider & Model state
-        const backend =
-          (settings.punk_backend === "cli"
-            ? "gemini-cli"
-            : settings.punk_backend) || "http";
+        const backend = settings.punk_backend || "api";
         ws.setPunkBackend(backend);
 
         if (settings.http_provider) ws.setHttpProvider(settings.http_provider);
 
-        // API keys & Base URLs
+        // API keys, Base URLs, disabled providers
         const apiKeys: Record<string, string> = settings.http_api_keys || {};
-        // Only use the legacy single key if the map doesn't already have one for that provider
-        const provider = settings.http_provider || "deepseek";
-        if (settings.http_api_key && !apiKeys[provider]) {
-          apiKeys[provider] = settings.http_api_key;
-        }
         ws.setHttpApiKeys(apiKeys);
         ws.setHttpBaseUrls(settings.http_base_urls || {});
+        if (settings.disabled_providers) ws.setDisabledProviders(settings.disabled_providers);
+        if (settings.curated_models) ws.setCuratedModels(settings.curated_models);
 
         // Model restoration
         if (settings.selected_model) {
-          let model = settings.selected_model;
-          if (model === "gemini-2.5-pro" || model === "gemini-1.5-pro-latest")
-            model = "gemini-3.1-pro-preview";
-          if (
-            model === "gemini-2.5-flash" ||
-            model === "gemini-1.5-flash-latest"
-          )
-            model = "gemini-3-flash-preview";
-
-          // Determine correct provider for the model
-          let provider =
-            settings.selected_model_provider || ws.selectedModelProvider;
-
-          // Validate that provider matches model
-          // Check if model belongs to a different provider than what's saved
-          for (const [prov, models] of Object.entries(PROVIDER_MODELS)) {
-            if (models.some((m: { value: string; label: string }) => m.value === model)) {
-              // Found the correct provider for this model
-              if (provider !== prov) {
-                console.warn(
-                  `[settings] Correcting provider mismatch: model "${model}" belongs to provider "${prov}" but settings has "${provider}"`,
-                );
-                provider = prov;
-              }
-              break;
-            }
-          }
-
-          ws.setSelectedModel(model, false, provider);
+          ws.setSelectedModel(
+            settings.selected_model,
+            false,
+            settings.selected_model_provider || ws.selectedModelProvider,
+          );
         }
 
-        // 3. Routing Migration & Validation
-        const rawRouting = settings.intent_routing as unknown as BackendRouting | IntentRouting | null;
-        const healedRouting: BackendRouting = JSON.parse(
-          JSON.stringify(DEFAULT_BACKEND_ROUTING),
-        );
+        // 3. Routing restore — flat PowerCombo { thinking, execution }
+        //    Migration path: old format was keyed by backend ("api", "claude-code", "gemini")
+        const rawCombo = settings.power_combo as Record<string, unknown> | undefined;
+        const legacyRouting = settings.intent_routing as Record<string, unknown> | undefined;
+        let restoredCombo: PowerCombo | null = null;
 
-        if (rawRouting) {
-          const isLegacyFlat =
-            'plan' in rawRouting &&
-            'execute' in rawRouting &&
-            !('http' in rawRouting) &&
-            !('gemini-cli' in rawRouting);
-
-          if (isLegacyFlat) {
-            // Assign legacy settings to the active backend
-            // rawRouting is IntentRouting here, not BackendRouting
-            healedRouting[backend] = { 
-              plan: (rawRouting as IntentRouting).plan,
-              execute: (rawRouting as IntentRouting).execute,
-              explain: (rawRouting as IntentRouting).explain,
-              other: (rawRouting as IntentRouting).other,
-            };
-          } else {
-            // Merge existing backend maps into our canonical defaults
-            const backendRouting = rawRouting as BackendRouting;
-            for (const key of Object.keys(backendRouting)) {
-              const normalizedKey = key === "cli" ? "gemini-cli" : key;
-              if (healedRouting[normalizedKey]) {
-                healedRouting[normalizedKey] = {
-                  ...healedRouting[normalizedKey],
-                  ...backendRouting[key],
-                };
-              }
-            }
+        if (rawCombo?.thinking && rawCombo?.execution) {
+          // New flat format
+          restoredCombo = rawCombo as unknown as PowerCombo;
+        } else if (rawCombo && typeof rawCombo === "object") {
+          // Old keyed format — pick the most specific key available
+          const keyed = (rawCombo["claude-code"] || rawCombo["api"] || rawCombo["gemini"]) as Record<string, unknown> | undefined;
+          if (keyed?.thinking && keyed?.execution) restoredCombo = keyed as unknown as PowerCombo;
+        } else if (legacyRouting) {
+          // Oldest format: 4-slot intent_routing
+          const r = (legacyRouting["claude-code"] || legacyRouting["api"]) as Record<string, unknown> | undefined;
+          if (r?.plan && r?.execute) {
+            restoredCombo = { thinking: r.plan as PowerCombo["thinking"], execution: r.execute as PowerCombo["execution"] };
           }
-
-          // Strict Validation: Ensure gemini-cli only uses auto- models
-          ["plan", "execute", "explain", "other"].forEach((intent) => {
-            const r =
-              healedRouting["gemini-cli"]?.[intent as keyof IntentRouting];
-
-            if (r && r.provider === "gemini" && !r.model.startsWith("auto-")) {
-              if (r.model.includes("pro")) r.model = "auto-gemini-3";
-              else r.model = "auto-gemini-3";
-            }
-          });
         }
-        useWorkspaceStore.setState({ intentRouting: healedRouting });
+
+        useWorkspaceStore.setState({ powerCombo: restoredCombo ?? DEFAULT_POWER_COMBO });
 
         if (settings.intent_auto_route !== undefined) {
-          ws.setIntentAutoRoute(settings.intent_auto_route);
+          ws.setAutoEscalate(settings.intent_auto_route);
         }
 
-        // 4. Project & Conversation restoration
-        const { addProject, setActiveProject, toggleDir } =
+        // 4. Project restoration — conversations load lazily in Conversation.tsx
+        const { addProject, setActiveProject, markRootMissing } =
           useProjectsStore.getState();
 
+        // project_ids maps root path → stable ID.
+        // On first launch after this update, existing projects won't have entries
+        // here. We fall back to the OLD derived-ID formula so their data
+        // (SQLite rows, memory files, brain graph) stays intact. New projects
+        // added after this update get real UUIDs.
+        const projectIds: Record<string, string> = settings.project_ids ?? {};
+
+        /** Reproduce the pre-UUID derived ID from a root path. */
+        function deriveOldId(root: string): string {
+          const name = root.split("/").filter(Boolean).pop() || root;
+          return name.toLowerCase().replace(/[^a-z0-9]/g, "-");
+        }
+
         if (settings.project_roots?.length > 0) {
-          paneDir = `${await getHomeDir()}/.pane`;
-          const preloaded = await Promise.all(
-            settings.project_roots.map(async (root: string) => {
-              const tentativeId = precomputeProjectId(root);
-              const saved = await loadConversation(tentativeId).catch(
-                () => null,
-              );
-              console.log(`[persistence] preloaded project ${tentativeId} from ${root}, hasSaved=${!!saved}, msgCount=${saved?.messages.length || 0}`);
-              return { root, saved };
-            }),
-          );
-
           let activeId: string | null = null;
-          const projectIds: string[] = [];
-          for (const { root, saved } of preloaded) {
-            const tentativeId = precomputeProjectId(root);
-            const id = addProject(root); // Returns the actual ID used in the store
-            projectIds.push(id);
-            if (root === settings.active_project_root) activeId = id;
+          const projectIds_: Record<string, string> = { ...projectIds };
+          const projectEntries: Array<{ id: string; root: string }> = [];
+          // Track which projects need migration: { root, oldId, newId }
+          const toMigrate: Array<{ root: string; oldId: string; newId: string }> = [];
 
-            console.log(`[persistence] project ${root}: tentativeId=${tentativeId}, actualId=${id}, hasSaved=${!!saved}`);
-
-            const ps = useProjectsStore.getState();
-            if (saved && saved.messages.length > 0) {
-              // Deduplicate by message ID (persisted data may have duplicates from prior bugs)
-              const seen = new Set<string>();
-              const dedupedMessages = saved.messages.filter((m: { id: string }) => {
-                if (seen.has(m.id)) return false;
-                seen.add(m.id);
-                return true;
-              });
-              console.log(`[persistence] restoring conversation for ${id} (saved messages: ${saved.messages.length}, deduped: ${dedupedMessages.length})`);
-              ps.restoreConversation(id, dedupedMessages, saved.sessionId);
-              if (saved.model) {
-                ps.setConversationModel(id, saved.model);
-              }
-              listCheckpoints(id)
-                .then((metas) => {
-                  if (metas.length > 0) ps.setCheckpoints(id, metas);
-                })
-                .catch(() => {});
+          for (const root of settings.project_roots as string[]) {
+            if (projectIds_[root]) {
+              // Already has a stable ID — no migration needed
+              const id = addProject(root, projectIds_[root]);
+              projectEntries.push({ id, root });
+              if (root === settings.active_project_root) activeId = id;
+            } else {
+              // First launch after the update — derive the old ID, generate a UUID,
+              // and queue a migration so all data moves to the UUID atomically.
+              const oldId = deriveOldId(root);
+              const newId = (typeof crypto !== "undefined" && crypto.randomUUID)
+                ? crypto.randomUUID()
+                : `proj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+              toMigrate.push({ root, oldId, newId });
+              // Load the project immediately with the old ID so the UI isn't
+              // blocked waiting for the async migration to finish.
+              const id = addProject(root, oldId);
+              projectEntries.push({ id, root });
+              if (root === settings.active_project_root) activeId = id;
             }
           }
+
           if (activeId) setActiveProject(activeId);
 
           // Mark all as restored AFTER the loops
-          for (const id of projectIds) {
+          for (const { id } of projectEntries) {
             useProjectsStore.getState().setConversationRestored(id, true);
           }
 
+          // Hydrate thread activity data from persisted state
+          const threadStates: Record<string, unknown> = await getAllThreadStates(projectEntries.map(e => e.id));
+          for (const [id, raw] of Object.entries(threadStates)) {
+            if (!raw) continue;
+            const state = raw as ThreadStateData;
+            if (!state.lastUserPromptText && !state.lastActivityAt) continue;
+            useProjectsStore.getState().setThreadActivity(id, {
+              lastUserPromptText: state.lastUserPromptText ?? null,
+              lastResponseSummary: state.lastResponseSummary ?? null,
+              lastActivityAt: state.lastActivityAt ?? null,
+            });
+          }
+
+          // Run migrations in the background — swap each project from its old
+          // derived ID to a real UUID. The project is already loaded and usable
+          // with the old ID; after migration completes we swap the store entry
+          // to the UUID and write the updated project_ids to disk.
+          if (toMigrate.length > 0) {
+            Promise.all(
+              toMigrate.map(async ({ root, oldId, newId }) => {
+                const result = await migrateProjectId(oldId, newId).catch(() => ({ success: false }));
+                if (result.success) {
+                  // Swap the store: rebind from oldId → newId so subsequent
+                  // data writes (conversations, brain, etc.) use the UUID.
+                  useProjectsStore.getState().migrateProjectId(oldId, newId);
+                  projectIds_[root] = newId;
+                } else {
+                  // Migration failed — keep the old derived ID as a stable
+                  // fallback. It'll be retried on the next launch.
+                  projectIds_[root] = oldId;
+                }
+              })
+            ).then(() => {
+              saveSettings({ project_ids: projectIds_ }).catch(() => {});
+              // Path-existence check after migration so we use final IDs
+              _checkMissingRoots(projectEntries.map(({ root }) => ({
+                id: projectIds_[root]!,
+                root,
+              })));
+            }).catch(() => {});
+          } else if (JSON.stringify(projectIds_) !== JSON.stringify(projectIds)) {
+            // No migrations needed but projectIds_ may have changed (e.g. a
+            // write-back from a previous partial run). Persist it.
+            saveSettings({ project_ids: projectIds_ }).catch(() => {});
+            _checkMissingRoots(projectEntries);
+          } else {
+            _checkMissingRoots(projectEntries);
+          }
+
+          function _checkMissingRoots(entries: Array<{ id: string; root: string }>) {
+            Promise.all(
+              entries.map(async ({ id, root }) => {
+                const exists = await checkPathExists(root).catch(() => true);
+                if (!exists) markRootMissing(id, true);
+              })
+            ).catch(() => {});
+          }
+
           const restoreProjectState = (idx: number) => {
-            if (idx >= projectIds.length) return;
-            const id = projectIds[idx]!;
-            const root = settings.project_roots[idx]!;
+            if (idx >= projectEntries.length) return;
+            const { id, root } = projectEntries[idx]!;
             const state: ProjectSessionState | undefined =
               settings.project_states?.[root];
 
             if (state) {
-              for (const dir of state.expanded_dirs) toggleDir(id, dir);
-              if (state.recent_files?.length) {
-                useProjectsStore.setState((s) => {
-                  const proj = s.projects.get(id);
-                  if (!proj) return s;
-                  const next = new Map(s.projects);
-                  next.set(id, { ...proj, recentFiles: state.recent_files! });
-                  return { projects: next };
-                });
-              }
-              if (state.scroll_positions) {
-                useProjectsStore.setState((s) => {
-                  const proj = s.projects.get(id);
-                  if (!proj) return s;
-                  const next = new Map(s.projects);
-                  next.set(id, {
-                    ...proj,
-                    scrollPositions: new Map(
-                      Object.entries(state.scroll_positions!),
-                    ),
-                  });
-                  return { projects: next };
-                });
-              }
+              // Batch all sync mutations into ONE setState() instead of 8+
+              // individual calls — each separate call triggers Zustand's full
+              // subscriber cascade (computeStructuralKey, re-renders, etc.).
+              restoringProjects.add(id);
+              useProjectsStore.setState((s) => {
+                let proj = s.projects.get(id);
+                if (!proj) return s;
+                let updated = { ...proj };
+
+                // name
+                if (state.name) updated.name = state.name;
+
+                // expanded dirs
+                if (state.expanded_dirs?.length) {
+                  const nextDirs = new Set(updated.expandedDirs);
+                  for (const dir of state.expanded_dirs) nextDirs.add(dir);
+                  updated.expandedDirs = nextDirs;
+                }
+
+                // recent files
+                if (state.recent_files?.length) {
+                  updated.recentFiles = state.recent_files;
+                }
+
+                // scroll positions
+                if (state.scroll_positions) {
+                  updated.scrollPositions = new Map(
+                    Object.entries(state.scroll_positions),
+                  );
+                }
+
+                // power combo
+                if (state.power_combo) {
+                  updated.powerCombo = state.power_combo;
+                }
+
+                // auto-escalate
+                if (state.auto_escalate !== undefined) {
+                  updated.autoEscalate = state.auto_escalate;
+                }
+
+                // selected model
+                if (state.selected_model) {
+                  updated.selectedModel = state.selected_model;
+                  updated.selectedModelThinking = state.selected_model_thinking ?? false;
+                  updated.selectedModelProvider = state.selected_model_provider;
+                }
+
+                // archived — also handle activeProjectId if this was the active project
+                if (state.archived) {
+                  updated.archived = true;
+                  const nextProjects = new Map(s.projects);
+                  nextProjects.set(id, updated);
+                  let active = s.activeProjectId;
+                  const newActive = active === id
+                    ? s.projectOrder.find((oid) => {
+                        const other = s.projects.get(oid);
+                        return other && !other.archived && oid !== id;
+                      }) ?? null
+                    : active;
+                  return { projects: nextProjects, activeProjectId: newActive };
+                }
+
+                const nextProjects = new Map(s.projects);
+                nextProjects.set(id, updated);
+                return { projects: nextProjects };
+              });
+
+              // Re-store individual setting setters for side effects that aren't
+              // covered by the batched setState above (e.g. `renameProject` also
+              // updates conversation meta). These fire store subscribers again,
+              // but we're inside restoringProjects so the structural key and
+              // conversation persistence subscribers bail out.
+              if (state.name) useProjectsStore.getState().renameProject(id, state.name);
+
+              // Handle active_file_path asynchronously — can't batch this
               if (state.active_file_path) {
                 readFile(state.active_file_path)
                   .then((content) => {
@@ -388,8 +387,14 @@ export function useSettingsPersistence() {
                   .catch(() => {});
               }
             }
-            if (idx + 1 < projectIds.length) {
+            restoringProjects.delete(id);
+            if (idx + 1 < projectEntries.length) {
               requestIdleCallback(() => restoreProjectState(idx + 1));
+            } else {
+              // Restore chain complete — clearing restoringProjects lets the
+              // unsubProjects subscriber run on the next store update, which
+              // will recompute the structural key and save if needed.
+              restoringProjects.clear();
             }
           };
           requestIdleCallback(() => restoreProjectState(0));
@@ -405,28 +410,6 @@ export function useSettingsPersistence() {
         savingDisabled.current = false;
         resolveAppReady();
 
-        brainGetProfile()
-          .then(({ profile }) => {
-            if (profile?.identity) {
-              const ws = useWorkspaceStore.getState();
-              if (profile.identity.name)
-                ws.setProfileName(profile.identity.name);
-              if (profile.identity.bio) ws.setProfileBio(profile.identity.bio);
-              if (profile.identity.role)
-                ws.setProfileRole(profile.identity.role);
-            }
-          })
-          .catch(() => {});
-
-        brainGetAvatar()
-          .then(({ base64, mime }) => {
-            if (base64 && mime) {
-              useWorkspaceStore
-                .getState()
-                .setProfileAvatarDataUrl(`data:${mime};base64,${base64}`);
-            }
-          })
-          .catch(() => {});
       })
       .catch((err) => {
         console.error("[persistence] Load failed:", err);
@@ -447,23 +430,32 @@ export function useSettingsPersistence() {
 
       const project_roots: string[] = [];
       const project_states: Record<string, ProjectSessionState> = {};
+      const project_ids: Record<string, string> = {};
 
       for (const id of ps.projectOrder) {
         const p = ps.projects.get(id);
         if (!p) continue;
         project_roots.push(p.root);
+        project_ids[p.root] = p.id; // always persist the stable ID
         project_states[p.root] = {
+          name: p.name,
           expanded_dirs: Array.from(p.expandedDirs),
           active_file_path: p.activeFilePath,
           recent_files: p.recentFiles,
           scroll_positions: Object.fromEntries(p.scrollPositions.entries()),
+          power_combo: p.powerCombo,
+          auto_escalate: p.autoEscalate,
+          selected_model: p.selectedModel,
+          selected_model_provider: p.selectedModelProvider,
+          selected_model_thinking: p.selectedModelThinking,
+          archived: p.archived ?? false,
         };
       }
 
       saveSettings({
         project_roots,
         active_project_root: activeProject?.root ?? null,
-        control_panel_visible: ws.controlPanelVisible,
+        project_ids,
         project_states,
         font_size: ws.fontSize,
         panel_font_size: ws.panelFontSize,
@@ -471,7 +463,6 @@ export function useSettingsPersistence() {
         font_weight: ws.fontWeight,
         keybindings: ws.keybindings,
         theme: ws.theme,
-        panel_width: ws.controlPanelWidth,
         completion_sound: ws.completionSound,
         selected_model: ws.selectedModel,
         selected_model_provider: ws.selectedModelProvider,
@@ -480,8 +471,10 @@ export function useSettingsPersistence() {
         http_provider: ws.httpProvider,
         http_api_keys: ws.httpApiKeys,
         http_base_urls: ws.httpBaseUrls,
-        intent_routing: ws.intentRouting as BackendRouting,
-        intent_auto_route: ws.intentAutoRoute,
+        disabled_providers: ws.disabledProviders,
+        curated_models: ws.curatedModels,
+        power_combo: ws.powerCombo,
+        intent_auto_route: ws.autoEscalate,
       }).catch((err) => console.error("[persistence] Save failed:", err));
     };
 
@@ -494,8 +487,8 @@ export function useSettingsPersistence() {
     const unsubWorkspace = useWorkspaceStore.subscribe((state, prev) => {
       // Deep comparison for routing to avoid unnecessary saves but capture changes
       const routingChanged =
-        JSON.stringify(state.intentRouting) !==
-        JSON.stringify(prev.intentRouting);
+        JSON.stringify(state.powerCombo) !==
+        JSON.stringify(prev.powerCombo);
       const keysChanged =
         JSON.stringify(state.httpApiKeys) !== JSON.stringify(prev.httpApiKeys);
       const urlsChanged =
@@ -509,8 +502,6 @@ export function useSettingsPersistence() {
         state.fontWeight !== prev.fontWeight ||
         state.keybindings !== prev.keybindings ||
         state.theme !== prev.theme ||
-        state.controlPanelWidth !== prev.controlPanelWidth ||
-        state.controlPanelVisible !== prev.controlPanelVisible ||
         state.completionSound !== prev.completionSound ||
         state.selectedModel !== prev.selectedModel ||
         state.selectedModelProvider !== prev.selectedModelProvider ||
@@ -519,7 +510,8 @@ export function useSettingsPersistence() {
         routingChanged ||
         keysChanged ||
         urlsChanged ||
-        state.intentAutoRoute !== prev.intentAutoRoute
+        state.autoEscalate !== prev.autoEscalate ||
+        state.curatedModels !== prev.curatedModels
       ) {
         debouncedSave();
       }
@@ -534,7 +526,7 @@ export function useSettingsPersistence() {
         const p = state.projects.get(id);
         if (!p) continue;
         parts.push(
-          `${id}:${p.expandedDirs.size}:${p.activeFilePath ?? ""}:${p.mode}`,
+          `${id}:${p.name}:${p.expandedDirs.size}:${p.activeFilePath ?? ""}:${p.mode}`,
         );
       }
       return parts.join("|");
@@ -542,6 +534,9 @@ export function useSettingsPersistence() {
     lastStructuralKey = computeStructuralKey(useProjectsStore.getState());
 
     const unsubProjects = useProjectsStore.subscribe((state) => {
+      // Skip while restore cascade is running — avoids O(N) iteration over
+      // ALL projects on every batch store update during startup.
+      if (restoringProjects.size > 0) return;
       const key = computeStructuralKey(state);
       if (key !== lastStructuralKey) {
         lastStructuralKey = key;
@@ -556,32 +551,62 @@ export function useSettingsPersistence() {
         const pp = prev.projects.get(id);
         if (!p) continue;
 
-        // Save when message count changes or session finishes
+        // Skip while conversation is being loaded from SQLite. The
+        // restoringProjects set is populated in Conversation.tsx before
+        // startTransition fires and cleared after the store update completes.
+        if (restoringProjects.has(id)) continue;
+
+        // Save when message count changes or session finishes.
+        // Uses delta persistence (only new/modified messages) + debounce
+        // to avoid blocking the main process event loop for seconds at a time.
         const countChanged =
           p.conversation.messages.length !== pp?.conversation.messages.length;
         const finished =
           !p.conversation.isProcessing && pp?.conversation.isProcessing;
 
         if (countChanged || finished) {
-          saveConversation(id, {
-            sessionId: p.conversation.sessionId,
-            model: p.conversation.model,
-            messages: p.conversation.messages,
-          }).catch(() => {});
+          // Cancel any pending debounced save for this project
+          const existing = debounceTimers.get(id);
+          if (existing) clearTimeout(existing);
+
+          if (finished) {
+            // Flush immediately — the turn is done, persist final state now
+            saveConversationDelta(id);
+          } else {
+            // Debounce: accumulate changes within the window, save once
+            debounceTimers.set(
+              id,
+              setTimeout(() => saveConversationDelta(id), DEBOUNCE_MS),
+            );
+          }
         }
       }
     });
 
-    window.addEventListener("beforeunload", save);
+    const handleBeforeUnload = () => {
+      // Flush workspace state
+      save();
+      // Flush any pending conversation deltas
+      for (const [projectId, timer] of debounceTimers) {
+        clearTimeout(timer);
+        saveConversationDelta(projectId);
+      }
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
     const interval = setInterval(save, 60000);
 
     return () => {
       unsubWorkspace();
       unsubProjects();
       unsubConversation();
-      window.removeEventListener("beforeunload", save);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
       clearInterval(interval);
       if (debounceTimer) clearTimeout(debounceTimer);
+      // Clear debounce timers
+      for (const [, timer] of debounceTimers) {
+        clearTimeout(timer);
+      }
+      debounceTimers.clear();
       if (loadedRef.current) save();
     };
   }, []);

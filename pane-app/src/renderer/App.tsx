@@ -1,10 +1,8 @@
-import { useEffect, useCallback } from "react";
+import { useEffect } from "react";
 import { setWindowTitle, destroyPty } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
-import { ControlPanel } from "./components/ControlPanel/ControlPanel";
+import { ThreadPanel } from "./components/ThreadPanel/ThreadPanel";
 import { Workspace } from "./components/Workspace/Workspace";
-import { FuzzyFinder } from "./components/FuzzyFinder/FuzzyFinder";
-import { FileSearch } from "./components/FileSearch/FileSearch";
 import { TaskNotification } from "./components/shared/TaskNotification";
 import { useWorkspaceStore } from "./stores/workspace";
 import { useProjectsStore } from "./stores/projects";
@@ -12,71 +10,26 @@ import { useFileWatcher } from "./hooks/useFileWatcher";
 import { useGitStatus } from "./hooks/useGitStatus";
 import { useSettingsPersistence } from "./hooks/useSettingsPersistence";
 
-function ResizeHandle() {
-  const handlePointerDown = useCallback((e: React.PointerEvent) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startWidth = useWorkspaceStore.getState().controlPanelWidth;
-
-    const handlePointerMove = (e: PointerEvent) => {
-      const newWidth = startWidth + (e.clientX - startX);
-      useWorkspaceStore.getState().setControlPanelWidth(newWidth);
-    };
-
-    const handlePointerUp = () => {
-      document.removeEventListener("pointermove", handlePointerMove);
-      document.removeEventListener("pointerup", handlePointerUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("pointermove", handlePointerMove);
-    document.addEventListener("pointerup", handlePointerUp);
-  }, []);
-
-  return (
-    <div
-      onPointerDown={handlePointerDown}
-      data-no-drag
-      className="w-1.5 shrink-0 cursor-col-resize hover:bg-pane-text/[0.06]
-                 flex items-center justify-center relative z-20"
-    >
-      <div className="w-[2px] h-8 bg-transparent group-hover:bg-pane-border" />
-    </div>
-  );
-}
-
 function App() {
-  const controlPanelVisible = useWorkspaceStore((s) => s.controlPanelVisible);
-  const controlPanelWidth = useWorkspaceStore((s) => s.controlPanelWidth);
-  const toggleControlPanel = useWorkspaceStore((s) => s.toggleControlPanel);
-  const toggleFuzzyFinder = useWorkspaceStore((s) => s.toggleFuzzyFinder);
-  const fuzzyFinderOpen = useWorkspaceStore((s) => s.fuzzyFinderOpen);
-  const toggleFileSearch = useWorkspaceStore((s) => s.toggleFileSearch);
-  const fileSearchOpen = useWorkspaceStore((s) => s.fileSearchOpen);
-  const toggleMind = () => useWorkspaceStore.getState().toggleOverlay("mind");
+  // Sidebar visibility derived from active mode — shown only in conversation mode.
+  // When no project exists (empty state), sidebar is visible to show the thread list.
+  const sidebarVisible = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.mode === "conversation" : true;
+  });
+  const toggleMind = () => {
+    const { activeProjectId, setMode } = useProjectsStore.getState();
+    if (activeProjectId) setMode(activeProjectId, "mind");
+  };
 
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
-
-  const claudeUpdateState = useWorkspaceStore((s) => s.claudeUpdateState);
-  const triggerClaudeUpdate = useWorkspaceStore((s) => s.triggerClaudeUpdate);
-  const geminiUpdateState = useWorkspaceStore((s) => s.geminiUpdateState);
-  const triggerGeminiUpdate = useWorkspaceStore((s) => s.triggerGeminiUpdate);
-
-  const showUpdate = !!claudeUpdateState || !!geminiUpdateState;
 
   useFileWatcher();
   useGitStatus();
   useSettingsPersistence();
 
-  // Check for updates and fetch models on app launch
+  // Fetch models on app launch
   useEffect(() => {
-    useWorkspaceStore.getState().checkForClaudeUpdate();
-    useWorkspaceStore.getState().checkForGeminiUpdate();
-    
-    // Initial fetch of models (cached or background)
     useWorkspaceStore.getState().fetchAllModels();
   }, []);
 
@@ -89,6 +42,9 @@ function App() {
     setWindowTitle(title).catch(console.error);
   }, [activeProjectId]);
 
+  // Notify punks when the user opens or switches to a project so they can
+  // Punks are now on-demand via Lens review — no proactive scheduling needed.
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Cmd+M — toggle Mind (hardcoded, not rebindable)
@@ -99,12 +55,22 @@ function App() {
       }
 
       // Cmd+1-9 — project switching (hardcoded, not rebindable)
+      // Sorted by lastActivityAt descending to match the visual order in ProjectList
       if ((e.metaKey || e.ctrlKey) && e.key >= "1" && e.key <= "9") {
         const index = parseInt(e.key) - 1;
-        const { projectOrder, setActiveProject } = useProjectsStore.getState();
-        if (index < projectOrder.length) {
+        const state = useProjectsStore.getState();
+        const { projects, projectOrder, setActiveProject } = state;
+        const sortedOrder = [...projectOrder].sort((a, b) => {
+          const aTime = projects.get(a)?.lastActivityAt ?? null;
+          const bTime = projects.get(b)?.lastActivityAt ?? null;
+          if (aTime !== null && bTime !== null) return bTime - aTime;
+          if (aTime !== null) return -1;
+          if (bTime !== null) return 1;
+          return projectOrder.indexOf(a) - projectOrder.indexOf(b);
+        });
+        if (index < sortedOrder.length) {
           e.preventDefault();
-          setActiveProject(projectOrder[index]!);
+          setActiveProject(sortedOrder[index]!);
         }
         return;
       }
@@ -134,9 +100,15 @@ function App() {
       if (!finalAction) return;
 
       switch (finalAction) {
-        case "toggle-panel":
-          toggleControlPanel();
+        case "toggle-panel": {
+          // Cmd+B now goes to conversation mode — the conceptual equivalent of "showing the sidebar"
+          const { activeProjectId: pid, setMode: sm } = useProjectsStore.getState();
+          if (pid) {
+            sm(pid, "conversation");
+            requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-input")));
+          }
           break;
+        }
         case "toggle-mode": {
           const { activeProjectId, projects, toggleMode } =
             useProjectsStore.getState();
@@ -161,19 +133,28 @@ function App() {
           }
           break;
         }
-        case "fuzzy-finder":
-          toggleFuzzyFinder();
+        case "fuzzy-finder": {
+          const { activeProjectId: pid, projects, setMode: sm } = useProjectsStore.getState();
+          if (pid) {
+            sm(pid, projects.get(pid)?.mode === "search" ? "conversation" : "search");
+          }
           break;
-        case "file-search":
-          toggleFileSearch();
+        }
+        case "file-search": {
+          const { activeProjectId: pid2, projects: p2, setMode: sm2 } = useProjectsStore.getState();
+          if (pid2) {
+            sm2(pid2, p2.get(pid2)?.mode === "filesearch" ? "conversation" : "filesearch");
+          }
           break;
+        }
         case "focus-chat":
           window.dispatchEvent(new CustomEvent("pane:focus-input"));
           break;
         case "new-file": {
-          const ws = useWorkspaceStore.getState();
-          if (!ws.controlPanelVisible) {
-            ws.toggleControlPanel();
+          const { activeProjectId: pid2, projects, setMode: sm2 } = useProjectsStore.getState();
+          const project = pid2 ? projects.get(pid2) : null;
+          if (project?.mode !== "conversation") {
+            if (pid2) sm2(pid2, "conversation");
             setTimeout(
               () => window.dispatchEvent(new CustomEvent("pane:new-file")),
               100,
@@ -183,9 +164,11 @@ function App() {
           }
           break;
         }
-        case "settings":
-          useWorkspaceStore.getState().toggleOverlay("profile");
+        case "settings": {
+          const { activeProjectId, setMode } = useProjectsStore.getState();
+          if (activeProjectId) setMode(activeProjectId, "profile");
           break;
+        }
         case "cycle-theme":
           useWorkspaceStore.getState().toggleTheme();
           break;
@@ -195,7 +178,7 @@ function App() {
             ? projects.get(activeProjectId)
             : undefined;
           const target = e.target as HTMLElement;
-          const isInPanel = target.closest('[data-panel="control"]');
+          const isInPanel = target.closest('[data-panel="thread"]');
 
           if (isInPanel) {
             useWorkspaceStore.getState().increasePanelFontSize();
@@ -212,7 +195,7 @@ function App() {
             ? projects.get(activeProjectId)
             : undefined;
           const target = e.target as HTMLElement;
-          const isInPanel = target.closest('[data-panel="control"]');
+          const isInPanel = target.closest('[data-panel="thread"]');
 
           if (isInPanel) {
             useWorkspaceStore.getState().decreasePanelFontSize();
@@ -229,7 +212,7 @@ function App() {
             ? projects.get(activeProjectId)
             : undefined;
           const target = e.target as HTMLElement;
-          const isInPanel = target.closest('[data-panel="control"]');
+          const isInPanel = target.closest('[data-panel="thread"]');
 
           if (isInPanel) {
             useWorkspaceStore.getState().resetPanelFontSize();
@@ -309,110 +292,29 @@ function App() {
     // Capture phase so shortcuts fire before Ace editor eats them (e.g. Cmd+/)
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [toggleControlPanel, toggleFuzzyFinder, toggleFileSearch]);
+  }, []);
 
   return (
-    <div className="relative h-screen w-screen bg-pane-bg overflow-hidden">
-      {/* Full-width titlebar drag region — matches h-12 spacers + pt-2 padding */}
+    <div className="relative h-screen w-screen bg-pane-bg">
+      {/* Titlebar drag region — must stay at App root level for full-width coverage.
+           z-30 sits above active pages (z-20), below interactive headers (z-40).
+           Uses app-region: drag (not -webkit-app-region — dead since Chromium 118+).
+           No background needed — app-region works regardless of element opacity. */}
       <div
-        className="absolute top-0 left-0 right-0 h-[50px] z-10"
+        className="absolute top-0 left-0 right-0 h-[50px] z-30"
         data-tauri-drag-region
       />
-
       <div className="flex h-full pt-2 pb-2 pl-2 gap-1">
-        {controlPanelVisible && (
-          <>
-            <div className="shrink-0" style={{ width: controlPanelWidth }}>
-              <ControlPanel />
-            </div>
-            <ResizeHandle />
-          </>
+        {sidebarVisible && (
+          <div className="shrink-0 w-80">
+            <ThreadPanel />
+          </div>
         )}
         <div className="flex-1 min-w-0 pr-2 h-full relative">
-          {/* Update notification bar — positioned absolutely within workspace area */}
-          {showUpdate && (
-            <div className="absolute top-0 left-0 right-0 h-9 flex items-center justify-end px-4 z-40 pointer-events-none gap-2">
-              {/* Claude Update Pill */}
-              {claudeUpdateState && (
-                <div
-                  data-no-drag
-                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown"
-                >
-                  {claudeUpdateState === "available" && (
-                    <button
-                      onClick={() => triggerClaudeUpdate()}
-                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
-                      claude update available
-                    </button>
-                  )}
-                  {claudeUpdateState === "updating" && (
-                    <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
-                      installing claude...
-                    </span>
-                  )}
-                  {claudeUpdateState === "updated" && (
-                    <span className="text-[11px] font-mono text-pane-status-added">
-                      claude complete
-                    </span>
-                  )}
-                  {claudeUpdateState === "restart" && (
-                    <button
-                      onClick={() => window.location.reload()}
-                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
-                      restart claude
-                    </button>
-                  )}
-                </div>
-              )}
-
-              {/* Gemini Update Pill */}
-              {geminiUpdateState && (
-                <div
-                  data-no-drag
-                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-pane-bg/80 backdrop-blur-md ring-1 ring-pane-border/40 shadow-sm pointer-events-auto animate-fadeSlideDown"
-                >
-                  {geminiUpdateState === "available" && (
-                    <button
-                      onClick={() => triggerGeminiUpdate()}
-                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text-secondary hover:text-pane-text btn-press transition-colors"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-modified shrink-0 shadow-[0_0_8px_rgba(var(--pane-status-modified-rgb),0.4)]" />
-                      gemini update available
-                    </button>
-                  )}
-                  {geminiUpdateState === "updating" && (
-                    <span className="text-[11px] font-mono text-pane-text-secondary animate-pulse">
-                      installing gemini...
-                    </span>
-                  )}
-                  {geminiUpdateState === "updated" && (
-                    <span className="text-[11px] font-mono text-pane-status-added">
-                      gemini complete
-                    </span>
-                  )}
-                  {geminiUpdateState === "restart" && (
-                    <button
-                      onClick={() => window.location.reload()}
-                      className="flex items-center gap-2 text-[11px] font-mono text-pane-text hover:text-pane-text-secondary btn-press transition-colors"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-pane-status-added shrink-0" />
-                      restart gemini
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
           <Workspace />
         </div>
       </div>
 
-      {fuzzyFinderOpen && <FuzzyFinder />}
-      {fileSearchOpen && <FileSearch />}
       <TaskNotification />
     </div>
   );

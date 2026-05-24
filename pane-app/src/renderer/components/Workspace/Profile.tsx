@@ -1,24 +1,31 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { useWorkspaceStore } from "../../stores/workspace";
+import { useProjectsStore } from "../../stores/projects";
 import { useShallow } from "zustand/react/shallow";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  THINKING_ENGINES,
-  BUILDING_ENGINES,
-  PROVIDER_MODELS,
   engineKey,
   DEFAULT_BACKEND_ROUTING,
   type EngineOption,
+  type PowerCombo,
   isThinkingModel,
   getContextWindowForModel,
 } from "../../lib/models";
 import {
-  brainUpdateIdentity,
-  brainSaveAvatar,
   brainGetProfile,
-  brainUpdateRules,
-  brainUpdatePhilosophy,
+  brainUpdateDNA,
   reinitializePunkBackend,
+  getBackendAvailability,
+  getClaudeAuthState,
+  cloudLogin,
+  cloudLogout,
+  cloudGetUser,
+  cloudGetStatus,
+  cloudTriggerBackup,
+  cloudRestore,
+  type ClaudeAuthState,
+  type CloudUser,
+  type CloudStatus,
 } from "../../lib/tauri-commands";
 import {
   ACTION_DEFINITIONS,
@@ -362,302 +369,430 @@ function KeybindingsSection() {
 // ─── AI Engines Section ───────────────────────────────────────────────────────
 
 function EngineSelect({
-  options,
   value,
   onChange,
-  openRouterModels = [],
+  allModels = {},
+  sdkModels = null,
   httpApiKeys = {},
+  disabledProviders = [],
+  curatedModels = [],
 }: {
-  options: EngineOption[];
   value: string;
   onChange: (opt: EngineOption) => void;
-  openRouterModels?: Array<{ id: string; name: string; context_length: number }>;
+  allModels?: Record<string, Array<{ id: string; name: string; context_length: number; input_cost?: number | null; output_cost?: number | null }>>;
+  sdkModels?: import("../../lib/punk-types").SdkModel[] | null;
   httpApiKeys?: Record<string, string>;
+  disabledProviders?: string[];
+  curatedModels?: string[];
 }) {
+  // Provider display labels
+  const providerLabel = useCallback((provider: string): string => {
+    const labels: Record<string, string> = {
+      anthropic: "Claude",
+      "anthropic-api": "Anthropic API",
+      gemini: "Gemini CLI",
+      "gemini-api": "Gemini API",
+      deepseek: "DeepSeek",
+      openrouter: "OpenRouter",
+      kimi: "Kimi",
+      stepfun: "StepFun",
+      xiaomi: "Xiaomi MiMo",
+    };
+    return labels[provider] || provider;
+  }, []);
+
   const groupedOptions = useMemo(() => {
     const groups: Record<string, EngineOption[]> = {};
+    const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini";
+    const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-code";
+    const hasCurated = curatedModels.length > 0;
 
-    // 1. Filter and group hardcoded options
-    options.forEach((opt) => {
-      // Check if provider has a key.
-      // Special-case: gemini provider is only shown if there's a key in httpApiKeys
-      // OR if we're in gemini-cli mode (where keys are managed by the CLI environment).
-      const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini-cli";
-      const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-cli";
-      if (!httpApiKeys?.[opt.provider] && !(isGeminiBackend && opt.provider === "gemini") && !(isClaudeBackend && opt.provider === "anthropic")) return;
+    const isDisabled = (p: string) => disabledProviders.includes(p);
 
-      if (!groups[opt.provider]) groups[opt.provider] = [];
-      groups[opt.provider]!.push(opt);
-    });
+    // Track native provider model IDs so OpenRouter can deduplicate
+    const nativeModelIds = new Set<string>();
 
-    // 2. Add OpenRouter if key exists
-    if (httpApiKeys["openrouter"]) {
-      const orGroup: EngineOption[] = [];
-      const hardcodedOr = PROVIDER_MODELS["openrouter"] || [];
-      
-      // If we have fetched models, use them as the source of truth for availability
-      if (openRouterModels.length > 0) {
-        // Map fetched models, merging with hardcoded ones if they match
-        openRouterModels.forEach((m) => {
-          const hardcoded = hardcodedOr.find((h) => h.value === m.id);
-          orGroup.push({
-            label: hardcoded ? hardcoded.label : m.name,
-            provider: "openrouter",
-            model: m.id,
-            // Use specialized thinking flag from hardcoded if it exists, otherwise guess
-            thinking: isThinkingModel(m.id),
-            requiresKey: "openrouter",
-            contextWindow: m.context_length || getContextWindowForModel("openrouter", m.id),
-          });
-        });
-      } else {
-        // Fallback to hardcoded list if fetch failed or hasn't run
-        hardcodedOr.forEach((m) => {
-          orGroup.push({
-            label: m.label,
-            provider: "openrouter",
-            model: m.value,
-            thinking: isThinkingModel(m.value),
-            requiresKey: "openrouter",
-            contextWindow: getContextWindowForModel("openrouter", m.value),
-          });
-        });
+    // Helper: look up pricing from allModels for a provider+id
+    const pricingFor = (provider: string, id: string) => {
+      const pm = allModels[provider]?.find((m) => m.id === id);
+      return { inputCost: pm?.input_cost ?? null, outputCost: pm?.output_cost ?? null };
+    };
+
+    // 1. Build anthropic group from SDK models (Claude Code backend) when available
+    if (sdkModels && sdkModels.length > 0 && !isDisabled("anthropic")) {
+      groups["anthropic"] = sdkModels.map((m) => {
+        nativeModelIds.add(m.value);
+        const pricing = pricingFor("anthropic", m.value);
+        return {
+          label: m.displayName || m.value,
+          provider: "anthropic",
+          model: m.value,
+          thinking: false,
+          requiresKey: "anthropic",
+          contextWindow: getContextWindowForModel("anthropic", m.value),
+          inputCost: pricing.inputCost,
+          outputCost: pricing.outputCost,
+        };
+      });
+    }
+
+    // 2. Build groups from dynamically fetched allModels (non-OpenRouter first)
+    for (const [provider, models] of Object.entries(allModels)) {
+      if (!models || models.length === 0) continue;
+      if (provider === "openrouter") continue;
+      if (groups[provider]) continue;
+      if (isDisabled(provider)) continue;
+
+      // Base provider for key lookup: "anthropic-api" → "anthropic"
+      const baseProvider = provider.replace(/-api$/, "");
+      const isUsable =
+        provider === "anthropic" ? isClaudeBackend :
+        provider === "gemini" ? isGeminiBackend :
+        !!httpApiKeys?.[baseProvider];
+      if (!isUsable) continue;
+
+      groups[provider] = models.map((m) => {
+        nativeModelIds.add(m.id);
+        return {
+          label: m.name || m.id,
+          provider,
+          model: m.id,
+          thinking: isThinkingModel(m.id),
+          requiresKey: provider,
+          contextWindow: m.context_length || getContextWindowForModel(provider, m.id),
+          inputCost: m.input_cost ?? null,
+          outputCost: m.output_cost ?? null,
+        };
+      });
+    }
+
+    // 3. OpenRouter — only show models NOT already available from native providers
+    const orModels = allModels["openrouter"];
+    if (orModels && orModels.length > 0 && !!httpApiKeys?.["openrouter"] && !isDisabled("openrouter")) {
+      const nativeProviderPrefixes = new Set<string>();
+      if (groups["anthropic"] || groups["anthropic-api"]) nativeProviderPrefixes.add("anthropic/");
+      if (groups["deepseek"]) nativeProviderPrefixes.add("deepseek/");
+      if (groups["xiaomi"]) nativeProviderPrefixes.add("xiaomi/");
+      if (groups["gemini"] || groups["gemini-api"]) { nativeProviderPrefixes.add("google/"); nativeProviderPrefixes.add("gemini/"); }
+
+      const filtered = orModels.filter((m) => {
+        for (const prefix of nativeProviderPrefixes) {
+          if (m.id.startsWith(prefix)) return false;
+        }
+        return true;
+      });
+
+      if (filtered.length > 0) {
+        groups["openrouter"] = filtered.map((m) => ({
+          label: m.name || m.id,
+          provider: "openrouter",
+          model: m.id,
+          thinking: isThinkingModel(m.id),
+          requiresKey: "openrouter",
+          contextWindow: m.context_length || getContextWindowForModel("openrouter", m.id),
+          inputCost: m.input_cost ?? null,
+          outputCost: m.output_cost ?? null,
+        }));
       }
-      
-      groups["openrouter"] = orGroup;
+    }
+
+    // Filter by curated models when set
+    if (hasCurated) {
+      const valueParts = value.split("::");
+      const currentModel = valueParts[1]; // already-selected model is always visible
+      for (const providerKey of Object.keys(groups)) {
+        const opts = groups[providerKey];
+        if (!opts) continue;
+        const filtered = opts.filter(
+          (opt) => curatedModels.includes(opt.model) || opt.model === currentModel
+        );
+        if (filtered.length === 0) {
+          delete groups[providerKey];
+        } else {
+          groups[providerKey] = filtered;
+        }
+      }
     }
 
     return groups;
-  }, [options, openRouterModels, httpApiKeys]);
+  }, [allModels, sdkModels, httpApiKeys, disabledProviders, curatedModels, value]);
+
+  const [isOpen, setIsOpen] = useState(false);
+
+  // Find currently selected option
+  const currentOption = useMemo(() => {
+    const parts = value.split("::");
+    const provider = parts[0];
+    const model = parts[1];
+    if (provider && model && groupedOptions[provider]) {
+      return groupedOptions[provider].find((o) => o.model === model) ?? null;
+    }
+    return null;
+  }, [value, groupedOptions]);
+
+  const handleSelect = (opt: EngineOption) => {
+    onChange(opt);
+    setIsOpen(false);
+  };
 
   return (
-    <select
-      value={value}
-      onChange={(e) => {
-        const parts = e.target.value.split("::");
-        const provider = parts[0];
-        const model = parts[1];
-        if (provider && model && provider in groupedOptions) {
-          const group = groupedOptions[provider];
-          if (group) {
-            const opt = group.find((o: EngineOption) => o.model === model);
-            if (opt) onChange(opt);
-          }
-        }
-      }}
-      className="px-3 py-1.5 rounded-xl font-mono bg-pane-surface text-pane-text border border-pane-border/40 hover:border-pane-border outline-none max-w-[220px]"
-      style={{ fontSize: "var(--pane-font-size-sm)" }}
+    <div
+      className={`rounded-md border transition-all duration-200 w-96 ${
+        isOpen
+          ? 'border-[var(--pane-border-soft)] bg-pane-bg/60'
+          : 'border-transparent hover:border-[var(--pane-border-soft)]'
+      }`}
     >
-      {Object.entries(groupedOptions).map(([provider, opts]) => (
-        <optgroup key={provider} label={provider} className="bg-pane-bg">
-          {opts.map((opt: EngineOption) => (
-            <option key={engineKey(opt)} value={engineKey(opt)}>
-              {opt.label}
-            </option>
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex items-center gap-1.5 text-pane-text-secondary font-mono hover:text-pane-text w-full text-left h-10 leading-none px-4"
+        style={{ fontSize: "var(--pane-font-size-sm)" }}
+      >
+        {currentOption ? (
+          <span className="flex-1 truncate flex items-center gap-1.5">
+            <span style={{ color: "var(--pane-accent)" }}>{providerLabel(currentOption.provider)}</span>
+            <span>{currentOption.label}</span>
+          </span>
+        ) : (
+          <span className="flex-1 truncate">select...</span>
+        )}
+      </button>
+
+      {isOpen && (
+        <div className="border-t border-[var(--pane-border-soft)] px-4 py-3 max-h-[400px] overflow-y-auto">
+          {Object.entries(groupedOptions).map(([provider, opts]) => (
+            <div key={provider}>
+              <div
+                className="font-mono text-pane-text-secondary/30 tracking-wider uppercase mb-1"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                {providerLabel(provider)}
+              </div>
+              {opts.map((opt: EngineOption) => {
+                const isSelected = engineKey(opt) === value;
+                const pricing = opt.inputCost != null && opt.outputCost != null
+                  ? ` · ${opt.inputCost}/${opt.outputCost}/M`
+                  : "";
+                return (
+                  <button
+                    key={engineKey(opt)}
+                    onClick={() => handleSelect(opt)}
+                    className={`w-full text-left px-4 py-1.5 font-mono transition-colors flex items-center gap-2 rounded-md ${
+                      isSelected
+                        ? "bg-pane-text/[0.08] text-pane-status-added"
+                        : "text-pane-text hover:bg-pane-text/[0.03]"
+                    }`}
+                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                  >
+                    <span className="truncate flex-1">{opt.label}</span>
+                    {pricing && (
+                      <span className="shrink-0 text-pane-text-secondary/30 whitespace-nowrap">
+                        {pricing}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
           ))}
-        </optgroup>
-      ))}
-    </select>
+        </div>
+      )}
+    </div>
   );
 }
 
-function AiEnginesSection({
+function PaneAutoSection({
   httpApiKeys,
 }: {
   httpApiKeys: Record<string, string>;
 }) {
-  const punkBackend = useWorkspaceStore((s) => s.punkBackend);
-  const routing = useWorkspaceStore(useShallow((s) => s.getEffectiveRouting()));
-  const openRouterModels = useWorkspaceStore((s) => s.openRouterModels);
+  const combo = useWorkspaceStore(useShallow((s) => s.getEffectiveCombo()));
+  const allModels = useWorkspaceStore((s) => s.allModels);
+  const sdkModels = useWorkspaceStore((s) => s.sdkModels);
+  const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
+  const curatedModels = useWorkspaceStore((s) => s.curatedModels);
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
 
-  // The provider that the current CLI backend authenticates natively —
-  // no HTTP API key needed for these (the CLI handles auth itself).
-  const nativeProvider =
-    punkBackend === "claude-cli" ? "anthropic" :
-    punkBackend === "gemini-cli" ? "gemini" :
-    null;
+  const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
+  const [geminiAvailable, setGeminiAvailable] = useState(false);
 
-  const filterEngines = useCallback(
-    (engines: EngineOption[]) =>
-      engines.filter((o) => {
-        // auto-* models are CLI-managed routing — only show for their native backend
-        if (o.model.startsWith("auto-")) return o.provider === nativeProvider;
-        // Native CLI provider: CLI handles auth, no HTTP key check needed
-        if (nativeProvider && o.provider === nativeProvider) return true;
-        // HTTP: show if the required API key is present
-        return o.provider === "openrouter" || !!httpApiKeys?.[o.provider];
-      }),
-    [nativeProvider, httpApiKeys],
-  );
+  useEffect(() => {
+    getBackendAvailability()
+      .then((availability) => {
+        setClaudeCodeAvailable(availability.claude);
+        setGeminiAvailable(availability.gemini);
+      })
+      .catch(() => {
+        setClaudeCodeAvailable(false);
+        setGeminiAvailable(false);
+      });
+  }, []);
 
-  const filteredThinking = useMemo(() => filterEngines(THINKING_ENGINES), [filterEngines]);
-  const filteredBuilding = useMemo(() => filterEngines(BUILDING_ENGINES), [filterEngines]);
+  // Build a flat list of all usable engines from dynamic data for auto-heal
+  const usableEngines = useMemo(() => {
+    const engines: EngineOption[] = [];
+    if (sdkModels && sdkModels.length > 0 && claudeCodeAvailable && !disabledProviders.includes("anthropic")) {
+      sdkModels.forEach((m) => engines.push({
+        label: m.displayName || m.value,
+        provider: "anthropic",
+        model: m.value,
+        thinking: false,
+        requiresKey: "anthropic",
+      }));
+    }
+    for (const [provider, models] of Object.entries(allModels)) {
+      if (!models || models.length === 0) continue;
+      if (provider === "anthropic" && engines.some((e) => e.provider === "anthropic")) continue;
+      const baseProvider = provider.replace(/-api$/, "");
+      const isUsable =
+        provider === "anthropic" ? claudeCodeAvailable :
+        provider === "gemini" ? geminiAvailable :
+        !!httpApiKeys?.[baseProvider];
+      if (!isUsable) continue;
+      if (disabledProviders.includes(provider)) continue;
+      models.forEach((m) => engines.push({
+        label: m.name || m.id,
+        provider,
+        model: m.id,
+        thinking: isThinkingModel(m.id),
+        requiresKey: provider,
+        contextWindow: m.context_length,
+      }));
+    }
+    return engines;
+  }, [allModels, sdkModels, claudeCodeAvailable, geminiAvailable, httpApiKeys, disabledProviders]);
 
-  const autoRoute = useWorkspaceStore((s) => s.intentAutoRoute);
-  const setIntentRouting = useWorkspaceStore((s) => s.setIntentRouting);
-  const setIntentAutoRoute = useWorkspaceStore((s) => s.setIntentAutoRoute);
+  const autoRoute = useWorkspaceStore((s) => s.autoEscalate);
+  const setPowerCombo = useWorkspaceStore((s) => s.setPowerCombo);
+  const setAutoEscalate = useWorkspaceStore((s) => s.setAutoEscalate);
+
+  // Sync combo changes to active project for per-project override
+  const syncComboToProject = useCallback((combo: PowerCombo) => {
+    const ps = useProjectsStore.getState();
+    const activeProjectId = ps.activeProjectId;
+    if (activeProjectId) {
+      ps.setProjectPowerCombo(activeProjectId, combo);
+    }
+  }, []);
+
+  const syncAutoRouteToProject = useCallback((auto: boolean) => {
+    const ps = useProjectsStore.getState();
+    const activeProjectId = ps.activeProjectId;
+    if (activeProjectId) {
+      ps.setProjectAutoEscalate(activeProjectId, auto);
+    }
+  }, []);
+
+  // Auto-heal: when availability changes, reset any combo slot pointing to an unusable provider.
+  useEffect(() => {
+    const isProviderUsable = (provider: string) => {
+      if (provider === "anthropic") return claudeCodeAvailable;
+      if (provider === "gemini") return geminiAvailable;
+      return !!httpApiKeys?.[provider];
+    };
+
+    const firstUsable = usableEngines[0];
+    if (!firstUsable) return;
+
+    const current = combo;
+    const updates: Partial<PowerCombo> = {};
+
+    if (current?.thinking && !isProviderUsable(current.thinking.provider)) {
+      updates.thinking = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
+    }
+    if (current?.execution && !isProviderUsable(current.execution.provider)) {
+      updates.execution = { provider: firstUsable.provider, model: firstUsable.model, thinking: firstUsable.thinking };
+    }
+
+    if (Object.keys(updates).length > 0) {
+      const healed = { ...current, ...updates } as PowerCombo;
+      setPowerCombo(healed);
+      syncComboToProject(healed);
+    }
+  }, [httpApiKeys, claudeCodeAvailable, geminiAvailable, syncComboToProject]);
 
   const handleThinkingChange = (opt: EngineOption) => {
     const isReasoningProvider =
-      opt.provider === "openrouter" ||
-      opt.provider === "kimi" ||
-      opt.provider === "deepseek";
-
-    const next = {
-      plan: {
-        provider: opt.provider,
-        model: opt.model,
-        thinking: opt.thinking || isReasoningProvider,
-      },
-      execute:
-        routing?.execute ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
-        DEFAULT_BACKEND_ROUTING["http"]!.execute,
-      explain:
-        routing?.explain ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
-        DEFAULT_BACKEND_ROUTING["http"]!.explain,
-      other:
-        routing?.other ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
-        DEFAULT_BACKEND_ROUTING["http"]!.other,
+      opt.provider === "openrouter" || opt.provider === "kimi" ||
+      opt.provider === "xiaomi" || opt.provider === "deepseek";
+    const newCombo: PowerCombo = {
+      thinking: { provider: opt.provider, model: opt.model, thinking: opt.thinking || isReasoningProvider },
+      execution: combo?.execution || DEFAULT_BACKEND_ROUTING["api"]!.execution,
     };
-    setIntentRouting(next);
-    reinitializePunkBackend(punkBackend).catch(() => {});
+    setPowerCombo(newCombo);
+    syncComboToProject(newCombo);
+    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleBuildingChange = (opt: EngineOption) => {
-    const next = {
-      plan:
-        routing?.plan ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
-        DEFAULT_BACKEND_ROUTING["http"]!.plan,
-      execute: {
-        provider: opt.provider,
-        model: opt.model,
-        thinking: opt.thinking,
-      },
-      explain:
-        routing?.explain ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
-        DEFAULT_BACKEND_ROUTING["http"]!.explain,
-      other:
-        routing?.other ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
-        DEFAULT_BACKEND_ROUTING["http"]!.other,
+    const newCombo: PowerCombo = {
+      thinking:  combo?.thinking  || DEFAULT_BACKEND_ROUTING["api"]!.thinking,
+      execution: { provider: opt.provider, model: opt.model, thinking: opt.thinking },
     };
-    setIntentRouting(next);
-    reinitializePunkBackend(punkBackend).catch(() => {});
-  };
-
-  const handleExplainChange = (opt: EngineOption) => {
-    const next = {
-      plan:
-        routing?.plan ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
-        DEFAULT_BACKEND_ROUTING["http"]!.plan,
-      execute:
-        routing?.execute ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
-        DEFAULT_BACKEND_ROUTING["http"]!.execute,
-      explain: {
-        provider: opt.provider,
-        model: opt.model,
-        thinking: opt.thinking,
-      },
-      other:
-        routing?.other ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.other ||
-        DEFAULT_BACKEND_ROUTING["http"]!.other,
-    };
-    setIntentRouting(next);
-    reinitializePunkBackend(punkBackend).catch(() => {});
-  };
-
-  const handleOtherChange = (opt: EngineOption) => {
-    const next = {
-      plan:
-        routing?.plan ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.plan ||
-        DEFAULT_BACKEND_ROUTING["http"]!.plan,
-      execute:
-        routing?.execute ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.execute ||
-        DEFAULT_BACKEND_ROUTING["http"]!.execute,
-      explain:
-        routing?.explain ||
-        DEFAULT_BACKEND_ROUTING[punkBackend]?.explain ||
-        DEFAULT_BACKEND_ROUTING["http"]!.explain,
-      other: {
-        provider: opt.provider,
-        model: opt.model,
-        thinking: opt.thinking,
-      },
-    };
-    setIntentRouting(next);
-    reinitializePunkBackend(punkBackend).catch(() => {});
+    setPowerCombo(newCombo);
+    syncComboToProject(newCombo);
+    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleAutoRouteToggle = () => {
-    setIntentAutoRoute(!autoRoute);
-    const { punkBackend } = useWorkspaceStore.getState();
-    reinitializePunkBackend(punkBackend).catch(() => {});
+    const next = !autoRoute;
+    setAutoEscalate(next);
+    syncAutoRouteToProject(next);
+    reinitializePunkBackend("api").catch(() => {});
   };
 
-  const getActiveOption = (
+  const resolveEngine = (
     current: { provider: string; model: string; thinking: boolean } | undefined,
-    baseOptions: EngineOption[],
-  ) => {
-    const routingDefault =
-      DEFAULT_BACKEND_ROUTING[punkBackend] || DEFAULT_BACKEND_ROUTING["http"];
-    const target = current || routingDefault?.plan || baseOptions[0]!;
+  ): EngineOption => {
+    const target = current || DEFAULT_BACKEND_ROUTING["api"]!.thinking;
+    if (!target) return usableEngines[0] || { label: "none", provider: "", model: "", thinking: false, requiresKey: "" };
 
-    // 1. Try to find in hardcoded options first
-    const found = baseOptions.find(
+    // Try usableEngines (already built from allModels + sdkModels)
+    const found = usableEngines.find(
       (o) => o.provider === target.provider && o.model === target.model,
     );
     if (found) return found;
 
-    // 2. If it's OpenRouter, try to find in fetched models
-    if (target.provider === "openrouter") {
-      const orModel = openRouterModels.find((m) => m.id === target.model);
-      if (orModel) {
+    // Try allModels directly (provider may be usable but model just not in usableEngines list)
+    const providerModels = allModels[target.provider];
+    if (providerModels) {
+      const m = providerModels.find((m) => m.id === target.model);
+      if (m) {
         return {
-          label: orModel.name,
-          provider: "openrouter",
-          model: orModel.id,
+          label: m.name || m.id,
+          provider: target.provider,
+          model: m.id,
           thinking: target.thinking || false,
-          requiresKey: "openrouter",
-        };
-      }
-      // Fallback for defaults in PROVIDER_MODELS
-      const orDefault = PROVIDER_MODELS["openrouter"]?.find(
-        (m) => m.value === target.model,
-      );
-      if (orDefault) {
-        return {
-          label: orDefault.label,
-          provider: "openrouter",
-          model: orDefault.value,
-          thinking: target.thinking || false,
-          requiresKey: "openrouter",
+          requiresKey: target.provider,
+          contextWindow: m.context_length,
+          inputCost: m.input_cost ?? null,
+          outputCost: m.output_cost ?? null,
         };
       }
     }
 
-    return baseOptions[0]!;
+    // Model not found in any fetched data — show it anyway with its raw ID
+    return {
+      label: target.model,
+      provider: target.provider,
+      model: target.model,
+      thinking: target.thinking || false,
+      requiresKey: target.provider,
+    };
   };
 
-  const thinkingEngine = getActiveOption(routing?.plan, filteredThinking);
-  const buildingEngine = getActiveOption(routing?.execute, filteredBuilding);
-  const explainingEngine = getActiveOption(routing?.explain, filteredThinking);
-  const otherEngine = getActiveOption(routing?.other, filteredBuilding);
+  const thinkingEngine = resolveEngine(combo?.thinking);
+  const buildingEngine = resolveEngine(combo?.execution);
 
-  const missingThinkingKey = !httpApiKeys[thinkingEngine.requiresKey];
-  const missingBuildingKey = !httpApiKeys[buildingEngine.requiresKey];
-  const missingExplainingKey = !httpApiKeys[explainingEngine.requiresKey];
-  const missingOtherKey = !httpApiKeys[otherEngine.requiresKey];
+  // Check if each slot's provider is usable
+  const isProviderUsable = (provider: string) => {
+    if (provider === "anthropic") return claudeCodeAvailable;
+    if (provider === "gemini") return geminiAvailable;
+    return !!httpApiKeys[provider];
+  };
+
+  const missingThinkingKey = !isProviderUsable(thinkingEngine.provider);
+  const missingBuildingKey = !isProviderUsable(buildingEngine.provider);
 
   return (
     <div className="flex flex-col gap-4">
@@ -699,7 +834,7 @@ function AiEnginesSection({
         {autoRoute && (
           <>
             <div className="py-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
+              <div className="flex items-start justify-between">
                 <div className="flex flex-col gap-0.5">
                   <span
                     className="text-pane-text font-mono"
@@ -711,14 +846,16 @@ function AiEnginesSection({
                     className="text-pane-text-secondary/50 font-mono"
                     style={{ fontSize: "var(--pane-font-size-xs)" }}
                   >
-                    architecture, design, decisions
+                    planning, brainstorming, verification
                   </span>
                 </div>
                 <div className="flex items-center gap-2">
                   <EngineSelect
-                    options={filteredThinking}
-                    openRouterModels={openRouterModels}
+                    allModels={allModels}
+                    sdkModels={sdkModels}
                     httpApiKeys={httpApiKeys}
+                    disabledProviders={disabledProviders}
+                    curatedModels={curatedModels}
                     value={engineKey(thinkingEngine)}
                     onChange={handleThinkingChange}
                   />
@@ -746,18 +883,18 @@ function AiEnginesSection({
                   )}
                 </div>
               </div>
-              {missingThinkingKey && thinkingEngine.provider !== nativeProvider && (
+              {missingThinkingKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ no API key for {thinkingEngine.requiresKey} — add it below
+                  ⚠ {thinkingEngine.provider === "anthropic" ? "Claude not connected" : thinkingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${thinkingEngine.requiresKey}`} — {thinkingEngine.provider === "anthropic" ? "sign in below" : thinkingEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
 
             <div className="py-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
+              <div className="flex items-start justify-between">
                 <div className="flex flex-col gap-0.5">
                   <span
                     className="text-pane-text font-mono"
@@ -773,90 +910,25 @@ function AiEnginesSection({
                   </span>
                 </div>
                 <EngineSelect
-                  options={filteredBuilding}
-                  openRouterModels={openRouterModels}
+                  allModels={allModels}
+                  sdkModels={sdkModels}
                   httpApiKeys={httpApiKeys}
+                  disabledProviders={disabledProviders}
+                  curatedModels={curatedModels}
                   value={engineKey(buildingEngine)}
                   onChange={handleBuildingChange}
                 />
               </div>
-              {missingBuildingKey && buildingEngine.provider !== nativeProvider && (
+              {missingBuildingKey && (
                 <span
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ no API key for {buildingEngine.requiresKey} — add it below
+                  ⚠ {buildingEngine.provider === "anthropic" ? "Claude not connected" : buildingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${buildingEngine.requiresKey}`} — {buildingEngine.provider === "anthropic" ? "sign in below" : buildingEngine.provider === "gemini" ? "install CLI" : "add key below"}
                 </span>
               )}
             </div>
 
-            <div className="py-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <div className="flex flex-col gap-0.5">
-                  <span
-                    className="text-pane-text font-mono"
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  >
-                    when explaining
-                  </span>
-                  <span
-                    className="text-pane-text-secondary/50 font-mono"
-                    style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  >
-                    understanding code, walkthroughs
-                  </span>
-                </div>
-                <EngineSelect
-                  options={filteredThinking}
-                  openRouterModels={openRouterModels}
-                  httpApiKeys={httpApiKeys}
-                  value={engineKey(explainingEngine)}
-                  onChange={handleExplainChange}
-                />
-              </div>
-              {missingExplainingKey && explainingEngine.provider !== nativeProvider && (
-                <span
-                  className="text-pane-error font-mono"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  ⚠ no API key for {explainingEngine.requiresKey} — add it below
-                </span>
-              )}
-            </div>
-
-            <div className="py-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <div className="flex flex-col gap-0.5">
-                  <span
-                    className="text-pane-text font-mono"
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  >
-                    everything else
-                  </span>
-                  <span
-                    className="text-pane-text-secondary/50 font-mono"
-                    style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  >
-                    chat, questions, general tasks
-                  </span>
-                </div>
-                <EngineSelect
-                  options={filteredBuilding}
-                  openRouterModels={openRouterModels}
-                  httpApiKeys={httpApiKeys}
-                  value={engineKey(otherEngine)}
-                  onChange={handleOtherChange}
-                />
-              </div>
-              {missingOtherKey && otherEngine.provider !== nativeProvider && (
-                <span
-                  className="text-pane-error font-mono"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  ⚠ no API key for {otherEngine.requiresKey} — add it below
-                </span>
-              )}
-            </div>
 
             <div className="py-2">
               <span
@@ -874,140 +946,330 @@ function AiEnginesSection({
 
 // ─── API Keys Section ─────────────────────────────────────────────────────────
 
-const PROVIDERS = [
-  {
-    key: "gemini",
-    label: "Google Gemini",
-    placeholder: "AI...",
-    docsUrl: "https://aistudio.google.com/app/apikey",
-  },
-  {
-    key: "deepseek",
-    label: "DeepSeek",
-    placeholder: "sk-...",
-    docsUrl: "https://platform.deepseek.com/api_keys",
-  },
-  {
-    key: "kimi",
-    label: "Kimi (Moonshot)",
-    placeholder: "sk-...",
-    docsUrl: "https://platform.moonshot.cn/console/api-keys",
-  },
-  {
-    key: "anthropic",
-    label: "Anthropic",
-    placeholder: "sk-ant-...",
-    docsUrl: "https://console.anthropic.com/settings/keys",
-  },
-  {
-    key: "openrouter",
-    label: "OpenRouter",
-    placeholder: "sk-or-...",
-    docsUrl: "https://openrouter.ai/keys",
-  },
-] as const;
+// API key provider configuration
+interface ApiKeyProvider {
+  key: string;
+  label: string;
+  placeholder: string;
+  docsUrl: string;
+  showBaseUrl?: boolean;
+  defaultBaseUrl?: string;
+}
+
+const API_KEY_PROVIDERS: ApiKeyProvider[] = [
+  { key: "gemini", label: "Google Gemini", placeholder: "AI...", docsUrl: "https://aistudio.google.com/app/apikey", showBaseUrl: true, defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta" },
+  { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys", showBaseUrl: true, defaultBaseUrl: "https://api.deepseek.com/v1/chat/completions" },
+  { key: "anthropic", label: "Anthropic", placeholder: "sk-ant-...", docsUrl: "https://console.anthropic.com/settings/keys", showBaseUrl: true, defaultBaseUrl: "https://api.anthropic.com/v1/messages" },
+  { key: "openrouter", label: "OpenRouter", placeholder: "sk-or-...", docsUrl: "https://openrouter.ai/keys", showBaseUrl: true, defaultBaseUrl: "https://openrouter.ai/api/v1/chat/completions" },
+  { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/", showBaseUrl: true, defaultBaseUrl: "https://api.xiaomimimo.com/v1" },
+  { key: "kimi", label: "Kimi (Moonshot)", placeholder: "sk-...", docsUrl: "https://platform.moonshot.cn/", showBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1/chat/completions" },
+  { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
+  { key: "jina", label: "Jina AI", placeholder: "jina_...", docsUrl: "https://jina.ai/embeddings/" },
+];
 
 function ApiKeysSection({
   httpApiKeys,
   onKeyChange,
+  httpBaseUrls = {},
+  onBaseUrlChange,
+  claudeCodeAvailable = false,
+  geminiAvailable: _geminiAvailable = false,
 }: {
   httpApiKeys: Record<string, string>;
   onKeyChange: (provider: string, key: string) => void;
+  httpBaseUrls?: Record<string, string>;
+  onBaseUrlChange?: (provider: string, url: string) => void;
+  claudeCodeAvailable?: boolean;
+  geminiAvailable?: boolean;
 }) {
+  void _geminiAvailable;
+  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
+  void (claudeCodeAvailable && sdkAccount != null);
   const [visible, setVisible] = useState<Record<string, boolean>>({});
+  const [expandedActive, setExpandedActive] = useState<string | null>(null);
+  const [expandedAvailable, setExpandedAvailable] = useState<string | null>(null);
+  const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
+  const toggleProvider = useWorkspaceStore((s) => s.toggleProvider);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const toggleKeyFor = (key: string) =>
+    (key === "anthropic" || key === "gemini") ? `${key}-api` : key;
+
+  const ProviderToggle = ({ toggleKey, label }: { toggleKey: string; label: string }) => {
+    const off = disabledProviders.includes(toggleKey);
+    return (
+      <button
+        onClick={() => toggleProvider(toggleKey)}
+        className={`w-6 h-3.5 rounded-full relative transition-colors shrink-0 ${off ? "bg-pane-text-secondary/20" : "bg-pane-status-added/60"}`}
+        title={off ? `enable ${label}` : `disable ${label}`}
+      >
+        <div className={`absolute top-0.5 w-2.5 h-2.5 rounded-full bg-white transition-all ${off ? "left-0.5" : "left-[11px]"}`} />
+      </button>
+    );
+  };
+
+  const activeProviders = API_KEY_PROVIDERS.filter((p) => !!httpApiKeys[p.key]);
+  const availableProviders = API_KEY_PROVIDERS.filter((p) => !httpApiKeys[p.key]);
 
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex items-center justify-between mb-1">
-        <span className="text-pane-text-secondary/30 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-          provider keys
-        </span>
-      </div>
-      <div className="flex flex-col gap-2">
-        {PROVIDERS.map(({ key, label, placeholder, docsUrl }) => {
-          const val = httpApiKeys[key] || "";
-          const isVisible = visible[key] ?? false;
-          return (
-            <div key={key} className="py-2 flex flex-col gap-1">
-              <div className="flex items-center justify-between">
-                <span
-                  className="text-pane-text font-mono"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+    <div className="flex flex-col gap-4">
+      {/* Active providers */}
+      {activeProviders.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <span
+            className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            active
+          </span>
+          {activeProviders.map((p) => {
+            const { key, label, placeholder, docsUrl, showBaseUrl, defaultBaseUrl } = p;
+            const toggleKey = toggleKeyFor(key);
+            const val = httpApiKeys[key] || "";
+            const baseUrl = httpBaseUrls[key] || "";
+            const isExpanded = expandedActive === key;
+            const isVisible = visible[key] ?? false;
+            const isOff = disabledProviders.includes(toggleKey);
+
+            return (
+              <div key={key} className={`rounded-lg overflow-hidden ring-1 ring-pane-border/30 transition-colors ${isOff ? "opacity-40" : ""}`}>
+                {/* Collapsed header */}
+                <button
+                  onClick={() => setExpandedActive(isExpanded ? null : key)}
+                  className="flex items-center justify-between w-full py-2 px-3 bg-pane-bg hover:bg-pane-bg/80 active:bg-pane-bg/60 transition-all"
                 >
-                  {label}
-                </span>
-                <a
-                  href={docsUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-pane-text-secondary/40 hover:text-pane-text-secondary font-mono"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  get key ↗
-                </a>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <motion.svg
+                      animate={{ rotate: isExpanded ? 90 : 0 }}
+                      transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+                      width="10"
+                      height="10"
+                      viewBox="0 0 10 10"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      className="text-pane-text-secondary/30 shrink-0"
+                    >
+                      <path d="M3 2L6 5L3 8" />
+                    </motion.svg>
+                    <span
+                      className="text-pane-text font-mono truncate"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {label}
+                    </span>
+                    <span
+                      className="text-pane-text-secondary/25 font-mono shrink-0"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      ••••{val.slice(-4)}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2.5 shrink-0">
+                    <a
+                      href={docsUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-pane-text-secondary/25 hover:text-pane-text-secondary font-mono transition-colors"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      ↗
+                    </a>
+                    <ProviderToggle toggleKey={toggleKey} label={label} />
+                  </div>
+                </button>
+
+                {/* Expanded content */}
+                <AnimatePresence initial={false}>
+                  {isExpanded && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.2, ease: [0.2, 0, 0, 1] }}
+                      className="overflow-hidden"
+                    >
+                      <div className="p-3 pt-2 border-t border-pane-border/30 bg-pane-bg/30 flex flex-col gap-2">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type={isVisible ? "text" : "password"}
+                            value={val}
+                            onChange={(e) => onKeyChange(key, e.target.value)}
+                            placeholder={placeholder}
+                            className="flex-1 px-2 py-1 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
+                            style={{ fontSize: "var(--pane-font-size-xs)" }}
+                          />
+                          {val && (
+                            <button
+                              onClick={() => setVisible((v) => ({ ...v, [key]: !v[key] }))}
+                              className="text-pane-text-secondary/40 hover:text-pane-text-secondary shrink-0"
+                            >
+                              {isVisible ? (
+                                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+                                  <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
+                                  <circle cx="7" cy="7" r="1.5" />
+                                </svg>
+                              ) : (
+                                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+                                  <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
+                                  <circle cx="7" cy="7" r="1.5" />
+                                  <path d="M2 2l10 10" />
+                                </svg>
+                              )}
+                            </button>
+                          )}
+                        </div>
+                        {showBaseUrl && (
+                          <div className="flex items-center gap-2 pl-4 border-l border-pane-border/20">
+                            <span
+                              className="text-pane-text-secondary/40 font-mono whitespace-nowrap"
+                              style={{ fontSize: "var(--pane-font-size-xs)" }}
+                            >
+                              base url
+                            </span>
+                            <input
+                              type="text"
+                              value={baseUrl}
+                              onChange={(e) => onBaseUrlChange?.(key, e.target.value)}
+                              placeholder={defaultBaseUrl || "https://..."}
+                              className="flex-1 px-2 py-0.5 rounded-lg font-mono text-pane-text-secondary border border-pane-border/20 hover:border-pane-border/40 outline-none placeholder:text-pane-text-secondary/20 bg-transparent"
+                              style={{ fontSize: "var(--pane-font-size-xs)" }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
-              <div className="flex items-center gap-2">
-                <input
-                  type={isVisible ? "text" : "password"}
-                  value={val}
-                  onChange={(e) => onKeyChange(key, e.target.value)}
-                  placeholder={placeholder}
-                  className="flex-1 px-2 py-1 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                />
-                {val && (
-                  <button
-                    onClick={() =>
-                      setVisible((v) => ({ ...v, [key]: !v[key] }))
-                    }
-                    className="text-pane-text-secondary/40 hover:text-pane-text-secondary shrink-0"
-                    title={isVisible ? "Hide" : "Show"}
-                  >
-                    {isVisible ? (
-                      <svg
-                        width="14"
-                        height="14"
-                        viewBox="0 0 14 14"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.4"
-                        strokeLinecap="round"
-                      >
-                        <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
-                        <circle cx="7" cy="7" r="1.5" />
-                      </svg>
-                    ) : (
-                      <svg
-                        width="14"
-                        height="14"
-                        viewBox="0 0 14 14"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.4"
-                        strokeLinecap="round"
-                      >
-                        <path d="M1 7s2.5-4 6-4 6 4 6 4-2.5 4-6 4-6-4-6-4z" />
-                        <circle cx="7" cy="7" r="1.5" />
-                        <path d="M2 2l10 10" />
-                      </svg>
-                    )}
-                  </button>
-                )}
-                {val && (
-                  <span
-                    className="text-pane-text-secondary/30 font-mono shrink-0"
+            );
+          })}
+        </div>
+      )}
+
+      {/* Available providers */}
+      {availableProviders.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <span
+            className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            available
+          </span>
+          {availableProviders.map((p) => {
+            const { key, label, placeholder, docsUrl, showBaseUrl, defaultBaseUrl } = p;
+            const isExpanded = expandedAvailable === key;
+
+            return (
+              <div key={key} className={`rounded-lg overflow-hidden ring-1 transition-colors ${isExpanded ? "ring-pane-border/30" : "ring-pane-border/10 hover:ring-pane-border/20"}`}>
+                {/* Compact row — click to expand */}
+                <button
+                  onClick={() => setExpandedAvailable(isExpanded ? null : key)}
+                  className={`flex items-center justify-between w-full py-2 px-3 transition-all ${isExpanded ? "bg-pane-bg" : "bg-pane-bg/30 hover:bg-pane-bg/50 active:bg-pane-bg/60"}`}
+                >
+                  <div className="flex items-center gap-2">
+                    <motion.svg
+                      animate={{ rotate: isExpanded ? 90 : 0 }}
+                      transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+                      width="10"
+                      height="10"
+                      viewBox="0 0 10 10"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      className="text-pane-text-secondary/15 shrink-0"
+                    >
+                      <path d="M3 2L6 5L3 8" />
+                    </motion.svg>
+                    <span
+                      className="text-pane-text-secondary/50 font-mono"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {label}
+                    </span>
+                  </div>
+                  <a
+                    href={docsUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-pane-text-secondary/15 hover:text-pane-text-secondary/50 font-mono transition-colors"
                     style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    onClick={(e) => e.stopPropagation()}
                   >
-                    ••••{val.slice(-4)}
-                  </span>
-                )}
+                    get key ↗
+                  </a>
+                </button>
+
+                {/* Expanded fields — appears when clicked */}
+                <AnimatePresence initial={false}>
+                  {isExpanded && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.2, ease: [0.2, 0, 0, 1] }}
+                      className="overflow-hidden"
+                    >
+                      <div className="p-3 pt-2 border-t border-pane-border/30 bg-pane-bg/30 flex flex-col gap-2">
+                        <input
+                          ref={inputRef}
+                          type="password"
+                          value={httpApiKeys[key] || ""}
+                          onChange={(e) => onKeyChange(key, e.target.value)}
+                          placeholder={placeholder}
+                          autoFocus
+                          className="flex-1 px-2 py-1 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
+                          style={{ fontSize: "var(--pane-font-size-xs)" }}
+                        />
+                        {showBaseUrl && (
+                          <div className="flex items-center gap-2 pl-4 border-l border-pane-border/20">
+                            <span
+                              className="text-pane-text-secondary/40 font-mono whitespace-nowrap"
+                              style={{ fontSize: "var(--pane-font-size-xs)" }}
+                            >
+                              base url
+                            </span>
+                            <input
+                              type="text"
+                              value={httpBaseUrls[key] || ""}
+                              onChange={(e) => onBaseUrlChange?.(key, e.target.value)}
+                              placeholder={defaultBaseUrl || "https://..."}
+                              className="flex-1 px-2 py-0.5 rounded-lg font-mono text-pane-text-secondary border border-pane-border/20 hover:border-pane-border/40 outline-none placeholder:text-pane-text-secondary/20 bg-transparent"
+                              style={{ fontSize: "var(--pane-font-size-xs)" }}
+                            />
+                          </div>
+                        )}
+                        <span
+                          className="text-pane-text-secondary/25 font-mono"
+                          style={{ fontSize: "var(--pane-font-size-xs)" }}
+                        >
+                          paste your key — it saves automatically
+                        </span>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Empty state */}
+      {activeProviders.length === 0 && availableProviders.length === 0 && (
+        <span
+          className="text-pane-text-secondary/30 font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          no providers
+        </span>
+      )}
+
       <span
-        className="text-pane-text-secondary/40 font-mono"
+        className="text-pane-text-secondary/30 font-mono"
         style={{ fontSize: "var(--pane-font-size-xs)" }}
       >
         saved automatically
@@ -1016,7 +1278,503 @@ function ApiKeysSection({
   );
 }
 
+// ─── Curated Models Section ──────────────────────────────────────────────────
+
+function CuratedModelsSection() {
+  const curatedModels = useWorkspaceStore((s) => s.curatedModels);
+  const addCuratedModel = useWorkspaceStore((s) => s.addCuratedModel);
+  const removeCuratedModel = useWorkspaceStore((s) => s.removeCuratedModel);
+  const allModels = useWorkspaceStore((s) => s.allModels);
+  const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
+
+  const [search, setSearch] = useState("");
+  const [manualId, setManualId] = useState("");
+  const [added, setAdded] = useState(false);
+
+  // Build flat list of all available models (non-disabled providers)
+  const availableModels = useMemo(() => {
+    const list: { id: string; name: string; provider: string; label: string; inputCost: number | null; outputCost: number | null }[] = [];
+    for (const [providerKey, models] of Object.entries(allModels)) {
+      if (!models || models.length === 0) continue;
+      if (disabledProviders.includes(providerKey)) continue;
+      for (const m of models) {
+        list.push({
+          id: m.id,
+          name: m.name || m.id,
+          provider: providerKey,
+          label: providerKey === "anthropic" || providerKey === "anthropic-api" ? "Claude" :
+                 providerKey === "gemini" || providerKey === "gemini-api" ? "Gemini" :
+                 providerKey === "deepseek" ? "DeepSeek" :
+                 providerKey === "openrouter" ? "OpenRouter" :
+                 providerKey === "kimi" ? "Kimi" :
+                 providerKey === "stepfun" ? "StepFun" :
+                 providerKey === "xiaomi" ? "Xiaomi" : providerKey,
+          inputCost: m.input_cost,
+          outputCost: m.output_cost,
+        });
+      }
+    }
+    return list;
+  }, [allModels, disabledProviders]);
+
+  // Filter available by search
+  const filteredAvailable = useMemo(() => {
+    if (!search.trim()) return [];
+    const q = search.toLowerCase();
+    return availableModels.filter((m) =>
+      m.name.toLowerCase().includes(q) ||
+      m.id.toLowerCase().includes(q) ||
+      m.label.toLowerCase().includes(q)
+    ).slice(0, 50); // cap at 50 for performance
+  }, [availableModels, search]);
+
+  // Resolve curated model names from available data
+  const curatedWithDetails = useMemo(() => {
+    return curatedModels.map((id) => {
+      const found = availableModels.find((m) => m.id === id);
+      return found || { id, name: id, provider: "", label: "", inputCost: null, outputCost: null };
+    });
+  }, [curatedModels, availableModels]);
+
+  const handleAddManual = () => {
+    const id = manualId.trim();
+    if (!id) return;
+    addCuratedModel(id);
+    setManualId("");
+    setAdded(true);
+    setTimeout(() => setAdded(false), 1500);
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Your Models list */}
+      {curatedModels.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <span
+            className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            your models ({curatedModels.length})
+          </span>
+          <div className="flex flex-col gap-1">
+            {curatedWithDetails.map((m) => (
+              <div key={m.id} className="flex items-center justify-between py-1.5 px-2.5 rounded-lg bg-pane-bg/40 ring-1 ring-pane-border/20">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span
+                    className="text-pane-text-secondary/20 font-mono shrink-0"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {m.label || "—"}
+                  </span>
+                  <span
+                    className="font-mono text-pane-text truncate"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {m.name}
+                  </span>
+                </div>
+                <button
+                  onClick={() => removeCuratedModel(m.id)}
+                  className="text-pane-text-secondary/30 hover:text-pane-status-removed transition-colors shrink-0 ml-2"
+                  title="remove"
+                >
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                    <path d="M3 3l6 6M9 3l-6 6" />
+                  </svg>
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {curatedModels.length === 0 && (
+        <span
+          className="text-pane-text-secondary/30 font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          no models selected — all available models will show in the picker
+        </span>
+      )}
+
+      {/* Separator */}
+      <div className="border-t border-pane-border/20" />
+
+      {/* Browse all */}
+      <div className="flex flex-col gap-2">
+        <span
+          className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          browse all
+        </span>
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="search models..."
+          className="w-full px-2.5 py-1.5 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        />
+        {search && filteredAvailable.length > 0 && (
+          <div className="flex flex-col gap-1 max-h-60 overflow-y-auto">
+            {filteredAvailable.map((m) => {
+              const alreadyAdded = curatedModels.includes(m.id);
+              return (
+                <div
+                  key={m.id}
+                  className="flex items-center justify-between py-1.5 px-2.5 rounded-lg hover:bg-pane-bg/40 transition-colors"
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className="text-pane-text-secondary/20 font-mono shrink-0"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {m.label}
+                    </span>
+                    <span
+                      className="font-mono text-pane-text truncate"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {m.name}
+                    </span>
+                    {(m.inputCost != null && m.outputCost != null) && (
+                      <span
+                        className="text-pane-text-secondary/20 font-mono shrink-0"
+                        style={{ fontSize: "var(--pane-font-size-xs)" }}
+                      >
+                        ${m.inputCost}/M · ${m.outputCost}/M
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => alreadyAdded ? removeCuratedModel(m.id) : addCuratedModel(m.id)}
+                    className={`shrink-0 ml-2 transition-colors ${alreadyAdded ? 'text-pane-status-added hover:text-pane-status-removed' : 'text-pane-text-secondary/40 hover:text-pane-status-added'}`}
+                    title={alreadyAdded ? "remove" : "add"}
+                  >
+                    {alreadyAdded ? (
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                        <path d="M3 6h6" />
+                      </svg>
+                    ) : (
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                        <path d="M6 2v8M2 6h8" />
+                      </svg>
+                    )}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {search && filteredAvailable.length === 0 && (
+          <span
+            className="text-pane-text-secondary/30 font-mono"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            no models match "{search}"
+          </span>
+        )}
+      </div>
+
+      {/* Add by ID */}
+      <div className="flex flex-col gap-2">
+        <span
+          className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          add by id
+        </span>
+        <div className="flex items-center gap-2">
+          <input
+            value={manualId}
+            onChange={(e) => setManualId(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleAddManual(); }}
+            placeholder="e.g. anthropic/claude-sonnet-4-5-20250929"
+            className="flex-1 px-2.5 py-1.5 rounded-lg font-mono text-pane-text border border-pane-border/40 hover:border-pane-border outline-none placeholder:text-pane-text-secondary/25 bg-transparent"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          />
+          <button
+            onClick={handleAddManual}
+            disabled={!manualId.trim()}
+            className="px-3 py-1.5 rounded-lg font-mono text-pane-text-secondary bg-pane-bg/40 ring-1 ring-pane-border/30 hover:ring-pane-border/50 transition-colors disabled:opacity-30"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {added ? "added" : "add"}
+          </button>
+        </div>
+        <span
+          className="text-pane-text-secondary/25 font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          paste any model id — it'll appear in the picker even if it hasn't been fetched yet
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Cloud Section ────────────────────────────────────────────────────────────
+
+const electronAPI = window.electronAPI;
+
+type SyncPhase = "idle" | "compressing" | "encrypting" | "uploading" | "complete" |
+  "finding" | "downloading" | "decrypting" | "restoring";
+
+function CloudSection() {
+  const [user, setUser] = useState<CloudUser | null>(null);
+  const [status, setStatus] = useState<CloudStatus | null>(null);
+  const [loggingIn, setLoggingIn] = useState(false);
+  const [syncPhase, setSyncPhase] = useState<SyncPhase>("idle");
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState(false);
+
+  // Load initial state
+  useEffect(() => {
+    cloudGetUser().then(setUser).catch(() => {});
+    cloudGetStatus().then(setStatus).catch(() => {});
+  }, []);
+
+  // Listen for auth changes from main process
+  useEffect(() => {
+    const unlisten = electronAPI.on("cloud-auth-changed", (u: CloudUser | null) => {
+      setUser(u);
+      if (u) {
+        cloudGetStatus().then(setStatus).catch(() => {});
+      } else {
+        setStatus(null);
+      }
+    });
+    return () => { if (typeof unlisten === "function") unlisten(); };
+  }, []);
+
+  // Listen for sync progress
+  useEffect(() => {
+    const unlisten = electronAPI.on("cloud-sync-progress", (data: { phase: SyncPhase }) => {
+      setSyncPhase(data.phase);
+      if (data.phase === "complete") {
+        // Refresh status after successful sync
+        cloudGetStatus().then(setStatus).catch(() => {});
+        setTimeout(() => setSyncPhase("idle"), 2000);
+      }
+    });
+    return () => { if (typeof unlisten === "function") unlisten(); };
+  }, []);
+
+  const handleLogin = async () => {
+    setLoggingIn(true);
+    setSyncError(null);
+    try {
+      const u = await cloudLogin();
+      setUser(u);
+      if (u) cloudGetStatus().then(setStatus).catch(() => {});
+    } catch (err: unknown) {
+      setSyncError(err instanceof Error ? err.message : "Login failed");
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await cloudLogout().catch(() => {});
+    setUser(null);
+    setStatus(null);
+    setSyncPhase("idle");
+    setSyncError(null);
+  };
+
+  const handleBackupNow = async () => {
+    setSyncError(null);
+    setSyncPhase("compressing");
+    try {
+      await cloudTriggerBackup();
+    } catch (err: unknown) {
+      setSyncError(err instanceof Error ? err.message : "Backup failed");
+      setSyncPhase("idle");
+    }
+  };
+
+  const handleRestore = async () => {
+    if (!confirm("Restore from cloud? This will overwrite your local data.")) return;
+    setSyncError(null);
+    setRestoring(true);
+    setSyncPhase("finding");
+    try {
+      await cloudRestore();
+    } catch (err: unknown) {
+      setSyncError(err instanceof Error ? err.message : "Restore failed");
+      setSyncPhase("idle");
+    } finally {
+      setRestoring(false);
+    }
+  };
+
+  const formatDate = (iso: string | null) => {
+    if (!iso) return "never";
+    const d = new Date(iso);
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  };
+
+  const phaseLabel: Record<SyncPhase, string> = {
+    idle: "",
+    compressing: "compressing…",
+    encrypting: "encrypting…",
+    uploading: "uploading…",
+    complete: "done",
+    finding: "finding backup…",
+    downloading: "downloading…",
+    decrypting: "decrypting…",
+    restoring: "restoring…",
+  };
+
+  const isSyncing = syncPhase !== "idle" && syncPhase !== "complete";
+
+  if (!user) {
+    // Logged-out state
+    return (
+      <div className="flex flex-col gap-4">
+        <p
+          className="text-pane-text-secondary/60 font-mono leading-relaxed"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          back up your session, memory, and brain to pane cloud. encrypted before it leaves your machine.
+        </p>
+        <button
+          onClick={handleLogin}
+          disabled={loggingIn}
+          className="flex items-center gap-2.5 self-start px-4 py-2 rounded-lg bg-pane-text/[0.06] hover:bg-pane-text/[0.10] active:bg-pane-text/[0.13] text-pane-text font-mono disabled:opacity-40 disabled:cursor-default transition-colors"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          {loggingIn ? (
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="animate-spin opacity-60">
+              <path d="M7 1.5A5.5 5.5 0 0112.5 7" />
+            </svg>
+          ) : (
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
+            </svg>
+          )}
+          {loggingIn ? "opening browser…" : "sign in with github"}
+        </button>
+        {syncError && (
+          <span
+            className="text-pane-error font-mono"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {syncError}
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  // Logged-in state
+  return (
+    <div className="flex flex-col gap-4">
+      {/* User row */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2.5">
+          {user.avatar_url ? (
+            <img
+              src={user.avatar_url}
+              alt=""
+              className="w-6 h-6 rounded-full ring-1 ring-pane-border/30"
+            />
+          ) : (
+            <div className="w-6 h-6 rounded-full bg-pane-text/[0.08] flex items-center justify-center">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="7" r="4" />
+                <path d="M5.5 21a7.5 7.5 0 0115 0" />
+              </svg>
+            </div>
+          )}
+          <span
+            className="text-pane-text font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {user.github_login}
+          </span>
+        </div>
+        <button
+          onClick={handleLogout}
+          className="text-pane-text-secondary/40 hover:text-pane-text-secondary font-mono transition-colors"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          sign out
+        </button>
+      </div>
+
+      {/* Status rows */}
+      <div className="flex flex-col gap-1 py-2 border-t border-b border-pane-border/20">
+        <SettingRow label="last backup">
+          <span
+            className="text-pane-text-secondary/60 font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {formatDate(status?.last_backup ?? null)}
+          </span>
+        </SettingRow>
+        <SettingRow label="storage used">
+          <span
+            className="text-pane-text-secondary/60 font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {status ? `${status.storage_mb} MB` : "—"}
+          </span>
+        </SettingRow>
+        <SettingRow label="backups stored">
+          <span
+            className="text-pane-text-secondary/60 font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {status?.backup_count ?? "—"}
+          </span>
+        </SettingRow>
+      </div>
+
+      {/* Actions */}
+      <div className="flex items-center gap-3">
+        <button
+          onClick={handleBackupNow}
+          disabled={isSyncing || restoring}
+          className="px-3 py-1.5 rounded-lg font-mono text-pane-text bg-pane-text/[0.06] hover:bg-pane-text/[0.10] active:bg-pane-text/[0.13] disabled:opacity-40 disabled:cursor-default transition-colors"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          back up now
+        </button>
+        <button
+          onClick={handleRestore}
+          disabled={isSyncing || restoring}
+          className="px-3 py-1.5 rounded-lg font-mono text-pane-text-secondary/60 hover:text-pane-text hover:bg-pane-text/[0.06] disabled:opacity-40 disabled:cursor-default transition-colors"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          restore
+        </button>
+        {(isSyncing || syncPhase === "complete") && (
+          <span
+            className="text-pane-terminal font-mono"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {phaseLabel[syncPhase]}
+          </span>
+        )}
+      </div>
+
+      {syncError && (
+        <span
+          className="text-pane-error font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          {syncError}
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Profile View ────────────────────────────────────────────────────────
+
+import { TokenAnalytics } from "./TokenAnalytics";
 
 // Accordion Section Component
 function AccordionSection({
@@ -1080,10 +1838,6 @@ function AccordionSection({
 }
 
 export function Profile() {
-  const profileName = useWorkspaceStore((s) => s.profileName);
-  const profileBio = useWorkspaceStore((s) => s.profileBio);
-  const profileRole = useWorkspaceStore((s) => s.profileRole);
-  const avatarDataUrl = useWorkspaceStore((s) => s.profileAvatarDataUrl);
   const theme = useWorkspaceStore((s) => s.theme);
   const fontSize = useWorkspaceStore((s) => s.fontSize);
   const panelFontSize = useWorkspaceStore((s) => s.panelFontSize);
@@ -1092,56 +1846,67 @@ export function Profile() {
   const setTheme = useWorkspaceStore((s) => s.setTheme);
   const completionSound = useWorkspaceStore((s) => s.completionSound);
   const setCompletionSound = useWorkspaceStore((s) => s.setCompletionSound);
-  const playCompletionSound = useWorkspaceStore((s) => s.playCompletionSound);
   const punkBackend = useWorkspaceStore((s) => s.punkBackend);
-  const setPunkBackend = useWorkspaceStore((s) => s.setPunkBackend);
   const httpApiKeys = useWorkspaceStore((s) => s.httpApiKeys);
   const setHttpApiKeys = useWorkspaceStore((s) => s.setHttpApiKeys);
+  const httpBaseUrls = useWorkspaceStore((s) => s.httpBaseUrls);
+  const setHttpBaseUrls = useWorkspaceStore((s) => s.setHttpBaseUrls);
 
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const identitySaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const [philosophy, setPhilosophy] = useState("");
-  const [rules, setRules] = useState("");
-  const philosophySaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [dnaString, setDnaString] = useState("");
+  const dnaSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Accordion state - only one section expanded at a time
   const [expandedSection, setExpandedSection] = useState<string | null>("identity");
+
+  // Detect which CLI backends are available in PATH
+  const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
+  const [geminiAvailable, setGeminiAvailable] = useState(false);
+  const [, setClaudeAuthState] = useState<ClaudeAuthState | null>(null);
+  const [, setClaudeSigninStatus] = useState<string[]>([]);
+
+  useEffect(() => {
+    // Check backend availability (is the CLI installed?)
+    getBackendAvailability()
+      .then((availability) => {
+        setClaudeCodeAvailable(availability.claude);
+        setGeminiAvailable(availability.gemini);
+        useWorkspaceStore.getState().setBackendAvailability({
+          claudeCode: availability.claude,
+          geminiCli: availability.gemini,
+        });
+      })
+      .catch(() => {
+        setClaudeCodeAvailable(false);
+        setGeminiAvailable(false);
+      });
+
+    // Read Claude auth state directly from ~/.claude.json — no session needed.
+    // This gives us the real signed-in/out state immediately, regardless of
+    // whether the SDK prefetch has fired yet.
+    getClaudeAuthState()
+      .then(setClaudeAuthState)
+      .catch(() => setClaudeAuthState({ authenticated: false, account: null }));
+  }, []);
+
+  useEffect(() => {
+    const cleanup = window.electronAPI.on("pane-claude-signin", (raw: unknown) => {
+      const data = raw as { type?: string; output?: string[] | null } | undefined;
+      if (data?.type === "status" && data.output?.length) {
+        setClaudeSigninStatus(data.output);
+      }
+    });
+    return () => cleanup?.();
+  }, []);
 
   useEffect(() => {
     brainGetProfile()
       .then(({ profile }) => {
         if (profile) {
-          setPhilosophy(profile.philosophy || "");
-          setRules(profile.rules || "");
+          setDnaString(profile.dna || "");
         }
       })
       .catch(() => {});
   }, []);
-
-  // Handle backend switching
-  const handleBackendChange = async (backend: string) => {
-    if (backend === punkBackend) return;
-    setPunkBackend(backend);
-
-    // Sync provider and model for Gemini CLI to ensure UI reflects the switch
-    if (backend === "gemini-cli") {
-      useWorkspaceStore
-        .getState()
-        .setSelectedModel("auto-gemini-3", false, "gemini");
-    } else if (backend === "claude-cli") {
-      useWorkspaceStore
-        .getState()
-        .setSelectedModel("sonnet", false, "anthropic");
-    } else if (backend === "http") {
-      // Default to DeepSeek for HTTP if no prior selection
-      useWorkspaceStore
-        .getState()
-        .setSelectedModel("deepseek-chat", false, "deepseek");
-    }
-
-    await reinitializePunkBackend(backend).catch(() => {});
-  };
 
   // API key changes go straight to the store.
   // useSettingsPersistence watches the store and saves automatically.
@@ -1149,87 +1914,24 @@ export function Profile() {
     setHttpApiKeys({ ...httpApiKeys, [provider]: key });
   };
 
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        useWorkspaceStore.getState().setOverlay(null);
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, []);
+  const handleBaseUrlChange = (provider: string, url: string) => {
+    setHttpBaseUrls({ ...httpBaseUrls, [provider]: url });
+  };
 
-  const saveIdentity = useCallback((field: string, value: string) => {
-    if (identitySaveRef.current) clearTimeout(identitySaveRef.current);
-    identitySaveRef.current = setTimeout(() => {
-      brainUpdateIdentity({ [field]: value }).catch(() => {});
-    }, 500);
-  }, []);
-
-  const handleAvatarClick = useCallback(
-    () => fileInputRef.current?.click(),
-    [],
-  );
-
-  const handleAvatarChange = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const dataUrl = reader.result as string;
-        useWorkspaceStore.getState().setProfileAvatarDataUrl(dataUrl);
-        await brainSaveAvatar(dataUrl.split(",")[1]!, file.type).catch(
-          () => {},
-        );
-      };
-      reader.readAsDataURL(file);
-      e.target.value = "";
-    },
-    [],
-  );
-
-  const handlePhilosophyChange = useCallback(
+  const handleDnaChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      setPhilosophy(e.target.value);
-      if (philosophySaveRef.current) clearTimeout(philosophySaveRef.current);
-      philosophySaveRef.current = setTimeout(() => {
-        brainUpdatePhilosophy(e.target.value).catch(() => {});
+      setDnaString(e.target.value);
+      if (dnaSaveRef.current) clearTimeout(dnaSaveRef.current);
+      dnaSaveRef.current = setTimeout(() => {
+        brainUpdateDNA(e.target.value).catch(() => {});
       }, 800);
     },
     [],
   );
-
-  const handleRulesChange = useCallback(
-    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      setRules(e.target.value);
-      if (philosophySaveRef.current) clearTimeout(philosophySaveRef.current);
-      philosophySaveRef.current = setTimeout(() => {
-        brainUpdateRules(e.target.value).catch(() => {});
-      }, 800);
-    },
-    [],
-  );
-
-  const initials = profileName
-    ? profileName
-        .split(" ")
-        .map((w) => w[0])
-        .join("")
-        .toUpperCase()
-        .slice(0, 2)
-    : "";
 
   // Icon components for each section
   const icons = {
     identity: (
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="12" cy="7" r="4" />
-        <path d="M5.5 21a7.5 7.5 0 0115 0" />
-      </svg>
-    ),
-    philosophy: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 20h9" />
         <path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z" />
@@ -1247,7 +1949,7 @@ export function Profile() {
         <path d="M9 9h6v6H9z" />
       </svg>
     ),
-    aiEngines: (
+    paneAuto: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
         <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
       </svg>
@@ -1271,165 +1973,58 @@ export function Profile() {
         <path d="M19.07 4.93l-1.41 1.41" />
       </svg>
     ),
+    cloud: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z" />
+      </svg>
+    ),
+    claude: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 2L2 7l10 5 10-5-10-5z" />
+        <path d="M2 17l10 5 10-5" />
+        <path d="M2 12l10 5 10-5" />
+      </svg>
+    ),
+    usage: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 20V10" />
+        <path d="M18 20V4" />
+        <path d="M6 20v-4" />
+      </svg>
+    ),
+    integrations: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M4 11a9 9 0 0118 0" />
+        <path d="M12 11V2" />
+        <path d="M8 22h8" />
+        <path d="M12 22v-6" />
+      </svg>
+    ),
+    models: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+      </svg>
+    ),
   };
 
   return (
     <div
-      className="h-full overflow-y-auto overflow-x-hidden px-12 pt-8 pb-48 relative z-20"
+      className="h-full overflow-y-auto overflow-x-hidden px-12 pt-8 pb-48 relative"
       data-no-drag
     >
-      {/* Close button — fixed top-right, always accessible while scrolling */}
-      <button
-        onClick={() => useWorkspaceStore.getState().setOverlay(null)}
-        data-no-drag
-        className="fixed top-8 right-12 w-7 h-7 flex items-center justify-center rounded text-pane-text-secondary/25 hover:text-pane-text hover:bg-pane-text/[0.06] transition-colors z-50"
-        title="Close (Esc)"
-      >
-        <svg
-          width="12"
-          height="12"
-          viewBox="0 0 12 12"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        >
-          <path d="M2 2l8 8M10 2l-8 8" />
-        </svg>
-      </button>
-
-      <div className="max-w-xl mx-auto flex flex-col gap-y-8">
-        {/* Identity Section */}
+      <div className="mx-auto w-full max-w-4xl flex flex-col gap-y-8">
+        {/* DNA Section */}
         <AccordionSection
           title="identity"
           icon={icons.identity}
           isExpanded={expandedSection === "identity"}
           onToggle={() => setExpandedSection(expandedSection === "identity" ? null : "identity")}
         >
-          <div className="flex flex-col items-center gap-4">
-            <button
-              onClick={handleAvatarClick}
-              className="relative w-20 h-20 rounded-full overflow-hidden bg-pane-bg ring-1 ring-pane-border/40 hover:ring-pane-text/20 transition-shadow group"
-              title="Change photo"
-            >
-              {avatarDataUrl ? (
-                <img
-                  src={avatarDataUrl}
-                  alt=""
-                  className="w-full h-full object-cover"
-                />
-              ) : (
-                <div className="w-full h-full flex items-center justify-center">
-                  {initials ? (
-                    <span className="font-mono text-pane-text text-lg font-medium">
-                      {initials}
-                    </span>
-                  ) : (
-                    <svg
-                      width="28"
-                      height="28"
-                      viewBox="0 0 28 28"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.5"
-                      strokeLinecap="round"
-                      className="text-pane-text-secondary/40"
-                    >
-                      <circle cx="14" cy="11" r="5" />
-                      <path d="M4 26c0-5.523 4.477-10 10-10s10 4.477 10 10" />
-                    </svg>
-                  )}
-                </div>
-              )}
-              <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 16 16"
-                  fill="none"
-                  stroke="white"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                >
-                  <circle cx="8" cy="8" r="2.5" />
-                  <path d="M2.5 6.5V5a1.5 1.5 0 011.5-1.5h1.5M12 3.5h1.5A1.5 1.5 0 0115 5v1.5M13.5 11v1.5a1.5 1.5 0 01-1.5 1.5h-1.5M4 14H2.5A1.5 1.5 0 011 12.5V11" />
-                </svg>
-              </div>
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/png,image/jpeg,image/webp"
-              className="hidden"
-              onChange={handleAvatarChange}
-            />
-
-            <input
-              type="text"
-              value={profileName}
-              onChange={(e) => {
-                useWorkspaceStore.getState().setProfileName(e.target.value);
-                saveIdentity("name", e.target.value);
-              }}
-              placeholder="your name"
-              className="w-full text-center font-mono text-pane-text bg-transparent outline-none text-lg placeholder:text-pane-text-secondary/30"
-            />
-            <input
-              type="text"
-              value={profileRole}
-              onChange={(e) => {
-                useWorkspaceStore.getState().setProfileRole(e.target.value);
-                saveIdentity("role", e.target.value);
-              }}
-              placeholder="role"
-              className="w-full text-center font-mono text-pane-text-secondary bg-transparent outline-none placeholder:text-pane-text-secondary/30"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            />
-            <textarea
-              value={profileBio}
-              onChange={(e) => {
-                useWorkspaceStore.getState().setProfileBio(e.target.value);
-                saveIdentity("bio", e.target.value);
-              }}
-              placeholder="about you"
-              rows={2}
-              className="w-full text-center font-mono text-pane-text-secondary bg-transparent outline-none resize-none placeholder:text-pane-text-secondary/30 leading-[1.75]"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            />
-          </div>
-        </AccordionSection>
-
-        {/* Philosophy Section */}
-        <AccordionSection
-          title="philosophy"
-          icon={icons.philosophy}
-          isExpanded={expandedSection === "philosophy"}
-          onToggle={() => setExpandedSection(expandedSection === "philosophy" ? null : "philosophy")}
-        >
           <textarea
-            value={philosophy}
-            onChange={handlePhilosophyChange}
-            placeholder="your design principles..."
-            rows={4}
-            className="w-full font-mono text-pane-text bg-transparent outline-none resize-none placeholder:text-pane-text-secondary/30 leading-[1.75]"
-            style={{ fontSize: "var(--pane-font-size-sm)" }}
-          />
-        </AccordionSection>
-
-        {/* Rules Section */}
-        <AccordionSection
-          title="rules"
-          icon={icons.rules}
-          isExpanded={expandedSection === "rules"}
-          onToggle={() => setExpandedSection(expandedSection === "rules" ? null : "rules")}
-        >
-          <textarea
-            value={rules}
-            onChange={handleRulesChange}
-            placeholder={
-              "always use bun\nnever auto-commit\nprefer functional over class"
-            }
-            rows={4}
+            value={dnaString}
+            onChange={handleDnaChange}
+            placeholder="your developer dna — what the model sees about how you work..."
+            rows={6}
             className="w-full font-mono text-pane-text bg-transparent outline-none resize-none placeholder:text-pane-text-secondary/30 leading-[1.75]"
             style={{ fontSize: "var(--pane-font-size-sm)" }}
           />
@@ -1437,74 +2032,34 @@ export function Profile() {
             className="text-pane-text-secondary/50 font-mono mt-2 block"
             style={{ fontSize: "var(--pane-font-size-xs)" }}
           >
-            one per line — these override observed preferences
+            this is exactly what every model sees about you — edit directly, no compilation needed
           </span>
         </AccordionSection>
 
-        {/* AI Backend Section */}
+        {/* Usage Section */}
         <AccordionSection
-          title="ai backend"
-          icon={icons.aiBackend}
-          isExpanded={expandedSection === "aiBackend"}
-          onToggle={() => setExpandedSection(expandedSection === "aiBackend" ? null : "aiBackend")}
+          title="usage & spend"
+          icon={icons.usage}
+          isExpanded={expandedSection === "usage"}
+          onToggle={() => setExpandedSection(expandedSection === "usage" ? null : "usage")}
         >
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <span className="text-pane-text-secondary/60 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                active mode
-              </span>
-              <div className="flex gap-1">
-                {(["http", "claude-cli", "gemini-cli"] as const).map((backend) => (
-                  <button
-                    key={backend}
-                    onClick={() => handleBackendChange(backend)}
-                    className={`px-3 py-1.5 rounded-lg font-mono transition-all ${punkBackend === backend ? "bg-pane-text/[0.12] text-pane-text ring-1 ring-pane-text/20" : "text-pane-text-secondary/40 hover:text-pane-text-secondary hover:bg-pane-text/[0.04]"}`}
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  >
-                    {backend === "claude-cli" ? "Claude CLI" : backend === "gemini-cli" ? "Gemini CLI" : "HTTP"}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Backend info cards */}
-            <div className="mt-2 p-3 bg-pane-surface/50 rounded-lg">
-              {(punkBackend === "claude-cli" || punkBackend === "gemini-cli") ? (
-                <div className="flex items-center gap-2 text-pane-text-secondary">
-                  <div className="w-2 h-2 rounded-full bg-pane-status-added animate-pulse" />
-                  <span className="font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    {punkBackend === "claude-cli" ? "Claude CLI" : "Gemini CLI"} — local command authentication ready
-                  </span>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2 text-pane-text-secondary">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <circle cx="12" cy="12" r="10" />
-                    <path d="M12 16v-4M12 8h.01" />
-                  </svg>
-                  <span className="font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                    HTTP mode — configure keys and model routing
-                  </span>
-                </div>
-              )}
-            </div>
-          </div>
+          <TokenAnalytics projectId={null} isExpanded={expandedSection === "usage"} />
         </AccordionSection>
 
         {/* AI Engines Section */}
         <AccordionSection
-          title="ai engines"
-          icon={icons.aiEngines}
-          isExpanded={expandedSection === "aiEngines"}
-          onToggle={() => setExpandedSection(expandedSection === "aiEngines" ? null : "aiEngines")}
+          title="pane auto"
+          icon={icons.paneAuto}
+          isExpanded={expandedSection === "paneAuto"}
+          onToggle={() => setExpandedSection(expandedSection === "paneAuto" ? null : "paneAuto")}
         >
-          <AiEnginesSection httpApiKeys={httpApiKeys} />
+          <PaneAutoSection httpApiKeys={httpApiKeys} />
         </AccordionSection>
 
         {/* API Keys Section */}
-        {punkBackend === "http" && (
+        {punkBackend === "api" && (
           <AccordionSection
-            title="api keys"
+            title="providers"
             icon={icons.apiKeys}
             isExpanded={expandedSection === "apiKeys"}
             onToggle={() => setExpandedSection(expandedSection === "apiKeys" ? null : "apiKeys")}
@@ -1512,7 +2067,23 @@ export function Profile() {
             <ApiKeysSection
               httpApiKeys={httpApiKeys}
               onKeyChange={handleApiKeyChange}
+              httpBaseUrls={httpBaseUrls}
+              onBaseUrlChange={handleBaseUrlChange}
+              claudeCodeAvailable={claudeCodeAvailable}
+              geminiAvailable={geminiAvailable}
             />
+          </AccordionSection>
+        )}
+
+        {/* Curate Models Section */}
+        {punkBackend === "api" && (
+          <AccordionSection
+            title="curate models"
+            icon={icons.models}
+            isExpanded={expandedSection === "curatedModels"}
+            onToggle={() => setExpandedSection(expandedSection === "curatedModels" ? null : "curatedModels")}
+          >
+            <CuratedModelsSection />
           </AccordionSection>
         )}
 
@@ -1523,29 +2094,51 @@ export function Profile() {
           isExpanded={expandedSection === "appearance"}
           onToggle={() => setExpandedSection(expandedSection === "appearance" ? null : "appearance")}
         >
-          <div className="flex flex-col gap-4">
-            <div className="flex items-center justify-between">
-              <span className="text-pane-text-secondary/60 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+          <div className="flex flex-col gap-0">
+            {/* Theme — circles preview each theme's actual bg/text colors */}
+            <div className="flex items-center justify-between py-4">
+              <span
+                className="text-pane-text-secondary/50 font-mono"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
                 theme
               </span>
-              <div className="flex gap-1">
-                {(["system", "dark", "light", "pure"] as const).map((t) => (
+              <div className="flex items-center gap-3">
+                {([
+                  { id: "system" as const, bg: "linear-gradient(135deg, #1C1B1A 50%, #F4F2EC 50%)", ring: "#A8A59E" },
+                  { id: "dark" as const, bg: "#1C1B1A", ring: "#D8D5CE" },
+                  { id: "light" as const, bg: "#F4F2EC", ring: "#1A1918" },
+                  { id: "pure" as const, bg: "#FFFFFF", ring: "#0A0A0A" },
+                  { id: "glass" as const, bg: "transparent", ring: "#D8D5CE" },
+                ]).map((t) => (
                   <button
-                    key={t}
-                    onClick={() => setTheme(t)}
-                    className={`px-3 py-1 rounded-lg font-mono ${theme === t ? "bg-pane-text/[0.12] text-pane-text ring-1 ring-pane-text/20" : "text-pane-text-secondary/40 hover:text-pane-text-secondary hover:bg-pane-text/[0.04]"}`}
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  >
-                    {t}
-                  </button>
+                    key={t.id}
+                    onClick={() => setTheme(t.id)}
+                    className="w-4 h-4 rounded-full transition-all duration-200"
+                    style={{
+                      background: t.bg,
+                      backgroundSize: "cover",
+                      boxShadow: theme === t.id
+                        ? `0 0 0 2px ${t.ring}`
+                        : `0 0 0 1px ${t.ring}40`,
+                      border: t.id === "glass" ? "0.5px solid rgba(255,255,255,0.15)" : "none",
+                    }}
+                  />
                 ))}
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <span className="text-pane-text-secondary/60 font-mono block mb-2" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  chat font
+            {/* Separator */}
+            <div className="border-t border-pane-border/20" />
+
+            {/* Text size — four rows: chat, weight, editor, panel */}
+            <div className="flex flex-col gap-3 py-4">
+              <div className="flex items-center justify-between">
+                <span
+                  className="text-pane-text-secondary/50 font-mono"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  text size
                 </span>
                 <FontSizeControl
                   value={fontSize}
@@ -1554,30 +2147,11 @@ export function Profile() {
                   onReset={() => useWorkspaceStore.getState().resetFontSize()}
                 />
               </div>
-              <div>
-                <span className="text-pane-text-secondary/60 font-mono block mb-2" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  editor font
-                </span>
-                <FontSizeControl
-                  value={editorFontSize}
-                  onIncrease={() => useWorkspaceStore.getState().increaseEditorFontSize()}
-                  onDecrease={() => useWorkspaceStore.getState().decreaseEditorFontSize()}
-                  onReset={() => useWorkspaceStore.getState().resetEditorFontSize()}
-                />
-              </div>
-              <div>
-                <span className="text-pane-text-secondary/60 font-mono block mb-2" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-                  panel font
-                </span>
-                <FontSizeControl
-                  value={panelFontSize}
-                  onIncrease={() => useWorkspaceStore.getState().increasePanelFontSize()}
-                  onDecrease={() => useWorkspaceStore.getState().decreasePanelFontSize()}
-                  onReset={() => useWorkspaceStore.getState().resetPanelFontSize()}
-                />
-              </div>
-              <div>
-                <span className="text-pane-text-secondary/60 font-mono block mb-2" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              <div className="flex items-center justify-between">
+                <span
+                  className="text-pane-text-secondary/50 font-mono"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
                   weight
                 </span>
                 <FontSizeControl
@@ -1588,39 +2162,73 @@ export function Profile() {
                   unit=""
                 />
               </div>
+              <div className="flex items-center justify-between">
+                <span
+                  className="text-pane-text-secondary/50 font-mono"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  editor
+                </span>
+                <FontSizeControl
+                  value={editorFontSize}
+                  onIncrease={() => useWorkspaceStore.getState().increaseEditorFontSize()}
+                  onDecrease={() => useWorkspaceStore.getState().decreaseEditorFontSize()}
+                  onReset={() => useWorkspaceStore.getState().resetEditorFontSize()}
+                />
+              </div>
+              <div className="flex items-center justify-between">
+                <span
+                  className="text-pane-text-secondary/50 font-mono"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  panel
+                </span>
+                <FontSizeControl
+                  value={panelFontSize}
+                  onIncrease={() => useWorkspaceStore.getState().increasePanelFontSize()}
+                  onDecrease={() => useWorkspaceStore.getState().decreasePanelFontSize()}
+                  onReset={() => useWorkspaceStore.getState().resetPanelFontSize()}
+                />
+              </div>
             </div>
 
-            <div className="flex items-center justify-between pt-2">
-              <span className="text-pane-text-secondary/60 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+            {/* Separator */}
+            <div className="border-t border-pane-border/20" />
+
+            {/* Sound — three dots: none / subtle / present. Active dot uses accent color. Clicking plays immediately */}
+            <div className="flex items-center justify-between py-4">
+              <span
+                className="text-pane-text-secondary/50 font-mono"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
                 sound
               </span>
-              <div className="flex gap-1">
-                <select
-                  value={completionSound}
-                  onChange={(e) => setCompletionSound(e.target.value)}
-                  className="px-3 py-1.5 rounded-lg font-mono bg-pane-surface text-pane-text border border-pane-border/40 hover:border-pane-border outline-none"
-                  style={{ fontSize: "var(--pane-font-size-sm)" }}
-                >
-                  <option value="none">none</option>
-                  {[
-                    "Basso", "Blow", "Bottle", "Frog", "Funk", "Glass",
-                    "Hero", "Morse", "Ping", "Pop", "Purr", "Sosumi",
-                    "Submarine", "Tink",
-                  ].map((s) => (
-                    <option key={s} value={s}>
-                      {s.toLowerCase()}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  onClick={playCompletionSound}
-                  disabled={completionSound === "none"}
-                  className="px-3 py-1.5 rounded-lg font-mono text-pane-text-secondary hover:text-pane-text hover:bg-pane-text/[0.04] disabled:opacity-30 disabled:cursor-default"
-                  style={{ fontSize: "var(--pane-font-size-sm)" }}
-                  title="Test sound"
-                >
-                  ▶
-                </button>
+              <div className="flex items-center gap-3">
+                {[
+                  { id: "none", label: "none" },
+                  { id: "Tink", label: "subtle" },
+                  { id: "Pop", label: "present" },
+                ].map((s) => {
+                  const isActive = s.id === "Pop"
+                    ? completionSound !== "none" && completionSound !== "Tink"
+                    : completionSound === s.id;
+                  return (
+                    <button
+                      key={s.id}
+                      onClick={() => {
+                        setCompletionSound(s.id);
+                        if (s.id !== "none") {
+                          window.electronAPI.invoke("play_sound", { sound: s.id });
+                        }
+                      }}
+                      className={`w-4 h-4 rounded-full transition-all duration-200 ${
+                        isActive
+                          ? "bg-pane-accent ring-2 ring-pane-accent/30"
+                          : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"
+                      }`}
+                    />
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -1640,6 +2248,18 @@ export function Profile() {
         >
           <KeybindingsSection />
         </AccordionSection>
+
+        {/* Cloud Section */}
+        <AccordionSection
+          title="pane cloud"
+          icon={icons.cloud}
+          isExpanded={expandedSection === "cloud"}
+          onToggle={() => setExpandedSection(expandedSection === "cloud" ? null : "cloud")}
+        >
+          <CloudSection />
+        </AccordionSection>
+
+
       </div>
     </div>
   );

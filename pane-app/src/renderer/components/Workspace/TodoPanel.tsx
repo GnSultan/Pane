@@ -1,6 +1,6 @@
 import { useProjectsStore } from "../../stores/projects";
 import { useShallow } from "zustand/react/shallow";
-import type { Todo } from "../../lib/claude-types";
+import type { Todo } from "../../lib/punk-types";
 
 const EMPTY_TODOS: Todo[] = [];
 

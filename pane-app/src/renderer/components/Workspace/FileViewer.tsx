@@ -44,7 +44,6 @@ import "ace-builds/src-noconflict/mode-zig";
 import "ace-builds/src-noconflict/mode-diff";
 import "ace-builds/src-noconflict/mode-ini";
 import "ace-builds/src-noconflict/mode-text";
-import "ace-builds/src-noconflict/ext-language_tools";
 // Import the custom Pane theme
 import "../../lib/pane-ace-theme";
 
@@ -175,6 +174,8 @@ export function FileViewer() {
   const prevFilePathRef = useRef<string | null>(null);
   const followRef = useRef(true);
   const rafRef = useRef(0);
+  const pendingProcessingContent = useRef<string | null>(null);
+  const processingDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleChange = useCallback(
     (content: string) => {
@@ -208,14 +209,23 @@ export function FileViewer() {
     [activeFilePath, activeProjectId],
   );
 
-  // Update editor content when file changes, saving/restoring scroll position
+  // Flush any pending processing content to the editor
+  const flushProcessingContent = useCallback(() => {
+    if (pendingProcessingContent.current !== null && editorRef.current) {
+      const editor = editorRef.current.editor;
+      editor.setValue(pendingProcessingContent.current, -1);
+      pendingProcessingContent.current = null;
+    }
+  }, []);
+
+  // Update editor content when file changes, saving/restoring scroll position.
+  // During AI processing, same-file content updates are debounced (500ms) to avoid
+  // full Ace reinit on every incremental AI write — setValue destroys and recreates
+  // all DOM nodes, causing severe frame drops.
   useEffect(() => {
     if (editorRef.current && activeFileContent !== null) {
       const editor = editorRef.current.editor;
       const currentValue = editor.getValue();
-      
-      // Only update if content is actually different to avoid jumps during typing.
-      // We also check if we're switching files.
       const isNewFile = prevFilePathRef.current !== activeFilePath;
       
       if (isNewFile || currentValue !== activeFileContent) {
@@ -230,30 +240,39 @@ export function FileViewer() {
           });
         }
 
-        // Only setValue if it's a new file or the content is fundamentally different.
-        // For same-file updates (external or auto-save sync), we only update if 
-        // the content doesn't match to avoid interrupting the user.
-        if (isNewFile || currentValue !== activeFileContent) {
+        // New file switch — apply immediately (mount event, must show correct content)
+        if (isNewFile) {
+          // Clear any pending debounced update
+          if (processingDebounceRef.current) {
+            clearTimeout(processingDebounceRef.current);
+            processingDebounceRef.current = null;
+            pendingProcessingContent.current = null;
+          }
           editor.setValue(activeFileContent, -1);
 
-          // Restore position
-          if (!isNewFile) {
-            // Same file (external update) — restore immediate position
-            // But only if we're not processing (agent editing) to allow auto-scrolling
-            if (!isProcessing) {
-              editor.session.setScrollTop(scrollTop);
-              editor.moveCursorToPosition(pos);
-            }
-          } else {
-            // New file — restore its last known position
-            const saved = activeFilePath && scrollPositions ? scrollPositions.get(activeFilePath) : null;
+          // Restore last known position, or scroll to end
+          const saved = activeFilePath && scrollPositions ? scrollPositions.get(activeFilePath) : null;
+          requestAnimationFrame(() => {
             if (saved) {
-              requestAnimationFrame(() => {
-                editor.session.setScrollTop(saved.scrollTop);
-                editor.moveCursorToPosition(saved.cursor);
-              });
+              editor.session.setScrollTop(saved.scrollTop);
+              editor.moveCursorToPosition(saved.cursor);
+            } else {
+              editor.navigateFileEnd();
             }
-          }
+          });
+        } else if (isProcessing) {
+          // Same file during AI processing — debounce the update to avoid
+          // thrashing the editor on every incremental AI write.
+          pendingProcessingContent.current = activeFileContent;
+          if (processingDebounceRef.current) clearTimeout(processingDebounceRef.current);
+          processingDebounceRef.current = setTimeout(() => {
+            flushProcessingContent();
+          }, 500);
+        } else {
+          // Same file, not processing — apply immediately
+          editor.setValue(activeFileContent, -1);
+          editor.session.setScrollTop(scrollTop);
+          editor.moveCursorToPosition(pos);
         }
       }
       prevFilePathRef.current = activeFilePath;
@@ -261,13 +280,12 @@ export function FileViewer() {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
     }
-  }, [activeFilePath, activeFileContent, activeProjectId, scrollPositions, isProcessing]);
+  }, [activeFilePath, activeFileContent, activeProjectId, scrollPositions, isProcessing, flushProcessingContent]);
 
   useEffect(() => {
     return () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-      }
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      if (processingDebounceRef.current) clearTimeout(processingDebounceRef.current);
     };
   }, []);
 
@@ -420,7 +438,7 @@ export function FileViewer() {
         showPrintMargin={false}
         showGutter={true}
         highlightActiveLine={false}
-        enableBasicAutocompletion={true}
+        enableBasicAutocompletion={false}
         enableLiveAutocompletion={false}
         enableSnippets={false}
         setOptions={{

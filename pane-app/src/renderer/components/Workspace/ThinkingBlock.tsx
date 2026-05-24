@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState } from "react";
-import type { ThinkingBlock } from "../../lib/claude-types";
+import type { ThinkingBlock } from "../../lib/punk-types";
 import { MarkdownText } from "./MarkdownText";
 import { MicroIndicator } from "../shared";
 
@@ -44,29 +44,27 @@ export function ThinkingBlockDisplay({
     >
       <button
         onClick={() => setUserToggle(!isExpanded)}
-        className="flex items-center gap-2.5 h-12 leading-none px-6 hover:text-pane-text transition-colors w-full text-left"
-        style={{ minHeight: '3rem' }}
+        className="flex items-center gap-2.5 h-10 leading-none px-4 hover:text-pane-text transition-colors w-full text-left group"
+        style={{ minHeight: '2.5rem' }}
       >
         <MicroIndicator
           variant={isStreaming ? "strong" : "subtle"}
           animate={isStreaming}
           size={5}
-          ariaLabel={isStreaming ? "thinking" : "reasoning complete"}
+          ariaLabel="contemplating"
         />
         <span
           className="font-mono mr-1"
           style={{ fontSize: "var(--pane-font-size-sm)" }}
         >
-          <span 
+          <span
             className={
-              isBreathing 
-                ? "text-pane-text-secondary/40 animate-pulse" 
-                : isStreaming 
-                  ? "text-pane-text-secondary/50" 
-                  : "text-pane-text-secondary/30"
+              isBreathing
+                ? "text-pane-text-secondary/40 animate-pulse"
+                : "text-pane-text-secondary/30"
             }
           >
-            {isStreaming ? "thinking..." : "reasoning"}
+            contemplating
           </span>
         </span>
         <span 
@@ -80,7 +78,7 @@ export function ThinkingBlockDisplay({
       {isExpanded && (
         <div
           ref={contentRef}
-          className="px-10 py-8 space-y-3
+          className="px-4 py-8 space-y-3
                      text-pane-text-secondary/60 leading-[1.8]
                      max-h-[500px] overflow-y-auto selection:bg-pane-text-secondary/10"
           style={{

@@ -1,0 +1,17 @@
+name = "pane-cloud"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+GITHUB_CLIENT_ID = ""  # Set via wrangler secret or dashboard
+
+# R2 bucket binding
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "pane-backups"
+
+# D1 database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "pane-cloud"
+database_id = ""  # Set after `wrangler d1 create pane-cloud`

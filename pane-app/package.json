@@ -1,21 +1,25 @@
 {
   "name": "pane",
-  "version": "0.4.0",
+"version": "0.4.168",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
   "author": "Aslam Abdul",
   "license": "MIT",
   "scripts": {
-    "dev": "node scripts/dev.js",
-    "build": "electron-vite build && node scripts/copy-compiled.js",
+    "dev": "node scripts/dev.mjs",
+    "build": "electron-vite build && node scripts/copy-compiled.mjs",
     "preview": "electron-vite preview",
-    "build:mac": "npm run build && electron-builder --mac --arm64",
-    "build:all": "npm run build && electron-builder --mac --arm64 --x64",
+    "build:mac": "npm update @anthropic-ai/claude-agent-sdk && npm run version:patch && npm run build && electron-builder --mac --arm64",
+    "build:all": "npm update @anthropic-ai/claude-agent-sdk && npm run build && electron-builder --mac --arm64 --x64",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/renderer/",
+    "build:icon": "node scripts/build-icon.mjs",
+    "download-models": "node scripts/download-models.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "postinstall": "electron-rebuild -f --only node-pty,better-sqlite3"
   },
   "build": {
@@ -23,6 +27,9 @@
     "productName": "Pane",
     "mac": {
       "category": "public.app-category.developer-tools",
+      "extendInfo": {
+        "CFBundleIconName": "AppIcon"
+      },
       "target": [
         {
           "target": "dmg",
@@ -30,12 +37,34 @@
             "arm64"
           ]
         }
+      ],
+      "protocols": [
+        {
+          "name": "Pane",
+          "schemes": [
+            "pane"
+          ]
+        }
       ]
     },
+    "extraResources": [
+      {
+        "from": "build/Assets.car",
+        "to": "Assets.car"
+      },
+      {
+        "from": "models/",
+        "to": "models",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "files": [
       "out/**/*",
       "src/main/main.mjs",
       "src/main/model-manager.mjs",
+      "src/main/model-paths.mjs",
       "src/main/cli-worker.mjs",
       "src/main/pty-worker.mjs",
       "src/main/pane-mcp-server.mjs",
@@ -46,15 +75,24 @@
       "src/main/session-context.mjs",
       "src/main/tool-executor.mjs",
       "src/main/classify-intent.mjs",
+      "src/main/intent-classifier.mjs",
+      "src/main/planning-agent.mjs",
       "src/main/punk-backend.mjs",
       "src/main/task-runner.mjs",
+      "src/main/backup-engine.mjs",
+      "src/main/cloud-auth.mjs",
+      "src/main/cloud-crypto.mjs",
+      "src/main/cloud-sync.mjs",
       "src/preload/preload.mjs",
       "package.json"
     ],
     "asarUnpack": [
       "node_modules/node-pty/**",
       "node_modules/better-sqlite3/**",
-      "node_modules/@anthropic-ai/claude-agent-sdk/**"
+      "node_modules/@anthropic-ai/claude-agent-sdk/**",
+      "node_modules/@vscode/ripgrep/**",
+      "node_modules/onnxruntime-node/**",
+      "node_modules/@huggingface/transformers/**"
     ],
     "directories": {
       "output": "dist"
@@ -64,9 +102,11 @@
     "@anthropic-ai/claude-agent-sdk": "^0.2.77",
     "@fontsource-variable/bricolage-grotesque": "^5.2.10",
     "@fontsource-variable/dm-sans": "^5.2.8",
+    "@fontsource-variable/geist": "^5.2.8",
     "@fontsource-variable/geist-mono": "^5.2.7",
     "@fontsource/geist-mono": "^5.2.7",
     "@huggingface/transformers": "^3.8.1",
+    "@vscode/ripgrep": "^1.17.1",
     "ace-builds": "^1.40.8",
     "better-sqlite3": "^12.6.2",
     "chokidar": "^5.0.0",
@@ -76,6 +116,7 @@
     "glob": "^11.0.0",
     "ignore": "^7.0.5",
     "node-pty": "^1.1.0",
+    "onnxruntime-node": "^1.25.1",
     "react": "^18.3.1",
     "react-ace": "^12.0.0",
     "react-dom": "^18.3.1",
@@ -95,11 +136,12 @@
     "electron": "^40.6.0",
     "electron-builder": "^26.8.1",
     "electron-vite": "^2.3.0",
-    "eslint": "^9.39.4",
+    "eslint": "^10.0.0",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.2.0",
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.56.1",
-    "vite": "^5.4.11"
+    "vite": "^5.4.11",
+    "vitest": "^4.1.7"
   }
 }

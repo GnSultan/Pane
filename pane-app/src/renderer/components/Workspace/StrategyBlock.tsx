@@ -1,96 +1,108 @@
 import { useState } from "react";
-import type { StrategyBlock } from "../../lib/claude-types";
+import type { StrategyBlock } from "../../lib/punk-types";
+import { MicroIndicator } from "../shared";
 
-function modelShortName(model: string): string {
-  const lower = model.toLowerCase();
-  if (lower.includes("opus"))   return "opus";
-  if (lower.includes("sonnet")) return "sonnet";
-  if (lower.includes("haiku"))  return "haiku";
-  if (lower.includes("flash"))  return "flash";
-  if (lower.includes("o3"))     return "o3";
-  if (lower.includes("o4"))     return "o4-mini";
-  if (lower.includes("gpt-4o")) return "gpt-4o";
-  if (lower.includes("pro"))    return "pro";
-  if (lower.includes("r1"))     return "r1";
-  const slug = model.split("/").pop() || model;
-  return slug.split("-").slice(0, 2).join("-");
-}
+const ESCALATION_RECOVERY: Record<string, string[]> = {
+  debug: [
+    "Verifying every assumption before acting — no guessing at the fix until the cause is confirmed.",
+    "Root cause analysis: tracing what invariant broke and where, walking backward from the failure.",
+    "Reading the full call chain cold, separating what's known from what's assumed.",
+    "Adversarial audit of every prior assumption — the answer is likely in a cross-component interaction.",
+  ],
+  architect: [
+    "Stepping back from the code — reasoning about system boundaries and responsibilities first.",
+    "Mapping what changes downstream before proposing anything — working backward from consequences.",
+    "Fresh design perspective: reading every module in scope, then asking what the ideal shape looks like.",
+    "Full system audit before touching anything — real architecture vs. ideal, minimum viable path to close the gap.",
+  ],
+  implement: [
+    "Reading the actual contracts and interfaces before writing — implementing to what's real, not assumed.",
+    "Mapping every caller and dependency — no assumptions about what's safe to rely on.",
+    "Tracing every place this touches before writing a line.",
+    "Starting from scratch with a cold read — deriving the implementation from observation, not memory.",
+  ],
+  refactor: [
+    "Defining exactly what behavior must be preserved — semantic equivalence as the hard constraint.",
+    "Finding every caller and verifying actual usages before touching anything.",
+    "Building a complete call graph and reading the tests — every invariant accounted for.",
+    "Full reference audit — no change is safe until every dependency is mapped.",
+  ],
+  explain: [
+    "Rebuilding the explanation from first principles — simplest true statement first.",
+    "Completely different framing — whatever angle was tried before, going the other way.",
+    "Identifying what prerequisite understanding is missing and starting one level below that.",
+    "Abandoning all previous framings and finding the one question that makes everything else obvious.",
+  ],
+};
 
-function humanSummary(block: StrategyBlock): string {
-  const model = modelShortName(block.model);
-  const lines: string[] = [];
+const DEFAULT_RECOVERY = [
+  "Approaching this from a different angle — not more effort, a different model of the problem.",
+  "Re-examining what the problem actually is before acting.",
+  "Reading everything relevant cold, deriving from what's observed rather than what's remembered.",
+  "Full audit of every prior assumption before anything else.",
+];
 
-  // What pane is doing and with which model
-  if (block.mode === "orchestrate") {
-    lines.push(
-      `Breaking this into a plan first, then executing with ${model}.` +
-      (block.discovery
-        ? " Checking alignment before starting — the direction needs a bit more clarity."
-        : " The scope is large enough to benefit from a structured approach.")
-    );
-  } else if (block.mode === "discuss") {
-    lines.push(
-      block.discovery
-        ? `Treating this as a conversation with ${model}, with the current task in mind — this looks like it could shift direction.`
-        : `Having a conversation with ${model}. No code changes expected right now.`
-    );
-  } else {
-    // direct
-    lines.push(`Answering directly with ${model}.`);
-  }
-
-  // Oracle insight — only if it actually overrode the heuristic
-  if (block.oracleUsed && block.oracleConfidence != null) {
-    if (block.oracleExploring) {
-      lines.push(`Trying ${model} here — testing whether it handles this type of work well.`);
-    } else {
-      const pct = Math.round(block.oracleConfidence * 100);
-      lines.push(`${model} was chosen based on past performance on similar tasks (${pct}% confidence).`);
-    }
-  }
-
-  // Reasoning depth — only mention if it's notable
-  if (block.reasoning === "deep" && block.mode !== "discuss") {
-    lines.push("Taking time to think this through carefully.");
-  }
-
-  return lines.join(" ");
+function escalationDetail(block: StrategyBlock): string {
+  const domain = block.localTaskType ?? null;
+  const tier   = block.escalationLevel ?? 1;
+  const shifts = (domain && ESCALATION_RECOVERY[domain]) ? ESCALATION_RECOVERY[domain] : DEFAULT_RECOVERY;
+  return shifts[Math.min(tier - 1, shifts.length - 1)] ?? shifts[0] ?? "";
 }
 
 export function StrategyBlockDisplay({ block }: { block: StrategyBlock }) {
   const [expanded, setExpanded] = useState(false);
+  const escalation  = block.escalationLevel ?? 0;
+  const isEscalated = escalation >= 1;
+
+  const reason = block.reason
+    ? (block.reason.endsWith(".") ? block.reason.slice(0, -1) : block.reason)
+    : null;
+
+  const expandedText = [
+    reason,
+    isEscalated ? escalationDetail(block) : null,
+  ].filter(Boolean).join("\n\n");
 
   return (
-    <div className="mb-0.5">
+    <div
+      className={`group rounded-md border transition-all duration-200 ${
+        expanded
+          ? "border-[var(--pane-border-soft)] bg-[var(--pane-bg)] mb-6"
+          : "border-transparent hover:border-[var(--pane-border-soft)] mb-4"
+      }`}
+    >
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full text-left px-0.5 py-0.5 group"
+        className="flex items-center gap-2.5 h-12 leading-none px-6 hover:text-pane-text transition-colors w-full text-left"
+        style={{ minHeight: "3rem" }}
       >
-        {/* Faint label — same register as thinking blocks */}
+        <MicroIndicator variant="subtle" animate={false} size={5} ariaLabel="pane reasoner" />
         <span
-          className="font-mono text-pane-text-secondary/30 group-hover:text-pane-text-secondary/50 transition-colors"
-          style={{ fontSize: "var(--pane-font-size-xs)" }}
+          className="font-mono mr-1"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
         >
-          pane route
+          <span className="text-pane-text-secondary/20">pane</span>
+          <span className="text-pane-text-secondary/30"> reasoner</span>
         </span>
         <span
-          className="font-mono text-pane-text-secondary/15 group-hover:text-pane-text-secondary/30 transition-colors"
-          style={{ fontSize: "var(--pane-font-size-xs)" }}
+          className="ml-auto shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-pane-text-secondary/20 font-mono"
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
         >
-          {expanded ? "▴" : "▾"}
+          {expanded ? "collapse" : "expand"}
         </span>
       </button>
 
       {expanded && (
         <div
-          className="mt-1 ml-0.5 px-3 py-2.5 rounded-md bg-pane-text/[0.02] border border-pane-text-secondary/[0.06]"
+          className="px-10 py-8 space-y-3
+                     text-pane-text-secondary/60 leading-[1.8]
+                     max-h-[500px] overflow-y-auto selection:bg-pane-text-secondary/10"
+          style={{
+            fontSize: "var(--pane-font-size-sm)",
+            fontFamily: "var(--font-mono)",
+          }}
         >
-          <p
-            className="font-mono text-pane-text-secondary/50 leading-relaxed"
-            style={{ fontSize: "var(--pane-font-size-xs)" }}
-          >
-            {humanSummary(block)}
-          </p>
+          {expandedText}
         </div>
       )}
     </div>
