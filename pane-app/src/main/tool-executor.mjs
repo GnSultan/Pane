@@ -1736,7 +1736,7 @@ export class ToolExecutor {
                 }
                 score += 0.4 * fuzzyScore(queryLower, (node.content || "").toLowerCase());
                 return { ...node, score };
-              }).filter(s => s.score > 0.15).sort((a, b) => b.score - a.score);
+              }).filter(s => s.type !== "mind" && s.score > 0.15).sort((a, b) => b.score - a.score);
 
               if (scored.length > 0) {
                 const matches = scored.slice(0, 30);
@@ -2028,7 +2028,7 @@ export class ToolExecutor {
           const parts = [`Knowledge graph: ${exported.length} nodes\n`];
 
           // Priority order: decisions and lessons first, then patterns, then everything else
-          const typeOrder = ["decision", "lesson", "pattern", "error_fix", "principle", "mind"];
+          const typeOrder = ["decision", "lesson", "pattern", "error_fix", "principle"];
           const orderedTypes = [
             ...typeOrder.filter(t => byType[t]),
             ...Object.keys(byType).filter(t => !typeOrder.includes(t)),

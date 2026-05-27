@@ -1458,37 +1458,31 @@ export class ApiBackend extends PunkBackend {
 
     // ── _resultRef resolution ──────────────────────────────────────────────
     // Messages from the backend's messages[] array have _resultRef pointers
-    // instead of full tool result content. For fresh turns (within freshDepth
-    // of the current turn), resolve the pointer from ToolResultStore so the
-    // model sees the full content. Non-fresh turns use the summary already in
-    // msg.content, keeping memory bounded.
+    // instead of full tool result content. We ALWAYS resolve to full content
+    // for cache stability — if the content at a given position changes between
+    // API calls (e.g., from full content to summary), the provider's prefix
+    // cache is invalidated from that point forward, destroying the cache rate.
     //
-    // context = { projectId, currentTurn, freshDepth }
-    //   freshDepth: turns within this distance from currentTurn are "fresh"
-    //   currentTurn: the current turn number in the spawn loop (1-indexed)
+    // The messages[] array maintains memory efficiency with summaries; the
+    // ToolResultStore holds the full content. We resolve here for the API
+    // request body only.
     const resolveResultRef = (msg) => {
       if (!msg._resultRef || !context) return msg;
-      const { projectId, currentTurn, freshDepth } = context;
-      if (!projectId || freshDepth == null) return msg;
-      const msgTurn = msg._resultRef.turn;
-      const turnFromEnd = currentTurn - msgTurn;
-      if (turnFromEnd <= freshDepth && turnFromEnd >= 0) {
-        try {
-          const resolved = toolResultCache.resolve(
-            projectId,
-            msgTurn,
-            msg._resultRef.seq,
-          );
-          if (resolved) {
-            const copy = { ...msg };
-            copy.content = resolved;
-            delete copy._resultRef;
-            delete copy._contentLength;
-            return copy;
-          }
-        } catch {
-          // Non-fatal — summary is sufficient for the API
+      try {
+        const resolved = toolResultCache.resolve(
+          context.projectId,
+          msg._resultRef.turn,
+          msg._resultRef.seq,
+        );
+        if (resolved) {
+          const copy = { ...msg };
+          copy.content = resolved;
+          delete copy._resultRef;
+          delete copy._contentLength;
+          return copy;
         }
+      } catch {
+        // Non-fatal — summary in msg.content is sufficient
       }
       return msg;
     };
@@ -2408,7 +2402,10 @@ export class ApiBackend extends PunkBackend {
                 const outputBudget = getDefaultOutputBudget(request.model);
                 const overheadBudget = 5000;
                 const maxMessagesTokens = modelLimit - outputBudget - overheadBudget;
-                let msgEstimateTokens = estimateTokens(JSON.stringify(sourceBody.messages));
+                // Use per-message estimation instead of JSON.stringify(allMessages) —
+                // avoids serializing the entire (potentially 20-100MB) messages array
+                // to a single string, which blocks the main thread for 50-200ms.
+                let msgEstimateTokens = estimateConversationTokens(sourceBody.messages);
                 if (sourceBody.system) {
                   const systemStr = typeof sourceBody.system === "string"
                     ? sourceBody.system
@@ -2825,8 +2822,28 @@ export class ApiBackend extends PunkBackend {
           const decoder = new TextDecoder("utf-8");
           let buffer = "";
 
+          // Shared idle timeout — single timer reused across chunks instead of
+          // creating a new setTimeout + Promise per SSE read (20/sec during streaming).
+          // Prevents rapid Timer object accumulation that triggers V8 minor GC pauses.
+          const STREAM_IDLE_TIMEOUT_MS = 60_000;
+          let _idleTimerId = null;
+          async function readWithTimeout() {
+            clearTimeout(_idleTimerId);
+            const result = await Promise.race([
+              reader.read(),
+              new Promise((_, reject) => {
+                _idleTimerId = setTimeout(
+                  () => reject(new Error("Stream idle timeout — no data received for 60s")),
+                  STREAM_IDLE_TIMEOUT_MS,
+                );
+              }),
+            ]);
+            clearTimeout(_idleTimerId);
+            return result;
+          }
+
           while (true) {
-            const { done, value } = await reader.read();
+            const { done, value } = await readWithTimeout();
             if (done) break;
 
             buffer += decoder.decode(value, { stream: true });
@@ -3709,7 +3726,12 @@ export class ApiBackend extends PunkBackend {
         // ── Turn Sentinel: independently verify the LLM's work ─────────────
         // Runs tsc + eslint on changed files. Verdict persisted for the context
         // orchestrator to inject as CRITICAL on the next turn.
-        if (arbiterChangedFiles.size > 0) {
+        // Only fire when JS/TS files were changed — markdown, JSON, config-only
+        // changes don't need type checking or linting (saves 2-15s of exec time).
+        const arbiterTargets = [...arbiterChangedFiles].filter(f =>
+          /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(path.extname(f)),
+        );
+        if (arbiterTargets.length > 0) {
           try {
             const {
               runTurnSentinel,
@@ -3725,7 +3747,7 @@ export class ApiBackend extends PunkBackend {
             const verdict = await runTurnSentinel(
               request.projectId,
               request.workingDir,
-              [...arbiterChangedFiles],
+              arbiterTargets,
               { db: arbiterDb },
             );
 
@@ -5477,7 +5499,11 @@ export class ApiBackend extends PunkBackend {
       model,
       messages: this.normalizeMessages(
         [
-          { role: "system", content: systemPrompt },
+          {
+            role: "system",
+            content: systemPrompt,
+            _tiers: { frozen: systemPrompt, session: "", turn: "" },
+          },
           { role: "user", content: userPrompt },
         ],
         apiConfig.provider,
@@ -5571,8 +5597,25 @@ export class ApiBackend extends PunkBackend {
         let usage = null;
         const callStartTime = Date.now();
 
+        const STREAM_IDLE_TIMEOUT_MS = 60_000;
+        let _idleTimerId = null;
+        async function readWithTimeout() {
+          clearTimeout(_idleTimerId);
+          const result = await Promise.race([
+            reader.read(),
+            new Promise((_, reject) => {
+              _idleTimerId = setTimeout(
+                () => reject(new Error("Stream idle timeout — no data received for 60s")),
+                STREAM_IDLE_TIMEOUT_MS,
+              );
+            }),
+          ]);
+          clearTimeout(_idleTimerId);
+          return result;
+        }
+
         while (true) {
-          const { done, value } = await reader.read();
+          const { done, value } = await readWithTimeout();
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
@@ -5725,7 +5768,11 @@ export class ApiBackend extends PunkBackend {
     const model = this.mapModelName(apiConfig.provider, request.model);
 
     const fullMessages = [
-      { role: "system", content: systemPrompt },
+      {
+        role: "system",
+        content: systemPrompt,
+        _tiers: { frozen: systemPrompt, session: "", turn: "" },
+      },
       ...messages,
     ];
 

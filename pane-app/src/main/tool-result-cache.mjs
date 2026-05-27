@@ -71,6 +71,14 @@ export function storeRaw(projectId, turnIndex, seq, entry) {
 export function summarize(toolName, rawContent) {
   if (!rawContent) return `(${toolName}: empty result)`;
 
+  // Type guard — tool results can be objects (pane_read_files, list_directory, etc.)
+  if (typeof rawContent !== "string") {
+    rawContent =
+      typeof rawContent === "object"
+        ? JSON.stringify(rawContent)
+        : String(rawContent ?? "");
+  }
+
   // For file reads, show file path + line count
   const lines = rawContent.split("\n");
   if (lines.length > 3) {

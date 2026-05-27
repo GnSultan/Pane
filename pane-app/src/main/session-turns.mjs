@@ -19,7 +19,8 @@ import zlib from "node:zlib";
 import { promisify } from "node:util";
 import { estimateTokens } from "./token-budget.mjs";
 
-const { gzipSync, gunzipSync } = zlib;
+const { gunzipSync } = zlib;
+const gzipAsync = promisify(zlib.gzip);
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
 
@@ -38,21 +39,6 @@ function getTurnsDir(projectId) {
  */
 function getMetadataPath(projectId) {
   return path.join(getTurnsDir(projectId), "metadata.json");
-}
-
-/**
- * Estimate token count for a turn object using centralized token estimation.
- */
-function estimateTurnTokens(turn) {
-  return estimateTokens(JSON.stringify(turn));
-}
-
-/**
- * Serialize and compress a turn object
- */
-function compressTurn(turn) {
-  const json = JSON.stringify(turn);
-  return gzipSync(json);
 }
 
 /**
@@ -112,26 +98,28 @@ function getTurnPath(projectId, turnIndex) {
 }
 
 /**
- * Save a turn to the archive.
+ * Save a turn to the archive (async — non-blocking).
  *
  * @param {string} projectId
  * @param {number} turnIndex - The turn number (0, 1, 2, ...)
  * @param {object} turn - The full turn object to archive
  * @param {object} options - { maxTurns, maxTokens }
  */
-export function saveTurn(projectId, turnIndex, turn, options = {}) {
+export async function saveTurn(projectId, turnIndex, turn, options = {}) {
   const maxTurns = options.maxTurns || DEFAULT_MAX_TURNS;
   const maxTokens = options.maxTokens || DEFAULT_MAX_TOKENS;
 
   try {
     const metadata = readMetadata(projectId);
-    const tokenEstimate = estimateTurnTokens(turn);
 
-    // Compress and write the turn file
-    const compressed = compressTurn(turn);
+    // Serialize once — reuse for both token estimation and compression
+    // Avoids the ~200ms of synchronous JSON.stringify(conversation) × 2.
+    const turnJson = JSON.stringify(turn);
+    const tokenEstimate = estimateTokens(turnJson);
+    const compressed = await gzipAsync(turnJson);
     const turnPath = getTurnPath(projectId, turnIndex);
-    fs.mkdirSync(path.dirname(turnPath), { recursive: true });
-    fs.writeFileSync(turnPath, compressed);
+    await fs.promises.mkdir(path.dirname(turnPath), { recursive: true });
+    await fs.promises.writeFile(turnPath, compressed);
 
     // Update metadata
     // Remove existing entry for this index if it exists (overwrite)
@@ -153,12 +141,14 @@ export function saveTurn(projectId, turnIndex, turn, options = {}) {
     if (metadata.turns.length > maxTurns) {
       const excess = metadata.turns.length - maxTurns;
       const toRemove = metadata.turns.slice(0, excess);
-      for (const entry of toRemove) {
-        try {
-          fs.unlinkSync(getTurnPath(projectId, entry.index));
-        } catch {}
-        metadata.turns = metadata.turns.filter(t => t.index !== entry.index);
-      }
+      const removeIndices = new Set(toRemove.map(e => e.index));
+      // Best-effort cleanup — errors don't affect the filter
+      await Promise.allSettled(
+        toRemove.map(entry =>
+          fs.promises.unlink(getTurnPath(projectId, entry.index)).catch(() => {}),
+        ),
+      );
+      metadata.turns = metadata.turns.filter(t => !removeIndices.has(t.index));
       metadata.totalTokens = metadata.turns.reduce((sum, t) => sum + t.tokenEstimate, 0);
     }
 
@@ -166,7 +156,7 @@ export function saveTurn(projectId, turnIndex, turn, options = {}) {
     while (metadata.turns.length > 0 && metadata.totalTokens > maxTokens) {
       const oldest = metadata.turns[0];
       try {
-        fs.unlinkSync(getTurnPath(projectId, oldest.index));
+        await fs.promises.unlink(getTurnPath(projectId, oldest.index));
       } catch {}
       metadata.turns = metadata.turns.slice(1);
       metadata.totalTokens = metadata.turns.reduce((sum, t) => sum + t.tokenEstimate, 0);

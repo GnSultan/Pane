@@ -16,7 +16,6 @@ import { FileViewer } from "./FileViewer";
 
 function sortEntries(entries: FileEntry[]): FileEntry[] {
   return entries
-    .filter((e) => !e.is_hidden)
     .sort((a, b) => {
       if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
       return a.name.localeCompare(b.name);

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { getChangeHistory, revertChange, type ChangeEntry } from "../../lib/tauri-commands";
 import { useProjectsStore } from "../../stores/projects";
 import { MicroIndicator } from "../shared";
@@ -11,14 +11,9 @@ interface ChangeHistoryPanelProps {
 export function ChangeHistoryPanel({ projectId }: ChangeHistoryPanelProps) {
   const [changes, setChanges] = useState<ChangeEntry[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const containerRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    loadChanges();
-    const interval = setInterval(loadChanges, 2000);
-    return () => clearInterval(interval);
-  }, [projectId]);
-
-  const loadChanges = async () => {
+  const loadChanges = useCallback(async () => {
     try {
       const result = await getChangeHistory(projectId);
       setChanges(result.changes || []);
@@ -27,10 +22,48 @@ export function ChangeHistoryPanel({ projectId }: ChangeHistoryPanelProps) {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [projectId]);
+
+  // Only poll while the panel is actually visible in the viewport.
+  // The panel is always mounted (hidden by CSS data-mode) so without
+  // this gate it fires 30 SQLite queries/minute regardless of visibility.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    let interval: ReturnType<typeof setInterval> | null = null;
+
+    const onVisible = () => {
+      loadChanges();
+      interval = setInterval(loadChanges, 2000);
+    };
+
+    const onHidden = () => {
+      if (interval) {
+        clearInterval(interval);
+        interval = null;
+      }
+    };
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) onVisible();
+          else onHidden();
+        }
+      },
+      { threshold: 0 },
+    );
+
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      if (interval) clearInterval(interval);
+    };
+  }, [loadChanges]);
 
   return (
-    <div className="h-full flex flex-col bg-pane-bg relative">
+    <div ref={containerRef} className="h-full flex flex-col bg-pane-bg relative">
       {/* Header */}
       <div className="flex-shrink-0 px-4 py-3 flex items-center justify-between border-b border-pane-border/10">
         <div className="flex items-center gap-3">

@@ -74,7 +74,10 @@ export function useGitStatus() {
         debouncedFetch();
       });
 
-      interval = setInterval(fetchAllStatuses, 10000);
+      // Safety-net poll: file-change events (`pane://file-changed`) handle
+      // real-time updates at 800ms debounce. The interval is only needed in
+      // case the watcher misses something (e.g., external git operations).
+      interval = setInterval(fetchAllStatuses, 60000);
     });
 
     return () => {
