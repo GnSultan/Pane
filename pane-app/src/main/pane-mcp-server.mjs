@@ -241,7 +241,7 @@ async function semanticSearch(query, projectId, limit = 20) {
     // Keyword score
     score += 0.4 * fuzzyScore(query.toLowerCase(), (node.content || "").toLowerCase());
     return { ...node, score };
-  }).filter(s => s.score > 0.15).sort((a, b) => b.score - a.score);
+  }).filter(s => s.type !== "mind" && s.score > 0.15).sort((a, b) => b.score - a.score);
 
   return scored.slice(0, limit);
 }
@@ -1013,9 +1013,10 @@ async function handleToolCall(name, args) {
       const exported = await readBrainExport(PROJECT_ID);
       if (!exported || exported.length === 0) return text("Knowledge graph is empty — it grows as you work.");
 
-      // Group by type
+      // Group by type, exclude mind entries
       const byType = {};
       for (const node of exported) {
+        if (node.type === "mind") continue;
         if (!byType[node.type]) byType[node.type] = [];
         byType[node.type].push(node);
       }

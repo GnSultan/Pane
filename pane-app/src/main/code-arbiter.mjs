@@ -20,7 +20,7 @@
  *   context-orchestrator.mjs reads verdict → injects as CRITICAL turn layer
  */
 
-import { execSync } from "node:child_process";
+import { execThroughWorker } from "./tool-executor.mjs";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
@@ -50,24 +50,27 @@ async function runTypeCheck(workingDir) {
   if (!fs.existsSync(tsconfigPath)) return [];
 
   try {
-    // npx tsc --noEmit outputs diagnostics to stdout on failure (exit code 2)
-    // We want the output even on failure, so we catch the error.
-    // execSync avoids libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak in Electron 40).
-    execSync("npx tsc --noEmit --incremental --pretty false 2>&1", {
-      cwd: workingDir,
-      timeout: TSC_TIMEOUT_MS,
-      encoding: "utf-8",
-      env: { ...process.env, FORCE_COLOR: "0" },
-      maxBuffer: 512 * 1024,
-    });
+    // Run through cmd-worker utility process so the main event loop isn't
+    // blocked for the duration of the tsc build (2-15s on large projects).
+    const result = await execThroughWorker(
+      "npx tsc --noEmit --incremental --pretty false 2>&1",
+      {
+        cwd: workingDir,
+        timeout: Math.ceil(TSC_TIMEOUT_MS / 1000),
+        env: { FORCE_COLOR: "0" },
+      },
+    );
     // Exit 0 — no errors
-    return [];
-  } catch (err) {
-    // tsc exits non-zero when there are errors. The diagnostics are in stdout.
-    const output = err.stdout?.toString?.() || err.stderr?.toString?.() || "";
+    if (result.success) return [];
+    // Non-zero exit — tsc found errors. Diagnostics are in stdout.
+    const output = result.stdout || "";
     if (!output) return [];
 
     return parseTscOutput(output, workingDir);
+  } catch (err) {
+    // Network error or worker crash (not a tsc diagnostic)
+    console.warn(`[arbiter] Type check worker error: ${err.message}`);
+    return [];
   }
 }
 
@@ -132,20 +135,25 @@ async function runEslint(workingDir, files) {
 
   try {
     const fileArgs = filesToLint.map(f => `"${f}"`).join(" ");
-    execSync(`npx eslint --format json --no-warn-ignored ${fileArgs} 2>/dev/null`, {
-      cwd: workingDir,
-      timeout: ESLINT_TIMEOUT_MS,
-      encoding: "utf-8",
-      env: { ...process.env, FORCE_COLOR: "0" },
-      maxBuffer: 512 * 1024,
-    });
+    const result = await execThroughWorker(
+      `npx eslint --format json --no-warn-ignored ${fileArgs} 2>/dev/null`,
+      {
+        cwd: workingDir,
+        timeout: Math.ceil(ESLINT_TIMEOUT_MS / 1000),
+        env: { FORCE_COLOR: "0" },
+      },
+    );
     // Exit 0 — no errors
-    return [];
-  } catch (err) {
-    const output = err.stdout?.toString?.() || "";
+    if (result.success) return [];
+    // Non-zero exit — eslint found errors. JSON output is in stdout.
+    const output = result.stdout || "";
     if (!output) return [];
 
     return parseEslintJson(output, workingDir);
+  } catch (err) {
+    // Network error or worker crash (not eslint diagnostics)
+    console.warn(`[arbiter] ESLint worker error: ${err.message}`);
+    return [];
   }
 }
 

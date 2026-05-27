@@ -1595,39 +1595,6 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
     tensions = (raw || []).filter(t => (t.pastConfidence || 0) >= 0.85).slice(0, 1);
   }
 
-  // Active Mind entries: human-authored thoughts, high signal
-  let mindEntries = [];
-  try {
-    const activeMinds = db.prepare(
-      `SELECT id, content, embedding FROM mind_entries WHERE completed = 0 ORDER BY updated_at DESC LIMIT 10`
-    ).all();
-
-    if (queryEmbedding && activeMinds.length > 0) {
-      // Semantic filter: only include mind entries relevant to this query
-      const scored = [];
-      for (const m of activeMinds) {
-        if (m.embedding) {
-          const mEmb = new Float32Array(m.embedding.buffer, m.embedding.byteOffset, m.embedding.byteLength / 4);
-          const sim = cosineSimilarity(queryEmbedding, mEmb);
-          if (sim > 0.35) scored.push({ content: m.content, score: sim });
-        } else {
-          // No embedding — keyword fallback
-          const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-          const text = m.content.toLowerCase();
-          const hit = words.length > 0 ? words.filter(w => text.includes(w)).length / words.length : 0;
-          if (hit > 0.3) scored.push({ content: m.content, score: hit });
-        }
-      }
-      scored.sort((a, b) => b.score - a.score);
-      mindEntries = scored.slice(0, 3);
-    } else if (activeMinds.length <= 3) {
-      // Few entries — include all (user clearly wants them active)
-      mindEntries = activeMinds.map(m => ({ content: m.content, score: 0.9 }));
-    }
-  } catch (err) {
-    console.error("[brain] Mind entry query failed:", err.message);
-  }
-
   // ── Principles: standing project standards, surfaced separately ──────────
   // Principles are intentionally excluded from `allowedTypes` above so they
   // don't compete with general memories. They get their own retrieval path
@@ -1672,7 +1639,7 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
     console.error("[brain] Principle query failed:", err.message);
   }
 
-  return { memories: valuable, tensions, atoms, profileAtoms, relevantFiles, mindEntries, principles };
+  return { memories: valuable, tensions, atoms, profileAtoms, relevantFiles, principles };
 }
 
 // --- Search Export (for MCP server) ---
@@ -1687,7 +1654,6 @@ function writeSearchExport(projectId) {
       WHERE project_id = ?
         AND entity_type IN ('decision','lesson','pattern','error','error_fix','file','project')
     `).all(projectId);
-    const mindEntries = db.prepare(`SELECT id, content, completed FROM mind_entries`).all();
 
     const exported = nodes.map(n => {
       const content = JSON.parse(n.content || "{}").text || n.name;
@@ -1698,17 +1664,6 @@ function writeSearchExport(projectId) {
         confidence: n.confidence,
       };
     });
-
-    // Add global mind entries (no embeddings — they're searched via keyword)
-    for (const m of mindEntries) {
-      exported.push({
-        id: m.id,
-        type: "mind",
-        content: m.content,
-        confidence: 0.9,
-        completed: !!m.completed,
-      });
-    }
 
     fs.mkdirSync(EXPORTS_DIR, { recursive: true });
     fs.writeFileSync(path.join(EXPORTS_DIR, `${projectId}.json`), JSON.stringify(exported));

@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.4.168",
+  "version": "0.4.184",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -10,8 +10,8 @@
     "dev": "node scripts/dev.mjs",
     "build": "electron-vite build && node scripts/copy-compiled.mjs",
     "preview": "electron-vite preview",
-    "build:mac": "npm update @anthropic-ai/claude-agent-sdk && npm run version:patch && npm run build && electron-builder --mac --arm64",
-    "build:all": "npm update @anthropic-ai/claude-agent-sdk && npm run build && electron-builder --mac --arm64 --x64",
+    "build:mac": "find node_modules -path '*/onnxruntime-node/*' -path '*/darwin/*' \\( -name '*.node' -o -name '*.dylib' \\) -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/node-pty/*' -path '*/darwin/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/better-sqlite3/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; npm update @anthropic-ai/claude-agent-sdk && npm run version:patch && npm run build && electron-builder --mac --arm64",
+    "build:all": "find node_modules -path '*/onnxruntime-node/*' -path '*/darwin/*' \\( -name '*.node' -o -name '*.dylib' \\) -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/node-pty/*' -path '*/darwin/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/better-sqlite3/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; npm update @anthropic-ai/claude-agent-sdk && npm run build && electron-builder --mac --arm64 --x64",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",
     "typecheck": "tsc --noEmit",

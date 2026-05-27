@@ -101,8 +101,8 @@ function generateProjectId(): string {
   return `proj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function createProject(root: string, stableId?: string): Project {
-  const name = root.split("/").filter(Boolean).pop() || root;
+function createProject(root: string, stableId?: string, nameOverride?: string): Project {
+  const name = (nameOverride ?? root.split("/").filter(Boolean).pop()) || root;
   const id = stableId ?? generateProjectId();
   return {
     id,
@@ -337,16 +337,16 @@ function createProjectsStore() {
 
     addProject: (root: string, stableId?: string) => {
       const state = get();
-      // Don't add duplicate roots — return existing project ID
-      for (const p of state.projects.values()) {
-        if (p.root === root) {
-          set({ activeProjectId: p.id });
-          return p.id;
-        }
+      // Multi-thread: same folder can be added multiple times, each gets its own
+      // UUID and independent conversation. Disambiguate name if there's a duplicate.
+      const sameRootCount = [...state.projects.values()].filter((p) => p.root === root).length;
+      let name = root.split("/").filter(Boolean).pop() || root;
+      if (sameRootCount > 0) {
+        name = `${name} (${sameRootCount + 1})`;
       }
       // If a stableId is provided and already exists (e.g. from a previous session),
       // trust it — don't ensureUnique since it IS the canonical identity.
-      const project = createProject(root, stableId);
+      const project = createProject(root, stableId, name);
       if (!stableId) {
         project.id = ensureUniqueId(project.id, state.projects);
       }
