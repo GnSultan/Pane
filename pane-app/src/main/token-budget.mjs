@@ -312,8 +312,6 @@ export function allocateBudget(options = {}) {
 export function createRequestBudget(model, conversationTokens = 0) {
   const contextLimit = getModelLimit(model);
   const outputBudget = getDefaultOutputBudget(model);
-  const available = contextLimit - outputBudget - conversationTokens;
-
   const tracker = {
     model,
     contextLimit,

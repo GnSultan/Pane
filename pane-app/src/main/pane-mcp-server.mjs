@@ -616,7 +616,7 @@ function mergeSessionState(id, delta) {
 
 // Phase helpers
 function getPhase(id) { return readSessionState(id).phase || "idle"; }
-function transitionPhase(id, phase, _reason) {
+function transitionPhase(id, phase) {
   mergeSessionState(id, { phase, phaseEnteredAt: Date.now(), suspended: false, clarification: null });
 }
 

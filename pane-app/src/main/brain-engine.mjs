@@ -893,7 +893,7 @@ async function _recyclePipeline() {
 function _walCheckpoint() {
   if (!db) return;
   try {
-    const info = db.pragma("wal_checkpoint(TRUNCATE)");
+    db.pragma("wal_checkpoint(TRUNCATE)");
   } catch {
     // Non-critical — best-effort
   }
@@ -1519,7 +1519,7 @@ function pruneOldNodes(projectId) {
 
 // --- Contextual Search (for proactive injection) ---
 
-async function contextualSearch(query, fileContext, projectId, intent, projectRoot, taskType = null, atomHints = [], projectWhy = "") {
+async function contextualSearch(query, fileContext, projectId, intent, projectRoot, projectWhy = "") {
   if (!db) return { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [], principles: [] };
 
   // Embed a why-augmented query — biases retrieval toward the project's purpose.
@@ -1823,7 +1823,6 @@ function getIntelligenceStats(projectId) {
 // --- Profile System: learned + explicit preferences ---
 
 const PROFILE_PROMOTION_THRESHOLD = 0.8; // Confidence needed to become a profile preference
-const PROFILE_MIN_PROJECTS = 1;          // Minimum projects a pattern must appear in (1 = project-specific OK, 2+ = cross-project)
 
 function initProfile() {
   fs.mkdirSync(PROFILE_DIR, { recursive: true });
@@ -2124,7 +2123,6 @@ function writeProfileExport() {
   const identity = readProfileJson("identity.json");
   const prefs = readProfileJson("preferences.json");
   const antiPatterns = readProfileJson("anti-patterns.json");
-  const style = readProfileJson("style.json");
   const rules = readProfileMd("rules.md");
   const philosophy = readProfileMd("philosophy.md");
 
@@ -2801,8 +2799,8 @@ process.parentPort.on("message", async ({ data }) => {
       case "lens_post_delete": {
         if (!db) { sendToMain({ type: "error", requestId: data.requestId, error: "db not ready" }); break; }
         // Delete post and cascade to all comments
-        const delPost = db.prepare(`DELETE FROM lens_posts WHERE id = ? RETURNING *`).get(data.postId);
-        const delComments = db.prepare(`DELETE FROM lens_comments WHERE post_id = ?`).run(data.postId);
+        db.prepare(`DELETE FROM lens_posts WHERE id = ?`).run(data.postId);
+        db.prepare(`DELETE FROM lens_comments WHERE post_id = ?`).run(data.postId);
         sendToMain({ type: "lens_post_deleted", requestId: data.requestId, deleted: true });
         break;
       }

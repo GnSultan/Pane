@@ -233,7 +233,7 @@ export function clearTurns(projectId) {
 /**
  * Check if a session has archived turns available
  */
-export function hasArchivedTurns(projectId, sessionId) {
+export function hasArchivedTurns(projectId) {
   const turns = getAvailableTurns(projectId);
   return turns.length > 0;
 }

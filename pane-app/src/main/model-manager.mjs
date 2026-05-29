@@ -88,7 +88,7 @@ class ModelManager {
     try {
       const content = await fs.readFile(CACHE_FILE, "utf-8");
       this.models = JSON.parse(content);
-    } catch (err) {
+    } catch {
       this.models = {};
     }
   }

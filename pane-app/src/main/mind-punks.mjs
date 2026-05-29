@@ -15,10 +15,9 @@
  */
 
 import fs from "node:fs/promises";
-import { readFileSync, readdirSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import crypto from "node:crypto";
 import { execSync } from "node:child_process";
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const PUNKS_DIR = path.join(PANE_DIR, "punks");
@@ -458,7 +457,7 @@ export class MindPunks {
    * Build the user prompt that gives each punk their focused objective.
    * The system prompt is the persona file itself.
    */
-  _buildUserPrompt(diffFocus, punkName) {
+  _buildUserPrompt(diffFocus) {
     const parts = [];
 
     if (diffFocus.files.length > 0) {

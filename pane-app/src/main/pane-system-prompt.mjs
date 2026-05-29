@@ -44,7 +44,6 @@ const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
 const BRAIN_DIR   = path.join(PANE_DIR, "brain");
 const MEMORY_DIR  = path.join(PANE_DIR, "memory");
-const PROFILE_DIR = path.join(PANE_DIR, "profile");
 
 // ---------------------------------------------------------------------------
 // State schema
@@ -295,7 +294,7 @@ function normalizeHandoffItem(item) {
   return null;
 }
 
-export function compileContext(projectId, intent = "other", historyLength = 0, backend = "claude-code", sqliteChanges = null) {
+export function compileContext(projectId, intent = "other", historyLength = 0) {
   const frozenParts  = [];   // Tier 1: never changes within session — cacheable prefix
   const sessionParts = [];   // Tier 2: changes when files/scope change — extends cache when stable
   const turnParts    = [];   // Tier 3: changes every turn — never cached
@@ -312,15 +311,6 @@ export function compileContext(projectId, intent = "other", historyLength = 0, b
   try {
     contextShape = JSON.parse(fs.readFileSync(
       path.join(BRAIN_DIR, "context", `${projectId}-shape.json`), "utf-8"
-    ));
-  } catch {}
-
-  // Brain contextual export — read early so unified atoms are available for
-  // both system prompt assembly and profile atom injection below.
-  let brainCtx = { memories: [], tensions: [], atoms: [], profileAtoms: [], relevantFiles: [] };
-  try {
-    brainCtx = JSON.parse(fs.readFileSync(
-      path.join(BRAIN_DIR, "context", `${projectId}.json`), "utf-8"
     ));
   } catch {}
 
@@ -700,46 +690,6 @@ function _buildDirective(intent, taskType, complexity, reasoning, verification) 
 //   workingSet: { path, purpose }[], // Files most likely to need changes
 // }
 
-// ---------------------------------------------------------------------------
-// Extract completed items from a single handoff object.
-// Returns a normalized ScoredItem[] with confidence sources.
-// ---------------------------------------------------------------------------
-function extractCompletedFromHandoff(handoff) {
-  if (!handoff) return [];
-
-  const items = [];
-  const seen = new Set();
-
-  // Helper to add an item with optional deduplication
-  const addItem = (text, confidence, source) => {
-    if (!text || text.trim().length === 0) return;
-    const key = text.trim().toLowerCase().slice(0, 60);
-    if (seen.has(key)) return;
-    seen.add(key);
-    items.push({ text, confidence, source });
-  };
-
-  // Extract from accomplishment (hard outcomes from this turn)
-  if (handoff.accomplishment) {
-    for (const item of (handoff.accomplishment || [])) {
-      if (typeof item === 'string') {
-        addItem(item, BASE_CONFIDENCE.state_accomplishment, 'handoff_accomplishment');
-      } else if (item.text) {
-        addItem(item.text, item.confidence, item.source || 'handoff_accomplishment');
-      }
-    }
-  }
-
-  // Extract from progress string (when it describes completed work)
-  // e.g., "3/5 tasks completed" or "Working on: X" (in_progress is not completed)
-  if (handoff.progress && handoff.progress.includes('completed')) {
-    // Could extract individual tasks from "3/5 tasks completed" if we had the task list,
-    // but for now we just mark the progress milestone
-    addItem(`${handoff.progress} (from previous session)`, BASE_CONFIDENCE.state_progress, 'handoff_progress');
-  }
-
-  return items.slice(0, 3); // Max 3 completed items from history
-}
 
 export function generateHandoff(projectId, { writeFile = true } = {}) {
   const state = readState(projectId);

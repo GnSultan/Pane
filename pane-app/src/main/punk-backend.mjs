@@ -26,20 +26,20 @@ export class PunkBackend {
    */
   get supportsSessionResume() { return false; }
 
-  async spawn(_request) {
+  async spawn() {
     throw new Error("Not implemented");
   }
 
   /** Lightweight text-only call (no tools). Override in backends that support it. */
-  async planningCall(_systemPrompt, _userPrompt, _request, _onChunk) {
+  async planningCall() {
     throw new Error("Not implemented");
   }
 
-  async abort(_projectId) {
+  async abort() {
     throw new Error("Not implemented");
   }
 
-  async terminate(_projectId) {
+  async terminate() {
     throw new Error("Not implemented");
   }
 

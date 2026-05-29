@@ -28,6 +28,7 @@ import {
 } from "./extraction-tuning.mjs";
 
 import { calculateCost } from "./pricing.mjs";
+import { safeStringify } from "./sanitize.mjs";
 import { buildSummary, toolResultCache } from "./tool-result-cache.mjs";
 import { forcePruneToBudget, applyV4TurnSelection, dropAllNonFreshTurns } from "./conversation-lifecycle.mjs";
 import { contextStore } from "./context-store.mjs";
@@ -1526,7 +1527,7 @@ export class ApiBackend extends PunkBackend {
                 content:
                   typeof c.content === "string"
                     ? c.content
-                    : JSON.stringify(c.content),
+                    : safeStringify(c.content),
                 is_error: c.is_error,
               };
               if (pendingToolCallIds.has(res.tool_call_id)) {
@@ -1617,7 +1618,7 @@ export class ApiBackend extends PunkBackend {
               } else if (args === null || typeof args !== "object") {
                 args = "{}";
               } else {
-                args = JSON.stringify(args);
+                args = safeStringify(args);
               }
 
               return {
@@ -1676,7 +1677,7 @@ export class ApiBackend extends PunkBackend {
                 content:
                   typeof c.content === "string"
                     ? c.content
-                    : JSON.stringify(c.content),
+                    : safeStringify(c.content),
                 is_error: c.is_error,
               });
             }
@@ -2432,7 +2433,7 @@ export class ApiBackend extends PunkBackend {
               response = await fetch(url, {
                 method: "POST",
                 headers,
-                body: JSON.stringify(sourceBody),
+                body: safeStringify(sourceBody),
                 signal: abortController.signal,
               });
 
@@ -3382,7 +3383,7 @@ export class ApiBackend extends PunkBackend {
                 const val = fn(getContextLimit, TOOL_DEFINITIONS);
                 result = {
                   success: true,
-                  output: JSON.stringify(val, null, 2),
+                  output: safeStringify(val, null, 2),
                 };
               } catch (err) {
                 result = { success: false, error: err.message };
@@ -4583,7 +4584,7 @@ export class ApiBackend extends PunkBackend {
                 {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
+                  body: safeStringify({
                     model: `models/${body.model}`,
                     systemInstruction: { parts: [{ text: stableSysContent }] },
                     ttl: "1800s",
@@ -5008,7 +5009,7 @@ export class ApiBackend extends PunkBackend {
               // Generate unique ID per tool call to prevent collisions within a chunk
               const toolId = `gemini_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
               const toolName = fc.name;
-              const toolArgs = JSON.stringify(fc.args || {});
+              const toolArgs = safeStringify(fc.args || {});
 
               // Emit start event immediately
               this.onEvent(
@@ -5542,7 +5543,7 @@ export class ApiBackend extends PunkBackend {
         const response = await fetch(url, {
           method: "POST",
           headers,
-          body: JSON.stringify(cleanBody),
+          body: safeStringify(cleanBody),
         });
 
         if (!response.ok) {
@@ -5814,7 +5815,7 @@ export class ApiBackend extends PunkBackend {
         const response = await fetch(url, {
           method: "POST",
           headers,
-          body: JSON.stringify(cleanBody),
+          body: safeStringify(cleanBody),
         });
 
         if (!response.ok) {

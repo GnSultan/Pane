@@ -9,7 +9,7 @@ import {
   nativeImage,
 } from "electron";
 import windowStateKeeper from "electron-window-state";
-import { execSync, execFileSync, execFile } from "node:child_process";
+import { execFileSync, execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
 
@@ -503,7 +503,7 @@ function registerCommandHandlers() {
       }
 
       return results;
-    } catch (err) {
+    } catch {
       // ripgrep exits code 1 when no matches found — not an error
       // Other errors (timeout, killed, ENOENT) → empty results
       return [];
@@ -930,7 +930,7 @@ Improvements
       // Update project_ids: remove old root mapping, add new root mapping
       const projectIds = settings.project_ids ?? {};
       if (oldRoot && projectIds[oldRoot]) {
-        delete projectIds[oldRoot];
+      Reflect.deleteProperty(projectIds, oldRoot);
       }
       projectIds[newRoot] = projectId;
       settings.project_ids = projectIds;
@@ -950,7 +950,7 @@ Improvements
       // Update project_states: move state from old root key to new root key
       if (settings.project_states?.[oldRoot]) {
         settings.project_states[newRoot] = settings.project_states[oldRoot];
-        delete settings.project_states[oldRoot];
+        Reflect.deleteProperty(settings.project_states, oldRoot);
       }
 
       const json = JSON.stringify(settings, null, 2);
@@ -1652,7 +1652,7 @@ function registerCheckpointHandlers(db) {
   });
 
   ipcMain.handle("revert_change", async (_event, args) => {
-    const { projectId, changeId, workingDir } = args;
+    const { changeId, workingDir } = args;
 
     const row = db.stmts.getChangeById.get(changeId);
     if (!row) return { success: false, error: "Change not found" };
@@ -1816,7 +1816,6 @@ function registerStateHandlers(db) {
   // Returns a slice of messages from SQLite — sub-millisecond indexed query
   // regardless of total conversation size.
   ipcMain.handle("get_conversation_slice", (_event, { projectId, beforeIndex, count }) => {
-    const _t = Date.now();
     try {
       const totalCount = db.stmts.countMessages.get(projectId).cnt;
       const end = (beforeIndex != null && beforeIndex >= 0) ? beforeIndex : totalCount;
@@ -2311,7 +2310,7 @@ function getBrainWorker() {
       console.warn(`[pane] Brain worker disabled after ${brainWorkerExitCount} crashes — retrying in ${brainWorkerNextRetryMs / 1000}s`);
     }
     // Reject pending requests
-    for (const [id, resolve] of brainPendingRequests) {
+    for (const [, resolve] of brainPendingRequests) {
       resolve({ type: "error", error: "Brain worker exited" });
     }
     brainPendingRequests.clear();
@@ -2718,7 +2717,6 @@ app.whenReady().then(async () => {
   // Mind punks: background intelligence with personality that acts on thoughts
   // Variable is used by brain_mind_add handler declared earlier in this scope,
   // but only called at runtime after this initialization completes.
-  /* eslint-disable-next-line no-use-before-define -- runtime order is safe */
   mindPunks = new MindPunks({
     brainRequest,
     quickCall: (sys, usr) => punkEngine.quickCall(sys, usr),

@@ -205,7 +205,7 @@ export async function getStructuralContext(projectId, query, brainRequest) {
  * @returns {Promise<string>} - Enriched output (original + appended context)
  */
 export async function enrichToolResult(toolName, toolInput, toolOutput, projectId, options = {}) {
-  const { brainRequest, projectRoot } = options;
+  const { brainRequest } = options;
   const enrichments = [];
 
   const filePath = toolInput?.file_path || toolInput?.path || "";

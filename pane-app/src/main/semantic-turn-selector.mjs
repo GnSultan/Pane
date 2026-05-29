@@ -28,13 +28,9 @@
 
 import { estimateTokens } from "./token-budget.mjs";
 
-// Embedding dimension — must match brain-engine.mjs (bge-base-en-v1.5 = 768)
-const EMBEDDING_DIM = 768;
-
 // How much weight to give recency vs semantic relevance (0-1)
 // 0.85 semantic + 0.15 recency ensures relevant old turns aren't buried by recent noise
 const SEMANTIC_WEIGHT = 0.85;
-const RECENCY_WEIGHT = 0.15;
 
 // --- Public API ---
 

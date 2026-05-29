@@ -115,7 +115,7 @@ export async function uploadBackup(backupDir) {
       throw new Error(err.error || `Finalize failed: ${finalizeRes.status}`);
     }
 
-    const result = await finalizeRes.json();
+    await finalizeRes.json();
     console.log(`[cloud-sync] uploaded ${backup_id} (${stat.size} bytes)`);
 
     emitProgress("complete", { backup_id, size_bytes: stat.size });

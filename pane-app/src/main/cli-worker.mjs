@@ -12,9 +12,9 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { compileContext, mergeState, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, readHandoff, writeHandoffWithHistory, updateLatestHandoff, MODEL_CONTEXT_LIMITS } from "./pane-system-prompt.mjs";
+import { compileContext, mergeState, generateHandoff, extractFromModelOutput, mergeExtractedIntoHandoff, readHandoff, writeHandoffWithHistory, updateLatestHandoff } from "./pane-system-prompt.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
-import { estimateConversationTokens, getModelLimit } from "./token-budget.mjs";
+import { estimateConversationTokens } from "./token-budget.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
 import { calculateCost } from "./pricing.mjs";
 
@@ -562,7 +562,6 @@ async function handleClaudeSpawn({
   workingDir,
   model: rawModel,
   systemPrompt,
-  historyLength,
   mcpServerDest,
   tools,
   maxTurns,
@@ -1083,7 +1082,6 @@ async function handleGeminiSpawn({
   mcpServerDest,
 }) {
   const home = os.homedir();
-  const paneDir = path.join(home, ".pane");
   const geminiConfigDir = path.join(workingDir, ".gemini");
   const geminiSettingsPath = path.join(geminiConfigDir, "settings.json");
 
@@ -1617,7 +1615,7 @@ function handleAbort({ projectId }) {
     abortedProjects.add(projectId);
     try {
       process.kill(-child.pid, "SIGTERM");
-    } catch (err) {
+    } catch {
       try { child.kill("SIGTERM"); } catch {}
     }
     setTimeout(() => {

@@ -15,15 +15,15 @@
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
-import { spawn, exec, execSync } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import os from "node:os";
-import crypto from "node:crypto";
 import vm from "node:vm";
 
 import { getPaneDb } from "./pane-db.mjs";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 import { readState, readHandoff } from "./pane-system-prompt.mjs";
 import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
+import { sanitizeString } from "./sanitize.mjs";
 
 // ── CMD Worker (utility process for shell execution) ──────────────────────
 // In Electron 40's packaged macOS app, child_process.spawn/execSync fails with
@@ -368,7 +368,7 @@ const DANGEROUS_COMMAND_PATTERNS = [
  * Switch to Blacklist approach: Allow everything EXCEPT explicitly dangerous
  * patterns and attempts to escape the project directory.
  */
-function validateCommand(command, _projectRoot) {
+function validateCommand(command) {
   const trimmed = command.trim();
   if (!trimmed) return { valid: false, error: "Empty command" };
 
@@ -785,6 +785,7 @@ export class ToolExecutor {
         if (result.success) {
           // Truncate if too large
           let output = result.stdout || "";
+          output = sanitizeString(output);
           if (output.length > MAX_OUTPUT_SIZE) {
             output = output.substring(0, MAX_OUTPUT_SIZE) + "\n...[output truncated]";
           }
@@ -807,16 +808,19 @@ export class ToolExecutor {
                 stdio: ['pipe', 'pipe', 'pipe'],
               });
               let output = stdout || "";
+              output = sanitizeString(output);
               if (output.length > MAX_OUTPUT_SIZE) {
                 output = output.substring(0, MAX_OUTPUT_SIZE) + "\n...[output truncated]";
               }
               return { success: true, output: output || "(no output)", toolId, duration: Date.now() - startTime, exitCode: 0 };
-            } catch (fallbackErr) {
+            } catch {
               // Both worker and direct execSync failed — report the worker's error
+              const stderr = sanitizeString(result.stderr || "");
+              const stdout = sanitizeString(result.stdout || "");
               return {
                 success: false,
-                error: `Command failed: ${result.stderr || result.stdout || result.errorMessage}`,
-                output: result.stderr || result.stdout,
+                error: `Command failed: ${stderr || stdout || result.errorMessage}`,
+                output: stderr || stdout,
                 toolId,
                 exitCode: result.exitCode,
               };
@@ -824,10 +828,12 @@ export class ToolExecutor {
           }
 
           // Command failed with non-zero exit code
+          const stderr = sanitizeString(result.stderr || "");
+          const stdout = sanitizeString(result.stdout || "");
           return {
             success: false,
-            error: `Command failed with exit code ${result.exitCode}: ${result.stderr || result.stdout || result.errorMessage}`,
-            output: result.stderr || result.stdout,
+            error: `Command failed with exit code ${result.exitCode}: ${stderr || stdout || result.errorMessage}`,
+            output: stderr || stdout,
             toolId,
             exitCode: result.exitCode,
           };
@@ -932,6 +938,8 @@ export class ToolExecutor {
       if (fileMemories.length > 0) {
         output += `\n\n[Pane memory for this file]\n${fileMemories.join("\n")}`;
       }
+
+      output = sanitizeString(output);
 
       return {
         success: true,
@@ -1304,7 +1312,7 @@ export class ToolExecutor {
       }
 
       const output = results.map((r) => `${r.file}:${r.line}: ${r.content}`).join("\n");
-      return { success: true, output: `Found ${results.length} match(es) for "${query}":\n\n${output}`, toolId };
+      return { success: true, output: sanitizeString(`Found ${results.length} match(es) for "${query}":\n\n${output}`), toolId };
     } catch (error) {
       return { success: false, error: error.message, toolId };
     }
@@ -1377,7 +1385,7 @@ export class ToolExecutor {
           const data = await response.json();
           const result = data.results?.[0];
           if (result?.raw_content) {
-            const content = result.raw_content.slice(0, 15000);
+            const content = sanitizeString(result.raw_content.slice(0, 15000));
             return { success: true, output: header + content, toolId };
           }
         }
@@ -1405,8 +1413,9 @@ export class ToolExecutor {
         .replace(/\s+/g, " ")
         .trim()
         .slice(0, 15000);
+      const sanitizedText = sanitizeString(cleanText);
 
-      return { success: true, output: header + cleanText, toolId };
+      return { success: true, output: header + sanitizedText, toolId };
     } catch (err) {
       return { success: false, output: `Error fetching URL: ${err.message}`, toolId };
     }
@@ -1457,7 +1466,7 @@ export class ToolExecutor {
           }
 
           if (parts.length > 0) {
-            return { success: true, output: `Search results for "${query}":\n\n${parts.join("\n\n")}`, toolId };
+            return { success: true, output: sanitizeString(`Search results for "${query}":\n\n${parts.join("\n\n")}`), toolId };
           }
         }
       }
@@ -1509,7 +1518,7 @@ export class ToolExecutor {
         `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`
       ).join("\n\n");
 
-      return { success: true, output: `Search results for "${query}":\n\n${formatted}`, toolId };
+      return { success: true, output: sanitizeString(`Search results for "${query}":\n\n${formatted}`), toolId };
     } catch (err) {
       return { success: false, error: `Search failed: ${err.message}`, toolId };
     }
@@ -2675,8 +2684,8 @@ Be thorough. Trace through the full call chain. Check test files for expected be
    * Clean up all resources
    */
   cleanup() {
-    for (const [toolId, process] of this.activeProcesses) {
-      try { process.kill("SIGTERM"); } catch {}
+    for (const [, activeProcess] of this.activeProcesses) {
+      try { activeProcess.kill("SIGTERM"); } catch {} // Best-effort cleanup — process may already be dead
     }
     this.activeProcesses.clear();
   }

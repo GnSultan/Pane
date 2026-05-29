@@ -15,8 +15,6 @@
  *   Fire-and-forget — never blocks the response path.
  */
 
-import { estimateTokens } from "./token-budget.mjs";
-
 // ── Filter thresholds ────────────────────────────────────────────────────
 // Minimum length for a memory to be worth storing (avoids noise)
 const MIN_MEMORY_LENGTH = 30;
