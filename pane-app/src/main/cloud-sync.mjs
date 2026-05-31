@@ -11,7 +11,7 @@ import fs from "node:fs/promises";
 import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execFileSync } from "node:child_process";
+import { execThroughWorker } from "./tool-executor.mjs";
 import { ipcMain, BrowserWindow } from "electron";
 
 import { isLoggedIn, getAuthToken, getUserSecret, getCloudUser, getCloudApiUrl } from "./cloud-auth.mjs";
@@ -47,9 +47,13 @@ export async function uploadBackup(backupDir) {
     emitProgress("compressing");
 
     // Compress backup directory
-    // execFileSync avoids libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak).
-    // NOTE: tar may block the main process for several seconds during backup.
-    execFileSync("tar", ["czf", tarPath, "-C", backupDir, "."], { encoding: "utf-8" });
+    // Route through cmd-worker (utility process) to avoid SyncProcessRunner crash.
+    // NOTE: tar may block for several seconds during backup — runs in utility process.
+    const tarCompressCmd = `tar czf ${tarPath} -C ${backupDir} .`;
+    const tarResult = await execThroughWorker(tarCompressCmd, { timeout: 120 });
+    if (!tarResult.success) {
+      throw new Error(`Backup compression failed: ${tarResult.errorMessage || tarResult.stderr}`);
+    }
 
     emitProgress("encrypting");
 
@@ -194,7 +198,11 @@ export async function restoreFromCloud() {
     // Extract into a temp dir first, then move to avoid partial restores
     const restoreDir = path.join(TEMP_DIR, "restore-staging");
     mkdirSync(restoreDir, { recursive: true });
-    execFileSync("tar", ["xzf", tarPath, "-C", restoreDir], { encoding: "utf-8" });
+    const tarDecompressCmd = `tar xzf ${tarPath} -C ${restoreDir}`;
+    const tarResult = await execThroughWorker(tarDecompressCmd, { timeout: 120 });
+    if (!tarResult.success) {
+      throw new Error(`Restore decompression failed: ${tarResult.errorMessage || tarResult.stderr}`);
+    }
 
     // Move restored contents into ~/.pane/
     const entries = await fs.readdir(restoreDir);

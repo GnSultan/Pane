@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
-import { execSync } from "node:child_process";
+import { execThroughWorker } from "./tool-executor.mjs";
 
 // Node.js globals for utility process
 const { AbortController, fetch, TextDecoder, console } = globalThis;
@@ -291,15 +291,6 @@ const TOOL_DEFINITIONS = [
       name: "pane_open_files",
       description:
         "Get the file currently open in Pane's editor, including its full content and recent file history. Working set pre-reads show partial content — use this for the complete file when you need more than what's pre-loaded.",
-      parameters: { type: "object", properties: {} },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "pane_recent_terminal",
-      description:
-        "Get recent terminal commands and their outputs from Pane's terminal. Use this FIRST whenever the user mentions an error, a running server, logs, build output, test results, or any process output — the terminal is shared and already has the data. Never ask the user to paste logs or copy output; read it here instead.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -1754,16 +1745,21 @@ export class ApiBackend extends PunkBackend {
     return normalized;
   }
 
-  getGitStatus(workingDir) {
+  async getGitStatus(workingDir) {
     try {
-      const branch = execSync(
+      const branchResult = await execThroughWorker(
         "git symbolic-ref --short HEAD || git rev-parse --abbrev-ref HEAD",
-        { cwd: workingDir, encoding: "utf-8" },
-      ).trim();
-      const summary = execSync(
+        { cwd: workingDir, timeout: 10 }
+      );
+      const branch = branchResult.success ? branchResult.stdout.trim() : "";
+
+      const statusResult = await execThroughWorker(
         "git status --porcelain=v1 -unormal",
-        { cwd: workingDir, encoding: "utf-8" },
-      ).trim() || "(clean)";
+        { cwd: workingDir, timeout: 10 }
+      );
+      const summary = statusResult.success ? (statusResult.stdout.trim() || "(clean)") : "";
+
+      if (!branch && !summary) return null;
       return { branch, summary };
     } catch {
       return null;

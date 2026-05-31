@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { setWindowTitle, destroyPty } from "./lib/tauri-commands";
+import { setWindowTitle } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ThreadPanel } from "./components/ThreadPanel/ThreadPanel";
 import { Workspace } from "./components/Workspace/Workspace";
@@ -116,7 +116,7 @@ function App() {
             const project = projects.get(activeProjectId);
             if (!project) return;
 
-            // Toggle using the store logic which handles fallback to terminal if no file
+            // Toggle between conversation and viewer modes
             toggleMode(activeProjectId);
 
             // Dispatch focus events based on the NEW mode (need to get it after toggle)
@@ -223,70 +223,7 @@ function App() {
           }
           break;
         }
-        case "terminal-new-tab": {
-          const store = useProjectsStore.getState();
-          const proj = store.activeProjectId
-            ? store.projects.get(store.activeProjectId)
-            : undefined;
-          if (proj?.mode === "terminal") {
-            const tabId = `pty-${proj.id}-${Date.now()}`;
-            const title =
-              proj.terminalTabs.length === 0
-                ? "zsh"
-                : `zsh (${proj.terminalTabs.length + 1})`;
-            // PTY is created by TerminalTabContent on mount — just add to store
-            store.addTerminalTab(proj.id, { id: tabId, title, isAlive: true });
-          }
-          break;
-        }
-        case "terminal-close-tab": {
-          const store = useProjectsStore.getState();
-          const proj = store.activeProjectId
-            ? store.projects.get(store.activeProjectId)
-            : undefined;
-          if (proj?.mode === "terminal" && proj.activeTerminalTabId) {
-            destroyPty(proj.activeTerminalTabId).catch(() => {});
-            store.removeTerminalTab(proj.id, proj.activeTerminalTabId);
-          }
-          break;
-        }
-        case "terminal-next-tab": {
-          const store = useProjectsStore.getState();
-          const proj = store.activeProjectId
-            ? store.projects.get(store.activeProjectId)
-            : undefined;
-          if (
-            proj?.mode === "terminal" &&
-            proj.terminalTabs.length > 1 &&
-            proj.activeTerminalTabId
-          ) {
-            const idx = proj.terminalTabs.findIndex(
-              (t) => t.id === proj.activeTerminalTabId,
-            );
-            const nextIdx = (idx + 1) % proj.terminalTabs.length;
-            store.setActiveTerminalTab(proj.id, proj.terminalTabs[nextIdx]!.id);
-          }
-          break;
-        }
-        case "terminal-prev-tab": {
-          const store = useProjectsStore.getState();
-          const proj = store.activeProjectId
-            ? store.projects.get(store.activeProjectId)
-            : undefined;
-          if (
-            proj?.mode === "terminal" &&
-            proj.terminalTabs.length > 1 &&
-            proj.activeTerminalTabId
-          ) {
-            const idx = proj.terminalTabs.findIndex(
-              (t) => t.id === proj.activeTerminalTabId,
-            );
-            const prevIdx =
-              (idx - 1 + proj.terminalTabs.length) % proj.terminalTabs.length;
-            store.setActiveTerminalTab(proj.id, proj.terminalTabs[prevIdx]!.id);
-          }
-          break;
-        }
+
       }
     };
     // Capture phase so shortcuts fire before Ace editor eats them (e.g. Cmd+/)

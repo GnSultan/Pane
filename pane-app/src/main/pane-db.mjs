@@ -839,7 +839,7 @@ async function _migrateStateBlobs(db) {
   });
 
   for (const projectId of projects) {
-    for (const key of ["editor", "terminal", "project"]) {
+    for (const key of ["editor", "project"]) {
       try {
         const raw = fs.readFileSync(path.join(stateDir, projectId, `${key}.json`), "utf-8");
         insertBlob(projectId, key, JSON.parse(raw));

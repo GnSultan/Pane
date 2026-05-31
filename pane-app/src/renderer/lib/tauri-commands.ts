@@ -231,6 +231,9 @@ export async function getGitLog(
 import type { PowerCombo } from "./models";
 
 export interface ProjectSessionState {
+  /** The project root path. Stored here so UUID-keyed states survive even
+   *  when project_ids/project_order are absent from the settings file. */
+  root?: string;
   expanded_dirs: string[];
   active_file_path: string | null;
   recent_files?: string[];
@@ -257,6 +260,10 @@ export interface ProjectSessionState {
 
 export interface UserSettings {
   project_roots: string[];
+  /** Ordered list of project IDs — the single source of truth for which
+   *  threads exist and in what order. Absent in old settings files; the
+   *  load side falls back to deduplicated project_roots. */
+  project_order?: string[];
   project_ids?: Record<string, string>;
   active_project_root: string | null;
   thread_panel_visible: boolean;
@@ -562,44 +569,6 @@ export async function setWindowTitle(title: string): Promise<void> {
   return electronAPI.invoke("set_window_title", { title });
 }
 
-// PTY terminal management
-
-export async function createPty(
-  ptyId: string,
-  projectId: string,
-  cwd: string,
-): Promise<void> {
-  return electronAPI.invoke("pty_create", { ptyId, projectId, cwd });
-}
-
-export async function writePty(ptyId: string, data: string): Promise<void> {
-  return electronAPI.invoke("pty_write", { ptyId, data });
-}
-
-export async function destroyPty(ptyId: string): Promise<void> {
-  return electronAPI.invoke("pty_destroy", { ptyId });
-}
-
-export async function destroyAllPtysForProject(
-  projectId: string,
-): Promise<void> {
-  return electronAPI.invoke("pty_destroy_project", { projectId });
-}
-
-export function onPtyData(
-  ptyId: string,
-  cb: (data: string) => void,
-): () => void {
-  return electronAPI.on(`pty-data:${ptyId}`, cb);
-}
-
-export function onPtyExit(
-  ptyId: string,
-  cb: (info: { exitCode: number }) => void,
-): () => void {
-  return electronAPI.on(`pty-exit:${ptyId}`, cb);
-}
-
 export async function getPunkPlanInfo(): Promise<string | null> {
   return electronAPI.invoke("get_claude_plan_info");
 }
@@ -790,17 +759,6 @@ export interface EditorState {
   recentFiles: string[];
 }
 
-export interface TerminalCommand {
-  cmd: string;
-  output: string;
-  cwd: string;
-  timestamp: number;
-}
-
-export interface TerminalState {
-  commands: TerminalCommand[];
-}
-
 export interface ProjectState {
   name: string;
   root: string;
@@ -813,46 +771,6 @@ export async function writeEditorState(
   data: EditorState,
 ): Promise<void> {
   return electronAPI.invoke("write_editor_state", { projectId, data });
-}
-
-export async function writeTerminalState(
-  projectId: string,
-  data: TerminalState,
-): Promise<void> {
-  return electronAPI.invoke("write_terminal_state", { projectId, data });
-}
-
-export interface TerminalCommandEntry {
-  cmd: string;
-  output: string;
-  cwd: string;
-  timestamp: number;
-  tabId: string;
-  tabTitle: string;
-  partial?: boolean;
-}
-
-/** Atomically appends one completed command to the shared terminal history (all tabs merged). */
-export async function appendTerminalCommand(
-  projectId: string,
-  entry: TerminalCommandEntry,
-): Promise<void> {
-  return electronAPI.invoke("append_terminal_command", { projectId, entry });
-}
-
-/** Reads the persisted terminal command history for a project (last 50 completed commands). */
-export async function getTerminalHistory(
-  projectId: string,
-): Promise<{ commands: Array<{ cmd: string; output: string; cwd: string; timestamp: number; tabId: string }> }> {
-  return electronAPI.invoke("get_terminal_history", { projectId });
-}
-
-/** Upserts a live "partial" snapshot for a long-running command (replaces previous partial for this tab). */
-export async function updateTerminalRunning(
-  projectId: string,
-  entry: TerminalCommandEntry & { partial: true },
-): Promise<void> {
-  return electronAPI.invoke("update_terminal_running", { projectId, entry });
 }
 
 export async function writeProjectState(

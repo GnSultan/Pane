@@ -2063,7 +2063,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         // Architecture & design constraints
         'pane_architecture_brief', 'pane_ui_constraints',
         // History
-        'pane_change_history', 'pane_search_changes', 'pane_recent_terminal',
+        'pane_change_history', 'pane_search_changes',
         // Verification
         'pane_run_in_terminal',
       ],

@@ -1,6 +1,6 @@
 // Pane Brain Engine — UtilityProcess that owns the knowledge graph, embeddings, and semantic search.
 // Isolated V8 — if the brain crashes, Pane and Claude keep working.
-// Same pattern as claude-worker.mjs and pty-worker.mjs.
+// Same pattern as claude-worker.mjs.
 
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);

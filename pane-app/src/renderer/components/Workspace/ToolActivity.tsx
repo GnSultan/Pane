@@ -9,8 +9,6 @@ import type {
 } from "../../lib/punk-types";
 import { MarkdownText, renderHighlightedCode } from "./MarkdownText";
 import { MicroIndicator } from "../shared";
-import { useProjectsStore } from "../../stores/projects";
-import { writePty } from "../../lib/tauri-commands";
 
 interface ToolActivityProps {
   toolUse: ToolUseBlock;
@@ -53,7 +51,6 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
         return "remember" + (c ? ` ${c.slice(0, 60)}` : "");
       }
       case "pane_brief": return "brief";
-      case "pane_recent_terminal": return "recent terminal";
       case "pane_search_changes": {
         const q = (input.query as string) || "";
         return q ? `search changes ${q}` : "search changes";
@@ -486,7 +483,6 @@ function ExpandedReadInput({ input, result }: { input?: Record<string, unknown>;
 function ExpandedBashInput({ input }: { input: Record<string, unknown> }) {
   const cmd = (input.command as string) || "";
   const [copied, setCopied] = useState(false);
-  const [ran, setRan] = useState(false);
 
   const handleCopy = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -494,19 +490,6 @@ function ExpandedBashInput({ input }: { input: Record<string, unknown> }) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
     }).catch(() => {});
-  };
-
-  const handleRun = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const s = useProjectsStore.getState();
-    const projectId = s.activeProjectId;
-    if (!projectId) return;
-    const tabId = s.projects.get(projectId)?.activeTerminalTabId;
-    if (!tabId) return;
-    writePty(tabId, cmd + "\n").catch(() => {});
-    s.setMode(projectId, "terminal");
-    setRan(true);
-    setTimeout(() => setRan(false), 1200);
   };
 
   return (
@@ -523,14 +506,6 @@ function ExpandedBashInput({ input }: { input: Record<string, unknown> }) {
             title="copy"
           >
             {copied ? "✓" : "copy"}
-          </button>
-          <button
-            onClick={handleRun}
-            className="transition-colors"
-            style={{ color: ran ? "var(--pane-status-added)" : "var(--pane-terminal)" }}
-            title="run in terminal"
-          >
-            {ran ? "✓" : "run"}
           </button>
         </span>
       </pre>
@@ -720,10 +695,9 @@ export function ToolActivity({ toolUse, toolResult, isHistorical }: ToolActivity
 
   // Stable expansion rules - NO SHAPE-SHIFTING:
   // 1. User manually toggled → respect that always
-  // 2. Errors → always expanded (need immediate attention)
-  // 3. Edit/Write → always expanded (must see changes)
-  // 4. Read/Bash/Grep/Glob/Search → always collapsed (quiet unless clicked)
-  // 5. Everything else → collapsed by default
+  // 2. Edit/Write → always expanded (must see changes)
+  // 3. Read/Bash/Grep/Glob/Search → always collapsed (quiet unless clicked)
+  // 4. Everything else → collapsed by default
 
   const alwaysExpanded = ["Edit", "Write", "replace", "write_file"];
   const alwaysCollapsed = ["Read", "Bash", "Grep", "Glob", "WebSearch", "Task", "Plan", "read_file", "run_shell_command", "grep_search", "glob", "google_web_search"];
@@ -745,7 +719,7 @@ export function ToolActivity({ toolUse, toolResult, isHistorical }: ToolActivity
     ? userToggle
     : isHistorical
       ? false
-      : (isFailed || alwaysExpanded.includes(baseToolName)) && !alwaysCollapsed.includes(baseToolName);
+      : alwaysExpanded.includes(baseToolName) && !alwaysCollapsed.includes(baseToolName);
 
   const label = getToolLabel(toolUse.name);
 
