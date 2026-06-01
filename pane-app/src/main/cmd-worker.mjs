@@ -6,6 +6,12 @@
  * that plagues child_process.spawn/execSync in Electron 40's main process
  * (where Chromium-integrated kqueue conflicts with libuv's EVFILT_PROC).
  *
+ * Known crash — "node.CrUtilityMain" SIGABRT during exit():
+ *   Stack: ::exit() → __cxa_finalize_ranges → std::terminate() → abort()
+ *   Root cause: Electron's C++ static destructors throw ObjC exceptions
+ *   during clean exit(). Prevented by keeping the event loop alive so the
+ *   process is killed by OS process-group signal (no exit() path).
+ *
  * Protocol:
  *   Main → Worker: { id, command, cwd?, timeout?, env? }
  *   Worker → Main: { type: "result", id, success, stdout, exitCode }
@@ -24,8 +30,74 @@ function getEnvWithPath() {
   return { ...process.env, PATH: combined };
 }
 
-process.parentPort.on("message", ({ data }) => {
+// ── Crash prevention: keep event loop alive ─────────────────────────────
+//
+// When the event loop drains (parentPort disconnects), Node.js calls
+// process.exit() → ::exit() → C++ static destructors. Electron's ObjC
+// runtime throws during this destruction, causing std::terminate() →
+// abort(). We prevent this by keeping a ref'd handle alive so the
+// process is killed by the parent's process-group signal instead.
+//
+// Key tradeoff: the process never exits cleanly via exit(). Instead:
+//   - During app quit, the parent process group is destroyed by the OS
+//     and the worker receives SIGTERM/SIGKILL — no exit() path involved.
+//   - During respawn (worker crash/restart), the old worker is killed
+//     by the OS signal, new worker is forked.
+
+// No-op interval keeps the event loop alive. Never fires — purely structural.
+// NOT unref'd — must keep the loop alive.
+const keepaliveTimer = setInterval(() => {}, 2 ** 31 - 1);
+
+// When the parent disconnects (app quit or parent crash), clear the keepalive
+// so the worker can exit. The exit() → static destructor crash may still
+// happen during app quit, but that's harmless — the user is done using Pane.
+// Without this, the worker becomes an orphan process.
+process.parentPort.on("close", () => {
+  clearInterval(keepaliveTimer);
+});
+
+// ── Error resilience ────────────────────────────────────────────────────
+// Prevent JS errors from triggering process exit (which hits the same
+// static-destructor crash path). Log and continue instead.
+
+process.on("uncaughtException", (err) => {
+  console.error("[cmd-worker] Uncaught exception:", err?.message || err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("[cmd-worker] Unhandled rejection:", err?.message || err);
+});
+
+// ── Message handler ─────────────────────────────────────────────────────
+
+process.parentPort.on("message", (msg) => {
+  let data;
+  try {
+    data = msg.data;
+    if (!data || typeof data !== "object") {
+      throw new Error("Invalid message: expected object with data property");
+    }
+  } catch (destructureErr) {
+    // Can't respond via postMessage (no id to correlate), so log and bail.
+    console.error("[cmd-worker] Malformed message:", destructureErr.message);
+    return;
+  }
+
   const { id, command, cwd, env, timeout } = data;
+
+  if (!id || typeof command !== "string") {
+    try {
+      process.parentPort.postMessage({
+        type: "result",
+        id: id || null,
+        success: false,
+        errorMessage: `Invalid command: ${typeof command}`,
+      });
+    } catch (_) {
+      // parentPort may be closed — nothing we can do
+    }
+    return;
+  }
 
   try {
     const stdout = execSync(command, {
