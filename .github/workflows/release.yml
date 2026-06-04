@@ -10,6 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.new }}
+      skip: ${{ steps.bump.outputs.skip }}
 
     steps:
       - uses: actions/checkout@v4
@@ -111,7 +114,7 @@ jobs:
           git tag "v${{ steps.version.outputs.new }}"
           git push origin master --tags
 
-      # ── Create GitHub Release ─────────────────────────────────────────────────
+      # ── Create GitHub Release (without binaries) ──────────────────────────────
       - name: Create release
         if: steps.bump.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
@@ -121,3 +124,36 @@ jobs:
           body: ${{ steps.changelog.outputs.body }}
           draft: false
           prerelease: false
+
+  # ── Build binaries on self-hosted macOS runner ─────────────────────────────────
+  build:
+    name: Build macOS (arm64 + x64)
+    needs: release
+    runs-on: self-hosted
+    if: needs.release.outputs.skip != 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: cd pane-app && npm ci
+
+      - name: Build DMGs for both architectures
+        run: cd pane-app && npm run build:all
+
+      - name: Upload DMGs to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.release.outputs.version }}
+          files: |
+            pane-app/dist/Pane-*.dmg
+            pane-app/dist/*.yml
+            pane-app/dist/*.blockmap
