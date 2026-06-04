@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.5.16",
+  "version": "0.5.17",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
