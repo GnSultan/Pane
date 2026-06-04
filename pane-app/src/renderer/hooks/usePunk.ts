@@ -1381,7 +1381,17 @@ export function usePunk(projectId: string) {
         const projectCombo = project.powerCombo;
         const projectAutoRoute = project.autoEscalate ?? ws.autoEscalate;
 
-        const truncatedHistory = conversation.messages.slice(-20);
+        // Sanitize history: filter out content blocks that lack a 'type' field.
+        // Malformed blocks (missing type) cause "missing field 'type'" errors on
+        // providers with strict serde validation (DeepSeek, etc.). This is defense-
+        // in-depth — the backend also sanitizes, but catching it at source prevents
+        // the problematic message from entering the retry/error path at all.
+        const truncatedHistory = conversation.messages.slice(-20).map((msg) => ({
+          ...msg,
+          content: Array.isArray(msg.content)
+            ? msg.content.filter((c) => c && typeof (c as Record<string, unknown>).type === "string")
+            : msg.content,
+        }));
         const todos = conversation.todos;
 
         await sendToPunk(

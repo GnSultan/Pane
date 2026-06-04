@@ -11,11 +11,7 @@ export type ActionId =
   | "cycle-theme"
   | "font-size-increase"
   | "font-size-decrease"
-  | "font-size-reset"
-  | "terminal-new-tab"
-  | "terminal-close-tab"
-  | "terminal-next-tab"
-  | "terminal-prev-tab";
+  | "font-size-reset";
 
 export interface KeyBinding {
   mod: boolean;   // Cmd (Mac) / Ctrl (Win/Linux)
@@ -44,10 +40,6 @@ export const ACTION_DEFINITIONS: ActionDefinition[] = [
   { id: "font-size-increase", label: "increase font size", defaultBinding: { mod: true, shift: false, alt: false, key: "=" } },
   { id: "font-size-decrease", label: "decrease font size", defaultBinding: { mod: true, shift: false, alt: false, key: "-" } },
   { id: "font-size-reset",    label: "reset font size",   defaultBinding: { mod: true, shift: false, alt: false, key: "0" } },
-  { id: "terminal-new-tab",   label: "new terminal tab",  defaultBinding: { mod: true, shift: true,  alt: false, key: "n" } },
-  { id: "terminal-close-tab", label: "close terminal tab", defaultBinding: { mod: true, shift: true,  alt: false, key: "w" } },
-  { id: "terminal-next-tab",  label: "next terminal tab", defaultBinding: { mod: true, shift: true,  alt: false, key: "]" } },
-  { id: "terminal-prev-tab",  label: "prev terminal tab", defaultBinding: { mod: true, shift: true,  alt: false, key: "[" } },
 ];
 
 export const DEFAULT_BINDINGS: Record<ActionId, KeyBinding> = Object.fromEntries(

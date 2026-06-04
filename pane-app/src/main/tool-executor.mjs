@@ -15,15 +15,16 @@
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
-import { spawn, execSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import os from "node:os";
-import crypto from "node:crypto";
 import vm from "node:vm";
 
 import { getPaneDb } from "./pane-db.mjs";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 import { readState, readHandoff } from "./pane-system-prompt.mjs";
 import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
+import { sanitizeString } from "./sanitize.mjs";
+import { validateCommand } from "./command-validator.mjs";
 
 // ── CMD Worker (utility process for shell execution) ──────────────────────
 // In Electron 40's packaged macOS app, child_process.spawn/execSync fails with
@@ -32,44 +33,37 @@ import { replay as replayJournal, readLastProgress } from "./session-journal.mjs
 // utilityProcess.fork() with a clean libuv loop — execSync works there.
 // Set via setCmdWorker() from main.mjs after pre-forking the worker.
 let _cmdWorker = null;
-// Track pending requests so we can reject them immediately if the worker exits.
-// Map<id, { resolve, timer }>
+
+// Tracks in-flight execThroughWorker requests so they can be cleaned up
+// when the cmd-worker process exits unexpectedly. Maps request ID → { resolve, timeoutId }.
 const _pendingRequests = new Map();
 
 /**
  * Register the cmd-worker instance from main.mjs.
  * Called once at startup after utilityProcess.fork("cmd-worker.mjs").
- * If a previous worker died, rejects all pending promises for that worker.
  */
 export function setCmdWorker(worker) {
-  // Remove listeners from old worker if any
-  if (_cmdWorker && _cmdWorker !== worker) {
-    _cmdWorker.removeAllListeners("exit");
-    _cmdWorker.removeAllListeners("message");
-  }
   _cmdWorker = worker;
   if (_cmdWorker && typeof _cmdWorker.setMaxListeners === 'function') {
     _cmdWorker.setMaxListeners(100);
   }
+}
 
-  // When the worker exits, immediately fail every pending request.
-  // This prevents callers from waiting up to safeTimeout (130s) and
-  // prevents the execSync fallback in executeBash from kicking in.
-  if (_cmdWorker) {
-    _cmdWorker.on("exit", () => {
-      for (const [id, entry] of _pendingRequests) {
-        clearTimeout(entry.timer);
-        entry.resolve({
-          success: false,
-          stdout: "",
-          stderr: "",
-          exitCode: -1,
-          errorMessage: "cmd-worker exited unexpectedly",
-        });
-      }
-      _pendingRequests.clear();
-    });
+/**
+ * Clean up all pending requests when the cmd-worker exits unexpectedly.
+ * Resolves each with a graceful "worker exited" error so callers don't hang.
+ * Called from main.mjs's exit handler before auto-respawn.
+ */
+export function onCmdWorkerExit() {
+  const count = _pendingRequests.size;
+  if (count > 0) {
+    console.warn(`[pane] Cleaning up ${count} pending cmd-worker request(s) after worker exit`);
   }
+  for (const [id, entry] of _pendingRequests) {
+    clearTimeout(entry.timeoutId);
+    entry.resolve({ success: false, stdout: "", stderr: "", exitCode: -1, errorMessage: "cmd-worker exited unexpectedly" });
+  }
+  _pendingRequests.clear();
 }
 
 /**
@@ -84,26 +78,14 @@ export function execThroughWorker(command, options = {}) {
     }
 
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-
-    // Safety timeout — fires if the worker never responds (network stall,
-    // message lost, etc.). Worker-exit is handled separately by the 'exit' listener.
-    const safeTimeout = setTimeout(() => {
-      _pendingRequests.delete(id);
-      resolve({ success: false, stdout: "", stderr: "", exitCode: -1, errorMessage: "cmd-worker timed out" });
-    }, (options.timeout || 120) * 1000 + 10000);
-    if (safeTimeout.unref) safeTimeout.unref();
-
     const handler = (response) => {
       if (response.id === id) {
-        _pendingRequests.delete(id);
-        clearTimeout(safeTimeout);
         _cmdWorker.removeListener("message", handler);
+        clearTimeout(_pendingRequests.get(id)?.timeoutId);
+        _pendingRequests.delete(id);
         resolve(response);
       }
     };
-
-    // Register BEFORE postMessage so we don't miss a synchronous response
-    _pendingRequests.set(id, { resolve, timer: safeTimeout });
     _cmdWorker.on("message", handler);
 
     _cmdWorker.postMessage({
@@ -113,6 +95,18 @@ export function execThroughWorker(command, options = {}) {
       env: options.env,
       timeout: options.timeout || 120,
     });
+
+    // Safety timeout — if worker never responds, reject
+    const safeTimeout = setTimeout(() => {
+      _cmdWorker.removeListener("message", handler);
+      _pendingRequests.delete(id);
+      resolve({ success: false, stdout: "", stderr: "", exitCode: -1, errorMessage: "cmd-worker timed out" });
+    }, (options.timeout || 120) * 1000 + 10000);
+    // Unref so it doesn't keep the process alive
+    if (safeTimeout.unref) safeTimeout.unref();
+
+    // Track for cleanup on unexpected worker exit
+    _pendingRequests.set(id, { resolve, timeoutId: safeTimeout });
   });
 }
 
@@ -381,42 +375,7 @@ const MAX_OUTPUT_SIZE = 100 * 1024; // 100KB max output
 const COMMAND_TIMEOUT_MS = 30000; // 30 seconds for commands
 const DEFAULT_ENCODING = "utf-8";
 
-// Dangerous command patterns (blacklist)
-const DANGEROUS_COMMAND_PATTERNS = [
-  /rm\s+.*-rf?\s+\//, // Root deletion
-  /rm\s+.*-rf?\s+\*/, // Catch-all deletion
-  /rm\s+.*\.\.\//,    // Relative deletion
-  /mkfs/,             // Disk formatting
-  /dd\s+if=.*(of=\/dev\/(sd|xvd|vd|nvme|loop|nbd))/, // Raw disk writing to block devices
-  /passwd/,           // Password changing
-  /shutdown|reboot/,  // System control
-  /chmod\s+.*777/,    // Dangerous permissions
-  // Block writes to system devices EXCEPT harmless ones
-  // Allowed: /dev/null, /dev/zero, /dev/random, /dev/urandom, /dev/stdin, /dev/stdout, /dev/stderr, /dev/fd/
-  />\s*\/dev\/(?!null|zero|random|urandom|stdin|stdout|stderr|fd\/)/,
-];
-
-/**
- * Validates a shell command for safety.
- *
- * Switch to Blacklist approach: Allow everything EXCEPT explicitly dangerous
- * patterns and attempts to escape the project directory.
- */
-function validateCommand(command, _projectRoot) {
-  const trimmed = command.trim();
-  if (!trimmed) return { valid: false, error: "Empty command" };
-
-  for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
-    if (pattern.test(trimmed)) {
-      return {
-        valid: false,
-        error: `Command contains dangerous pattern: ${pattern}`,
-      };
-    }
-  }
-
-  return { valid: true };
-}
+// validateCommand imported from ./command-validator.mjs
 
 // ============================================================================
 // File Read Cache — eliminates redundant disk reads across turns and sessions.
@@ -758,7 +717,8 @@ export class ToolExecutor {
   }
 
   /**
-   * Validate a shell command for safety
+   * Validate a shell command for safety.
+   * Passes projectRoot for path-boundary enforcement (rejects escapes).
    */
   validateCommand(command) {
     return validateCommand(command, this.projectRoot);
@@ -819,6 +779,7 @@ export class ToolExecutor {
         if (result.success) {
           // Truncate if too large
           let output = result.stdout || "";
+          output = sanitizeString(output);
           if (output.length > MAX_OUTPUT_SIZE) {
             output = output.substring(0, MAX_OUTPUT_SIZE) + "\n...[output truncated]";
           }
@@ -831,13 +792,18 @@ export class ToolExecutor {
             exitCode: 0,
           };
         } else {
-          // Command failed (worker unavailable, crashed, timed out, or non-zero exit)
+          // Worker unavailable or command failed — fail cleanly.
+          // The worker is pre-forked at startup (main.mjs:2541). If it's dead,
+          // do NOT degrade to main-process execSync — that bypasses isolation.
+          // Command failed with non-zero exit code
+          const stderr = sanitizeString(result.stderr || "");
+          const stdout = sanitizeString(result.stdout || "");
           return {
             success: false,
-            error: `Command failed: ${result.stderr || result.stdout || result.errorMessage || "unknown error"}`,
-            output: result.stderr || result.stdout || "",
+            error: `Command failed with exit code ${result.exitCode}: ${stderr || stdout || result.errorMessage}`,
+            output: stderr || stdout,
             toolId,
-            exitCode: result.exitCode != null ? result.exitCode : -1,
+            exitCode: result.exitCode,
           };
         }
       }
@@ -940,6 +906,8 @@ export class ToolExecutor {
       if (fileMemories.length > 0) {
         output += `\n\n[Pane memory for this file]\n${fileMemories.join("\n")}`;
       }
+
+      output = sanitizeString(output);
 
       return {
         success: true,
@@ -1312,7 +1280,7 @@ export class ToolExecutor {
       }
 
       const output = results.map((r) => `${r.file}:${r.line}: ${r.content}`).join("\n");
-      return { success: true, output: `Found ${results.length} match(es) for "${query}":\n\n${output}`, toolId };
+      return { success: true, output: sanitizeString(`Found ${results.length} match(es) for "${query}":\n\n${output}`), toolId };
     } catch (error) {
       return { success: false, error: error.message, toolId };
     }
@@ -1385,7 +1353,7 @@ export class ToolExecutor {
           const data = await response.json();
           const result = data.results?.[0];
           if (result?.raw_content) {
-            const content = result.raw_content.slice(0, 15000);
+            const content = sanitizeString(result.raw_content.slice(0, 15000));
             return { success: true, output: header + content, toolId };
           }
         }
@@ -1413,8 +1381,9 @@ export class ToolExecutor {
         .replace(/\s+/g, " ")
         .trim()
         .slice(0, 15000);
+      const sanitizedText = sanitizeString(cleanText);
 
-      return { success: true, output: header + cleanText, toolId };
+      return { success: true, output: header + sanitizedText, toolId };
     } catch (err) {
       return { success: false, output: `Error fetching URL: ${err.message}`, toolId };
     }
@@ -1465,7 +1434,7 @@ export class ToolExecutor {
           }
 
           if (parts.length > 0) {
-            return { success: true, output: `Search results for "${query}":\n\n${parts.join("\n\n")}`, toolId };
+            return { success: true, output: sanitizeString(`Search results for "${query}":\n\n${parts.join("\n\n")}`), toolId };
           }
         }
       }
@@ -1517,7 +1486,7 @@ export class ToolExecutor {
         `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`
       ).join("\n\n");
 
-      return { success: true, output: `Search results for "${query}":\n\n${formatted}`, toolId };
+      return { success: true, output: sanitizeString(`Search results for "${query}":\n\n${formatted}`), toolId };
     } catch (err) {
       return { success: false, error: `Search failed: ${err.message}`, toolId };
     }
@@ -1661,63 +1630,10 @@ export class ToolExecutor {
           return { success: true, output: out, toolId };
         }
 
-        case "pane_recent_terminal": {
-          const data = await readJson(path.join(stateDir, "terminal.json"));
-          if (!data?.commands?.length) return { success: true, output: "No terminal history.", toolId };
-          const cmds = data.commands.slice(-50);
-
-          // Show tab labels when more than one source is present
-          const sources = new Set(cmds.map(c => c.tabId || c.source || "terminal"));
-          const needsLabels = sources.size > 1;
-
-          const out = cmds.map(c => {
-            // Tail of output — most useful for servers where latest lines matter most
-            const raw = c.output || "(no output)";
-            const output = raw.length > 1000 ? "...\n" + raw.slice(-1000) : raw;
-            const runningMark = c.partial ? " (running)" : "";
-
-            let prefix = "";
-            if (needsLabels) {
-              if (c.source === "claude" || c.tabId === "claude") {
-                prefix = "[claude] ";
-              } else if (c.tabTitle) {
-                prefix = `[${c.tabTitle}] `;
-              } else if (c.tabId) {
-                prefix = "[terminal] ";
-              }
-            }
-
-            return `${prefix}$ ${c.cmd}${runningMark}\n${output}`;
-          }).join("\n\n");
-
-          // Contextual augmentation: auto-attach referenced files from errors
-          const lastOutput = cmds[cmds.length - 1]?.output || "";
-          const augmentation = await augmentWithReferencedFiles(lastOutput, this.projectRoot);
-          return { success: true, output: out + augmentation, toolId };
-        }
-
-        case "pane_run_in_terminal": {
+            case "pane_run_in_terminal": {
           const command = (input?.command || "").trim();
           if (!command) return { success: false, error: "No command provided.", toolId };
           const result = await this.executeBash(toolId, command, false, null);
-          // Append to terminal history so pane_recent_terminal and the UI reflect what Claude ran
-          try {
-            const termPath = path.join(stateDir, "terminal.json");
-            let termData = null;
-            try { termData = JSON.parse(await fsPromises.readFile(termPath, "utf-8")); } catch {}
-            const commands = Array.isArray(termData?.commands) ? termData.commands : [];
-            commands.push({
-              cmd: command,
-              output: result.output || result.error || "",
-              timestamp: Date.now(),
-              tabId: "claude",
-              tabTitle: "claude",
-              source: "claude",
-            });
-            await fsPromises.mkdir(stateDir, { recursive: true });
-            await fsPromises.writeFile(termPath, JSON.stringify({ commands: commands.slice(-50) }));
-          } catch {}
-
           // Contextual augmentation: if command failed, auto-attach error-referenced files
           if (!result.success && result.output) {
             const aug = await augmentWithReferencedFiles(result.output || result.error || "", this.projectRoot);
@@ -2321,11 +2237,16 @@ Be thorough. Trace through the full call chain. Check test files for expected be
               }
             }
           } else {
-            // Search for file by name
-            const { execSync } = await import("node:child_process");
+            // Search for file by name — route through cmd-worker (utility process)
+            // to avoid SyncProcessRunner crash on main thread during streaming.
             try {
-              const found = execSync(`find "${rootDir}/src" -name "${target}.*" -not -path "*/node_modules/*" 2>/dev/null | head -1`, { encoding: "utf-8" }).trim();
-              if (found) primaryFile = found;
+              const sq = (s) => `'${s.replace(/'/g, "'\\''")}'`;
+              const findCmd = `find ${sq(path.join(rootDir, "src"))} -name ${sq(`${target}.*`)} -not -path ${sq("*/node_modules/*")} 2>/dev/null | head -1`;
+              const findResult = await execThroughWorker(findCmd, { timeout: 5 });
+              if (findResult.success) {
+                const firstLine = findResult.stdout.trim();
+                if (firstLine) primaryFile = firstLine;
+              }
             } catch {}
           }
           if (!primaryFile) return { success: false, error: `No file found matching "${target}".`, toolId };
@@ -2374,7 +2295,6 @@ Be thorough. Trace through the full call chain. Check test files for expected be
             if (componentKey.includes("input") || componentKey.includes("textarea")) inferredCategories.add("input");
             if (componentKey.includes("search")) inferredCategories.add("search");
             if (componentKey.includes("float") || componentKey.includes("panel") || componentKey.includes("picker")) inferredCategories.add("floating");
-            if (componentKey.includes("terminal")) inferredCategories.add("terminal");
 
             const filtered = inferredCategories.size > 0
               ? constraints.filter(c => Array.isArray(c.categories) && c.categories.some(cat => inferredCategories.has(cat)))
@@ -2507,13 +2427,16 @@ Be thorough. Trace through the full call chain. Check test files for expected be
             }
           } catch {}
 
-          // Fallback: list files from working directory
+          // Fallback: list files from working directory via cmd-worker
           try {
-            const stdout = execSync(
+            const projResult = await execThroughWorker(
               `find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' | head -200`,
-              { cwd: this.workingDir, encoding: 'utf-8', timeout: 5000 }
+              { cwd: this.workingDir, timeout: 5 }
             );
-            return { success: true, output: `Project files:\n${stdout}`, toolId };
+            if (projResult.success) {
+              return { success: true, output: `Project files:\n${projResult.stdout}`, toolId };
+            }
+            return { success: true, output: "Could not read project file structure.", toolId };
           } catch {
             return { success: true, output: "Could not read project file structure.", toolId };
           }
@@ -2522,13 +2445,15 @@ Be thorough. Trace through the full call chain. Check test files for expected be
         case "pane_get_recent_changes": {
           const parts = [];
 
-          // Git status
+          // Git status via cmd-worker
           try {
-            const status = execSync("git status --short", { cwd: this.workingDir, encoding: 'utf-8', timeout: 5000 });
-            const branch = execSync("git branch --show-current", { cwd: this.workingDir, encoding: 'utf-8', timeout: 3000 });
-            parts.push(`Branch: ${branch.trim()}`);
-            if (status.trim()) {
-              parts.push(`\nChanged files:\n${status.trim()}`);
+            const statusR = await execThroughWorker("git status --short", { cwd: this.workingDir, timeout: 5 });
+            const branchR = await execThroughWorker("git branch --show-current", { cwd: this.workingDir, timeout: 3 });
+            if (branchR.success) {
+              parts.push(`Branch: ${branchR.stdout.trim()}`);
+            }
+            if (statusR.success && statusR.stdout.trim()) {
+              parts.push(`\nChanged files:\n${statusR.stdout.trim()}`);
             } else {
               parts.push("Working tree clean.");
             }
@@ -2536,19 +2461,19 @@ Be thorough. Trace through the full call chain. Check test files for expected be
             parts.push("Git status unavailable.");
           }
 
-          // Recent git log
+          // Recent git log via cmd-worker
           try {
-            const log = execSync("git log --oneline -5", { cwd: this.workingDir, encoding: 'utf-8', timeout: 5000 });
-            if (log.trim()) {
-              parts.push(`\nRecent commits:\n${log.trim()}`);
+            const logR = await execThroughWorker("git log --oneline -5", { cwd: this.workingDir, timeout: 5 });
+            if (logR.success && logR.stdout.trim()) {
+              parts.push(`\nRecent commits:\n${logR.stdout.trim()}`);
             }
           } catch {}
 
-          // Git diff summary
+          // Git diff summary via cmd-worker
           try {
-            const diff = execSync("git diff --stat HEAD 2>/dev/null || git diff --stat", { cwd: this.workingDir, encoding: 'utf-8', timeout: 5000 });
-            if (diff.trim()) {
-              parts.push(`\nDiff summary:\n${diff.trim()}`);
+            const diffR = await execThroughWorker("git diff --stat HEAD 2>/dev/null || git diff --stat", { cwd: this.workingDir, timeout: 5 });
+            if (diffR.success && diffR.stdout.trim()) {
+              parts.push(`\nDiff summary:\n${diffR.stdout.trim()}`);
             }
           } catch {}
 
@@ -2683,8 +2608,8 @@ Be thorough. Trace through the full call chain. Check test files for expected be
    * Clean up all resources
    */
   cleanup() {
-    for (const [toolId, process] of this.activeProcesses) {
-      try { process.kill("SIGTERM"); } catch {}
+    for (const [, activeProcess] of this.activeProcesses) {
+      try { activeProcess.kill("SIGTERM"); } catch {} // Best-effort cleanup — process may already be dead
     }
     this.activeProcesses.clear();
   }

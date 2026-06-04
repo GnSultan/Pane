@@ -200,7 +200,6 @@ export function detectSuccessSignals(message) {
  * @param {string} message
  * @param {number} workingSetSize
  * @param {number} turnCount
- * @param {number} pendingTodos
  * @param {number} consecutiveFailures
  * @returns {number} 0-100
  */
@@ -208,7 +207,6 @@ export function scoreComplexity(
   message,
   workingSetSize = 0,
   turnCount = 0,
-  pendingTodos = 0,
   consecutiveFailures = 0,
 ) {
   let score = 0;
@@ -374,7 +372,7 @@ export function tierFromScore(score) {
  * @param {string} taskType
  * @returns {string|null}
  */
-export function buildEscalationHint(stage, taskType) {
+export function buildEscalationHint(stage) {
   switch (stage) {
     case 0:
       return null;
@@ -543,17 +541,11 @@ export function routeHeuristic(input) {
     turnCount = 0,
     workingSetSize = 0,
     pendingTodos = 0,
-    phase = "idle",
     threadState = {},
-    backend = "claude-code",
   } = input;
 
   const {
     consecutiveFailures = 0,
-    lastFailureType = null,
-    approachesTried = 0,
-    lastResponseSummary = null,
-    lastUserPromptHash = null,
   } = threadState;
 
   const trimmed = message.trim();
@@ -566,7 +558,6 @@ export function routeHeuristic(input) {
     trimmed,
     workingSetSize,
     turnCount,
-    pendingTodos,
     consecutiveFailures,
   );
 
@@ -835,7 +826,7 @@ export async function routeIntegrated(input) {
  * Feeds routing-store for outcome analytics. No classifier training anymore.
  * @param {object} _params — routing outcome data (passed through to routing-store elsewhere)
  */
-export function recordOutcome(_params) {
+export function recordOutcome() {
   // No-op — outcome tracking is handled directly by punk-engine via routing-store
 }
 

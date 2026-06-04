@@ -122,7 +122,7 @@ export function consult(taskType, domain, candidates, projectId = '') {
 
 // ── Prior score derivation ─────────────────────────────────────────────────
 
-function _priorScore(prior, domain, taskType) {
+function _priorScore(prior, domain) {
   let score;
 
   switch (domain) {

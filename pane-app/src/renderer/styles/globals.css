@@ -506,7 +506,6 @@ html[data-theme="glass"] #root {
    does not reliably suppress all painting in Electron/Chromium. */
 [data-mode="conversation"] > [data-page="conversation"],
 [data-mode="viewer"] > [data-page="viewer"],
-[data-mode="terminal"] > [data-page="terminal"],
 [data-mode="git"] > [data-page="git"],
 [data-mode="mind"] > [data-page="mind"],
 [data-mode="profile"] > [data-page="profile"],

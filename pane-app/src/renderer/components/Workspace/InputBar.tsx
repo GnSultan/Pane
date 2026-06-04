@@ -16,7 +16,8 @@ const EMPTY_TODOS: Todo[] = [];
 // build = execute the plan (execution model)
 // Phase is sticky — persists across messages until explicitly changed.
 
-type PhaseName = "think" | "build";
+const _PHASE_CYCLE = ["think", "build"] as const;
+type PhaseName = typeof _PHASE_CYCLE[number];
 
 const PHASE_CONFIG: Record<PhaseName, { color: string }> = {
   think: { color: "var(--pane-status-modified)" },

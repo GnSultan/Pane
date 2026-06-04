@@ -33,13 +33,6 @@ export interface ProjectFileIndex {
   isLoading: boolean;
 }
 
-export interface TerminalTab {
-  id: string; // doubles as ptyId
-  title: string; // display label (path)
-  isAlive: boolean; // false after PTY exit
-  cwd?: string; // current working directory, updated as user navigates
-}
-
 export interface Project {
   id: string;
   root: string;
@@ -51,15 +44,13 @@ export interface Project {
   selectedPath: string | null;
   activeFilePath: string | null;
   activeFileContent: string | null;
-  mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
+  mode: "conversation" | "viewer" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
   conversation: ConversationState;
   git: ProjectGit;
   fileIndex: ProjectFileIndex;
   hasUnreadCompletion: boolean; // true when background task completes, cleared when project becomes active
   hasUnreadLens: boolean; // true when a new Lens post/punk finding arrives while Lens is not open
   recentFiles: string[]; // last 20 opened files (FIFO)
-  terminalTabs: TerminalTab[];
-  activeTerminalTabId: string | null;
   checkpoints: CheckpointMeta[];
   scrollPositions: Map<string, { scrollTop: number; cursor: { row: number; column: number } }>;
   /** Per-project power combo: which model serves each phase (think/build).
@@ -126,8 +117,6 @@ function createProject(root: string, stableId?: string, nameOverride?: string): 
     hasUnreadCompletion: false,
     hasUnreadLens: false,
     recentFiles: [],
-    terminalTabs: [],
-    activeTerminalTabId: null,
     checkpoints: [],
     scrollPositions: new Map(),
     lastUserPromptText: null,
@@ -190,7 +179,7 @@ interface ProjectsState {
   // Per-project mode
   setMode: (
     projectId: string,
-    mode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch",
+    mode: "conversation" | "viewer" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch",
   ) => void;
   toggleMode: (projectId: string) => void;
 
@@ -295,13 +284,6 @@ interface ProjectsState {
   ) => void;
   setCachedBrief: (projectId: string, brief: string) => void;
 
-  // Terminal tabs
-  addTerminalTab: (projectId: string, tab: TerminalTab) => void;
-  removeTerminalTab: (projectId: string, tabId: string) => void;
-  setActiveTerminalTab: (projectId: string, tabId: string) => void;
-  markTerminalTabDead: (projectId: string, tabId: string) => void;
-  updateTerminalTabCwd: (projectId: string, tabId: string, cwd: string) => void;
-
   // Per-project routing
   setProjectPowerCombo: (projectId: string, combo: PowerCombo) => void;
   setProjectAutoEscalate: (projectId: string, autoEscalate: boolean) => void;
@@ -357,7 +339,9 @@ function createProjectsStore() {
       set({
         projects: next,
         activeProjectId: project.id,
-        projectOrder: [...state.projectOrder, project.id],
+        projectOrder: state.projectOrder.includes(project.id)
+          ? state.projectOrder
+          : [...state.projectOrder, project.id],
       });
       return project.id;
     },
@@ -440,7 +424,7 @@ function createProjectsStore() {
         if (!project) return { activeProjectId: id };
 
         // Carry the current workspace mode to the target project so switching
-        // threads while in file explorer (or terminal, etc.) stays locked there.
+        // threads while in file explorer stays locked there.
         const currentProject = state.activeProjectId
           ? state.projects.get(state.activeProjectId)
           : undefined;
@@ -568,11 +552,11 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => {
           // Toggle between Chat and Viewer (file explorer / directory browser)
-          let nextMode: "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
+          let nextMode: "conversation" | "viewer" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
           if (p.mode === "conversation") {
             nextMode = "viewer";
           } else {
-            // From git, terminal, viewer, mind, profile, history, lens, fuzzy, or search — always go back to conversation
+            // From git, viewer, mind, profile, history, lens, fuzzy, or search — always go back to conversation
             nextMode = "conversation";
           }
           return { mode: nextMode };
@@ -1081,52 +1065,6 @@ function createProjectsStore() {
             },
           };
         }),
-      ),
-
-    // Terminal tabs
-    addTerminalTab: (projectId, tab) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => ({
-          terminalTabs: [...p.terminalTabs, tab],
-          activeTerminalTabId: tab.id,
-        })),
-      ),
-
-    removeTerminalTab: (projectId, tabId) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => {
-          const tabs = p.terminalTabs.filter((t) => t.id !== tabId);
-          let activeId = p.activeTerminalTabId;
-          if (activeId === tabId) {
-            activeId = tabs.length > 0 ? tabs[tabs.length - 1]!.id : null;
-          }
-          return { terminalTabs: tabs, activeTerminalTabId: activeId };
-        }),
-      ),
-
-    setActiveTerminalTab: (projectId, tabId) =>
-      set((state) =>
-        updateProject(state, projectId, () => ({
-          activeTerminalTabId: tabId,
-        })),
-      ),
-
-    markTerminalTabDead: (projectId, tabId) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => ({
-          terminalTabs: p.terminalTabs.map((t) =>
-            t.id === tabId ? { ...t, isAlive: false } : t,
-          ),
-        })),
-      ),
-
-    updateTerminalTabCwd: (projectId, tabId, cwd) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => ({
-          terminalTabs: p.terminalTabs.map((t) =>
-            t.id === tabId ? { ...t, cwd } : t,
-          ),
-        })),
       ),
 
     // Per-project routing

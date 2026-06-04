@@ -78,7 +78,7 @@ async function runTypeCheck(workingDir) {
  * Parse tsc --pretty false output into structured diagnostics.
  * Format: path(line,col): error TSxxxx: message
  */
-function parseTscOutput(output, workingDir) {
+function parseTscOutput(output) {
   const diagnostics = [];
   const lines = output.split("\n");
   // Match: src/foo.ts(42,5): error TS2345: Argument of type...

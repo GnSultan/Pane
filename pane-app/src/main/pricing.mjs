@@ -23,8 +23,6 @@ import os from "node:os";
 
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 const CACHE_FILE = path.join(os.homedir(), ".pane", "cache", "pricing.json");
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
 // ── Internal State ──────────────────────────────────────────────────────────
 /** @type {Map<string, {input:number, output:number, cache_read?:number, cache_write?:number}>} */
 let _pricingMap = new Map();
@@ -221,7 +219,7 @@ function _init() {
   _initStarted = true;
 
   // 1. Load from disk cache (synchronous — instant)
-  const loadedFromCache = _loadCacheSync();
+  _loadCacheSync();
 
   // 2. Always fetch fresh from OpenRouter in background (cache validates freshness)
   //    This handles first-run, stale cache, and models added since cache was saved.
@@ -314,7 +312,6 @@ export function getModelRates(model) {
  */
 export function calculateCost({
   model,
-  provider,
   inputTokens,
   outputTokens,
   cacheReadTokens = 0,

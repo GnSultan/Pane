@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, type ReactNode } from "react";
 
-export type PaneMode = "conversation" | "viewer" | "terminal" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
+export type PaneMode = "conversation" | "viewer" | "git" | "mind" | "profile" | "history" | "lens" | "search" | "filesearch";
 
 // ─── Inline SVG icons (16x16, outlined) ──────────────────────────────────────
 
@@ -71,16 +71,6 @@ function GitIcon() {
   );
 }
 
-function TerminalIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="2" y="2" width="12" height="12" rx="2" />
-      <path d="M4.5 7l2.5 1.5-2.5 1.5" />
-      <path d="M9.5 9.5h3.5" />
-    </svg>
-  );
-}
-
 function ChangeHistoryIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
@@ -115,7 +105,6 @@ const MODES: ModeDef[] = [
   { id: "viewer", label: "Files", icon: <FileIcon /> },
   { id: "search", label: "Search", icon: <SearchIcon /> },
   { id: "git", label: "Git", icon: <GitIcon />, requiresGit: true },
-  { id: "terminal", label: "Terminal", icon: <TerminalIcon /> },
   { id: "history", label: "History", icon: <ChangeHistoryIcon /> },
   { id: "lens", label: "Lens", icon: <LensIcon /> },
   { id: "mind", label: "Mind", icon: <MindIcon /> },

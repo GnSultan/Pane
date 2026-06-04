@@ -15,11 +15,10 @@
  */
 
 import fs from "node:fs/promises";
-import { readFileSync, readdirSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import crypto from "node:crypto";
-import { execSync } from "node:child_process";
+import { execThroughWorker } from "./tool-executor.mjs";
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const PUNKS_DIR = path.join(PANE_DIR, "punks");
 
@@ -148,7 +147,8 @@ export class MindPunks {
     // 9. Get current HEAD for next review's base_ref
     let currentHead = null;
     try {
-      currentHead = execSync("git rev-parse HEAD 2>/dev/null", { cwd: workingDir, encoding: "utf-8", timeout: 5000 }).trim() || null;
+      const headR = await execThroughWorker("git rev-parse HEAD 2>/dev/null", { cwd: workingDir, timeout: 5 });
+      currentHead = headR.success ? (headR.stdout.trim() || null) : null;
     } catch {}
 
     // 10. Complete session
@@ -422,30 +422,33 @@ export class MindPunks {
     const ref = lastRef || "HEAD~20";
 
     try {
-      const statOut = execSync(`git diff --stat ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, encoding: "utf-8", timeout: 5000 });
-      result.stat = statOut.trim();
+      const statR = await execThroughWorker(`git diff --stat ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, timeout: 5 });
+      if (statR.success) result.stat = statR.stdout.trim();
     } catch {}
     try {
-      const filesOut = execSync(`git diff --name-only ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, encoding: "utf-8", timeout: 5000 });
-      result.files = filesOut.trim().split("\n").filter(Boolean);
+      const filesR = await execThroughWorker(`git diff --name-only ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, timeout: 5 });
+      if (filesR.success) result.files = filesR.stdout.trim().split("\n").filter(Boolean);
     } catch {}
     try {
-      const logOut = execSync(`git log --oneline ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, encoding: "utf-8", timeout: 5000 });
-      result.log = logOut.trim();
+      const logR = await execThroughWorker(`git log --oneline ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, timeout: 5 });
+      if (logR.success) result.log = logR.stdout.trim();
     } catch {}
     try {
       // Cap diff to avoid blowing context
-      const raw = execSync(`git diff ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, encoding: "utf-8", timeout: 10000 });
-      result.diff = raw.length > 15000
-        ? raw.slice(0, 15000) + `\n\n... [diff truncated, ${raw.length - 15000} chars omitted]`
-        : raw;
+      const rawR = await execThroughWorker(`git diff ${ref}..HEAD 2>/dev/null`, { cwd: workingDir, timeout: 10 });
+      if (rawR.success) {
+        const raw = rawR.stdout;
+        result.diff = raw.length > 15000
+          ? raw.slice(0, 15000) + `\n\n... [diff truncated, ${raw.length - 15000} chars omitted]`
+          : raw;
+      }
     } catch {}
 
     // Fallback: if no git history, include uncommitted changes
     if (result.files.length === 0) {
       try {
-        const filesOut = execSync("git diff --name-only 2>/dev/null", { cwd: workingDir, encoding: "utf-8", timeout: 5000 });
-        result.files = filesOut.trim().split("\n").filter(Boolean);
+        const filesR = await execThroughWorker("git diff --name-only 2>/dev/null", { cwd: workingDir, timeout: 5 });
+        if (filesR.success) result.files = filesR.stdout.trim().split("\n").filter(Boolean);
       } catch {}
     }
 
@@ -458,7 +461,7 @@ export class MindPunks {
    * Build the user prompt that gives each punk their focused objective.
    * The system prompt is the persona file itself.
    */
-  _buildUserPrompt(diffFocus, punkName) {
+  _buildUserPrompt(diffFocus) {
     const parts = [];
 
     if (diffFocus.files.length > 0) {

@@ -113,7 +113,7 @@ async function detectBackendAvailability() {
     await import("@anthropic-ai/claude-agent-sdk");
     result.claudeAgent = true;
     result.versions.claudeAgent = "installed";
-  } catch (err) {
+  } catch {
     // Not installed — non-fatal
     // console.log("[punk] Claude Agent SDK not available");
   }
@@ -141,15 +141,15 @@ import { routingStore } from "./routing-store.mjs";
 import { classifyDomain } from "./routing-oracle.mjs";
 import { ensurePriors } from "./benchmark-scout.mjs";
 // intent-classifier.mjs removed — LLM-based classifier was dead code (never called)
-import { routeHeuristic, detectFailureSignals, detectSuccessSignals, djb2Hash } from "./heuristic-router.mjs";
-import { routeIntegrated, recordOutcome, getClassifierStats } from "./heuristic-router.mjs";
+import { detectFailureSignals, detectSuccessSignals, djb2Hash } from "./heuristic-router.mjs";
+import { routeIntegrated, recordOutcome } from "./heuristic-router.mjs";
 import { contextStore } from "./context-store.mjs";
 import { propagateCompletion } from "./completion-propagator.mjs";
 import { extractAndIndex } from "./memory-extractor.mjs";
 import { readThreadState, incrementFailure, recordSuccess, updateLastPrompt, updateLastResponse, recordApproach } from "./thread-state.mjs";
 
 // Node.js globals for utility process
-const { AbortController, fetch, TextDecoder, setImmediate, console } =
+const { setImmediate, console } =
   globalThis;
 
 // ============================================================================
@@ -566,7 +566,7 @@ class PunkEngine {
 
     // Initialize learned classifier on startup (non-blocking)
     import("./heuristic-router.mjs").then(module => {
-      module.getClassifierStats && console.log("[punk] learned classifier ready");
+      if (module.getClassifierStats) console.log("[punk] learned classifier ready");
     }).catch(() => {
       console.log("[punk] learned classifier not available");
     });
@@ -921,7 +921,6 @@ class PunkEngine {
           const has1m = id.includes("[1m]") || id.includes("1m");
           const isOpus = id.includes("opus");
           const isSonnet = id.includes("sonnet");
-          const isHaiku = id.includes("haiku");
           const isDefault = id === "default";
           const context = (has1m || isOpus || isDefault) ? 1000000 : 200000;
           const tier = (isOpus || isDefault) ? 1 : isSonnet ? 2 : 3;
@@ -1565,7 +1564,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         // Try to use the best model available from any provider with a key
         const keys = catalogData.apiKeys || {};
         if (!keys[resolvedRequest.provider]) {
-          const firstWithKey = Object.entries(keys).find(([_, k]) => !!k)?.[0];
+          const firstWithKey = Object.entries(keys).find(([, k]) => !!k)?.[0];
           if (firstWithKey) {
             console.log(`[punk] heuristic route ${resolvedRequest.provider} has no key → redirect to ${firstWithKey}`);
             resolvedRequest.provider = firstWithKey;
@@ -1600,7 +1599,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       if (catalogData?.backend === "api") {
         const keys = catalogData.apiKeys || {};
         if (!keys[resolvedRequest.provider]) {
-          const firstWithKey = Object.entries(keys).find(([_, k]) => !!k)?.[0];
+          const firstWithKey = Object.entries(keys).find(([, k]) => !!k)?.[0];
           if (firstWithKey) {
             resolvedRequest.provider = firstWithKey;
             resolvedRequest.model = null;
@@ -1998,7 +1997,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       const currentProvider = request.provider || "deepseek";
 
       if (!keys[currentProvider]) {
-        const firstWithKey = Object.entries(keys).find(([_, k]) => !!k)?.[0];
+        const firstWithKey = Object.entries(keys).find(([, k]) => !!k)?.[0];
         if (firstWithKey) {
           request.provider = firstWithKey;
           request.model = null;
@@ -2064,7 +2063,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
         // Architecture & design constraints
         'pane_architecture_brief', 'pane_ui_constraints',
         // History
-        'pane_change_history', 'pane_search_changes', 'pane_recent_terminal',
+        'pane_change_history', 'pane_search_changes',
         // Verification
         'pane_run_in_terminal',
       ],
@@ -2370,7 +2369,7 @@ export async function registerPunkHandlers() {
     const resource = process.resourceUsage ? process.resourceUsage() : null;
     let v8heap = null;
     try {
-      const v8 = require("node:v8");
+      const { default: v8 } = await import("node:v8");
       v8heap = v8.getHeapStatistics();
     } catch {}
 
@@ -2412,75 +2411,6 @@ export async function registerPunkHandlers() {
  * Only fires on inputs so clear that calling the LLM is pure waste.
  * Returns a full decision object (same shape as parseDecision output)
  * or null to fall through to the LLM classifier.
- *
- * @param {string} message   — raw user message
- * @param {string} backend   — normalised backend ("claude-code" | "gemini" | "api")
- * @returns {object|null}
- */
-function _fastPathClassify(message, backend) {
-  const trimmed = message.trim();
-  if (!trimmed) return null;
-
-  const lower  = trimmed.toLowerCase();
-  const isGemini   = backend === "gemini";
-  const provider   = isGemini ? "gemini"     : "anthropic";
-  const cheapModel = isGemini ? "gemini-3-flash-preview" : "haiku";
-  const midModel   = isGemini ? "gemini-3-flash-preview" : "sonnet";
-
-  // ── Pattern 1: Pure confirmations ────────────────────────────────────────
-  // Single-intent words / phrases that just mean "yes, do it".
-  // Routed to sonnet (not haiku) because confirmations trigger real execution.
-  const CONFIRMATIONS = new Set([
-    "yes", "y", "ok", "okay", "sure", "do it", "go ahead", "go",
-    "yep", "yup", "yeah", "sounds good", "let's go", "lets go",
-    "proceed", "continue", "looks good", "ship it", "lgtm",
-    "perfect", "great", "done", "alright", "cool", "nice",
-  ]);
-  if (CONFIRMATIONS.has(lower)) {
-    return {
-      mode: "direct", reason: "Continuing — going directly.",
-      discovery: false, reasoning: "shallow", verification: "diff",
-      taskType: "other", complexity: "low", preferFrontier: false,
-      atomHints: [], historyDepth: 3, includeBrief: false, fileDepth: "none",
-      planningModel: null,
-      executionModel: { model: midModel, provider },
-    };
-  }
-
-  // ── Pattern 2: Short pure questions (≤ 15 words, ends with ?, no code) ───
-  // "what does X do?", "why is Y failing?", "how does Z work?"
-  // Routed to haiku — just answering, no file changes.
-  const wordCount    = trimmed.split(/\s+/).filter(Boolean).length;
-  const hasCodeBlock = trimmed.includes("```");
-  if (trimmed.endsWith("?") && wordCount <= 15 && !hasCodeBlock) {
-    return {
-      mode: "discuss", reason: "Quick question — answering directly.",
-      discovery: false, reasoning: "shallow", verification: "none",
-      taskType: "quick-answer", complexity: "low", preferFrontier: false,
-      atomHints: [], historyDepth: 3, includeBrief: false, fileDepth: "none",
-      planningModel: null,
-      executionModel: { model: cheapModel, provider },
-    };
-  }
-
-  return null; // no fast-path match — fall through to LLM classifier
-}
-
-// Maps local-intel taskType → oracle domain. Replaces regex classifyDomain()
-/**
- * Count consecutive failing turns from the most-recent outcome backward.
- * A turn "fails" when it had tool errors or scored below 0.45.
- */
-function _computeStruggleCount(outcomes) {
-  if (!outcomes || outcomes.length === 0) return 0;
-  let count = 0;
-  for (const o of outcomes) {
-    if (o.had_tool_errors || (o.score !== null && o.score < 0.45)) count++;
-    else break;
-  }
-  return count;
-}
-
 // when the Qwen model has already classified the task.
 function _taskTypeToDomain(taskType) {
   switch (taskType) {

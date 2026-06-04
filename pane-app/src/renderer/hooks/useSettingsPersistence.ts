@@ -187,6 +187,76 @@ export function useSettingsPersistence() {
         const { addProject, setActiveProject, markRootMissing } =
           useProjectsStore.getState();
 
+        // ── Recovery: UUID-keyed project_states without project_order/project_ids ──
+        // An intermediate save (from migrating root-keyed → ID-keyed states) may
+        // have written project_states keyed by UUID without writing project_order
+        // or project_ids. Rebuild the mapping by matching state names to folder
+        // names so the existing data isn't orphaned.
+        const _psKeys = Object.keys(settings.project_states ?? {});
+        if (_psKeys.length > 0 && !settings.project_order) {
+          const _firstKey = _psKeys[0];
+          if (_firstKey && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(_firstKey)) {
+            const _roots = settings.project_roots ?? [];
+            const _folderToRoot: Record<string, string> = {};
+            for (const _r of _roots) {
+              const _f = _r.split('/').filter(Boolean).pop() || '';
+              if (_f) _folderToRoot[_f] = _r;
+            }
+            const _recoveredIds: Record<string, string> = {};
+            const _recoveredOrder: string[] = [];
+            const _matchedUuids = new Set<string>();
+            // Track the last matched root so same-folder threads can inherit it
+            let _lastMatchedRoot: string | null = null;
+            // First pass: match by name (case-insensitive)
+            for (const [_uuid, _state] of Object.entries(settings.project_states)) {
+              const _sname = _state.name || '';
+              if (!_sname) continue;
+              let _matchedRoot: string | null = null;
+              if (_folderToRoot[_sname]) {
+                _matchedRoot = _folderToRoot[_sname];
+              } else {
+                const _lower = _sname.toLowerCase();
+                for (const [folder, root] of Object.entries(_folderToRoot)) {
+                  if (folder.toLowerCase() === _lower) { _matchedRoot = root; break; }
+                }
+              }
+              if (_matchedRoot) {
+                _recoveredIds[_uuid] = _matchedRoot; // id→root
+                _recoveredOrder.push(_uuid);
+                _matchedUuids.add(_uuid);
+                _lastMatchedRoot = _matchedRoot;
+              }
+            }
+            // Second pass: unmatched UUIDs (same-folder threads) — attach to
+            // the last matched root. Add id→root entries so the NEW format
+            // load path (which builds idToRoot from project_ids) can find their root.
+            for (const [_uuid, _state] of Object.entries(settings.project_states)) {
+              if (_matchedUuids.has(_uuid)) continue;
+              // Pick a root: last matched root, or first root, or last root
+              const _fallbackRoot = _lastMatchedRoot ?? _roots[0] ?? (_roots.length > 0 ? _roots[_roots.length - 1] : null);
+              if (_fallbackRoot) {
+                _recoveredOrder.push(_uuid);
+                _recoveredIds[_uuid] = _fallbackRoot; // id→root format
+                _matchedUuids.add(_uuid);
+              }
+            }
+            settings.project_ids = _recoveredIds;
+            settings.project_order = _recoveredOrder;
+            // Inject root into each state entry for future-proofing
+            const _nameToRoot: Record<string, string> = {};
+            for (const [folder, root] of Object.entries(_folderToRoot)) {
+              _nameToRoot[folder.toLowerCase()] = root;
+            }
+            for (const [_uuid, _state] of Object.entries(settings.project_states)) {
+              if (!_state.root) {
+                const _sname = _state.name || '';
+                const _matchedRoot = _nameToRoot[_sname.toLowerCase()] ?? _recoveredIds[_uuid] ?? (_roots.length > 0 ? _roots[_roots.length - 1] : undefined);
+                (_state as ProjectSessionState).root = _matchedRoot;
+              }
+            }
+          }
+        }
+
         // project_ids maps root path → stable ID.
         // On first launch after this update, existing projects won't have entries
         // here. We fall back to the OLD derived-ID formula so their data
@@ -207,25 +277,64 @@ export function useSettingsPersistence() {
           // Track which projects need migration: { root, oldId, newId }
           const toMigrate: Array<{ root: string; oldId: string; newId: string }> = [];
 
-          for (const root of settings.project_roots as string[]) {
-            if (projectIds_[root]) {
-              // Already has a stable ID — no migration needed
-              const id = addProject(root, projectIds_[root]);
+          // NEW FORMAT: project_order is the authoritative ordered list of
+          // project IDs. project_ids may be in old format (root→id) or new
+          // format (id→root). Build a reverse map to handle both.
+          const projectOrderSetting: string[] = settings.project_order ?? [];
+          if (projectOrderSetting.length > 0) {
+            // Build id→root from project_ids regardless of format
+            const idToRoot: Record<string, string> = {};
+            for (const [key, val] of Object.entries(projectIds_)) {
+              if (key.startsWith("/")) {
+                // Old format: root → id
+                idToRoot[val] = key;
+              } else {
+                // New format: id → root
+                idToRoot[key] = val;
+              }
+            }
+            for (const pid of projectOrderSetting) {
+              let root = idToRoot[pid];
+              if (!root) {
+                // Fallback: derive root from project_states entry. Handles
+                // multiple threads on the same folder when project_ids is
+                // still in root→id format (only one ID survives per root).
+                root = (settings.project_states?.[pid] as ProjectSessionState | undefined)?.root;
+              }
+              if (!root) continue; // truly orphaned — skip
+              const id = addProject(root, pid);
               projectEntries.push({ id, root });
               if (root === settings.active_project_root) activeId = id;
-            } else {
-              // First launch after the update — derive the old ID, generate a UUID,
-              // and queue a migration so all data moves to the UUID atomically.
-              const oldId = deriveOldId(root);
-              const newId = (typeof crypto !== "undefined" && crypto.randomUUID)
-                ? crypto.randomUUID()
-                : `proj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-              toMigrate.push({ root, oldId, newId });
-              // Load the project immediately with the old ID so the UI isn't
-              // blocked waiting for the async migration to finish.
-              const id = addProject(root, oldId);
-              projectEntries.push({ id, root });
-              if (root === settings.active_project_root) activeId = id;
+            }
+          } else {
+            // OLD FORMAT: iterate project_roots with dedup by seen ID.
+            // Pre-project_order settings could have duplicate roots for
+            // multiple threads on the same folder. On load, the loop would
+            // call addProject with the same stableId N times, creating N
+            // duplicate entries in projectOrder. Dedup here prevents that.
+            const seenIds = new Set<string>();
+            for (const root of settings.project_roots as string[]) {
+              if (projectIds_[root]) {
+                const pid = projectIds_[root]!;
+                if (seenIds.has(pid)) continue; // skip duplicate
+                seenIds.add(pid);
+                const id = addProject(root, pid);
+                projectEntries.push({ id, root });
+                if (root === settings.active_project_root) activeId = id;
+              } else {
+                // First launch after the update — derive the old ID, generate a UUID,
+                // and queue a migration so all data moves to the UUID atomically.
+                const oldId = deriveOldId(root);
+                const newId = (typeof crypto !== "undefined" && crypto.randomUUID)
+                  ? crypto.randomUUID()
+                  : `proj-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+                toMigrate.push({ root, oldId, newId });
+                // Load the project immediately with the old ID so the UI isn't
+                // blocked waiting for the async migration to finish.
+                const id = addProject(root, oldId);
+                projectEntries.push({ id, root });
+                if (root === settings.active_project_root) activeId = id;
+              }
             }
           }
 
@@ -261,20 +370,23 @@ export function useSettingsPersistence() {
                   // Swap the store: rebind from oldId → newId so subsequent
                   // data writes (conversations, brain, etc.) use the UUID.
                   useProjectsStore.getState().migrateProjectId(oldId, newId);
-                  projectIds_[root] = newId;
+                  projectIds_[newId] = root;
                 } else {
                   // Migration failed — keep the old derived ID as a stable
                   // fallback. It'll be retried on the next launch.
-                  projectIds_[root] = oldId;
+                  projectIds_[oldId] = root;
                 }
               })
             ).then(() => {
               saveSettings({ project_ids: projectIds_ }).catch(() => {});
-              // Path-existence check after migration so we use final IDs
-              _checkMissingRoots(projectEntries.map(({ root }) => ({
-                id: projectIds_[root]!,
-                root,
-              })));
+              // Path-existence check after migration — use final IDs from
+              // the id→root map (projectIds_[newId] === root means success)
+              _checkMissingRoots(
+                toMigrate.map(({ root, newId, oldId }) => ({
+                  id: projectIds_[newId] === root ? newId : oldId,
+                  root,
+                }))
+              );
             }).catch(() => {});
           } else if (JSON.stringify(projectIds_) !== JSON.stringify(projectIds)) {
             // No migrations needed but projectIds_ may have changed (e.g. a
@@ -297,8 +409,10 @@ export function useSettingsPersistence() {
           const restoreProjectState = (idx: number) => {
             if (idx >= projectEntries.length) return;
             const { id, root } = projectEntries[idx]!;
+            // New format: project_states is keyed by project ID.
+            // Old format: keyed by root path. Try ID first, then root.
             const state: ProjectSessionState | undefined =
-              settings.project_states?.[root];
+              settings.project_states?.[id] ?? settings.project_states?.[root];
 
             if (state) {
               // Batch all sync mutations into ONE setState() instead of 8+
@@ -432,12 +546,19 @@ export function useSettingsPersistence() {
       const project_states: Record<string, ProjectSessionState> = {};
       const project_ids: Record<string, string> = {};
 
+      const seenRoots = new Set<string>();
       for (const id of ps.projectOrder) {
         const p = ps.projects.get(id);
         if (!p) continue;
-        project_roots.push(p.root);
-        project_ids[p.root] = p.id; // always persist the stable ID
-        project_states[p.root] = {
+        // Deduplicate project_roots so the load-side iterator
+        // doesn't create duplicate projectOrder entries.
+        if (!seenRoots.has(p.root)) {
+          project_roots.push(p.root);
+          seenRoots.add(p.root);
+        }
+        project_ids[p.id] = p.root; // id→root — supports multiple threads per folder
+        project_states[id] = {       // KEY BY ID (not root) — supports multiple threads on same folder
+          root: p.root,
           name: p.name,
           expanded_dirs: Array.from(p.expandedDirs),
           active_file_path: p.activeFilePath,
@@ -451,9 +572,14 @@ export function useSettingsPersistence() {
           archived: p.archived ?? false,
         };
       }
+      // Save projectOrder explicitly so the load side can restore
+      // the exact set of projects (including multiple on the same root)
+      // instead of guessing from deduped project_roots.
+      const project_order = ps.projectOrder;
 
       saveSettings({
         project_roots,
+        project_order,
         active_project_root: activeProject?.root ?? null,
         project_ids,
         project_states,

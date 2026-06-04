@@ -9,6 +9,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { execSync } from "node:child_process";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
+import { validateCommand } from "./command-validator.mjs";
 
 import { createRequire } from "node:module";
 
@@ -159,19 +160,6 @@ function getEnvWithPath() {
   return { ...process.env, PATH: combined };
 }
 
-async function appendTerminalHistory(stateDir, cmd, output) {
-  const filePath = path.join(stateDir, "terminal.json");
-  let data = null;
-  try { data = JSON.parse(await fs.promises.readFile(filePath, "utf-8")); } catch {}
-  const commands = Array.isArray(data?.commands) ? data.commands : [];
-  commands.push({ cmd, output, timestamp: Date.now(), source: "claude" });
-  const trimmed = commands.slice(-20);
-  try {
-    await fs.promises.mkdir(stateDir, { recursive: true });
-    await fs.promises.writeFile(filePath, JSON.stringify({ commands: trimmed }));
-  } catch {}
-}
-
 // --- Search helpers ---
 
 function fuzzyScore(query, text) {
@@ -257,11 +245,6 @@ const TOOLS = [
   {
     name: "pane_open_files",
     description: "Get the file the user currently has open in Pane's editor, including its full content and recent file history. Call this when the user's message is about 'this file', 'here', or 'what I'm looking at' — it gives you their exact context without asking.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "pane_recent_terminal",
-    description: "Get recent terminal commands and their outputs from Pane's terminal. Call this when the user references a command they ran, an error they saw, or 'what I just did'. Combine with pane_open_files to get the full picture of their current work context.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -491,7 +474,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        subsystem: { type: "string", description: "Subsystem name or file path (e.g. 'terminal', 'ipc', 'src/main/pty-worker.mjs')" },
+        subsystem: { type: "string", description: "Subsystem name or file path (e.g. 'terminal', 'ipc', 'src/main/cmd-worker.mjs')" },
         projectId: { type: "string" },
       },
       required: ["subsystem"],
@@ -616,7 +599,7 @@ function mergeSessionState(id, delta) {
 
 // Phase helpers
 function getPhase(id) { return readSessionState(id).phase || "idle"; }
-function transitionPhase(id, phase, _reason) {
+function transitionPhase(id, phase) {
   mergeSessionState(id, { phase, phaseEnteredAt: Date.now(), suspended: false, clarification: null });
 }
 
@@ -733,27 +716,17 @@ async function handleToolCall(name, args) {
       return text(out);
     }
 
-    case "pane_recent_terminal": {
-      const data = await readJson(path.join(stateDir, "terminal.json"));
-      if (!data?.commands?.length) return text("No terminal history.");
-      const cmds = data.commands.slice(-20);
-      const out = cmds.map(c => {
-        const output = c.output?.length > 1000
-          ? c.output.slice(0, 1000) + "\n... (truncated)"
-          : c.output || "(no output)";
-        return `$ ${c.cmd}\n${output}`;
-      }).join("\n\n");
-
-      // Contextual augmentation: if terminal has errors with file references,
-      // auto-attach the relevant code so the model doesn't need extra Read calls.
-      const lastOutput = cmds[cmds.length - 1]?.output || "";
-      const augmentation = await augmentWithReferencedFiles(lastOutput, PROJECT_ROOT);
-      return text(out + augmentation);
-    }
-
     case "pane_run_in_terminal": {
       const command = (args?.command || "").trim();
       if (!command) return text("Error: no command provided.");
+
+      // Validate against shared command safety gate (same patterns + path-boundary
+      // enforcement used by executeBash in tool-executor.mjs).
+      const validation = validateCommand(command, PROJECT_ROOT || null);
+      if (!validation.valid) {
+        return text(`Error: command rejected by safety validator — ${validation.error}`);
+      }
+
       const timeoutSecs = Math.min(Math.max(Number(args?.timeout) || 30, 1), 120);
       const cwd = PROJECT_ROOT || process.cwd();
       let output = "";
@@ -776,7 +749,6 @@ async function handleToolCall(name, args) {
           ? `Exit ${exitCode}\n${partial}`
           : (err.killed ? `Error: command timed out after ${timeoutSecs}s` : `Error: ${err.message}`);
       }
-      await appendTerminalHistory(stateDir, command, output);
       const result = output || "(no output)";
 
       // Contextual augmentation: if command output has errors with file references,
@@ -1284,7 +1256,6 @@ async function handleToolCall(name, args) {
       if (componentKey.includes("input") || componentKey.includes("textarea")) inferredCategories.add("input");
       if (componentKey.includes("search")) inferredCategories.add("search");
       if (componentKey.includes("float") || componentKey.includes("panel") || componentKey.includes("picker")) inferredCategories.add("floating");
-      if (componentKey.includes("terminal")) inferredCategories.add("terminal");
 
       const constraints = Array.isArray(data.constraints) ? data.constraints : [];
       const filtered = inferredCategories.size > 0

@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
-import { execSync } from "node:child_process";
+import { execThroughWorker } from "./tool-executor.mjs";
 
 // Node.js globals for utility process
 const { AbortController, fetch, TextDecoder, console } = globalThis;
@@ -28,6 +28,7 @@ import {
 } from "./extraction-tuning.mjs";
 
 import { calculateCost } from "./pricing.mjs";
+import { safeStringify } from "./sanitize.mjs";
 import { buildSummary, toolResultCache } from "./tool-result-cache.mjs";
 import { forcePruneToBudget, applyV4TurnSelection, dropAllNonFreshTurns } from "./conversation-lifecycle.mjs";
 import { contextStore } from "./context-store.mjs";
@@ -290,15 +291,6 @@ const TOOL_DEFINITIONS = [
       name: "pane_open_files",
       description:
         "Get the file currently open in Pane's editor, including its full content and recent file history. Working set pre-reads show partial content — use this for the complete file when you need more than what's pre-loaded.",
-      parameters: { type: "object", properties: {} },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "pane_recent_terminal",
-      description:
-        "Get recent terminal commands and their outputs from Pane's terminal. Use this FIRST whenever the user mentions an error, a running server, logs, build output, test results, or any process output — the terminal is shared and already has the data. Never ask the user to paste logs or copy output; read it here instead.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -1526,7 +1518,7 @@ export class ApiBackend extends PunkBackend {
                 content:
                   typeof c.content === "string"
                     ? c.content
-                    : JSON.stringify(c.content),
+                    : safeStringify(c.content),
                 is_error: c.is_error,
               };
               if (pendingToolCallIds.has(res.tool_call_id)) {
@@ -1617,7 +1609,7 @@ export class ApiBackend extends PunkBackend {
               } else if (args === null || typeof args !== "object") {
                 args = "{}";
               } else {
-                args = JSON.stringify(args);
+                args = safeStringify(args);
               }
 
               return {
@@ -1676,7 +1668,7 @@ export class ApiBackend extends PunkBackend {
                 content:
                   typeof c.content === "string"
                     ? c.content
-                    : JSON.stringify(c.content),
+                    : safeStringify(c.content),
                 is_error: c.is_error,
               });
             }
@@ -1750,19 +1742,68 @@ export class ApiBackend extends PunkBackend {
       normalized.splice(insertAt, 0, ...fakeResults);
     }
 
+    // --- 5. DEFENSIVE SANITIZATION (OpenAI providers) ---
+    // Last-resort guard: ensure every message has string content and no stray
+    // array-content blocks leak through. Some renderer paths may produce content
+    // blocks with missing 'type' fields, which causes Rust's serde to error with
+    // "missing field 'type'" on providers like DeepSeek.
+    if (isOpenAI) {
+      for (let i = 0; i < normalized.length; i++) {
+        const msg = normalized[i];
+
+        // Flatten any array content that wasn't converted above
+        if (Array.isArray(msg.content)) {
+          const text = msg.content
+            .filter((c) => c && typeof c.type === "string" && c.type === "text")
+            .map((c) => c.text || "")
+            .join("\n");
+          // Include tool_result content blocks as well
+          const toolResults = msg.content
+            .filter((c) => c && c.type === "tool_result" && c.content)
+            .map((c) => (typeof c.content === "string" ? c.content : safeStringify(c.content)))
+            .join("\n");
+          const combined = [text, toolResults].filter(Boolean).join("\n\n");
+          normalized[i] = { ...msg, content: combined || "" };
+        }
+
+        // Never send null/undefined content
+        if (normalized[i].content == null) {
+          normalized[i] = { ...normalized[i], content: "" };
+        }
+
+        // Ensure all tool_calls have the 'type' discriminator
+        if (normalized[i].tool_calls) {
+          normalized[i].tool_calls = normalized[i].tool_calls
+            .filter((tc) => tc && tc.id)
+            .map((tc) => ({ ...tc, type: tc.type || "function" }));
+        }
+
+        // Strip any top-level 'type' field — belongs on content blocks, not messages
+        if ("type" in normalized[i] && normalized[i].role) {
+          const { type: _unused, ...clean } = normalized[i];
+          normalized[i] = clean;
+        }
+      }
+    }
+
     return normalized;
   }
 
-  getGitStatus(workingDir) {
+  async getGitStatus(workingDir) {
     try {
-      const branch = execSync(
+      const branchResult = await execThroughWorker(
         "git symbolic-ref --short HEAD || git rev-parse --abbrev-ref HEAD",
-        { cwd: workingDir, encoding: "utf-8" },
-      ).trim();
-      const summary = execSync(
+        { cwd: workingDir, timeout: 10 }
+      );
+      const branch = branchResult.success ? branchResult.stdout.trim() : "";
+
+      const statusResult = await execThroughWorker(
         "git status --porcelain=v1 -unormal",
-        { cwd: workingDir, encoding: "utf-8" },
-      ).trim() || "(clean)";
+        { cwd: workingDir, timeout: 10 }
+      );
+      const summary = statusResult.success ? (statusResult.stdout.trim() || "(clean)") : "";
+
+      if (!branch && !summary) return null;
       return { branch, summary };
     } catch {
       return null;
@@ -2432,7 +2473,7 @@ export class ApiBackend extends PunkBackend {
               response = await fetch(url, {
                 method: "POST",
                 headers,
-                body: JSON.stringify(sourceBody),
+                body: safeStringify(sourceBody),
                 signal: abortController.signal,
               });
 
@@ -2585,6 +2626,56 @@ export class ApiBackend extends PunkBackend {
                     console.error(
                       `[http] Bad request (400): ${errorBody.slice(0, 300)}`,
                     );
+
+                    // Diagnostic: extract the offending message index from "missing field"
+                    // errors (e.g. "messages[15]: missing field 'type' at line 1 column 54023")
+                    // and log it so we can trace the root cause in logs.
+                    if (
+                      errorBody.includes("missing field") ||
+                      errorBody.includes("missing_field")
+                    ) {
+                      const msgIdxMatch = errorBody.match(/messages\[(\d+)\]/);
+                      if (msgIdxMatch) {
+                        const badIdx = parseInt(msgIdxMatch[1], 10);
+                        const badMsg =
+                          sourceBody?.messages?.[badIdx];
+                        if (badMsg) {
+                          const diag = safeStringify({
+                            role: badMsg.role,
+                            contentType: typeof badMsg.content,
+                            contentIsArray: Array.isArray(badMsg.content),
+                            contentLength: Array.isArray(badMsg.content)
+                              ? badMsg.content.length
+                              : typeof badMsg.content === "string"
+                                ? badMsg.content.length
+                                : null,
+                            hasToolCalls: !!badMsg.tool_calls,
+                            toolCallsCount: badMsg.tool_calls?.length,
+                            topKeys: Object.keys(badMsg),
+                            // For array content: what types are present
+                            blockTypes: Array.isArray(badMsg.content)
+                              ? [
+                                  ...new Set(
+                                    badMsg.content.map(
+                                      (b) => b?.type || "MISSING",
+                                    ),
+                                  ),
+                                ]
+                              : null,
+                            // If a block has no type, include its keys
+                            typeLessBlocks: Array.isArray(badMsg.content)
+                              ? badMsg.content
+                                  .filter((b) => !b?.type)
+                                  .map((b) => Object.keys(b || {}))
+                              : null,
+                          });
+                          console.error(
+                            `[http] DIAGNOSTIC: message[${badIdx}] structure:`,
+                            diag,
+                          );
+                        }
+                      }
+                    }
                   } else if (status === 401) {
                     console.error(
                       `[http] Unauthorized (401): Check API key configuration`,
@@ -3382,7 +3473,7 @@ export class ApiBackend extends PunkBackend {
                 const val = fn(getContextLimit, TOOL_DEFINITIONS);
                 result = {
                   success: true,
-                  output: JSON.stringify(val, null, 2),
+                  output: safeStringify(val, null, 2),
                 };
               } catch (err) {
                 result = { success: false, error: err.message };
@@ -4583,7 +4674,7 @@ export class ApiBackend extends PunkBackend {
                 {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
+                  body: safeStringify({
                     model: `models/${body.model}`,
                     systemInstruction: { parts: [{ text: stableSysContent }] },
                     ttl: "1800s",
@@ -5008,7 +5099,7 @@ export class ApiBackend extends PunkBackend {
               // Generate unique ID per tool call to prevent collisions within a chunk
               const toolId = `gemini_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
               const toolName = fc.name;
-              const toolArgs = JSON.stringify(fc.args || {});
+              const toolArgs = safeStringify(fc.args || {});
 
               // Emit start event immediately
               this.onEvent(
@@ -5542,7 +5633,7 @@ export class ApiBackend extends PunkBackend {
         const response = await fetch(url, {
           method: "POST",
           headers,
-          body: JSON.stringify(cleanBody),
+          body: safeStringify(cleanBody),
         });
 
         if (!response.ok) {
@@ -5814,7 +5905,7 @@ export class ApiBackend extends PunkBackend {
         const response = await fetch(url, {
           method: "POST",
           headers,
-          body: JSON.stringify(cleanBody),
+          body: safeStringify(cleanBody),
         });
 
         if (!response.ok) {

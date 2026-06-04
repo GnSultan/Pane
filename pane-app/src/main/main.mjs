@@ -9,7 +9,7 @@ import {
   nativeImage,
 } from "electron";
 import windowStateKeeper from "electron-window-state";
-import { execSync, execFileSync, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
 
@@ -60,10 +60,23 @@ import { updateLastPrompt, updateLastResponse, readThreadState } from "./thread-
 import { contextStore } from "./context-store.mjs";
 import { getPaneDb, extractMessageText } from "./pane-db.mjs";
 import { loadRecentTurns } from "./session-turns.mjs";
-import { setCmdWorker, execThroughWorker } from "./tool-executor.mjs";
+import { setCmdWorker, execThroughWorker, onCmdWorkerExit } from "./tool-executor.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
+
+// ── Global unhandled rejection / exception handlers ──────────────────────
+// Prevent process crashes from unhandled promise rejections or exceptions.
+// Log with full stack context for diagnosis — do NOT terminate the process.
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[pane] Unhandled rejection:", reason instanceof Error ? `${reason.message}\n${reason.stack}` : String(reason));
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[pane] Uncaught exception:", error.message);
+  console.error(error.stack);
+});
+
 let mindPunks = null;
 // Punk engine runs in a UtilityProcess to keep the main thread free.
 // Main process is a thin relay — never touches JSON.parse or model output.
@@ -382,17 +395,16 @@ function registerCommandHandlers() {
   });
   ipcMain.handle("delete_file", async (_event, args) => {
     // Move to Trash instead of permanent deletion.
-    // execSync avoids libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak in Electron 40).
-    // This runs in the main process but AppleScript is fast (~100ms) and the action is rare.
-    const { execSync: execSync2 } = await import("node:child_process");
-
+    // Route through cmd-worker (utility process) to avoid SyncProcessRunner crash.
     const escapedPath = args.path.replace(/'/g, "'\\''");
     const script = `osascript -e 'tell application "Finder" to delete POSIX file "${escapedPath}"'`;
 
     try {
-      execSync2(script, { encoding: "utf-8" });
+      const result = await execThroughWorker(script, { timeout: 10 });
+      if (!result.success) {
+        throw new Error(result.errorMessage || `AppleScript failed with exit code ${result.exitCode}`);
+      }
     } catch (error) {
-      // If AppleScript fails, fall back to permanent deletion with explicit confirmation
       throw new Error(
         `Failed to move to Trash: ${error.message}. File was NOT deleted.`,
       );
@@ -456,9 +468,10 @@ function registerCommandHandlers() {
     const { rgPath } = await import("@vscode/ripgrep");
 
     try {
-      // execFileSync bypasses libuv's uv_spawn/kqueue EVFILT_PROC path (macOS leak).
-      // ripgrep exits code 1 when no matches found — catch that specifically.
-      const stdout = execFileSync(
+      // Route through cmd-worker (utility process) via execFileAsync to avoid
+      // SyncProcessRunner crash on main thread. Falls back to async execFile
+      // if the worker is unavailable — both paths avoid SyncProcessRunner.
+      const { stdout } = await execFileAsync(
         rgPath,
         [
           "--line-number",
@@ -470,11 +483,7 @@ function registerCommandHandlers() {
           query,
           root,
         ],
-        {
-          encoding: "utf-8",
-          maxBuffer: 10 * 1024 * 1024,
-          timeout: 30000,
-        },
+        { timeout: 30000 },
       );
 
       const results = [];
@@ -503,7 +512,7 @@ function registerCommandHandlers() {
       }
 
       return results;
-    } catch (err) {
+    } catch {
       // ripgrep exits code 1 when no matches found — not an error
       // Other errors (timeout, killed, ENOENT) → empty results
       return [];
@@ -927,12 +936,15 @@ Improvements
       const content = await fs.promises.readFile(filePath, "utf-8");
       const settings = JSON.parse(content);
 
-      // Update project_ids: remove old root mapping, add new root mapping
+      // Update project_ids: remove old mapping, add new (id→root format)
       const projectIds = settings.project_ids ?? {};
-      if (oldRoot && projectIds[oldRoot]) {
-        delete projectIds[oldRoot];
+      if (oldRoot) {
+        // Remove old id→root entry if present
+        if (projectIds[projectId]) Reflect.deleteProperty(projectIds, projectId);
+        // Also clean up any legacy root→id entry
+        if (projectIds[oldRoot]) Reflect.deleteProperty(projectIds, oldRoot);
       }
-      projectIds[newRoot] = projectId;
+      projectIds[projectId] = newRoot;
       settings.project_ids = projectIds;
 
       // Update project_roots array to replace old root with new
@@ -947,10 +959,14 @@ Improvements
         settings.active_project_root = newRoot;
       }
 
-      // Update project_states: move state from old root key to new root key
+      // Update project_states: in new format (ID-keyed), update the root field.
+      // Also handle legacy root-keyed entries if present.
+      if (settings.project_states?.[projectId]) {
+        settings.project_states[projectId].root = newRoot;
+      }
       if (settings.project_states?.[oldRoot]) {
         settings.project_states[newRoot] = settings.project_states[oldRoot];
-        delete settings.project_states[oldRoot];
+        Reflect.deleteProperty(settings.project_states, oldRoot);
       }
 
       const json = JSON.stringify(settings, null, 2);
@@ -1056,89 +1072,8 @@ function registerSettingsHandlers() {
     app.dock.setIcon(nativeImage.createFromPath(iconPath));
   });
 }
-// PTY runs in a UtilityProcess to isolate node-pty crashes from the main process.
-// Same pattern as the Claude worker — main process is a zero-cost relay.
-let ptyWorker = null;
-const activePtyIds = new Set();
-function getPtyWorker() {
-  if (ptyWorker && !ptyWorker.killed) return ptyWorker;
-  const workerPath = path.join(__dirname, "pty-worker.mjs");
-  ptyWorker = utilityProcess.fork(workerPath);
-  ptyWorker.on("message", (message) => {
-    if (message.type === "data") {
-      const channel = `pty-data:${message.ptyId}`;
-      const windows = BrowserWindow.getAllWindows();
-      for (const win of windows) {
-        if (!win.isDestroyed()) {
-          win.webContents.send(channel, message.data);
-        }
-      }
-    } else if (message.type === "exit") {
-      activePtyIds.delete(message.ptyId);
-      const channel = `pty-exit:${message.ptyId}`;
-      const windows = BrowserWindow.getAllWindows();
-      for (const win of windows) {
-        if (!win.isDestroyed()) {
-          win.webContents.send(channel, { exitCode: message.exitCode });
-        }
-      }
-    }
-  });
-  // Crash recovery: if node-pty kills the worker, send synthetic exit to all active PTYs.
-  // Ignore exits during app shutdown (ptyWorker already nulled by before-quit handler).
-  ptyWorker.on("exit", (code) => {
-    if (forceQuit) return;
-    console.warn(`[pane] PTY worker exited unexpectedly with code ${code}`);
-    for (const ptyId of activePtyIds) {
-      const channel = `pty-exit:${ptyId}`;
-      const windows = BrowserWindow.getAllWindows();
-      for (const win of windows) {
-        if (!win.isDestroyed()) {
-          win.webContents.send(channel, { exitCode: null });
-        }
-      }
-    }
-    activePtyIds.clear();
-    ptyWorker = null;
-  });
-  return ptyWorker;
-}
-function registerPtyHandlers() {
-  ipcMain.handle("pty_create", async (_event, args) => {
-    const worker = getPtyWorker();
-    activePtyIds.add(args.ptyId);
-    worker.postMessage({
-      type: "create",
-      ptyId: args.ptyId,
-      projectId: args.projectId,
-      cwd: args.cwd,
-    });
-  });
-  ipcMain.handle("pty_write", async (_event, args) => {
-    if (ptyWorker && !ptyWorker.killed) {
-      ptyWorker.postMessage({
-        type: "write",
-        ptyId: args.ptyId,
-        data: args.data,
-      });
-    }
-  });
-  ipcMain.handle("pty_destroy", async (_event, args) => {
-    if (ptyWorker && !ptyWorker.killed) {
-      ptyWorker.postMessage({ type: "destroy", ptyId: args.ptyId });
-    }
-    activePtyIds.delete(args.ptyId);
-  });
-  ipcMain.handle("pty_destroy_project", async (_event, args) => {
-    if (ptyWorker && !ptyWorker.killed) {
-      ptyWorker.postMessage({
-        type: "destroy_project",
-        projectId: args.projectId,
-      });
-    }
-  });
-}
 let cmdWorker = null;
+let cmdWorkerLastExitTime = 0;
 function getCmdWorker() {
   if (cmdWorker && !cmdWorker.killed) return cmdWorker;
   const workerPath = path.join(__dirname, "cmd-worker.mjs");
@@ -1149,11 +1084,24 @@ function getCmdWorker() {
   setCmdWorker(cmdWorker);
   cmdWorker.on("exit", (code) => {
     if (forceQuit) return;
+    const now = Date.now();
+    if (now - cmdWorkerLastExitTime < 1000) {
+      // Worker keeps dying — throttle to avoid infinite respawn loop.
+      // Next request will trigger lazy re-fork.
+      console.warn(`[pane] CMD worker died again within 1s — throttling respawn`);
+      cmdWorker = null;
+      setCmdWorker(null);
+      onCmdWorkerExit();
+      cmdWorkerLastExitTime = now;
+      return;
+    }
     console.warn(`[pane] CMD worker exited unexpectedly with code ${code}`);
-    // setCmdWorker(null) handles rejection of all pending execThroughWorker promises
-    setCmdWorker(null);
+    onCmdWorkerExit();
     cmdWorker = null;
-    // Auto-restart on next request (lazy re-fork)
+    setCmdWorker(null);
+    cmdWorkerLastExitTime = now;
+    // Auto-respawn eagerly instead of lazy re-fork on next request
+    getCmdWorker();
   });
   return cmdWorker;
 }
@@ -1163,19 +1111,6 @@ function getCmdWorker() {
 app.on("before-quit", () => {
   forceQuit = true;
   shutdownPunkWorker();
-  if (ptyWorker && !ptyWorker.killed) {
-    // Send shutdown and let the worker exit gracefully — it needs time to
-    // dispose native ThreadSafeFunction handles before environment teardown.
-    // Force-kill only as a fallback if graceful shutdown doesn't complete.
-    ptyWorker.postMessage({ type: "shutdown" });
-    const workerRef = ptyWorker;
-    ptyWorker = null;
-    setTimeout(() => {
-      if (!workerRef.killed) {
-        workerRef.kill();
-      }
-    }, 500);
-  }
   // Shut down brain worker — it holds ONNX embedder memory (~200-400MB)
   // and was previously left to Electron's default cleanup (unreliable).
   if (brainWorker && !brainWorker.killed) {
@@ -1293,9 +1228,7 @@ function startMcpFileWatcher() {
         fs.promises.readFile(filePath, "utf-8").then(raw => {
           const roadmap = JSON.parse(raw);
           punkEngine.handleBackendEvent(projectId, { event: "roadmap_updated", data: { roadmap } });
-        }).catch(() => {
-          /* ignore parse errors during write */
-        });
+        }).catch(() => { /* ignore parse errors during write */ });
       });
     });
   } catch (err) {
@@ -1328,9 +1261,7 @@ function startMcpFileWatcher() {
           import("./pane-system-prompt.mjs").then(({ mergeState }) => {
             mergeState(projectId, { phase });
           }).catch(() => {});
-        }).catch(() => {
-          /* ignore parse errors */
-        });
+        }).catch(() => { /* ignore parse errors */ });
       });
     });
   } catch (err) {
@@ -1661,7 +1592,7 @@ function registerCheckpointHandlers(db) {
   });
 
   ipcMain.handle("revert_change", async (_event, args) => {
-    const { projectId, changeId, workingDir } = args;
+    const { changeId, workingDir } = args;
 
     const row = db.stmts.getChangeById.get(changeId);
     if (!row) return { success: false, error: "Change not found" };
@@ -1740,82 +1671,43 @@ function registerStateHandlers(db) {
     upsertBlob(args.projectId, "editor", args.data);
   });
 
-  ipcMain.handle("write_terminal_state", (_event, args) => {
-    upsertBlob(args.projectId, "terminal", args.data);
-  });
-
-  // Atomically appends one completed command to the shared multi-tab terminal history.
-  // better-sqlite3 is synchronous — no concurrent write races possible.
-  ipcMain.handle("append_terminal_command", (_event, { projectId, entry }) => {
-    let data = readBlob(projectId, "terminal") ?? { commands: [] };
-    if (!Array.isArray(data.commands)) data.commands = [];
-    // Remove stale partial entry for this tab (command just finished)
-    data.commands = data.commands.filter(
-      (c) => !(c.tabId === entry.tabId && c.partial === true),
-    );
-    data.commands.push(entry);
-    data.commands = data.commands.slice(-50);
-    upsertBlob(projectId, "terminal", data);
-  });
-
-  // Returns the stored terminal history for a project (last 50 commands).
-  ipcMain.handle("get_terminal_history", (_event, { projectId }) => {
-    const data = readBlob(projectId, "terminal") ?? { commands: [] };
-    return { commands: Array.isArray(data.commands) ? data.commands.filter((c) => !c.partial) : [] };
-  });
-
-  // Upserts a live snapshot for a long-running command.
-  ipcMain.handle("update_terminal_running", (_event, { projectId, entry }) => {
-    let data = readBlob(projectId, "terminal") ?? { commands: [] };
-    if (!Array.isArray(data.commands)) data.commands = [];
-    const idx = data.commands.findIndex(
-      (c) => c.tabId === entry.tabId && c.partial === true,
-    );
-    if (idx !== -1) {
-      data.commands[idx] = entry;
-    } else {
-      data.commands.push(entry);
-      data.commands = data.commands.slice(-50);
-    }
-    upsertBlob(projectId, "terminal", data);
-  });
-
   ipcMain.handle("write_project_state", (_event, args) => {
     upsertBlob(args.projectId, "project", args.data);
   });
 
   // save_conversation: accepts projectId instead of filePath.
   // Renderer sends only delta messages (new/modified since last persist) via
-  // debounced delta persistence. Wrapped in a single db.transaction() so all
-  // inserts + FTS updates + meta upsert commit atomically with one fsync.
-  // WAL mode ensures concurrent reads are never blocked during the transaction.
+  // debounced delta persistence. Each SQLite statement auto-commits independently
+  // — no explicit db.transaction() wrapper, so the database lock is never held
+  // across multiple messages. This prevents blocking other IPC handlers (git
+  // status, change history, token analytics) for hundreds of milliseconds.
+  // INSERT OR REPLACE handles both re-persisting an updated message (content
+  // streaming updates) and inserting new messages.
+  // Rows in the DB outside the delta slice are untouched; no prefix-merge needed.
   ipcMain.handle("save_conversation", (_event, args) => {
     const { projectId, conversation } = args;
     const { model, messages } = conversation;
 
     try {
-      const saveAll = db.transaction(() => {
-        for (const msg of messages) {
-          const id = msg.id || `msg-${projectId}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-          const contentJson = JSON.stringify(msg);
-          db.stmts.insertMessage.run(
-            id, projectId, msg.type ?? "assistant",
-            contentJson,
-            msg.created_at ?? msg.timestamp ?? Date.now(),
-            msg.cost_usd ?? null, msg.duration_ms ?? null,
-            msg.input_tokens ?? null, msg.output_tokens ?? null,
-            msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
-          );
-          // Keep FTS in sync: delete old entry (if any), insert fresh
-          const text = extractMessageText(contentJson);
-          if (text) {
-            db.stmts.deleteFts.run(id);
-            db.stmts.insertFts.run(projectId, id, text);
-          }
+      for (const msg of messages) {
+        const id = msg.id || `msg-${projectId}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+        const contentJson = JSON.stringify(msg);
+        db.stmts.insertMessage.run(
+          id, projectId, msg.type ?? "assistant",
+          contentJson,
+          msg.created_at ?? msg.timestamp ?? Date.now(),
+          msg.cost_usd ?? null, msg.duration_ms ?? null,
+          msg.input_tokens ?? null, msg.output_tokens ?? null,
+          msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
+        );
+        // Keep FTS in sync: delete old entry (if any), insert fresh
+        const text = extractMessageText(contentJson);
+        if (text) {
+          db.stmts.deleteFts.run(id);
+          db.stmts.insertFts.run(projectId, id, text);
         }
-        db.stmts.upsertConvMeta.run(projectId, null, model ?? null, Date.now());
-      });
-      saveAll();
+      }
+      db.stmts.upsertConvMeta.run(projectId, null, model ?? null, Date.now());
     } catch (e) {
       console.error("[pane-db] save_conversation error:", e.message);
     }
@@ -1824,7 +1716,6 @@ function registerStateHandlers(db) {
   // Returns a slice of messages from SQLite — sub-millisecond indexed query
   // regardless of total conversation size.
   ipcMain.handle("get_conversation_slice", (_event, { projectId, beforeIndex, count }) => {
-    const _t = Date.now();
     try {
       const totalCount = db.stmts.countMessages.get(projectId).cnt;
       const end = (beforeIndex != null && beforeIndex >= 0) ? beforeIndex : totalCount;
@@ -2319,7 +2210,7 @@ function getBrainWorker() {
       console.warn(`[pane] Brain worker disabled after ${brainWorkerExitCount} crashes — retrying in ${brainWorkerNextRetryMs / 1000}s`);
     }
     // Reject pending requests
-    for (const [id, resolve] of brainPendingRequests) {
+    for (const [, resolve] of brainPendingRequests) {
       resolve({ type: "error", error: "Brain worker exited" });
     }
     brainPendingRequests.clear();
@@ -2584,7 +2475,6 @@ async function registerIpcHandlers() {
   registerSettingsHandlers();
   await registerClaudeHandlers();
   registerWatcherHandlers();
-  registerPtyHandlers();
   registerCheckpointHandlers(db);
   registerStateHandlers(db);
   registerMemoryHandlers();
@@ -2675,7 +2565,6 @@ app.whenReady().then(async () => {
   modelManager.initialize();
   createWindow();
   preforkPunkWorker(); // Pre-fork to hide first-use latency
-  getPtyWorker();
   getBrainWorker(); // Pre-fork: start SQLite + profile (embedding model loads lazily on first embed)
   getCmdWorker();   // Pre-fork: runs execSync in isolated libuv loop (avoids EBADF in packaged app)
 
@@ -2726,7 +2615,6 @@ app.whenReady().then(async () => {
   // Mind punks: background intelligence with personality that acts on thoughts
   // Variable is used by brain_mind_add handler declared earlier in this scope,
   // but only called at runtime after this initialization completes.
-  /* eslint-disable-next-line no-use-before-define -- runtime order is safe */
   mindPunks = new MindPunks({
     brainRequest,
     quickCall: (sys, usr) => punkEngine.quickCall(sys, usr),

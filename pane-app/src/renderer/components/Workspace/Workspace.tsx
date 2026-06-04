@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, useCallback, memo, useTransition } from "react";
 import { Conversation } from "./Conversation";
 import { FileExplorer } from "./FileExplorer";
-import { Terminal } from "./Terminal";
 import { Profile } from "./Profile";
 import { Mind } from "./Mind";
 import { Lens } from "./Lens";
@@ -69,13 +68,6 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
     </div>
   );
 });
-
-function ProjectTerminal({ projectId }: { projectId: string }) {
-  const root = useProjectsStore((s) => s.projects.get(projectId)?.root ?? "");
-  if (!root) return null;
-  return <Terminal projectId={projectId} workingDir={root} />;
-}
-
 
 // Empty state — shown when no threads exist.
 // Centered input: type what you're working on → directory picker → thread created → message sent.
@@ -209,14 +201,6 @@ export function Workspace() {
 
       <div data-page="viewer" className="absolute inset-0 flex flex-col bg-pane-bg">
         <FileExplorer />
-      </div>
-
-      <div data-page="terminal" className="absolute inset-0 flex bg-pane-bg">
-        {activeProjectId && (
-          <div className="flex-1 min-h-0 min-w-0 flex flex-col">
-            <ProjectTerminal projectId={activeProjectId} />
-          </div>
-        )}
       </div>
 
       <div data-page="git" className="absolute inset-0 flex flex-col bg-pane-bg">
