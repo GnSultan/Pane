@@ -42,6 +42,7 @@ import {
 } from "./session-journal.mjs";
 
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
+import { runTurnSentinel, recordQualityMetric, runDeepReview, saveDeepReview } from "./code-arbiter.mjs";
 
 // ============================================================================
 // Context Window Manager — Pane-owned conversation lifecycle
@@ -3824,12 +3825,6 @@ export class ApiBackend extends PunkBackend {
         );
         if (arbiterTargets.length > 0) {
           try {
-            const {
-              runTurnSentinel,
-              recordQualityMetric,
-              runDeepReview,
-              saveDeepReview,
-            } = await import("./code-arbiter.mjs");
             // Pass DB for architecture sentinel (circular deps, broken imports)
             let arbiterDb = null;
             try {

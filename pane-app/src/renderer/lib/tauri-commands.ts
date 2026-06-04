@@ -640,7 +640,7 @@ export async function getCheckpointDiff(
   projectId: string,
   checkpointId: string,
   workingDir: string,
-): Promise<{ files: CheckpointDiffFile[] }> {
+): Promise<{ files: CheckpointDiffFile[]; error?: string }> {
   return electronAPI.invoke("get_checkpoint_diff", {
     projectId,
     checkpointId,

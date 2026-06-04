@@ -58,9 +58,10 @@ import { MindPunks } from "./mind-punks.mjs";
 import { getModelRates } from "./pricing.mjs";
 import { updateLastPrompt, updateLastResponse, readThreadState } from "./thread-state.mjs";
 import { contextStore } from "./context-store.mjs";
-import { getPaneDb, extractMessageText } from "./pane-db.mjs";
+import { getPaneDb, extractMessageText, initPaneDb, runMigrationIfNeeded, pruneConversationMessages } from "./pane-db.mjs";
 import { loadRecentTurns } from "./session-turns.mjs";
 import { setCmdWorker, execThroughWorker, onCmdWorkerExit } from "./tool-executor.mjs";
+import { mergeState } from "./pane-system-prompt.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -1255,12 +1256,10 @@ function startMcpFileWatcher() {
           if (lastPhase.get(projectId) === phase) return; // no change
           lastPhase.set(projectId, phase);
           punkEngine.handleBackendEvent(projectId, { event: "phase_changed", data: { phase } });
-          // Also sync in-memory workflow manager so phase gates reflect the new phase.
-          // Dynamic import is fire-and-forget — mergeState will re-read from file
-          // on next access if this loses the race, so errors are safe to ignore.
-          import("./pane-system-prompt.mjs").then(({ mergeState }) => {
+          // Sync in-memory workflow manager so phase gates reflect the new phase.
+          try {
             mergeState(projectId, { phase });
-          }).catch(() => {});
+          } catch {}
         }).catch(() => { /* ignore parse errors */ });
       });
     });
@@ -1466,12 +1465,29 @@ function registerCheckpointHandlers(db) {
 
   ipcMain.handle("list_checkpoints", (_event, args) => {
     try {
-      return db.stmts.listCheckpoints.all(args.projectId).map(m => ({
-        id: m.id,
-        timestamp: m.created_at,
-        messageId: m.message_id,
-        fileCount: m.file_count,
-      }));
+      const rows = db.stmts.listCheckpoints.all(args.projectId);
+      const cpDir = checkpointDir(args.projectId);
+      const valid = [];
+      for (const m of rows) {
+        // Prune stale rows whose JSON files no longer exist on disk
+        const cpPath = path.join(cpDir, `${m.id}.json`);
+        try {
+          if (fs.existsSync(cpPath)) {
+            valid.push({
+              id: m.id,
+              timestamp: m.created_at,
+              messageId: m.message_id,
+              fileCount: m.file_count,
+            });
+          } else {
+            db.stmts.deleteCheckpointById.run(m.id);
+          }
+        } catch {
+          // skip on read error, don't push to valid
+          try { db.stmts.deleteCheckpointById.run(m.id); } catch { /* cleanup best-effort */ }
+        }
+      }
+      return valid;
     } catch {
       return [];
     }
@@ -1486,15 +1502,17 @@ function registerCheckpointHandlers(db) {
 
   ipcMain.handle("get_checkpoint_diff", async (_event, args) => {
     const { projectId, checkpointId, workingDir } = args;
+    const cpPath = path.join(checkpointDir(projectId), `${checkpointId}.json`);
     let checkpoint;
     try {
-      const raw = await fs.promises.readFile(
-        path.join(checkpointDir(projectId), `${checkpointId}.json`),
-        "utf-8",
-      );
+      const raw = await fs.promises.readFile(cpPath, "utf-8");
       checkpoint = JSON.parse(raw);
     } catch {
-      return { files: [] };
+      // Checkpoint JSON file missing from disk — prune the stale SQLite row
+      // so the UI doesn't show a phantom checkpoint that can never be restored.
+      // Best-effort: row may already be deleted by concurrent request, no recovery needed
+      try { db.stmts.deleteCheckpointById.run(checkpointId); } catch { /* cleanup best-effort */ }
+      return { files: [], error: "Checkpoint file missing — removed stale entry" };
     }
     const diffs = [];
     for (const file of checkpoint.files) {
@@ -2460,7 +2478,6 @@ function registerBrainHandlers() {
 async function registerIpcHandlers() {
   let db = null;
   try {
-    const { initPaneDb, runMigrationIfNeeded } = await import("./pane-db.mjs");
     db = initPaneDb();
     await runMigrationIfNeeded(db);
     console.log("[main] Database initialized successfully");
@@ -2653,7 +2670,6 @@ app.whenReady().then(async () => {
       for (const projectId of allProjectIds) {
         // Prune old conversation messages — keep last 200
         try {
-          const { pruneConversationMessages } = await import("./pane-db.mjs");
           pruneConversationMessages(projectId, 200);
         } catch {}
 

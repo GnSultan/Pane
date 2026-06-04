@@ -137,6 +137,7 @@ interface ChangeItemProps {
 function ChangeItem({ change, projectId, onReverted }: ChangeItemProps) {
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
   const [reverting, setReverting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const isWrite = !change.oldString;
   const label = isWrite ? "write" : "edit";
@@ -153,14 +154,22 @@ function ChangeItem({ change, projectId, onReverted }: ChangeItemProps) {
 
   const handleRevert = async (e: React.MouseEvent) => {
     e.stopPropagation();
+    setError(null);
     const project = useProjectsStore.getState().projects.get(projectId);
-    if (!project) return;
+    if (!project) {
+      setError("Project not found");
+      return;
+    }
     setReverting(true);
     try {
-      await revertChange(projectId, change.id, project.root);
+      const result = await revertChange(projectId, change.id, project.root);
+      if (!result.success) {
+        setError(result.error ?? "Revert failed — file may have changed");
+        return;
+      }
       onReverted();
     } catch {
-      // ignore
+      setError("Revert failed — unexpected error");
     } finally {
       setReverting(false);
     }
@@ -219,7 +228,15 @@ function ChangeItem({ change, projectId, onReverted }: ChangeItemProps) {
           }
 
           {/* Revert action */}
-          <div className="px-4 py-2 border-t border-pane-text-secondary/10 flex justify-end">
+          <div className="px-4 py-2 border-t border-pane-text-secondary/10 flex items-center justify-end gap-2">
+            {error && (
+              <span
+                className="font-mono text-pane-error"
+                style={{ fontSize: "10px" }}
+              >
+                {error}
+              </span>
+            )}
             <button
               onClick={handleRevert}
               disabled={reverting}

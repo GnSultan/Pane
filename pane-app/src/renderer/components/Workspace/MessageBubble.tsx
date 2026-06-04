@@ -113,6 +113,7 @@ function CheckpointIndicator({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [diff, setDiff] = useState<CheckpointDiffFile[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [restoring, setRestoring] = useState(false);
   const [restored, setRestored] = useState(false);
   const isProcessing = useProjectsStore(
@@ -121,6 +122,7 @@ function CheckpointIndicator({
 
   const handleExpand = async () => {
     if (restored) return;
+    setError(null);
     if (!expanded) {
       setExpanded(true);
       const project = useProjectsStore.getState().projects.get(projectId);
@@ -131,10 +133,16 @@ function CheckpointIndicator({
             checkpointId,
             project.root,
           );
+          if (d.error) {
+            setError(d.error);
+          }
           setDiff(d.files);
         } catch {
           setDiff([]);
+          setError("Failed to load checkpoint diff");
         }
+      } else {
+        setError("Project not found");
       }
     } else {
       setExpanded(false);
@@ -142,15 +150,28 @@ function CheckpointIndicator({
   };
 
   const handleRestore = async () => {
-    if (restoring || isProcessing) return;
+    if (restoring || isProcessing) {
+      if (isProcessing) setError("Wait for current turn to finish before restoring");
+      return;
+    }
+    setError(null);
     const project = useProjectsStore.getState().projects.get(projectId);
-    if (!project) return;
+    if (!project) {
+      setError("Project not found");
+      return;
+    }
 
     setRestoring(true);
     setRestoreInProgress(true);
     try {
-      await restoreCheckpoint(projectId, checkpointId, project.root);
+      const result = await restoreCheckpoint(projectId, checkpointId, project.root);
+      if (!result.success) {
+        setError(result.error ?? "Restore failed");
+        return;
+      }
       setRestored(true);
+    } catch {
+      setError("Restore failed — checkpoint data may be corrupted");
     } finally {
       setRestoring(false);
       setTimeout(() => setRestoreInProgress(false), 1000);
@@ -197,6 +218,7 @@ function CheckpointIndicator({
               <button
                 onClick={handleRestore}
                 disabled={restoring || isProcessing}
+                title={isProcessing ? "wait for current turn to finish" : undefined}
                 className="text-pane-status-modified hover:text-pane-text font-mono btn-press
                            disabled:opacity-30 disabled:pointer-events-none"
                 style={{ fontSize: "var(--pane-font-size-xs)" }}
@@ -213,6 +235,14 @@ function CheckpointIndicator({
             </span>
           )}
         </>
+      )}
+      {error && (
+        <span
+          className="text-pane-error font-mono"
+          style={{ fontSize: "10px" }}
+        >
+          {error}
+        </span>
       )}
     </div>
   );

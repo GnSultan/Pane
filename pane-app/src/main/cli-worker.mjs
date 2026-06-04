@@ -17,6 +17,7 @@ import { orchestrateContext } from "./context-orchestrator.mjs";
 import { estimateConversationTokens } from "./token-budget.mjs";
 import { extractWithLLM, countHighConfidence, recordCorrections } from "./extraction-tuning.mjs";
 import { calculateCost } from "./pricing.mjs";
+import { runTurnSentinel } from "./code-arbiter.mjs";
 
 // Resolve the SDK's cli.js — works in both dev and production (asar).
 // In production, cli-worker.mjs is inside app.asar/out/main/, so node_modules
@@ -989,7 +990,6 @@ ${PANE_END}`;
     // because UtilityProcess workers cannot access pane-db.mjs (SQLite).
     if (hadFileEdits) {
       try {
-        const { runTurnSentinel } = await import("./code-arbiter.mjs");
         // git diff --name-only (no HEAD) catches both staged and unstaged changes
         const stdout = execSync(
           'git diff --name-only 2>/dev/null || echo ""',
@@ -1351,7 +1351,6 @@ ${PANE_END}`;
     // ── Turn Sentinel for Gemini (before processEnded so routing can adjust) ──
     ;(async () => {
       try {
-        const { runTurnSentinel } = await import("./code-arbiter.mjs");
         const stdout = execSync(
           'git diff --name-only 2>/dev/null || echo ""',
           { cwd: workingDir, encoding: "utf-8", timeout: 5000 },
