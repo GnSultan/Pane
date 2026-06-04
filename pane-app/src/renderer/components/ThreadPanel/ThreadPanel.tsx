@@ -43,21 +43,19 @@ export function ThreadPanel() {
 
   return (
     <div
-      className="no-select flex flex-col h-full bg-pane-bg rounded-xl font-panel outline-none ring-1 ring-pane-border/40 relative"
+      className="no-select flex flex-col h-full rounded-xl font-panel outline-none relative bg-pane-bg overflow-hidden"
       data-panel="thread"
       tabIndex={0}
     >
-      {/* Spacer for macOS traffic lights — enough room so they sit inside the panel */}
-      <div className="h-12 shrink-0" />
-
-      {/* Thread list — scrolls, fills remaining space */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-2 pt-2">
+      {/* Thread list — fills the full panel height, edge to edge.
+           pt-12 leaves room for macOS traffic lights to float over the content surface. */}
+      <div className="absolute inset-0 overflow-y-auto pt-12 px-2 pb-10">
         <ProjectList />
       </div>
 
-      {/* Menu — in normal flow at the bottom, width is the anchor that the thread highlight matches.
+      {/* Menu — overlaid at the bottom, floats over the content surface.
            px-1.5 pb-1.5 matches the InputBar '+' attach button padding (p-1.5). */}
-      <div className="px-1.5 pb-1.5">
+      <div className="absolute bottom-0 left-0 right-0 px-1.5 pb-1.5">
         <Menu
           currentMode={mode}
           isGitRepo={isGitRepo}

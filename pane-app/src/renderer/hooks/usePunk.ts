@@ -1389,7 +1389,7 @@ export function usePunk(projectId: string) {
         const truncatedHistory = conversation.messages.slice(-20).map((msg) => ({
           ...msg,
           content: Array.isArray(msg.content)
-            ? msg.content.filter((c) => c && typeof (c as Record<string, unknown>).type === "string")
+            ? msg.content.filter((c) => c && typeof c.type === "string")
             : msg.content,
         }));
         const todos = conversation.todos;

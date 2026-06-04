@@ -197,7 +197,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode }: Me
         /* Icon button — only visible when closed */
         <button
           onClick={handleToggle}
-          className="pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md ring-1 ring-pane-border/40 bg-pane-bg text-pane-text-secondary hover:text-pane-text transition-colors btn-press"
+          className="pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md text-pane-text-secondary hover:text-pane-text transition-colors btn-press"
           title="modes"
         >
           <MenuTriggerIcon />

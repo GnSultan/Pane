@@ -289,6 +289,7 @@ function _prepareStatements(db) {
       "SELECT * FROM checkpoints WHERE project_id = ? ORDER BY created_at ASC"
     ),
     getCheckpoint: db.prepare("SELECT * FROM checkpoints WHERE id = ?"),
+    deleteCheckpointById: db.prepare("DELETE FROM checkpoints WHERE id = ?"),
     deleteCheckpointsByProject: db.prepare("DELETE FROM checkpoints WHERE project_id = ?"),
 
     // state_blobs

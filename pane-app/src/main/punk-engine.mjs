@@ -142,11 +142,12 @@ import { classifyDomain } from "./routing-oracle.mjs";
 import { ensurePriors } from "./benchmark-scout.mjs";
 // intent-classifier.mjs removed — LLM-based classifier was dead code (never called)
 import { detectFailureSignals, detectSuccessSignals, djb2Hash } from "./heuristic-router.mjs";
-import { routeIntegrated, recordOutcome } from "./heuristic-router.mjs";
+import { routeIntegrated, recordOutcome, getClassifierStats } from "./heuristic-router.mjs";
 import { contextStore } from "./context-store.mjs";
 import { propagateCompletion } from "./completion-propagator.mjs";
 import { extractAndIndex } from "./memory-extractor.mjs";
 import { readThreadState, incrementFailure, recordSuccess, updateLastPrompt, updateLastResponse, recordApproach } from "./thread-state.mjs";
+import { recordQualityMetric, recordArbiterCorrections, isUserCorrection, recordUserCorrection } from "./code-arbiter.mjs";
 
 // Node.js globals for utility process
 const { setImmediate, console } =
@@ -564,12 +565,8 @@ class PunkEngine {
     // Used by agentCall() — events are consumed internally, never forwarded to renderer.
     this._workerAgentListeners = new Map();
 
-    // Initialize learned classifier on startup (non-blocking)
-    import("./heuristic-router.mjs").then(module => {
-      if (module.getClassifierStats) console.log("[punk] learned classifier ready");
-    }).catch(() => {
-      console.log("[punk] learned classifier not available");
-    });
+    // Log learned classifier status at startup
+    if (getClassifierStats()) console.log("[punk] learned classifier ready");
 
     // Safety sweep: evict any _activeOutcomes entries older than 10 minutes
     // (covers crashes/hangs where neither processEnded nor error fires) and
@@ -684,8 +681,7 @@ class PunkEngine {
       console.warn("[punk] benchmark-scout failed (non-fatal):", err.message)
     );
 
-    // Initialize learned classifier (non-blocking, logs when ready)
-    const { getClassifierStats } = await import("./heuristic-router.mjs");
+    // Log learned classifier status at startup (static import already loaded)
     const stats = getClassifierStats();
     if (stats) {
       console.log(`[punk] learned classifier ready (${stats.sampleCount} samples, ${stats.vocabSize} vocab)`);
@@ -1033,11 +1029,7 @@ class PunkEngine {
           }
 
           // Record behavioral fingerprint + correction events (main process has SQLite access).
-          // Fire-and-forget — handleBackendEvent is sync, so use .then().
-          Promise.all([
-            import("./code-arbiter.mjs"),
-            import("./pane-db.mjs"),
-          ]).then(([{ recordQualityMetric, recordArbiterCorrections }, { getPaneDb }]) => {
+          try {
             const db = getPaneDb();
             recordQualityMetric(db, {
               projectId: tracked.projectId,
@@ -1049,7 +1041,7 @@ class PunkEngine {
             if (!v.pass) {
               recordArbiterCorrections(db, tracked.projectId, v);
             }
-          }).catch(() => {});
+          } catch {}
         } catch {}
       }
 
@@ -1354,20 +1346,18 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // If the user's message starts with "no", "don't", "wrong", "revert",
     // etc., record it as a correction event for pattern detection.
     if (resolvedRequest.prompt && resolvedRequest.history?.length > 0) {
-      import("./code-arbiter.mjs").then(({ isUserCorrection, recordUserCorrection }) => {
-        if (isUserCorrection(resolvedRequest.prompt)) {
-          try {
-            const db = getPaneDb();
-            recordUserCorrection(
-              db,
-              resolvedRequest.projectId,
-              "user-negation",
-              resolvedRequest.prompt.slice(0, 200),
-              resolvedRequest.model,
-            );
-          } catch {}
-        }
-      }).catch(() => {});
+      if (isUserCorrection(resolvedRequest.prompt)) {
+        try {
+          const db = getPaneDb();
+          recordUserCorrection(
+            db,
+            resolvedRequest.projectId,
+            "user-negation",
+            resolvedRequest.prompt.slice(0, 200),
+            resolvedRequest.model,
+          );
+        } catch {}
+      }
     }
 
     // ── INTELLIGENCE ──────────────────────────────────────────────────────
@@ -1898,7 +1888,6 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     const combo = await this.loadPowerCombo();
 
     try {
-      const { routeIntegrated } = await import("./heuristic-router.mjs");
       const state = readState(projectId);
       const threadState = readThreadState(projectId);
 

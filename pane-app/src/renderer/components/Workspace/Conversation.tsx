@@ -88,9 +88,11 @@ export const Conversation = memo(function Conversation({
   const hasOlderMessages = historyStartIndex > 0;
 
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+  const [loadOlderError, setLoadOlderError] = useState<string | null>(null);
 
   const handleLoadOlder = useCallback(async () => {
     if (!projectId || isLoadingOlder || !hasOlderMessages) return;
+    setLoadOlderError(null);
     setIsLoadingOlder(true);
     try {
       const slice = await getConversationSlice(projectId, 30, historyStartIndex);
@@ -113,6 +115,7 @@ export const Conversation = memo(function Conversation({
       }
     } catch (err) {
       console.error("[conversation] failed to load older messages:", err);
+      setLoadOlderError("Failed to load older messages");
     } finally {
       setIsLoadingOlder(false);
     }
@@ -311,7 +314,14 @@ export const Conversation = memo(function Conversation({
         data-conv-scroll
       >
         {hasOlderMessages && (
-          <div className="flex justify-center py-3">
+          <div className="flex flex-col items-center py-3">
+            {loadOlderError && (
+              <span
+                className="font-mono text-[10px] text-pane-error mb-1"
+              >
+                {loadOlderError}
+              </span>
+            )}
             <button
               onClick={handleLoadOlder}
               disabled={isLoadingOlder}
