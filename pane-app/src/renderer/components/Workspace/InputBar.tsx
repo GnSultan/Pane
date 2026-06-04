@@ -1013,9 +1013,10 @@ export function InputBar({
         </div>
       )}
 
-      {/* Expanded: card with floating processing bar above */}
-      {expanded && <div className="relative flex flex-col">
-        {/* Processing bar — absolute, floats above card, no background footprint */}
+      {/* Expanded: outer wrapper + card with processing bar floating above the card ring */}
+      {expanded && (
+        <div className="relative flex flex-col">
+        {/* Processing bar — floats above the card ring, no layout footprint */}
         {(isProcessing || isFadingOut) && attachMenu !== "thoughts" && (
           <div
             className={`absolute top-0 left-0 right-0 z-10 flex items-center gap-3 px-3 pb-2 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
@@ -1055,7 +1056,6 @@ export function InputBar({
 
         {/* One card. Textarea + thoughts picker + button bar in column. */}
         <div ref={cardRef} className={`rounded-xl ring-1 relative flex flex-col ring-pane-border/40 ${isProcessing || isFadingOut ? "pt-10" : ""}`}>
-
         {attachMenu !== "thoughts" && (
           <CaretTextArea
             ref={textareaRef}
@@ -1247,7 +1247,8 @@ export function InputBar({
           )}
         </div>
         </div>
-      </div>}
+        </div>
+      )}
     </div>
   );
 }
