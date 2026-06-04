@@ -76,7 +76,6 @@ export function PlanApprovalBar({ projectId, toolId, question, inputType }: Plan
               onChange={(e) => setFeedback(e.target.value)}
               placeholder="your answer"
               className="flex-1 bg-transparent outline-none text-pane-text placeholder:text-pane-text-secondary/40"
-              data-no-drag
             />
             <button
               type="submit"
@@ -137,7 +136,6 @@ export function PlanApprovalBar({ projectId, toolId, question, inputType }: Plan
                 onChange={(e) => setFeedback(e.target.value)}
                 placeholder="what should change?"
                 className="flex-1 bg-transparent outline-none text-pane-text placeholder:text-pane-text-secondary/40"
-                data-no-drag
               />
               <button
                 type="submit"

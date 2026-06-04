@@ -309,7 +309,6 @@ export const Conversation = memo(function Conversation({
         ref={scrollRef}
         className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto px-10 pb-8 pt-8 bg-pane-bg"
         data-conv-scroll
-        data-no-drag
       >
         {hasOlderMessages && (
           <div className="flex justify-center py-3">

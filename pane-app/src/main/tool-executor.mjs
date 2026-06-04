@@ -15,7 +15,7 @@
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
-import { spawn, exec, execSync } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import os from "node:os";
 import crypto from "node:crypto";
 import vm from "node:vm";
@@ -32,15 +32,43 @@ import { replay as replayJournal, readLastProgress } from "./session-journal.mjs
 // utilityProcess.fork() with a clean libuv loop — execSync works there.
 // Set via setCmdWorker() from main.mjs after pre-forking the worker.
 let _cmdWorker = null;
+// Track pending requests so we can reject them immediately if the worker exits.
+// Map<id, { resolve, timer }>
+const _pendingRequests = new Map();
 
 /**
  * Register the cmd-worker instance from main.mjs.
  * Called once at startup after utilityProcess.fork("cmd-worker.mjs").
+ * If a previous worker died, rejects all pending promises for that worker.
  */
 export function setCmdWorker(worker) {
+  // Remove listeners from old worker if any
+  if (_cmdWorker && _cmdWorker !== worker) {
+    _cmdWorker.removeAllListeners("exit");
+    _cmdWorker.removeAllListeners("message");
+  }
   _cmdWorker = worker;
   if (_cmdWorker && typeof _cmdWorker.setMaxListeners === 'function') {
     _cmdWorker.setMaxListeners(100);
+  }
+
+  // When the worker exits, immediately fail every pending request.
+  // This prevents callers from waiting up to safeTimeout (130s) and
+  // prevents the execSync fallback in executeBash from kicking in.
+  if (_cmdWorker) {
+    _cmdWorker.on("exit", () => {
+      for (const [id, entry] of _pendingRequests) {
+        clearTimeout(entry.timer);
+        entry.resolve({
+          success: false,
+          stdout: "",
+          stderr: "",
+          exitCode: -1,
+          errorMessage: "cmd-worker exited unexpectedly",
+        });
+      }
+      _pendingRequests.clear();
+    });
   }
 }
 
@@ -56,12 +84,26 @@ export function execThroughWorker(command, options = {}) {
     }
 
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+    // Safety timeout — fires if the worker never responds (network stall,
+    // message lost, etc.). Worker-exit is handled separately by the 'exit' listener.
+    const safeTimeout = setTimeout(() => {
+      _pendingRequests.delete(id);
+      resolve({ success: false, stdout: "", stderr: "", exitCode: -1, errorMessage: "cmd-worker timed out" });
+    }, (options.timeout || 120) * 1000 + 10000);
+    if (safeTimeout.unref) safeTimeout.unref();
+
     const handler = (response) => {
       if (response.id === id) {
+        _pendingRequests.delete(id);
+        clearTimeout(safeTimeout);
         _cmdWorker.removeListener("message", handler);
         resolve(response);
       }
     };
+
+    // Register BEFORE postMessage so we don't miss a synchronous response
+    _pendingRequests.set(id, { resolve, timer: safeTimeout });
     _cmdWorker.on("message", handler);
 
     _cmdWorker.postMessage({
@@ -71,14 +113,6 @@ export function execThroughWorker(command, options = {}) {
       env: options.env,
       timeout: options.timeout || 120,
     });
-
-    // Safety timeout — if worker never responds, reject
-    const safeTimeout = setTimeout(() => {
-      _cmdWorker.removeListener("message", handler);
-      resolve({ success: false, stdout: "", stderr: "", exitCode: -1, errorMessage: "cmd-worker timed out" });
-    }, (options.timeout || 120) * 1000 + 10000);
-    // Unref so it doesn't keep the process alive
-    if (safeTimeout.unref) safeTimeout.unref();
   });
 }
 
@@ -797,39 +831,13 @@ export class ToolExecutor {
             exitCode: 0,
           };
         } else {
-          // Worker was unavailable (not forked yet) — try direct execSync as last resort
-          if (result.errorMessage === "cmd-worker not available") {
-            try {
-              const stdout = execSync(command, {
-                ...execOptions,
-                encoding: DEFAULT_ENCODING,
-                timeout: 30000,
-                stdio: ['pipe', 'pipe', 'pipe'],
-              });
-              let output = stdout || "";
-              if (output.length > MAX_OUTPUT_SIZE) {
-                output = output.substring(0, MAX_OUTPUT_SIZE) + "\n...[output truncated]";
-              }
-              return { success: true, output: output || "(no output)", toolId, duration: Date.now() - startTime, exitCode: 0 };
-            } catch (fallbackErr) {
-              // Both worker and direct execSync failed — report the worker's error
-              return {
-                success: false,
-                error: `Command failed: ${result.stderr || result.stdout || result.errorMessage}`,
-                output: result.stderr || result.stdout,
-                toolId,
-                exitCode: result.exitCode,
-              };
-            }
-          }
-
-          // Command failed with non-zero exit code
+          // Command failed (worker unavailable, crashed, timed out, or non-zero exit)
           return {
             success: false,
-            error: `Command failed with exit code ${result.exitCode}: ${result.stderr || result.stdout || result.errorMessage}`,
-            output: result.stderr || result.stdout,
+            error: `Command failed: ${result.stderr || result.stdout || result.errorMessage || "unknown error"}`,
+            output: result.stderr || result.stdout || "",
             toolId,
-            exitCode: result.exitCode,
+            exitCode: result.exitCode != null ? result.exitCode : -1,
           };
         }
       }

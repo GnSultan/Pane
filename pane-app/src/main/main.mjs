@@ -1150,8 +1150,9 @@ function getCmdWorker() {
   cmdWorker.on("exit", (code) => {
     if (forceQuit) return;
     console.warn(`[pane] CMD worker exited unexpectedly with code ${code}`);
-    cmdWorker = null;
+    // setCmdWorker(null) handles rejection of all pending execThroughWorker promises
     setCmdWorker(null);
+    cmdWorker = null;
     // Auto-restart on next request (lazy re-fork)
   });
   return cmdWorker;
@@ -1289,10 +1290,12 @@ function startMcpFileWatcher() {
       if (!filePath.endsWith("roadmap.json")) return;
       const projectId = path.basename(path.dirname(filePath));
       debounced(`roadmap:${projectId}`, () => {
-        try {
-          const roadmap = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+        fs.promises.readFile(filePath, "utf-8").then(raw => {
+          const roadmap = JSON.parse(raw);
           punkEngine.handleBackendEvent(projectId, { event: "roadmap_updated", data: { roadmap } });
-        } catch { /* ignore parse errors during write */ }
+        }).catch(() => {
+          /* ignore parse errors during write */
+        });
       });
     });
   } catch (err) {
@@ -1313,8 +1316,8 @@ function startMcpFileWatcher() {
       if (!filePath.endsWith("state.json")) return;
       const projectId = path.basename(path.dirname(filePath));
       debounced(`state:${projectId}`, () => {
-        try {
-          const state = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+        fs.promises.readFile(filePath, "utf-8").then(raw => {
+          const state = JSON.parse(raw);
           const phase = state.phase || "idle";
           if (lastPhase.get(projectId) === phase) return; // no change
           lastPhase.set(projectId, phase);
@@ -1325,7 +1328,9 @@ function startMcpFileWatcher() {
           import("./pane-system-prompt.mjs").then(({ mergeState }) => {
             mergeState(projectId, { phase });
           }).catch(() => {});
-        } catch { /* ignore parse errors */ }
+        }).catch(() => {
+          /* ignore parse errors */
+        });
       });
     });
   } catch (err) {
@@ -1634,6 +1639,10 @@ function registerCheckpointHandlers(db) {
       workingDir ?? null,
     );
 
+    // Notify renderer so ChangeHistoryPanel updates instantly (event-driven)
+    // instead of polling every 2s
+    sendToRenderer("pane://change-recorded", { projectId, id });
+
     return { id, success: true };
   });
 
@@ -1777,37 +1786,36 @@ function registerStateHandlers(db) {
 
   // save_conversation: accepts projectId instead of filePath.
   // Renderer sends only delta messages (new/modified since last persist) via
-  // debounced delta persistence. Each SQLite statement auto-commits independently
-  // — no explicit db.transaction() wrapper, so the database lock is never held
-  // across multiple messages. This prevents blocking other IPC handlers (git
-  // status, change history, token analytics) for hundreds of milliseconds.
-  // INSERT OR REPLACE handles both re-persisting an updated message (content
-  // streaming updates) and inserting new messages.
-  // Rows in the DB outside the delta slice are untouched; no prefix-merge needed.
+  // debounced delta persistence. Wrapped in a single db.transaction() so all
+  // inserts + FTS updates + meta upsert commit atomically with one fsync.
+  // WAL mode ensures concurrent reads are never blocked during the transaction.
   ipcMain.handle("save_conversation", (_event, args) => {
     const { projectId, conversation } = args;
     const { model, messages } = conversation;
 
     try {
-      for (const msg of messages) {
-        const id = msg.id || `msg-${projectId}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-        const contentJson = JSON.stringify(msg);
-        db.stmts.insertMessage.run(
-          id, projectId, msg.type ?? "assistant",
-          contentJson,
-          msg.created_at ?? msg.timestamp ?? Date.now(),
-          msg.cost_usd ?? null, msg.duration_ms ?? null,
-          msg.input_tokens ?? null, msg.output_tokens ?? null,
-          msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
-        );
-        // Keep FTS in sync: delete old entry (if any), insert fresh
-        const text = extractMessageText(contentJson);
-        if (text) {
-          db.stmts.deleteFts.run(id);
-          db.stmts.insertFts.run(projectId, id, text);
+      const saveAll = db.transaction(() => {
+        for (const msg of messages) {
+          const id = msg.id || `msg-${projectId}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+          const contentJson = JSON.stringify(msg);
+          db.stmts.insertMessage.run(
+            id, projectId, msg.type ?? "assistant",
+            contentJson,
+            msg.created_at ?? msg.timestamp ?? Date.now(),
+            msg.cost_usd ?? null, msg.duration_ms ?? null,
+            msg.input_tokens ?? null, msg.output_tokens ?? null,
+            msg.checkpoint_id ?? null, msg.model ?? null, msg.num_turns ?? null,
+          );
+          // Keep FTS in sync: delete old entry (if any), insert fresh
+          const text = extractMessageText(contentJson);
+          if (text) {
+            db.stmts.deleteFts.run(id);
+            db.stmts.insertFts.run(projectId, id, text);
+          }
         }
-      }
-      db.stmts.upsertConvMeta.run(projectId, null, model ?? null, Date.now());
+        db.stmts.upsertConvMeta.run(projectId, null, model ?? null, Date.now());
+      });
+      saveAll();
     } catch (e) {
       console.error("[pane-db] save_conversation error:", e.message);
     }

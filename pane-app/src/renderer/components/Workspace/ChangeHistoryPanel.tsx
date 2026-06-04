@@ -25,17 +25,29 @@ export function ChangeHistoryPanel({ projectId }: ChangeHistoryPanelProps) {
   }, [projectId]);
 
   // Only poll while the panel is actually visible in the viewport.
-  // The panel is always mounted (hidden by CSS data-mode) so without
-  // this gate it fires 30 SQLite queries/minute regardless of visibility.
+  // Primary updates come from pane://change-recorded events emitted by the
+  // main process after each record_change IPC. 30s safety-net interval
+  // handles stale-while-revalidate in case an event is missed.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
 
+    // Guard against cold-start race where preload hasn't injected electronAPI yet
+    const electronAPI = window.electronAPI;
+    if (!electronAPI) return;
+
     let interval: ReturnType<typeof setInterval> | null = null;
+
+    // Listen for change-recorded events — instant update when a change is saved
+    const unlisten = electronAPI.on("pane://change-recorded", (data: { projectId: string; id: string }) => {
+      if (data.projectId === projectId) {
+        loadChanges();
+      }
+    });
 
     const onVisible = () => {
       loadChanges();
-      interval = setInterval(loadChanges, 2000);
+      interval = setInterval(loadChanges, 30000);
     };
 
     const onHidden = () => {
@@ -59,8 +71,9 @@ export function ChangeHistoryPanel({ projectId }: ChangeHistoryPanelProps) {
     return () => {
       observer.disconnect();
       if (interval) clearInterval(interval);
+      unlisten();
     };
-  }, [loadChanges]);
+  }, [loadChanges, projectId]);
 
   return (
     <div ref={containerRef} className="h-full flex flex-col bg-pane-bg relative">

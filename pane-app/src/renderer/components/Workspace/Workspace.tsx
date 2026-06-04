@@ -123,7 +123,7 @@ function EmptyState() {
   }, [handleSubmit]);
 
   return (
-    <div className="absolute inset-0 flex items-center justify-center" data-no-drag>
+    <div className="absolute inset-0 flex items-center justify-center">
       <div className="w-full max-w-xl px-10">
         <textarea
           ref={inputRef}
@@ -196,7 +196,7 @@ export function Workspace() {
   }, [setMode]);
 
   return (
-    <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl ring-1 ring-pane-border/40 overflow-hidden">
+    <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl overflow-hidden ring-1 ring-pane-border/40">
       {/* Conversation page — participates in the same [data-page] CSS system as every other page.
            Page-level visibility (conversation vs mind vs profile) is CSS-driven.
            Thread switching (project A vs project B) is JS-driven z-index 0/1 inside. */}

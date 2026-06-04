@@ -104,10 +104,10 @@ function readStateFromDisk(projectId) {
   }
 }
 
-function writeStateToDisk(projectId, state) {
+async function writeStateToDisk(projectId, state) {
   const dir = getJournalDir(projectId);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(getStatePath(projectId), JSON.stringify(state, null, 2), "utf-8");
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.writeFile(getStatePath(projectId), JSON.stringify(state, null, 2), "utf-8");
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +199,7 @@ export function openJournal(projectId, options = {}) {
   // Close any existing journal for this project
   const existing = activeJournals.get(projectId);
   if (existing) {
-    existing.close();
+    existing.close().catch(() => {});
   }
 
   const dir = getJournalDir(projectId);
@@ -286,6 +286,8 @@ class SessionJournal {
     this._closed = false;
     this._state = initialState;
     this._stateFlushTimer = null;
+    this._writing = false;      // Exclusive write lock for state.json
+    this._pendingWrite = false; // Deferred write while lock was held
   }
 
   // ── State management ────────────────────────────────────────────────────
@@ -338,17 +340,28 @@ class SessionJournal {
     }, 2000);
   }
 
-  /** @private — write current state to state.json */
+  /** @private — write current state to state.json with exclusive write lock */
   _flushStateToDisk() {
     if (this._stateFlushTimer) {
       clearTimeout(this._stateFlushTimer);
       this._stateFlushTimer = null;
     }
-    try {
-      writeStateToDisk(this.projectId, this._state);
-    } catch (err) {
-      console.warn(`[session-journal] Failed to flush state to disk: ${err.message}`);
+    if (this._writing) {
+      this._pendingWrite = true;
+      return;
     }
+    this._writing = true;
+    writeStateToDisk(this.projectId, this._state)
+      .catch(err => {
+        console.warn(`[session-journal] Failed to flush state to disk: ${err.message}`);
+      })
+      .finally(() => {
+        this._writing = false;
+        if (this._pendingWrite) {
+          this._pendingWrite = false;
+          this._flushStateToDisk();
+        }
+      });
   }
 
   // ── Message logging ─────────────────────────────────────────────────────
@@ -408,22 +421,31 @@ class SessionJournal {
   /**
    * Close the journal. Flushes state, writes meta, unregisters from global.
    */
-  close() {
+  async close() {
     if (this._closed) return;
     this._closed = true;
-    this._flushStateToDisk();
-    this._flushMeta();
+    // Wait for any in-flight write to complete, then do final writes
+    while (this._writing) {
+      await new Promise(r => setTimeout(r, 10));
+    }
+    this._writing = true;
+    try {
+      await Promise.all([
+        writeStateToDisk(this.projectId, this._state).catch(() => {}),
+        fs.promises.writeFile(this._metaPath, JSON.stringify(this._meta, null, 2), "utf-8").catch(() => {}),
+      ]);
+    } finally {
+      this._writing = false;
+    }
     try { fs.closeSync(this._fd); } catch {}
     activeJournals.delete(this.projectId);
   }
 
   /** @private */
   _flushMeta() {
-    try {
-      fs.writeFileSync(this._metaPath, JSON.stringify(this._meta, null, 2), "utf-8");
-    } catch (err) {
+    fs.promises.writeFile(this._metaPath, JSON.stringify(this._meta, null, 2), "utf-8").catch(err => {
       console.warn(`[session-journal] Failed to flush meta: ${err.message}`);
-    }
+    });
   }
 }
 

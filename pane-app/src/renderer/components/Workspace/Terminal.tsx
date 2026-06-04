@@ -596,7 +596,7 @@ function TerminalTabContent({
       className="flex flex-col flex-1 min-h-0 w-full relative"
       style={{ display: isVisible ? "flex" : "none" }}
     >
-      <div className="flex-1 relative min-h-0" data-no-drag>
+      <div className="flex-1 relative min-h-0">
         {lines.length > 0 && (
           <button
             onClick={clearTerminal}

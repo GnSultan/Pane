@@ -306,9 +306,9 @@ export function useSettingsPersistence() {
               // subscriber cascade (computeStructuralKey, re-renders, etc.).
               restoringProjects.add(id);
               useProjectsStore.setState((s) => {
-                let proj = s.projects.get(id);
+                const proj = s.projects.get(id);
                 if (!proj) return s;
-                let updated = { ...proj };
+                const updated = { ...proj };
 
                 // name
                 if (state.name) updated.name = state.name;
@@ -354,7 +354,7 @@ export function useSettingsPersistence() {
                   updated.archived = true;
                   const nextProjects = new Map(s.projects);
                   nextProjects.set(id, updated);
-                  let active = s.activeProjectId;
+                  const active = s.activeProjectId;
                   const newActive = active === id
                     ? s.projectOrder.find((oid) => {
                         const other = s.projects.get(oid);

@@ -225,7 +225,6 @@ function EntryRow({
   return (
     <div
       className="group flex items-center h-8 px-4 hover:bg-pane-text/[0.04] select-none"
-      data-no-drag
     >
       {isRenaming ? (
         <RenameInput
@@ -329,7 +328,7 @@ function NewFileRow({
 
   if (active) {
     return (
-      <div className="flex items-center h-8 px-4" data-no-drag>
+      <div className="flex items-center h-8 px-4">
         <input
           ref={ref}
           value={value}
@@ -359,7 +358,6 @@ function NewFileRow({
       onClick={onBegin}
       className="w-full flex items-center h-8 px-4 text-pane-text-secondary/30 hover:text-pane-text-secondary font-mono btn-press"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
-      data-no-drag
     >
       + new file
     </button>
@@ -425,7 +423,7 @@ function DirectoryListing({
   }
 
   return (
-    <div className="flex-1 overflow-y-auto py-1 custom-scrollbar" data-no-drag>
+    <div className="flex-1 overflow-y-auto py-1 custom-scrollbar">
       <NewFileRow
         active={creatingFile}
         value={newFileName}
@@ -651,7 +649,7 @@ export function FileExplorer() {
   if (!activeProjectId || !projectRoot) return null;
 
   return (
-    <div className="flex flex-col h-full" data-no-drag>
+    <div className="flex flex-col h-full">
       <ExplorerHeader
         projectRoot={projectRoot}
         currentDir={currentDir}
