@@ -301,25 +301,32 @@ function ProjectListInner() {
     useShallow((s) => {
       const order = s.projectOrder;
       const map = s.projects;
-      // Precompute index lookup — O(n) once instead of O(n²) in sort
       const idxMap = new Map(order.map((id, i) => [id, i]));
       return [...order].sort((a, b) => {
         const aTime = map.get(a)?.lastActivityAt ?? null;
         const bTime = map.get(b)?.lastActivityAt ?? null;
-        // Both have activity: most recent first
         if (aTime !== null && bTime !== null) return bTime - aTime;
-        // Active threads come before inactive ones
         if (aTime !== null) return -1;
         if (bTime !== null) return 1;
-        // Both inactive: insertion order (Map lookups are O(1) vs indexOf O(n))
         return (idxMap.get(a) ?? 0) - (idxMap.get(b) ?? 0);
       });
     }),
   );
 
-  const projects = useProjectsStore((s) => s.projects);
-  const activeIds = sortedOrder.filter((id) => !projects.get(id)?.archived);
-  const archivedIds = sortedOrder.filter((id) => projects.get(id)?.archived);
+  // Track archived status separately — only fires when a project is archived/restored,
+  // not on every text delta during streaming.
+  const archivedSet = useProjectsStore(
+    useShallow((s) => {
+      const ids: string[] = [];
+      for (const [id, p] of s.projects) {
+        if (p.archived) ids.push(id);
+      }
+      return ids;
+    }),
+  );
+
+  const activeIds = sortedOrder.filter((id) => !archivedSet.includes(id));
+  const archivedIds = sortedOrder.filter((id) => archivedSet.includes(id));
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const [archivedOpen, setArchivedOpen] = useState(false);

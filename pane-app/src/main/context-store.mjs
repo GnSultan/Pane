@@ -10,6 +10,7 @@
  */
 
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { EventEmitter } from "node:events";
@@ -108,26 +109,33 @@ class ContextStore extends EventEmitter {
    * Called on debounced timer and on graceful shutdown.
    * @param {string} projectId
    */
-  serializeToDisk(projectId) {
+  async serializeToDisk(projectId) {
     const ctx = this._projects.get(projectId);
     if (!ctx) return;
 
     try {
-      fs.mkdirSync(CONTEXT_DIR, { recursive: true });
+      await fsp.mkdir(CONTEXT_DIR, { recursive: true });
 
+      const writes = [];
       if (ctx.brainExport) {
-        fs.writeFileSync(
-          path.join(CONTEXT_DIR, `${projectId}.json`),
-          JSON.stringify(ctx.brainExport),
+        writes.push(
+          fsp.writeFile(
+            path.join(CONTEXT_DIR, `${projectId}.json`),
+            JSON.stringify(ctx.brainExport),
+          ),
         );
       }
 
       if (ctx.contextShape) {
-        fs.writeFileSync(
-          path.join(CONTEXT_DIR, `${projectId}-shape.json`),
-          JSON.stringify(ctx.contextShape),
+        writes.push(
+          fsp.writeFile(
+            path.join(CONTEXT_DIR, `${projectId}-shape.json`),
+            JSON.stringify(ctx.contextShape),
+          ),
         );
       }
+
+      await Promise.all(writes);
     } catch (err) {
       console.warn(`[context-store] disk write failed for ${projectId}:`, err.message);
     }
@@ -159,12 +167,16 @@ class ContextStore extends EventEmitter {
   /**
    * Flush all pending disk writes. Called on graceful shutdown.
    */
-  flushAll() {
+  async flushAll() {
+    const writes = [];
     for (const [projectId, timer] of this._diskTimers) {
       clearTimeout(timer);
-      this.serializeToDisk(projectId);
+      writes.push(this.serializeToDisk(projectId));
     }
     this._diskTimers.clear();
+    await Promise.all(writes).catch((err) => {
+      console.warn("[context-store] flushAll failed:", err.message);
+    });
   }
 
   /**
@@ -251,7 +263,9 @@ class ContextStore extends EventEmitter {
       projectId,
       setTimeout(() => {
         this._diskTimers.delete(projectId);
-        this.serializeToDisk(projectId);
+        this.serializeToDisk(projectId).catch((err) => {
+          console.warn(`[context-store] scheduled disk write failed for ${projectId}:`, err.message);
+        });
       }, DISK_DEBOUNCE_MS),
     );
   }

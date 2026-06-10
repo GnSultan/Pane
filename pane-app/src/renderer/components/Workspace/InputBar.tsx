@@ -1013,49 +1013,46 @@ export function InputBar({
         </div>
       )}
 
-      {/* Expanded: outer wrapper + card with processing bar floating above the card ring */}
-      {expanded && (
-        <div className="relative flex flex-col">
-        {/* Processing bar — floats above the card ring, no layout footprint */}
-        {(isProcessing || isFadingOut) && attachMenu !== "thoughts" && (
-          <div
-            className={`absolute top-0 left-0 right-0 z-10 flex items-center gap-3 px-3 pb-2 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
+      {/* Processing bar above expanded card — spinner + stop float above, InputBar stays clean */}
+      {expanded && (isProcessing || isFadingOut) && attachMenu !== "thoughts" && (
+        <div
+          className={`flex items-center gap-3 px-3 pb-2 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
+        >
+          <svg
+            width="26"
+            height="26"
+            viewBox="0 0 1080 1080"
+            fill="currentColor"
+            className="shrink-0 animate-gentle-spin"
+            style={{ color: "var(--pane-accent)" }}
           >
-            <svg
-              width="26"
-              height="26"
-              viewBox="0 0 1080 1080"
-              fill="currentColor"
-              className="shrink-0 animate-gentle-spin"
-              style={{ color: "var(--pane-accent)" }}
-            >
-              <rect x="537.64" y="716.95" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(1532.34 709.43) rotate(117.97)"/>
-              <rect x="339.14" y="645.42" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(911.14 1351.24) rotate(162.97)"/>
-              <rect x="249.37" y="454.48" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(239.05 1165.33) rotate(-152.03)"/>
-              <rect x="320.9" y="255.98" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(95.77 779.63) rotate(-107.03)"/>
-              <rect x="511.84" y="166.21" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(46.18 606.07) rotate(-62.03)"/>
-              <rect x="710.34" y="237.74" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(-66.64 227.28) rotate(-17.03)"/>
-              <rect x="800.11" y="428.68" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(342.42 -320.83) rotate(27.97)"/>
-              <rect x="728.58" y="627.18" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(1219.73 -198.15) rotate(72.97)"/>
-            </svg>
-            <span
-              className="font-mono text-pane-text-secondary/40"
-              style={{ fontSize: "var(--pane-font-size-xs)" }}
-            >
-              working on it
-            </span>
-            <button
-              onClick={onAbort}
-              className="ml-auto text-pane-error font-mono hover:text-pane-error/80 btn-press shrink-0"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              stop
-            </button>
-          </div>
-        )}
+            <rect x="537.64" y="716.95" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(1532.34 709.43) rotate(117.97)"/>
+            <rect x="339.14" y="645.42" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(911.14 1351.24) rotate(162.97)"/>
+            <rect x="249.37" y="454.48" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(239.05 1165.33) rotate(-152.03)"/>
+            <rect x="320.9" y="255.98" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(95.77 779.63) rotate(-107.03)"/>
+            <rect x="511.84" y="166.21" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(46.18 606.07) rotate(-62.03)"/>
+            <rect x="710.34" y="237.74" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(-66.64 227.28) rotate(-17.03)"/>
+            <rect x="800.11" y="428.68" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(342.42 -320.83) rotate(27.97)"/>
+            <rect x="728.58" y="627.18" width="30.52" height="196.84" rx="4.26" ry="4.26" transform="translate(1219.73 -198.15) rotate(72.97)"/>
+          </svg>
+          <span
+            className="font-mono text-pane-text-secondary/40"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            working on it
+          </span>
+          <button
+            onClick={onAbort}
+            className="ml-auto text-pane-error font-mono hover:text-pane-error/80 btn-press shrink-0"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            stop
+          </button>
+        </div>
+      )}
 
-        {/* One card. Textarea + thoughts picker + button bar in column. */}
-        <div ref={cardRef} className={`rounded-xl ring-1 relative flex flex-col ring-pane-border/40 ${isProcessing || isFadingOut ? "pt-10" : ""}`}>
+      {/* One card. Textarea + thoughts picker + button bar in column. */}
+      {expanded && <div ref={cardRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40">
         {attachMenu !== "thoughts" && (
           <CaretTextArea
             ref={textareaRef}
@@ -1246,9 +1243,7 @@ export function InputBar({
             </>
           )}
         </div>
-        </div>
-        </div>
-      )}
+      </div>}
     </div>
   );
 }
