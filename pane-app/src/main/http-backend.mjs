@@ -1069,16 +1069,15 @@ function _anthropicContextLength(id) {
 // Used to set max_tokens per request without hardcoding provider-level logic
 // in the hot path. Rules are checked in order — more specific entries first.
 //
-// Reasoning models (deepseek-reasoner, mimo-v2-pro, stepfun) consume thinking
-// tokens from the same pool as output tokens, so their budgets are larger.
+// Reasoning models (mimo-v2-pro, stepfun) consume thinking tokens from the
+// same pool as output tokens, so their budgets are larger.
 // StepFun is omitted intentionally — their docs say not to set max_tokens.
 //
 // If no entry matches, the fallback is DEFAULT_MAX_TOKENS (4096).
 const MODEL_OUTPUT_LIMITS = [
-  // DeepSeek
-  { match: "deepseek-reasoner", maxTokens: 32768, omit: false },
-  { match: "deepseek-chat", maxTokens: 8192, omit: false },
-  { match: "deepseek", maxTokens: 8192, omit: false },
+  // DeepSeek — V4 models have 384K output (thinking + content share the same pool)
+  { match: "deepseek-v4-flash", maxTokens: 384000, omit: false },
+  { match: "deepseek-v4-pro", maxTokens: 384000, omit: false },
   // Xiaomi MiMo — thinking tokens count against max_tokens
   { match: "mimo-v2-pro", maxTokens: 65536, omit: false }, // ~16K thinking + 48K output
   { match: "mimo-v2-omni", maxTokens: 65536, omit: false },
@@ -1125,12 +1124,24 @@ function resolveMaxTokens(modelId) {
   return { maxTokens: DEFAULT_MAX_TOKENS, omit: false };
 }
 const MODEL_STREAMING_CONFIG = [
-  // deepseek-reasoner must come before generic deepseek/
+  // DeepSeek V4 Flash/Pro — supports tools + thinking simultaneously
   [
-    "deepseek/deepseek-reasoner",
-    { reasoningField: "reasoning_content", supportsTools: false },
+    "deepseek-v4-flash",
+    { reasoningField: "reasoning_content", supportsTools: true },
   ],
-  ["deepseek/", { reasoningField: null, supportsTools: true }],
+  [
+    "deepseek-v4-pro",
+    { reasoningField: "reasoning_content", supportsTools: true },
+  ],
+  [
+    "deepseek/deepseek-v4-flash",
+    { reasoningField: "reasoning_content", supportsTools: true },
+  ],
+  [
+    "deepseek/deepseek-v4-pro",
+    { reasoningField: "reasoning_content", supportsTools: true },
+  ],
+  ["deepseek/", { reasoningField: "reasoning_content", supportsTools: true }],
   // Xiaomi MiMo — uses delta.reasoning
   ["xiaomi/mimo", { reasoningField: "reasoning", supportsTools: true }],
   // StepFun — uses delta.reasoning
@@ -1440,8 +1451,8 @@ export class ApiBackend extends PunkBackend {
       provider === "alibaba" ||
       provider === "dashscope";
 
-    // deepseek-reasoner history rules:
-    // REQUIRES passing reasoning_content back to avoid 400 errors.
+    // DeepSeek thinking models:
+    // REQUIRES passing reasoning_content back on every turn to avoid 400 errors.
     const isReasoner =
       isDeepSeek &&
       (model?.includes("reasoner") ||
@@ -1653,8 +1664,9 @@ export class ApiBackend extends PunkBackend {
           Array.isArray(content) &&
           content.some((c) => c.type === "tool_result"))
       ) {
-        // deepseek-reasoner has no tool support — silently drop all tool result
-        // messages from history so they don't trigger a 400 from the API.
+        // Some DeepSeek models (prover-v2, thinking-only) have no tool support —
+        // silently drop all tool result messages from history so they don't
+        // trigger a 400 from the API.
         if (isReasoner) continue;
         const results = [];
         if (role === "tool" && !Array.isArray(content)) {
@@ -1719,8 +1731,8 @@ export class ApiBackend extends PunkBackend {
     // --- 4. AUTO-HEAL: Close orphaned tool calls ---
     // Insert fake results at the correct position — right after the assistant
     // message that made those tool calls — instead of appending at the end.
-    // Skip for deepseek-reasoner — it has no tool support so tool messages must
-    // never appear in the history regardless.
+    // Skip for non-tool DeepSeek models — they have no tool support so tool
+    // messages must never appear in the history regardless.
     if (isOpenAI && !isReasoner && pendingToolCallIds.size > 0) {
       console.warn(
         `[http] history sequence error: ${pendingToolCallIds.size} tool calls missing results. Healing...`,
@@ -2226,9 +2238,9 @@ export class ApiBackend extends PunkBackend {
         this.requestStates.set(request.projectId, state);
 
         try {
-          // deepseek-reasoner (R1) does not support function calling — sending tools
-          // returns HTTP 400. It also ignores sampling params (temperature etc.).
-          // We expand this to V4 and other thinking models that share this protocol.
+          // Some DeepSeek models (prover-v2, thinking-only variants) don't support
+          // function calling — sending tools returns HTTP 400. They also ignore
+          // sampling params (temperature etc.). V4 Flash/Pro fully support tools.
           const isDeepSeekReasoner =
             apiConfig.provider === "deepseek" &&
             (resolvedModel.includes("reasoner") ||
@@ -2300,9 +2312,9 @@ export class ApiBackend extends PunkBackend {
           }
 
           // Phase-based tool filtering — planning phase gets Plan tool, discovery gets read-only.
-          // deepseek-reasoner does NOT support function calling — skip entirely.
-          // For OpenRouter, consult the model personality registry — some OR-proxied
-          // models (e.g. deepseek/deepseek-reasoner) also don't support tools.
+          // Some DeepSeek models (prover-v2, thinking-only variants) do NOT support
+          // function calling — skip tools for those. For OpenRouter, consult the
+          // model personality registry — some OR-proxied models also don't support tools.
           const phase = request.phase || "execution";
           const orPersonality =
             apiConfig.provider === "openrouter"
@@ -2360,22 +2372,29 @@ export class ApiBackend extends PunkBackend {
             apiConfig.provider === "deepseek" &&
             !isDeepSeekReasoner
           ) {
-            // DeepSeek-chat thinking mode — returns reasoning_content in the response.
-            // reasoning_content MUST be passed back on every subsequent turn.
+            // DeepSeek V4 thinking mode: uses OpenAI-compatible parameters.
+            //   thinking: { type: "enabled" }     — toggle
+            //   reasoning_effort: "max"            — effort level (high | max)
+            // Returns reasoning_content in the response delta, which MUST be
+            // passed back on every subsequent turn.
             //
-            // Thinking tokens share the same budget as output tokens. Don't cap at
-            // the static limit (8K for old deepseek-chat). Compute from the live
-            // context window: context_limit - prompt_tokens - safety_reserve.
-            // DeepSeek V4 models support up to 384K output tokens. No artificial
-            // ceiling — the API will clamp to whatever its actual limit is.
-            body.enable_thinking = true;
+            // Notes:
+            //   • V4 Flash/Pro use OpenAI-compatible thinking params
+            //   • reasoning_effort="max" for agent/coding workloads (default is high)
+            //   • When thinking is on, temperature/top_p/presence/frequency are ignored
+            //
+            // Thinking tokens share the same budget as output tokens from maxTokens
+            // (384K for V4 Flash/Pro). No *2 multiplication — maxTokens already
+            // includes the thinking budget. Never exceed the model's output limit.
+            body.thinking = { type: "enabled" };
+            body.reasoning_effort = "max";
             if (!omitMaxTokens) {
               const contextLimit = getModelLimit(resolvedModel);
               const promptTokens = estimateConversationTokens(validatedMessages);
               const safetyReserve = 4000;
               const dynamicMax = contextLimit - promptTokens - safetyReserve;
-              const minimum = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
-              body.max_tokens = Math.max(dynamicMax, minimum);
+              const cap = maxTokens ?? DEFAULT_MAX_TOKENS;
+              body.max_tokens = Math.min(dynamicMax, cap);
             }
           }
 
@@ -4788,7 +4807,7 @@ export class ApiBackend extends PunkBackend {
       case "gemini":
         return "gemini-3-flash-preview";
       case "deepseek":
-        return "deepseek-chat";
+        return "deepseek-v4-flash";
       case "stepfun":
         return "step-3.5-flash";
       case "kimi":
@@ -4823,10 +4842,9 @@ export class ApiBackend extends PunkBackend {
 
     if (provider === "deepseek") {
       const map = {
-        "deepseek-v3": "deepseek-chat",
-        "deepseek-r1": "deepseek-reasoner",
-        "deepseek-v3.2": "deepseek-chat",
-        "deepseek-v3.2-speciale": "deepseek-reasoner",
+        "deepseek-v4-flash": "deepseek-v4-flash",
+        "deepseek-v4-pro": "deepseek-v4-pro",
+        "deepseek-v4": "deepseek-v4-flash",
       };
       return map[model.toLowerCase()] || model;
     }
@@ -5005,7 +5023,7 @@ export class ApiBackend extends PunkBackend {
       }
 
       // Native provider cases — fixed, known streaming formats.
-      // deepseek-reasoner uses reasoning_content; stepfun uses reasoning;
+      // DeepSeek V4 uses reasoning_content; stepfun uses reasoning;
       // kimi uses standard content only. Tool-call handling is identical
       // to the openrouter block above so they share that logic via fallthrough.
       case "xiaomi":

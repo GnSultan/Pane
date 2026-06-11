@@ -380,11 +380,11 @@ function mergeEnrichment(projectId, handoff, enrichment, updateFn) {
 
 function getDefaultModelForProvider(provider) {
   const defaults = {
-    deepseek: "deepseek-chat",
+    deepseek: "deepseek-v4-flash",
     kimi: "moonshot-v1-8k",
     openrouter: "openai/gpt-4o-mini",
     anthropic: "claude-3-haiku-20240307",
     gemini: "gemini-2.0-flash",
   };
-  return defaults[provider] || "deepseek-chat";
+  return defaults[provider] || "deepseek-v4-flash";
 }

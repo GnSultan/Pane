@@ -204,7 +204,6 @@ export function getModelLimit(model) {
 export function getDefaultOutputBudget(model) {
   if (!model) return 8192;
   const m = model.toLowerCase();
-  if (m.includes("deepseek-reasoner") || m.includes("deepseek-r1")) return 32768;
   if (m.includes("deepseek")) return 8192;
   if (m.includes("stepfun") || m.includes("step-")) return 16384;
   return 8192;
