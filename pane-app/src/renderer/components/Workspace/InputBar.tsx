@@ -2,7 +2,6 @@ import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } fr
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
-import { TodoPanel } from "./TodoPanel";
 import type { Todo } from "../../lib/punk-types";
 import { isThinkingModel } from "../../lib/models";
 import { showFilePicker, brainMindGetAll, brainMindAdd, type MindEntry } from "../../lib/tauri-commands";
@@ -616,10 +615,10 @@ export function InputBar({
   isProcessing,
 }: InputBarProps) {
   const [value, setValue] = useState("");
-  const [todoPanelOpen, setTodoPanelOpen] = useState(false);
   const [modelPickerExpanded, setModelPickerExpanded] = useState(false);
   const [isFadingOut, setIsFadingOut] = useState(false);
-  const [expanded, setExpanded] = useState(false);
+  const [expandedSection, setExpandedSection] = useState<"none" | "input" | "todos">("none");
+  const todosRef = useRef<HTMLDivElement>(null);
 
   // Attach menu: closed → menu → thoughts
   const [attachMenu, setAttachMenu] = useState<"closed" | "menu" | "thoughts">("closed");
@@ -648,7 +647,7 @@ export function InputBar({
       const prompt = (e as CustomEvent).detail?.prompt;
       if (prompt) {
         setValue(prompt);
-        setExpanded(true);
+        setExpandedSection("input");
         // Focus the textarea so the user can review and send
         requestAnimationFrame(() => {
           const ta = document.querySelector<HTMLTextAreaElement>("[data-pane-input]");
@@ -742,30 +741,35 @@ export function InputBar({
     }
   }, [isProcessing]);
 
-  // Collapse to ghost state when clicking outside the card with an empty input.
+  // Collapse to ghost state when clicking outside the card or todos panel.
   useEffect(() => {
-    if (!expanded) return;
+    if (expandedSection === "none") return;
     const handler = (e: MouseEvent) => {
-      if (cardRef.current && !cardRef.current.contains(e.target as Node)) {
-        if (!value.trim()) setExpanded(false);
+      const target = e.target as Node;
+      const outsideCard = cardRef.current && !cardRef.current.contains(target);
+      const outsideTodos = todosRef.current && !todosRef.current.contains(target);
+      if (expandedSection === "input") {
+        if (outsideCard && !value.trim()) setExpandedSection("none");
+      } else if (expandedSection === "todos") {
+        if (outsideTodos) setExpandedSection("none");
       }
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
-  }, [expanded, value]);
+  }, [expandedSection, value]);
 
   // Auto-focus when input expands
   useEffect(() => {
-    if (expanded && textareaRef.current && isConversationVisible()) {
+    if (expandedSection === "input" && textareaRef.current && isConversationVisible()) {
       textareaRef.current.focus();
     }
-  }, [expanded]);
+  }, [expandedSection]);
 
   // Cmd+K focus
   useEffect(() => {
     const handler = () => {
       if (isConversationVisible()) {
-        setExpanded(true);
+        setExpandedSection("input");
         requestAnimationFrame(() => textareaRef.current?.focus());
       }
     };
@@ -779,14 +783,14 @@ export function InputBar({
       if ((e.metaKey || e.ctrlKey) && e.key === "m") {
         if (!isConversationVisible()) return;
         e.preventDefault();
-        if (!expanded) setExpanded(true);
+        if (expandedSection !== "input") setExpandedSection("input");
         setIsMindMode(prev => !prev);
         requestAnimationFrame(() => textareaRef.current?.focus());
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [expanded]);
+  }, [expandedSection]);
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
@@ -833,11 +837,11 @@ export function InputBar({
     setIsMindMode(false);
   }, [value, projectId]);
 
-  // Toggle mind mode — also expand if collapsed
+  // Toggle mind mode — also expand input if collapsed
   const toggleMindMode = useCallback(() => {
-    if (!expanded) setExpanded(true);
+    if (expandedSection !== "input") setExpandedSection("input");
     setIsMindMode(prev => !prev);
-  }, [expanded]);
+  }, [expandedSection]);
 
   // ─────────────────────────────────────────────────────────────────────
 
@@ -852,7 +856,7 @@ export function InputBar({
           } else {
             onSend(buildPrompt(trimmed), undefined, currentPhase);
             setValue("");
-            setExpanded(false);
+            setExpandedSection("none");
             setPhaseOverride(null);
           }
         }
@@ -877,7 +881,7 @@ export function InputBar({
       {/* Processing indicator — absolute like the ghost trigger, floats over scroll
           content with zero layout footprint and no background. Hidden once the
           user expands the input bar (expanded card takes over). */}
-      {(isProcessing || isFadingOut) && !todoPanelOpen && !expanded && (
+      {(isProcessing || isFadingOut) && expandedSection === "none" && (
         <div
           className={`absolute bottom-0 left-0 right-0 flex items-center gap-3 px-3 pb-3 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
         >
@@ -913,7 +917,7 @@ export function InputBar({
           */}
           {todos.length > 0 ? (
             <button
-              onClick={() => setTodoPanelOpen((v) => !v)}
+              onClick={() => setExpandedSection("todos")}
               className="text-pane-text-secondary font-mono hover:text-pane-text btn-press shrink-0 truncate"
               style={{ fontSize: "var(--pane-font-size-sm)" }}
             >
@@ -938,7 +942,7 @@ export function InputBar({
           ) : (
             /* Placeholder — shows status when no todos; tap to expand */
             <button
-              onClick={() => setExpanded(true)}
+              onClick={() => setExpandedSection("input")}
               className="font-mono text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors text-left"
               style={{ fontSize: "var(--pane-font-size-xs)" }}
             >
@@ -948,7 +952,7 @@ export function InputBar({
           <div className="ml-auto shrink-0 flex items-center gap-1.5">
             {/* Mode pill — shows active phase in collapsed bar */}
             <button
-              onClick={() => setExpanded(true)}
+              onClick={() => setExpandedSection("input")}
               className="font-mono btn-press shrink-0 px-2 py-0.5 rounded transition-colors"
               style={{ fontSize: "var(--pane-font-size-xs)", color: PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)" }}
             >
@@ -959,7 +963,7 @@ export function InputBar({
               autoRoute={autoEscalate}
               routedModel={routedModel}
               isProcessing={isProcessing}
-              onClick={() => { setModelPickerExpanded(true); setExpanded(true); }}
+              onClick={() => { setModelPickerExpanded(true); setExpandedSection("input"); }}
               plain
             />
           </div>
@@ -973,21 +977,14 @@ export function InputBar({
         </div>
       )}
 
-      {todoPanelOpen && todos.length > 0 && (
-        <TodoPanel
-          projectId={projectId}
-          onCollapse={() => setTodoPanelOpen(false)}
-        />
-      )}
-
       {/* Ghost trigger — absolute, zero layout footprint, floats over scroll content */}
-      {!expanded && !isProcessing && !isFadingOut && (
+      {expandedSection === "none" && !isProcessing && !isFadingOut && (
         <div
           className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-transparent font-mono px-5 py-3 pointer-events-none"
           style={{ fontSize: "var(--pane-font-size-xs)" }}
         >
           <button
-            onClick={() => setExpanded(true)}
+            onClick={() => setExpandedSection("input")}
             className="pointer-events-auto text-left text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors"
           >
             let's build
@@ -995,7 +992,7 @@ export function InputBar({
           <div className="pointer-events-auto shrink-0 flex items-center gap-1.5">
             {/* Mode pill — shows active phase in ghost trigger */}
             <button
-              onClick={() => setExpanded(true)}
+              onClick={() => setExpandedSection("input")}
               className="font-mono btn-press shrink-0 px-2 py-0.5 rounded transition-colors"
               style={{ fontSize: "var(--pane-font-size-xs)", color: PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)" }}
             >
@@ -1006,7 +1003,7 @@ export function InputBar({
               autoRoute={autoEscalate}
               routedModel={routedModel}
               isProcessing={isProcessing}
-              onClick={() => { setModelPickerExpanded(true); setExpanded(true); }}
+              onClick={() => { setModelPickerExpanded(true); setExpandedSection("input"); }}
               plain
             />
           </div>
@@ -1014,7 +1011,7 @@ export function InputBar({
       )}
 
       {/* Processing bar above expanded card — spinner + stop float above, InputBar stays clean */}
-      {expanded && (isProcessing || isFadingOut) && attachMenu !== "thoughts" && (
+      {expandedSection === "input" && (isProcessing || isFadingOut) && attachMenu !== "thoughts" && (
         <div
           className={`flex items-center gap-3 px-3 pb-2 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
         >
@@ -1052,7 +1049,7 @@ export function InputBar({
       )}
 
       {/* One card. Textarea + thoughts picker + button bar in column. */}
-      {expanded && <div ref={cardRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40">
+      {expandedSection === "input" && <div ref={cardRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40 mx-px mb-px">
         {attachMenu !== "thoughts" && (
           <CaretTextArea
             ref={textareaRef}
@@ -1244,6 +1241,58 @@ export function InputBar({
           )}
         </div>
       </div>}
+
+      {/* Todos inside the same card + ring. No textarea, no button bar. */}
+      {expandedSection === "todos" && todos.length > 0 && (
+        <div ref={todosRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40 mx-px mb-px">
+          <div className="space-y-1.5 px-5 py-4">
+            {todos.map((todo, i) => (
+              <div key={i} className="flex items-start gap-3">
+                <div className="shrink-0 mt-[3px]">
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    className={
+                      todo.status === "in_progress"
+                        ? "text-pane-text-secondary"
+                        : todo.status === "completed"
+                          ? "text-pane-text-secondary/25"
+                          : "text-pane-text-secondary/15"
+                    }
+                  >
+                    <circle
+                      cx="12"
+                      cy="12"
+                      r="7"
+                      fill="none"
+                      strokeWidth="1.5"
+                      className={todo.status === "in_progress" ? "animate-circle-pulse" : ""}
+                      style={todo.status === "in_progress" ? { strokeWidth: 'var(--circle-stroke-width, 1.5)' } : undefined}
+                    />
+                  </svg>
+                </div>
+                <span
+                  className={`font-mono leading-snug ${
+                    todo.status === "completed"
+                      ? "text-pane-text-secondary/35 line-through"
+                      : todo.status === "in_progress"
+                        ? "text-pane-text"
+                        : "text-pane-text-secondary/50"
+                  }`}
+                  style={{ fontSize: "var(--pane-font-size-sm)" }}
+                >
+                  {todo.status === "in_progress"
+                    ? todo.activeForm || todo.content
+                    : todo.content}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
