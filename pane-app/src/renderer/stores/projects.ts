@@ -219,7 +219,19 @@ interface ProjectsState {
   updateLastAssistantContent: (
     projectId: string,
     content: ContentBlock[],
-  ) => void;  appendToLastAssistantText: (projectId: string, text: string) => void;
+  ) => void;
+  /** Atomic batch update for streaming — all mutations in one set() call.
+   *  Applies text delta, thinking delta, and status message in a single pass,
+   *  producing ONE new Map instead of 2-3 per event. */
+  batchUpdateConversation: (
+    projectId: string,
+    updates: {
+      textDelta?: string;
+      thinkingDelta?: string;
+      statusMessage?: string | null;
+    },
+  ) => void;
+  appendToLastAssistantText: (projectId: string, text: string) => void;
   appendToLastAssistantThinking: (projectId: string, thinking: string) => void;
   setLastThinkingSignature: (projectId: string, signature: string) => void;
   setConversationModel: (projectId: string, model: string) => void;
@@ -675,6 +687,50 @@ function createProjectsStore() {
             m.id === messageId ? { ...m, reasoning_content: reasoning } : m,
           );
           return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
+    /** Atomic batch: applies textDelta, thinkingDelta, statusMessage in ONE set() call. */
+    batchUpdateConversation: (projectId, { textDelta, thinkingDelta, statusMessage }) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const conv = { ...p.conversation };
+          if (statusMessage !== undefined) {
+            conv.statusMessage = statusMessage;
+          }
+          if (textDelta || thinkingDelta) {
+            const msgs = [...conv.messages];
+            const last = msgs[msgs.length - 1];
+            if (last && last.type === "assistant") {
+              const blocks = [...last.content];
+              if (textDelta) {
+                const lastBlock = blocks[blocks.length - 1];
+                if (lastBlock && lastBlock.type === "text") {
+                  blocks[blocks.length - 1] = {
+                    ...lastBlock,
+                    text: (lastBlock as { type: "text"; text: string }).text + textDelta,
+                  };
+                } else {
+                  blocks.push({ type: "text", text: textDelta });
+                }
+              }
+              if (thinkingDelta) {
+                const lastBlock = blocks[blocks.length - 1];
+                if (lastBlock && lastBlock.type === "thinking") {
+                  blocks[blocks.length - 1] = {
+                    ...lastBlock,
+                    thinking:
+                      (lastBlock as { type: "thinking"; thinking: string }).thinking + thinkingDelta,
+                  };
+                } else {
+                  blocks.push({ type: "thinking", thinking: thinkingDelta });
+                }
+              }
+              msgs[msgs.length - 1] = { ...last, content: blocks };
+            }
+            conv.messages = msgs;
+          }
+          return { conversation: conv };
         }),
       ),
 

@@ -30,8 +30,8 @@ import {
 import { calculateCost } from "./pricing.mjs";
 import { safeStringify } from "./sanitize.mjs";
 import { buildSummary, toolResultCache } from "./tool-result-cache.mjs";
-import { forcePruneToBudget, applyV4TurnSelection, dropAllNonFreshTurns } from "./conversation-lifecycle.mjs";
 import { contextStore } from "./context-store.mjs";
+import { compactMessages, startCompactionWorker, stopCompactionWorker } from "./compaction-driver.mjs";
 import { scoreTurnsByRelevance, selectTurns, base64ToFloat32Array, getTopRelevantSummaries, formatSemanticPool } from "./semantic-turn-selector.mjs";
 import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
 import {
@@ -1345,6 +1345,9 @@ export class ApiBackend extends PunkBackend {
     this.paneDir = path.join(os.homedir(), ".pane");
     this.toolExecutors = new Map(); // projectId -> ToolExecutor
     this._brainRequest = null;
+    // Start the compaction worker thread — keeps context compaction off
+    // the main process event loop.
+    startCompactionWorker();
   }
 
   setBrainRequest(fn) {
@@ -2136,9 +2139,21 @@ export class ApiBackend extends PunkBackend {
       // ── Context window management (V4-direct) ────────────────────────
       // Only applies to explicit-caching providers. Auto-caching providers
       // let the pre-flight forcePruneToBudget guardrail handle overflow.
-      const windowResult = turnSelection
-        ? applyV4TurnSelection(messages, turnSelection, request.projectId)
-        : { action: "none", tokensSaved: 0, droppedTurns: [] };
+      // Offloaded to a Worker thread to avoid freezing the main process.
+      let windowResult;
+      if (turnSelection) {
+        const compResult = await compactMessages("applyV4TurnSelection", {
+          messages, turnSelection, projectId: request.projectId,
+        });
+        messages = compResult.messages;
+        windowResult = {
+          action: compResult.action,
+          tokensSaved: compResult.tokensSaved,
+          droppedTurns: compResult.droppedTurns,
+        };
+      } else {
+        windowResult = { action: "none", tokensSaved: 0, droppedTurns: [] };
+      }
       if (windowResult.action !== "none") {
         this.onEvent(
           request.projectId,
@@ -2479,7 +2494,10 @@ export class ApiBackend extends PunkBackend {
                     `[http] GUARDRAIL FIRED: ~${currentMsgTokens} total tokens (${TOKEN_ESTIMATE_SAFETY}x safety) exceeds ${maxMessagesTokens} budget. V4 should have prevented this. Force-pruning...`
                   );
                   const pruneTarget = Math.floor(maxMessagesTokens / TOKEN_ESTIMATE_SAFETY);
-                  const result = forcePruneToBudget(sourceBody.messages, pruneTarget, request.projectId);
+                  const result = await compactMessages("forcePruneToBudget", {
+                    messages: sourceBody.messages, maxTokens: pruneTarget, projectId: request.projectId,
+                  });
+                  sourceBody.messages = result.messages;
                   console.log(`[http] Guardrail force-prune: saved ${result.tokensSaved} tokens`);
                   if (finalBody && finalBody !== body && finalBody.messages) {
                     body.messages = finalBody.messages;
@@ -2603,11 +2621,12 @@ export class ApiBackend extends PunkBackend {
                       const healOutputBudget = getDefaultOutputBudget(request.model);
                       const healOverheadBudget = 5000;
                       const healMaxMsgTokens = healModelLimit - healOutputBudget - healOverheadBudget;
-                      const healResult = dropAllNonFreshTurns(
-                        sourceBody.messages,
-                        request.projectId,
-                        healMaxMsgTokens,
-                      );
+                      const healResult = await compactMessages("dropAllNonFreshTurns", {
+                        messages: sourceBody.messages,
+                        projectId: request.projectId,
+                        maxTokens: healMaxMsgTokens,
+                      });
+                      sourceBody.messages = healResult.messages;
                       console.log(
                         `[http] Context-heal: dropped ${healResult.dropped} non-fresh turns (saved ~${healResult.tokensSaved} estimated tokens)`
                       );
@@ -3761,8 +3780,12 @@ export class ApiBackend extends PunkBackend {
           // Window management — V4-direct when turn selection is available
           // Only for explicit-caching providers (Anthropic). Auto-caching
           // providers skip body-level pruning to keep the cache prefix stable.
+          // Offloaded to a Worker thread to avoid freezing the main process.
           if (turnSelection && PROVIDERS_WITH_EXPLICIT_CACHE.has(request.provider)) {
-            applyV4TurnSelection(messages, turnSelection, request.projectId);
+            const compResult = await compactMessages("applyV4TurnSelection", {
+              messages, turnSelection, projectId: request.projectId,
+            });
+            messages = compResult.messages;
           }
         } catch (turnError) {
           // Per-turn error handling — retry recoverable errors inside the loop
@@ -5377,6 +5400,8 @@ export class ApiBackend extends PunkBackend {
       executor.cleanup();
     }
     this.toolExecutors.clear();
+    // Gracefully terminate the compaction worker
+    stopCompactionWorker();
   }
 
   async getOpenRouterModels() {

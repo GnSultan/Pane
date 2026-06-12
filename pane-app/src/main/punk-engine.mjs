@@ -1168,6 +1168,47 @@ class PunkEngine {
   }
 
   sendToRenderer(channel, event) {
+    // Estimate serialized size via JSON. For small events (<500KB) this is
+    // near-instant. For large events (multi-MB tool results), JSON.stringify
+    // cost is dwarfed by the structured clone in webContents.send.
+    // Threshold: 500KB — well above any normal event (text deltas, status
+    // updates, tool_use metadata), catches only rare multi-MB tool results.
+    const CHUNK_THRESHOLD = 512 * 1024; // 512KB
+    let json;
+    try { json = JSON.stringify(event); } catch {
+      // Circular reference or other serialization issue — fall through to
+      // the normal path and let webContents.send's structured clone handle it.
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send(channel, event);
+      }
+      return;
+    }
+    if (json.length > CHUNK_THRESHOLD) {
+      // Split into 256KB chunks. Each chunk is sent as a separate IPC message
+      // with _chunkMeta so the renderer can reassemble. Chunk data is a string,
+      // which structured clone handles efficiently (zero-copy string sharing).
+      const CHUNK_SIZE = 256 * 1024;
+      const total = Math.ceil(json.length / CHUNK_SIZE);
+      for (let i = 0; i < total; i++) {
+        const chunkPayload = {
+          _chunkMeta: {
+            total,
+            index: i,
+            type: event.event,
+            requestId: event.requestId,
+          },
+          _chunkData: json.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+        };
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) win.webContents.send(channel, chunkPayload);
+        }
+      }
+      console.log(
+        `[punk] Chunked large IPC event (${(json.length / 1024).toFixed(1)}KB → ${total} chunks) on channel "${channel}"`
+      );
+      return;
+    }
+    // Normal path — small event, send as-is
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed()) win.webContents.send(channel, event);
     }
@@ -1177,13 +1218,16 @@ class PunkEngine {
     if (this.relayDraining) return;
     this.relayDraining = true;
 
-    // Process up to BATCH_SIZE events per setImmediate tick.
-    // One-per-tick was correct for preventing synchronous dumps, but during
-    // a burst (e.g. context compaction outputting hundreds of lines at once)
-    // it creates hundreds of pending setImmediate callbacks, each calling
-    // webContents.send() in isolation. Batching reduces the number of
-    // scheduled callbacks while still yielding to I/O between batches.
-    const BATCH_SIZE = 16;
+    // Process dynamically-batched events per setImmediate tick.
+    // During a burst (e.g. post-compaction event flood), we scale the
+    // batch size with queue depth so the drain completes in fewer ticks.
+    // Under normal load, we stay at the minimum of 16 per tick.
+    const MIN_BATCH = 16;
+    const MAX_BATCH = 128;
+    const BATCH_SIZE = Math.min(
+      MAX_BATCH,
+      Math.max(MIN_BATCH, Math.ceil(this.relayQueue.length / 4)),
+    );
 
     const drain = () => {
       if (this.relayQueue.length === 0) {
