@@ -16,7 +16,6 @@ This project is managed by Pane. You have pane_ MCP tools that are faster than m
 
 - **pane_project_context** — project name, branch, file structure
 - **pane_brief** — project decisions, lessons, session history
-- **pane_synthesize** — architectural DNA, why things are the way they are
 - **pane_recall** — search project memory for past decisions and context
 - **pane_architecture_brief** — locked decisions and patterns for a subsystem
 - **pane_ui_constraints** — design rules for component types

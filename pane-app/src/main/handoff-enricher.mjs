@@ -53,7 +53,10 @@ export async function enrichHandoff(projectId, updateLatestHandoffFn) {
     settings.http_api_keys?.[provider] || settings.http_api_key || "";
   const baseUrl =
     settings.http_base_urls?.[provider] ||
-    (provider === "deepseek" ? "https://api.deepseek.com/v1" : "");
+    (provider === "deepseek" ? "https://api.deepseek.com/v1" :
+     provider === "z-ai" ? "https://api.z.ai/api/paas/v4" :
+     provider === "anthropic" ? "https://api.anthropic.com/v1" :
+     "");
   const model = settings.http_model || getDefaultModelForProvider(provider);
 
   if (!apiKey || !baseUrl) {
@@ -385,6 +388,7 @@ function getDefaultModelForProvider(provider) {
     openrouter: "openai/gpt-4o-mini",
     anthropic: "claude-3-haiku-20240307",
     gemini: "gemini-2.0-flash",
+    "z-ai": "glm-5.2",
   };
   return defaults[provider] || "deepseek-v4-flash";
 }

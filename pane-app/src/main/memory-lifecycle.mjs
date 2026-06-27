@@ -219,11 +219,23 @@ export async function consolidateMemories(db, projectId, quickCall = null) {
       principlesCreated++;
     } catch {}
 
-    // Boost source nodes slightly (they contributed to a principle)
+    // Delete source nodes — they've been subsumed by the principle.
+    // This is the critical fix: previously we only boosted confidence (0.02),
+    // so every consolidation added MORE nodes without removing originals,
+    // causing unbounded growth (120K+ principle nodes over 80 days).
+    // Now the source nodes are removed; their content lives on in the principle.
     for (const node of cluster) {
       try {
-        db._stmts.boostConfidence.run(0.02, node.id);
-      } catch {}
+        // Delete foreign key targets first to avoid FK violations
+        db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(node.id);
+        db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(node.id, node.id);
+        const info = db.prepare("DELETE FROM nodes WHERE id = ?").run(node.id);
+        if (info.changes === 0) {
+          console.warn(`[memory] consolidation: node ${node.id} already deleted`);
+        }
+      } catch (err) {
+        console.warn(`[memory] consolidation: failed to delete source node ${node.id}: ${err.message}`);
+      }
     }
     consolidated += cluster.length;
   }

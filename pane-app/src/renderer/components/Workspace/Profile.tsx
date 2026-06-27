@@ -397,6 +397,7 @@ function EngineSelect({
       kimi: "Kimi",
       stepfun: "StepFun",
       xiaomi: "Xiaomi MiMo",
+      "z-ai": "Z.ai",
     };
     return labels[provider] || provider;
   }, []);
@@ -714,7 +715,8 @@ function PaneAutoSection({
   const handleThinkingChange = (opt: EngineOption) => {
     const isReasoningProvider =
       opt.provider === "openrouter" || opt.provider === "kimi" ||
-      opt.provider === "xiaomi" || opt.provider === "deepseek";
+      opt.provider === "xiaomi" || opt.provider === "deepseek" ||
+      opt.provider === "z-ai";
     const newCombo: PowerCombo = {
       thinking: { provider: opt.provider, model: opt.model, thinking: opt.thinking || isReasoningProvider },
       execution: combo?.execution || DEFAULT_BACKEND_ROUTING["api"]!.execution,
@@ -963,6 +965,7 @@ const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   { key: "openrouter", label: "OpenRouter", placeholder: "sk-or-...", docsUrl: "https://openrouter.ai/keys", showBaseUrl: true, defaultBaseUrl: "https://openrouter.ai/api/v1/chat/completions" },
   { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/", showBaseUrl: true, defaultBaseUrl: "https://api.xiaomimimo.com/v1" },
   { key: "kimi", label: "Kimi (Moonshot)", placeholder: "sk-...", docsUrl: "https://platform.moonshot.cn/", showBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1/chat/completions" },
+  { key: "z-ai", label: "Z.ai (GLM)", placeholder: "sk-...", docsUrl: "https://z.ai/manage-apikey/apikey-list", showBaseUrl: true, defaultBaseUrl: "https://api.z.ai/api/paas/v4/chat/completions" },
   { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
   { key: "jina", label: "Jina AI", placeholder: "jina_...", docsUrl: "https://jina.ai/embeddings/" },
 ];
@@ -1518,7 +1521,7 @@ function CuratedModelsSection() {
 
 const electronAPI = window.electronAPI;
 
-type SyncPhase = "idle" | "compressing" | "encrypting" | "uploading" | "complete" |
+type SyncPhase = "idle" | "compressing" | "encrypting" | "uploading" | "complete" | "error" |
   "finding" | "downloading" | "decrypting" | "restoring";
 
 function CloudSection() {
@@ -1550,12 +1553,16 @@ function CloudSection() {
 
   // Listen for sync progress
   useEffect(() => {
-    const unlisten = electronAPI.on("cloud-sync-progress", (data: { phase: SyncPhase }) => {
+    const unlisten = electronAPI.on("cloud-sync-progress", (data: { phase: SyncPhase; message?: string }) => {
       setSyncPhase(data.phase);
       if (data.phase === "complete") {
         // Refresh status after successful sync
         cloudGetStatus().then(setStatus).catch(() => {});
         setTimeout(() => setSyncPhase("idle"), 2000);
+      }
+      if (data.phase === "error") {
+        setSyncError(data.message || "Backup failed");
+        setTimeout(() => setSyncPhase("idle"), 4000);
       }
     });
     return () => { if (typeof unlisten === "function") unlisten(); };
@@ -1621,13 +1628,14 @@ function CloudSection() {
     encrypting: "encrypting…",
     uploading: "uploading…",
     complete: "done",
+    error: "failed",
     finding: "finding backup…",
     downloading: "downloading…",
     decrypting: "decrypting…",
     restoring: "restoring…",
   };
 
-  const isSyncing = syncPhase !== "idle" && syncPhase !== "complete";
+  const isSyncing = syncPhase !== "idle" && syncPhase !== "complete" && syncPhase !== "error";
 
   if (!user) {
     // Logged-out state

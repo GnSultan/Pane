@@ -1045,6 +1045,24 @@ function _deepSeekContextLength(id) {
   return 128000; // DeepSeek default
 }
 
+// ─── Z.ai (GLM) model helpers ────────────────────────────────────────────────
+
+function _zaiDisplayName(id) {
+  // glm-5.2 → GLM 5.2, glm-4.7-flash → GLM 4.7 Flash
+  return id
+    .replace(/^glm-/, "GLM ")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function _zaiContextLength(id) {
+  if (id.includes("glm-5")) return 1000000;
+  if (id.includes("glm-4.7")) return 1000000;
+  if (id.includes("glm-4.6")) return 128000;
+  if (id.includes("glm-4.5")) return 128000;
+  return 128000;
+}
+
 // ─── Anthropic model helpers ─────────────────────────────────────────────────
 
 function _anthropicDisplayName(id) {
@@ -1085,6 +1103,14 @@ const MODEL_OUTPUT_LIMITS = [
   { match: "mimo", maxTokens: 16384, omit: false }, // future MiMo variants
   // StepFun — docs say not to set max_tokens for reasoning models
   { match: "step-", maxTokens: null, omit: true },
+  // Z.ai GLM — 128K max output for GLM-5/4.7/4.6 series, 96K for GLM-4.5
+  { match: "glm-5.2", maxTokens: 131072, omit: false },
+  { match: "glm-5.1", maxTokens: 131072, omit: false },
+  { match: "glm-5-turbo", maxTokens: 131072, omit: false },
+  { match: "glm-5", maxTokens: 131072, omit: false },
+  { match: "glm-4.7", maxTokens: 131072, omit: false },
+  { match: "glm-4.6", maxTokens: 131072, omit: false },
+  { match: "glm-4.5", maxTokens: 98304, omit: false }, // 96K
   // Kimi — standard output, 8K is safe
   { match: "moonshot", maxTokens: 8192, omit: false },
   // Qwen / Alibaba
@@ -1146,8 +1172,8 @@ const MODEL_STREAMING_CONFIG = [
   ["xiaomi/mimo", { reasoningField: "reasoning", supportsTools: true }],
   // StepFun — uses delta.reasoning
   ["stepfun/", { reasoningField: "reasoning", supportsTools: true }],
-  // Z.ai GLM — thinks before tool calls, uses delta.reasoning
-  ["z-ai/glm", { reasoningField: "reasoning", supportsTools: true }],
+  // Z.ai GLM — thinks before tool calls, uses delta.reasoning_content
+  ["z-ai/glm", { reasoningField: "reasoning_content", supportsTools: true }],
   // Kimi / Moonshot — standard content, no reasoning field
   ["moonshot/", { reasoningField: null, supportsTools: true }],
   // Qwen3 Coder — standard content
@@ -1188,6 +1214,7 @@ function validateMessageSequence(messages, provider) {
   const isOpenAI =
     !provider || // no provider means OpenAI-compatible
     provider === "deepseek" ||
+    provider === "z-ai" ||
     provider === "kimi" ||
     provider === "openrouter" ||
     provider === "stepfun" ||
@@ -1447,6 +1474,7 @@ export class ApiBackend extends PunkBackend {
 
     const isOpenAI =
       isDeepSeek ||
+      provider === "z-ai" ||
       provider === "kimi" ||
       provider === "openrouter" ||
       provider === "stepfun" ||
@@ -2315,7 +2343,7 @@ export class ApiBackend extends PunkBackend {
           // Without this flag, some APIs (DeepSeek, Kimi, etc.) omit the usage object
           // from the final SSE chunk, breaking cost and cache rate tracking entirely.
           if (
-            ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(
+            ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter", "z-ai"].includes(
               apiConfig.provider,
             )
           ) {
@@ -2337,6 +2365,7 @@ export class ApiBackend extends PunkBackend {
               : null;
           if (
             (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
+            apiConfig.provider === "z-ai" ||
             apiConfig.provider === "kimi" ||
             apiConfig.provider === "stepfun" ||
             apiConfig.provider === "xiaomi" ||
@@ -2356,8 +2385,11 @@ export class ApiBackend extends PunkBackend {
               const promptTokens = estimateConversationTokens(validatedMessages);
               const safetyReserve = 4000;
               const dynamicMax = contextLimit - promptTokens - safetyReserve;
-              const minimum = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
-              body.max_tokens = Math.max(dynamicMax, minimum);
+              const cap = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
+              // When the conversation already exceeds context budget, don't send
+              // a doomed request — let the API see the full picture and return a
+              // clean "context length exceeded" error instead of a confusing stub.
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
             }
           }
 
@@ -2377,8 +2409,11 @@ export class ApiBackend extends PunkBackend {
               const promptTokens = estimateConversationTokens(validatedMessages);
               const safetyReserve = 4000;
               const dynamicMax = contextLimit - promptTokens - safetyReserve;
-              const minimum = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
-              body.max_tokens = Math.max(dynamicMax, minimum);
+              const cap = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
+              // When the conversation already exceeds context budget, don't send
+              // a doomed request — let the API see the full picture and return a
+              // clean "context length exceeded" error instead of a confusing stub.
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
             }
           }
 
@@ -2409,7 +2444,39 @@ export class ApiBackend extends PunkBackend {
               const safetyReserve = 4000;
               const dynamicMax = contextLimit - promptTokens - safetyReserve;
               const cap = maxTokens ?? DEFAULT_MAX_TOKENS;
-              body.max_tokens = Math.min(dynamicMax, cap);
+              // When the conversation already exceeds context budget, don't send
+              // a doomed request with 1 token — let the API see the full picture
+              // and return a clean "context length exceeded" error.
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
+            }
+          }
+
+          if (
+            request.thinking &&
+            apiConfig.provider === "z-ai"
+          ) {
+            // Z.ai GLM thinking mode (OpenAI-compatible):
+            //   thinking: { type: "enabled" }     — toggle
+            //   reasoning_effort: "max"            — supported by GLM-5.2
+            // Returns reasoning_content in the response delta, which MUST be
+            // passed back on every subsequent turn.
+            //
+            // Notes:
+            //   • GLM-5.2 supports reasoning_effort; other models default to thinking
+            //   • temperature/top_p/presence_penalty/frequency_penalty ignored when thinking
+            //   • clear_thinking=true by default (clear thinking across turns)
+            body.thinking = { type: "enabled", clear_thinking: true };
+            body.reasoning_effort = "max";
+            if (!omitMaxTokens) {
+              const contextLimit = getModelLimit(resolvedModel);
+              const promptTokens = estimateConversationTokens(validatedMessages);
+              const safetyReserve = 4000;
+              const dynamicMax = contextLimit - promptTokens - safetyReserve;
+              const cap = maxTokens ?? DEFAULT_MAX_TOKENS;
+              // When the conversation already exceeds context budget, don't send
+              // a doomed request with 1 token — let the API see the full picture
+              // and return a clean "context length exceeded" error.
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
             }
           }
 
@@ -3113,6 +3180,7 @@ export class ApiBackend extends PunkBackend {
             apiConfig.provider === "deepseek" ||
             (apiConfig.provider === "openrouter" &&
               resolvedModel.includes("deepseek"));
+          const isZaiModel = apiConfig.provider === "z-ai";
           const deepseekThinking =
             isDeepSeekModel &&
             (isDeepSeekReasoner ||
@@ -3120,8 +3188,13 @@ export class ApiBackend extends PunkBackend {
               (apiConfig.provider === "openrouter" &&
                 body.include_reasoning)) &&
             state.thinking;
+          const zaiThinking =
+            isZaiModel && request.thinking && state.thinking;
 
           if (deepseekThinking) {
+            parsedMessage.message.reasoning_content = state.thinking;
+          }
+          if (zaiThinking) {
             parsedMessage.message.reasoning_content = state.thinking;
           }
 
@@ -3137,7 +3210,7 @@ export class ApiBackend extends PunkBackend {
           );
 
           const assistantEntry = { role: "assistant", content: finalContent };
-          if (deepseekThinking) {
+          if (deepseekThinking || zaiThinking) {
             assistantEntry.reasoning_content = state.thinking;
           }
           messages.push(assistantEntry);
@@ -4486,6 +4559,23 @@ export class ApiBackend extends PunkBackend {
         };
         break;
 
+      case "z-ai":
+        url =
+          apiConfig.baseUrl || "https://api.z.ai/api/paas/v4/chat/completions";
+        headers = {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiConfig.apiKey}`,
+        };
+        // Prefix-cache: GLM supports context caching, benefit from frozen-only split
+        finalBody = {
+          ...body,
+          messages: systemTiers
+            ? applyPrefixCacheOptimization(body.messages, systemTiers)
+            : body.messages,
+          user: userTag,
+        };
+        break;
+
       case "stepfun":
         // StepFun is fully OpenAI-compatible. Native API is at api.stepfun.com/v1.
         url =
@@ -4831,6 +4921,8 @@ export class ApiBackend extends PunkBackend {
         return "gemini-3-flash-preview";
       case "deepseek":
         return "deepseek-v4-flash";
+      case "z-ai":
+        return "glm-5.2";
       case "stepfun":
         return "step-3.5-flash";
       case "kimi":
@@ -4868,6 +4960,22 @@ export class ApiBackend extends PunkBackend {
         "deepseek-v4-flash": "deepseek-v4-flash",
         "deepseek-v4-pro": "deepseek-v4-pro",
         "deepseek-v4": "deepseek-v4-flash",
+      };
+      return map[model.toLowerCase()] || model;
+    }
+
+    if (provider === "z-ai") {
+      // Z.ai GLM models use their native IDs directly (glm-5.2, glm-4.7, etc.)
+      const map = {
+        "glm-5.2": "glm-5.2",
+        "glm-5.1": "glm-5.1",
+        "glm-5": "glm-5",
+        "glm-5-turbo": "glm-5-turbo",
+        "glm-4.7": "glm-4.7",
+        "glm-4.7-flash": "glm-4.7-flash",
+        "glm-4.6": "glm-4.6",
+        "glm-4.5": "glm-4.5",
+        "glm-4.5-flash": "glm-4.5-flash",
       };
       return map[model.toLowerCase()] || model;
     }
@@ -5050,6 +5158,7 @@ export class ApiBackend extends PunkBackend {
       // kimi uses standard content only. Tool-call handling is identical
       // to the openrouter block above so they share that logic via fallthrough.
       case "xiaomi":
+      case "z-ai":
       case "deepseek":
       case "kimi":
       case "stepfun": {
@@ -5463,6 +5572,49 @@ export class ApiBackend extends PunkBackend {
         .sort(_byRelevance);
     } catch (err) {
       console.error("[http] Failed to fetch DeepSeek models:", err);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch available Z.ai (GLM) models via their OpenAI-compatible /models endpoint.
+   * Z.ai's /models endpoint returns the standard OpenAI format with id, context_length, etc.
+   */
+  async getZaiModels() {
+    const apiConfig = await this.getApiConfig("z-ai");
+    if (!apiConfig.apiKey) return [];
+
+    try {
+      const base = apiConfig.baseUrl
+        ? apiConfig.baseUrl.replace(/\/chat\/completions\/?$/, "")
+        : "https://api.z.ai/api/paas/v4";
+      const baseUrlClean = base.replace(/\/$/, "");
+      const url = baseUrlClean.endsWith("/models")
+        ? baseUrlClean
+        : `${baseUrlClean}/models`;
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!response.ok) return [];
+
+      const json = await response.json();
+      if (!json.data) return [];
+
+      return json.data
+        .filter((m) => m.id && (m.id.includes("glm") || m.id.includes("cogview")))
+        .map((m) => ({
+          id: m.id,
+          name: _zaiDisplayName(m.id),
+          context_length: m.context_length || _zaiContextLength(m.id),
+          provider: "Z.ai",
+          tier: m.id.includes("glm-5") ? 1 : m.id.includes("glm-4.7") ? 1 : 2,
+          input_cost: null,
+          output_cost: null,
+        }))
+        .sort(_byRelevance);
+    } catch (err) {
+      console.error("[http] Failed to fetch Z.ai models:", err);
       return [];
     }
   }

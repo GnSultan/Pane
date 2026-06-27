@@ -23,17 +23,35 @@ import { runTurnSentinel } from "./code-arbiter.mjs";
 // In production, cli-worker.mjs is inside app.asar/out/main/, so node_modules
 // resolves to app.asar/node_modules/. We redirect to app.asar.unpacked/ where
 // electron-builder extracts asarUnpack entries so they can be spawned.
+//
+// As of @anthropic-ai/claude-agent-sdk 0.3.x the SDK no longer ships a JS
+// `cli.js`. It ships a self-contained native binary (`claude`) in a
+// platform-specific sibling package (e.g. claude-agent-sdk-darwin-arm64).
+// We point the SDK directly at that binary; because the path does NOT end in
+// .js the SDK runs it as a native executable (no node/electron wrapper).
 function getClaudeCliPath() {
+  const platform = process.platform; // "darwin" | "linux" | "win32"
+  const arch = process.arch; // "arm64" | "x64"
+  const binName = platform === "win32" ? "claude.exe" : "claude";
   const workerDir = path.dirname(fileURLToPath(import.meta.url));
   const appRoot = path.resolve(workerDir, "../..");
   const cliPath = path.join(
     appRoot,
-    "node_modules/@anthropic-ai/claude-agent-sdk/cli.js",
+    `node_modules/@anthropic-ai/claude-agent-sdk-${platform}-${arch}/${binName}`,
   );
   return cliPath.replace(/app\.asar([/\\])/g, "app.asar.unpacked$1");
 }
 
 const CLAUDE_CLI_PATH = getClaudeCliPath();
+
+// Env for the native `claude` binary. This worker runs as electron-as-node, so
+// process.env carries ELECTRON_RUN_AS_NODE=1 — strip it: the claude binary is a
+// standalone executable and must not inherit that flag.
+function claudeCliEnv() {
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  return env;
+}
 
 const __dirname = import.meta.dirname;
 
@@ -667,15 +685,20 @@ ${PANE_END}`;
     console.warn("[cli-worker] Failed to write CLAUDE.md:", err.message);
   }
 
+  // Run the native `claude` binary directly. The pane MCP server below still
+  // uses ELECTRON_RUN_AS_NODE because it genuinely is a JS file run via
+  // electron-as-node; the claude binary (claudeCliEnv) does not.
   const options = {
     cwd: workingDir,
     model: rawModel || undefined,  // Pass original to SDK (accepts aliases like "default")
-    appendSystemPrompt: systemPrompt || undefined,
+    // 0.3.x: appendSystemPrompt was removed — append via the claude_code preset.
+    systemPrompt: systemPrompt
+      ? { type: "preset", preset: "claude_code", append: systemPrompt }
+      : { type: "preset", preset: "claude_code" },
     pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
-    executable: process.execPath,
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+    env: claudeCliEnv(),
     permissionMode: "bypassPermissions",
-    dangerouslySkipPermissions: true,
+    allowDangerouslySkipPermissions: true,
     maxTurns: maxTurns || 50,
     tools: tools || undefined,
     betas: ["context-1m-2025-08-07"],
@@ -1812,10 +1835,9 @@ async function handleStartLogin() {
       cwd: os.tmpdir(),
       maxTurns: 1,
       pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
-      executable: process.execPath,
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      env: claudeCliEnv(),
       permissionMode: "bypassPermissions",
-      dangerouslySkipPermissions: true,
+      allowDangerouslySkipPermissions: true,
       forceLoginMethod: "claudeai",
       abortController: ac,
     },
@@ -1882,10 +1904,9 @@ async function handlePrefetchModels() {
       cwd: tmpDir,
       maxTurns: 1,
       pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
-      executable: process.execPath,
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      env: claudeCliEnv(),
       permissionMode: "bypassPermissions",
-      dangerouslySkipPermissions: true,
+      allowDangerouslySkipPermissions: true,
       abortController: ac,
     },
   });

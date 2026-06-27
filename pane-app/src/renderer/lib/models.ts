@@ -67,7 +67,8 @@ export function isThinkingModel(model: string): boolean {
     lower.includes("next") || // Many reasoning models use "next" (e.g. Qwen Next)
     lower.includes("step-") ||
     lower.includes("flash-lite") ||
-    lower.includes("trinity")
+    lower.includes("trinity") ||
+    lower.includes("glm") // GLM-5.x and GLM-4.7+ think by default
   );
 }
 
@@ -139,6 +140,7 @@ export function getContextLimit(
   // 3. Provider-based heuristic
   if (lower.includes("gemini")) return 1000000;
   if (lower.includes("deepseek")) return 1000000; // DeepSeek V4 has 1M context
+  if (lower.includes("glm")) return 1000000; // Z.ai GLM has 1M context (5.x, 4.7)
 
   return 128000;
 }

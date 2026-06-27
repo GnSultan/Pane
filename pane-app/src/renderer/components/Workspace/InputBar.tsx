@@ -198,6 +198,7 @@ const PROVIDER_NAMES: Record<string, string> = {
   openrouter: "OpenRouter",
   kimi: "Kimi",
   stepfun: "StepFun",
+  "z-ai": "Z.ai",
 };
 function resolveProviderName(key: string): string {
   return PROVIDER_NAMES[key] ?? key;
@@ -940,10 +941,10 @@ export function InputBar({
               })()}
             </button>
           ) : (
-            /* Placeholder — shows status when no todos; tap to expand */
+            /* Placeholder — shows status when no todos; text ember animation signals activity */
             <button
               onClick={() => setExpandedSection("input")}
-              className="font-mono text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors text-left"
+              className="font-mono animate-text-ember text-left"
               style={{ fontSize: "var(--pane-font-size-xs)" }}
             >
               working on it

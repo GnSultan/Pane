@@ -217,6 +217,7 @@ export function getModelLimit(model) {
   if (modelLower.includes("claude") || modelLower.includes("opus") || modelLower.includes("sonnet")) return 1000000;
   if (modelLower.includes("qwen")) return 262144;
   if (modelLower.includes("deepseek")) return 1000000;
+  if (modelLower.includes("glm")) return 1000000;
 
   return 128000;
 }
@@ -232,6 +233,7 @@ export function getDefaultOutputBudget(model) {
   if (!model) return 8192;
   const m = model.toLowerCase();
   if (m.includes("deepseek")) return 8192;
+  if (m.includes("glm")) return 8192;
   if (m.includes("stepfun") || m.includes("step-")) return 16384;
   return 8192;
 }

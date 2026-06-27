@@ -51,7 +51,7 @@ import {
   punkEngine,
 } from "./punk-engine.mjs";
 import { modelManager } from "./model-manager.mjs";
-import { startBackupSchedule } from "./backup-engine.mjs";
+import { startBackupSchedule, registerBackupHandlers } from "./backup-engine.mjs";
 import { initCloudAuth } from "./cloud-auth.mjs";
 import { registerCloudSyncHandlers } from "./cloud-sync.mjs";
 import { MindPunks } from "./mind-punks.mjs";
@@ -2703,6 +2703,7 @@ app.whenReady().then(async () => {
   // Pane Cloud — GitHub OAuth, encrypted backups, cross-device sync
   initCloudAuth(mainWindow);
   registerCloudSyncHandlers();
+  registerBackupHandlers(); // on-demand "back up now" — creates local backup before cloud upload
 
   app.on("activate", () => {
     if (mainWindow) {
