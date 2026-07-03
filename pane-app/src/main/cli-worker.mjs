@@ -1519,32 +1519,25 @@ async function handleSpawn({
 
   const backend = command === "claude" ? "claude-code" : "gemini";
 
-  // ── Context assembly: lean for CLI backends, full for HTTP ──────────────
-  // CLI backends (Claude SDK, Gemini CLI) are complete agents with their own
-  // tools, context management, and session resumption. They get minimal context
-  // (rules + identity + arbiter) and pull project intelligence via MCP tools.
-  // HTTP backends need Pane to manage everything — they get the full assembly.
+  // ── Context assembly: unified for all backends ──────────────────────────
+  // All backends (Claude SDK, Gemini CLI, HTTP) get the same system prompt.
+  // This enables seamless model swapping — the context and tools are identical
+  // regardless of which backend is active.
   let context;
   let budgetInfo = null;
 
   const isCli = command === "claude" || command === "gemini";
 
   if (isCli) {
-    // Lean mode: ~500 tokens instead of 5000. MCP tools provide the rest.
-    // Use activeSessionIds as the source of truth — historyLength can be 0
-    // on first message after restart (async load race) even with a valid session.
-    const isResume = activeSessionIds.has(projectId);
     try {
       context = orchestrateContext(projectId, {
-        mode: "lean",
-        isResume,
         intent,
         backend,
       });
       budgetInfo = context.budget;
-      console.log(`[cli-worker] Lean context: ${budgetInfo.systemUsed} tokens (resume=${isResume})`);
+      console.log(`[cli-worker] Unified context: ${budgetInfo.systemUsed} tokens`);
     } catch (err) {
-      console.warn(`[cli-worker] Lean context failed, falling back to full: ${err.message}`);
+      console.warn(`[cli-worker] Context assembly failed, falling back to compileContext: ${err.message}`);
       context = compileContext(projectId, intent, historyLength, backend, sqliteChanges);
     }
   } else {

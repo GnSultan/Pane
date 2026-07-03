@@ -10,6 +10,8 @@ import readline from "node:readline";
 import { execSync } from "node:child_process";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 import { validateCommand } from "./command-validator.mjs";
+import { readState, readHandoff, mergeState } from "./pane-system-prompt.mjs";
+import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
 
 import { createRequire } from "node:module";
 
@@ -543,6 +545,94 @@ const TOOLS = [
         ordered_ids: { type: "array", description: "For reorder_milestones: milestone IDs in desired order" },
       },
       required: ["action"],
+    },
+  },
+  {
+    name: "pane_get_handoff",
+    description: "Get the handoff document from the most recent previous session — accomplishments, blockers, next steps, and discoveries. Call this on cold start if you need context about what was done before.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "pane_get_session_state",
+    description: "Get the current session state: active task, pending todos, locked decisions, recent actions, and working set. Call this when you need to know what work has been done or what's pending — it is NOT pre-loaded into context.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "pane_read_journal",
+    description: "Read the session journal — a log of all messages, tool results, and progress snapshots from the current and recent sessions. Optionally search by keyword. Use this to recall what happened earlier in the conversation or in a previous session that was interrupted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Optional keyword to search for in journal entries. Omit to get the most recent entries." },
+        limit: { type: "number", description: "Maximum number of entries to return (default: 10)" },
+      },
+    },
+  },
+  {
+    name: "pane_get_project_map",
+    description: "Get the project's file structure — every indexed file with path and type. Call this to understand the codebase layout before exploring. Useful on first turn or when working in unfamiliar areas.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "pane_get_recent_changes",
+    description: "Get recent file changes: git diff summary, modified files since last turn, and current branch status. Call this to understand what changed recently.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "TodoWrite",
+    description: "Update the project's TODO list. Use this to track progress and plan future steps.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        todos: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              content: { type: "string", description: "The task description" },
+              status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "Current status" },
+              activeForm: { type: "string", description: "Optional: A shorter 'ing' form for the status bar (e.g. 'writing tests')" },
+            },
+            required: ["content", "status"],
+          },
+          description: "The full TODO list",
+        },
+      },
+      required: ["todos"],
+    },
+  },
+  {
+    name: "Task",
+    description: "Set the active task that you are currently working on. This is displayed in the Pane status bar.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: { type: "string", description: "The task description (e.g. 'Fixing login bug')" },
+      },
+      required: ["task"],
+    },
+  },
+  {
+    name: "save_memory",
+    description: "Persists global preferences or facts across ALL future sessions. Use this for recurring instructions like coding styles or personal facts. Do NOT use for session-specific context.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fact: { type: "string", description: "A concise, global fact or preference (e.g. 'I prefer using tabs')" },
+      },
+      required: ["fact"],
+    },
+  },
+  {
+    name: "pane_codebase_compass",
+    description: "Get a 'neighborhood' of code relevant to your intent. Combines semantic search, structural symbols, and spatial dependency mapping to surface files you should look at. Use this when you are entering a new area of the codebase or need to understand the 'blast radius' of a change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What you are looking for or trying to do" },
+        limit: { type: "number", description: "Maximum number of files to return (default 8)" },
+      },
+      required: ["query"],
     },
   },
   {
@@ -1118,12 +1208,14 @@ async function handleToolCall(name, args) {
         }
       } catch {}
 
-      // Digest (graduated behavioral wiring)
+      // Playbooks — tested principles distilled by the reflection engine.
+      // Replaces the old digest.txt graduation target.
       try {
-        const digest = await fs.promises.readFile(path.join(profileDir, "digest.txt"), "utf-8");
-        if (digest.trim().length > 5) {
-          parts.push("\n## Behavioral Wiring (graduated from experience)");
-          parts.push(digest.trim());
+        const playbooksDir = path.join(profileDir, "playbooks");
+        const globalPb = await fs.promises.readFile(path.join(playbooksDir, "global.md"), "utf-8");
+        if (globalPb.trim().length > 5) {
+          parts.push("\n## Craft Profile (principles that hold across projects)");
+          parts.push(globalPb.trim());
         }
       } catch {}
 
@@ -1954,6 +2046,321 @@ async function handleToolCall(name, args) {
       }
 
       return text(`Unknown pane_roadmap action: ${action}`);
+    }
+
+    // ── Session continuity tools (enable seamless model swapping) ────────
+
+    case "pane_get_handoff": {
+      const handoff = readHandoff(PROJECT_ID);
+      if (!handoff) {
+        return text("No previous session handoff found. This may be the first session for this project.");
+      }
+
+      const parts = [];
+      const age = handoff.timestamp
+        ? Math.round((Date.now() - handoff.timestamp) / (1000 * 60 * 60))
+        : null;
+
+      parts.push(`Previous session handoff${age ? ` (${age}h ago)` : ""}:`);
+
+      if (handoff._exitReason) {
+        parts.push(`Exit reason: ${handoff._exitReason}${handoff._errorMessage ? ` — ${handoff._errorMessage}` : ""}`);
+      }
+
+      if (handoff.currentObjective) parts.push(`Objective: ${handoff.currentObjective}`);
+      if (handoff.progress) parts.push(`Progress: ${handoff.progress}`);
+
+      const renderItems = (label, items) => {
+        if (!items?.length) return;
+        parts.push(`\n${label}:`);
+        for (const item of items) {
+          const text = typeof item === "string" ? item : item.text || item.content || JSON.stringify(item);
+          parts.push(`- ${text}`);
+        }
+      };
+
+      renderItems("Accomplished", handoff.accomplishment);
+      renderItems("Completed from history", handoff.completed_from_history);
+      renderItems("Blockers", handoff.blockers);
+      renderItems("Next steps", handoff.nextSteps);
+      renderItems("Findings", handoff.findings);
+      renderItems("Decisions", handoff.decisionsLocked);
+
+      if (handoff.workingSet?.length > 0) {
+        parts.push(`\nWorking set: ${handoff.workingSet.map(f => f.path || f).join(", ")}`);
+      }
+
+      return text(parts.join("\n"));
+    }
+
+    case "pane_get_session_state": {
+      const state = readState(PROJECT_ID);
+      const parts = [];
+
+      // Stale task retirement — 8-hour threshold
+      const STALE_THRESHOLD_MS = 8 * 60 * 60 * 1000;
+      if (state.activeTask && (!state.activeTask.timestamp || (Date.now() - state.activeTask.timestamp) > STALE_THRESHOLD_MS)) {
+        parts.push("No active task set (previous task was stale and has been cleared).");
+      } else if (state.activeTask) {
+        const age = Math.round((Date.now() - state.activeTask.timestamp) / (1000 * 60 * 60));
+        parts.push(`Active task (set ${age}h ago): ${state.activeTask.description}`);
+        if (state.activeTask.goal) parts.push(`Goal: ${state.activeTask.goal}`);
+      } else {
+        parts.push("No active task set.");
+      }
+
+      // Todos
+      const todos = state.todos || [];
+      if (todos.length > 0) {
+        parts.push("\nTodos:");
+        for (const t of todos) {
+          const mark = t.status === "completed" ? "[✓]" : t.status === "in_progress" ? "[→]" : "[ ]";
+          parts.push(`${mark} ${t.content}`);
+        }
+      }
+
+      // Decisions
+      const decisions = state.decisions || [];
+      if (decisions.length > 0) {
+        parts.push("\nLocked decisions:");
+        for (const d of decisions.slice(0, 8)) {
+          const age = d.timestamp
+            ? `(${Math.round((Date.now() - d.timestamp) / (1000 * 60 * 60))}h ago)`
+            : "";
+          parts.push(`- ${d.content} ${age}`);
+        }
+      }
+
+      // Recent actions
+      const actions = state.recentActions || [];
+      if (actions.length > 0) {
+        parts.push("\nRecent actions:");
+        for (const a of actions.slice(-5)) {
+          parts.push(`- [${a.type}] ${a.content}`);
+        }
+      }
+
+      // Working set
+      if (state.workingSet?.length > 0) {
+        parts.push("\nWorking set:");
+        for (const f of state.workingSet.slice(0, 8)) {
+          parts.push(`- ${f.path}${f.purpose ? ` — ${f.purpose}` : ""}`);
+        }
+      }
+
+      parts.push(`\nSession: turn ${state.turnCount}, phase: ${state.phase}`);
+
+      return text(parts.join("\n"));
+    }
+
+    case "pane_read_journal": {
+      const query = (args?.query || "").trim().toLowerCase();
+      const limit = Math.min(args?.limit || 10, 30);
+
+      const journalData = replayJournal(PROJECT_ID);
+      if (!journalData.messages.length) {
+        return text("No session journal entries found.");
+      }
+
+      const progress = journalData.progress || readLastProgress(PROJECT_ID);
+
+      let entries = journalData.messages;
+
+      if (query) {
+        entries = entries.filter(msg => {
+          const text = typeof msg.content === "string"
+            ? msg.content
+            : JSON.stringify(msg.content);
+          return text.toLowerCase().includes(query);
+        });
+      }
+
+      entries = entries.slice(-limit);
+
+      const parts = [];
+
+      if (progress) {
+        parts.push("[Last progress snapshot]");
+        if (progress.accomplishments?.length > 0) {
+          parts.push(`Completed: ${progress.accomplishments.join("; ")}`);
+        }
+        if (progress.decisions?.length > 0) {
+          parts.push(`Decisions: ${progress.decisions.join("; ")}`);
+        }
+        if (progress.pendingTodos?.length > 0) {
+          parts.push(`Pending: ${progress.pendingTodos.join("; ")}`);
+        }
+        parts.push("");
+      }
+
+      parts.push(`[Journal entries: ${entries.length}${query ? ` matching "${args.query}"` : ""}]`);
+      for (const msg of entries) {
+        const content = typeof msg.content === "string"
+          ? msg.content.slice(0, 300)
+          : Array.isArray(msg.content)
+            ? msg.content.filter(b => b.type === "text").map(b => b.text).join("\n").slice(0, 300)
+            : JSON.stringify(msg.content).slice(0, 300);
+        parts.push(`[${msg.role}] ${content}${content.length >= 300 ? "..." : ""}`);
+      }
+
+      return text(parts.join("\n"));
+    }
+
+    case "pane_get_project_map": {
+      // Read the codebase map from brain context export
+      const mapPath = path.join(PANE_DIR, "brain", "context", `${PROJECT_ID}.json`);
+      try {
+        const data = JSON.parse(await fs.promises.readFile(mapPath, "utf-8"));
+        if (data.codebaseMap) {
+          return text(data.codebaseMap);
+        }
+        if (Array.isArray(data) && data.length > 0) {
+          const files = data.filter(n => n.type === "file").map(n => n.path || n.content).slice(0, 200);
+          return text(`Project files (${files.length}):\n${files.join("\n")}`);
+        }
+      } catch {}
+
+      // Fallback: list files from project root via find
+      try {
+        const stdout = execSync(
+          "find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' | head -200",
+          { cwd: PROJECT_ROOT, timeout: 5000, encoding: "utf-8" }
+        );
+        return text(`Project files:\n${stdout.trim()}`);
+      } catch {
+        return text("Could not read project file structure.");
+      }
+    }
+
+    case "pane_get_recent_changes": {
+      const parts = [];
+
+      try {
+        const branch = execSync("git branch --show-current", { cwd: PROJECT_ROOT, timeout: 3000, encoding: "utf-8" }).trim();
+        parts.push(`Branch: ${branch}`);
+      } catch {}
+
+      try {
+        const status = execSync("git status --short", { cwd: PROJECT_ROOT, timeout: 5000, encoding: "utf-8" }).trim();
+        if (status) {
+          parts.push(`\nChanged files:\n${status}`);
+        } else {
+          parts.push("Working tree clean.");
+        }
+      } catch {
+        parts.push("Git status unavailable.");
+      }
+
+      try {
+        const log = execSync("git log --oneline -5", { cwd: PROJECT_ROOT, timeout: 5000, encoding: "utf-8" }).trim();
+        if (log) {
+          parts.push(`\nRecent commits:\n${log}`);
+        }
+      } catch {}
+
+      return text(parts.join("\n"));
+    }
+
+    // ── Workflow tools ──────────────────────────────────────────────────
+
+    case "TodoWrite": {
+      const todos = args?.todos || [];
+      mergeState(PROJECT_ID, { todos });
+      const counts = { pending: 0, in_progress: 0, completed: 0 };
+      for (const t of todos) {
+        if (counts[t.status] !== undefined) counts[t.status]++;
+      }
+      return text(`Updated ${todos.length} todos (${counts.pending} pending, ${counts.in_progress} in progress, ${counts.completed} completed).`);
+    }
+
+    case "Task": {
+      const task = (args?.task || "").trim();
+      if (!task) return text("Error: no task description provided.");
+      mergeState(PROJECT_ID, {
+        activeTask: { description: task, timestamp: Date.now() },
+      });
+      return text(`Active task set: ${task}`);
+    }
+
+    case "save_memory": {
+      const fact = (args?.fact || "").trim();
+      if (!fact) return text("Error: no fact provided.");
+
+      const globalMemoryDir = path.join(PANE_DIR, "memory", "global");
+      const memoriesPath = path.join(globalMemoryDir, "memories.json");
+
+      await fs.promises.mkdir(globalMemoryDir, { recursive: true });
+
+      let memories = [];
+      try {
+        memories = JSON.parse(await fs.promises.readFile(memoriesPath, "utf-8"));
+      } catch {}
+
+      // Deduplicate — skip if this exact fact already exists
+      if (memories.some(m => m.fact === fact)) {
+        return text("Memory already exists (duplicate skipped).");
+      }
+
+      memories.push({ fact, timestamp: Date.now() });
+      await fs.promises.writeFile(memoriesPath, JSON.stringify(memories, null, 2));
+
+      return text(`Saved global memory: ${fact}`);
+    }
+
+    // ── Codebase exploration ────────────────────────────────────────────
+
+    case "pane_codebase_compass": {
+      const query = (args?.query || "").toLowerCase();
+      const limit = args?.limit || 8;
+
+      // Read brain context export — same approach as explore
+      const mapPath = path.join(PANE_DIR, "brain", "context", `${PROJECT_ID}.json`);
+      let files = [];
+      try {
+        const data = JSON.parse(await fs.promises.readFile(mapPath, "utf-8"));
+
+        // Extract file entries
+        const entries = [];
+        if (data.codebaseMap) {
+          // Parse codebase map format: each line is "path — description"
+          for (const line of data.codebaseMap.split("\n")) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith("#")) continue;
+            entries.push({ path: trimmed, description: "" });
+          }
+        } else if (Array.isArray(data)) {
+          for (const node of data) {
+            if (node.path) entries.push({ path: node.path, description: node.description || node.content || "" });
+          }
+        }
+
+        // Fuzzy match against query
+        const scored = entries
+          .map(e => ({
+            ...e,
+            score: fuzzyScore(query, `${e.path} ${e.description}`),
+          }))
+          .filter(e => e.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit);
+
+        files = scored;
+      } catch {
+        // No brain export — graceful fallback
+      }
+
+      if (files.length === 0) {
+        return text(`Codebase compass found no relevant files for "${args.query}". Try a different query or use pane_get_project_map for the full file list.`);
+      }
+
+      const out = files.map(f => {
+        const scorePct = Math.round(f.score * 100);
+        return f.description
+          ? `- ${f.path} (${scorePct}%)\n    ${f.description}`
+          : `- ${f.path} (${scorePct}%)`;
+      }).join("\n");
+
+      return text(`Codebase Compass — relevant files for "${args.query}":\n\n${out}`);
     }
 
     case "explore": {

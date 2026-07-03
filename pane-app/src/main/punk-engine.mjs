@@ -921,13 +921,13 @@ class PunkEngine {
           const context = (has1m || isOpus || isDefault) ? 1000000 : 200000;
           const tier = (isOpus || isDefault) ? 1 : isSonnet ? 2 : 3;
 
-          // Build a clear display name
+          // Trust the SDK's own display name — never hardcode version numbers,
+          // or a newer model hides behind a stale label (e.g. an "Opus 4.6"
+          // label pinned over whatever the default alias actually resolves to).
           let name = m.displayName || m.name || id;
-          if (name === "Sonnet") name = "Sonnet 4.6";
-          if (name === "Haiku") name = "Haiku 4.5";
-          // "Default (recommended)" → show the actual model name + (default)
-          if (isDefault || name.toLowerCase().includes("default")) {
-            name = "Opus 4.6 (default)";
+          // Mark the default alias only if the SDK name doesn't already say so.
+          if (isDefault && !name.toLowerCase().includes("default")) {
+            name += " (default)";
           }
           if (has1m && !name.includes("1M") && !name.includes("1m")) name += " (1M)";
 
@@ -1042,6 +1042,17 @@ class PunkEngine {
               recordArbiterCorrections(db, tracked.projectId, v);
             }
           } catch {}
+
+          // Playbook validation loop: the verdict holds injected principles
+          // accountable. A finding that matches a principle records a
+          // violation; a clean turn slowly reinforces. This is how principle
+          // confidence is EARNED rather than assigned.
+          if (this._brainRequest) {
+            this._brainRequest("playbook_feedback", {
+              projectId: tracked.projectId,
+              verdict: { pass: v.pass, findings: v.findings || [] },
+            }).catch(() => {});
+          }
         } catch {}
       }
 
