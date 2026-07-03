@@ -62,6 +62,7 @@ import { getPaneDb, extractMessageText, initPaneDb, runMigrationIfNeeded, pruneC
 import { loadRecentTurns } from "./session-turns.mjs";
 import { setCmdWorker, execThroughWorker, onCmdWorkerExit } from "./tool-executor.mjs";
 import { mergeState } from "./pane-system-prompt.mjs";
+import { runModelProfileReflection } from "./playbook-engine.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -2589,17 +2590,27 @@ app.whenReady().then(async () => {
   // This is the critical link: brain searches the knowledge graph for query-
   // relevant context and writes it to disk BEFORE compileContext() reads it.
   punkEngine.setBrainSearch(async args => {
-    const { projectId, query, taskType, atomHints, projectRoot, intent, projectWhy } = args;
+    const { projectId, query, taskType, atomHints, projectRoot, intent, model, projectWhy } = args;
     if (projectRoot) {
       brainRequest("index_project_files", { projectId, projectRoot }).catch(() => {});
     }
-    // Memory lifecycle: decay unused memories, consolidate patterns, graduate principles.
-    // Fire-and-forget — runs in the brain worker, doesn't block the context search.
-    // enableConsolidation: true only 10% of the time (LLM calls are expensive).
+    // Memory lifecycle: decay unused memories, reflect into playbook.
+    // Fire-and-forget — runs in the brain worker, throttled internally.
     brainRequest("memory_lifecycle", {
       projectId,
       enableConsolidation: Math.random() < 0.1,
     }).catch(() => {});
+
+    // Per-model behavioral profile — uses pane.db (main process), runs here.
+    // Throttled to 24h + corpus-change check. Safe to fire every turn.
+    if (model) {
+      const paneDb = getPaneDb();
+      runModelProfileReflection(
+        paneDb,
+        model,
+        (sys, usr) => punkEngine.quickCall(sys, usr),
+      ).catch(() => {});
+    }
 
     const result = await brainRequest("contextual_search", {
       projectId,

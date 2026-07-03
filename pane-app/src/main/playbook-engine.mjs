@@ -36,6 +36,7 @@ import crypto from "node:crypto";
 
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const PLAYBOOKS_DIR = path.join(PANE_DIR, "profile", "playbooks");
+const MODELS_DIR = path.join(PANE_DIR, "profile", "models");
 
 // ── Tunables ────────────────────────────────────────────────────────────
 const MAX_ACTIVE_PRINCIPLES = 30;        // Per project — fewer, stronger beats many, weak
@@ -49,6 +50,10 @@ const VIOLATION_PENALTY = 0.08;
 const CLEAN_TURN_BOOST = 0.005;
 const CONFIDENCE_CAP = 0.95;
 const RETIRE_BELOW = 0.2;                // Auto-retire before reflection
+
+const MAX_MODEL_DIRECTIVES = 10;           // Per model — specific failure counter-directives
+const MODEL_PROFILE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const MIN_MODEL_TURNS = 10;               // Don't profile from too little data
 
 // Observation types that qualify as knowledge (vs session exhaust)
 export const KNOWLEDGE_TYPES = ["lesson", "error_fix", "pattern", "decision"];
@@ -363,6 +368,174 @@ export async function runGlobalReflection(db, llmCall) {
 
   console.log(`[playbook] global craft profile updated: ${lines.length} principles`);
   return { principles: lines.length };
+}
+
+// ============================================================================
+// Model profiles — per-model behavioral counter-directives
+// ============================================================================
+
+const MODEL_PROFILE_SYSTEM_PROMPT = `You are analyzing the behavioral failure patterns of a specific AI model based on real arbiter verdicts and correction events from a developer's workflow.
+
+Your job is to produce counter-directives — brief instructions that pre-empt this model's KNOWN failure modes. Think of it as a pre-briefing written specifically for this model about its own blind spots.
+
+Rules:
+- Each directive is 1-2 sentences, addressed directly to the model ("When X, do Y instead", "You tend to Z — don't")
+- Ground every directive in the provided evidence. No invented patterns.
+- Focus on behavioral patterns: error suppression, broken tests, over-abstraction, task drift, missing edge cases, specific error codes that recur
+- A directive must be specific enough to actually change behavior. Generic advice is useless.
+- Contradictions in the data → pick the dominant pattern or note the conditional ("only when X")
+- Omitting a directive from your output retires it. Keep only what's still evidenced.
+- Maximum ${MAX_MODEL_DIRECTIVES} directives. Fewer strong ones beat many weak ones.
+
+Output ONLY valid JSON, no prose: {"profile": [{"text": "the directive"}]}`;
+
+/** Sanitize a model ID to a safe filename: replace /, :, spaces with - */
+function safeModelFilename(modelId) {
+  return modelId.replace(/[/: ]+/g, "-").replace(/[^a-zA-Z0-9._-]/g, "") + ".md";
+}
+
+/**
+ * Gather failure evidence for a model across all projects.
+ * Uses quality_metrics for aggregate stats and correction_events for specifics.
+ */
+function gatherModelEvidence(db, modelId) {
+  // Aggregate stats for this model
+  const stats = db.prepare(`
+    SELECT
+      COUNT(*) as total_turns,
+      SUM(CASE WHEN verdict_pass = 0 THEN 1 ELSE 0 END) as failed_turns,
+      ROUND(AVG(quality_score), 1) as avg_score,
+      SUM(suppressions) as total_suppressions,
+      SUM(type_errors) as total_type_errors,
+      SUM(lint_errors) as total_lint_errors,
+      SUM(arch_issues) as total_arch_issues
+    FROM quality_metrics
+    WHERE model = ?
+      AND timestamp > ?
+  `).get(modelId, Date.now() - 30 * 24 * 60 * 60 * 1000) || {};
+
+  // Top recurring correction types with example detail
+  const corrections = db.prepare(`
+    SELECT correction_type, COUNT(*) as cnt, MAX(detail) as example_detail
+    FROM correction_events
+    WHERE model = ?
+      AND timestamp > ?
+    GROUP BY correction_type
+    ORDER BY cnt DESC
+    LIMIT 20
+  `).all(modelId, Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+  return { stats, corrections };
+}
+
+function computeModelEvidenceHash(stats, corrections) {
+  const h = crypto.createHash("sha256");
+  h.update(JSON.stringify({ t: stats.total_turns, f: stats.failed_turns }));
+  for (const c of corrections) h.update(`${c.correction_type}:${c.cnt}|`);
+  return h.digest("hex").slice(0, 16);
+}
+
+/**
+ * Write the model profile markdown to ~/.pane/profile/models/<modelId>.md
+ */
+export function writeModelProfileMarkdown(modelId, directives) {
+  const lines = directives.map((d) => `- ${d.text}`);
+  const markdown = lines.join("\n");
+
+  try {
+    fs.mkdirSync(MODELS_DIR, { recursive: true });
+    const filePath = path.join(MODELS_DIR, safeModelFilename(modelId));
+    if (markdown) {
+      fs.writeFileSync(filePath, markdown + "\n", "utf-8");
+    } else if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (err) {
+    console.warn(`[playbook] failed to write model profile for ${modelId}: ${err.message}`);
+  }
+  return markdown;
+}
+
+/**
+ * Run one model profile reflection cycle.
+ * Throttled to 24h + corpus-change check. Safe to call on every lifecycle tick.
+ *
+ * @param {object} db - pane database (quality_metrics + correction_events)
+ * @param {string} modelId - the model identifier (e.g. "claude-sonnet-4-6")
+ * @param {Function} llmCall - (system, user) => Promise<string|null>
+ */
+export async function runModelProfileReflection(db, modelId, llmCall) {
+  if (!llmCall || !modelId) return { skipped: "no-llm-or-model" };
+  ensurePlaybookSchema(db);
+
+  const synthKey = `model-profile-${modelId}`;
+  const meta = getSynthesis(db, "__global__", synthKey);
+  if (meta && Date.now() - meta.generated_at * 1000 < MODEL_PROFILE_INTERVAL_MS) {
+    return { skipped: "throttled" };
+  }
+
+  const { stats, corrections } = gatherModelEvidence(db, modelId);
+  if (!stats.total_turns || stats.total_turns < MIN_MODEL_TURNS) {
+    return { skipped: "too-few-turns" };
+  }
+
+  const sourceHash = computeModelEvidenceHash(stats, corrections);
+  if (meta && meta.source_hash === sourceHash) return { skipped: "unchanged" };
+
+  // Read existing profile directives for the revision prompt
+  let existing = "";
+  try {
+    const profilePath = path.join(MODELS_DIR, safeModelFilename(modelId));
+    if (fs.existsSync(profilePath)) {
+      existing = fs.readFileSync(profilePath, "utf-8").trim();
+    }
+  } catch {}
+
+  const failRate = stats.total_turns > 0
+    ? Math.round((stats.failed_turns / stats.total_turns) * 100)
+    : 0;
+
+  const correctionLines = corrections.map(
+    (c) => `  ${c.correction_type} ×${c.cnt}${c.example_detail ? ` — e.g. "${c.example_detail}"` : ""}`
+  ).join("\n") || "  (none recorded)";
+
+  const userPrompt = [
+    `Model: ${modelId}`,
+    ``,
+    `Performance over last 30 days:`,
+    `  Total turns: ${stats.total_turns}`,
+    `  Failure rate: ${failRate}% (${stats.failed_turns} failed)`,
+    `  Avg quality score: ${stats.avg_score}/100`,
+    `  Error suppressions attempted: ${stats.total_suppressions}`,
+    `  TypeScript errors: ${stats.total_type_errors}`,
+    `  Lint errors: ${stats.total_lint_errors}`,
+    `  Architecture violations: ${stats.total_arch_issues}`,
+    ``,
+    `Top recurring correction types (what the arbiter caught repeatedly):`,
+    correctionLines,
+    ``,
+    `Current profile directives (revise these based on the evidence above):`,
+    existing || "(empty — this is the first profile for this model)",
+    ``,
+    `Produce the revised profile. Maximum ${MAX_MODEL_DIRECTIVES} directives.`,
+  ].join("\n");
+
+  const raw = await llmCall(MODEL_PROFILE_SYSTEM_PROMPT, userPrompt);
+  const parsed = parseJsonResponse(raw);
+  if (!parsed || !Array.isArray(parsed.profile)) {
+    console.warn(`[playbook] model profile for ${modelId}: unparseable LLM output`);
+    return { skipped: "bad-llm-output" };
+  }
+
+  const directives = parsed.profile
+    .filter((d) => d && typeof d.text === "string" && d.text.trim().length >= 15)
+    .slice(0, MAX_MODEL_DIRECTIVES);
+
+  writeModelProfileMarkdown(modelId, directives);
+  putSynthesis(db, "__global__", synthKey, directives.map((d) => d.text).join("\n"), sourceHash);
+
+  console.log(`[playbook] model profile for ${modelId}: ${directives.length} directives`);
+  return { directives: directives.length };
 }
 
 // ============================================================================

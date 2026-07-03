@@ -28,6 +28,7 @@ import { getPaneDb } from "./pane-db.mjs";
 
 const MEMORY_DIR = path.join(os.homedir(), ".pane", "memory");
 const PLAYBOOKS_DIR = path.join(os.homedir(), ".pane", "profile", "playbooks");
+const MODELS_DIR = path.join(os.homedir(), ".pane", "profile", "models");
 
 // Playbooks are small by construction (≤30 principles per project, ≤15
 // global) but cap defensively — a runaway file must not eat the prompt.
@@ -66,6 +67,31 @@ function readPlaybook(projectId) {
     "the current task, say so rather than silently ignoring it.\n\n" +
     body
   );
+}
+
+/**
+ * Read behavioral counter-directives earned for a specific model.
+ * These are distilled from real arbiter verdicts for that model —
+ * injected only when that model is driving, so it gets briefed on
+ * its own known failure modes at the start of every session.
+ */
+function readModelProfile(modelId) {
+  if (!modelId) return null;
+  try {
+    const safeFilename = modelId.replace(/[/: ]+/g, "-").replace(/[^a-zA-Z0-9._-]/g, "") + ".md";
+    const profilePath = path.join(MODELS_DIR, safeFilename);
+    if (!fs.existsSync(profilePath)) return null;
+    const body = fs.readFileSync(profilePath, "utf-8").trim();
+    if (!body) return null;
+    return (
+      "## Model directives — known failure patterns for this model\n\n" +
+      "These were earned from real arbiter verdicts on your outputs. " +
+      "They describe YOUR specific tendencies — follow them.\n\n" +
+      body
+    );
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +136,12 @@ export function orchestrateContext(projectId, options = {}) {
   //    engine writes these files; every session starts already knowing them.
   const playbook = readPlaybook(projectId);
   if (playbook) parts.push(playbook);
+
+  // 3b. Model directives — counter-directives specific to the active model,
+  //     earned from its own failure history in this workflow. Different models
+  //     have different failure modes; this section adapts to whoever is driving.
+  const modelProfile = readModelProfile(options.model);
+  if (modelProfile) parts.push(modelProfile);
 
   // 4. Working in Pane instruction
   parts.push(

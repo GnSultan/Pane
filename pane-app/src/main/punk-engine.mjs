@@ -1771,6 +1771,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
             atomHints:   localDecision?.atomHints ?? [],
             projectRoot: resolvedRequest.workingDir ?? null,
             intent:      resolvedRequest.intent ?? null,
+            model:       resolvedRequest.model ?? null,
             projectWhy,
           }),
           searchTimeout,
