@@ -55,6 +55,12 @@ const MAX_MODEL_DIRECTIVES = 10;           // Per model — specific failure cou
 const MODEL_PROFILE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MIN_MODEL_TURNS = 10;               // Don't profile from too little data
 
+// Error codes that reflect project configuration, not model behavior. A missing
+// tsconfig JSX flag lights up thousands of TS17004 across a file — that is a
+// setup issue, never a signal about how the model writes code. Excluded from
+// model profiles so one misconfigured project can't pollute a model's fingerprint.
+const CONFIG_CLASS_CODES = ["TS17004", "TS6142", "TS5076", "TS2688", "TS5083", "TS5023"];
+
 // Observation types that qualify as knowledge (vs session exhaust)
 export const KNOWLEDGE_TYPES = ["lesson", "error_fix", "pattern", "decision"];
 
@@ -414,16 +420,25 @@ function gatherModelEvidence(db, modelId) {
       AND timestamp > ?
   `).get(modelId, Date.now() - 30 * 24 * 60 * 60 * 1000) || {};
 
-  // Top recurring correction types with example detail
+  // Top recurring correction types (counter form: SUM the occurrence counts).
+  // project_spread separates model traits from project traits — a pattern seen
+  // across many projects is the model's tendency; one confined to a single
+  // project is almost always that project's config, not model behavior.
+  // Config-class error codes (tsconfig issues like the JSX flag) are excluded
+  // outright — they are never a model behavior signal.
   const corrections = db.prepare(`
-    SELECT correction_type, COUNT(*) as cnt, MAX(detail) as example_detail
+    SELECT correction_type,
+           SUM(count) as cnt,
+           COUNT(DISTINCT project_id) as project_spread,
+           MAX(detail) as example_detail
     FROM correction_events
     WHERE model = ?
-      AND timestamp > ?
+      AND last_seen > ?
+      AND correction_type NOT IN (${CONFIG_CLASS_CODES.map(() => "?").join(",")})
     GROUP BY correction_type
-    ORDER BY cnt DESC
+    ORDER BY project_spread DESC, cnt DESC
     LIMIT 20
-  `).all(modelId, Date.now() - 30 * 24 * 60 * 60 * 1000);
+  `).all(modelId, Date.now() - 30 * 24 * 60 * 60 * 1000, ...CONFIG_CLASS_CODES);
 
   return { stats, corrections };
 }
@@ -496,7 +511,8 @@ export async function runModelProfileReflection(db, modelId, llmCall) {
     : 0;
 
   const correctionLines = corrections.map(
-    (c) => `  ${c.correction_type} ×${c.cnt}${c.example_detail ? ` — e.g. "${c.example_detail}"` : ""}`
+    (c) => `  ${c.correction_type} ×${c.cnt} across ${c.project_spread} project(s)` +
+      `${c.example_detail ? ` — e.g. "${c.example_detail}"` : ""}`
   ).join("\n") || "  (none recorded)";
 
   const userPrompt = [
@@ -511,8 +527,13 @@ export async function runModelProfileReflection(db, modelId, llmCall) {
     `  Lint errors: ${stats.total_lint_errors}`,
     `  Architecture violations: ${stats.total_arch_issues}`,
     ``,
-    `Top recurring correction types (what the arbiter caught repeatedly):`,
+    `Top recurring correction types (type ×occurrences across N projects):`,
     correctionLines,
+    ``,
+    `Weight patterns that recur across MULTIPLE projects — those are this model's`,
+    `real tendencies. A pattern confined to one project is likely that project's`,
+    `setup, not the model. Do not write a directive from a single-project pattern`,
+    `unless the occurrence count is very high and clearly behavioral.`,
     ``,
     `Current profile directives (revise these based on the evidence above):`,
     existing || "(empty — this is the first profile for this model)",
@@ -701,6 +722,88 @@ export function runPlaybookMigration(db) {
     `VACUUM ${vacuumMs}ms`
   );
   return { deleted, vacuumMs };
+}
+
+// Dead node types that never earn recall: profile_atom (session-derived, never
+// accessed) and raw error nodes (superseded by error_fix). file/project/symbol
+// are load-bearing code intelligence and are deliberately NOT touched.
+const HYGIENE_DEAD_TYPES = ["profile_atom", "error"];
+const MAX_NODE_VERSIONS = 3;   // Keep the latest few revisions per node, not full history
+
+/**
+ * One-time storage hygiene on the brain graph:
+ *   - trim node_versions to the latest N per node (edit history the playbook
+ *     engine never reads — pure write log)
+ *   - purge zero-access dead-type nodes
+ *   - VACUUM to reclaim the freed pages
+ * Guarded by a syntheses marker; runs once per brain.db.
+ */
+export function runStorageHygiene(db) {
+  ensurePlaybookSchema(db);
+  if (getSynthesis(db, "__global__", "storage-hygiene-v1")) {
+    return { skipped: "already-ran" };
+  }
+
+  const started = Date.now();
+  let versionsDeleted = 0;
+  let nodesDeleted = 0;
+
+  try {
+    // Trim node_versions: keep only the latest MAX_NODE_VERSIONS per node.
+    const vres = db.prepare(`
+      DELETE FROM node_versions WHERE rowid IN (
+        SELECT rowid FROM (
+          SELECT rowid, ROW_NUMBER() OVER (
+            PARTITION BY node_id ORDER BY version DESC
+          ) AS rn FROM node_versions
+        ) WHERE rn > ?
+      )
+    `).run(MAX_NODE_VERSIONS);
+    versionsDeleted = vres.changes || 0;
+  } catch (err) {
+    console.warn(`[playbook] node_versions trim failed (non-fatal): ${err.message}`);
+  }
+
+  try {
+    const dead = db.prepare(`
+      SELECT id FROM nodes
+      WHERE access_count = 0
+        AND entity_type IN (${HYGIENE_DEAD_TYPES.map(() => "?").join(",")})
+    `).all(...HYGIENE_DEAD_TYPES);
+    const ids = dead.map((r) => r.id);
+
+    const purge = db.transaction((batch) => {
+      for (const id of batch) {
+        db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(id);
+        db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(id, id);
+        db.prepare("DELETE FROM nodes WHERE id = ?").run(id);
+        nodesDeleted++;
+      }
+    });
+    for (let i = 0; i < ids.length; i += 5000) {
+      purge(ids.slice(i, i + 5000));
+    }
+  } catch (err) {
+    console.warn(`[playbook] dead node purge failed (non-fatal): ${err.message}`);
+  }
+
+  putSynthesis(db, "__global__", "storage-hygiene-v1",
+    `versions=${versionsDeleted} nodes=${nodesDeleted}`, "");
+
+  let vacuumMs = 0;
+  try {
+    const vStart = Date.now();
+    db.exec("VACUUM");
+    vacuumMs = Date.now() - vStart;
+  } catch (err) {
+    console.warn(`[playbook] hygiene VACUUM failed (non-fatal): ${err.message}`);
+  }
+
+  console.log(
+    `[playbook] storage hygiene: trimmed ${versionsDeleted} node versions, ` +
+    `purged ${nodesDeleted} dead nodes in ${Date.now() - started - vacuumMs}ms, VACUUM ${vacuumMs}ms`
+  );
+  return { versionsDeleted, nodesDeleted, vacuumMs };
 }
 
 // ============================================================================

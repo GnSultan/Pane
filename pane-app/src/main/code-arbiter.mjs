@@ -1270,10 +1270,11 @@ export function recordArbiterCorrections(db, projectId, verdict, model) {
         id,
         projectId,
         f.code || f.id || "unknown",         // correction_type: "ts-ignore", "unclosed-brace", etc.
-        model || verdict.model || null,
+        model || verdict.model || "",
         "arbiter",                             // source
         `${f.file}:${f.line} — ${(f.raw || f.plain || "").slice(0, 200)}`,
-        now,
+        now,                                   // first_seen (ignored on conflict)
+        now,                                   // last_seen
       );
     } catch {}
   }
@@ -1291,16 +1292,18 @@ export function recordArbiterCorrections(db, projectId, verdict, model) {
 export function recordUserCorrection(db, projectId, correctionType, detail, model) {
   if (!db?.stmts?.insertCorrection) return;
 
-  const id = `corr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const now = Date.now();
+  const id = `corr-${now}-${Math.random().toString(36).slice(2, 6)}`;
   try {
     db.stmts.insertCorrection.run(
       id,
       projectId,
       correctionType,
-      model || null,
+      model || "",
       "user",
       (detail || "").slice(0, 200),
-      Date.now(),
+      now,   // first_seen (ignored on conflict)
+      now,   // last_seen
     );
   } catch {}
 }

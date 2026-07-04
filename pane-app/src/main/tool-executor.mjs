@@ -19,7 +19,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import vm from "node:vm";
 
-import { getPaneDb } from "./pane-db.mjs";
+import { getPaneDb, pruneChangeHistory } from "./pane-db.mjs";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 import { readState, readHandoff } from "./pane-system-prompt.mjs";
 import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
@@ -666,15 +666,17 @@ export class ToolExecutor {
     try {
       const db = getPaneDb();
       db.stmts.insertChange.run(
-        id, 
-        this.projectId, 
+        id,
+        this.projectId,
         change.filePath,
-        change.oldString ?? null, 
+        change.oldString ?? null,
         change.newString ?? "",
-        change.description || "", 
+        change.description || "",
         timestamp,
         this.projectRoot
       );
+      // Cap retention at 7 days — cheap indexed range delete per write.
+      pruneChangeHistory(this.projectId);
     } catch (err) {
       console.error("[tool-executor] Failed to record change to SQLite:", err.message);
     }

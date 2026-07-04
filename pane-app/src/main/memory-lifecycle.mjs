@@ -26,6 +26,7 @@ import {
   runReflection,
   runGlobalReflection,
   runPlaybookMigration,
+  runStorageHygiene,
 } from "./playbook-engine.mjs";
 
 // ============================================================================
@@ -133,6 +134,10 @@ export async function runMemoryLifecycle(db, projectId, quickCall = null) {
   //    (guarded internally — no-op after first run)
   const migration = runPlaybookMigration(db);
 
+  // 0b. One-time storage hygiene: trim node version history + purge dead-type
+  //     nodes + VACUUM (guarded internally — no-op after first run)
+  const hygiene = runStorageHygiene(db);
+
   // 1. Decay unused memories
   const decayResult = applyDecay(db, projectId);
 
@@ -147,6 +152,7 @@ export async function runMemoryLifecycle(db, projectId, quickCall = null) {
 
   const result = {
     migration,
+    hygiene,
     decay: decayResult,
     reflection,
     global,
@@ -155,7 +161,7 @@ export async function runMemoryLifecycle(db, projectId, quickCall = null) {
 
   const hasActivity = decayResult.decayed > 0 || decayResult.pruned > 0
     || reflection.added > 0 || reflection.retired > 0
-    || migration.deleted > 0;
+    || migration.deleted > 0 || hygiene.nodesDeleted > 0 || hygiene.versionsDeleted > 0;
 
   if (hasActivity) {
     console.log(
