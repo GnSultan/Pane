@@ -27,6 +27,7 @@ import {
   runGlobalReflection,
   runPlaybookMigration,
   runStorageHygiene,
+  runCorpusCleanup,
 } from "./playbook-engine.mjs";
 
 // ============================================================================
@@ -138,6 +139,10 @@ export async function runMemoryLifecycle(db, projectId, quickCall = null) {
   //     nodes + VACUUM (guarded internally — no-op after first run)
   const hygiene = runStorageHygiene(db);
 
+  // 0c. One-time corpus cleanup: purge auto-generated error_fix noise so it
+  //     never reaches the reflection corpus (guarded internally)
+  const corpusCleanup = runCorpusCleanup(db);
+
   // 1. Decay unused memories
   const decayResult = applyDecay(db, projectId);
 
@@ -153,6 +158,7 @@ export async function runMemoryLifecycle(db, projectId, quickCall = null) {
   const result = {
     migration,
     hygiene,
+    corpusCleanup,
     decay: decayResult,
     reflection,
     global,
@@ -161,7 +167,8 @@ export async function runMemoryLifecycle(db, projectId, quickCall = null) {
 
   const hasActivity = decayResult.decayed > 0 || decayResult.pruned > 0
     || reflection.added > 0 || reflection.retired > 0
-    || migration.deleted > 0 || hygiene.nodesDeleted > 0 || hygiene.versionsDeleted > 0;
+    || migration.deleted > 0 || hygiene.nodesDeleted > 0 || hygiene.versionsDeleted > 0
+    || corpusCleanup.purged > 0;
 
   if (hasActivity) {
     console.log(

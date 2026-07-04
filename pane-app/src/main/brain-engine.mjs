@@ -1052,6 +1052,15 @@ const DEDUP_THRESHOLD = 0.9; // Cosine similarity above this = same concept
 // graph with zero recalls. "error" is kept for error→fix edges.
 const GRAPH_EVENT_TYPES = new Set([...KNOWLEDGE_TYPES, "error", "principle"]);
 
+// Seed confidence by signal quality. user_correction is a human stating a
+// standard — the most trustworthy input we have, so it enters near-certain.
+// decision/lesson/principle are strong; everything else starts as a hypothesis.
+function seedConfidenceFor(type) {
+  if (type === "user_correction") return 0.85;
+  if (type === "decision" || type === "lesson" || type === "principle") return 0.65;
+  return 0.5;
+}
+
 async function indexEvents(projectId, events) {
   if (!db) return { indexed: 0, deduplicated: 0 };
 
@@ -1111,17 +1120,17 @@ async function indexEvents(projectId, events) {
         if (isDuplicate) continue;
 
         // New node with embedding
-        const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+        const seedConfidence = seedConfidenceFor(event.type);
         const embeddingBuffer = Buffer.from(embedding.buffer);
         db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), embeddingBuffer, seedConfidence);
       } else {
         // Embedding failed — insert without
-        const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+        const seedConfidence = seedConfidenceFor(event.type);
         db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, seedConfidence);
       }
     } else {
       // Embedder not ready — insert without embedding
-      const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+      const seedConfidence = seedConfidenceFor(event.type);
       db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, seedConfidence);
     }
 

@@ -147,7 +147,7 @@ import { contextStore } from "./context-store.mjs";
 import { propagateCompletion } from "./completion-propagator.mjs";
 import { extractAndIndex } from "./memory-extractor.mjs";
 import { readThreadState, incrementFailure, recordSuccess, updateLastPrompt, updateLastResponse, recordApproach } from "./thread-state.mjs";
-import { recordQualityMetric, recordArbiterCorrections, isUserCorrection, recordUserCorrection } from "./code-arbiter.mjs";
+import { recordQualityMetric, recordArbiterCorrections, isUserCorrection, recordUserCorrection, buildUserCorrectionEvent } from "./code-arbiter.mjs";
 
 // Node.js globals for utility process
 const { setImmediate, console } =
@@ -1412,6 +1412,15 @@ Respond with a single concise principle statement (one sentence, under 150 chara
             resolvedRequest.model,
           );
         } catch {}
+
+        // The correction itself is the gold: a human stating a standard. Capture
+        // the PAIR (what was rejected → what was demanded) as a high-signal node
+        // so reflection can distill it into a durable principle. This is the
+        // friction-point capture — born high-signal, not mined from exhaust.
+        if (this._brainIndexer) {
+          const evt = buildUserCorrectionEvent(resolvedRequest.prompt, resolvedRequest.history);
+          if (evt) this._brainIndexer(resolvedRequest.projectId, [evt]).catch(() => {});
+        }
       }
     }
 

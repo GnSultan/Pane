@@ -61,8 +61,10 @@ const MIN_MODEL_TURNS = 10;               // Don't profile from too little data
 // model profiles so one misconfigured project can't pollute a model's fingerprint.
 const CONFIG_CLASS_CODES = ["TS17004", "TS6142", "TS5076", "TS2688", "TS5083", "TS5023"];
 
-// Observation types that qualify as knowledge (vs session exhaust)
-export const KNOWLEDGE_TYPES = ["lesson", "error_fix", "pattern", "decision"];
+// Observation types that qualify as knowledge (vs session exhaust).
+// user_correction is the highest-value signal — a human stating a standard —
+// captured at the friction point, not mined from the activity stream.
+export const KNOWLEDGE_TYPES = ["user_correction", "lesson", "error_fix", "pattern", "decision"];
 
 // ============================================================================
 // Schema
@@ -103,8 +105,9 @@ const REFLECTION_SYSTEM_PROMPT = `You are the reflection engine of Pane, a devel
 
 Rules:
 - A principle is an actionable belief about how to work in THIS codebase: "do X when Y", "never Z because W". 1-2 sentences, concrete enough to change behavior.
+- Observations of type "user_correction" are the HIGHEST-VALUE signal: the human explicitly stated a standard or rejected an approach. When one expresses a durable preference (a rule about how things should always be done — style, architecture, process), promote it to a principle almost verbatim in the user's intent. When it's a one-off, task-specific correction ("no, edit the other file"), ignore it — it is not a standard.
 - Merge overlapping observations into one general principle. Generalize from specific incidents to the rule they imply.
-- Contradictions are the most valuable signal: when a new observation conflicts with an existing principle, revise or narrow the principle ("this holds except when X") rather than keeping both.
+- Contradictions are the most valuable signal: when a new observation conflicts with an existing principle, revise or narrow the principle ("this holds except when X") rather than keeping both. A user_correction always wins a contradiction against a machine-derived principle.
 - Retire principles that are stale, too narrow to matter, chronically violated (see ledger counts), or subsumed by a better one. Omitting an existing principle from your output retires it.
 - Fewer, stronger principles beat many weak ones. Only keep what would change how a developer acts.
 - Never invent principles that are not grounded in the provided observations or existing playbook.
@@ -828,6 +831,55 @@ export function runStorageHygiene(db) {
     `purged ${nodesDeleted} dead nodes in ${Date.now() - started - vacuumMs}ms, VACUUM ${vacuumMs}ms`
   );
   return { versionsDeleted, nodesDeleted, vacuumMs };
+}
+
+/**
+ * One-time corpus cleanup: purge auto-generated error_fix noise.
+ *
+ * Before the surprise-gated extractor landed, tool/shell errors were captured
+ * verbatim as "error_fix" nodes with the template text `Fixed: <raw error>`
+ * ("Fixed: File does not exist", "Fixed: <tool_use_error>...", "Fixed: Unknown
+ * tool: Read"). These carry no lesson — they echo the error. Genuine fixes
+ * explain a root cause and never match this template. We purge only the
+ * zero-access templated echoes, so any that were ever recalled survive.
+ * Guarded by its own marker; runs once.
+ */
+export function runCorpusCleanup(db) {
+  ensurePlaybookSchema(db);
+  if (getSynthesis(db, "__global__", "corpus-cleanup-v1")) {
+    return { skipped: "already-ran" };
+  }
+
+  let purged = 0;
+  try {
+    // The stored content is JSON: {"text":"Fixed: ...","metadata":{...}}.
+    // Match the templated echo at the start of the text field, zero-access only.
+    const noise = db.prepare(`
+      SELECT id FROM nodes
+      WHERE entity_type = 'error_fix'
+        AND access_count = 0
+        AND content LIKE '{"text":"Fixed: %'
+    `).all();
+    const ids = noise.map((r) => r.id);
+
+    const purge = db.transaction((batch) => {
+      for (const id of batch) {
+        db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(id);
+        db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(id, id);
+        db.prepare("DELETE FROM nodes WHERE id = ?").run(id);
+        purged++;
+      }
+    });
+    for (let i = 0; i < ids.length; i += 5000) {
+      purge(ids.slice(i, i + 5000));
+    }
+  } catch (err) {
+    console.warn(`[playbook] corpus cleanup failed (non-fatal): ${err.message}`);
+  }
+
+  putSynthesis(db, "__global__", "corpus-cleanup-v1", `purged=${purged}`, "");
+  console.log(`[playbook] corpus cleanup: purged ${purged} templated error_fix echoes`);
+  return { purged };
 }
 
 // ============================================================================

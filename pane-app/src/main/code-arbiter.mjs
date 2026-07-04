@@ -1322,6 +1322,65 @@ export function isUserCorrection(message) {
 }
 
 /**
+ * Pull the most recent assistant text from conversation history. Handles both
+ * string content and content-block arrays (Anthropic-style). Used to capture
+ * the "what was rejected" half of a user-correction pair.
+ *
+ * @param {Array} history
+ * @returns {string}
+ */
+function extractLastAssistantText(history) {
+  if (!Array.isArray(history)) return "";
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (!msg) continue;
+    const role = msg.type || msg.role;
+    if (role !== "assistant") continue;
+    const content = msg.content ?? msg.message?.content;
+    if (typeof content === "string") return content.trim();
+    if (Array.isArray(content)) {
+      const text = content
+        .filter(b => b?.type === "text" && typeof b.text === "string")
+        .map(b => b.text)
+        .join(" ")
+        .trim();
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+/**
+ * Build a user-correction event from a negation and the turn it rejects.
+ *
+ * A user correction is the highest-value signal Pane can capture: a human
+ * explicitly stating a standard ("no, fix root causes", "don't add borders").
+ * We capture the PAIR — what the assistant did, and what the user demanded
+ * instead — so the reflection engine can distill it into a durable principle.
+ * Returns null when there's nothing usable to record.
+ *
+ * @param {string} prompt - the user's correcting message
+ * @param {Array} history - conversation history (to recover the rejected turn)
+ * @returns {{type: string, content: string, metadata: object}|null}
+ */
+export function buildUserCorrectionEvent(prompt, history) {
+  const demanded = (prompt || "").trim();
+  if (demanded.length < 3) return null;
+
+  const rejected = extractLastAssistantText(history).slice(0, 400);
+  const content = rejected
+    ? `The user rejected the assistant's approach and demanded: "${demanded.slice(0, 500)}". ` +
+      `Context — the assistant had just said/done: ${rejected}`
+    : `The user issued a correction: "${demanded.slice(0, 500)}"`;
+
+  return {
+    type: "user_correction",
+    content,
+    metadata: { correction_verbatim: demanded.slice(0, 500), source: "user" },
+  };
+}
+
+/**
  * Get repeated corrections that should graduate to rules.
  * Returns correction types that occurred 3+ times in the last 7 days.
  *
