@@ -1039,7 +1039,7 @@ class PunkEngine {
             });
             // Record individual correction events for pattern detection
             if (!v.pass) {
-              recordArbiterCorrections(db, tracked.projectId, v);
+              recordArbiterCorrections(db, tracked.projectId, v, v.model || tracked.model);
             }
           } catch {}
 

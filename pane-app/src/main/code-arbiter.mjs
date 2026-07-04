@@ -1258,7 +1258,7 @@ const NEGATION_PATTERNS = [
  * @param {string} projectId
  * @param {ArbiterVerdict} verdict
  */
-export function recordArbiterCorrections(db, projectId, verdict) {
+export function recordArbiterCorrections(db, projectId, verdict, model) {
   if (!db?.stmts?.insertCorrection || !verdict?.findings) return;
 
   const now = Date.now();
@@ -1270,7 +1270,7 @@ export function recordArbiterCorrections(db, projectId, verdict) {
         id,
         projectId,
         f.code || f.id || "unknown",         // correction_type: "ts-ignore", "unclosed-brace", etc.
-        verdict.model || null,
+        model || verdict.model || null,
         "arbiter",                             // source
         `${f.file}:${f.line} — ${(f.raw || f.plain || "").slice(0, 200)}`,
         now,
