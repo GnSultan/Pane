@@ -161,6 +161,24 @@ function putSynthesis(db, projectId, kind, content, sourceHash) {
   `).run(`${kind}-${projectId}`, projectId, kind, content, sourceHash, Math.floor(Date.now() / 1000));
 }
 
+/**
+ * Record the outcome of a reflection attempt so it is never silent. Persists to
+ * the syntheses table (queryable without log access): last reason, timestamp,
+ * and — on parse failure — a sample of what the model actually returned.
+ * This is the observability that turns "reflection produced nothing" from
+ * archaeology into a single SELECT.
+ */
+function recordReflectAttempt(db, projectId, reason, rawSample) {
+  try {
+    const payload = JSON.stringify({
+      reason,
+      at: Date.now(),
+      ...(rawSample ? { sample: String(rawSample).slice(0, 600) } : {}),
+    });
+    putSynthesis(db, projectId, "playbook-attempt", payload, "");
+  } catch {}
+}
+
 /** Extract a JSON object from an LLM response that may be fenced or padded. */
 function parseJsonResponse(raw) {
   if (!raw) return null;
@@ -215,6 +233,7 @@ export async function runReflection(db, projectId, llmCall) {
   // First reflection needs a real corpus; later ones can run on playbook alone
   // (to apply ledger evidence) but only when something actually changed.
   if (active.length === 0 && observations.length < MIN_NEW_OBSERVATIONS) {
+    recordReflectAttempt(db, projectId, "too-few-observations");
     return { skipped: "too-few-observations" };
   }
 
@@ -242,6 +261,7 @@ export async function runReflection(db, projectId, llmCall) {
   const parsed = parseJsonResponse(raw);
   if (!parsed || !Array.isArray(parsed.playbook)) {
     console.warn(`[playbook] reflection for ${projectId}: unparseable LLM output`);
+    recordReflectAttempt(db, projectId, raw ? "bad-llm-output" : "llm-null", raw);
     return { skipped: "bad-llm-output" };
   }
 
@@ -291,6 +311,7 @@ export async function runReflection(db, projectId, llmCall) {
   const retired = active.length - kept;
   const markdown = writePlaybookMarkdown(db, projectId);
   putSynthesis(db, projectId, "playbook", markdown, sourceHash);
+  recordReflectAttempt(db, projectId, `ok kept=${kept} added=${added} retired=${retired}`);
 
   console.log(`[playbook] reflection for ${projectId}: kept=${kept} added=${added} retired=${retired}`);
   return { kept, added, retired };
@@ -491,6 +512,7 @@ export async function runModelProfileReflection(db, modelId, llmCall) {
 
   const { stats, corrections } = gatherModelEvidence(db, modelId);
   if (!stats.total_turns || stats.total_turns < MIN_MODEL_TURNS) {
+    recordReflectAttempt(db, `model:${modelId}`, `too-few-turns (${stats.total_turns || 0})`);
     return { skipped: "too-few-turns" };
   }
 
@@ -545,6 +567,7 @@ export async function runModelProfileReflection(db, modelId, llmCall) {
   const parsed = parseJsonResponse(raw);
   if (!parsed || !Array.isArray(parsed.profile)) {
     console.warn(`[playbook] model profile for ${modelId}: unparseable LLM output`);
+    recordReflectAttempt(db, `model:${modelId}`, raw ? "bad-llm-output" : "llm-null", raw);
     return { skipped: "bad-llm-output" };
   }
 
@@ -554,6 +577,7 @@ export async function runModelProfileReflection(db, modelId, llmCall) {
 
   writeModelProfileMarkdown(modelId, directives);
   putSynthesis(db, "__global__", synthKey, directives.map((d) => d.text).join("\n"), sourceHash);
+  recordReflectAttempt(db, `model:${modelId}`, `ok directives=${directives.length}`);
 
   console.log(`[playbook] model profile for ${modelId}: ${directives.length} directives`);
   return { directives: directives.length };
