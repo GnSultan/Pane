@@ -663,6 +663,30 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "ask_user",
+      description:
+        "Pause and ask the user a question, then STOP and wait for their reply before doing anything else. Use this when you are unsure how to proceed, when you need the user to test something and report back, when a decision is theirs to make, or when you cannot verify your work yourself. Calling this ENDS your turn — you will not continue until the user answers. Do NOT use it to narrate progress or announce what you're about to do; use it only to genuinely request input you cannot obtain on your own.",
+      parameters: {
+        type: "object",
+        properties: {
+          question: {
+            type: "string",
+            description:
+              "The specific question or request for the user. Be concrete about exactly what you need from them.",
+          },
+          context: {
+            type: "string",
+            description:
+              "Optional: brief context on what you did and why you need their input — e.g. what to test, what the options are, what you're unsure about.",
+          },
+        },
+        required: ["question"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "Task",
       description:
         "Set the active task that you are currently working on. This is displayed in the Pane status bar.",
@@ -2259,6 +2283,7 @@ export class ApiBackend extends PunkBackend {
       const MAX_TURN_RETRIES = 3;
       let turnRetryCount = 0;
       let _preCallMessageCount = 0; // Hoisted for post-turn archiving
+      let awaitingUserInput = false; // Set when the model calls ask_user — ends the loop cleanly
 
       while (turn < maxTurns) {
         turn++;
@@ -3350,12 +3375,19 @@ export class ApiBackend extends PunkBackend {
                 // Ends with punctuation that implies more is coming
                 /[,:]\s*$/.test(lastOutput.slice(-50)));
 
-            if ((workLeft || looksIncomplete) && turn < maxTurns) {
+            // Continue ONLY when the output was genuinely cut off mid-stream
+            // (unclosed code fence, explicit "I'll continue", trailing comma).
+            // Lingering todos do NOT force continuation: a model doing real work
+            // keeps calling tools — a stop with no tools is the model YIELDING,
+            // whether it's done or wants the user's input. Respect that instead
+            // of force-feeding "keep going," which is what made the model plow
+            // past completion and ignore the need for user verification.
+            if (looksIncomplete && turn < maxTurns) {
               const remaining = todos.filter((t) => t.status !== "completed");
               const continueReason =
                 looksIncomplete && !workLeft
                   ? "incomplete output detected"
-                  : `work is pending (${remaining.length} todos)`;
+                  : `incomplete output with ${remaining.length} pending todos`;
               console.log(
                 `[http] Auto-continuing turn ${turn} - ${continueReason}`,
               );
@@ -3590,6 +3622,42 @@ export class ApiBackend extends PunkBackend {
               } catch (err) {
                 result = { success: false, error: err.message };
               }
+            } else if (tool.name === "ask_user") {
+              // Terminal tool: the model is handing control back to the user.
+              // Surface the question as a normal assistant message so it renders
+              // in the conversation, flag the wait, and acknowledge the tool so
+              // the turn closes with a valid tool_result. The loop breaks after
+              // this batch — the user's next message resumes naturally.
+              const question = (parsedInput.question || "").trim();
+              const ctx = (parsedInput.context || "").trim();
+              const visible = ctx ? `${ctx}\n\n${question}` : question;
+              if (visible) {
+                this.onEvent(
+                  request.projectId,
+                  {
+                    event: "message",
+                    data: {
+                      parsed: {
+                        type: "assistant",
+                        message: { content: [{ type: "text", text: visible }] },
+                      },
+                    },
+                  },
+                  request.requestId,
+                );
+              }
+              // Signal the renderer that the session is waiting on the user.
+              this.onEvent(
+                request.projectId,
+                { event: "awaiting_input", data: { question } },
+                request.requestId,
+              );
+              awaitingUserInput = true;
+              result = {
+                success: true,
+                output:
+                  "Question delivered to the user. The turn is now paused — stop here and wait for the user's reply. Do not take further action.",
+              };
             } else {
               result = await executor.executeTool(
                 tool.id,
@@ -4228,6 +4296,14 @@ export class ApiBackend extends PunkBackend {
           timestamp: Date.now(),
           phase: "post-turn",
         });
+
+        // The model called ask_user — it is explicitly handing control back and
+        // waiting for a reply. Stop the loop cleanly (all post-turn processing
+        // above has run); the user's next message resumes the conversation.
+        if (awaitingUserInput) {
+          console.log(`[http] ask_user on turn ${turn} — pausing for user input.`);
+          break;
+        }
       }
 
       // Signal successful completion — mirrors cli-worker's "result" event so the

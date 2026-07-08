@@ -154,6 +154,22 @@ export function orchestrateContext(projectId, options = {}) {
     "A session that discovers but doesn't record forces re-discovery."
   );
 
+  // 4b. Terminal-state awareness (API turn-loop only — ask_user exists there).
+  //     The loop keeps running while you call tools. Be deliberate about when
+  //     you stop: finish, or hand back to the user — don't drift past done.
+  if (options.backend === "http") {
+    parts.push(
+      "## Finishing and asking\n\n" +
+      "Every turn you keep calling tools, work continues. When you stop calling tools, control returns to the user. " +
+      "Be deliberate about which of three states you're in:\n" +
+      "- Still working: keep going, use tools. Don't stop mid-task.\n" +
+      "- Done: the task is complete and verified. Stop with a brief summary of what changed. Do not invent more work.\n" +
+      "- Need the user: you're unsure how to proceed, a decision is theirs, or you need them to test/confirm something you cannot verify yourself. " +
+      "Call ask_user with a concrete question and STOP — you will wait for their reply. Never guess or plow ahead when the right move is to ask.\n\n" +
+      "If your work needs to be tested or confirmed and you cannot verify it yourself, ask_user rather than declaring it done."
+    );
+  }
+
   // 5. Arbiter findings — if unresolved errors exist, surface them immediately
   const verdict = readVerdict(projectId);
   const arbiterText = formatVerdictForContext(verdict);
