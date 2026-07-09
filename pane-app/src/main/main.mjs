@@ -63,6 +63,7 @@ import { loadRecentTurns } from "./session-turns.mjs";
 import { setCmdWorker, execThroughWorker, onCmdWorkerExit } from "./tool-executor.mjs";
 import { mergeState } from "./pane-system-prompt.mjs";
 import { runModelProfileReflection } from "./playbook-engine.mjs";
+import { createCheckpointSnapshot } from "./checkpoint-engine.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -1270,127 +1271,13 @@ function startMcpFileWatcher() {
 }
 
 function registerCheckpointHandlers(db) {
-  const CHECKPOINT_MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
-  const CHECKPOINT_MAX_FILES = 200;
-
   function checkpointDir(projectId) {
     return path.join(os.homedir(), ".pane", "checkpoints", projectId);
   }
 
   ipcMain.handle("create_checkpoint", async (_event, args) => {
     const { projectId, workingDir, messageId } = args;
-    const cpId = `cp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    // Must be a git repo
-    let headCommit = null;
-    try {
-      const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], {
-        cwd: workingDir,
-      });
-      headCommit = stdout.trim();
-    } catch {
-      return { id: null, fileCount: 0 };
-    }
-
-    // Get dirty + untracked files
-    let porcelain = "";
-    try {
-      const { stdout } = await execFileAsync(
-        "git",
-        ["status", "--porcelain=v1", "-unormal"],
-        { cwd: workingDir },
-      );
-      porcelain = stdout;
-    } catch {
-      return { id: null, fileCount: 0 };
-    }
-
-    const entries = [];
-    for (const line of porcelain.split("\n")) {
-      if (line.length < 4) continue;
-      const statusCode = line.slice(0, 2).trim();
-      let filePath = line.slice(3);
-      const arrowPos = filePath.indexOf(" -> ");
-      if (arrowPos !== -1) filePath = filePath.slice(arrowPos + 4);
-      entries.push({ relativePath: filePath, gitStatus: statusCode });
-    }
-
-    // Read file contents (skip binary, large files)
-    const files = [];
-    for (const { relativePath, gitStatus } of entries.slice(
-      0,
-      CHECKPOINT_MAX_FILES,
-    )) {
-      const fullPath = path.join(workingDir, relativePath);
-      try {
-        const stat = await fs.promises.stat(fullPath);
-        if (stat.size > CHECKPOINT_MAX_FILE_SIZE) continue;
-        const buffer = await fs.promises.readFile(fullPath);
-        // Binary check: null byte in first 512 bytes
-        const checkLen = Math.min(buffer.length, 512);
-        let isBinary = false;
-        for (let i = 0; i < checkLen; i++) {
-          if (buffer[i] === 0) {
-            isBinary = true;
-            break;
-          }
-        }
-        if (isBinary) continue;
-        files.push({
-          relativePath,
-          content: buffer.toString("utf-8"),
-          gitStatus,
-        });
-      } catch {
-        files.push({ relativePath, content: null, gitStatus });
-      }
-    }
-
-    const checkpoint = {
-      id: cpId,
-      timestamp: Date.now(),
-      projectId,
-      headCommit,
-      files,
-      messageId,
-    };
-    const dir = checkpointDir(projectId);
-    await fs.promises.mkdir(dir, { recursive: true });
-    await fs.promises.writeFile(
-      path.join(dir, `${cpId}.json`),
-      JSON.stringify(checkpoint),
-      "utf-8",
-    );
-
-    // Insert metadata into SQLite
-    db.stmts.insertCheckpoint.run(
-      cpId, projectId, messageId ?? null,
-      checkpoint.timestamp, files.length, headCommit,
-    );
-
-    // Keep manifest.json in sync for tool-executor.mjs and pane-mcp-server.mjs
-    try {
-      const allMeta = db.stmts.listCheckpoints.all(projectId);
-      const manifest = allMeta.map(m => ({
-        id: m.id,
-        timestamp: m.created_at,
-        messageId: m.message_id,
-        fileCount: m.file_count,
-        headCommit: m.head_commit,
-        workingDir,
-      }));
-      await fs.promises.writeFile(
-        path.join(dir, "manifest.json"),
-        JSON.stringify({ projectId, projectRoot: workingDir, checkpoints: manifest }),
-        "utf-8",
-      );
-    } catch {}
-
-    return {
-      id: cpId,
-      fileCount: files.length,
-      timestamp: checkpoint.timestamp,
-    };
+    return createCheckpointSnapshot({ projectId, workingDir, messageId });
   });
 
   ipcMain.handle("restore_checkpoint", async (_event, args) => {
@@ -1446,7 +1333,16 @@ function registerCheckpointHandlers(db) {
           if (ap !== -1) fp = fp.slice(ap + 4);
           if (cpPaths.has(fp)) continue;
           if (sc === "??") {
-            restored.push({ path: fp, action: "orphaned_new" });
+            // Untracked file that did not exist at checkpoint time — it was
+            // created during the turn(s) being reverted. A true point-in-time
+            // restore must remove it, otherwise the working tree keeps files
+            // that weren't there at the checkpoint.
+            try {
+              await fs.promises.unlink(path.join(workingDir, fp));
+              restored.push({ path: fp, action: "deleted_new" });
+            } catch {
+              restored.push({ path: fp, action: "orphaned_new" });
+            }
           } else {
             try {
               await execFileAsync(
@@ -1623,11 +1519,26 @@ function registerCheckpointHandlers(db) {
     try {
       const currentContent = await fs.promises.readFile(resolvedPath, "utf-8");
 
-      if (!currentContent.includes(row.new_string)) {
-        return { success: false, error: "File content doesn't match expected change" };
+      // Find the edit's post-edit text. Use lastIndexOf so we undo the most
+      // recent matching occurrence. If it's gone, the file was changed after
+      // this edit — single-edit undo can't safely apply. Point the user at the
+      // checkpoint restore, which reverts the whole file to an earlier state.
+      const idx = currentContent.lastIndexOf(row.new_string);
+      if (idx === -1) {
+        return {
+          success: false,
+          error:
+            "This file was changed after this edit, so the edited text is no longer present. Undo the newer changes on this file first, or restore an earlier checkpoint to revert the whole file.",
+        };
       }
 
-      const revertedContent = currentContent.replace(row.new_string, row.old_string ?? "");
+      // Splice the replacement in by index — avoids String.replace treating
+      // '$' sequences in old_string as special replacement patterns, and
+      // guarantees exactly one, precise occurrence is reverted.
+      const revertedContent =
+        currentContent.slice(0, idx) +
+        (row.old_string ?? "") +
+        currentContent.slice(idx + row.new_string.length);
       await fs.promises.writeFile(resolvedPath, revertedContent, "utf-8");
 
       db.stmts.deleteChangeById.run(changeId);

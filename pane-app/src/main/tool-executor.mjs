@@ -1865,6 +1865,26 @@ export class ToolExecutor {
           return { success: true, output: `${manifest.checkpoints.length} checkpoints:\n${out}`, toolId };
         }
 
+        case "create_checkpoint": {
+          const { createCheckpointSnapshot } = await import("./checkpoint-engine.mjs");
+          const result = await createCheckpointSnapshot({
+            projectId: this.projectId,
+            workingDir: this.projectRoot,
+            label: input.label,
+          });
+          if (!result.id) {
+            const why = result.reason === "not-a-git-repo"
+              ? "this project is not a git repository"
+              : "no snapshot could be taken";
+            return { success: false, error: `Checkpoint not saved — ${why}.`, toolId };
+          }
+          return {
+            success: true,
+            output: `Checkpoint saved (${result.fileCount} file${result.fileCount === 1 ? "" : "s"})${input.label ? ` — ${input.label}` : ""}. This state can be restored later if the changes don't work out.`,
+            toolId,
+          };
+        }
+
         case "pane_change_history": {
           const db = getPaneDb();
           const rows = db.stmts.getChanges.all(this.projectId);

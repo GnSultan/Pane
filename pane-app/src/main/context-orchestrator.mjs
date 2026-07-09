@@ -166,7 +166,8 @@ export function orchestrateContext(projectId, options = {}) {
       "- Done: the task is complete and verified. Stop with a brief summary of what changed. Do not invent more work.\n" +
       "- Need the user: you're unsure how to proceed, a decision is theirs, or you need them to test/confirm something you cannot verify yourself. " +
       "Call ask_user with a concrete question and STOP — you will wait for their reply. Never guess or plow ahead when the right move is to ask.\n\n" +
-      "If your work needs to be tested or confirmed and you cannot verify it yourself, ask_user rather than declaring it done."
+      "If your work needs to be tested or confirmed and you cannot verify it yourself, ask_user rather than declaring it done.\n\n" +
+      "Before a risky or large change — a refactor, a deletion, edits you're unsure about — call create_checkpoint first so the state can be restored if it doesn't work out."
     );
   }
 

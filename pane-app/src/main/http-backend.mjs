@@ -397,6 +397,25 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "create_checkpoint",
+      description:
+        "Save a checkpoint — a snapshot of the current contents of every modified file — BEFORE you make a risky or large change (a refactor, a deletion, edits you're unsure about). If the change doesn't work out, this exact state can be restored. Cheap and safe to call; requires a git repo. Prefer this over hoping an edit is reversible.",
+      parameters: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            description:
+              "Optional short label for what you're about to do, e.g. 'before auth refactor'.",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "pane_change_history",
       description:
         "List the history of file changes made during this session. Shows the file, old content, new content, and timestamp for each change.",
