@@ -1102,22 +1102,21 @@ function createProjectsStore() {
     prependOlderMessages: (projectId, olderMessages, newStartIndex) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const merged = [
-            ...olderMessages.map((m) => ({ ...m, isHistorical: true })),
-            ...p.conversation.messages,
-          ];
-          // Cap to most recent N, adjusting start index for trimmed front
-          const trimmed = merged.length > MAX_STORE_MESSAGES
-            ? merged.length - MAX_STORE_MESSAGES
-            : 0;
-          const capped = trimmed > 0
-            ? merged.slice(trimmed)
-            : merged;
+          // Do NOT trim the front here: the front is exactly the older messages
+          // the user just asked to load. Trimming them created a permanent
+          // ceiling at MAX_STORE_MESSAGES where "load older" became a no-op.
+          // Explicit back-paging grows the window; the live-append cap
+          // (addConversationMessage) still bounds normal streaming growth.
+          // Dedupe against what's already loaded to guard overlapping slices.
+          const existingIds = new Set(p.conversation.messages.map((m) => m.id));
+          const older = olderMessages
+            .filter((m) => !existingIds.has(m.id))
+            .map((m) => ({ ...m, isHistorical: true }));
           return {
             conversation: {
               ...p.conversation,
-              messages: capped,
-              historyStartIndex: newStartIndex + trimmed,
+              messages: [...older, ...p.conversation.messages],
+              historyStartIndex: newStartIndex,
             },
           };
         }),
