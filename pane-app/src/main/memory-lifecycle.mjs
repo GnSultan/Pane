@@ -38,6 +38,13 @@ const DECAY_RATE_PER_WEEK = 0.01;        // Confidence drop per week of no acces
 const REINFORCE_BOOST = 0.05;            // Confidence boost on useful recall
 const STALE_THRESHOLD_DAYS = 3;          // Days without access before memory is prunable
 
+// A source observation that has already been distilled into a principle AND has
+// never been recalled has handed its value to the playbook. It doesn't need to
+// linger for a year at the normal decay rate — retire it faster. The principle
+// carries the knowledge forward; the raw node is just an unread receipt.
+const DISTILLED_UNREAD_DECAY_MULT = 6;   // ~1yr normal retirement → ~2 months
+const PROTECTED_DECAY_TYPES = new Set(["file", "project"]); // code map — never fast-decay
+
 // ============================================================================
 // 1. DECAY — unused memories fade
 // ============================================================================
@@ -55,6 +62,22 @@ export function applyDecay(db, projectId) {
   let decayed = 0;
   let pruned = 0;
 
+  // Build the set of source nodes that have already been distilled into an
+  // active principle. Their value now lives in the playbook, so if they've also
+  // never been recalled we let them decay faster (see below). Safe if the
+  // principles table isn't ready yet — treat as empty.
+  const distilledSources = new Set();
+  try {
+    const rows = db.prepare(
+      `SELECT born_from FROM principles WHERE project_id = ? AND status = 'active'`,
+    ).all(projectId);
+    for (const r of rows) {
+      try {
+        for (const id of JSON.parse(r.born_from || "[]")) distilledSources.add(id);
+      } catch {}
+    }
+  } catch {}
+
   // Get nodes not updated in the last week
   const staleNodes = db._stmts.getStaleNodes.all(projectId, "-7 days");
 
@@ -62,7 +85,19 @@ export function applyDecay(db, projectId) {
     // Calculate weeks since last access
     const updatedAt = new Date(node.updated_at).getTime();
     const weeksSinceAccess = Math.max(0, (Date.now() - updatedAt) / (7 * 24 * 60 * 60 * 1000));
-    const decay = DECAY_RATE_PER_WEEK * weeksSinceAccess;
+
+    // Accelerate decay for nodes whose knowledge is already captured in a
+    // principle and that have never been recalled — the raw node is redundant.
+    // The code map (file/project) is exempt: it's rebuildable intelligence, not
+    // a distilled-away observation.
+    const distilledUnread =
+      (node.access_count ?? 0) === 0 &&
+      distilledSources.has(node.id) &&
+      !PROTECTED_DECAY_TYPES.has(node.entity_type);
+    const rate = distilledUnread
+      ? DECAY_RATE_PER_WEEK * DISTILLED_UNREAD_DECAY_MULT
+      : DECAY_RATE_PER_WEEK;
+    const decay = rate * weeksSinceAccess;
 
     if (node.confidence - decay < 0.15) {
       // Too faded — prune if old enough

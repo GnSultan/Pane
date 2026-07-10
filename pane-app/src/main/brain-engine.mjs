@@ -695,7 +695,7 @@ function initDatabase() {
       UPDATE nodes SET confidence = MIN(0.95, confidence + ?), updated_at = datetime('now') WHERE id = ?
     `),
     getStaleNodes: db.prepare(`
-      SELECT id, confidence, updated_at FROM nodes
+      SELECT id, confidence, updated_at, access_count, entity_type FROM nodes
       WHERE project_id = ? AND confidence > 0.2
       AND updated_at < datetime('now', ?)
     `),
