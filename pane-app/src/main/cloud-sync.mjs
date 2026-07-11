@@ -43,14 +43,12 @@ async function fetchWithTimeout(url, opts = {}) {
 // Upload — called after local backup completes
 // ---------------------------------------------------------------------------
 
-// Each part is ≤4MB — well under Cloudflare Workers' 100MB body limit.
-// Parts are uploaded sequentially through the Worker which forwards them to
-// R2's multipart upload API via the binding.
-const PART_SIZE = 4 * 1024 * 1024;
-
 /**
  * Compress, encrypt, and upload a local backup directory to Pane Cloud.
- * Uses R2 multipart upload (via Worker binding) to keep each part well under body size limits.
+ *
+ * Uploads directly to R2 via an AWS SigV4 presigned PUT URL — zero Worker
+ * buffering, no body size limits, one HTTP round-trip instead of the
+ * legacy multipart-though-Worker approach.
  *
  * @param {string} backupDir — path to the dated backup dir (e.g. ~/.pane/backups/2026-03-22/)
  * @returns {{ backup_id: string, size_bytes: number }}
@@ -90,69 +88,50 @@ export async function uploadBackup(backupDir) {
 
     emitProgress("uploading");
 
-    // Step 1: Initiate multipart upload
-    const initRes = await fetchWithTimeout(`${apiUrl}/backups/upload-init`, {
+    // Step 1: Request a presigned upload URL from the Worker
+    const urlRes = await fetchWithTimeout(`${apiUrl}/backups/upload-url`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
+      body: JSON.stringify({ size_bytes: stat.size, checksum }),
     });
 
-    if (!initRes.ok) {
-      const err = await initRes.json().catch(() => ({}));
-      throw new Error(err.error || `Upload init failed: ${initRes.status}`);
+    if (!urlRes.ok) {
+      const err = await urlRes.json().catch(() => ({}));
+      throw new Error(err.error || `Failed to get upload URL: ${urlRes.status}`);
     }
 
-    const { backup_id, r2_key, upload_id } = await initRes.json();
+    const { backup_id, r2_key, upload_url } = await urlRes.json();
 
-    // Step 2: Upload each part
-    const parts = [];
-    const fd = await fs.open(encPath, "r");
+    // Step 2: Upload directly to R2 via presigned URL — no Worker proxy,
+    // no body size limits, no multipart buffering. One round-trip.
+    // Timeout: larger uploads need more time; 5 minutes covers ~500 MB
+    // on a typical connection.
+    const R2_UPLOAD_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    const encData = await fs.readFile(encPath);
+
+    const r2Ctrl = new AbortController();
+    const r2Timer = setTimeout(() => r2Ctrl.abort(), R2_UPLOAD_TIMEOUT);
+    let uploadRes;
     try {
-      let partNumber = 0;
-      let offset = 0;
-
-      while (offset < stat.size) {
-        partNumber++;
-        const chunkSize = Math.min(PART_SIZE, stat.size - offset);
-        const buf = Buffer.alloc(chunkSize);
-        const { bytesRead } = await fd.read(buf, 0, chunkSize, offset);
-        if (bytesRead === 0) break;
-
-        const partRes = await fetchWithTimeout(
-          `${apiUrl}/backups/upload-part/${backup_id}?partNumber=${partNumber}&uploadId=${upload_id}&r2Key=${encodeURIComponent(r2_key)}`,
-          {
-            method: "PUT",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "Content-Type": "application/octet-stream",
-            },
-            body: buf.subarray(0, bytesRead),
-          },
-        );
-
-        if (!partRes.ok) {
-          const err = await partRes.json().catch(() => ({}));
-          throw new Error(`Part ${partNumber} failed: ${err.error || partRes.status}`);
-        }
-
-        const { etag } = await partRes.json();
-        parts.push({ partNumber, etag });
-        offset += bytesRead;
-
-        emitProgress("uploading", {
-          backup_id,
-          parts_uploaded: partNumber,
-          total_parts: Math.ceil(stat.size / PART_SIZE),
-        });
-      }
+      uploadRes = await fetch(upload_url, {
+        method: "PUT",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: encData,
+        signal: r2Ctrl.signal,
+      });
     } finally {
-      await fd.close();
+      clearTimeout(r2Timer);
     }
 
-    // Step 3: Complete multipart upload
-    const completeRes = await fetchWithTimeout(`${apiUrl}/backups/upload-complete`, {
+    if (!uploadRes.ok) {
+      throw new Error(`R2 upload failed: ${uploadRes.status} ${uploadRes.statusText || ""}`);
+    }
+
+    // Step 3: Finalize — register in D1 and rotate old backups
+    const finalizeRes = await fetchWithTimeout(`${apiUrl}/backups/upload-complete`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -161,8 +140,6 @@ export async function uploadBackup(backupDir) {
       body: JSON.stringify({
         backup_id,
         r2_key,
-        upload_id,
-        parts,
         size_bytes: stat.size,
         checksum,
         device_name: os.hostname(),
@@ -170,18 +147,17 @@ export async function uploadBackup(backupDir) {
       }),
     });
 
-    if (!completeRes.ok) {
-      const err = await completeRes.json().catch(() => ({}));
-      throw new Error(err.error || `Complete failed: ${completeRes.status}`);
+    if (!finalizeRes.ok) {
+      const err = await finalizeRes.json().catch(() => ({}));
+      throw new Error(err.error || `Finalize failed: ${finalizeRes.status}`);
     }
 
-    await completeRes.json();
-    console.log(`[cloud-sync] uploaded ${backup_id} (${stat.size} bytes, ${parts.length} parts)`);
+    await finalizeRes.json();
+    console.log(`[cloud-sync] uploaded ${backup_id} (${stat.size} bytes, direct R2)`);
 
     emitProgress("complete", { backup_id, size_bytes: stat.size });
     return { backup_id, size_bytes: stat.size };
   } catch (err) {
-    // Attempt to abort the multipart upload to avoid orphaned parts
     emitProgress("error", { message: err.message || "Upload failed" });
     console.warn("[cloud-sync] upload failed:", err.message);
     throw err;

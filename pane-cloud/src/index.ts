@@ -1,13 +1,19 @@
 /**
  * Pane Cloud — Cloudflare Worker
  *
- * Thin API layer: auth, backup CRUD, multipart upload.
- * Large backups are split into ≤4MB parts to stay under body size limits.
- * Parts are reassembled in R2 via the binding's multipart Upload API.
+ * Thin API layer: auth, backup CRUD, presigned S3 upload.
+ *
+ * Upload is direct-to-R2 via presigned PUT URLs (SigV4). This bypasses the
+ * Worker's body size limit entirely — the client uploads the encrypted blob
+ * straight to R2's S3 endpoint, then calls back to finalize in D1.
+ *
+ * The legacy multipart-upload-through-Worker routes (upload-init, upload-part)
+ * are kept for compatibility but the primary path is presigned upload.
  */
 
 import type { Env } from "./types";
 import { handleGitHubAuth, authenticateRequest } from "./auth";
+import { generatePresignedPutUrl } from "./s3-presign";
 import {
   initMultipartUpload,
   uploadPart,
@@ -102,7 +108,30 @@ async function route(
     return json({ deleted: true });
   }
 
-  // ── Backups: multipart upload ─────────────────────────────────────────
+  // ── Backups: presigned upload (primary path) ──────────────────────────
+  //
+  // Flow:
+  //   1. POST /backups/upload-url  →  { backup_id, r2_key, upload_url }
+  //   2. Client PUTs directly to R2 (presigned URL, no Worker body limit)
+  //   3. POST /backups/upload-complete  →  register in D1, rotate
+
+  if (method === "POST" && path === "/backups/upload-url") {
+    const backupId = crypto.randomUUID().replace(/-/g, "").slice(0, 24);
+    const r2Key = `${user.github_id}/${backupId}.tar.gz.enc`;
+
+    const uploadUrl = await generatePresignedPutUrl(
+      env.CLOUDFLARE_ACCOUNT_ID,
+      env.R2_ACCESS_KEY_ID,
+      env.R2_SECRET_ACCESS_KEY,
+      "pane-backups",
+      r2Key,
+      3600,
+    );
+
+    return json({ backup_id: backupId, r2_key: r2Key, upload_url: uploadUrl });
+  }
+
+  // ── Backups: multipart upload (legacy path) ───────────────────────────
   //
   // Flow:
   //   1. POST /backups/upload-init  →  { backup_id, r2_key, upload_id }
@@ -141,8 +170,8 @@ async function route(
     const body = await request.json<{
       backup_id: string;
       r2_key: string;
-      upload_id: string;
-      parts: { partNumber: number; etag: string }[];
+      upload_id?: string;
+      parts?: { partNumber: number; etag: string }[];
       size_bytes: number;
       checksum: string;
       device_name?: string;
@@ -153,8 +182,11 @@ async function route(
       return json({ error: "r2_key does not match user" }, 403);
     }
 
-    // Complete the multipart upload in R2
-    await completeMultipartUpload(body.r2_key, body.upload_id, body.parts, env);
+    // Multipart flow: complete the multipart upload in R2
+    // Presigned flow: upload is already complete — skip multipart completion
+    if (body.upload_id && body.parts) {
+      await completeMultipartUpload(body.r2_key, body.upload_id, body.parts, env);
+    }
 
     // Register in D1
     const backup = await finalizeBackup(user, {

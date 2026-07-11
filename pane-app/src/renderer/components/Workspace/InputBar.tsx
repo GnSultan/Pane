@@ -723,9 +723,12 @@ export function InputBar({
     if (transition) setPhaseOverride(transition);
   }, [value, currentPhase, phaseOverride]);
 
-  // Clear override when input empties
+  // Clear override when input is fully empty — a <3 threshold (intended for
+  // auto-detected transitions) also killed manual pill toggles: user clicks
+  // think→build, types the first character, and the override is cleared
+  // before they've typed enough to be meaningful.
   useEffect(() => {
-    if (value.trim().length < 3) setPhaseOverride(null);
+    if (value.trim().length === 0) setPhaseOverride(null);
   }, [value]);
 
   // Handle graceful fadeout of processing indicator.
