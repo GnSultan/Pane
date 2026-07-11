@@ -1102,20 +1102,26 @@ function createProjectsStore() {
     prependOlderMessages: (projectId, olderMessages, newStartIndex) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          // Do NOT trim the front here: the front is exactly the older messages
-          // the user just asked to load. Trimming them created a permanent
-          // ceiling at MAX_STORE_MESSAGES where "load older" became a no-op.
-          // Explicit back-paging grows the window; the live-append cap
-          // (addConversationMessage) still bounds normal streaming growth.
+          // Sliding window, not unbounded growth. The original bug trimmed the
+          // FRONT (the just-loaded older messages) → a permanent ceiling. But
+          // NOT trimming at all is worse: the message list is not virtualized,
+          // so an unbounded array freezes the renderer (every MemoizedMessage
+          // re-renders markdown + syntax highlighting). So we page backward by
+          // dropping the off-screen NEWEST tail instead, keeping the rendered
+          // window bounded while history still loads all the way to the start.
           // Dedupe against what's already loaded to guard overlapping slices.
           const existingIds = new Set(p.conversation.messages.map((m) => m.id));
           const older = olderMessages
             .filter((m) => !existingIds.has(m.id))
             .map((m) => ({ ...m, isHistorical: true }));
+          const merged = [...older, ...p.conversation.messages];
+          const capped = merged.length > MAX_STORE_MESSAGES
+            ? merged.slice(0, MAX_STORE_MESSAGES)
+            : merged;
           return {
             conversation: {
               ...p.conversation,
-              messages: [...older, ...p.conversation.messages],
+              messages: capped,
               historyStartIndex: newStartIndex,
             },
           };
