@@ -39,6 +39,63 @@ async function fetchWithTimeout(url, opts = {}) {
   }
 }
 
+// ── Resilient fetch ───────────────────────────────────────────────────────
+// A bare `fetch failed` is undici hiding the real reason on err.cause. Backups
+// run over whatever connection the user has — flaky links, slow R2 hops — so a
+// single transient failure must not sink the whole backup. Retry network errors
+// and transient HTTP with backoff, and on final failure surface the actual cause
+// and which step failed, instead of a useless "fetch failed".
+const MAX_FETCH_ATTEMPTS = 3;
+
+function describeFetchError(err) {
+  const cause = err?.cause;
+  if (cause?.code) return cause.message ? `${cause.code} (${cause.message})` : cause.code;
+  if (cause?.message) return cause.message;
+  if (err?.name === "AbortError") return "timed out";
+  return err?.message || "unknown network error";
+}
+
+function backoff(attempt) {
+  const ms = Math.min(2000 * 2 ** (attempt - 1), 15_000);
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * fetch with per-attempt timeout, retry+backoff on transient failures, and a
+ * clear error that names the step and the underlying cause.
+ * @param {string} url
+ * @param {object} opts - fetch options (do not pass signal; managed internally)
+ * @param {{ step?: string, timeout?: number }} [cfg]
+ */
+async function fetchWithRetry(url, opts = {}, { step = "request", timeout = FETCH_TIMEOUT } = {}) {
+  let lastReason = "unknown error";
+  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    let res = null;
+    try {
+      res = await fetch(url, { ...opts, signal: ctrl.signal });
+    } catch (err) {
+      lastReason = describeFetchError(err);
+      res = null;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (res) {
+      const transient = res.status === 429 || (res.status >= 500 && res.status <= 599);
+      if (!transient || attempt === MAX_FETCH_ATTEMPTS) return res;
+      lastReason = `HTTP ${res.status}`;
+    }
+
+    if (attempt < MAX_FETCH_ATTEMPTS) {
+      console.warn(`[cloud-sync] ${step} attempt ${attempt}/${MAX_FETCH_ATTEMPTS}: ${lastReason} — retrying`);
+      await backoff(attempt);
+    }
+  }
+  throw new Error(`${step} failed after ${MAX_FETCH_ATTEMPTS} attempts: ${lastReason}`);
+}
+
 // ---------------------------------------------------------------------------
 // Upload — called after local backup completes
 // ---------------------------------------------------------------------------
@@ -89,14 +146,14 @@ export async function uploadBackup(backupDir) {
     emitProgress("uploading");
 
     // Step 1: Request a presigned upload URL from the Worker
-    const urlRes = await fetchWithTimeout(`${apiUrl}/backups/upload-url`, {
+    const urlRes = await fetchWithRetry(`${apiUrl}/backups/upload-url`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ size_bytes: stat.size, checksum }),
-    });
+    }, { step: "upload-url request" });
 
     if (!urlRes.ok) {
       const err = await urlRes.json().catch(() => ({}));
@@ -112,26 +169,21 @@ export async function uploadBackup(backupDir) {
     const R2_UPLOAD_TIMEOUT = 5 * 60 * 1000; // 5 minutes
     const encData = await fs.readFile(encPath);
 
-    const r2Ctrl = new AbortController();
-    const r2Timer = setTimeout(() => r2Ctrl.abort(), R2_UPLOAD_TIMEOUT);
-    let uploadRes;
-    try {
-      uploadRes = await fetch(upload_url, {
-        method: "PUT",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: encData,
-        signal: r2Ctrl.signal,
-      });
-    } finally {
-      clearTimeout(r2Timer);
-    }
+    // Do NOT send Content-Type — the presigned URL only signs "host".
+    // Content-Type is a canonical S3 header; if present but unsigned, R2
+    // rejects with 403 Forbidden. This is the flaky hop (slow R2 connects), so
+    // it gets the retry treatment with a generous per-attempt timeout.
+    const uploadRes = await fetchWithRetry(upload_url, {
+      method: "PUT",
+      body: encData,
+    }, { step: "R2 upload", timeout: R2_UPLOAD_TIMEOUT });
 
     if (!uploadRes.ok) {
-      throw new Error(`R2 upload failed: ${uploadRes.status} ${uploadRes.statusText || ""}`);
+      throw new Error(`R2 upload rejected: ${uploadRes.status} ${uploadRes.statusText || ""}`);
     }
 
     // Step 3: Finalize — register in D1 and rotate old backups
-    const finalizeRes = await fetchWithTimeout(`${apiUrl}/backups/upload-complete`, {
+    const finalizeRes = await fetchWithRetry(`${apiUrl}/backups/upload-complete`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -145,7 +197,7 @@ export async function uploadBackup(backupDir) {
         device_name: os.hostname(),
         app_version: "1.0.0",
       }),
-    });
+    }, { step: "finalize" });
 
     if (!finalizeRes.ok) {
       const err = await finalizeRes.json().catch(() => ({}));

@@ -337,6 +337,32 @@ function msUntilMidnight() {
   return next - now;
 }
 
+// A scheduled backup that failed shouldn't wait a full day to try again — a
+// transient network blip at midnight would otherwise mean no backup for 24h.
+// Retry a few times with growing gaps, surfacing the error each time, then fall
+// back to the daily cadence. The per-request retries inside uploadBackup handle
+// brief flakiness; this handles longer outages (offline, R2 degraded).
+const SCHEDULED_RETRY_DELAYS = [30, 60, 90].map((m) => m * 60_000); // 30m, 1h, 1.5h
+
+async function runScheduledBackup() {
+  const attempts = SCHEDULED_RETRY_DELAYS.length + 1;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await runBackup();
+      return;
+    } catch (err) {
+      const message = err?.message || "Backup failed";
+      console.warn(`[backup] scheduled run ${i + 1}/${attempts} failed: ${message}`);
+      emitBackupProgress("error", { message });
+      if (i < SCHEDULED_RETRY_DELAYS.length) {
+        await new Promise((r) => setTimeout(r, SCHEDULED_RETRY_DELAYS[i]));
+      } else {
+        console.error("[backup] gave up scheduled backup until next daily run");
+      }
+    }
+  }
+}
+
 export function startBackupSchedule() {
   const delay = msUntilMidnight();
   const hh = Math.floor(delay / 3_600_000);
@@ -344,9 +370,9 @@ export function startBackupSchedule() {
   console.log(`[backup] next run in ${hh}h ${mm}m`);
 
   setTimeout(() => {
-    runBackup().catch(err => console.error("[backup] run failed:", err.message));
+    runScheduledBackup();
     setInterval(() => {
-      runBackup().catch(err => console.error("[backup] run failed:", err.message));
+      runScheduledBackup();
     }, 24 * 60 * 60 * 1000);
   }, delay);
 }
