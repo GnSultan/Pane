@@ -111,8 +111,9 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
     }
   };
 
-  // Missing root: show a compact rebind row
-  if (rootMissing) {
+  // Unbound or missing root: show a compact rebind row
+  const isUnbound = !root || rootMissing;
+  if (isUnbound) {
     return (
       <div
         className={`w-full flex items-center gap-1.5 h-8 px-2 rounded-md ${
@@ -120,7 +121,7 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
         }`}
         style={{ fontSize: "var(--pane-panel-font-size)" }}
       >
-        <span className="truncate flex-1 text-left text-pane-text-secondary/50 line-through">
+        <span className={`truncate flex-1 text-left ${rootMissing ? "text-pane-text-secondary/50 line-through" : "text-pane-text-secondary/70"}`}>
           {name}
         </span>
         <button
@@ -128,9 +129,9 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
           disabled={isRebinding}
           className="shrink-0 font-mono text-pane-status-modified hover:text-pane-text transition-colors disabled:opacity-40"
           style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
-          title={`Folder not found at ${root} — click to rebind`}
+          title={rootMissing ? `Folder not found at ${root} — click to rebind` : "Bind a folder to this thread"}
         >
-          {isRebinding ? "..." : "rebind"}
+          {isRebinding ? "..." : "bind"}
         </button>
       </div>
     );
@@ -215,6 +216,26 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
                   strokeLinejoin="round"
                 >
                   <path d="M8.5 8.5h-7v-6h7v6zM3 3V1.5h4V3M1.5 3h7" />
+                </svg>
+              </span>
+              {/* Change folder icon */}
+              <span
+                onClick={handleRebind}
+                className="shrink-0 text-pane-text-secondary/30 opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-3.5 h-3.5 btn-press"
+                title="Change folder"
+              >
+                <svg
+                  width="9"
+                  height="9"
+                  viewBox="0 0 10 10"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.25"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M1.5 8V2.5L4.5 1l4 1.5V8L5 6.5 1.5 8z" />
+                  <path d="M1.5 8V5l3-1.5L8 5v3" />
                 </svg>
               </span>
               {/* Edit icon */}

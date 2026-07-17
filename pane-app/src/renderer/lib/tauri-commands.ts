@@ -637,7 +637,7 @@ export async function createCheckpoint(
   workingDir: string,
   messageId: string,
 ): Promise<CheckpointResult> {
-  return electronAPI.invoke("create_checkpoint", {
+  return electronAPI.invoke("pane_checkpoint", {
     projectId,
     workingDir,
     messageId,

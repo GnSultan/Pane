@@ -63,7 +63,7 @@ import { loadRecentTurns } from "./session-turns.mjs";
 import { setCmdWorker, execThroughWorker, onCmdWorkerExit } from "./tool-executor.mjs";
 import { mergeState } from "./pane-system-prompt.mjs";
 import { runModelProfileReflection } from "./playbook-engine.mjs";
-import { createCheckpointSnapshot } from "./checkpoint-engine.mjs";
+import { restoreCheckpoint } from "./checkpoint-engine.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -1275,89 +1275,23 @@ function registerCheckpointHandlers(db) {
     return path.join(os.homedir(), ".pane", "checkpoints", projectId);
   }
 
-  ipcMain.handle("create_checkpoint", async (_event, args) => {
+  ipcMain.handle("pane_checkpoint", async (_event, args) => {
     const { projectId, workingDir, messageId } = args;
-    return createCheckpointSnapshot({ projectId, workingDir, messageId });
+    // Full project snapshot — used for pre-turn checkpoints from the renderer.
+    // The tool executor path uses the per-turn journal instead.
+    const { snapshotAllFiles, flushJournal } = await import("./checkpoint-engine.mjs");
+    const journal = new Map();
+    try {
+      await snapshotAllFiles(workingDir, journal);
+    } catch {
+      return { id: null, fileCount: 0, reason: "snapshot-failed" };
+    }
+    return flushJournal({ projectId, workingDir, journal });
   });
 
   ipcMain.handle("restore_checkpoint", async (_event, args) => {
     const { projectId, checkpointId, workingDir } = args;
-    let checkpoint;
-    try {
-      const raw = await fs.promises.readFile(
-        path.join(checkpointDir(projectId), `${checkpointId}.json`),
-        "utf-8",
-      );
-      checkpoint = JSON.parse(raw);
-    } catch {
-      return {
-        success: false,
-        error: "Checkpoint not found",
-        restoredFiles: [],
-      };
-    }
-
-    const restored = [];
-
-    // Restore files from checkpoint
-    for (const file of checkpoint.files) {
-      const fullPath = path.join(workingDir, file.relativePath);
-      try {
-        if (file.content === null) {
-          try {
-            await fs.promises.unlink(fullPath);
-            restored.push({ path: file.relativePath, action: "deleted" });
-          } catch {}
-        } else {
-          await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
-          await fs.promises.writeFile(fullPath, file.content, "utf-8");
-          restored.push({ path: file.relativePath, action: "restored" });
-        }
-      } catch {}
-    }
-
-    // Restore clean tracked files Claude modified (not in checkpoint) from git HEAD
-    if (checkpoint.headCommit) {
-      try {
-        const { stdout } = await execFileAsync(
-          "git",
-          ["status", "--porcelain=v1", "-unormal"],
-          { cwd: workingDir },
-        );
-        const cpPaths = new Set(checkpoint.files.map((f) => f.relativePath));
-        for (const line of stdout.split("\n")) {
-          if (line.length < 4) continue;
-          const sc = line.slice(0, 2).trim();
-          let fp = line.slice(3);
-          const ap = fp.indexOf(" -> ");
-          if (ap !== -1) fp = fp.slice(ap + 4);
-          if (cpPaths.has(fp)) continue;
-          if (sc === "??") {
-            // Untracked file that did not exist at checkpoint time — it was
-            // created during the turn(s) being reverted. A true point-in-time
-            // restore must remove it, otherwise the working tree keeps files
-            // that weren't there at the checkpoint.
-            try {
-              await fs.promises.unlink(path.join(workingDir, fp));
-              restored.push({ path: fp, action: "deleted_new" });
-            } catch {
-              restored.push({ path: fp, action: "orphaned_new" });
-            }
-          } else {
-            try {
-              await execFileAsync(
-                "git",
-                ["checkout", checkpoint.headCommit, "--", fp],
-                { cwd: workingDir },
-              );
-              restored.push({ path: fp, action: "git_restored" });
-            } catch {}
-          }
-        }
-      } catch {}
-    }
-
-    return { success: true, restoredFiles: restored };
+    return restoreCheckpoint({ projectId, checkpointId, workingDir });
   });
 
   ipcMain.handle("list_checkpoints", (_event, args) => {
@@ -1432,29 +1366,8 @@ function registerCheckpointHandlers(db) {
         });
       }
     }
-    // Also check for new untracked files not in checkpoint
-    if (checkpoint.headCommit) {
-      try {
-        const { stdout } = await execFileAsync(
-          "git",
-          ["status", "--porcelain=v1", "-unormal"],
-          { cwd: workingDir },
-        );
-        const cpPaths = new Set(checkpoint.files.map((f) => f.relativePath));
-        for (const line of stdout.split("\n")) {
-          if (line.length < 4) continue;
-          const sc = line.slice(0, 2).trim();
-          let fp = line.slice(3);
-          const ap = fp.indexOf(" -> ");
-          if (ap !== -1) fp = fp.slice(ap + 4);
-          if (!cpPaths.has(fp) && sc !== "??") {
-            diffs.push({ relativePath: fp, status: "modified" });
-          } else if (!cpPaths.has(fp) && sc === "??") {
-            diffs.push({ relativePath: fp, status: "created" });
-          }
-        }
-      } catch {}
-    }
+    // Checkpoint already contains all files that were touched during the turn.
+    // No git dependency needed.
     return { files: diffs };
   });
 
@@ -2545,7 +2458,7 @@ app.whenReady().then(async () => {
   punkEngine.setBrainRequest((type, data) => brainRequest(type, data));
 
   punkEngine.setQuickCall((sys, usr) => punkEngine.quickCall(sys, usr));
-  punkEngine.setAgentCall((sys, prompt, workingDir) => punkEngine.agentCall(sys, prompt, workingDir));
+  punkEngine.setAgentCall((sys, prompt, workingDir, options) => punkEngine.agentCall(sys, prompt, workingDir, options));
 
   punkEngine.setBrainIndexer((projectId, events) =>
     brainRequest("index_events", { projectId, events })
@@ -2557,7 +2470,7 @@ app.whenReady().then(async () => {
   mindPunks = new MindPunks({
     brainRequest,
     quickCall: (sys, usr) => punkEngine.quickCall(sys, usr),
-    agentCall: (sys, prompt, workingDir) => punkEngine.agentCall(sys, prompt, workingDir),
+    agentCall: (sys, prompt, workingDir, options) => punkEngine.agentCall(sys, prompt, workingDir, options),
     sendToRenderer,
   });
 

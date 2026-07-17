@@ -180,7 +180,7 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "list_directory",
+      name: "pane_directory",
       description: "List the contents of a directory.",
       parameters: {
         type: "object",
@@ -397,9 +397,9 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "create_checkpoint",
+      name: "pane_checkpoint",
       description:
-        "Save a checkpoint — a snapshot of the current contents of every modified file — BEFORE you make a risky or large change (a refactor, a deletion, edits you're unsure about). If the change doesn't work out, this exact state can be restored. Cheap and safe to call; requires a git repo. Prefer this over hoping an edit is reversible.",
+        "Save a checkpoint — a snapshot of the current contents of every modified file — BEFORE you make a risky or large change (a refactor, a deletion, edits you're unsure about). If the change doesn't work out, this exact state can be restored. Cheap and safe to call. Prefer this over hoping an edit is reversible.",
       parameters: {
         type: "object",
         properties: {
@@ -761,9 +761,9 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "pane_ora",
+      name: "pane_delegate",
       description:
-        "Delegate complex codebase analysis, architectural mapping, or bug root-cause investigation to a specialized sub-agent. Use this for tasks that require methodically tracing through the codebase, reading multiple files, and returning structured findings.",
+        "Delegate a task to an autonomous sub-agent with full read/write access. The sub-agent inherits the project's playbook (accumulated principles, patterns, and rules) and can read files, write code, run shell commands, search the web, record memories, and create checkpoints. Use this for complex multi-step tasks that are self-contained — e.g. 'add error handling to all API routes', 'refactor the auth module to use the new token format', 'investigate and fix the race condition in the queue worker'. The sub-agent works autonomously until the objective is complete, then returns a summary of changes.",
       parameters: {
         type: "object",
         properties: {
@@ -3615,6 +3615,8 @@ export class ApiBackend extends PunkBackend {
             request.projectId,
             request.workingDir,
           );
+          // Reset the copy-on-write file journal for this turn
+          executor.resetJournal();
           let toolSeq = 0; // sequence counter for tool-result-cache
 
           for (const tool of state.toolUses.values()) {

@@ -83,6 +83,15 @@ async function route(
     });
   }
 
+  // ── Debug (public) ────────────────────────────────────────────────────
+  if (method === "GET" && path === "/debug") {
+    return json({
+      has_r2_access_key: typeof env.R2_ACCESS_KEY_ID === "string" && env.R2_ACCESS_KEY_ID.length > 0,
+      has_r2_secret:    typeof env.R2_SECRET_ACCESS_KEY === "string" && env.R2_SECRET_ACCESS_KEY.length > 0,
+      account_id_set:   typeof env.CLOUDFLARE_ACCOUNT_ID === "string",
+    });
+  }
+
   // ── Everything below requires auth ────────────────────────────────────
   const user = await authenticateRequest(request, env);
   if (!user) return json({ error: "Unauthorized" }, 401);

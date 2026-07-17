@@ -249,6 +249,8 @@ class CliBackend extends PunkBackend {
     this.command = command;
     this.activeRequests = new Map(); // requestId -> projectId
     this._requestResolvers = new Map(); // requestId -> resolve function
+    this._requestCompletions = new Map(); // requestId -> Promise (awaited by abort)
+    this._abortPromises = new Map(); // projectId -> Promise (dedup concurrent aborts)
     this._loginResolver = null;
     this._idleTimer = null; // 15-min inactivity timeout
   }
@@ -327,6 +329,8 @@ class CliBackend extends PunkBackend {
           this._requestResolvers.get(rid)(message.event.data);
           this._requestResolvers.delete(rid);
         }
+        // Clean completions — abort() may be awaiting this
+        this._requestCompletions.delete(rid);
       }
       this.onEvent(message.projectId, message.event, message.requestId);
     });
@@ -348,6 +352,7 @@ class CliBackend extends PunkBackend {
           this._requestResolvers.get(requestId)(event.data);
           this._requestResolvers.delete(requestId);
         }
+        this._requestCompletions.delete(requestId);
         this.onEvent(projectId, event, requestId);
       }
       this.activeRequests.clear();
@@ -381,6 +386,7 @@ class CliBackend extends PunkBackend {
     const completionPromise = new Promise((resolve) => {
       this._requestResolvers.set(request.requestId, resolve);
     });
+    this._requestCompletions.set(request.requestId, completionPromise);
 
     // Fetch recent changes from SQLite to pass to worker context
     let sqliteChanges = [];
@@ -421,14 +427,53 @@ class CliBackend extends PunkBackend {
   }
 
   async abort(projectId) {
+    // Deduplicate: if already aborting this project, return the existing promise.
+    // This handles the case where abortMessage and sendMessage both call abortPunk.
+    if (this._abortPromises.has(projectId)) {
+      return this._abortPromises.get(projectId);
+    }
+
     if (this.worker && !this.worker.killed) {
       this.worker.postMessage({ type: "abort", projectId });
     }
-    // Clean up all requests for this project
+
+    // Collect completion promises and request IDs for this project
+    const completions = [];
+    const requestIds = [];
     for (const [rid, pid] of this.activeRequests.entries()) {
-      if (pid === projectId) this.activeRequests.delete(rid);
+      if (pid === projectId) {
+        requestIds.push(rid);
+        const promise = this._requestCompletions.get(rid);
+        if (promise) completions.push(promise);
+      }
     }
-    this._resetIdleTimer(); // may now be idle
+    // Clean activeRequests immediately so no new events are dispatched for this project
+    for (const rid of requestIds) {
+      this.activeRequests.delete(rid);
+    }
+    this._resetIdleTimer();
+
+    // Wait for process termination with a 5s timeout.
+    // Even if the process ignores SIGTERM, the worker applies SIGKILL after 2s.
+    const abortPromise = (async () => {
+      try {
+        if (completions.length > 0) {
+          await Promise.race([
+            Promise.all(completions),
+            new Promise((r) => setTimeout(r, 5000)),
+          ]);
+        }
+      } finally {
+        // Clean up completions map regardless of timeout
+        for (const rid of requestIds) {
+          this._requestCompletions.delete(rid);
+        }
+        this._abortPromises.delete(projectId);
+      }
+    })();
+
+    this._abortPromises.set(projectId, abortPromise);
+    return abortPromise;
   }
 
   async terminate(projectId) {
@@ -453,6 +498,9 @@ class CliBackend extends PunkBackend {
       this.worker = null;
     }
     this.activeRequests.clear();
+    this._requestResolvers.clear();
+    this._requestCompletions.clear();
+    this._abortPromises.clear();
   }
 
   /**
@@ -2075,7 +2123,24 @@ Respond with a single concise principle statement (one sentence, under 150 chara
    *
    * Returns the accumulated assistant text, or throws on timeout/error.
    */
-  async agentCall(systemPrompt, prompt, workingDir) {
+  /**
+   * Spawn a sub-agent for delegated work.
+   *
+   * @param {string} systemPrompt - System prompt for the sub-agent
+   * @param {string} prompt - User prompt / objective
+   * @param {string} workingDir - Project root directory
+   * @param {object} [options]
+   * @param {'think'|'execution'} [options.phase='think'] - Phase: 'think' = read-only, 'execution' = full read/write
+   * @param {number} [options.maxTurns=50] - Max turns (0 = effectively unlimited → 500)
+   * @param {string[]} [options.extraTools=[]] - Additional tool names to include
+   */
+  async agentCall(systemPrompt, prompt, workingDir, options = {}) {
+    const {
+      phase = 'think',
+      maxTurns = 50,
+      extraTools = [],
+    } = options;
+
     await this.initialize();
 
     const requestId = `worker-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
@@ -2091,6 +2156,36 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       reject: rejectCall,
     });
 
+    // Base toolkit: navigation, code intelligence, memory, architecture, verification
+    const baseTools = [
+      // Navigation
+      'Read', 'read_file', 'pane_read_files', 'pane_directory',
+      'Glob', 'glob', 'Grep', 'grep_search',
+      // Code intelligence
+      'pane_find_symbol', 'pane_find_references', 'pane_codebase_compass',
+      'pane_codebase_navigator', 'explore',
+      // Project context & memory
+      'pane_project_context', 'pane_brief',
+      'pane_recall', 'pane_knowledge_graph', 'pane_profile',
+      // Architecture & design constraints
+      'pane_architecture_brief', 'pane_ui_constraints',
+      // History
+      'pane_change_history', 'pane_search_changes',
+      // Verification
+      'pane_run_in_terminal',
+    ];
+
+    // Execution phase: add write tools, memory persistence, checkpoints, task tracking
+    const execTools = phase === 'execution' ? [
+      'write_file', 'replace',
+      'pane_checkpoint', 'pane_checkpoints', 'pane_revert_change',
+      'pane_remember', 'TodoWrite', 'ask_user',
+      'google_web_search', 'web_fetch',
+    ] : [];
+
+    const tools = [...baseTools, ...execTools, ...extraTools];
+    const effectiveMaxTurns = maxTurns > 0 ? maxTurns : 500; // 0 = unlimited → 500
+
     await this.spawn({
       projectId,
       prompt,
@@ -2100,29 +2195,9 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       history: [],
       requestId,
       todos: null,
-      // Full read-only toolkit for punk analysis.
-      // For HTTP backends: phase="think" gives all tools except writes — this
-      // list is decorative. For CLI backends: this list filters SDK built-in tools,
-      // and pane_ tools come via MCP server regardless.
-      tools: [
-        // Navigation
-        'Read', 'read_file', 'pane_read_files', 'list_directory',
-        'Glob', 'glob', 'Grep', 'grep_search',
-        // Code intelligence
-        'pane_find_symbol', 'pane_find_references', 'pane_codebase_compass',
-        'pane_codebase_navigator', 'explore',
-        // Project context & memory
-        'pane_project_context', 'pane_brief',
-        'pane_recall', 'pane_knowledge_graph', 'pane_profile',
-        // Architecture & design constraints
-        'pane_architecture_brief', 'pane_ui_constraints',
-        // History
-        'pane_change_history', 'pane_search_changes',
-        // Verification
-        'pane_run_in_terminal',
-      ],
-      phase: 'think',                 // read-only, uses thinking model slot (thinker, not builder)
-      maxTurns: 50,
+      tools,
+      phase,                         // 'think' = read-only thinker slot, 'execution' = full builder slot
+      maxTurns: effectiveMaxTurns,
       systemPromptOverride: systemPrompt,
       _systemOverride: true,
       noExec: false,

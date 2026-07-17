@@ -59,6 +59,17 @@ export function getPaneDb() {
 // ---------------------------------------------------------------------------
 
 function _createSchema(db) {
+  // Fold any legacy append-only correction_events into counter form BEFORE the
+  // schema block below runs. That block declares `CREATE UNIQUE INDEX ... ON
+  // correction_events(project_id, correction_type, model, detail)`; on a legacy
+  // db the table already exists with run-multiplied duplicate rows, so creating
+  // that index throws "UNIQUE constraint failed" and aborts the whole exec —
+  // leaving db.stmts unprepared and every conversation query silently empty.
+  // Running the fold first rebuilds the table deduped (and creates the index
+  // itself), so the IF NOT EXISTS statements below become no-ops. On a fresh db
+  // the table doesn't exist yet, the fold no-ops, and the block creates it.
+  _foldCorrectionEvents(db);
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS migration_version (
       id      INTEGER PRIMARY KEY CHECK (id = 1),
@@ -220,10 +231,6 @@ function _createSchema(db) {
     END;
   `);
 
-  // Fold any legacy append-only correction_events into counter form before
-  // statements are prepared against the new columns. Idempotent — no-op once
-  // the table already has a `count` column.
-  _foldCorrectionEvents(db);
 }
 
 /**
@@ -243,6 +250,17 @@ function _foldCorrectionEvents(db) {
   const before = db.prepare("SELECT COUNT(*) AS c FROM correction_events").get().c;
 
   db.exec("ALTER TABLE correction_events RENAME TO correction_events_legacy");
+  // Index names are database-global, and RENAME TABLE keeps the legacy table's
+  // indexes attached under their original names. If the legacy schema used any
+  // of the names we recreate below, `CREATE INDEX` would throw "already exists"
+  // and abort the fold. Drop them first — the legacy table is dropped at the end
+  // anyway, so losing its indexes is harmless.
+  db.exec(`
+    DROP INDEX IF EXISTS idx_corrections_unique;
+    DROP INDEX IF EXISTS idx_corrections_project;
+    DROP INDEX IF EXISTS idx_corrections_type;
+    DROP INDEX IF EXISTS idx_corrections_model;
+  `);
   db.exec(`
     CREATE TABLE correction_events (
       id               TEXT    PRIMARY KEY,

@@ -295,16 +295,20 @@ export function useSettingsPersistence() {
             }
             for (const pid of projectOrderSetting) {
               let root = idToRoot[pid];
-              if (!root) {
+              // root may be undefined (not in idToRoot) or "" (empty root thread)
+              if (root === undefined) {
                 // Fallback: derive root from project_states entry. Handles
                 // multiple threads on the same folder when project_ids is
                 // still in root→id format (only one ID survives per root).
                 root = (settings.project_states?.[pid] as ProjectSessionState | undefined)?.root;
               }
-              if (!root) continue; // truly orphaned — skip
-              const id = addProject(root, pid);
-              projectEntries.push({ id, root });
-              if (root === settings.active_project_root) activeId = id;
+              // root may be "" for unbound threads or undefined for truly orphaned
+              const stateEntry = settings.project_states?.[pid] as ProjectSessionState | undefined;
+              const nameOverride = stateEntry?.name;
+              const finalRoot = root ?? "";
+              const id = addProject(finalRoot, pid, nameOverride);
+              projectEntries.push({ id, root: finalRoot });
+              if (finalRoot && finalRoot === settings.active_project_root) activeId = id;
             }
           } else {
             // OLD FORMAT: iterate project_roots with dedup by seen ID.
@@ -552,11 +556,12 @@ export function useSettingsPersistence() {
         if (!p) continue;
         // Deduplicate project_roots so the load-side iterator
         // doesn't create duplicate projectOrder entries.
-        if (!seenRoots.has(p.root)) {
+        // Skip empty roots (unbound threads) — they have no folder to track.
+        if (p.root && !seenRoots.has(p.root)) {
           project_roots.push(p.root);
           seenRoots.add(p.root);
         }
-        project_ids[p.id] = p.root; // id→root — supports multiple threads per folder
+        project_ids[p.id] = p.root; // id→root — supports multiple threads per folder, empty for unbound
         project_states[id] = {       // KEY BY ID (not root) — supports multiple threads on same folder
           root: p.root,
           name: p.name,

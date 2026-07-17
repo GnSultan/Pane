@@ -850,9 +850,14 @@ function extractMethodViolations(
 
 export function usePunk(projectId: string) {
   const abortingRef = useRef(false);
-  // Set to true when sendMessage aborts an in-flight session to replace it with a new one.
-  // Prevents the old processEnded from calling finishProcessing (which would set isProcessing=false)
-  // and from nulling the session ID — the new message needs both intact.
+  // Incremented on each new session (sendMessage or manual abort).
+  // Guards stale event handlers from updating state after a new session has started.
+  // Every handleEvent closure captures the session ID at creation time; if the global
+  // ref has moved past it, the closure is stale and must skip all processing.
+  const sessionIdRef = useRef(0);
+  // Set to true when abortMessage initiates a manual stop. Prevents the old
+  // processEnded from calling finishProcessing (which would play completion sound,
+  // set unread badges, etc. — unwanted on manual stop).
   const intentionalAbortRef = useRef(false);
   const retryAttemptRef = useRef<Record<string, number>>({});
   const messageQueueRef = useRef<Array<{ prompt: string; minds?: Array<{ id: string }>; phase?: string }>>([]);
@@ -876,6 +881,10 @@ export function usePunk(projectId: string) {
         }, 3000);
         return;
       }
+
+      // Capture session ID before starting — invalidates any stale event handlers
+      // from a previous session (the old closure will see sessionIdRef has moved past it).
+      const mySessionId = ++sessionIdRef.current;
 
       await abortPunk(projectId).catch(() => {});
       resetStreamingState(projectId);
@@ -1007,6 +1016,10 @@ export function usePunk(projectId: string) {
       };
 
       const handleEvent = (event: PunkStreamEvent) => {
+        // If a new session has started (via sendMessage or abortMessage), this
+        // closure is stale — ignore all events to prevent cross-session corruption.
+        if (sessionIdRef.current !== mySessionId) return;
+
         switch (event.event) {
           case "processStarted":
             break;
@@ -1425,10 +1438,25 @@ export function usePunk(projectId: string) {
   const abortMessage = useCallback(async () => {
     if (abortingRef.current) return;
     abortingRef.current = true;
+
+    // Invalidate the current session so stale event handlers skip processing.
+    // This prevents the old handleEvent → finishProcessing path from running
+    // after we manually clean up below.
+    ++sessionIdRef.current;
+    // Also set intentionalAbortRef so that if the old processEnded sneaks in
+    // before sessionIdRef takes effect, finishProcessing is still skipped
+    // (avoids completion sound, unread badge on manual stop).
+    intentionalAbortRef.current = true;
+
     try {
+      // abortPunk now waits for the backend process to actually terminate
+      // (with a 5s timeout), so we know the stream is truly dead before
+      // we clean up state. This prevents tool results from leaking into
+      // the UI after the user sees "stopped."
       await abortPunk(projectId);
     } finally {
       abortingRef.current = false;
+      intentionalAbortRef.current = false;
       const store = useProjectsStore.getState();
       store.setConversationProcessing(projectId, false);
       store.setLastMessageStreamingDone(projectId);

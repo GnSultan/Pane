@@ -19,8 +19,8 @@ export async function generatePresignedPutUrl(
   key: string,
   ttlSeconds = 3600,
 ): Promise<string> {
-  const endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
   const host = `${bucket}.${accountId}.r2.cloudflarestorage.com`;
+  const endpoint = `https://${host}`;
   const path = `/${key}`;
   return signUrl("PUT", endpoint, host, path, accessKey, secretKey, ttlSeconds);
 }
@@ -36,8 +36,8 @@ export async function generatePresignedGetUrl(
   key: string,
   ttlSeconds = 3600,
 ): Promise<string> {
-  const endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
   const host = `${bucket}.${accountId}.r2.cloudflarestorage.com`;
+  const endpoint = `https://${host}`;
   const path = `/${key}`;
   return signUrl("GET", endpoint, host, path, accessKey, secretKey, ttlSeconds);
 }
@@ -62,11 +62,24 @@ async function signUrl(
   const credentialScope = `${dateStamp}/${S3_REGION}/${S3_SERVICE}/aws4_request`;
   const signedHeaders = "host";
 
-  // Canonical request
+  // Build query params (without signature — it depends on the canonical request).
+  // URLSearchParams.toString() sorts alphabetically and URL-encodes per RFC 3986,
+  // which is exactly what SigV4 canonical query strings require.
+  const params = new URLSearchParams({
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": `${accessKey}/${credentialScope}`,
+    "X-Amz-Date": amzDate,
+    "X-Amz-Expires": String(ttlSeconds),
+    "X-Amz-SignedHeaders": signedHeaders,
+  });
+
+  // Canonical request — MUST include the query params for presigned URL auth.
+  // The signature covers the query string, so omitting it means the computed
+  // signature never matches what R2 expects from the actual PUT request.
   const canonicalRequest = [
     method,
     path,
-    "", // no query params in canonical request
+    params.toString(),
     `host:${host}`,
     "",
     signedHeaders,
@@ -85,15 +98,8 @@ async function signUrl(
   const signingKey = await getSignatureKey(secretKey, dateStamp, S3_REGION, S3_SERVICE);
   const signature = hex(await hmacSha256(signingKey, stringToSign));
 
-  // Build query params
-  const params = new URLSearchParams({
-    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
-    "X-Amz-Credential": `${accessKey}/${credentialScope}`,
-    "X-Amz-Date": amzDate,
-    "X-Amz-Expires": String(ttlSeconds),
-    "X-Amz-SignedHeaders": signedHeaders,
-    "X-Amz-Signature": signature,
-  });
+  // Append signature to params
+  params.set("X-Amz-Signature", signature);
 
   return `${endpoint}${path}?${params.toString()}`;
 }
