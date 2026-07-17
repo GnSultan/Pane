@@ -3,6 +3,11 @@ export interface Env {
   BACKUPS: R2Bucket;
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string; // set via wrangler secret
+
+  // R2 S3 credentials for presigned URLs — set via wrangler secret
+  R2_ACCESS_KEY_ID: string;
+  R2_SECRET_ACCESS_KEY: string;
+  CLOUDFLARE_ACCOUNT_ID: string;
 }
 
 export interface User {

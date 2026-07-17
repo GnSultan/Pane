@@ -1,9 +1,12 @@
 name = "pane-cloud"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
+workers_dev = true
+preview_urls = false
 
 [vars]
-GITHUB_CLIENT_ID = ""  # Set via wrangler secret or dashboard
+GITHUB_CLIENT_ID = "Ov23lifBVhyNXF5Z7Zvc"
+CLOUDFLARE_ACCOUNT_ID = "cac7e229f2a1b3def2d675cb0db49e27"
 
 # R2 bucket binding
 [[r2_buckets]]
@@ -14,4 +17,4 @@ bucket_name = "pane-backups"
 [[d1_databases]]
 binding = "DB"
 database_name = "pane-cloud"
-database_id = ""  # Set after `wrangler d1 create pane-cloud`
+database_id = "0ceb7899-cf4f-4242-abcd-f7c38a19aa36"

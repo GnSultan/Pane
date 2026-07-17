@@ -19,7 +19,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import vm from "node:vm";
 
-import { getPaneDb } from "./pane-db.mjs";
+import { getPaneDb, pruneChangeHistory } from "./pane-db.mjs";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 import { readState, readHandoff } from "./pane-system-prompt.mjs";
 import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
@@ -634,6 +634,8 @@ export class ToolExecutor {
     this.onEvent = onEvent;
     this.activeProcesses = new Map(); // toolId -> child process
     this._brainRequest = null;
+    /** @type {Map<string, string|null>} relativePath → preEditContent (null = file didn't exist) */
+    this.fileJournal = new Map();
     this.executionContext = {
       cwd: projectRoot,
       env: this.getSafeEnvironment(),
@@ -657,6 +659,42 @@ export class ToolExecutor {
   }
 
   /**
+   * Read the distilled playbook for this project (+ global craft profile).
+   * These are tested principles the reflection engine graduated from accumulated
+   * experience — injected so they shape behavior without needing recall.
+   * Mirrors context-orchestrator.mjs's readPlaybook().
+   */
+  _readPlaybook() {
+    const PLAYBOOKS_DIR = path.join(os.homedir(), ".pane", "profile", "playbooks");
+    const MAX_PLAYBOOK_CHARS = 4000;
+    const sections = [];
+    try {
+      const globalPath = path.join(PLAYBOOKS_DIR, "global.md");
+      if (fs.existsSync(globalPath)) {
+        const global = fs.readFileSync(globalPath, "utf-8").trim();
+        if (global) sections.push(global);
+      }
+    } catch {}
+    try {
+      const projectPath = path.join(PLAYBOOKS_DIR, `${this.projectId}.md`);
+      if (fs.existsSync(projectPath)) {
+        const project = fs.readFileSync(projectPath, "utf-8").trim();
+        if (project) sections.push(project);
+      }
+    } catch {}
+    if (sections.length === 0) return null;
+
+    const body = sections.join("\n").slice(0, MAX_PLAYBOOK_CHARS);
+    return (
+      "## Playbook — principles earned from working in this codebase\n\n" +
+      "These were distilled from real sessions: mistakes made, fixes that held, " +
+      "approaches that worked. Follow them by default; if one seems wrong for " +
+      "the current task, say so rather than silently ignoring it.\n\n" +
+      body
+    );
+  }
+
+  /**
    * Record a change in the change history.
    */
   async recordChange(change) {
@@ -666,15 +704,17 @@ export class ToolExecutor {
     try {
       const db = getPaneDb();
       db.stmts.insertChange.run(
-        id, 
-        this.projectId, 
+        id,
+        this.projectId,
         change.filePath,
-        change.oldString ?? null, 
+        change.oldString ?? null,
         change.newString ?? "",
-        change.description || "", 
+        change.description || "",
         timestamp,
         this.projectRoot
       );
+      // Cap retention at 7 days — cheap indexed range delete per write.
+      pruneChangeHistory(this.projectId);
     } catch (err) {
       console.error("[tool-executor] Failed to record change to SQLite:", err.message);
     }
@@ -725,6 +765,40 @@ export class ToolExecutor {
   }
 
   /**
+   * Snapshot a file's current content into the turn journal before the first
+   * write to it. Safe to call multiple times for the same file — only the
+   * first call (pre-edit state) is saved.
+   * @param {string} filePath - relative or absolute path within the project
+   */
+  async journalFileWrite(filePath) {
+    const resolvedPath = this.resolveProjectPath(filePath);
+    if (!resolvedPath) return;
+    const relativePath = path.relative(this.projectRoot, resolvedPath);
+    if (this.fileJournal.has(relativePath)) return; // already captured pre-edit state
+
+    const { readFileForJournal } = await import("./checkpoint-engine.mjs");
+    const content = await readFileForJournal(resolvedPath);
+    if (content !== undefined) {
+      this.fileJournal.set(relativePath, content);
+    }
+  }
+
+  /**
+   * Reset the file journal for a new turn.
+   */
+  resetJournal() {
+    this.fileJournal.clear();
+  }
+
+  /**
+   * Get a reference to the current file journal (for flushing to checkpoint).
+   * @returns {Map<string, string|null>}
+   */
+  getJournal() {
+    return this.fileJournal;
+  }
+
+  /**
    * Execute a Bash command
    */
   async executeBash(toolId, command, background = false, cwd = null) {
@@ -742,6 +816,19 @@ export class ToolExecutor {
     if (cwd) {
       const resolvedCwd = this.resolveProjectPath(cwd);
       if (resolvedCwd) execOptions.cwd = resolvedCwd;
+    }
+
+    // Copy-on-write: if command has write intent, pre-snapshot all project files
+    // as a safety net — shell commands can modify any file, not just ones the
+    // model has explicitly opened via write_file/replace.
+    const { hasWriteIntent: checkWriteIntent } = await import("./command-validator.mjs");
+    const { snapshotAllFiles: preSnapshot } = await import("./checkpoint-engine.mjs");
+    if (checkWriteIntent(command)) {
+      try {
+        await preSnapshot(this.projectRoot, this.fileJournal);
+      } catch {
+        // snapshot failure shouldn't block the command
+      }
     }
 
     try {
@@ -850,7 +937,7 @@ export class ToolExecutor {
       if (stats.isDirectory()) {
         return {
           success: false,
-          error: `${filePath} is a directory. Use list_directory to see its contents.`,
+          error: `${filePath} is a directory. Use pane_directory to see its contents.`,
           toolId,
         };
       }
@@ -999,6 +1086,9 @@ export class ToolExecutor {
         // File doesn't exist yet — new file creation, oldString stays ""
       }
 
+      // Copy-on-write: save pre-edit state for checkpoint/restore
+      await this.journalFileWrite(filePath);
+
       // Ensure directory exists
       await fsPromises.mkdir(path.dirname(resolvedPath), { recursive: true });
 
@@ -1108,6 +1198,9 @@ export class ToolExecutor {
       const startLine = matchIndex >= 0
         ? currentContent.substring(0, matchIndex).split("\n").length
         : 1;
+
+      // Copy-on-write: save pre-edit state for checkpoint/restore
+      await this.journalFileWrite(filePath);
 
       // Replace
       const newContent = currentContent.replace(oldString, newString);
@@ -1575,7 +1668,7 @@ export class ToolExecutor {
           };
         }
 
-        case "list_directory":
+        case "pane_directory":
           return await this.executeListDirectory(toolId, input.dir_path || input.path);
 
         case "write_file":
@@ -1861,6 +1954,29 @@ export class ToolExecutor {
             return `${cp.id} — ${cp.fileCount} files`;
           }).join("\n");
           return { success: true, output: `${manifest.checkpoints.length} checkpoints:\n${out}`, toolId };
+        }
+
+        case "pane_checkpoint": {
+          const { flushJournal } = await import("./checkpoint-engine.mjs");
+          const result = await flushJournal({
+            projectId: this.projectId,
+            workingDir: this.projectRoot,
+            journal: this.fileJournal,
+            label: input.label,
+          });
+          if (!result.id) {
+            const why = result.reason === "no-files-journaled"
+              ? "no files have been modified in this turn yet"
+              : "no snapshot could be taken";
+            return { success: false, error: `Checkpoint not saved — ${why}.`, toolId };
+          }
+          // Flushed — clear the journal for the next turn
+          this.fileJournal.clear();
+          return {
+            success: true,
+            output: `Checkpoint saved (${result.fileCount} file${result.fileCount === 1 ? "" : "s"})${input.label ? ` — ${input.label}` : ""}. This state can be restored later if the changes don't work out.`,
+            toolId,
+          };
         }
 
         case "pane_change_history": {
@@ -2178,35 +2294,59 @@ export class ToolExecutor {
           }
         }
 
-        case "pane_ora": {
+        case "pane_delegate": {
           const objective = (input?.objective || "").trim();
           if (!objective) return { success: false, error: "Research objective is required.", toolId };
           if (!this._agentCall) return { success: false, error: "Sub-agent engine not available (agentCall not wired).", toolId };
 
-          const systemPrompt = `You are pane_ora, a specialized sub-agent for deep codebase analysis.
+          // ── Compile the system prompt ─────────────────────────────────
+          const playbook = this._readPlaybook();
 
-Your job: investigate the codebase to answer a research objective. You have access to read-only tools — read files, grep/search, explore, find symbols, list directories.
+          // Load project about for context
+          let aboutBlock = "";
+          try {
+            const aboutPath = path.join(os.homedir(), ".pane", "memory", this.projectId, "about.md");
+            if (fs.existsSync(aboutPath)) {
+              aboutBlock = `\n## Project context\n\n${fs.readFileSync(aboutPath, "utf-8").trim().slice(0, 2000)}`;
+            }
+          } catch {}
 
-Approach:
-1. Start broad — use explore() to understand the codebase architecture relevant to the objective
-2. Trace data flows — find how data moves between modules, what imports what
-3. Dive deep on specific files — read the actual implementation of key functions
-4. Check connections — use pane_find_references and pane_codebase_navigator to understand blast radius
-5. Look at tests if they exist
+          const systemPrompt = `You are pane_delegate, an autonomous executor sub-agent with full read/write access to the codebase.
 
-Return your findings as a structured report with:
-- Summary of findings
-- Root causes or key insights
-- Specific file locations with line numbers
-- Concrete recommendations
+Your job: accomplish the given objective. You have access to all tools — read files, write files, edit code, run shell commands, search the web, record memories, create checkpoints. Work until the objective is fully complete — there is no turn limit.
 
-Be thorough. Trace through the full call chain. Check test files for expected behavior.`;
+${aboutBlock}
+
+${playbook || ""}
+
+## Working in Pane
+
+You are working inside a Pane project. You have access to the full tool set. Use it.
+
+### Execution approach
+1. **Understand first**: read relevant files before making changes
+2. **Execute methodically**: one step at a time, verify each change
+3. **Create checkpoints**: use pane_checkpoint before risky or large changes (you decide when)
+4. **Record discoveries**: use pane_remember to persist important decisions, patterns, or lessons
+5. **Report completion**: when the objective is fully accomplished, return a structured summary
+
+### Finishing
+When you are done, return a summary with:
+- What was accomplished
+- What files were changed and why
+- Key decisions made
+- Any follow-up items for the parent session`;
 
           try {
-            const output = await this._agentCall(systemPrompt, `## Research Objective\n\n${objective}`, this.projectRoot);
+            const output = await this._agentCall(
+              systemPrompt,
+              `## Objective\n\n${objective}`,
+              this.projectRoot,
+              { phase: 'execution', maxTurns: 0 }
+            );
             return { success: true, output, toolId };
           } catch (err) {
-            return { success: false, error: `Investigation failed: ${err.message}`, toolId };
+            return { success: false, error: `Execution failed: ${err.message}`, toolId };
           }
         }
 

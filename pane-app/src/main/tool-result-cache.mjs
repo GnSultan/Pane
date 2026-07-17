@@ -71,7 +71,7 @@ export function storeRaw(projectId, turnIndex, seq, entry) {
 export function summarize(toolName, rawContent) {
   if (!rawContent) return `(${toolName}: empty result)`;
 
-  // Type guard — tool results can be objects (pane_read_files, list_directory, etc.)
+  // Type guard — tool results can be objects (pane_read_files, pane_directory, etc.)
   if (typeof rawContent !== "string") {
     rawContent =
       typeof rawContent === "object"

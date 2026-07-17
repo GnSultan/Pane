@@ -1,55 +1,111 @@
 import type { Env, User, Backup } from "./types";
 
 const MAX_CLOUD_BACKUPS = 7;
-const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
-const PRESIGN_TTL = 1800; // 30 minutes
+
+// ---------------------------------------------------------------------------
+// Multipart upload — splits the backup into chunks so each part stays well
+// under the Worker's 100MB body limit.
+// ---------------------------------------------------------------------------
 
 /**
- * Generate a presigned upload URL for direct-to-R2 upload.
- * Bypasses the Worker's body size limit.
+ * Initiate a multipart upload. Client will upload parts one at a time,
+ * then call completeMultipartUpload.
  */
-export async function getUploadUrl(
+export async function initMultipartUpload(
   user: User,
   env: Env,
-): Promise<{ upload_url: string; backup_id: string; r2_key: string }> {
+): Promise<{
+  backup_id: string;
+  r2_key: string;
+  upload_id: string;
+}> {
   const backupId = generateId();
   const r2Key = `${user.github_id}/${backupId}.tar.gz.enc`;
 
-  // R2 presigned URLs require the S3-compatible API.
-  // For Workers with R2 binding, we use a two-step approach:
-  // Client uploads to a Worker endpoint that proxies to R2.
-  // This keeps it simple and avoids S3 credential management.
+  const multipartUpload = await env.BACKUPS.createMultipartUpload(r2Key);
+
   return {
-    upload_url: `/backups/${backupId}/upload`,
     backup_id: backupId,
     r2_key: r2Key,
+    upload_id: multipartUpload.uploadId,
   };
 }
 
 /**
- * Handle the actual upload — receive the encrypted blob and write to R2.
+ * Upload a single part of a multipart upload.
+ * Each part should be ≤ 5 MB to stay well under Worker limits.
+ *
+ * Buffers the incoming stream to an ArrayBuffer before passing to R2,
+ * because direct ReadableStream piping can hang in some Workers runtime
+ * configurations (the stream's completion signal may not reach R2's
+ * multipart upload API reliably).
  */
-export async function handleUpload(
-  backupId: string,
-  body: ReadableStream | null,
-  user: User,
+export async function uploadPart(
+  r2Key: string,
+  uploadId: string,
+  partNumber: number,
+  body: ReadableStream,
   env: Env,
-): Promise<{ success: boolean; size_bytes: number }> {
-  if (!body) {
-    throw new Error("No body provided");
+): Promise<{ etag: string }> {
+  const resume = env.BACKUPS.resumeMultipartUpload(r2Key, uploadId);
+
+  // Buffer the incoming stream to a known-length ArrayBuffer.
+  // 4MB per part → negligible CPU cost on the Worker.
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalLen = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    totalLen += value.byteLength;
   }
 
-  const r2Key = `${user.github_id}/${backupId}.tar.gz.enc`;
+  const combined = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
 
-  const obj = await env.BACKUPS.put(r2Key, body, {
-    customMetadata: {
-      user_id: String(user.id),
-      backup_id: backupId,
-    },
-  });
-
-  return { success: true, size_bytes: obj.size };
+  const result = await resume.uploadPart(partNumber, combined.buffer as ArrayBuffer);
+  return { etag: result.etag };
 }
+
+/**
+ * Complete a multipart upload, assembling all parts.
+ */
+export async function completeMultipartUpload(
+  r2Key: string,
+  uploadId: string,
+  parts: { partNumber: number; etag: string }[],
+  env: Env,
+): Promise<void> {
+  const resume = env.BACKUPS.resumeMultipartUpload(r2Key, uploadId);
+  // Sort by part number — R2 requires ascending order
+  parts.sort((a, b) => a.partNumber - b.partNumber);
+  await resume.complete(parts.map(p => ({ partNumber: p.partNumber, etag: p.etag })));
+}
+
+/**
+ * Abort a multipart upload (cleanup on failure).
+ */
+export async function abortMultipartUpload(
+  r2Key: string,
+  uploadId: string,
+  env: Env,
+): Promise<void> {
+  try {
+    const resume = env.BACKUPS.resumeMultipartUpload(r2Key, uploadId);
+    await resume.abort();
+  } catch {
+    // Abort is best-effort cleanup
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Backup finalization + CRUD
+// ---------------------------------------------------------------------------
 
 /**
  * Finalize a backup — register in D1 and enforce rotation.
@@ -66,7 +122,6 @@ export async function finalizeBackup(
   },
   env: Env,
 ): Promise<Backup> {
-  // Insert backup record
   await env.DB.prepare(
     `INSERT INTO backups (id, user_id, r2_key, size_bytes, checksum, device_name, app_version)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -134,7 +189,6 @@ export async function getBackupStream(
   user: User,
   env: Env,
 ): Promise<{ body: ReadableStream; size: number; checksum: string } | null> {
-  // Verify ownership
   const backup = await env.DB.prepare(
     "SELECT * FROM backups WHERE id = ? AND user_id = ?",
   )

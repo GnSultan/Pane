@@ -30,8 +30,8 @@ import {
 import { calculateCost } from "./pricing.mjs";
 import { safeStringify } from "./sanitize.mjs";
 import { buildSummary, toolResultCache } from "./tool-result-cache.mjs";
-import { forcePruneToBudget, applyV4TurnSelection, dropAllNonFreshTurns } from "./conversation-lifecycle.mjs";
 import { contextStore } from "./context-store.mjs";
+import { compactMessages, startCompactionWorker, stopCompactionWorker } from "./compaction-driver.mjs";
 import { scoreTurnsByRelevance, selectTurns, base64ToFloat32Array, getTopRelevantSummaries, formatSemanticPool } from "./semantic-turn-selector.mjs";
 import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
 import {
@@ -180,7 +180,7 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "list_directory",
+      name: "pane_directory",
       description: "List the contents of a directory.",
       parameters: {
         type: "object",
@@ -392,6 +392,25 @@ const TOOL_DEFINITIONS = [
       description:
         "List available file checkpoints for this project. Each checkpoint is a snapshot of file state before a Claude edit.",
       parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_checkpoint",
+      description:
+        "Save a checkpoint — a snapshot of the current contents of every modified file — BEFORE you make a risky or large change (a refactor, a deletion, edits you're unsure about). If the change doesn't work out, this exact state can be restored. Cheap and safe to call. Prefer this over hoping an edit is reversible.",
+      parameters: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            description:
+              "Optional short label for what you're about to do, e.g. 'before auth refactor'.",
+          },
+        },
+        required: [],
+      },
     },
   },
   {
@@ -663,6 +682,30 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "ask_user",
+      description:
+        "Pause and ask the user a question, then STOP and wait for their reply before doing anything else. Use this when you are unsure how to proceed, when you need the user to test something and report back, when a decision is theirs to make, or when you cannot verify your work yourself. Calling this ENDS your turn — you will not continue until the user answers. Do NOT use it to narrate progress or announce what you're about to do; use it only to genuinely request input you cannot obtain on your own.",
+      parameters: {
+        type: "object",
+        properties: {
+          question: {
+            type: "string",
+            description:
+              "The specific question or request for the user. Be concrete about exactly what you need from them.",
+          },
+          context: {
+            type: "string",
+            description:
+              "Optional: brief context on what you did and why you need their input — e.g. what to test, what the options are, what you're unsure about.",
+          },
+        },
+        required: ["question"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "Task",
       description:
         "Set the active task that you are currently working on. This is displayed in the Pane status bar.",
@@ -718,9 +761,9 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
-      name: "pane_ora",
+      name: "pane_delegate",
       description:
-        "Delegate complex codebase analysis, architectural mapping, or bug root-cause investigation to a specialized sub-agent. Use this for tasks that require methodically tracing through the codebase, reading multiple files, and returning structured findings.",
+        "Delegate a task to an autonomous sub-agent with full read/write access. The sub-agent inherits the project's playbook (accumulated principles, patterns, and rules) and can read files, write code, run shell commands, search the web, record memories, and create checkpoints. Use this for complex multi-step tasks that are self-contained — e.g. 'add error handling to all API routes', 'refactor the auth module to use the new token format', 'investigate and fix the race condition in the queue worker'. The sub-agent works autonomously until the objective is complete, then returns a summary of changes.",
       parameters: {
         type: "object",
         properties: {
@@ -1045,6 +1088,24 @@ function _deepSeekContextLength(id) {
   return 128000; // DeepSeek default
 }
 
+// ─── Z.ai (GLM) model helpers ────────────────────────────────────────────────
+
+function _zaiDisplayName(id) {
+  // glm-5.2 → GLM 5.2, glm-4.7-flash → GLM 4.7 Flash
+  return id
+    .replace(/^glm-/, "GLM ")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function _zaiContextLength(id) {
+  if (id.includes("glm-5")) return 1000000;
+  if (id.includes("glm-4.7")) return 1000000;
+  if (id.includes("glm-4.6")) return 128000;
+  if (id.includes("glm-4.5")) return 128000;
+  return 128000;
+}
+
 // ─── Anthropic model helpers ─────────────────────────────────────────────────
 
 function _anthropicDisplayName(id) {
@@ -1069,16 +1130,15 @@ function _anthropicContextLength(id) {
 // Used to set max_tokens per request without hardcoding provider-level logic
 // in the hot path. Rules are checked in order — more specific entries first.
 //
-// Reasoning models (deepseek-reasoner, mimo-v2-pro, stepfun) consume thinking
-// tokens from the same pool as output tokens, so their budgets are larger.
+// Reasoning models (mimo-v2-pro, stepfun) consume thinking tokens from the
+// same pool as output tokens, so their budgets are larger.
 // StepFun is omitted intentionally — their docs say not to set max_tokens.
 //
 // If no entry matches, the fallback is DEFAULT_MAX_TOKENS (4096).
 const MODEL_OUTPUT_LIMITS = [
-  // DeepSeek
-  { match: "deepseek-reasoner", maxTokens: 32768, omit: false },
-  { match: "deepseek-chat", maxTokens: 8192, omit: false },
-  { match: "deepseek", maxTokens: 8192, omit: false },
+  // DeepSeek — V4 models have 384K output (thinking + content share the same pool)
+  { match: "deepseek-v4-flash", maxTokens: 384000, omit: false },
+  { match: "deepseek-v4-pro", maxTokens: 384000, omit: false },
   // Xiaomi MiMo — thinking tokens count against max_tokens
   { match: "mimo-v2-pro", maxTokens: 65536, omit: false }, // ~16K thinking + 48K output
   { match: "mimo-v2-omni", maxTokens: 65536, omit: false },
@@ -1086,6 +1146,14 @@ const MODEL_OUTPUT_LIMITS = [
   { match: "mimo", maxTokens: 16384, omit: false }, // future MiMo variants
   // StepFun — docs say not to set max_tokens for reasoning models
   { match: "step-", maxTokens: null, omit: true },
+  // Z.ai GLM — 128K max output for GLM-5/4.7/4.6 series, 96K for GLM-4.5
+  { match: "glm-5.2", maxTokens: 131072, omit: false },
+  { match: "glm-5.1", maxTokens: 131072, omit: false },
+  { match: "glm-5-turbo", maxTokens: 131072, omit: false },
+  { match: "glm-5", maxTokens: 131072, omit: false },
+  { match: "glm-4.7", maxTokens: 131072, omit: false },
+  { match: "glm-4.6", maxTokens: 131072, omit: false },
+  { match: "glm-4.5", maxTokens: 98304, omit: false }, // 96K
   // Kimi — standard output, 8K is safe
   { match: "moonshot", maxTokens: 8192, omit: false },
   // Qwen / Alibaba
@@ -1125,18 +1193,30 @@ function resolveMaxTokens(modelId) {
   return { maxTokens: DEFAULT_MAX_TOKENS, omit: false };
 }
 const MODEL_STREAMING_CONFIG = [
-  // deepseek-reasoner must come before generic deepseek/
+  // DeepSeek V4 Flash/Pro — supports tools + thinking simultaneously
   [
-    "deepseek/deepseek-reasoner",
-    { reasoningField: "reasoning_content", supportsTools: false },
+    "deepseek-v4-flash",
+    { reasoningField: "reasoning_content", supportsTools: true },
   ],
-  ["deepseek/", { reasoningField: null, supportsTools: true }],
+  [
+    "deepseek-v4-pro",
+    { reasoningField: "reasoning_content", supportsTools: true },
+  ],
+  [
+    "deepseek/deepseek-v4-flash",
+    { reasoningField: "reasoning_content", supportsTools: true },
+  ],
+  [
+    "deepseek/deepseek-v4-pro",
+    { reasoningField: "reasoning_content", supportsTools: true },
+  ],
+  ["deepseek/", { reasoningField: "reasoning_content", supportsTools: true }],
   // Xiaomi MiMo — uses delta.reasoning
   ["xiaomi/mimo", { reasoningField: "reasoning", supportsTools: true }],
   // StepFun — uses delta.reasoning
   ["stepfun/", { reasoningField: "reasoning", supportsTools: true }],
-  // Z.ai GLM — thinks before tool calls, uses delta.reasoning
-  ["z-ai/glm", { reasoningField: "reasoning", supportsTools: true }],
+  // Z.ai GLM — thinks before tool calls, uses delta.reasoning_content
+  ["z-ai/glm", { reasoningField: "reasoning_content", supportsTools: true }],
   // Kimi / Moonshot — standard content, no reasoning field
   ["moonshot/", { reasoningField: null, supportsTools: true }],
   // Qwen3 Coder — standard content
@@ -1177,6 +1257,7 @@ function validateMessageSequence(messages, provider) {
   const isOpenAI =
     !provider || // no provider means OpenAI-compatible
     provider === "deepseek" ||
+    provider === "z-ai" ||
     provider === "kimi" ||
     provider === "openrouter" ||
     provider === "stepfun" ||
@@ -1334,6 +1415,9 @@ export class ApiBackend extends PunkBackend {
     this.paneDir = path.join(os.homedir(), ".pane");
     this.toolExecutors = new Map(); // projectId -> ToolExecutor
     this._brainRequest = null;
+    // Start the compaction worker thread — keeps context compaction off
+    // the main process event loop.
+    startCompactionWorker();
   }
 
   setBrainRequest(fn) {
@@ -1433,6 +1517,7 @@ export class ApiBackend extends PunkBackend {
 
     const isOpenAI =
       isDeepSeek ||
+      provider === "z-ai" ||
       provider === "kimi" ||
       provider === "openrouter" ||
       provider === "stepfun" ||
@@ -1440,8 +1525,8 @@ export class ApiBackend extends PunkBackend {
       provider === "alibaba" ||
       provider === "dashscope";
 
-    // deepseek-reasoner history rules:
-    // REQUIRES passing reasoning_content back to avoid 400 errors.
+    // DeepSeek thinking models:
+    // REQUIRES passing reasoning_content back on every turn to avoid 400 errors.
     const isReasoner =
       isDeepSeek &&
       (model?.includes("reasoner") ||
@@ -1653,8 +1738,9 @@ export class ApiBackend extends PunkBackend {
           Array.isArray(content) &&
           content.some((c) => c.type === "tool_result"))
       ) {
-        // deepseek-reasoner has no tool support — silently drop all tool result
-        // messages from history so they don't trigger a 400 from the API.
+        // Some DeepSeek models (prover-v2, thinking-only) have no tool support —
+        // silently drop all tool result messages from history so they don't
+        // trigger a 400 from the API.
         if (isReasoner) continue;
         const results = [];
         if (role === "tool" && !Array.isArray(content)) {
@@ -1719,8 +1805,8 @@ export class ApiBackend extends PunkBackend {
     // --- 4. AUTO-HEAL: Close orphaned tool calls ---
     // Insert fake results at the correct position — right after the assistant
     // message that made those tool calls — instead of appending at the end.
-    // Skip for deepseek-reasoner — it has no tool support so tool messages must
-    // never appear in the history regardless.
+    // Skip for non-tool DeepSeek models — they have no tool support so tool
+    // messages must never appear in the history regardless.
     if (isOpenAI && !isReasoner && pendingToolCallIds.size > 0) {
       console.warn(
         `[http] history sequence error: ${pendingToolCallIds.size} tool calls missing results. Healing...`,
@@ -2124,9 +2210,21 @@ export class ApiBackend extends PunkBackend {
       // ── Context window management (V4-direct) ────────────────────────
       // Only applies to explicit-caching providers. Auto-caching providers
       // let the pre-flight forcePruneToBudget guardrail handle overflow.
-      const windowResult = turnSelection
-        ? applyV4TurnSelection(messages, turnSelection, request.projectId)
-        : { action: "none", tokensSaved: 0, droppedTurns: [] };
+      // Offloaded to a Worker thread to avoid freezing the main process.
+      let windowResult;
+      if (turnSelection) {
+        const compResult = await compactMessages("applyV4TurnSelection", {
+          messages, turnSelection, projectId: request.projectId,
+        });
+        messages = compResult.messages;
+        windowResult = {
+          action: compResult.action,
+          tokensSaved: compResult.tokensSaved,
+          droppedTurns: compResult.droppedTurns,
+        };
+      } else {
+        windowResult = { action: "none", tokensSaved: 0, droppedTurns: [] };
+      }
       if (windowResult.action !== "none") {
         this.onEvent(
           request.projectId,
@@ -2204,6 +2302,7 @@ export class ApiBackend extends PunkBackend {
       const MAX_TURN_RETRIES = 3;
       let turnRetryCount = 0;
       let _preCallMessageCount = 0; // Hoisted for post-turn archiving
+      let awaitingUserInput = false; // Set when the model calls ask_user — ends the loop cleanly
 
       while (turn < maxTurns) {
         turn++;
@@ -2226,9 +2325,9 @@ export class ApiBackend extends PunkBackend {
         this.requestStates.set(request.projectId, state);
 
         try {
-          // deepseek-reasoner (R1) does not support function calling — sending tools
-          // returns HTTP 400. It also ignores sampling params (temperature etc.).
-          // We expand this to V4 and other thinking models that share this protocol.
+          // Some DeepSeek models (prover-v2, thinking-only variants) don't support
+          // function calling — sending tools returns HTTP 400. They also ignore
+          // sampling params (temperature etc.). V4 Flash/Pro fully support tools.
           const isDeepSeekReasoner =
             apiConfig.provider === "deepseek" &&
             (resolvedModel.includes("reasoner") ||
@@ -2288,7 +2387,7 @@ export class ApiBackend extends PunkBackend {
           // Without this flag, some APIs (DeepSeek, Kimi, etc.) omit the usage object
           // from the final SSE chunk, breaking cost and cache rate tracking entirely.
           if (
-            ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(
+            ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter", "z-ai"].includes(
               apiConfig.provider,
             )
           ) {
@@ -2300,9 +2399,9 @@ export class ApiBackend extends PunkBackend {
           }
 
           // Phase-based tool filtering — planning phase gets Plan tool, discovery gets read-only.
-          // deepseek-reasoner does NOT support function calling — skip entirely.
-          // For OpenRouter, consult the model personality registry — some OR-proxied
-          // models (e.g. deepseek/deepseek-reasoner) also don't support tools.
+          // Some DeepSeek models (prover-v2, thinking-only variants) do NOT support
+          // function calling — skip tools for those. For OpenRouter, consult the
+          // model personality registry — some OR-proxied models also don't support tools.
           const phase = request.phase || "execution";
           const orPersonality =
             apiConfig.provider === "openrouter"
@@ -2310,6 +2409,7 @@ export class ApiBackend extends PunkBackend {
               : null;
           if (
             (apiConfig.provider === "deepseek" && !isDeepSeekReasoner) ||
+            apiConfig.provider === "z-ai" ||
             apiConfig.provider === "kimi" ||
             apiConfig.provider === "stepfun" ||
             apiConfig.provider === "xiaomi" ||
@@ -2329,8 +2429,11 @@ export class ApiBackend extends PunkBackend {
               const promptTokens = estimateConversationTokens(validatedMessages);
               const safetyReserve = 4000;
               const dynamicMax = contextLimit - promptTokens - safetyReserve;
-              const minimum = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
-              body.max_tokens = Math.max(dynamicMax, minimum);
+              const cap = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
+              // When the conversation already exceeds context budget, don't send
+              // a doomed request — let the API see the full picture and return a
+              // clean "context length exceeded" error instead of a confusing stub.
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
             }
           }
 
@@ -2350,8 +2453,11 @@ export class ApiBackend extends PunkBackend {
               const promptTokens = estimateConversationTokens(validatedMessages);
               const safetyReserve = 4000;
               const dynamicMax = contextLimit - promptTokens - safetyReserve;
-              const minimum = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
-              body.max_tokens = Math.max(dynamicMax, minimum);
+              const cap = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
+              // When the conversation already exceeds context budget, don't send
+              // a doomed request — let the API see the full picture and return a
+              // clean "context length exceeded" error instead of a confusing stub.
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
             }
           }
 
@@ -2360,22 +2466,61 @@ export class ApiBackend extends PunkBackend {
             apiConfig.provider === "deepseek" &&
             !isDeepSeekReasoner
           ) {
-            // DeepSeek-chat thinking mode — returns reasoning_content in the response.
-            // reasoning_content MUST be passed back on every subsequent turn.
+            // DeepSeek V4 thinking mode: uses OpenAI-compatible parameters.
+            //   thinking: { type: "enabled" }     — toggle
+            //   reasoning_effort: "max"            — effort level (high | max)
+            // Returns reasoning_content in the response delta, which MUST be
+            // passed back on every subsequent turn.
             //
-            // Thinking tokens share the same budget as output tokens. Don't cap at
-            // the static limit (8K for old deepseek-chat). Compute from the live
-            // context window: context_limit - prompt_tokens - safety_reserve.
-            // DeepSeek V4 models support up to 384K output tokens. No artificial
-            // ceiling — the API will clamp to whatever its actual limit is.
-            body.enable_thinking = true;
+            // Notes:
+            //   • V4 Flash/Pro use OpenAI-compatible thinking params
+            //   • reasoning_effort="max" for agent/coding workloads (default is high)
+            //   • When thinking is on, temperature/top_p/presence/frequency are ignored
+            //
+            // Thinking tokens share the same budget as output tokens from maxTokens
+            // (384K for V4 Flash/Pro). No *2 multiplication — maxTokens already
+            // includes the thinking budget. Never exceed the model's output limit.
+            body.thinking = { type: "enabled" };
+            body.reasoning_effort = "max";
             if (!omitMaxTokens) {
               const contextLimit = getModelLimit(resolvedModel);
               const promptTokens = estimateConversationTokens(validatedMessages);
               const safetyReserve = 4000;
               const dynamicMax = contextLimit - promptTokens - safetyReserve;
-              const minimum = (maxTokens ?? DEFAULT_MAX_TOKENS) * 2;
-              body.max_tokens = Math.max(dynamicMax, minimum);
+              const cap = maxTokens ?? DEFAULT_MAX_TOKENS;
+              // When the conversation already exceeds context budget, don't send
+              // a doomed request with 1 token — let the API see the full picture
+              // and return a clean "context length exceeded" error.
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
+            }
+          }
+
+          if (
+            request.thinking &&
+            apiConfig.provider === "z-ai"
+          ) {
+            // Z.ai GLM thinking mode (OpenAI-compatible):
+            //   thinking: { type: "enabled" }     — toggle
+            //   reasoning_effort: "max"            — supported by GLM-5.2
+            // Returns reasoning_content in the response delta, which MUST be
+            // passed back on every subsequent turn.
+            //
+            // Notes:
+            //   • GLM-5.2 supports reasoning_effort; other models default to thinking
+            //   • temperature/top_p/presence_penalty/frequency_penalty ignored when thinking
+            //   • clear_thinking=true by default (clear thinking across turns)
+            body.thinking = { type: "enabled", clear_thinking: true };
+            body.reasoning_effort = "max";
+            if (!omitMaxTokens) {
+              const contextLimit = getModelLimit(resolvedModel);
+              const promptTokens = estimateConversationTokens(validatedMessages);
+              const safetyReserve = 4000;
+              const dynamicMax = contextLimit - promptTokens - safetyReserve;
+              const cap = maxTokens ?? DEFAULT_MAX_TOKENS;
+              // When the conversation already exceeds context budget, don't send
+              // a doomed request with 1 token — let the API see the full picture
+              // and return a clean "context length exceeded" error.
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
             }
           }
 
@@ -2460,7 +2605,10 @@ export class ApiBackend extends PunkBackend {
                     `[http] GUARDRAIL FIRED: ~${currentMsgTokens} total tokens (${TOKEN_ESTIMATE_SAFETY}x safety) exceeds ${maxMessagesTokens} budget. V4 should have prevented this. Force-pruning...`
                   );
                   const pruneTarget = Math.floor(maxMessagesTokens / TOKEN_ESTIMATE_SAFETY);
-                  const result = forcePruneToBudget(sourceBody.messages, pruneTarget, request.projectId);
+                  const result = await compactMessages("forcePruneToBudget", {
+                    messages: sourceBody.messages, maxTokens: pruneTarget, projectId: request.projectId,
+                  });
+                  sourceBody.messages = result.messages;
                   console.log(`[http] Guardrail force-prune: saved ${result.tokensSaved} tokens`);
                   if (finalBody && finalBody !== body && finalBody.messages) {
                     body.messages = finalBody.messages;
@@ -2584,11 +2732,12 @@ export class ApiBackend extends PunkBackend {
                       const healOutputBudget = getDefaultOutputBudget(request.model);
                       const healOverheadBudget = 5000;
                       const healMaxMsgTokens = healModelLimit - healOutputBudget - healOverheadBudget;
-                      const healResult = dropAllNonFreshTurns(
-                        sourceBody.messages,
-                        request.projectId,
-                        healMaxMsgTokens,
-                      );
+                      const healResult = await compactMessages("dropAllNonFreshTurns", {
+                        messages: sourceBody.messages,
+                        projectId: request.projectId,
+                        maxTokens: healMaxMsgTokens,
+                      });
+                      sourceBody.messages = healResult.messages;
                       console.log(
                         `[http] Context-heal: dropped ${healResult.dropped} non-fresh turns (saved ~${healResult.tokensSaved} estimated tokens)`
                       );
@@ -3075,6 +3224,7 @@ export class ApiBackend extends PunkBackend {
             apiConfig.provider === "deepseek" ||
             (apiConfig.provider === "openrouter" &&
               resolvedModel.includes("deepseek"));
+          const isZaiModel = apiConfig.provider === "z-ai";
           const deepseekThinking =
             isDeepSeekModel &&
             (isDeepSeekReasoner ||
@@ -3082,8 +3232,13 @@ export class ApiBackend extends PunkBackend {
               (apiConfig.provider === "openrouter" &&
                 body.include_reasoning)) &&
             state.thinking;
+          const zaiThinking =
+            isZaiModel && request.thinking && state.thinking;
 
           if (deepseekThinking) {
+            parsedMessage.message.reasoning_content = state.thinking;
+          }
+          if (zaiThinking) {
             parsedMessage.message.reasoning_content = state.thinking;
           }
 
@@ -3099,7 +3254,7 @@ export class ApiBackend extends PunkBackend {
           );
 
           const assistantEntry = { role: "assistant", content: finalContent };
-          if (deepseekThinking) {
+          if (deepseekThinking || zaiThinking) {
             assistantEntry.reasoning_content = state.thinking;
           }
           messages.push(assistantEntry);
@@ -3239,12 +3394,19 @@ export class ApiBackend extends PunkBackend {
                 // Ends with punctuation that implies more is coming
                 /[,:]\s*$/.test(lastOutput.slice(-50)));
 
-            if ((workLeft || looksIncomplete) && turn < maxTurns) {
+            // Continue ONLY when the output was genuinely cut off mid-stream
+            // (unclosed code fence, explicit "I'll continue", trailing comma).
+            // Lingering todos do NOT force continuation: a model doing real work
+            // keeps calling tools — a stop with no tools is the model YIELDING,
+            // whether it's done or wants the user's input. Respect that instead
+            // of force-feeding "keep going," which is what made the model plow
+            // past completion and ignore the need for user verification.
+            if (looksIncomplete && turn < maxTurns) {
               const remaining = todos.filter((t) => t.status !== "completed");
               const continueReason =
                 looksIncomplete && !workLeft
                   ? "incomplete output detected"
-                  : `work is pending (${remaining.length} todos)`;
+                  : `incomplete output with ${remaining.length} pending todos`;
               console.log(
                 `[http] Auto-continuing turn ${turn} - ${continueReason}`,
               );
@@ -3453,6 +3615,8 @@ export class ApiBackend extends PunkBackend {
             request.projectId,
             request.workingDir,
           );
+          // Reset the copy-on-write file journal for this turn
+          executor.resetJournal();
           let toolSeq = 0; // sequence counter for tool-result-cache
 
           for (const tool of state.toolUses.values()) {
@@ -3479,6 +3643,42 @@ export class ApiBackend extends PunkBackend {
               } catch (err) {
                 result = { success: false, error: err.message };
               }
+            } else if (tool.name === "ask_user") {
+              // Terminal tool: the model is handing control back to the user.
+              // Surface the question as a normal assistant message so it renders
+              // in the conversation, flag the wait, and acknowledge the tool so
+              // the turn closes with a valid tool_result. The loop breaks after
+              // this batch — the user's next message resumes naturally.
+              const question = (parsedInput.question || "").trim();
+              const ctx = (parsedInput.context || "").trim();
+              const visible = ctx ? `${ctx}\n\n${question}` : question;
+              if (visible) {
+                this.onEvent(
+                  request.projectId,
+                  {
+                    event: "message",
+                    data: {
+                      parsed: {
+                        type: "assistant",
+                        message: { content: [{ type: "text", text: visible }] },
+                      },
+                    },
+                  },
+                  request.requestId,
+                );
+              }
+              // Signal the renderer that the session is waiting on the user.
+              this.onEvent(
+                request.projectId,
+                { event: "awaiting_input", data: { question } },
+                request.requestId,
+              );
+              awaitingUserInput = true;
+              result = {
+                success: true,
+                output:
+                  "Question delivered to the user. The turn is now paused — stop here and wait for the user's reply. Do not take further action.",
+              };
             } else {
               result = await executor.executeTool(
                 tool.id,
@@ -3742,8 +3942,12 @@ export class ApiBackend extends PunkBackend {
           // Window management — V4-direct when turn selection is available
           // Only for explicit-caching providers (Anthropic). Auto-caching
           // providers skip body-level pruning to keep the cache prefix stable.
+          // Offloaded to a Worker thread to avoid freezing the main process.
           if (turnSelection && PROVIDERS_WITH_EXPLICIT_CACHE.has(request.provider)) {
-            applyV4TurnSelection(messages, turnSelection, request.projectId);
+            const compResult = await compactMessages("applyV4TurnSelection", {
+              messages, turnSelection, projectId: request.projectId,
+            });
+            messages = compResult.messages;
           }
         } catch (turnError) {
           // Per-turn error handling — retry recoverable errors inside the loop
@@ -4113,6 +4317,14 @@ export class ApiBackend extends PunkBackend {
           timestamp: Date.now(),
           phase: "post-turn",
         });
+
+        // The model called ask_user — it is explicitly handing control back and
+        // waiting for a reply. Stop the loop cleanly (all post-turn processing
+        // above has run); the user's next message resumes the conversation.
+        if (awaitingUserInput) {
+          console.log(`[http] ask_user on turn ${turn} — pausing for user input.`);
+          break;
+        }
       }
 
       // Signal successful completion — mirrors cli-worker's "result" event so the
@@ -4435,6 +4647,23 @@ export class ApiBackend extends PunkBackend {
           Authorization: `Bearer ${apiConfig.apiKey}`,
         };
         // Prefix-cache: frozen-only system message + dynamic preamble on user message
+        finalBody = {
+          ...body,
+          messages: systemTiers
+            ? applyPrefixCacheOptimization(body.messages, systemTiers)
+            : body.messages,
+          user: userTag,
+        };
+        break;
+
+      case "z-ai":
+        url =
+          apiConfig.baseUrl || "https://api.z.ai/api/paas/v4/chat/completions";
+        headers = {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiConfig.apiKey}`,
+        };
+        // Prefix-cache: GLM supports context caching, benefit from frozen-only split
         finalBody = {
           ...body,
           messages: systemTiers
@@ -4788,7 +5017,9 @@ export class ApiBackend extends PunkBackend {
       case "gemini":
         return "gemini-3-flash-preview";
       case "deepseek":
-        return "deepseek-chat";
+        return "deepseek-v4-flash";
+      case "z-ai":
+        return "glm-5.2";
       case "stepfun":
         return "step-3.5-flash";
       case "kimi":
@@ -4823,10 +5054,25 @@ export class ApiBackend extends PunkBackend {
 
     if (provider === "deepseek") {
       const map = {
-        "deepseek-v3": "deepseek-chat",
-        "deepseek-r1": "deepseek-reasoner",
-        "deepseek-v3.2": "deepseek-chat",
-        "deepseek-v3.2-speciale": "deepseek-reasoner",
+        "deepseek-v4-flash": "deepseek-v4-flash",
+        "deepseek-v4-pro": "deepseek-v4-pro",
+        "deepseek-v4": "deepseek-v4-flash",
+      };
+      return map[model.toLowerCase()] || model;
+    }
+
+    if (provider === "z-ai") {
+      // Z.ai GLM models use their native IDs directly (glm-5.2, glm-4.7, etc.)
+      const map = {
+        "glm-5.2": "glm-5.2",
+        "glm-5.1": "glm-5.1",
+        "glm-5": "glm-5",
+        "glm-5-turbo": "glm-5-turbo",
+        "glm-4.7": "glm-4.7",
+        "glm-4.7-flash": "glm-4.7-flash",
+        "glm-4.6": "glm-4.6",
+        "glm-4.5": "glm-4.5",
+        "glm-4.5-flash": "glm-4.5-flash",
       };
       return map[model.toLowerCase()] || model;
     }
@@ -5005,10 +5251,11 @@ export class ApiBackend extends PunkBackend {
       }
 
       // Native provider cases — fixed, known streaming formats.
-      // deepseek-reasoner uses reasoning_content; stepfun uses reasoning;
+      // DeepSeek V4 uses reasoning_content; stepfun uses reasoning;
       // kimi uses standard content only. Tool-call handling is identical
       // to the openrouter block above so they share that logic via fallthrough.
       case "xiaomi":
+      case "z-ai":
       case "deepseek":
       case "kimi":
       case "stepfun": {
@@ -5359,6 +5606,8 @@ export class ApiBackend extends PunkBackend {
       executor.cleanup();
     }
     this.toolExecutors.clear();
+    // Gracefully terminate the compaction worker
+    stopCompactionWorker();
   }
 
   async getOpenRouterModels() {
@@ -5420,6 +5669,49 @@ export class ApiBackend extends PunkBackend {
         .sort(_byRelevance);
     } catch (err) {
       console.error("[http] Failed to fetch DeepSeek models:", err);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch available Z.ai (GLM) models via their OpenAI-compatible /models endpoint.
+   * Z.ai's /models endpoint returns the standard OpenAI format with id, context_length, etc.
+   */
+  async getZaiModels() {
+    const apiConfig = await this.getApiConfig("z-ai");
+    if (!apiConfig.apiKey) return [];
+
+    try {
+      const base = apiConfig.baseUrl
+        ? apiConfig.baseUrl.replace(/\/chat\/completions\/?$/, "")
+        : "https://api.z.ai/api/paas/v4";
+      const baseUrlClean = base.replace(/\/$/, "");
+      const url = baseUrlClean.endsWith("/models")
+        ? baseUrlClean
+        : `${baseUrlClean}/models`;
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!response.ok) return [];
+
+      const json = await response.json();
+      if (!json.data) return [];
+
+      return json.data
+        .filter((m) => m.id && (m.id.includes("glm") || m.id.includes("cogview")))
+        .map((m) => ({
+          id: m.id,
+          name: _zaiDisplayName(m.id),
+          context_length: m.context_length || _zaiContextLength(m.id),
+          provider: "Z.ai",
+          tier: m.id.includes("glm-5") ? 1 : m.id.includes("glm-4.7") ? 1 : 2,
+          input_cost: null,
+          output_cost: null,
+        }))
+        .sort(_byRelevance);
+    } catch (err) {
+      console.error("[http] Failed to fetch Z.ai models:", err);
       return [];
     }
   }

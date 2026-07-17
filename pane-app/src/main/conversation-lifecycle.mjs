@@ -15,7 +15,7 @@
  * Fallback: forcePruneToBudget() — pre-flight guardrail with safety multiplier.
  */
 
-import { estimateTokens, SLIDING_WINDOW_SIZE } from "./token-budget.mjs";
+import { estimateTokens, estimateConversationTokens, estimateMessageTokens, invalidateMessageTokenCache, MESSAGE_OVERHEAD, SLIDING_WINDOW_SIZE } from "./token-budget.mjs";
 import { buildSummary, pruneOldTurns } from "./tool-result-cache.mjs";
 import { contextStore } from "./context-store.mjs";
 
@@ -93,10 +93,21 @@ export function summarizeTurn(messages, startIdx, endIdx, options = {}) {
     // push time in http-backend.mjs. Full content is in ToolResultStore.
     // Re-summarizing would just replace the summary with the same value.
     if (msg._resultRef) continue;
+    // Skip already-summarized tool messages — prevents re-summarization
+    // in compaction loops. The _summarized flag is set below after
+    // the first summarization pass.
+    if (msg._summarized) continue;
 
+    // Use the cached per-message token estimate when available — avoids
+    // re-scanning the full tool result content with classifyContent().
+    // The _tokenEstimate was set by the guardrail's estimateConversationTokens()
+    // call just before compaction. Subtract MESSAGE_OVERHEAD since we only
+    // want the content tokens, not the role-header overhead.
     const originalContent =
       typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-    const originalTokens = estimateTokens(originalContent);
+    const originalTokens = msg._tokenEstimate !== undefined
+      ? msg._tokenEstimate - MESSAGE_OVERHEAD
+      : estimateTokens(originalContent);
 
     // Build summary (and optionally cache raw on disk)
     const toolName = msg.name || "unknown";
@@ -116,6 +127,12 @@ export function summarizeTurn(messages, startIdx, endIdx, options = {}) {
 
     const summaryTokens = estimateTokens(summary);
     msg.content = summary;
+
+    // Mark as summarized so subsequent compaction iterations skip it
+    msg._summarized = true;
+
+    // Invalidate token cache — content has changed
+    invalidateMessageTokenCache(msg);
 
     // Track savings
     const saved = originalTokens - summaryTokens;
@@ -254,12 +271,10 @@ function dropOldestTurn(messages, turns, freshDepth, projectId) {
     const userMsg = messages[turn.start];
     if (userMsg?.role === "system") continue;
 
-    // Calculate how many tokens this turn uses
+    // Calculate how many tokens this turn uses (uses cached _tokenEstimate)
     let turnTokens = 0;
     for (let i = turn.start; i <= turn.end; i++) {
-      const msg = messages[i];
-      const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-      turnTokens += estimateTokens(content);
+      turnTokens += estimateMessageTokens(messages[i]);
     }
 
     // Build extractive summary BEFORE removing messages
@@ -328,12 +343,10 @@ export function dropIrrelevantTurns(messages, turns, selection, projectId) {
     .sort((a, b) => b.start - a.start);
 
   for (const turn of toDrop) {
-    // Calculate tokens before removal
+    // Calculate tokens before removal (uses cached _tokenEstimate)
     let turnTokens = 0;
     for (let i = turn.start; i <= turn.end; i++) {
-      const content = typeof messages[i]?.content === "string"
-        ? messages[i].content : JSON.stringify(messages[i]?.content || "");
-      turnTokens += estimateTokens(content);
+      turnTokens += estimateMessageTokens(messages[i]);
     }
 
     // Build extractive summary BEFORE removing messages
@@ -385,7 +398,7 @@ export function dropIrrelevantTurns(messages, turns, selection, projectId) {
  */
 function truncateOversizedMessages(messages, targetTokens) {
   let totalSaved = 0;
-  let currentTokens = estimateTokens(JSON.stringify(messages));
+  let currentTokens = estimateConversationTokens(messages);
   let iterations = 0;
   const MAX_ITER = 20;
 
@@ -411,18 +424,28 @@ function truncateOversizedMessages(messages, targetTokens) {
     const originalContent = typeof msg.content === "string" ? msg.content : "";
     if (!originalContent) break;
 
-    const originalTokens = estimateTokens(originalContent);
+    // Use cached estimate when available — avoids re-scanning the full content.
+    // For fresh-turn tool results that are still in their original form, the
+    // _tokenEstimate was set by the guardrail's estimateConversationTokens().
+    const originalTokens = msg._tokenEstimate !== undefined
+      ? msg._tokenEstimate - MESSAGE_OVERHEAD
+      : estimateTokens(originalContent);
 
     // Halve the content — aggressive but guarantees progress
     const halfLen = Math.floor(originalContent.length / 2);
     msg.content = originalContent.slice(0, halfLen) + "\n[...truncated]";
 
+    // Invalidate token cache — content has changed
+    invalidateMessageTokenCache(msg);
+
+    // Cache was invalidated above — must re-scan. Content is now smaller
+    // (halved), so this is faster than the original scan.
     const newTokens = estimateTokens(msg.content);
     const saved = originalTokens - newTokens;
     if (saved <= 0) break; // edge case: estimation says no savings
 
     totalSaved += saved;
-    currentTokens = estimateTokens(JSON.stringify(messages));
+    currentTokens = estimateConversationTokens(messages);
   }
 
   return totalSaved;
@@ -430,8 +453,17 @@ function truncateOversizedMessages(messages, targetTokens) {
 
 /**
  * Force-prune messages to fit within a given token budget.
- * Drops oldest turns first, summarizes tool results second.
- * Used as pre-flight guardrail before API calls.
+ * Uses a one-pass approach: summarize all non-fresh tool results, then
+ * drop the oldest non-fresh non-system turns in a single splice until
+ * under budget or nothing prunable remains. Falls through to per-message
+ * truncation (Phase 3) as a safety net.
+ *
+ * Why one-pass instead of iterative:
+ *   - Token cache (message._tokenEstimate) makes estimation O(messages) ~microseconds
+ *   - _summarized flag prevents re-summarizing already-compressed tool results
+ *   - Dropping multiple turns in one splice avoids O(n) detectTurns per iteration
+ *   - The old while loop could iterate up to 50× on deeply over-budget conversations;
+ *     one-pass always completes in exactly 1 summarize pass + 1 drop pass
  *
  * @param {Array} messages - mutated in place
  * @param {number} maxTokens - Maximum allowed tokens for serialized messages
@@ -439,60 +471,128 @@ function truncateOversizedMessages(messages, targetTokens) {
  * @returns {{ tokensSaved: number, messagesRemaining: number }}
  */
 export function forcePruneToBudget(messages, maxTokens, projectId = "unknown") {
-  let totalTokens = estimateTokens(JSON.stringify(messages));
+  let totalTokens = estimateConversationTokens(messages);
   let totalSaved = 0;
-  let iterations = 0;
-  const MAX_ITERATIONS = 50;
 
-  while (totalTokens > maxTokens && iterations < MAX_ITERATIONS) {
-    iterations++;
-    const turns = detectTurns(messages);
+  // Fast path: already under budget, nothing to do
+  if (totalTokens <= maxTokens) {
+    return { tokensSaved: 0, messagesRemaining: messages.length };
+  }
 
-    // Phase 1: Summarize tool results from oldest turns
-    let savedThisRound = 0;
-    for (let t = 0; t < turns.length; t++) {
-      const turn = turns[t];
-      const turnFromEnd = turns.length - 1 - t;
-      if (turnFromEnd < FRESH_DEPTH) continue; // keep fresh
+  // ── Phase 1: One-pass summarization of all non-fresh tool results ──────
+  // After this pass, all non-fresh tool messages have _summarized=true
+  // and will be skipped in any subsequent summarization call.
+  let turns = detectTurns(messages);
+  let summarySaved = 0;
 
-      const saved = summarizeTurn(messages, turn.start, turn.end, {
-        projectId,
-        turnIndex: turn.turnIndex,
-        cache: true,
-      });
-      if (saved > 0) savedThisRound += saved;
-    }
+  for (let t = 0; t < turns.length; t++) {
+    const turn = turns[t];
+    const turnFromEnd = turns.length - 1 - t;
+    if (turnFromEnd < FRESH_DEPTH) continue; // keep fresh turns raw
 
-    if (savedThisRound > 0) {
-      totalSaved += savedThisRound;
-      totalTokens = estimateTokens(JSON.stringify(messages));
-    }
+    // cache: false — skip redundant disk writes during compaction.
+    // Disk caching already happened at push time via _resultRef pointers
+    // (set in http-backend.mjs). Writing the full content to disk again
+    // here adds 5-15 seconds of synchronous fs.writeFileSync I/O for
+    // large conversations, which can blow past the 30s worker timeout.
+    summarySaved += summarizeTurn(messages, turn.start, turn.end, {
+      projectId,
+      turnIndex: turn.turnIndex,
+      cache: false,
+    });
+  }
 
-    // Phase 2: Drop oldest turns if still over budget
-    if (totalTokens > maxTokens) {
-      const refreshedTurns = detectTurns(messages);
-      const result = dropOldestTurn(messages, refreshedTurns, FRESH_DEPTH);
-      if (result.tokensSaved > 0) {
-        totalSaved += result.tokensSaved;
-        totalTokens = estimateTokens(JSON.stringify(messages));
-      } else {
-        break; // nothing more to drop
+  if (summarySaved > 0) {
+    totalSaved += summarySaved;
+    totalTokens = estimateConversationTokens(messages);
+  }
+
+  // ── Phase 2: Iterative turn dropping ────────────────────────────────────
+  // Drop oldest non-fresh turns until under budget or nothing prunable remains.
+  // This MUST be iterative because FRESH_DEPTH is calculated from turn position
+  // from end (FRESH_DEPTH = SLIDING_WINDOW_SIZE = 5). After dropping the oldest
+  // turn, previously-protected turns shift closer to "old" status and become
+  // eligible for dropping. Only way to handle this is to re-check after each drop.
+  //
+  // Key optimization vs old code: Phase 1 already summarized ALL non-fresh tool
+  // results in one pass and set _summarized=true. Phase 2's summarizeTurn calls
+  // will skip already-summarized messages (O(1) _summarized check), so Phase 2
+  // does NOT re-summarize — it just measures token savings.
+  if (totalTokens > maxTokens) {
+    let dropIterations = 0;
+    const MAX_DROP_ITERATIONS = 50;
+
+    while (totalTokens > maxTokens && dropIterations < MAX_DROP_ITERATIONS) {
+      dropIterations++;
+
+      turns = detectTurns(messages);
+
+      // Find the oldest non-fresh, non-system, non-marker turn to drop.
+      // Skip markers (single-message "turns" that are already archived) —
+      // otherwise the same marker gets perpetually re-archived each iteration
+      // with near-zero token savings, wasting CPU cycles.
+      let oldestPrunable = null;
+
+      for (let t = 0; t < turns.length; t++) {
+        const turn = turns[t];
+        const turnFromEnd = turns.length - 1 - t;
+        if (turnFromEnd < FRESH_DEPTH) break; // remaining turns are fresh
+
+        const userMsg = messages[turn.start];
+        if (userMsg?.role === "system") continue;
+
+        // Skip marker turns: single-message archival summaries.
+        if (turn.end === turn.start) continue;
+
+        oldestPrunable = turn;
+        break; // found the oldest real turn
       }
-    }
 
-    if (savedThisRound === 0 && totalTokens > maxTokens) {
-      break;
+      if (!oldestPrunable) break; // nothing more to drop
+
+      const turn = oldestPrunable;
+
+      // Measure token cost of this turn using cached estimates (O(1) each)
+      let turnTokens = 0;
+      for (let i = turn.start; i <= turn.end; i++) {
+        turnTokens += estimateMessageTokens(messages[i]);
+      }
+
+      // Build summary marker and apply
+      const { marker, extracted } = buildTurnSummaryMarker(
+        messages, turn.start, turn.end, turn.turnIndex
+      );
+
+      // Remove all messages in this turn (reverse order preserves indices)
+      for (let i = turn.end; i >= turn.start; i--) {
+        messages.splice(i, 1);
+      }
+
+      // Insert summary marker at the start position
+      messages.splice(turn.start, 0, marker);
+
+      // Fill raw token count and persist for semantic retrieval
+      extracted.rawTokenCount = turnTokens;
+      if (projectId) {
+        storeTurnSummary(projectId, extracted);
+      }
+
+      // Estimate net savings: turn tokens - marker tokens
+      const estimatedSaved = Math.max(turnTokens - estimateTokens(marker.content), 0);
+      totalSaved += estimatedSaved;
+
+      // Re-measure total tokens (uses cache — O(messages) ~microseconds)
+      totalTokens = estimateConversationTokens(messages);
     }
   }
 
-  // Phase 3: Per-message content truncation — last resort when all turns are fresh
-  // and turn-level pruning can't reduce further. Halves the largest non-system
-  // message content each iteration. This is a nuclear option but prevents the
-  // death loop where every turn is "fresh" but a single tool result exceeds budget.
+  // ── Phase 3: Per-message content truncation ────────────────────────────
+  // Last resort when all remaining turns are fresh but a single oversized
+  // tool result still exceeds budget. Halves the largest non-system message
+  // content each iteration.
   if (totalTokens > maxTokens) {
     const truncateSaved = truncateOversizedMessages(messages, maxTokens);
     totalSaved += truncateSaved;
-    totalTokens = estimateTokens(JSON.stringify(messages));
   }
 
   return {
@@ -599,7 +699,7 @@ export function dropAllNonFreshTurns(messages, projectId = "unknown", maxTokens 
   // Phase 2: Per-message truncation — all remaining turns are fresh,
   // but a single oversized tool result can still exceed the budget.
   if (maxTokens !== null) {
-    const currentTokens = estimateTokens(JSON.stringify(messages));
+    const currentTokens = estimateConversationTokens(messages);
     if (currentTokens > maxTokens) {
       const truncateSaved = truncateOversizedMessages(messages, maxTokens);
       totalSaved += truncateSaved;

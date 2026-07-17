@@ -48,7 +48,7 @@ export const RATIOS = {
  * Per-message overhead: role header, formatting tokens, separators.
  * Claude uses ~4 tokens per message for role/formatting.
  */
-const MESSAGE_OVERHEAD = 4;
+export const MESSAGE_OVERHEAD = 4;
 
 /**
  * Classify content by structural type.
@@ -126,29 +126,56 @@ export function estimateTokens(text) {
 }
 
 /**
+ * Invalidate the cached token estimate for a message.
+ * Must be called whenever a message's content is mutated.
+ * @param {{ _tokenEstimate?: number }} message
+ */
+export function invalidateMessageTokenCache(message) {
+  if (message && message._tokenEstimate !== undefined) {
+    delete message._tokenEstimate;
+  }
+}
+
+/**
  * Estimate token count for a conversation message.
  * Accounts for role header overhead.
+ *
+ * Results are cached on `message._tokenEstimate` for O(1) re-query.
+ * Call `invalidateMessageTokenCache(msg)` if content changes.
+ *
  * @param {{ role: string, content: string | object }} message
  * @returns {number}
  */
 export function estimateMessageTokens(message) {
   if (!message) return 0;
+
+  // Return cached estimate if available — avoids re-scanning content
+  if (message._tokenEstimate !== undefined) return message._tokenEstimate;
+
   const content = typeof message.content === "string"
     ? message.content
     : JSON.stringify(message.content);
-  return estimateTokens(content) + MESSAGE_OVERHEAD;
+  const estimate = estimateTokens(content) + MESSAGE_OVERHEAD;
+
+  // Cache on the message object. Messages are immutable after creation
+  // for 99% of their lifetime. Cache is invalidated explicitly when
+  // content changes (summarization, truncation).
+  message._tokenEstimate = estimate;
+  return estimate;
 }
 
 /**
  * Estimate total tokens for a conversation history.
+ * Leverages per-message cache for O(n) with n = message count (typically <200).
+ *
  * @param {Array<{ role: string, content: string | object }>} messages
  * @returns {number}
  */
 export function estimateConversationTokens(messages) {
   if (!messages || messages.length === 0) return 0;
   let total = 0;
-  for (const msg of messages) {
-    total += estimateMessageTokens(msg);
+  for (let i = 0; i < messages.length; i++) {
+    total += estimateMessageTokens(messages[i]);
   }
   return total;
 }
@@ -190,6 +217,7 @@ export function getModelLimit(model) {
   if (modelLower.includes("claude") || modelLower.includes("opus") || modelLower.includes("sonnet")) return 1000000;
   if (modelLower.includes("qwen")) return 262144;
   if (modelLower.includes("deepseek")) return 1000000;
+  if (modelLower.includes("glm")) return 1000000;
 
   return 128000;
 }
@@ -204,8 +232,8 @@ export function getModelLimit(model) {
 export function getDefaultOutputBudget(model) {
   if (!model) return 8192;
   const m = model.toLowerCase();
-  if (m.includes("deepseek-reasoner") || m.includes("deepseek-r1")) return 32768;
   if (m.includes("deepseek")) return 8192;
+  if (m.includes("glm")) return 8192;
   if (m.includes("stepfun") || m.includes("step-")) return 16384;
   return 8192;
 }

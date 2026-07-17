@@ -93,7 +93,7 @@ function generateProjectId(): string {
 }
 
 function createProject(root: string, stableId?: string, nameOverride?: string): Project {
-  const name = (nameOverride ?? root.split("/").filter(Boolean).pop()) || root;
+  const name = nameOverride ?? (root ? (root.split("/").filter(Boolean).pop() || root) : "Untitled");
   const id = stableId ?? generateProjectId();
   return {
     id,
@@ -139,7 +139,7 @@ interface ProjectsState {
   projectOrder: string[]; // ordered list of project IDs for Cmd+1/2/3
 
   // Project lifecycle
-  addProject: (root: string, stableId?: string) => string; // returns project ID
+  addProject: (root: string, stableId?: string, nameOverride?: string) => string; // returns project ID
   removeProject: (id: string) => void;
   archiveProject: (id: string) => void;
   restoreProject: (id: string) => void;
@@ -219,7 +219,19 @@ interface ProjectsState {
   updateLastAssistantContent: (
     projectId: string,
     content: ContentBlock[],
-  ) => void;  appendToLastAssistantText: (projectId: string, text: string) => void;
+  ) => void;
+  /** Atomic batch update for streaming — all mutations in one set() call.
+   *  Applies text delta, thinking delta, and status message in a single pass,
+   *  producing ONE new Map instead of 2-3 per event. */
+  batchUpdateConversation: (
+    projectId: string,
+    updates: {
+      textDelta?: string;
+      thinkingDelta?: string;
+      statusMessage?: string | null;
+    },
+  ) => void;
+  appendToLastAssistantText: (projectId: string, text: string) => void;
   appendToLastAssistantThinking: (projectId: string, thinking: string) => void;
   setLastThinkingSignature: (projectId: string, signature: string) => void;
   setConversationModel: (projectId: string, model: string) => void;
@@ -317,20 +329,27 @@ function createProjectsStore() {
     activeProjectId: null,
     projectOrder: [],
 
-    addProject: (root: string, stableId?: string) => {
+    addProject: (root: string, stableId?: string, nameOverride?: string) => {
       const state = get();
       // Multi-thread: same folder can be added multiple times, each gets its own
       // UUID and independent conversation. Disambiguate name if there's a duplicate.
-      const sameRootCount = [...state.projects.values()].filter((p) => p.root === root).length;
-      let name = root.split("/").filter(Boolean).pop() || root;
-      if (sameRootCount > 0) {
-        name = `${name} (${sameRootCount + 1})`;
+      if (root) {
+        const sameRootCount = [...state.projects.values()].filter((p) => p.root === root).length;
+        let derivedName = root.split("/").filter(Boolean).pop() || root;
+        if (sameRootCount > 0) {
+          derivedName = `${derivedName} (${sameRootCount + 1})`;
+        }
+        nameOverride ??= derivedName;
       }
       // If a stableId is provided and already exists (e.g. from a previous session),
       // trust it — don't ensureUnique since it IS the canonical identity.
-      const project = createProject(root, stableId, name);
+      const project = createProject(root, stableId, nameOverride);
       if (!stableId) {
         project.id = ensureUniqueId(project.id, state.projects);
+      }
+      // Threads without a root are marked as rootMissing until bound.
+      if (!root) {
+        project.rootMissing = true;
       }
       // Seed thread activity timestamp so newly added projects sort to top
       project.lastActivityAt = Date.now();
@@ -351,13 +370,19 @@ function createProjectsStore() {
     },
 
     rebindProject: (id: string, newRoot: string) => {
-      set((state) =>
-        updateProject(state, id, () => ({
+      set((state) => {
+        const project = state.projects.get(id);
+        // If the project had an empty root (user-named thread), preserve the name.
+        // If it had a real root (folder-renamed), derive name from new root.
+        const hadEmptyRoot = !project?.root;
+        return updateProject(state, id, () => ({
           root: newRoot,
-          name: newRoot.split("/").filter(Boolean).pop() || newRoot,
+          name: hadEmptyRoot
+            ? (project?.name ?? (newRoot.split("/").filter(Boolean).pop() || newRoot))
+            : (newRoot.split("/").filter(Boolean).pop() || newRoot),
           rootMissing: false,
-        }))
-      );
+        }));
+      });
     },
 
     markRootMissing: (id: string, missing: boolean) => {
@@ -675,6 +700,50 @@ function createProjectsStore() {
             m.id === messageId ? { ...m, reasoning_content: reasoning } : m,
           );
           return { conversation: { ...p.conversation, messages: msgs } };
+        }),
+      ),
+
+    /** Atomic batch: applies textDelta, thinkingDelta, statusMessage in ONE set() call. */
+    batchUpdateConversation: (projectId, { textDelta, thinkingDelta, statusMessage }) =>
+      set((state) =>
+        updateProject(state, projectId, (p) => {
+          const conv = { ...p.conversation };
+          if (statusMessage !== undefined) {
+            conv.statusMessage = statusMessage;
+          }
+          if (textDelta || thinkingDelta) {
+            const msgs = [...conv.messages];
+            const last = msgs[msgs.length - 1];
+            if (last && last.type === "assistant") {
+              const blocks = [...last.content];
+              if (textDelta) {
+                const lastBlock = blocks[blocks.length - 1];
+                if (lastBlock && lastBlock.type === "text") {
+                  blocks[blocks.length - 1] = {
+                    ...lastBlock,
+                    text: (lastBlock as { type: "text"; text: string }).text + textDelta,
+                  };
+                } else {
+                  blocks.push({ type: "text", text: textDelta });
+                }
+              }
+              if (thinkingDelta) {
+                const lastBlock = blocks[blocks.length - 1];
+                if (lastBlock && lastBlock.type === "thinking") {
+                  blocks[blocks.length - 1] = {
+                    ...lastBlock,
+                    thinking:
+                      (lastBlock as { type: "thinking"; thinking: string }).thinking + thinkingDelta,
+                  };
+                } else {
+                  blocks.push({ type: "thinking", thinking: thinkingDelta });
+                }
+              }
+              msgs[msgs.length - 1] = { ...last, content: blocks };
+            }
+            conv.messages = msgs;
+          }
+          return { conversation: conv };
         }),
       ),
 
@@ -1046,22 +1115,27 @@ function createProjectsStore() {
     prependOlderMessages: (projectId, olderMessages, newStartIndex) =>
       set((state) =>
         updateProject(state, projectId, (p) => {
-          const merged = [
-            ...olderMessages.map((m) => ({ ...m, isHistorical: true })),
-            ...p.conversation.messages,
-          ];
-          // Cap to most recent N, adjusting start index for trimmed front
-          const trimmed = merged.length > MAX_STORE_MESSAGES
-            ? merged.length - MAX_STORE_MESSAGES
-            : 0;
-          const capped = trimmed > 0
-            ? merged.slice(trimmed)
+          // Sliding window, not unbounded growth. The original bug trimmed the
+          // FRONT (the just-loaded older messages) → a permanent ceiling. But
+          // NOT trimming at all is worse: the message list is not virtualized,
+          // so an unbounded array freezes the renderer (every MemoizedMessage
+          // re-renders markdown + syntax highlighting). So we page backward by
+          // dropping the off-screen NEWEST tail instead, keeping the rendered
+          // window bounded while history still loads all the way to the start.
+          // Dedupe against what's already loaded to guard overlapping slices.
+          const existingIds = new Set(p.conversation.messages.map((m) => m.id));
+          const older = olderMessages
+            .filter((m) => !existingIds.has(m.id))
+            .map((m) => ({ ...m, isHistorical: true }));
+          const merged = [...older, ...p.conversation.messages];
+          const capped = merged.length > MAX_STORE_MESSAGES
+            ? merged.slice(0, MAX_STORE_MESSAGES)
             : merged;
           return {
             conversation: {
               ...p.conversation,
               messages: capped,
-              historyStartIndex: newStartIndex + trimmed,
+              historyStartIndex: newStartIndex,
             },
           };
         }),

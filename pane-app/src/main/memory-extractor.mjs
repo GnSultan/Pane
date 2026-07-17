@@ -1,9 +1,12 @@
 /**
  * Memory Extractor — automatic post-turn memory extraction.
  *
- * After each turn, asks: "Did anything here matter?" If yes, indexes the
- * extracted memories into the brain's knowledge graph at confidence 1.0
- * with standard decay. No separate step. No cold reset. No re-explaining.
+ * After each turn, asks: "Did anything here SURPRISE us?" If yes, indexes
+ * the extracted memories into the brain's knowledge graph as hypotheses
+ * (moderate seed confidence, standard decay). A memory only qualifies if
+ * it can be phrased as a rule-candidate — something that would change how
+ * a developer acts next time. Routine work is not knowledge; the reflection
+ * engine (playbook-engine.mjs) later distills what survives into principles.
  *
  * This is the "effortless" part of the three-tier architecture:
  *   TIER 1 — Sliding window (exact recent turns)
@@ -26,26 +29,35 @@ const MAX_MEMORY_LENGTH = 300;
  * The model is asked to evaluate the assistant's response and determine
  * if anything worth remembering happened during this turn.
  */
-const EXTRACTION_PROMPT = `You are a memory extraction filter for a coding assistant. 
-Given the assistant's response to a user's request, determine if anything happened 
+const EXTRACTION_PROMPT = `You are a memory extraction filter for a coding assistant.
+Given the assistant's response to a user's request, determine if anything happened
 that's worth remembering for future sessions.
 
+The bar is SURPRISE: something was believed or expected, and reality turned out
+different. A memory is only worth keeping if it can be phrased as a rule-candidate —
+what was expected, what turned out true, and the rule it implies. If you cannot state
+the implied rule, it is not knowledge.
+
 A "worth remembering" event includes:
-- A root cause was identified (e.g. "the bug was caused by X")
-- A decision was made (e.g. "we'll use strategy X over Y")
-- A pattern was discovered (e.g. "all handlers follow this structure")
-- A tool preference emerged (e.g. "always use bun instead of npm")
-- A lesson was learned (e.g. "setting Z breaks feature X")
-- An error fix revealed non-obvious behavior
+- A root cause was identified that wasn't the obvious suspect (e.g. "the freeze looked like X but was caused by Y")
+- A decision was made WITH its rationale (e.g. "chose X over Y because Z")
+- A non-obvious pattern was discovered (e.g. "all handlers follow this structure")
+- The user corrected an approach (e.g. "never do X here, do Y instead")
+- A lesson was learned the hard way (e.g. "setting Z silently breaks feature X")
+- An error fix revealed behavior that contradicts documentation or intuition
 
 NOT worth remembering:
-- Routine implementation details
-- Code that was written as expected
-- Simple yes/no confirmations
-- General conversation
+- Routine implementation details, however large the change
+- Code that was written and worked as expected
+- What was accomplished (that's session state, not knowledge)
+- Anything derivable by reading the code or docs
+- Simple confirmations or general conversation
+
+Each memory's content must be phrased as the implied rule with its reason —
+"do/avoid X when Y because Z" — not as a narrative of what happened.
 
 Return ONLY a JSON object with this exact format:
-{"worthRemembering": true/false, "memories": [{"type": "decision|lesson|pattern|error_fix", "content": "concise factual statement under 200 chars"}]}
+{"worthRemembering": true/false, "memories": [{"type": "decision|lesson|pattern|error_fix", "content": "actionable rule under 200 chars"}]}
 
 If nothing is worth remembering, return {"worthRemembering": false, "memories": []}.`;
 

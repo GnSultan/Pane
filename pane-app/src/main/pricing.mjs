@@ -34,8 +34,6 @@ let _lastFetchTime = 0;
 // Pane uses internal names for some models that don't match OpenRouter's IDs.
 // Map them to their OpenRouter equivalents so pricing resolves correctly.
 const MODEL_ALIASES = {
-  "deepseek-reasoner":  "deepseek/deepseek-r1-0528",
-  "deepseek-r1":        "deepseek/deepseek-r1-0528",
   "step-3.5-flash":     "stepfun/step-3-5-flash",
   "kimi-k2":            "moonshotai/kimi-k2",
   "mimo-v2-flash":      "xiaomi/mimo-v2-flash",
@@ -55,7 +53,6 @@ const COLD_START_SEED = {
   "sonnet":            { input: 3.0,  output: 15.0, cache_read: 0.3,  cache_write: 3.75 },
   "haiku":             { input: 0.8,  output: 4.0,  cache_read: 0.08, cache_write: 1.0 },
   "default":           { input: 5.0,  output: 25.0, cache_read: 0.5,  cache_write: 6.25 },
-  "deepseek-chat":     { input: 0.14, output: 0.28, cache_read: 0.014 },
   "gemini-2.5-flash":  { input: 0.15, output: 0.6,  cache_read: 0.015 },
   "gemini-2.5-pro":    { input: 1.25, output: 10.0, cache_read: 0.125 },
   "gpt-4o":            { input: 2.5,  output: 10.0 },

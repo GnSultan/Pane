@@ -11,6 +11,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { runMemoryLifecycle, touchMemory, reinforceMemory } from "./memory-lifecycle.mjs";
+import { recordPlaybookFeedback, getPlaybookLedger, KNOWLEDGE_TYPES } from "./playbook-engine.mjs";
 import { isSignalNoise } from "./signal-filters.mjs";
 
 import {
@@ -694,7 +695,7 @@ function initDatabase() {
       UPDATE nodes SET confidence = MIN(0.95, confidence + ?), updated_at = datetime('now') WHERE id = ?
     `),
     getStaleNodes: db.prepare(`
-      SELECT id, confidence, updated_at FROM nodes
+      SELECT id, confidence, updated_at, access_count, entity_type FROM nodes
       WHERE project_id = ? AND confidence > 0.2
       AND updated_at < datetime('now', ?)
     `),
@@ -1045,6 +1046,21 @@ function nodeId(type, content) {
 
 const DEDUP_THRESHOLD = 0.9; // Cosine similarity above this = same concept
 
+// Only knowledge-shaped events enter the graph. Session exhaust
+// (accomplishment, command, intent, discovery, blocker) stays in
+// events.jsonl and handoff state where it belongs — it was 15% of the
+// graph with zero recalls. "error" is kept for error→fix edges.
+const GRAPH_EVENT_TYPES = new Set([...KNOWLEDGE_TYPES, "error", "principle"]);
+
+// Seed confidence by signal quality. user_correction is a human stating a
+// standard — the most trustworthy input we have, so it enters near-certain.
+// decision/lesson/principle are strong; everything else starts as a hypothesis.
+function seedConfidenceFor(type) {
+  if (type === "user_correction") return 0.85;
+  if (type === "decision" || type === "lesson" || type === "principle") return 0.65;
+  return 0.5;
+}
+
 async function indexEvents(projectId, events) {
   if (!db) return { indexed: 0, deduplicated: 0 };
 
@@ -1058,6 +1074,8 @@ async function indexEvents(projectId, events) {
   for (const event of events) {
     // Skip summaries — used for brief only
     if (event.type === "summary") continue;
+    // Knowledge gate — journaling exhaust never enters the graph
+    if (!GRAPH_EVENT_TYPES.has(event.type)) continue;
 
     const content = event.content || "";
     if (content.length < 5) continue;
@@ -1102,17 +1120,17 @@ async function indexEvents(projectId, events) {
         if (isDuplicate) continue;
 
         // New node with embedding
-        const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+        const seedConfidence = seedConfidenceFor(event.type);
         const embeddingBuffer = Buffer.from(embedding.buffer);
         db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), embeddingBuffer, seedConfidence);
       } else {
         // Embedding failed — insert without
-        const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+        const seedConfidence = seedConfidenceFor(event.type);
         db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, seedConfidence);
       }
     } else {
       // Embedder not ready — insert without embedding
-      const seedConfidence = (event.type === "decision" || event.type === "lesson" || event.type === "principle") ? 0.65 : 0.5;
+      const seedConfidence = seedConfidenceFor(event.type);
       db._stmts.insertNode.run(id, name, event.type, projectId, JSON.stringify({ text: content, metadata: event.metadata || {} }), null, seedConfidence);
     }
 
@@ -2662,18 +2680,44 @@ process.parentPort.on("message", async ({ data }) => {
       }
 
       case "memory_lifecycle": {
-        // Run the full memory lifecycle: decay → consolidate → graduate
+        // Run the full memory lifecycle: decay → reflect (playbook revision).
+        // Safe to fire every turn — reflection throttles internally
+        // (6h interval + corpus-change hash) and the one-time migration
+        // is guarded by a syntheses marker.
         if (!db) { sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId }); break; }
         try {
-          // Always enable consolidation — consolidateMemories() has internal guards
-          // (CONSOLIDATION_THRESHOLD, similarity clustering) and only calls the LLM
-          // when there are actually clusters to synthesize. The old caller-side
-          // Math.random() < 0.1 gate in main.mjs was pure waste.
           const result = await runMemoryLifecycle(db, data.projectId, llmCall);
           sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId, result });
         } catch (err) {
           console.error("[brain] memory lifecycle error:", err.message);
           sendToMain({ type: "memory_lifecycle_done", requestId: data.requestId, error: err.message });
+        }
+        break;
+      }
+
+      case "playbook_feedback": {
+        // Validation loop: arbiter verdict holds principles accountable.
+        // Fire-and-forget from punk-engine on every arbiter_verdict event.
+        if (!db) break;
+        try {
+          const result = recordPlaybookFeedback(db, data.projectId, data.verdict);
+          if (result.violations > 0) {
+            console.log(`[brain] playbook feedback for ${data.projectId}: ${result.violations} principle violation(s)`);
+          }
+        } catch (err) {
+          console.warn("[brain] playbook feedback error:", err.message);
+        }
+        break;
+      }
+
+      case "playbook_ledger": {
+        // Ledger snapshot — the "did Pane get smarter" data
+        if (!db) { sendToMain({ type: "playbook_ledger", requestId: data.requestId, principles: [] }); break; }
+        try {
+          const principles = getPlaybookLedger(db, data.projectId);
+          sendToMain({ type: "playbook_ledger", requestId: data.requestId, principles });
+        } catch (err) {
+          sendToMain({ type: "playbook_ledger", requestId: data.requestId, principles: [], error: err.message });
         }
         break;
       }
