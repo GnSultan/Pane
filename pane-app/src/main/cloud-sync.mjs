@@ -9,6 +9,7 @@
 
 import fs from "node:fs/promises";
 import { existsSync, mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import os from "node:os";
 import { execThroughWorker } from "./tool-executor.mjs";
@@ -16,8 +17,84 @@ import { ipcMain, BrowserWindow } from "electron";
 
 import { isLoggedIn, getAuthToken, getUserSecret, getCloudUser, getCloudApiUrl } from "./cloud-auth.mjs";
 import { deriveKey, encryptFile, decryptFile, checksumFile } from "./cloud-crypto.mjs";
+
+const require2 = createRequire(import.meta.url);
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const TEMP_DIR = path.join(PANE_DIR, "tmp");
+
+// ── Fetch timeout ───────────────────────────────────────────────────────
+// Cloudflare Workers have a 30s CPU timeout per invocation, but I/O (fetch,
+// R2) doesn't count — so a hanging R2 call would never timeout on its own.
+// We add client-side timeouts to match the Worker's expected response window.
+const FETCH_TIMEOUT = 60_000; // 60s — generous but not infinite
+
+async function fetchWithTimeout(url, opts = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
+  try {
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── Resilient fetch ───────────────────────────────────────────────────────
+// A bare `fetch failed` is undici hiding the real reason on err.cause. Backups
+// run over whatever connection the user has — flaky links, slow R2 hops — so a
+// single transient failure must not sink the whole backup. Retry network errors
+// and transient HTTP with backoff, and on final failure surface the actual cause
+// and which step failed, instead of a useless "fetch failed".
+const MAX_FETCH_ATTEMPTS = 3;
+
+function describeFetchError(err) {
+  const cause = err?.cause;
+  if (cause?.code) return cause.message ? `${cause.code} (${cause.message})` : cause.code;
+  if (cause?.message) return cause.message;
+  if (err?.name === "AbortError") return "timed out";
+  return err?.message || "unknown network error";
+}
+
+function backoff(attempt) {
+  const ms = Math.min(2000 * 2 ** (attempt - 1), 15_000);
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * fetch with per-attempt timeout, retry+backoff on transient failures, and a
+ * clear error that names the step and the underlying cause.
+ * @param {string} url
+ * @param {object} opts - fetch options (do not pass signal; managed internally)
+ * @param {{ step?: string, timeout?: number }} [cfg]
+ */
+async function fetchWithRetry(url, opts = {}, { step = "request", timeout = FETCH_TIMEOUT } = {}) {
+  let lastReason = "unknown error";
+  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    let res = null;
+    try {
+      res = await fetch(url, { ...opts, signal: ctrl.signal });
+    } catch (err) {
+      lastReason = describeFetchError(err);
+      res = null;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (res) {
+      const transient = res.status === 429 || (res.status >= 500 && res.status <= 599);
+      if (!transient || attempt === MAX_FETCH_ATTEMPTS) return res;
+      lastReason = `HTTP ${res.status}`;
+    }
+
+    if (attempt < MAX_FETCH_ATTEMPTS) {
+      console.warn(`[cloud-sync] ${step} attempt ${attempt}/${MAX_FETCH_ATTEMPTS}: ${lastReason} — retrying`);
+      await backoff(attempt);
+    }
+  }
+  throw new Error(`${step} failed after ${MAX_FETCH_ATTEMPTS} attempts: ${lastReason}`);
+}
 
 // ---------------------------------------------------------------------------
 // Upload — called after local backup completes
@@ -25,6 +102,10 @@ const TEMP_DIR = path.join(PANE_DIR, "tmp");
 
 /**
  * Compress, encrypt, and upload a local backup directory to Pane Cloud.
+ *
+ * Uploads directly to R2 via an AWS SigV4 presigned PUT URL — zero Worker
+ * buffering, no body size limits, one HTTP round-trip instead of the
+ * legacy multipart-though-Worker approach.
  *
  * @param {string} backupDir — path to the dated backup dir (e.g. ~/.pane/backups/2026-03-22/)
  * @returns {{ backup_id: string, size_bytes: number }}
@@ -47,8 +128,6 @@ export async function uploadBackup(backupDir) {
     emitProgress("compressing");
 
     // Compress backup directory
-    // Route through cmd-worker (utility process) to avoid SyncProcessRunner crash.
-    // NOTE: tar may block for several seconds during backup — runs in utility process.
     const tarCompressCmd = `tar czf ${tarPath} -C ${backupDir} .`;
     const tarResult = await execThroughWorker(tarCompressCmd, { timeout: 120 });
     if (!tarResult.success) {
@@ -66,39 +145,45 @@ export async function uploadBackup(backupDir) {
 
     emitProgress("uploading");
 
-    // Step 1: get upload URL
-    const urlRes = await fetch(`${apiUrl}/backups/upload-url`, {
+    // Step 1: Request a presigned upload URL from the Worker
+    const urlRes = await fetchWithRetry(`${apiUrl}/backups/upload-url`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
-    });
+      body: JSON.stringify({ size_bytes: stat.size, checksum }),
+    }, { step: "upload-url request" });
 
     if (!urlRes.ok) {
       const err = await urlRes.json().catch(() => ({}));
-      throw new Error(err.error || `Upload URL failed: ${urlRes.status}`);
+      throw new Error(err.error || `Failed to get upload URL: ${urlRes.status}`);
     }
 
     const { backup_id, r2_key, upload_url } = await urlRes.json();
 
-    // Step 2: upload encrypted blob
-    const blob = await fs.readFile(encPath);
-    const uploadRes = await fetch(`${apiUrl}${upload_url}`, {
+    // Step 2: Upload directly to R2 via presigned URL — no Worker proxy,
+    // no body size limits, no multipart buffering. One round-trip.
+    // Timeout: larger uploads need more time; 5 minutes covers ~500 MB
+    // on a typical connection.
+    const R2_UPLOAD_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    const encData = await fs.readFile(encPath);
+
+    // Do NOT send Content-Type — the presigned URL only signs "host".
+    // Content-Type is a canonical S3 header; if present but unsigned, R2
+    // rejects with 403 Forbidden. This is the flaky hop (slow R2 connects), so
+    // it gets the retry treatment with a generous per-attempt timeout.
+    const uploadRes = await fetchWithRetry(upload_url, {
       method: "PUT",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/octet-stream",
-      },
-      body: blob,
-    });
+      body: encData,
+    }, { step: "R2 upload", timeout: R2_UPLOAD_TIMEOUT });
 
     if (!uploadRes.ok) {
-      throw new Error(`Upload failed: ${uploadRes.status}`);
+      throw new Error(`R2 upload rejected: ${uploadRes.status} ${uploadRes.statusText || ""}`);
     }
 
-    // Step 3: finalize
-    const finalizeRes = await fetch(`${apiUrl}/backups`, {
+    // Step 3: Finalize — register in D1 and rotate old backups
+    const finalizeRes = await fetchWithRetry(`${apiUrl}/backups/upload-complete`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -112,7 +197,7 @@ export async function uploadBackup(backupDir) {
         device_name: os.hostname(),
         app_version: "1.0.0",
       }),
-    });
+    }, { step: "finalize" });
 
     if (!finalizeRes.ok) {
       const err = await finalizeRes.json().catch(() => ({}));
@@ -120,12 +205,15 @@ export async function uploadBackup(backupDir) {
     }
 
     await finalizeRes.json();
-    console.log(`[cloud-sync] uploaded ${backup_id} (${stat.size} bytes)`);
+    console.log(`[cloud-sync] uploaded ${backup_id} (${stat.size} bytes, direct R2)`);
 
     emitProgress("complete", { backup_id, size_bytes: stat.size });
     return { backup_id, size_bytes: stat.size };
+  } catch (err) {
+    emitProgress("error", { message: err.message || "Upload failed" });
+    console.warn("[cloud-sync] upload failed:", err.message);
+    throw err;
   } finally {
-    // Clean up temp files
     await fs.unlink(tarPath).catch(() => {});
     await fs.unlink(encPath).catch(() => {});
   }
@@ -171,19 +259,20 @@ export async function restoreFromCloud() {
 
     emitProgress("downloading");
 
-    // Download
+    // Download stream from Worker — Worker proxies from R2 directly
     const dlRes = await fetch(`${apiUrl}/backups/${latest.id}/download`, {
       headers: { Authorization: `Bearer ${token}` },
     });
 
     if (!dlRes.ok) throw new Error(`Download failed: ${dlRes.status}`);
 
+    const checksum = dlRes.headers.get("X-Checksum") || latest.checksum;
     const encData = Buffer.from(await dlRes.arrayBuffer());
     await fs.writeFile(encPath, encData);
 
     // Verify checksum
-    const checksum = await checksumFile(encPath);
-    if (checksum !== latest.checksum) {
+    const actualChecksum = await checksumFile(encPath);
+    if (actualChecksum !== checksum) {
       throw new Error("Checksum mismatch — download may be corrupted");
     }
 
@@ -215,13 +304,111 @@ export async function restoreFromCloud() {
     }
 
     console.log(`[cloud-sync] restored backup ${latest.id} from ${latest.created_at}`);
-    emitProgress("complete", { backup_id: latest.id, created_at: latest.created_at });
 
+    // Post-restore: rebuild FTS index (messages_fts was excluded from backup)
+    emitProgress("rebuilding-fts");
+    try {
+      rebuildFtsIndex(path.join(PANE_DIR, "pane.db"));
+    } catch (err) {
+      console.warn("[cloud-sync] FTS rebuild failed (non-fatal):", err.message);
+    }
+
+    emitProgress("complete", { backup_id: latest.id, created_at: latest.created_at });
     return { backup_id: latest.id, created_at: latest.created_at };
   } finally {
     await fs.unlink(encPath).catch(() => {});
     await fs.unlink(tarPath).catch(() => {});
     await fs.rm(path.join(TEMP_DIR, "restore-staging"), { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FTS rebuild — called after restore to repopulate search index
+// ---------------------------------------------------------------------------
+
+/**
+ * Rebuild the FTS5 search index from the messages table.
+ *
+ * The optimized backup excludes messages_fts (33 MB recreatable index).
+ * After restore, this function repopulates it from the messages table.
+ * Called synchronously — the app will block on FTS search until this
+ * completes, but that's acceptable for a one-time post-restore step.
+ *
+ * @param {string} paneDbPath — path to the restored pane.db
+ */
+function rebuildFtsIndex(paneDbPath) {
+  if (!existsSync(paneDbPath)) {
+    console.warn("[cloud-sync] pane.db not found at", paneDbPath, "— skipping FTS rebuild");
+    return;
+  }
+
+  const Database = require2("better-sqlite3");
+  const db = new Database(paneDbPath);
+  try {
+    // Create FTS virtual table if it doesn't exist
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        project_id  UNINDEXED,
+        message_id  UNINDEXED,
+        text_content,
+        tokenize = 'porter unicode61'
+      )
+    `);
+
+    // Find messages not yet indexed
+    const messages = db.prepare(`
+      SELECT m.id, m.project_id, m.content
+      FROM messages m
+      WHERE NOT EXISTS (SELECT 1 FROM messages_fts f WHERE f.message_id = m.id)
+    `).all();
+
+    if (messages.length === 0) {
+      console.log("[cloud-sync] FTS index already up to date — nothing to rebuild");
+      return;
+    }
+
+    const insert = db.prepare("INSERT INTO messages_fts (project_id, message_id, text_content) VALUES (?, ?, ?)");
+
+    // Inline version of extractMessageText to avoid circular dependency on pane-db.mjs
+    const extractText = (contentJson) => {
+      try {
+        const msg = JSON.parse(contentJson);
+        const blocks = Array.isArray(msg.content) ? msg.content : [];
+        return blocks
+          .filter(b => b.type === "text" && typeof b.text === "string")
+          .map(b => b.text)
+          .join(" ")
+          .trim();
+      } catch {
+        return "";
+      }
+    };
+
+    const batchInsert = db.transaction((items) => {
+      for (const msg of items) {
+        const text = extractText(msg.content);
+        if (text) {
+          insert.run(msg.project_id, msg.id, text);
+        }
+      }
+    });
+
+    batchInsert(messages);
+    console.log(`[cloud-sync] Rebuilt FTS index: ${messages.length} messages indexed (${db.prepare("SELECT COUNT(*) as cnt FROM messages_fts").get().cnt} total entries)`);
+
+    // Recreate the delete trigger that keeps FTS in sync
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS messages_fts_delete
+      AFTER DELETE ON messages
+      BEGIN
+        DELETE FROM messages_fts WHERE message_id = old.id;
+      END
+    `);
+  } catch (err) {
+    console.warn("[cloud-sync] FTS rebuild error:", err.message);
+    throw err;
+  } finally {
+    db.close();
   }
 }
 
@@ -263,21 +450,7 @@ export function registerCloudSyncHandlers() {
     return getCloudStatus();
   });
 
-  ipcMain.handle("cloud_trigger_backup", async () => {
-    // Find the most recent local backup
-    const backupRoot = path.join(PANE_DIR, "backups");
-    if (!existsSync(backupRoot)) throw new Error("No local backups found");
-
-    const dirs = (await fs.readdir(backupRoot))
-      .filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d))
-      .sort()
-      .reverse();
-
-    if (dirs.length === 0) throw new Error("No local backups found");
-
-    const latestDir = path.join(backupRoot, dirs[0]);
-    return uploadBackup(latestDir);
-  });
+  // cloud_trigger_backup is registered in backup-engine.mjs (runs local backup first)
 
   ipcMain.handle("cloud_restore", async () => {
     return restoreFromCloud();

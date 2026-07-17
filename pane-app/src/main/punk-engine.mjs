@@ -147,7 +147,7 @@ import { contextStore } from "./context-store.mjs";
 import { propagateCompletion } from "./completion-propagator.mjs";
 import { extractAndIndex } from "./memory-extractor.mjs";
 import { readThreadState, incrementFailure, recordSuccess, updateLastPrompt, updateLastResponse, recordApproach } from "./thread-state.mjs";
-import { recordQualityMetric, recordArbiterCorrections, isUserCorrection, recordUserCorrection } from "./code-arbiter.mjs";
+import { recordQualityMetric, recordArbiterCorrections, isUserCorrection, recordUserCorrection, buildUserCorrectionEvent } from "./code-arbiter.mjs";
 
 // Node.js globals for utility process
 const { setImmediate, console } =
@@ -921,13 +921,13 @@ class PunkEngine {
           const context = (has1m || isOpus || isDefault) ? 1000000 : 200000;
           const tier = (isOpus || isDefault) ? 1 : isSonnet ? 2 : 3;
 
-          // Build a clear display name
+          // Trust the SDK's own display name — never hardcode version numbers,
+          // or a newer model hides behind a stale label (e.g. an "Opus 4.6"
+          // label pinned over whatever the default alias actually resolves to).
           let name = m.displayName || m.name || id;
-          if (name === "Sonnet") name = "Sonnet 4.6";
-          if (name === "Haiku") name = "Haiku 4.5";
-          // "Default (recommended)" → show the actual model name + (default)
-          if (isDefault || name.toLowerCase().includes("default")) {
-            name = "Opus 4.6 (default)";
+          // Mark the default alias only if the SDK name doesn't already say so.
+          if (isDefault && !name.toLowerCase().includes("default")) {
+            name += " (default)";
           }
           if (has1m && !name.includes("1M") && !name.includes("1m")) name += " (1M)";
 
@@ -1039,9 +1039,20 @@ class PunkEngine {
             });
             // Record individual correction events for pattern detection
             if (!v.pass) {
-              recordArbiterCorrections(db, tracked.projectId, v);
+              recordArbiterCorrections(db, tracked.projectId, v, v.model || tracked.model);
             }
           } catch {}
+
+          // Playbook validation loop: the verdict holds injected principles
+          // accountable. A finding that matches a principle records a
+          // violation; a clean turn slowly reinforces. This is how principle
+          // confidence is EARNED rather than assigned.
+          if (this._brainRequest) {
+            this._brainRequest("playbook_feedback", {
+              projectId: tracked.projectId,
+              verdict: { pass: v.pass, findings: v.findings || [] },
+            }).catch(() => {});
+          }
         } catch {}
       }
 
@@ -1168,6 +1179,47 @@ class PunkEngine {
   }
 
   sendToRenderer(channel, event) {
+    // Estimate serialized size via JSON. For small events (<500KB) this is
+    // near-instant. For large events (multi-MB tool results), JSON.stringify
+    // cost is dwarfed by the structured clone in webContents.send.
+    // Threshold: 500KB — well above any normal event (text deltas, status
+    // updates, tool_use metadata), catches only rare multi-MB tool results.
+    const CHUNK_THRESHOLD = 512 * 1024; // 512KB
+    let json;
+    try { json = JSON.stringify(event); } catch {
+      // Circular reference or other serialization issue — fall through to
+      // the normal path and let webContents.send's structured clone handle it.
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send(channel, event);
+      }
+      return;
+    }
+    if (json.length > CHUNK_THRESHOLD) {
+      // Split into 256KB chunks. Each chunk is sent as a separate IPC message
+      // with _chunkMeta so the renderer can reassemble. Chunk data is a string,
+      // which structured clone handles efficiently (zero-copy string sharing).
+      const CHUNK_SIZE = 256 * 1024;
+      const total = Math.ceil(json.length / CHUNK_SIZE);
+      for (let i = 0; i < total; i++) {
+        const chunkPayload = {
+          _chunkMeta: {
+            total,
+            index: i,
+            type: event.event,
+            requestId: event.requestId,
+          },
+          _chunkData: json.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+        };
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) win.webContents.send(channel, chunkPayload);
+        }
+      }
+      console.log(
+        `[punk] Chunked large IPC event (${(json.length / 1024).toFixed(1)}KB → ${total} chunks) on channel "${channel}"`
+      );
+      return;
+    }
+    // Normal path — small event, send as-is
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed()) win.webContents.send(channel, event);
     }
@@ -1177,13 +1229,16 @@ class PunkEngine {
     if (this.relayDraining) return;
     this.relayDraining = true;
 
-    // Process up to BATCH_SIZE events per setImmediate tick.
-    // One-per-tick was correct for preventing synchronous dumps, but during
-    // a burst (e.g. context compaction outputting hundreds of lines at once)
-    // it creates hundreds of pending setImmediate callbacks, each calling
-    // webContents.send() in isolation. Batching reduces the number of
-    // scheduled callbacks while still yielding to I/O between batches.
-    const BATCH_SIZE = 16;
+    // Process dynamically-batched events per setImmediate tick.
+    // During a burst (e.g. post-compaction event flood), we scale the
+    // batch size with queue depth so the drain completes in fewer ticks.
+    // Under normal load, we stay at the minimum of 16 per tick.
+    const MIN_BATCH = 16;
+    const MAX_BATCH = 128;
+    const BATCH_SIZE = Math.min(
+      MAX_BATCH,
+      Math.max(MIN_BATCH, Math.ceil(this.relayQueue.length / 4)),
+    );
 
     const drain = () => {
       if (this.relayQueue.length === 0) {
@@ -1357,6 +1412,15 @@ Respond with a single concise principle statement (one sentence, under 150 chara
             resolvedRequest.model,
           );
         } catch {}
+
+        // The correction itself is the gold: a human stating a standard. Capture
+        // the PAIR (what was rejected → what was demanded) as a high-signal node
+        // so reflection can distill it into a durable principle. This is the
+        // friction-point capture — born high-signal, not mined from exhaust.
+        if (this._brainIndexer) {
+          const evt = buildUserCorrectionEvent(resolvedRequest.prompt, resolvedRequest.history);
+          if (evt) this._brainIndexer(resolvedRequest.projectId, [evt]).catch(() => {});
+        }
       }
     }
 
@@ -1716,6 +1780,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
             atomHints:   localDecision?.atomHints ?? [],
             projectRoot: resolvedRequest.workingDir ?? null,
             intent:      resolvedRequest.intent ?? null,
+            model:       resolvedRequest.model ?? null,
             projectWhy,
           }),
           searchTimeout,

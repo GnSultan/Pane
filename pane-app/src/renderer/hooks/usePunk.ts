@@ -235,13 +235,14 @@ function flushTodos(projectId: string) {
 
 function flushTextDelta(projectId: string) {
   const state = getStreamingState(projectId);
-  if (state.pendingTextDelta) {
-    // Flush the full buffer in one shot per frame — no character-drip throttle.
-    // The typewriter bleed (1-4 chars/frame) caused visible lag: fast scrolls
-    // landed on empty space while the buffer slowly caught up (~1s delay in dev).
-    // Natural streaming cadence from the backend already produces smooth output.
-    useProjectsStore.getState().appendToLastAssistantText(projectId, state.pendingTextDelta);
+  if (state.pendingTextDelta || state.pendingThinkingDelta) {
+    // Batch text + thinking delta in ONE set() call to produce a single new Map.
+    useProjectsStore.getState().batchUpdateConversation(projectId, {
+      textDelta: state.pendingTextDelta || undefined,
+      thinkingDelta: state.pendingThinkingDelta || undefined,
+    });
     state.pendingTextDelta = "";
+    state.pendingThinkingDelta = "";
   }
   state.textFlushRaf = 0;
 }
@@ -249,18 +250,14 @@ function flushTextDelta(projectId: string) {
 function resetStreamingState(projectId: string, flush = false) {
   const state = getStreamingState(projectId);
   if (flush) {
-    if (state.pendingTextDelta) {
+    if (state.pendingTextDelta || state.pendingThinkingDelta) {
       cancelAnimationFrame(state.textFlushRaf);
-      useProjectsStore
-        .getState()
-        .appendToLastAssistantText(projectId, state.pendingTextDelta);
-      state.pendingTextDelta = "";
-    }
-    if (state.pendingThinkingDelta) {
       cancelAnimationFrame(state.thinkingFlushRaf);
-      useProjectsStore
-        .getState()
-        .appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
+      useProjectsStore.getState().batchUpdateConversation(projectId, {
+        textDelta: state.pendingTextDelta || undefined,
+        thinkingDelta: state.pendingThinkingDelta || undefined,
+      });
+      state.pendingTextDelta = "";
       state.pendingThinkingDelta = "";
     }
     // Flush any pending tool JSON that didn't make it through the rAF pipeline.
@@ -315,10 +312,13 @@ function resetStreamingState(projectId: string, flush = false) {
 
 function flushThinkingDelta(projectId: string) {
   const state = getStreamingState(projectId);
-  if (state.pendingThinkingDelta) {
-    useProjectsStore
-      .getState()
-      .appendToLastAssistantThinking(projectId, state.pendingThinkingDelta);
+  if (state.pendingTextDelta || state.pendingThinkingDelta) {
+    // Batch text + thinking delta in ONE set() call.
+    useProjectsStore.getState().batchUpdateConversation(projectId, {
+      textDelta: state.pendingTextDelta || undefined,
+      thinkingDelta: state.pendingThinkingDelta || undefined,
+    });
+    state.pendingTextDelta = "";
     state.pendingThinkingDelta = "";
   }
   state.thinkingFlushRaf = 0;

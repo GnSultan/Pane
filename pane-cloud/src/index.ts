@@ -1,15 +1,24 @@
 /**
  * Pane Cloud — Cloudflare Worker
  *
- * Thin API layer: auth, backup CRUD, presigned upload/download.
- * All backup data is encrypted client-side before it reaches R2.
+ * Thin API layer: auth, backup CRUD, presigned S3 upload.
+ *
+ * Upload is direct-to-R2 via presigned PUT URLs (SigV4). This bypasses the
+ * Worker's body size limit entirely — the client uploads the encrypted blob
+ * straight to R2's S3 endpoint, then calls back to finalize in D1.
+ *
+ * The legacy multipart-upload-through-Worker routes (upload-init, upload-part)
+ * are kept for compatibility but the primary path is presigned upload.
  */
 
-import type { Env, User } from "./types";
+import type { Env } from "./types";
 import { handleGitHubAuth, authenticateRequest } from "./auth";
+import { generatePresignedPutUrl } from "./s3-presign";
 import {
-  getUploadUrl,
-  handleUpload,
+  initMultipartUpload,
+  uploadPart,
+  completeMultipartUpload,
+  abortMultipartUpload,
   finalizeBackup,
   listBackups,
   getBackupStream,
@@ -28,7 +37,6 @@ export default {
     const method = request.method;
     const path = url.pathname;
 
-    // CORS headers for Electron app
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -40,8 +48,7 @@ export default {
     }
 
     try {
-      const res = await route(method, path, request, env);
-      // Add CORS headers to every response
+      const res = await route(method, path, request, url, env);
       for (const [k, v] of Object.entries(corsHeaders)) {
         res.headers.set(k, v);
       }
@@ -56,6 +63,7 @@ async function route(
   method: string,
   path: string,
   request: Request,
+  url: URL,
   env: Env,
 ): Promise<Response> {
 
@@ -100,35 +108,109 @@ async function route(
     return json({ deleted: true });
   }
 
-  // ── Backups ───────────────────────────────────────────────────────────
+  // ── Backups: presigned upload (primary path) ──────────────────────────
+  //
+  // Flow:
+  //   1. POST /backups/upload-url  →  { backup_id, r2_key, upload_url }
+  //   2. Client PUTs directly to R2 (presigned URL, no Worker body limit)
+  //   3. POST /backups/upload-complete  →  register in D1, rotate
+
   if (method === "POST" && path === "/backups/upload-url") {
-    const result = await getUploadUrl(user, env);
+    const backupId = crypto.randomUUID().replace(/-/g, "").slice(0, 24);
+    const r2Key = `${user.github_id}/${backupId}.tar.gz.enc`;
+
+    const uploadUrl = await generatePresignedPutUrl(
+      env.CLOUDFLARE_ACCOUNT_ID,
+      env.R2_ACCESS_KEY_ID,
+      env.R2_SECRET_ACCESS_KEY,
+      "pane-backups",
+      r2Key,
+      3600,
+    );
+
+    return json({ backup_id: backupId, r2_key: r2Key, upload_url: uploadUrl });
+  }
+
+  // ── Backups: multipart upload (legacy path) ───────────────────────────
+  //
+  // Flow:
+  //   1. POST /backups/upload-init  →  { backup_id, r2_key, upload_id }
+  //   2. PUT /backups/upload-part/{backupId}?partNumber=N&uploadId=X&r2Key=Y  →  { etag }
+  //   3. POST /backups/upload-complete  →  complete multipart, then finalize
+
+  if (method === "POST" && path === "/backups/upload-init") {
+    const result = await initMultipartUpload(user, env);
     return json(result);
   }
 
-  // Direct upload endpoint — client PUTs encrypted blob here
-  const uploadMatch = path.match(/^\/backups\/([a-f0-9]+)\/upload$/);
-  if (method === "PUT" && uploadMatch) {
-    const backupId = uploadMatch[1];
-    const result = await handleUpload(backupId, request.body, user, env);
+  if (method === "PUT" && /^\/backups\/upload-part\/[a-f0-9]+$/.test(path)) {
+    const partNumber = parseInt(url.searchParams.get("partNumber") || "0");
+    const uploadId = url.searchParams.get("uploadId") || "";
+    const r2Key = url.searchParams.get("r2Key") || "";
+
+    if (!partNumber || partNumber < 1 || partNumber > 10000) {
+      return json({ error: "Invalid partNumber (1-10000)" }, 400);
+    }
+    if (!uploadId || !r2Key) {
+      return json({ error: "Missing uploadId or r2Key" }, 400);
+    }
+
+    // Verify ownership — confirm this user's r2Key starts with their ID
+    if (!r2Key.startsWith(`${user.github_id}/`)) {
+      return json({ error: "r2Key does not match user" }, 403);
+    }
+
+    // Stream the part body directly to R2 — no buffering
+    // Cloudflare Workers limit: 100MB per request, but parts are ≤4MB
+    const result = await uploadPart(r2Key, uploadId, partNumber, request.body!, env);
     return json(result);
   }
 
-  if (method === "POST" && path === "/backups") {
+  if (method === "POST" && path === "/backups/upload-complete") {
     const body = await request.json<{
       backup_id: string;
       r2_key: string;
+      upload_id?: string;
+      parts?: { partNumber: number; etag: string }[];
       size_bytes: number;
       checksum: string;
       device_name?: string;
       app_version?: string;
     }>();
-    const backup = await finalizeBackup(user, body, env);
+
+    if (!body.r2_key.startsWith(`${user.github_id}/`)) {
+      return json({ error: "r2_key does not match user" }, 403);
+    }
+
+    // Multipart flow: complete the multipart upload in R2
+    // Presigned flow: upload is already complete — skip multipart completion
+    if (body.upload_id && body.parts) {
+      await completeMultipartUpload(body.r2_key, body.upload_id, body.parts, env);
+    }
+
+    // Register in D1
+    const backup = await finalizeBackup(user, {
+      backup_id: body.backup_id,
+      r2_key: body.r2_key,
+      size_bytes: body.size_bytes,
+      checksum: body.checksum,
+      device_name: body.device_name,
+      app_version: body.app_version,
+    }, env);
+
     return json(backup);
   }
 
+  if (method === "POST" && path === "/backups/upload-abort") {
+    const body = await request.json<{ r2_key: string; upload_id: string }>();
+    await abortMultipartUpload(body.r2_key, body.upload_id, env);
+    return json({ aborted: true });
+  }
+
+  // ── Backups: list / download / delete ─────────────────────────────────
+
   if (method === "GET" && path === "/backups") {
-    const limit = parseInt(new URL(request.url).searchParams.get("limit") || "10");
+    const limit = parseInt(url.searchParams.get("limit") || "10");
     const backups = await listBackups(user, env, Math.min(limit, 50));
     return json({ backups });
   }

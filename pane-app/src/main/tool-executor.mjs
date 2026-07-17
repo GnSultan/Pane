@@ -19,7 +19,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import vm from "node:vm";
 
-import { getPaneDb } from "./pane-db.mjs";
+import { getPaneDb, pruneChangeHistory } from "./pane-db.mjs";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 import { readState, readHandoff } from "./pane-system-prompt.mjs";
 import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
@@ -666,15 +666,17 @@ export class ToolExecutor {
     try {
       const db = getPaneDb();
       db.stmts.insertChange.run(
-        id, 
-        this.projectId, 
+        id,
+        this.projectId,
         change.filePath,
-        change.oldString ?? null, 
+        change.oldString ?? null,
         change.newString ?? "",
-        change.description || "", 
+        change.description || "",
         timestamp,
         this.projectRoot
       );
+      // Cap retention at 7 days — cheap indexed range delete per write.
+      pruneChangeHistory(this.projectId);
     } catch (err) {
       console.error("[tool-executor] Failed to record change to SQLite:", err.message);
     }
@@ -1861,6 +1863,26 @@ export class ToolExecutor {
             return `${cp.id} — ${cp.fileCount} files`;
           }).join("\n");
           return { success: true, output: `${manifest.checkpoints.length} checkpoints:\n${out}`, toolId };
+        }
+
+        case "create_checkpoint": {
+          const { createCheckpointSnapshot } = await import("./checkpoint-engine.mjs");
+          const result = await createCheckpointSnapshot({
+            projectId: this.projectId,
+            workingDir: this.projectRoot,
+            label: input.label,
+          });
+          if (!result.id) {
+            const why = result.reason === "not-a-git-repo"
+              ? "this project is not a git repository"
+              : "no snapshot could be taken";
+            return { success: false, error: `Checkpoint not saved — ${why}.`, toolId };
+          }
+          return {
+            success: true,
+            output: `Checkpoint saved (${result.fileCount} file${result.fileCount === 1 ? "" : "s"})${input.label ? ` — ${input.label}` : ""}. This state can be restored later if the changes don't work out.`,
+            toolId,
+          };
         }
 
         case "pane_change_history": {

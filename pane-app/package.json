@@ -10,8 +10,8 @@
     "dev": "node scripts/dev.mjs",
     "build": "electron-vite build && node scripts/copy-compiled.mjs",
     "preview": "electron-vite preview",
-    "build:mac": "find node_modules -path '*/onnxruntime-node/*' -path '*/darwin/*' \\( -name '*.node' -o -name '*.dylib' \\) -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/node-pty/*' -path '*/darwin/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/better-sqlite3/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; npm update @anthropic-ai/claude-agent-sdk && npm run build && electron-builder --mac --arm64",
-    "build:all": "find node_modules -path '*/onnxruntime-node/*' -path '*/darwin/*' \\( -name '*.node' -o -name '*.dylib' \\) -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/node-pty/*' -path '*/darwin/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/better-sqlite3/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; npm update @anthropic-ai/claude-agent-sdk && npm run build && electron-builder --mac --arm64 --x64",
+    "build:mac": "find node_modules -path '*/onnxruntime-node/*' -path '*/darwin/*' \\( -name '*.node' -o -name '*.dylib' \\) -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/node-pty/*' -path '*/darwin/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/better-sqlite3/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; npm run build && electron-builder --mac --arm64",
+    "build:all": "find node_modules -path '*/onnxruntime-node/*' -path '*/darwin/*' \\( -name '*.node' -o -name '*.dylib' \\) -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/node-pty/*' -path '*/darwin/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; find node_modules -path '*/better-sqlite3/*' -name '*.node' -exec codesign --remove-signature {} \\; 2>/dev/null; npm run build && electron-builder --mac --arm64 --x64",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",
     "typecheck": "tsc --noEmit",
@@ -90,6 +90,7 @@
       "node_modules/node-pty/**",
       "node_modules/better-sqlite3/**",
       "node_modules/@anthropic-ai/claude-agent-sdk/**",
+      "node_modules/@anthropic-ai/claude-agent-sdk-*/**",
       "node_modules/@vscode/ripgrep/**",
       "node_modules/onnxruntime-node/**",
       "node_modules/@huggingface/transformers/**"
@@ -99,7 +100,7 @@
     }
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.77",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.193",
     "@fontsource-variable/bricolage-grotesque": "^5.2.10",
     "@fontsource-variable/dm-sans": "^5.2.8",
     "@fontsource-variable/geist": "^5.2.8",

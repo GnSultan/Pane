@@ -43,7 +43,7 @@ export function ThreadPanel() {
 
   return (
     <div
-      className="no-select flex flex-col h-full rounded-xl font-panel outline-none relative bg-pane-bg overflow-hidden"
+      className="no-select flex flex-col h-full rounded-xl font-panel outline-none relative bg-pane-bg overflow-hidden ring-1 ring-pane-border/40"
       data-panel="thread"
       tabIndex={0}
     >

@@ -21,8 +21,8 @@ const PANE_DIR  = path.join(os.homedir(), ".pane");
 const AUTH_FILE = path.join(PANE_DIR, "auth.enc");
 
 // Bundled defaults — override via ~/.pane/settings.json if needed
-const DEFAULT_CLOUD_API_URL  = "https://pane-cloud.workers.dev";
-const DEFAULT_GITHUB_CLIENT_ID = ""; // filled in after GitHub OAuth App is created
+const DEFAULT_CLOUD_API_URL  = "https://pane-cloud.imaslamabdul.workers.dev";
+const DEFAULT_GITHUB_CLIENT_ID = "Ov23lifBVhyNXF5Z7Zvc";
 
 let CLOUD_API_URL      = DEFAULT_CLOUD_API_URL;
 let GITHUB_CLIENT_ID   = DEFAULT_GITHUB_CLIENT_ID;
