@@ -93,17 +93,15 @@ export const MODEL_CONTEXT_LIMITS = {
   "gemini-3": 2000000,
   "gemini-2": 1000000,
   "gemini-1.5": 1000000,
-  "deepseek-v3": 1000000,
-  "deepseek-chat": 1000000,
-  "deepseek-reasoner": 1000000,
+  "deepseek-v4-flash": 1000000,
+  "deepseek-v4-pro": 1000000,
   "deepseek/deepseek-v4-flash": 1000000,
+  "deepseek/deepseek-v4-pro": 1000000,
   qwen3: 262144,
   "moonshot": 128000,
   openrouter: 128000,
   // Specific OpenRouter model context windows
   "anthropic/claude-3.5-sonnet": 200000,
-  "deepseek/deepseek-r1": 1000000,
-  "deepseek/deepseek-chat": 1000000,
   "qwen/qwen3-coder": 262144,
   "qwen/qwen3-coder:free": 262144,
   // Native StepFun model IDs (direct API, not via OpenRouter)
@@ -154,8 +152,6 @@ export function getContextLimit(model) {
   // 3. Partial matches from most specific to least specific
   const partialMatches = [
     "anthropic/claude-3.5-sonnet",
-    "deepseek/deepseek-r1",
-    "deepseek/deepseek-chat",
     "qwen/qwen3-coder",
     "qwen/qwen3-next",
     "arcee-ai/trinity-mini",

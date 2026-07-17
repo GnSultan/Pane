@@ -1,0 +1,901 @@
+/**
+ * Playbook Engine — reflection, principles, and the validation loop.
+ *
+ * Replaces the old consolidate/graduate pipeline. The core idea:
+ * the value of accumulated memory is not storage, it's a small set of
+ * tested principles that shape behavior. This module does what a
+ * developer's mind does between sessions — distill raw observations
+ * into a playbook of hard-won beliefs, then hold those beliefs
+ * accountable against real outcomes.
+ *
+ * Three loops:
+ *   1. REFLECTION  — periodic LLM pass over high-signal observations
+ *                    (lessons, error fixes, patterns, decisions) that
+ *                    REVISES a small playbook: merge, generalize,
+ *                    resolve contradictions, retire. Nondestructive —
+ *                    source nodes stay in the graph for recall.
+ *   2. INJECTION   — the playbook markdown is written to
+ *                    ~/.pane/profile/playbooks/<project>.md and read by
+ *                    context-orchestrator at session start. Principles
+ *                    shape behavior without needing recall.
+ *   3. VALIDATION  — arbiter verdicts feed back: a finding that matches
+ *                    a principle records a violation (belief not held /
+ *                    not followed); clean turns slowly reinforce.
+ *                    Confidence is EARNED, not assigned. Principles that
+ *                    stop paying rent get retired at the next reflection.
+ *
+ * Ledger lives in the `principles` table — born_from sources, credited /
+ * violated counts, empirical confidence. This is the "did Pane get
+ * smarter this week" dashboard data.
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+
+const PANE_DIR = path.join(os.homedir(), ".pane");
+const PLAYBOOKS_DIR = path.join(PANE_DIR, "profile", "playbooks");
+const MODELS_DIR = path.join(PANE_DIR, "profile", "models");
+
+// ── Tunables ────────────────────────────────────────────────────────────
+const MAX_ACTIVE_PRINCIPLES = 30;        // Per project — fewer, stronger beats many, weak
+const MAX_GLOBAL_PRINCIPLES = 15;        // Cross-project craft profile
+const MAX_OBSERVATIONS_PER_REFLECTION = 200;
+const MIN_NEW_OBSERVATIONS = 3;          // Don't reflect over nothing
+const REFLECTION_INTERVAL_MS = 6 * 60 * 60 * 1000;   // Per project
+const GLOBAL_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const BIRTH_CONFIDENCE = 0.5;            // A new principle is a hypothesis
+const VIOLATION_PENALTY = 0.08;
+const CLEAN_TURN_BOOST = 0.005;
+const CONFIDENCE_CAP = 0.95;
+const RETIRE_BELOW = 0.2;                // Auto-retire before reflection
+
+const MAX_MODEL_DIRECTIVES = 10;           // Per model — specific failure counter-directives
+const MODEL_PROFILE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const MIN_MODEL_TURNS = 10;               // Don't profile from too little data
+
+// Error codes that reflect project configuration, not model behavior. A missing
+// tsconfig JSX flag lights up thousands of TS17004 across a file — that is a
+// setup issue, never a signal about how the model writes code. Excluded from
+// model profiles so one misconfigured project can't pollute a model's fingerprint.
+const CONFIG_CLASS_CODES = ["TS17004", "TS6142", "TS5076", "TS2688", "TS5083", "TS5023"];
+
+// Observation types that qualify as knowledge (vs session exhaust).
+// user_correction is the highest-value signal — a human stating a standard —
+// captured at the friction point, not mined from the activity stream.
+export const KNOWLEDGE_TYPES = ["user_correction", "lesson", "error_fix", "pattern", "decision"];
+
+// ============================================================================
+// Schema
+// ============================================================================
+
+export function ensurePlaybookSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS principles (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      text TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      born_from TEXT DEFAULT '[]',
+      credited INTEGER DEFAULT 0,
+      violated INTEGER DEFAULT 0,
+      cycles_survived INTEGER DEFAULT 0,
+      confidence REAL DEFAULT ${BIRTH_CONFIDENCE},
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_principles_project ON principles(project_id, status);
+    CREATE TABLE IF NOT EXISTS syntheses (
+      id TEXT PRIMARY KEY,
+      project_id TEXT,
+      kind TEXT,
+      content TEXT,
+      source_hash TEXT,
+      generated_at INTEGER
+    );
+  `);
+}
+
+// ============================================================================
+// Reflection — the "sleep cycle"
+// ============================================================================
+
+const REFLECTION_SYSTEM_PROMPT = `You are the reflection engine of Pane, a development environment with persistent memory. Your job is what a developer's mind does during sleep: distill raw observations from real coding sessions into a small playbook of hard-won principles.
+
+Rules:
+- A principle is an actionable belief about how to work in THIS codebase: "do X when Y", "never Z because W". 1-2 sentences, concrete enough to change behavior.
+- Observations of type "user_correction" are the HIGHEST-VALUE signal: the human explicitly stated a standard or rejected an approach. When one expresses a durable preference (a rule about how things should always be done — style, architecture, process), promote it to a principle almost verbatim in the user's intent. When it's a one-off, task-specific correction ("no, edit the other file"), ignore it — it is not a standard.
+- Merge overlapping observations into one general principle. Generalize from specific incidents to the rule they imply.
+- Contradictions are the most valuable signal: when a new observation conflicts with an existing principle, revise or narrow the principle ("this holds except when X") rather than keeping both. A user_correction always wins a contradiction against a machine-derived principle.
+- Retire principles that are stale, too narrow to matter, chronically violated (see ledger counts), or subsumed by a better one. Omitting an existing principle from your output retires it.
+- Fewer, stronger principles beat many weak ones. Only keep what would change how a developer acts.
+- Never invent principles that are not grounded in the provided observations or existing playbook.
+
+Output ONLY valid JSON, no prose, in this exact shape:
+{"playbook": [{"text": "the principle", "from": "existing principle id or null", "sources": ["observation node id", ...]}]}`;
+
+/**
+ * Gather the high-signal observation corpus for a project.
+ * Small by design — hundreds of items, not thousands.
+ */
+function gatherObservations(db, projectId) {
+  const rows = db.prepare(`
+    SELECT id, entity_type, content, confidence, access_count, updated_at
+    FROM nodes
+    WHERE project_id = ?
+      AND entity_type IN (${KNOWLEDGE_TYPES.map(() => "?").join(",")})
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(projectId, ...KNOWLEDGE_TYPES, MAX_OBSERVATIONS_PER_REFLECTION);
+
+  return rows.map((r) => {
+    let text = "";
+    try {
+      const parsed = JSON.parse(r.content || "{}");
+      text = parsed.text || parsed.content || "";
+    } catch {}
+    return { id: r.id, type: r.entity_type, text, version: r.updated_at };
+  }).filter((o) => o.text && o.text.length >= 15);
+}
+
+function computeSourceHash(observations) {
+  const h = crypto.createHash("sha256");
+  for (const o of observations) h.update(`${o.id}:${o.version}|`);
+  return h.digest("hex").slice(0, 16);
+}
+
+function getSynthesis(db, projectId, kind) {
+  try {
+    return db.prepare(
+      `SELECT * FROM syntheses WHERE project_id = ? AND kind = ?`
+    ).get(projectId, kind) || null;
+  } catch {
+    return null;
+  }
+}
+
+function putSynthesis(db, projectId, kind, content, sourceHash) {
+  db.prepare(`
+    INSERT INTO syntheses (id, project_id, kind, content, source_hash, generated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET content = excluded.content,
+      source_hash = excluded.source_hash, generated_at = excluded.generated_at
+  `).run(`${kind}-${projectId}`, projectId, kind, content, sourceHash, Math.floor(Date.now() / 1000));
+}
+
+/**
+ * Record the outcome of a reflection attempt so it is never silent. Persists to
+ * the syntheses table (queryable without log access): last reason, timestamp,
+ * and — on parse failure — a sample of what the model actually returned.
+ * This is the observability that turns "reflection produced nothing" from
+ * archaeology into a single SELECT.
+ */
+function recordReflectAttempt(db, projectId, reason, rawSample) {
+  try {
+    const payload = JSON.stringify({
+      reason,
+      at: Date.now(),
+      ...(rawSample ? { sample: String(rawSample).slice(0, 600) } : {}),
+    });
+    putSynthesis(db, projectId, "playbook-attempt", payload, "");
+  } catch {}
+}
+
+/** Extract a JSON object from an LLM response that may be fenced or padded. */
+function parseJsonResponse(raw) {
+  if (!raw) return null;
+  let text = raw.trim();
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) text = fence[1].trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end <= start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run one reflection cycle for a project. Throttled internally —
+ * safe to call fire-and-forget on every lifecycle tick.
+ *
+ * @param {object} db - brain database
+ * @param {string} projectId
+ * @param {Function} llmCall - (system, user) => Promise<string|null>
+ * @returns {Promise<{skipped?: string, kept?: number, added?: number, retired?: number}>}
+ */
+export async function runReflection(db, projectId, llmCall) {
+  if (!llmCall) return { skipped: "no-llm" };
+  ensurePlaybookSchema(db);
+
+  // Throttle: time + corpus change
+  const meta = getSynthesis(db, projectId, "playbook");
+  if (meta && Date.now() - meta.generated_at * 1000 < REFLECTION_INTERVAL_MS) {
+    return { skipped: "throttled" };
+  }
+
+  const observations = gatherObservations(db, projectId);
+  const sourceHash = computeSourceHash(observations);
+  if (meta && meta.source_hash === sourceHash) return { skipped: "unchanged" };
+
+  // Auto-retire principles whose earned confidence collapsed
+  db.prepare(`
+    UPDATE principles SET status = 'archived', updated_at = datetime('now')
+    WHERE project_id = ? AND status = 'active' AND confidence < ?
+  `).run(projectId, RETIRE_BELOW);
+
+  const active = db.prepare(`
+    SELECT id, text, confidence, credited, violated FROM principles
+    WHERE project_id = ? AND status = 'active'
+    ORDER BY confidence DESC
+  `).all(projectId);
+
+  // First reflection needs a real corpus; later ones can run on playbook alone
+  // (to apply ledger evidence) but only when something actually changed.
+  if (active.length === 0 && observations.length < MIN_NEW_OBSERVATIONS) {
+    recordReflectAttempt(db, projectId, "too-few-observations");
+    return { skipped: "too-few-observations" };
+  }
+
+  const playbookLines = active.map(
+    (p) => `${p.id} | conf ${p.confidence.toFixed(2)} | credited ${p.credited} / violated ${p.violated} | ${p.text}`
+  ).join("\n") || "(empty — this is the first reflection)";
+
+  const observationLines = observations.map(
+    (o) => `${o.id} | ${o.type} | ${o.text}`
+  ).join("\n") || "(none)";
+
+  const userPrompt = [
+    `Project: ${projectId}`,
+    ``,
+    `Current playbook (id | confidence | ledger | text):`,
+    playbookLines,
+    ``,
+    `Observations from recent sessions (id | type | text):`,
+    observationLines,
+    ``,
+    `Produce the revised playbook. Maximum ${MAX_ACTIVE_PRINCIPLES} principles.`,
+  ].join("\n");
+
+  const raw = await llmCall(REFLECTION_SYSTEM_PROMPT, userPrompt);
+  const parsed = parseJsonResponse(raw);
+  if (!parsed || !Array.isArray(parsed.playbook)) {
+    console.warn(`[playbook] reflection for ${projectId}: unparseable LLM output`);
+    recordReflectAttempt(db, projectId, raw ? "bad-llm-output" : "llm-null", raw);
+    return { skipped: "bad-llm-output" };
+  }
+
+  const revised = parsed.playbook
+    .filter((p) => p && typeof p.text === "string" && p.text.trim().length >= 15)
+    .slice(0, MAX_ACTIVE_PRINCIPLES);
+
+  // Apply the revision inside a transaction
+  const activeIds = new Set(active.map((p) => p.id));
+  const survivingIds = new Set();
+  let added = 0, kept = 0;
+
+  const apply = db.transaction(() => {
+    for (const entry of revised) {
+      const from = entry.from && activeIds.has(entry.from) ? entry.from : null;
+      const sources = Array.isArray(entry.sources) ? entry.sources.slice(0, 20) : [];
+      if (from) {
+        db.prepare(`
+          UPDATE principles SET text = ?, cycles_survived = cycles_survived + 1,
+            updated_at = datetime('now')
+          WHERE id = ?
+        `).run(entry.text.trim(), from);
+        survivingIds.add(from);
+        kept++;
+      } else {
+        const id = `pr-${projectId}-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+        db.prepare(`
+          INSERT INTO principles (id, project_id, text, born_from, confidence)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(id, projectId, entry.text.trim(), JSON.stringify(sources), BIRTH_CONFIDENCE);
+        survivingIds.add(id);
+        added++;
+      }
+    }
+    // Anything active that the reflection omitted is retired
+    for (const p of active) {
+      if (!survivingIds.has(p.id)) {
+        db.prepare(`
+          UPDATE principles SET status = 'archived', updated_at = datetime('now')
+          WHERE id = ?
+        `).run(p.id);
+      }
+    }
+  });
+  apply();
+
+  const retired = active.length - kept;
+  const markdown = writePlaybookMarkdown(db, projectId);
+  putSynthesis(db, projectId, "playbook", markdown, sourceHash);
+  recordReflectAttempt(db, projectId, `ok kept=${kept} added=${added} retired=${retired}`);
+
+  console.log(`[playbook] reflection for ${projectId}: kept=${kept} added=${added} retired=${retired}`);
+  return { kept, added, retired };
+}
+
+/**
+ * Render the active playbook to markdown and write it where the
+ * context-orchestrator (main process) reads it. File-based handoff —
+ * no worker roundtrip on the hot path.
+ */
+export function writePlaybookMarkdown(db, projectId) {
+  const active = db.prepare(`
+    SELECT text, confidence FROM principles
+    WHERE project_id = ? AND status = 'active'
+    ORDER BY confidence DESC, updated_at DESC
+  `).all(projectId);
+
+  const lines = active.map((p) => `- ${p.text}`);
+  const markdown = lines.join("\n");
+
+  try {
+    fs.mkdirSync(PLAYBOOKS_DIR, { recursive: true });
+    const filePath = path.join(PLAYBOOKS_DIR, `${projectId}.md`);
+    if (markdown) {
+      fs.writeFileSync(filePath, markdown + "\n", "utf-8");
+    } else if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath); // empty playbook — don't inject an empty section
+    }
+  } catch (err) {
+    console.warn(`[playbook] failed to write markdown for ${projectId}: ${err.message}`);
+  }
+  return markdown;
+}
+
+/**
+ * Cross-project reflection: distill the global craft profile from all
+ * per-project playbooks. Only what holds regardless of project belongs here.
+ */
+export async function runGlobalReflection(db, llmCall) {
+  if (!llmCall) return { skipped: "no-llm" };
+  ensurePlaybookSchema(db);
+
+  const meta = getSynthesis(db, "__global__", "playbook-global");
+  if (meta && Date.now() - meta.generated_at * 1000 < GLOBAL_INTERVAL_MS) {
+    return { skipped: "throttled" };
+  }
+
+  let files = [];
+  try {
+    files = fs.readdirSync(PLAYBOOKS_DIR)
+      .filter((f) => f.endsWith(".md") && f !== "global.md");
+  } catch {}
+  if (files.length < 2) return { skipped: "too-few-playbooks" };
+
+  const sections = files.map((f) => {
+    const body = fs.readFileSync(path.join(PLAYBOOKS_DIR, f), "utf-8").trim();
+    return `## ${f.replace(/\.md$/, "")}\n${body}`;
+  });
+  const combined = sections.join("\n\n");
+  const sourceHash = crypto.createHash("sha256").update(combined).digest("hex").slice(0, 16);
+  if (meta && meta.source_hash === sourceHash) return { skipped: "unchanged" };
+
+  const raw = await llmCall(
+    `You distill a developer's cross-project craft profile. Given per-project playbooks, extract ONLY the principles that hold regardless of project — how this developer works, what they value, what always breaks. Skip anything project-specific (file names, frameworks, particular subsystems). Maximum ${MAX_GLOBAL_PRINCIPLES} principles, each 1-2 actionable sentences. Output ONLY valid JSON: {"playbook": [{"text": "..."}]}`,
+    combined
+  );
+  const parsed = parseJsonResponse(raw);
+  if (!parsed || !Array.isArray(parsed.playbook)) return { skipped: "bad-llm-output" };
+
+  const lines = parsed.playbook
+    .filter((p) => p && typeof p.text === "string" && p.text.trim().length >= 15)
+    .slice(0, MAX_GLOBAL_PRINCIPLES)
+    .map((p) => `- ${p.text.trim()}`);
+
+  if (lines.length === 0) return { skipped: "empty" };
+
+  const markdown = lines.join("\n") + "\n";
+  fs.mkdirSync(PLAYBOOKS_DIR, { recursive: true });
+  fs.writeFileSync(path.join(PLAYBOOKS_DIR, "global.md"), markdown, "utf-8");
+  putSynthesis(db, "__global__", "playbook-global", markdown, sourceHash);
+
+  console.log(`[playbook] global craft profile updated: ${lines.length} principles`);
+  return { principles: lines.length };
+}
+
+// ============================================================================
+// Model profiles — per-model behavioral counter-directives
+// ============================================================================
+
+const MODEL_PROFILE_SYSTEM_PROMPT = `You are analyzing the behavioral failure patterns of a specific AI model based on real arbiter verdicts and correction events from a developer's workflow.
+
+Your job is to produce counter-directives — brief instructions that pre-empt this model's KNOWN failure modes. Think of it as a pre-briefing written specifically for this model about its own blind spots.
+
+Rules:
+- Each directive is 1-2 sentences, addressed directly to the model ("When X, do Y instead", "You tend to Z — don't")
+- Ground every directive in the provided evidence. No invented patterns.
+- Focus on behavioral patterns: error suppression, broken tests, over-abstraction, task drift, missing edge cases, specific error codes that recur
+- A directive must be specific enough to actually change behavior. Generic advice is useless.
+- Contradictions in the data → pick the dominant pattern or note the conditional ("only when X")
+- Omitting a directive from your output retires it. Keep only what's still evidenced.
+- Maximum ${MAX_MODEL_DIRECTIVES} directives. Fewer strong ones beat many weak ones.
+
+Output ONLY valid JSON, no prose: {"profile": [{"text": "the directive"}]}`;
+
+/** Sanitize a model ID to a safe filename: replace /, :, spaces with - */
+function safeModelFilename(modelId) {
+  return modelId.replace(/[/: ]+/g, "-").replace(/[^a-zA-Z0-9._-]/g, "") + ".md";
+}
+
+/**
+ * Gather failure evidence for a model across all projects.
+ * Uses quality_metrics for aggregate stats and correction_events for specifics.
+ */
+function gatherModelEvidence(db, modelId) {
+  // Aggregate stats for this model
+  const stats = db.prepare(`
+    SELECT
+      COUNT(*) as total_turns,
+      SUM(CASE WHEN verdict_pass = 0 THEN 1 ELSE 0 END) as failed_turns,
+      ROUND(AVG(quality_score), 1) as avg_score,
+      SUM(suppressions) as total_suppressions,
+      SUM(type_errors) as total_type_errors,
+      SUM(lint_errors) as total_lint_errors,
+      SUM(arch_issues) as total_arch_issues
+    FROM quality_metrics
+    WHERE model = ?
+      AND timestamp > ?
+  `).get(modelId, Date.now() - 30 * 24 * 60 * 60 * 1000) || {};
+
+  // Top recurring correction types (counter form: SUM the occurrence counts).
+  // project_spread separates model traits from project traits — a pattern seen
+  // across many projects is the model's tendency; one confined to a single
+  // project is almost always that project's config, not model behavior.
+  // Config-class error codes (tsconfig issues like the JSX flag) are excluded
+  // outright — they are never a model behavior signal.
+  const corrections = db.prepare(`
+    SELECT correction_type,
+           SUM(count) as cnt,
+           COUNT(DISTINCT project_id) as project_spread,
+           MAX(detail) as example_detail
+    FROM correction_events
+    WHERE model = ?
+      AND last_seen > ?
+      AND correction_type NOT IN (${CONFIG_CLASS_CODES.map(() => "?").join(",")})
+    GROUP BY correction_type
+    ORDER BY project_spread DESC, cnt DESC
+    LIMIT 20
+  `).all(modelId, Date.now() - 30 * 24 * 60 * 60 * 1000, ...CONFIG_CLASS_CODES);
+
+  return { stats, corrections };
+}
+
+function computeModelEvidenceHash(stats, corrections) {
+  const h = crypto.createHash("sha256");
+  h.update(JSON.stringify({ t: stats.total_turns, f: stats.failed_turns }));
+  for (const c of corrections) h.update(`${c.correction_type}:${c.cnt}|`);
+  return h.digest("hex").slice(0, 16);
+}
+
+/**
+ * Write the model profile markdown to ~/.pane/profile/models/<modelId>.md
+ */
+export function writeModelProfileMarkdown(modelId, directives) {
+  const lines = directives.map((d) => `- ${d.text}`);
+  const markdown = lines.join("\n");
+
+  try {
+    fs.mkdirSync(MODELS_DIR, { recursive: true });
+    const filePath = path.join(MODELS_DIR, safeModelFilename(modelId));
+    if (markdown) {
+      fs.writeFileSync(filePath, markdown + "\n", "utf-8");
+    } else if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (err) {
+    console.warn(`[playbook] failed to write model profile for ${modelId}: ${err.message}`);
+  }
+  return markdown;
+}
+
+/**
+ * Run one model profile reflection cycle.
+ * Throttled to 24h + corpus-change check. Safe to call on every lifecycle tick.
+ *
+ * @param {object} db - pane database (quality_metrics + correction_events)
+ * @param {string} modelId - the model identifier (e.g. "claude-sonnet-4-6")
+ * @param {Function} llmCall - (system, user) => Promise<string|null>
+ */
+export async function runModelProfileReflection(db, modelId, llmCall) {
+  if (!llmCall || !modelId) return { skipped: "no-llm-or-model" };
+  ensurePlaybookSchema(db);
+
+  const synthKey = `model-profile-${modelId}`;
+  const meta = getSynthesis(db, "__global__", synthKey);
+  if (meta && Date.now() - meta.generated_at * 1000 < MODEL_PROFILE_INTERVAL_MS) {
+    return { skipped: "throttled" };
+  }
+
+  const { stats, corrections } = gatherModelEvidence(db, modelId);
+  if (!stats.total_turns || stats.total_turns < MIN_MODEL_TURNS) {
+    recordReflectAttempt(db, `model:${modelId}`, `too-few-turns (${stats.total_turns || 0})`);
+    return { skipped: "too-few-turns" };
+  }
+
+  const sourceHash = computeModelEvidenceHash(stats, corrections);
+  if (meta && meta.source_hash === sourceHash) return { skipped: "unchanged" };
+
+  // Read existing profile directives for the revision prompt
+  let existing = "";
+  try {
+    const profilePath = path.join(MODELS_DIR, safeModelFilename(modelId));
+    if (fs.existsSync(profilePath)) {
+      existing = fs.readFileSync(profilePath, "utf-8").trim();
+    }
+  } catch {}
+
+  const failRate = stats.total_turns > 0
+    ? Math.round((stats.failed_turns / stats.total_turns) * 100)
+    : 0;
+
+  const correctionLines = corrections.map(
+    (c) => `  ${c.correction_type} ×${c.cnt} across ${c.project_spread} project(s)` +
+      `${c.example_detail ? ` — e.g. "${c.example_detail}"` : ""}`
+  ).join("\n") || "  (none recorded)";
+
+  const userPrompt = [
+    `Model: ${modelId}`,
+    ``,
+    `Performance over last 30 days:`,
+    `  Total turns: ${stats.total_turns}`,
+    `  Failure rate: ${failRate}% (${stats.failed_turns} failed)`,
+    `  Avg quality score: ${stats.avg_score}/100`,
+    `  Error suppressions attempted: ${stats.total_suppressions}`,
+    `  TypeScript errors: ${stats.total_type_errors}`,
+    `  Lint errors: ${stats.total_lint_errors}`,
+    `  Architecture violations: ${stats.total_arch_issues}`,
+    ``,
+    `Top recurring correction types (type ×occurrences across N projects):`,
+    correctionLines,
+    ``,
+    `Weight patterns that recur across MULTIPLE projects — those are this model's`,
+    `real tendencies. A pattern confined to one project is likely that project's`,
+    `setup, not the model. Do not write a directive from a single-project pattern`,
+    `unless the occurrence count is very high and clearly behavioral.`,
+    ``,
+    `Current profile directives (revise these based on the evidence above):`,
+    existing || "(empty — this is the first profile for this model)",
+    ``,
+    `Produce the revised profile. Maximum ${MAX_MODEL_DIRECTIVES} directives.`,
+  ].join("\n");
+
+  const raw = await llmCall(MODEL_PROFILE_SYSTEM_PROMPT, userPrompt);
+  const parsed = parseJsonResponse(raw);
+  if (!parsed || !Array.isArray(parsed.profile)) {
+    console.warn(`[playbook] model profile for ${modelId}: unparseable LLM output`);
+    recordReflectAttempt(db, `model:${modelId}`, raw ? "bad-llm-output" : "llm-null", raw);
+    return { skipped: "bad-llm-output" };
+  }
+
+  const directives = parsed.profile
+    .filter((d) => d && typeof d.text === "string" && d.text.trim().length >= 15)
+    .slice(0, MAX_MODEL_DIRECTIVES);
+
+  writeModelProfileMarkdown(modelId, directives);
+  putSynthesis(db, "__global__", synthKey, directives.map((d) => d.text).join("\n"), sourceHash);
+  recordReflectAttempt(db, `model:${modelId}`, `ok directives=${directives.length}`);
+
+  console.log(`[playbook] model profile for ${modelId}: ${directives.length} directives`);
+  return { directives: directives.length };
+}
+
+// ============================================================================
+// Validation loop — verdicts hold principles accountable
+// ============================================================================
+
+const STOPWORDS = new Set([
+  "the", "a", "an", "and", "or", "but", "if", "when", "then", "than", "that",
+  "this", "these", "those", "is", "are", "was", "were", "be", "been", "being",
+  "have", "has", "had", "do", "does", "did", "will", "would", "should", "could",
+  "not", "no", "never", "always", "with", "without", "for", "from", "into",
+  "over", "under", "before", "after", "use", "using", "used", "it", "its",
+  "on", "in", "at", "by", "to", "of", "as", "via", "any", "all", "only",
+]);
+
+function significantWords(text) {
+  return new Set(
+    (text.toLowerCase().match(/[a-z][a-z0-9_.-]{2,}/g) || [])
+      .filter((w) => !STOPWORDS.has(w))
+  );
+}
+
+/**
+ * Feed an arbiter verdict back into the principle ledger.
+ *
+ * A finding whose text overlaps a principle records a violation — the
+ * belief exists but didn't shape behavior (or is wrong). A clean turn
+ * slowly reinforces every active principle. Confidence is earned.
+ *
+ * @param {object} db - brain database
+ * @param {string} projectId
+ * @param {{pass: boolean, findings?: Array<{plain?: string, raw?: string, code?: string}>}} verdict
+ * @returns {{violations: number, reinforced: number}}
+ */
+export function recordPlaybookFeedback(db, projectId, verdict) {
+  ensurePlaybookSchema(db);
+  const active = db.prepare(`
+    SELECT id, text FROM principles WHERE project_id = ? AND status = 'active'
+  `).all(projectId);
+  if (active.length === 0) return { violations: 0, reinforced: 0 };
+
+  let violations = 0;
+  let reinforced = 0;
+
+  if (verdict?.pass) {
+    // Clean turn — small credit to every injected principle. "credited"
+    // counts sessions survived without a matching violation.
+    db.prepare(`
+      UPDATE principles
+      SET credited = credited + 1,
+          confidence = MIN(${CONFIDENCE_CAP}, confidence + ${CLEAN_TURN_BOOST}),
+          updated_at = datetime('now')
+      WHERE project_id = ? AND status = 'active'
+    `).run(projectId);
+    reinforced = active.length;
+    return { violations, reinforced };
+  }
+
+  const findings = Array.isArray(verdict?.findings) ? verdict.findings : [];
+  if (findings.length === 0) return { violations, reinforced };
+
+  const principleWords = active.map((p) => ({ ...p, words: significantWords(p.text) }));
+
+  for (const finding of findings) {
+    const text = `${finding.plain || finding.raw || ""} ${finding.code || ""}`;
+    const words = significantWords(text);
+    if (words.size < 3) continue;
+
+    let best = null;
+    let bestOverlap = 0;
+    for (const p of principleWords) {
+      let overlap = 0;
+      for (const w of words) if (p.words.has(w)) overlap++;
+      if (overlap > bestOverlap) { bestOverlap = overlap; best = p; }
+    }
+
+    // Conservative: require real lexical overlap before blaming a principle
+    if (best && bestOverlap >= 3) {
+      db.prepare(`
+        UPDATE principles
+        SET violated = violated + 1,
+            confidence = MAX(0.05, confidence - ${VIOLATION_PENALTY}),
+            updated_at = datetime('now')
+        WHERE id = ?
+      `).run(best.id);
+      violations++;
+    }
+  }
+
+  return { violations, reinforced };
+}
+
+// ============================================================================
+// One-time migration — archive the dead weight
+// ============================================================================
+
+// Session exhaust that accumulated in the graph but belongs to handoff/journal
+// state (which has its own storage in ~/.pane/session and events.jsonl).
+const EXHAUST_TYPES = ["accomplishment", "command", "intent", "discovery", "blocker", "file_edit"];
+
+/**
+ * Clean the graph of nodes that never earned their place:
+ *   - "principle" nodes from the old runaway consolidation (126K+, ~0 accessed)
+ *   - journaling exhaust types that were never meant to be knowledge
+ * Only zero-access nodes are touched — anything ever recalled survives.
+ * Guarded by a syntheses marker; runs once.
+ */
+export function runPlaybookMigration(db) {
+  ensurePlaybookSchema(db);
+  if (getSynthesis(db, "__global__", "playbook-migration")) {
+    return { skipped: "already-ran" };
+  }
+
+  const started = Date.now();
+  const targets = db.prepare(`
+    SELECT id FROM nodes
+    WHERE access_count = 0
+      AND entity_type IN ('principle', ${EXHAUST_TYPES.map(() => "?").join(",")})
+  `).all(...EXHAUST_TYPES);
+
+  const ids = targets.map((r) => r.id);
+  let deleted = 0;
+
+  const purge = db.transaction((batch) => {
+    for (const id of batch) {
+      db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(id);
+      db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(id, id);
+      db.prepare("DELETE FROM nodes WHERE id = ?").run(id);
+      deleted++;
+    }
+  });
+
+  // Batch to keep transactions bounded
+  for (let i = 0; i < ids.length; i += 5000) {
+    purge(ids.slice(i, i + 5000));
+  }
+
+  putSynthesis(db, "__global__", "playbook-migration", `deleted=${deleted}`, "");
+
+  // Retire digest.txt — the old graduation target. It accumulated raw
+  // session dumps (the graduation filter was confidence≥0.9 on nodes born
+  // at 0.95 ceiling) and nothing injected it. Playbooks replace it.
+  try {
+    const digestPath = path.join(PANE_DIR, "profile", "digest.txt");
+    if (fs.existsSync(digestPath)) {
+      fs.renameSync(digestPath, digestPath + ".pre-playbook.bak");
+    }
+  } catch {}
+
+  // Reclaim space. One-time synchronous cost in the utility process —
+  // queued messages wait, nothing breaks.
+  let vacuumMs = 0;
+  try {
+    const vStart = Date.now();
+    db.exec("VACUUM");
+    vacuumMs = Date.now() - vStart;
+  } catch (err) {
+    console.warn(`[playbook] VACUUM failed (non-fatal): ${err.message}`);
+  }
+
+  console.log(
+    `[playbook] migration: deleted ${deleted} dead nodes in ${Date.now() - started - vacuumMs}ms, ` +
+    `VACUUM ${vacuumMs}ms`
+  );
+  return { deleted, vacuumMs };
+}
+
+// Dead node types that never earn recall: profile_atom (session-derived, never
+// accessed) and raw error nodes (superseded by error_fix). file/project/symbol
+// are load-bearing code intelligence and are deliberately NOT touched.
+const HYGIENE_DEAD_TYPES = ["profile_atom", "error"];
+const MAX_NODE_VERSIONS = 3;   // Keep the latest few revisions per node, not full history
+
+/**
+ * One-time storage hygiene on the brain graph:
+ *   - trim node_versions to the latest N per node (edit history the playbook
+ *     engine never reads — pure write log)
+ *   - purge zero-access dead-type nodes
+ *   - VACUUM to reclaim the freed pages
+ * Guarded by a syntheses marker; runs once per brain.db.
+ */
+export function runStorageHygiene(db) {
+  ensurePlaybookSchema(db);
+  if (getSynthesis(db, "__global__", "storage-hygiene-v1")) {
+    return { skipped: "already-ran" };
+  }
+
+  const started = Date.now();
+  let versionsDeleted = 0;
+  let nodesDeleted = 0;
+
+  try {
+    // Trim node_versions: keep only the latest MAX_NODE_VERSIONS per node.
+    const vres = db.prepare(`
+      DELETE FROM node_versions WHERE rowid IN (
+        SELECT rowid FROM (
+          SELECT rowid, ROW_NUMBER() OVER (
+            PARTITION BY node_id ORDER BY version DESC
+          ) AS rn FROM node_versions
+        ) WHERE rn > ?
+      )
+    `).run(MAX_NODE_VERSIONS);
+    versionsDeleted = vres.changes || 0;
+  } catch (err) {
+    console.warn(`[playbook] node_versions trim failed (non-fatal): ${err.message}`);
+  }
+
+  try {
+    const dead = db.prepare(`
+      SELECT id FROM nodes
+      WHERE access_count = 0
+        AND entity_type IN (${HYGIENE_DEAD_TYPES.map(() => "?").join(",")})
+    `).all(...HYGIENE_DEAD_TYPES);
+    const ids = dead.map((r) => r.id);
+
+    const purge = db.transaction((batch) => {
+      for (const id of batch) {
+        db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(id);
+        db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(id, id);
+        db.prepare("DELETE FROM nodes WHERE id = ?").run(id);
+        nodesDeleted++;
+      }
+    });
+    for (let i = 0; i < ids.length; i += 5000) {
+      purge(ids.slice(i, i + 5000));
+    }
+  } catch (err) {
+    console.warn(`[playbook] dead node purge failed (non-fatal): ${err.message}`);
+  }
+
+  putSynthesis(db, "__global__", "storage-hygiene-v1",
+    `versions=${versionsDeleted} nodes=${nodesDeleted}`, "");
+
+  let vacuumMs = 0;
+  try {
+    const vStart = Date.now();
+    db.exec("VACUUM");
+    vacuumMs = Date.now() - vStart;
+  } catch (err) {
+    console.warn(`[playbook] hygiene VACUUM failed (non-fatal): ${err.message}`);
+  }
+
+  console.log(
+    `[playbook] storage hygiene: trimmed ${versionsDeleted} node versions, ` +
+    `purged ${nodesDeleted} dead nodes in ${Date.now() - started - vacuumMs}ms, VACUUM ${vacuumMs}ms`
+  );
+  return { versionsDeleted, nodesDeleted, vacuumMs };
+}
+
+/**
+ * One-time corpus cleanup: purge auto-generated error_fix noise.
+ *
+ * Before the surprise-gated extractor landed, tool/shell errors were captured
+ * verbatim as "error_fix" nodes with the template text `Fixed: <raw error>`
+ * ("Fixed: File does not exist", "Fixed: <tool_use_error>...", "Fixed: Unknown
+ * tool: Read"). These carry no lesson — they echo the error. Genuine fixes
+ * explain a root cause and never match this template. We purge only the
+ * zero-access templated echoes, so any that were ever recalled survive.
+ * Guarded by its own marker; runs once.
+ */
+export function runCorpusCleanup(db) {
+  ensurePlaybookSchema(db);
+  if (getSynthesis(db, "__global__", "corpus-cleanup-v1")) {
+    return { skipped: "already-ran" };
+  }
+
+  let purged = 0;
+  try {
+    // The stored content is JSON: {"text":"Fixed: ...","metadata":{...}}.
+    // Match the templated echo at the start of the text field, zero-access only.
+    const noise = db.prepare(`
+      SELECT id FROM nodes
+      WHERE entity_type = 'error_fix'
+        AND access_count = 0
+        AND content LIKE '{"text":"Fixed: %'
+    `).all();
+    const ids = noise.map((r) => r.id);
+
+    const purge = db.transaction((batch) => {
+      for (const id of batch) {
+        db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(id);
+        db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(id, id);
+        db.prepare("DELETE FROM nodes WHERE id = ?").run(id);
+        purged++;
+      }
+    });
+    for (let i = 0; i < ids.length; i += 5000) {
+      purge(ids.slice(i, i + 5000));
+    }
+  } catch (err) {
+    console.warn(`[playbook] corpus cleanup failed (non-fatal): ${err.message}`);
+  }
+
+  putSynthesis(db, "__global__", "corpus-cleanup-v1", `purged=${purged}`, "");
+  console.log(`[playbook] corpus cleanup: purged ${purged} templated error_fix echoes`);
+  return { purged };
+}
+
+// ============================================================================
+// Ledger read — the "did Pane get smarter" dashboard
+// ============================================================================
+
+/**
+ * Ledger snapshot for a project: active principles with their earned stats.
+ */
+export function getPlaybookLedger(db, projectId) {
+  ensurePlaybookSchema(db);
+  return db.prepare(`
+    SELECT id, text, confidence, credited, violated, cycles_survived,
+           born_from, created_at, updated_at
+    FROM principles
+    WHERE project_id = ? AND status = 'active'
+    ORDER BY confidence DESC
+  `).all(projectId);
+}

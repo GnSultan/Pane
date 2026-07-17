@@ -18,6 +18,7 @@ const PROVIDER_LINKS: Record<string, { label: string; url: string }> = {
   gemini: { label: "Google AI", url: "https://aistudio.google.com/" },
   kimi: { label: "Kimi", url: "https://platform.moonshot.cn/" },
   xiaomi: { label: "Xiaomi", url: "https://platform.xiaomimimo.com/" },
+  "z-ai": { label: "Z.ai", url: "https://z.ai/manage-apikey/apikey-list" },
 };
 
 function formatCost(val: number) {

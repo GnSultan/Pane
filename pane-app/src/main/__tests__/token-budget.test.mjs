@@ -86,12 +86,10 @@ describe("getModelLimit", () => {
     expect(limit).toBe(1000000);
   });
 
-  it("uses prefix matching for model families", () => {
-    const limit = getModelLimit("deepseek-deepseek-v4-flash-extended");
-    // "deepseek-v3" is a key, but "deepseek-deepseek-v4-flash-extended" starts with "deepseek-v3"? No.
-    // "deepseek-chat" is a key. "deepseek-deepseek-v4-flash-extended" starts with "deepseek-chat"? No.
-    // "deepseek-reasoner" is a key. Starts with that? No.
-    // "deepseek-deepseek-v4-flash" is a key. "deepseek-deepseek-v4-flash-extended" starts with that? Yes!
+  it("uses provider heuristic for model families", () => {
+    const limit = getModelLimit("deepseek-coder");
+    // No exact or prefix match in MODEL_CONTEXT_LIMITS.
+    // Falls through to provider heuristic: includes("deepseek") → 1M.
     expect(limit).toBe(1000000);
   });
 
@@ -105,8 +103,8 @@ describe("getModelLimit", () => {
 
 describe("getDefaultOutputBudget", () => {
   it("returns budget for known model", () => {
-    // "deepseek" family returns 8192
-    const budget = getDefaultOutputBudget("deepseek-chat");
+    // "deepseek" family returns 8192 (conservative fallback for budget estimation)
+    const budget = getDefaultOutputBudget("deepseek-v4-flash");
     expect(budget).toBe(8192);
   });
 

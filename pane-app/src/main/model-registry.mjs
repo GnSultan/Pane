@@ -22,7 +22,7 @@ const _registry = new Map();
  * Register a model's context window.
  * Called by model-manager.mjs when models are loaded from API or disk cache.
  *
- * @param {string} modelId - Full model ID (e.g. "deepseek/deepseek-chat", "claude-sonnet-4-6")
+ * @param {string} modelId - Full model ID (e.g. "deepseek/deepseek-v4-flash", "claude-sonnet-4-6")
  * @param {number} contextLength - Context window in tokens from the API
  */
 export function registerModelContext(modelId, contextLength) {

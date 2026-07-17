@@ -169,14 +169,9 @@ const EMBEDDED_PRIORS = [
   },
   // ── DeepSeek ───────────────────────────────────────────────────────────
   {
-    model: "deepseek-r1",        provider: "deepseek",
-    codingScore: 0.86, reasoningScore: 0.90, generalScore: 0.87,
-    costInputMtok: 0.55, costOutputMtok: 2.19, arenaRank: 14,
-  },
-  {
-    model: "deepseek-v3",        provider: "deepseek",
-    codingScore: 0.83, reasoningScore: 0.84, generalScore: 0.83,
-    costInputMtok: 0.27, costOutputMtok: 1.10, arenaRank: 16,
+    model: "deepseek/deepseek-v4-flash", provider: "deepseek",
+    codingScore: 0.84, reasoningScore: 0.88, generalScore: 0.85,
+    costInputMtok: 0.07, costOutputMtok: 0.28, arenaRank: 12,
   },
 ];
 
@@ -246,8 +241,7 @@ const LITELLM_MAP = {
   "gemini-2.0-flash":  ["gemini/gemini-2.0-flash",           "gemini-2.0-flash"],
   "gemini-1.5-pro":    ["gemini/gemini-1.5-pro",             "gemini-1.5-pro"],
   // DeepSeek
-  "deepseek-r1":       ["deepseek/deepseek-r1",              "deepseek-r1"],
-  "deepseek-v3":       ["deepseek/deepseek-chat",            "deepseek-v3"],
+  "deepseek-v4-flash": ["deepseek-v4-flash", "deepseek-v4-flash"],
 };
 
 // Provider lookup for our model names (needed for updatePriorCost)
@@ -262,7 +256,7 @@ const MODEL_PROVIDER = {
   "o3": "openai", "o4-mini": "openai", "o3-mini": "openai",
   "gemini-2.5-pro": "google", "gemini-2.0-pro": "google",
   "gemini-2.0-flash": "google", "gemini-1.5-pro": "google",
-  "deepseek-r1": "deepseek", "deepseek-v3": "deepseek",
+  "deepseek-v4-flash": "deepseek",
 };
 
 async function tryLiveRefresh() {

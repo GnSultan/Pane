@@ -123,13 +123,15 @@ export const Conversation = memo(function Conversation({
 
   // toolResultMap: only recompute when the count of system messages changes,
   // not on every text delta. Text deltas only touch the last assistant message.
-  const systemMessageCount = useMemo(
-    () => messages.filter((m) => m.type === "system").length,
-    [messages],
-  );
+  // We use a ref so the useMemo doesn't depend on the messages array reference —
+  // otherwise every rAF-flushed text delta would create a new Map and force ALL
+  // MemoizedMessages to re-render (their comparator sees toolResults changed).
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const systemMessageCount = messages.filter((m) => m.type === "system").length;
   const toolResultMap = useMemo(() => {
     const map = new Map<string, ToolResultBlock>();
-    for (const msg of messages) {
+    for (const msg of messagesRef.current) {
       if (msg.type === "system") {
         for (const block of msg.content) {
           if (block.type === "tool_result") {
@@ -142,7 +144,7 @@ export const Conversation = memo(function Conversation({
       }
     }
     return map;
-  }, [messages, systemMessageCount]);
+  }, [systemMessageCount]);
 
   const { sendMessage, abortMessage } = usePunk(projectId);
   const scrollRef = useRef<HTMLDivElement>(null);

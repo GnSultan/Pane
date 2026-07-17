@@ -413,18 +413,44 @@ export async function sendToPunk(
     else draining = false;
   };
 
+  // Chunk buffer for large IPC payloads. Keyed by `${requestId}:${eventType}`.
+  const chunkBuffer = new Map<string, { chunks: string[]; total: number }>();
+
   cleanup = electronAPI.on(
     `punk-stream:${projectId}`,
-    (event: PunkStreamEvent) => {
+    (event: PunkStreamEvent & { _chunkMeta?: { total: number; index: number; type: string; requestId: string }; _chunkData?: string }) => {
       // Ignore events tagged for a different request (e.g. a previous aborted
       // session whose processEnded arrives after the new session has started).
       if (event.requestId && event.requestId !== requestId) return;
 
-      // All events go through the MessageChannel queue so the browser can
-      // interleave paint/input between each one. The old pattern of
-      // synchronously dumping the queue on processEnded caused UI freezes
-      // with CLI backends that burst many events right before exit.
-      queue.push(event);
+      // ── Chunk reassembly ─────────────────────────────────────────
+      // Large IPC events are split into 256KB chunks by sendToRenderer.
+      // Accumulate chunks until all have arrived, then reassemble and
+      // push the original event to the queue.
+      if (event._chunkMeta) {
+        const key = `${event._chunkMeta.requestId || requestId}:${event._chunkMeta.type}`;
+        let buf = chunkBuffer.get(key);
+        if (!buf) {
+          buf = { chunks: new Array<string>(event._chunkMeta.total), total: event._chunkMeta.total };
+          chunkBuffer.set(key, buf);
+        }
+        buf.chunks[event._chunkMeta.index] = event._chunkData!;
+
+        // Check if all chunks have arrived
+        if (buf.chunks.every(c => c !== undefined)) {
+          chunkBuffer.delete(key);
+          try {
+            const reassembled = JSON.parse(buf.chunks.join('')) as PunkStreamEvent;
+            queue.push(reassembled);
+          } catch (err) {
+            console.error('[punk] Failed to reassemble chunked event:', err);
+          }
+        }
+      } else {
+        // Normal (non-chunked) event
+        queue.push(event);
+      }
+
       if (!draining) {
         draining = true;
         port1.postMessage(null);
@@ -611,7 +637,7 @@ export async function createCheckpoint(
   workingDir: string,
   messageId: string,
 ): Promise<CheckpointResult> {
-  return electronAPI.invoke("create_checkpoint", {
+  return electronAPI.invoke("pane_checkpoint", {
     projectId,
     workingDir,
     messageId,

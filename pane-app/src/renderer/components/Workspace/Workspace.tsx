@@ -188,7 +188,7 @@ export function Workspace() {
   }, [setMode]);
 
   return (
-    <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl overflow-hidden ring-1 ring-pane-border/40">
+    <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl overflow-hidden">
       {/* Conversation page — participates in the same [data-page] CSS system as every other page.
            Page-level visibility (conversation vs mind vs profile) is CSS-driven.
            Thread switching (project A vs project B) is JS-driven z-index 0/1 inside. */}

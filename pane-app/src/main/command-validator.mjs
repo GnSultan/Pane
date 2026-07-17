@@ -75,7 +75,7 @@ const WRITE_COMMAND_PATTERNS = [
  * Strips quoted strings first to avoid false positives from echo "> file", etc.
  * Also strips file descriptor redirects (2>&1, N<&M, etc.) which are read-only.
  */
-function hasWriteIntent(command) {
+export function hasWriteIntent(command) {
   // Strip quoted strings to avoid false matches inside echo/printf
   let unquoted = command.replace(/(["'])(?:(?!\1).)*\1/g, '""');
   // Strip file descriptor redirects (N>&M, N<&M, N>&-, N<&-) — these are read-only fd duplication

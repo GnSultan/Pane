@@ -56,10 +56,18 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
         return q ? `search changes ${q}` : "search changes";
       }
       case "pane_checkpoints": return "checkpoints";
+      case "pane_checkpoint": {
+        const label = (input.label as string) || "";
+        return label ? `checkpoint ${label}` : "checkpoint";
+      }
       case "pane_change_history": return "change history";
       case "pane_set_about": return "set about";
       case "pane_set_philosophy": return "set philosophy";
       case "pane_set_rule": return "set rule";
+      case "pane_delegate": {
+        const obj = (input.objective as string) || "";
+        return obj ? `delegate ${obj.slice(0, 60)}` : "delegate";
+      }
       case "pane_cross_project": {
         const q = (input.query as string) || "";
         return q ? `cross project ${q}` : "cross project";
@@ -150,7 +158,7 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
     }
     case "evaluate_js":
       return "evaluate";
-    case "list_directory":
+    case "pane_directory":
       return (input.dir_path as string) || "list directory";
     case "web_fetch":
       return "fetch";

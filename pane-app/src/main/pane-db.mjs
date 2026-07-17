@@ -20,6 +20,7 @@ const Database = require("better-sqlite3");
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const DB_PATH = path.join(PANE_DIR, "pane.db");
@@ -58,6 +59,17 @@ export function getPaneDb() {
 // ---------------------------------------------------------------------------
 
 function _createSchema(db) {
+  // Fold any legacy append-only correction_events into counter form BEFORE the
+  // schema block below runs. That block declares `CREATE UNIQUE INDEX ... ON
+  // correction_events(project_id, correction_type, model, detail)`; on a legacy
+  // db the table already exists with run-multiplied duplicate rows, so creating
+  // that index throws "UNIQUE constraint failed" and aborts the whole exec —
+  // leaving db.stmts unprepared and every conversation query silently empty.
+  // Running the fold first rebuilds the table deduped (and creates the index
+  // itself), so the IF NOT EXISTS statements below become no-ops. On a fresh db
+  // the table doesn't exist yet, the fold no-ops, and the block creates it.
+  _foldCorrectionEvents(db);
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS migration_version (
       id      INTEGER PRIMARY KEY CHECK (id = 1),
@@ -174,22 +186,30 @@ function _createSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_quality_model
       ON quality_metrics(model, timestamp);
 
-    -- Correction events — tracks individual corrections for pattern detection.
-    -- When the same correction_type hits 3+ times in a week, it graduates
-    -- to a candidate rule. No LLM extraction — just counting events.
+    -- Correction events — DISTINCT corrections with an occurrence counter.
+    -- Counter form (not append-only): each (project, type, model, detail) is one
+    -- row whose count increments on repeat. A persistent unfixed error stays one
+    -- row instead of accumulating thousands. This is the corpus the model profile
+    -- reads — distinct patterns, not run-multiplied noise.
     CREATE TABLE IF NOT EXISTS correction_events (
       id               TEXT    PRIMARY KEY,
       project_id       TEXT    NOT NULL,
       correction_type  TEXT    NOT NULL,
-      model            TEXT,
+      model            TEXT    NOT NULL DEFAULT '',
       source           TEXT    NOT NULL,
-      detail           TEXT,
-      timestamp        INTEGER NOT NULL
+      detail           TEXT    NOT NULL DEFAULT '',
+      count            INTEGER NOT NULL DEFAULT 1,
+      first_seen       INTEGER NOT NULL,
+      last_seen        INTEGER NOT NULL
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_unique
+      ON correction_events(project_id, correction_type, model, detail);
     CREATE INDEX IF NOT EXISTS idx_corrections_project
-      ON correction_events(project_id, timestamp);
+      ON correction_events(project_id, last_seen);
     CREATE INDEX IF NOT EXISTS idx_corrections_type
-      ON correction_events(correction_type, timestamp);
+      ON correction_events(correction_type, last_seen);
+    CREATE INDEX IF NOT EXISTS idx_corrections_model
+      ON correction_events(model, last_seen);
 
     -- FTS5 full-text search across all conversation messages.
     -- Stores extracted plain text from message content blocks.
@@ -210,6 +230,86 @@ function _createSchema(db) {
       DELETE FROM messages_fts WHERE message_id = old.id;
     END;
   `);
+
+}
+
+/**
+ * One-shot: collapse the legacy append-only correction_events table into the
+ * counter form. Runs inside _createSchema (before _prepareStatements) so the
+ * prepared upsert always binds against the new schema. Idempotent.
+ *
+ * The old table stored one row per (finding × arbiter run) — a single unfixed
+ * error became thousands of rows. This groups by the distinct correction
+ * identity and carries an occurrence count + first/last-seen window.
+ */
+function _foldCorrectionEvents(db) {
+  const cols = db.prepare("PRAGMA table_info(correction_events)").all();
+  if (!cols.length || cols.some((c) => c.name === "count")) return; // fresh or already folded
+
+  console.log("[pane-db] Folding legacy correction_events into counter form...");
+  const before = db.prepare("SELECT COUNT(*) AS c FROM correction_events").get().c;
+
+  db.exec("ALTER TABLE correction_events RENAME TO correction_events_legacy");
+  // Index names are database-global, and RENAME TABLE keeps the legacy table's
+  // indexes attached under their original names. If the legacy schema used any
+  // of the names we recreate below, `CREATE INDEX` would throw "already exists"
+  // and abort the fold. Drop them first — the legacy table is dropped at the end
+  // anyway, so losing its indexes is harmless.
+  db.exec(`
+    DROP INDEX IF EXISTS idx_corrections_unique;
+    DROP INDEX IF EXISTS idx_corrections_project;
+    DROP INDEX IF EXISTS idx_corrections_type;
+    DROP INDEX IF EXISTS idx_corrections_model;
+  `);
+  db.exec(`
+    CREATE TABLE correction_events (
+      id               TEXT    PRIMARY KEY,
+      project_id       TEXT    NOT NULL,
+      correction_type  TEXT    NOT NULL,
+      model            TEXT    NOT NULL DEFAULT '',
+      source           TEXT    NOT NULL,
+      detail           TEXT    NOT NULL DEFAULT '',
+      count            INTEGER NOT NULL DEFAULT 1,
+      first_seen       INTEGER NOT NULL,
+      last_seen        INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX idx_corrections_unique
+      ON correction_events(project_id, correction_type, model, detail);
+    CREATE INDEX idx_corrections_project ON correction_events(project_id, last_seen);
+    CREATE INDEX idx_corrections_type ON correction_events(correction_type, last_seen);
+    CREATE INDEX idx_corrections_model ON correction_events(model, last_seen);
+  `);
+
+  const grouped = db.prepare(`
+    SELECT project_id, correction_type,
+           COALESCE(model, '') AS model,
+           MAX(source) AS source,
+           COALESCE(detail, '') AS detail,
+           COUNT(*) AS cnt,
+           MIN(timestamp) AS first_seen,
+           MAX(timestamp) AS last_seen
+    FROM correction_events_legacy
+    GROUP BY project_id, correction_type, COALESCE(model, ''), COALESCE(detail, '')
+  `).all();
+
+  const insert = db.prepare(`
+    INSERT INTO correction_events
+      (id, project_id, correction_type, model, source, detail, count, first_seen, last_seen)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const fold = db.transaction((rows) => {
+    for (const r of rows) {
+      const id = crypto.createHash("sha1")
+        .update(`${r.project_id}|${r.correction_type}|${r.model}|${r.detail}`)
+        .digest("hex").slice(0, 32);
+      insert.run(id, r.project_id, r.correction_type, r.model, r.source, r.detail,
+        r.cnt, r.first_seen, r.last_seen);
+    }
+  });
+  fold(grouped);
+
+  db.exec("DROP TABLE correction_events_legacy");
+  console.log(`[pane-db] Folded correction_events: ${before} rows → ${grouped.length} distinct patterns`);
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +372,7 @@ function _prepareStatements(db) {
     getChangeById: db.prepare("SELECT * FROM change_history WHERE id = ?"),
     deleteChangeById: db.prepare("DELETE FROM change_history WHERE id = ?"),
     deleteAllChanges: db.prepare("DELETE FROM change_history WHERE project_id = ?"),
+    pruneOldChanges: db.prepare("DELETE FROM change_history WHERE project_id = ? AND timestamp < ?"),
     searchChanges: db.prepare(
       "SELECT * FROM change_history WHERE project_id = ? AND (file_path LIKE ? OR description LIKE ? OR new_string LIKE ? OR old_string LIKE ?) ORDER BY timestamp DESC LIMIT 200"
     ),
@@ -442,23 +543,27 @@ function _prepareStatements(db) {
       LIMIT ?
     `),
 
-    // correction events — pattern detection for rule graduation
+    // correction events — counter form. Upsert increments the occurrence count
+    // for a distinct (project, type, model, detail) rather than appending a row.
     insertCorrection: db.prepare(`
-      INSERT INTO correction_events (id, project_id, correction_type, model, source, detail, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO correction_events
+        (id, project_id, correction_type, model, source, detail, count, first_seen, last_seen)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(project_id, correction_type, model, detail)
+      DO UPDATE SET count = count + 1, last_seen = excluded.last_seen
     `),
     getRepeatedCorrections: db.prepare(`
-      SELECT correction_type, COUNT(*) as count, MAX(detail) as last_detail, MAX(timestamp) as last_seen
+      SELECT correction_type, SUM(count) as count, MAX(detail) as last_detail, MAX(last_seen) as last_seen
       FROM correction_events
-      WHERE timestamp >= ?
+      WHERE last_seen >= ?
       GROUP BY correction_type
       HAVING count >= ?
       ORDER BY count DESC
     `),
     getCorrectionsByProject: db.prepare(`
-      SELECT correction_type, COUNT(*) as count, MAX(detail) as last_detail
+      SELECT correction_type, SUM(count) as count, MAX(detail) as last_detail
       FROM correction_events
-      WHERE project_id = ? AND timestamp >= ?
+      WHERE project_id = ? AND last_seen >= ?
       GROUP BY correction_type
       HAVING count >= 2
       ORDER BY count DESC
@@ -525,6 +630,26 @@ export function pruneConversationMessages(projectId, keepCount = 200) {
     console.log(`[pane-db] Pruned messages for ${projectId}: ${before} -> ${after} (kept ${keepCount})`);
   } catch (err) {
     console.warn(`[pane-db] pruneConversationMessages failed: ${err.message}`);
+  }
+}
+
+/**
+ * Prune change history older than the retention window for a project.
+ * Change history backs the undo/revert feature — reverting an edit from more
+ * than a week ago is not a realistic scenario, so we cap retention at 7 days.
+ * Cheap indexed range delete; safe to call opportunistically after each write.
+ *
+ * @param {string} projectId
+ * @param {number} [days=7] - Retention window in days
+ */
+export function pruneChangeHistory(projectId, days = 7) {
+  try {
+    const db = getPaneDb();
+    if (!db || !db.stmts.pruneOldChanges) return;
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    db.stmts.pruneOldChanges.run(projectId, cutoff);
+  } catch (err) {
+    console.warn(`[pane-db] pruneChangeHistory failed: ${err.message}`);
   }
 }
 
