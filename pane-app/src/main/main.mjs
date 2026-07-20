@@ -46,6 +46,8 @@ import ignore from "ignore";
 import chokidar from "chokidar";
 import {
   registerPunkHandlers,
+  registerPunkHandlersSync,
+  initPunkBackend,
   preforkPunkWorker,
   shutdownPunkWorker,
   punkEngine,
@@ -55,15 +57,17 @@ import { startBackupSchedule, registerBackupHandlers } from "./backup-engine.mjs
 import { initCloudAuth } from "./cloud-auth.mjs";
 import { registerCloudSyncHandlers } from "./cloud-sync.mjs";
 import { MindPunks } from "./mind-punks.mjs";
+import { DocPunk } from "./doc-punk.mjs";
 import { getModelRates } from "./pricing.mjs";
 import { updateLastPrompt, updateLastResponse, readThreadState } from "./thread-state.mjs";
 import { contextStore } from "./context-store.mjs";
-import { getPaneDb, extractMessageText, initPaneDb, runMigrationIfNeeded, pruneConversationMessages } from "./pane-db.mjs";
+import { getPaneDb, extractMessageText, initPaneDb, runMigrationIfNeeded, pruneConversationMessages, completeCorrectionFold } from "./pane-db.mjs";
 import { loadRecentTurns } from "./session-turns.mjs";
 import { setCmdWorker, execThroughWorker, onCmdWorkerExit } from "./tool-executor.mjs";
 import { mergeState } from "./pane-system-prompt.mjs";
 import { runModelProfileReflection } from "./playbook-engine.mjs";
-import { restoreCheckpoint } from "./checkpoint-engine.mjs";
+import { restoreCheckpoint, snapshotAllFiles, flushJournal } from "./checkpoint-engine.mjs";
+import { bustRootMapCache } from "./intents.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -81,11 +85,15 @@ process.on("uncaughtException", (error) => {
 });
 
 let mindPunks = null;
+let docPunk = null;
 // Punk engine runs in a UtilityProcess to keep the main thread free.
 // Main process is a thin relay — never touches JSON.parse or model output.
-async function registerClaudeHandlers() {
+// Synchronous: IPC handlers are registered immediately. Backend init happens
+// later via initPunkBackend() after the window is shown.
+function registerClaudeHandlers() {
   // Punk is the default engine; keep these names for backwards compatibility.
-  await registerPunkHandlers();
+  // Use sync version — handlers lazy-init backends on first call.
+  registerPunkHandlersSync();
 
   // ── Token Usage Persistence Hook ───────────────────────────────────────
   // Intercept all token_usage events from backends (HTTP and CLI) and record
@@ -976,6 +984,7 @@ Improvements
       const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
       await fs.promises.writeFile(tmpPath, json, "utf-8");
       await fs.promises.rename(tmpPath, filePath);
+      bustRootMapCache();
       return { success: true };
     } catch (err) {
       return { success: false, error: err.message };
@@ -1279,7 +1288,6 @@ function registerCheckpointHandlers(db) {
     const { projectId, workingDir, messageId } = args;
     // Full project snapshot — used for pre-turn checkpoints from the renderer.
     // The tool executor path uses the per-turn journal instead.
-    const { snapshotAllFiles, flushJournal } = await import("./checkpoint-engine.mjs");
     const journal = new Map();
     try {
       await snapshotAllFiles(workingDir, journal);
@@ -2298,30 +2306,85 @@ function registerBrainHandlers() {
     await brainRequest('lens_comment_set_session', { postId: args.postId, sessionId: args.sessionId });
   });
 
+  // ── Doc Punk ──────────────────────────────────────────────────────────────
+  ipcMain.handle('doc_punk_run', async (_event, args) => {
+    if (!docPunk) return { post: null, skipped: "not-initialized" };
+    const { projectId, workingDir, force } = args;
+    // Fire-and-forget — results come via pane://lens-post event
+    docPunk.run(projectId, workingDir, force ?? false).catch(err => {
+      console.error("[doc-punk] run failed:", err.message);
+    });
+    return { started: true };
+  });
+
+  ipcMain.handle('doc_punk_run_all', async (_event, args) => {
+    if (!docPunk) return { results: [] };
+    const { projects } = args;
+    // Fire-and-forget
+    docPunk.runAll(projects).catch(err => {
+      console.error("[doc-punk] runAll failed:", err.message);
+    });
+    return { started: true };
+  });
+
 }
 
-async function registerIpcHandlers() {
+// Register all IPC handlers synchronously so they're ready before the window
+// loads. Slow operations (DB migrations, backend detection) are deferred to
+// initStartupServices() which runs after the window is shown.
+function registerIpcHandlers() {
   let db = null;
   try {
     db = initPaneDb();
-    await runMigrationIfNeeded(db);
-    console.log("[main] Database initialized successfully");
+    console.log("[main] Database opened");
   } catch (err) {
     console.error("[main] Failed to initialize database:", err.message);
-    console.error("[main] App will continue with limited functionality");
-    // Create a mock db object to prevent crashes
     db = { stmts: {} };
   }
 
   registerCommandHandlers();
   registerSettingsHandlers();
-  await registerClaudeHandlers();
+  registerClaudeHandlers();        // sync: registers handlers, skips backend init
   registerWatcherHandlers();
   registerCheckpointHandlers(db);
   registerStateHandlers(db);
   registerMemoryHandlers();
   registerSessionHandlers(db);
   registerBrainHandlers();
+}
+
+// Slow startup work that should NOT block the window from appearing.
+// DB migrations, backend detection (dynamic import of Claude SDK), and
+// worker prefork run here, after the window is already visible.
+async function initStartupServices() {
+  // DB migrations (reads JSON files from disk — can be slow on cold FS)
+  try {
+    const db = getPaneDb();
+    await runMigrationIfNeeded(db);
+    console.log("[main] Database migrations complete");
+  } catch (err) {
+    console.error("[main] Migration error (non-fatal):", err.message);
+  }
+
+  // Deferred heavy data fold for correction_events. The schema swap already
+  // happened synchronously at init; this migrates the legacy rows. Kept OFF the
+  // launch path so a new device restoring a large legacy backup doesn't freeze
+  // before the window appears. One-time, self-guarded (no-op once folded).
+  try {
+    completeCorrectionFold(getPaneDb());
+  } catch (err) {
+    console.error("[main] correction fold error (non-fatal):", err.message);
+  }
+
+  // Backend detection — this is the slow one (~10-30s on cold disk due to
+  // `await import("@anthropic-ai/claude-agent-sdk")`). Fire-and-forget so
+  // handlers that call spawn() will lazy-init if they fire before this completes.
+  initPunkBackend().then(() => {
+    console.log("[main] Punk backends initialized");
+    preforkPunkWorker();  // safe to call now — initialize() is a no-op since backends are ready
+  }).catch(err => {
+    console.warn("[main] Punk backend init failed:", err.message);
+  });
 }
 let mainWindow = null;
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
@@ -2403,12 +2466,22 @@ app.commandLine.appendSwitch('enable-zero-copy');
 app.commandLine.appendSwitch('num-raster-threads', '4');
 
 app.whenReady().then(async () => {
-  await registerIpcHandlers();
-  modelManager.initialize();
+  // ── Fast path: register IPC handlers + create window ──────────────────
+  // Nothing here awaits disk I/O or dynamic imports. The window appears in
+  // <1s even on cold filesystem. Handlers that need backends (spawn, etc.)
+  // lazy-initialize on first call.
+  registerIpcHandlers();
+  modelManager.initialize();        // async but not awaited — handler registered sync, cache load is fast
   createWindow();
-  preforkPunkWorker(); // Pre-fork to hide first-use latency
-  getBrainWorker(); // Pre-fork: start SQLite + profile (embedding model loads lazily on first embed)
-  getCmdWorker();   // Pre-fork: runs execSync in isolated libuv loop (avoids EBADF in packaged app)
+
+  // ── Background init: slow operations that must not block the window ───
+  // initStartupServices() handles DB migrations + backend detection. The SDK
+  // import alone can take 10-30s on cold disk.
+  initStartupServices();
+
+  // Pre-fork workers — non-blocking, return immediately
+  getBrainWorker(); // SQLite + embedding model (loads lazily on first embed)
+  getCmdWorker();   // isolated libuv loop for command execution
 
   // Wire brain contextual search into punk-engine so it fires every turn.
   // This is the critical link: brain searches the knowledge graph for query-
@@ -2474,28 +2547,94 @@ app.whenReady().then(async () => {
     sendToRenderer,
   });
 
+  // Doc punk: nightly documentation drafter
+  docPunk = new DocPunk({
+    quickCall: (sys, usr) => punkEngine.quickCall(sys, usr),
+    brainRequest,
+    sendToRenderer,
+  });
+
   // Watch ~/.pane/projects/*/roadmap.json and ~/.pane/session/*/state.json so
   // the UI reacts when an external CLI agent (Gemini, Claude) writes via the
   // MCP server's pane_roadmap tool. Without this the roadmap panel and phase
   // indicator only update when the Electron-side ToolExecutor fires events.
   startMcpFileWatcher();
 
+  // ── Doc Punk Scheduler: nightly documentation draft at 10pm ────────────
+  // Checks if the last run was >20h ago and triggers across all active
+  // projects. Uses setTimeout to hit 10pm local time.
+  (function scheduleDocPunk() {
+    if (!docPunk) return;
+
+    const now = new Date();
+    const target = new Date(now);
+    // 10pm today (22:00 local)
+    target.setHours(22, 0, 0, 0);
+
+    // If 10pm has already passed today, schedule for tomorrow
+    if (target <= now) {
+      target.setDate(target.getDate() + 1);
+    }
+
+    const msUntilTarget = target.getTime() - now.getTime();
+
+    console.log(`[doc-punk] Scheduled next run at ${target.toLocaleString()} (in ${Math.round(msUntilTarget / 3600000)}h)`);
+
+    setTimeout(async () => {
+      try {
+        console.log("[doc-punk] Nightly run starting...");
+
+        // Discover active projects from settings
+        let settings = {};
+        try {
+          settings = JSON.parse(
+            fs.readFileSync(path.join(os.homedir(), ".pane", "settings.json"), "utf-8"),
+          );
+        } catch {}
+
+        const projectStates = settings.project_states || {};
+        const projects = Object.entries(projectStates)
+          .filter(([, state]) => state.root && typeof state.root === "string")
+          .map(([projectId, state]) => ({ projectId, workingDir: state.root }));
+
+        if (projects.length > 0) {
+          await docPunk.runAll(projects);
+        } else {
+          console.log("[doc-punk] No active projects found for nightly run");
+        }
+      } catch (err) {
+        console.error("[doc-punk] Nightly run failed:", err.message);
+      }
+
+      // Schedule the next run (24h from now)
+      scheduleDocPunk();
+    }, msUntilTarget).unref?.(); // unref so the timer doesn't keep the process alive
+  })();
+
   // ── Startup cleanup: prune accumulated noise ───────────────────────────
-  // The extraction→brain loop was never closed, so raw messages and raw brain
-  // nodes accumulated indefinitely. On first startup after this fix, clean up
-  // existing data: keep only the latest 200 messages per project, prune low-
-  // confidence brain nodes (< 0.15), and reclaim disk via VACUUM.
+  // Fire-and-forget — must not block renderer startup. Brain may not be
+  // ready yet (ONNX runtime init, model cache warmup). Short timeout on
+  // the brain probe; brain-dependent steps are skipped if not ready.
   (async () => {
     try {
-      // Get all projects that have conversation data in pane.db
-      const db = getPaneDb();
-      const projectsWithMessages = db.prepare(
-        `SELECT DISTINCT project_id FROM messages`
-      ).all().map(r => r.project_id);
+      // Guard against DB init failure — getPaneDb() throws if initPaneDb() failed
+      let db = null;
+      try { db = getPaneDb(); } catch { /* intentional: no-op — DB init failed, cleanup can't run */ }
 
-      // Get all projects that have brain data
-      const brainResult = await brainRequest("get_all_projects", {});
-      const projectsWithBrain = (brainResult?.projects || []);
+      const projectsWithMessages = db
+        ? db.prepare(`SELECT DISTINCT project_id FROM messages`).all().map(r => r.project_id)
+        : [];
+
+      // Brain probe with short timeout — brain worker may still be initializing
+      // its ONNX runtime. Cleanup is not critical; skip brain-side work if
+      // the worker isn't ready yet instead of blocking on the 30s default.
+      let projectsWithBrain = [];
+      if (projectsWithMessages.length > 0) {
+        try {
+          const brainResult = await brainRequest("get_all_projects", {}, 5000);
+          projectsWithBrain = brainResult?.projects || [];
+        } catch { /* brain not ready — skip brain-side cleanup */ }
+      }
 
       const allProjectIds = [...new Set([...projectsWithMessages, ...projectsWithBrain])];
       if (allProjectIds.length === 0) return;
@@ -2504,27 +2643,27 @@ app.whenReady().then(async () => {
 
       for (const projectId of allProjectIds) {
         // Prune old conversation messages — keep last 200
-        try {
-          pruneConversationMessages(projectId, 200);
-        } catch {}
+        try { pruneConversationMessages(projectId, 200); } catch { /* intentional: per-project failure is non-fatal */ }
 
-        // Prune low-confidence brain nodes
-        try {
-          await brainRequest("prune", { projectId });
-        } catch {}
+        // Prune low-confidence brain nodes (only if brain was reachable)
+        if (projectsWithBrain.includes(projectId)) {
+          try { await brainRequest("prune", { projectId }); } catch { /* intentional: brain prune failure is non-fatal */ }
+        }
       }
 
       // VACUUM pane.db to reclaim freelist space
-      try {
-        db.pragma("auto_vacuum = INCREMENTAL");
-        db.exec("PRAGMA incremental_vacuum(10)");
-        console.log("[main] pane.db incremental vacuum complete");
-      } catch {}
+      if (db) {
+        try {
+          db.pragma("auto_vacuum = INCREMENTAL");
+          db.exec("PRAGMA incremental_vacuum(10)");
+          console.log("[main] pane.db incremental vacuum complete");
+        } catch { /* intentional: vacuum failure is non-fatal */ }
+      }
 
-      // VACUUM brain.db
-      try {
-        await brainRequest("vacuum", {});
-      } catch {}
+      // VACUUM brain.db (skip if brain wasn't ready)
+      if (projectsWithBrain.length > 0) {
+        try { await brainRequest("vacuum", {}); } catch { /* intentional: brain vacuum failure is non-fatal */ }
+      }
 
       console.log("[main] Startup cleanup complete");
     } catch (err) {

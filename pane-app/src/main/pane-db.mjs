@@ -234,27 +234,25 @@ function _createSchema(db) {
 }
 
 /**
- * One-shot: collapse the legacy append-only correction_events table into the
- * counter form. Runs inside _createSchema (before _prepareStatements) so the
- * prepared upsert always binds against the new schema. Idempotent.
+ * FAST phase of the correction_events counter migration — runs inside
+ * _createSchema, on the app's synchronous startup path (before the window can
+ * show). It must NOT touch row data: on a new device restoring a large legacy
+ * backup, a full GROUP BY + reinsert here froze launch for seconds.
  *
- * The old table stored one row per (finding × arbiter run) — a single unfixed
- * error became thousands of rows. This groups by the distinct correction
- * identity and carries an occurrence count + first/last-seen window.
+ * Instead we only set the legacy table aside and create the empty new-schema
+ * table so _prepareStatements binds the upsert correctly and the window appears
+ * immediately. The heavy row fold is deferred to completeCorrectionFold(),
+ * called after the window is visible. Idempotent.
  */
 function _foldCorrectionEvents(db) {
   const cols = db.prepare("PRAGMA table_info(correction_events)").all();
   if (!cols.length || cols.some((c) => c.name === "count")) return; // fresh or already folded
 
-  console.log("[pane-db] Folding legacy correction_events into counter form...");
-  const before = db.prepare("SELECT COUNT(*) AS c FROM correction_events").get().c;
+  console.log("[pane-db] Legacy correction_events detected — setting aside; data fold deferred");
 
   db.exec("ALTER TABLE correction_events RENAME TO correction_events_legacy");
-  // Index names are database-global, and RENAME TABLE keeps the legacy table's
-  // indexes attached under their original names. If the legacy schema used any
-  // of the names we recreate below, `CREATE INDEX` would throw "already exists"
-  // and abort the fold. Drop them first — the legacy table is dropped at the end
-  // anyway, so losing its indexes is harmless.
+  // Index names are database-global; RENAME keeps the legacy indexes under their
+  // original names. Drop any we're about to recreate so CREATE INDEX won't throw.
   db.exec(`
     DROP INDEX IF EXISTS idx_corrections_unique;
     DROP INDEX IF EXISTS idx_corrections_project;
@@ -279,6 +277,26 @@ function _foldCorrectionEvents(db) {
     CREATE INDEX idx_corrections_type ON correction_events(correction_type, last_seen);
     CREATE INDEX idx_corrections_model ON correction_events(model, last_seen);
   `);
+}
+
+/**
+ * SLOW phase — fold the set-aside legacy rows into counter form. Runs deferred
+ * (after the window is shown) so the heavy GROUP BY + reinsert never blocks
+ * launch. Idempotent and crash-safe: INSERT OR IGNORE lets a re-run after an
+ * interrupted fold pick up where it left off, and the legacy table is dropped
+ * only once the data is in.
+ *
+ * @param {object} db
+ * @returns {{ folded: boolean, before?: number, distinct?: number }}
+ */
+export function completeCorrectionFold(db) {
+  const legacy = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='correction_events_legacy'",
+  ).get();
+  if (!legacy) return { folded: false };
+
+  const before = db.prepare("SELECT COUNT(*) AS c FROM correction_events_legacy").get().c;
+  console.log(`[pane-db] Folding ${before} legacy correction rows into counter form (deferred)...`);
 
   const grouped = db.prepare(`
     SELECT project_id, correction_type,
@@ -293,7 +311,7 @@ function _foldCorrectionEvents(db) {
   `).all();
 
   const insert = db.prepare(`
-    INSERT INTO correction_events
+    INSERT OR IGNORE INTO correction_events
       (id, project_id, correction_type, model, source, detail, count, first_seen, last_seen)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -310,6 +328,7 @@ function _foldCorrectionEvents(db) {
 
   db.exec("DROP TABLE correction_events_legacy");
   console.log(`[pane-db] Folded correction_events: ${before} rows → ${grouped.length} distinct patterns`);
+  return { folded: true, before, distinct: grouped.length };
 }
 
 // ---------------------------------------------------------------------------
