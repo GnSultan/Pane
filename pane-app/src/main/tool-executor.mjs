@@ -2003,6 +2003,16 @@ export class ToolExecutor {
         }
 
         case "pane_checkpoint": {
+          // If no files have been modified this turn, snapshot the full project
+          // so the checkpoint captures the current state as a safety net.
+          // This lets pane_checkpoint work at any moment, not just mid-edit.
+          if (this.fileJournal.size === 0) {
+            try {
+              await snapshotAllFiles(this.projectRoot, this.fileJournal);
+            } catch {
+              return { success: false, error: "Checkpoint not saved — project snapshot failed.", toolId };
+            }
+          }
           const result = await flushJournal({
             projectId: this.projectId,
             workingDir: this.projectRoot,
@@ -2011,7 +2021,7 @@ export class ToolExecutor {
           });
           if (!result.id) {
             const why = result.reason === "no-files-journaled"
-              ? "no files have been modified in this turn yet"
+              ? "no files found in the project to snapshot"
               : "no snapshot could be taken";
             return { success: false, error: `Checkpoint not saved — ${why}.`, toolId };
           }
