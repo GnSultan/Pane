@@ -1100,6 +1100,38 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "pane_lens_findings",
+      description:
+        "Interact with Lens punk findings — the background code analysts that watch the codebase. Use 'list' to read all undismissed findings grouped by punk. Use 'resolve' to mark findings as resolved after fixing them. Use 'run' to trigger a specific punk with an optional task directive.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["list", "resolve", "run"],
+            description: "What to do: list findings, resolve them, or run a punk.",
+          },
+          findingIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Finding IDs to resolve (required when action is 'resolve').",
+          },
+          punk: {
+            type: "string",
+            description: "Punk name to run, e.g. 'ghost', 'ash', 'sage' (required when action is 'run').",
+          },
+          task: {
+            type: "string",
+            description: "Optional task directive when running a punk, e.g. 'trace the auth flow and find any bypass'.",
+          },
+        },
+        required: ["action"],
+      },
+    },
+  },
 ];
 
 // ── Phase-based tool lists ─────────────────────────────────────────────────
@@ -1623,6 +1655,13 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
+  setRunPunk(fn) {
+    this._runPunk = fn;
+    for (const executor of this.toolExecutors.values()) {
+      if (executor.setRunPunk) executor.setRunPunk(fn);
+    }
+  }
+
   getToolExecutor(projectId, projectRoot) {
     let executor = this.toolExecutors.get(projectId);
     if (!executor) {
@@ -1637,6 +1676,9 @@ export class ApiBackend extends PunkBackend {
       }
       if (this._agentCall && executor.setAgentCall) {
         executor.setAgentCall(this._agentCall);
+      }
+      if (this._runPunk && executor.setRunPunk) {
+        executor.setRunPunk(this._runPunk);
       }
       this.toolExecutors.set(projectId, executor);
     }
@@ -2840,6 +2882,34 @@ export class ApiBackend extends PunkBackend {
             }
           }
 
+          if (
+            request.thinking &&
+            apiConfig.provider === "anthropic"
+          ) {
+            // Anthropic extended thinking (interleaved-thinking-2025-05-14 beta):
+            //   thinking: { type: "enabled", budget_tokens: N }
+            //
+            // Claude Code uses thinking: { type: "adaptive" } but the API also
+            // supports explicit budget_tokens. We use a generous budget so Claude
+            // can reason deeply before acting — especially important for complex
+            // coding tasks. Temperature MUST be 1 when thinking is enabled.
+            //
+            // The interleaved-thinking-2025-05-14 beta flag (already in OAuth
+            // headers via getOAuthHeaders) enables interleaved thinking blocks
+            // between tool calls.
+            body.thinking = { type: "enabled", budget_tokens: 16000 };
+            body.temperature = 1;
+            if (!omitMaxTokens) {
+              const contextLimit = getModelLimit(resolvedModel);
+              const promptTokens = estimateConversationTokens(validatedMessages);
+              const safetyReserve = 4000;
+              const dynamicMax = contextLimit - promptTokens - safetyReserve;
+              // thinking tokens share the max_tokens budget — ensure room for both
+              const cap = (maxTokens ?? DEFAULT_MAX_TOKENS) * 4;
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
+            }
+          }
+
           const { url, headers, finalBody } = await this.prepareRequest(
             apiConfig,
             body,
@@ -3076,11 +3146,14 @@ export class ApiBackend extends PunkBackend {
                       // blocks (turn tier) until it fits in a reasonable budget.
                       if (sourceBody.system && Array.isArray(sourceBody.system)) {
                         const systemBudget = 80000; // generous: 80K tokens max for system
+                        // Track the estimate incrementally — re-stringifying the whole
+                        // (shrinking) array on every pop is O(n^2) and can pin the main
+                        // thread for tens of seconds when there are many/large blocks.
                         let sysEstimate = estimateTokens(JSON.stringify(sourceBody.system));
                         while (sysEstimate > systemBudget && sourceBody.system.length > 1) {
                           // Drop the last (turn) block — it's the lowest priority, changes every turn
-                          sourceBody.system.pop();
-                          sysEstimate = estimateTokens(JSON.stringify(sourceBody.system));
+                          const dropped = sourceBody.system.pop();
+                          sysEstimate -= estimateTokens(JSON.stringify(dropped));
                         }
                         console.log(
                           `[http] Context-heal pruned system prompt to ${sourceBody.system.length} blocks (estimated ${sysEstimate} tokens)`
@@ -5214,13 +5287,14 @@ export class ApiBackend extends PunkBackend {
           }
         }
 
-        // ── Cache optimizations: API-key only ──
-        // OAuth requests use prompt-caching-scope-2026-01-05 which has a
-        // different cache format. The legacy cache_control: { type: "ephemeral" }
-        // requires prompt-caching-2024-07-31 (API-key-only). Using the wrong
-        // cache format causes "400 Invalid request format" on OAuth requests.
-        // opencode-claude-auth never adds cache_control to OAuth bodies.
-        if (!isOAuth) {
+        // ── Cache optimizations ──
+        // Both API-key and OAuth support cache_control: { type: "ephemeral" }.
+        // API-key uses prompt-caching-2024-07-31 beta; OAuth uses
+        // prompt-caching-scope-2026-01-05 + extended-cache-ttl-2025-04-11.
+        // The cache_control format is identical — only the beta flags differ.
+        // The original 400 error was from cache_control being added WITHOUT the
+        // correct OAuth beta flag, not from cache_control itself being rejected.
+        {
           // Top-level auto-caching: automatically caches the last block of
           // the last message, handling conversation prefix caching without
           // manual breakpoints.
@@ -5237,16 +5311,21 @@ export class ApiBackend extends PunkBackend {
 
         if (sysMsg) {
           // ── Cache-aware system prompt for Anthropic ──
-          // OAuth: system tiers get cache_control stripped in the OAuth block below
+          // Both API-key and OAuth use cache_control: { type: "ephemeral" }.
+          // The betas differ (prompt-caching-2024-07-31 vs prompt-caching-scope)
+          // but the cache_control format is identical.
           if (systemTiers && systemTiers.frozen) {
             const tiers = systemTiers;
             const blocks = [];
             // Frozen tier — 1-hour cache (biggest win, survives user breaks)
+            // OAuth supports caching via prompt-caching-scope-2026-01-05 +
+            // extended-cache-ttl-2025-04-11 betas. The cache_control format is
+            // the same for both API-key and OAuth — only the beta flag differs.
             if (tiers.frozen) {
               blocks.push({
                 type: "text",
                 text: tiers.frozen,
-                cache_control: isOAuth ? undefined : { type: "ephemeral", ttl: "1h" },
+                cache_control: { type: "ephemeral", ttl: "1h" },
               });
             }
             // Session tier — 5-min cache (changes on scope change)
@@ -5254,7 +5333,7 @@ export class ApiBackend extends PunkBackend {
               blocks.push({
                 type: "text",
                 text: tiers.session,
-                cache_control: isOAuth ? undefined : { type: "ephemeral" },
+                cache_control: { type: "ephemeral" },
               });
             }
             // Turn tier — never cached, changes every turn
@@ -5262,11 +5341,9 @@ export class ApiBackend extends PunkBackend {
               blocks.push({ type: "text", text: tiers.turn });
             }
             anthropicBody.system = blocks;
-            if (!isOAuth) {
-              console.log(
-                `[http] Anthropic cache: tools=cached frozen=${tiers.frozen.length}c(1h) session=${tiers.session.length}c(5m) turn=${tiers.turn.length}c`,
-              );
-            }
+            console.log(
+              `[http] Anthropic cache: tools=cached frozen=${tiers.frozen.length}c(1h) session=${tiers.session.length}c(5m) turn=${tiers.turn.length}c${isOAuth ? " [oauth]" : ""}`,
+            );
           } else {
             anthropicBody.system = sysMsg.content;
           }
@@ -5276,8 +5353,16 @@ export class ApiBackend extends PunkBackend {
         // The Anthropic API validates OAuth-authenticated requests by checking:
         // 1. Billing header: signed hash of first user message (proves "Claude Code" client)
         // 2. System identity prefix: "You are Claude Code, Anthropic's official CLI for Claude."
-        // 3. Only billing + identity in system[] — other system content moved to user message
-        // 4. Tool names prefixed with mcp_ + PascalCase (lowercase = non-Claude-Code = rejected)
+        // 3. Tool names prefixed with mcp_ + PascalCase (lowercase = non-Claude-Code = rejected)
+        //
+        // IMPORTANT: The API does NOT validate or restrict system[] content beyond
+        // billing + identity. Claude Code itself sends its full system prompt (166+ lines)
+        // in system[]. All system tiers (frozen, session, turn) stay in system[] with
+        // their cache_control intact. The original 400 error (opencode-claude-auth PR #148)
+        // was caused by cache_control: { type: "ephemeral" } sent WITHOUT the correct
+        // OAuth beta flag, NOT by system content validation. Conflating these two issues
+        // caused all system instructions to be demoted to user messages — fundamentally
+        // weakening instruction adherence for 6+ months.
         if (isOAuth) {
           const systemBlocks = Array.isArray(anthropicBody.system)
             ? anthropicBody.system
@@ -5290,51 +5375,30 @@ export class ApiBackend extends PunkBackend {
           const BILLING_PREFIX = "x-anthropic-billing-header";
           const SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-          // Compute billing header from first user message
+          // Compute billing header from the ACTUAL first user message text.
+          // This must happen BEFORE any modification to messages — the hash
+          // is tied to what the user actually typed, not to injected prefixes.
           const billingHeader = buildBillingHeaderValue(anthropicBody.messages || []);
 
-          // Separate core (billing + identity) from everything else
-          const coreBlocks = [];
-          const movedTexts = [];
-          for (const block of systemBlocks) {
-            const txt = typeof block === "string" ? block : (block.text ?? "");
-            const stripped = stripCacheControl(block);
-            if (txt.startsWith(BILLING_PREFIX) || txt.startsWith(SYSTEM_IDENTITY)) {
-              coreBlocks.push(stripped);
-            } else if (txt.length > 0) {
-              movedTexts.push(txt);
-            }
-          }
-
-          // Build final system: [billing, identity]
-          // OAuth API validates system[] content — only billing + identity
-          // are allowed. ALL other content (frozen, session, turn tiers)
-          // must go to the first user message to avoid "400 Invalid request format".
-          // See: opencode-claude-auth PR #148.
+          // Build final system: [billing, identity, ...all other tiers]
+          // All system content stays in system[] — no demotion to user messages.
+          // Strip any pre-existing billing/identity blocks to avoid duplicates.
           const newSystem = [
             { type: "text", text: billingHeader },
             { type: "text", text: SYSTEM_IDENTITY },
-            ...coreBlocks,
           ];
 
-          // Turn tier is already in movedTexts from the loop above
-          // (it was one of the systemBlocks). Nothing extra needed —
-          // it's already being relocated to the first user message.
-
-          anthropicBody.system = newSystem;
-
-          // Move non-core system content to first user message
-          if (movedTexts.length > 0 && Array.isArray(anthropicBody.messages)) {
-            const firstUser = anthropicBody.messages.find((m) => m.role === "user");
-            if (firstUser) {
-              const prefix = movedTexts.join("\n\n");
-              if (typeof firstUser.content === "string") {
-                firstUser.content = prefix + "\n\n" + firstUser.content;
-              } else if (Array.isArray(firstUser.content)) {
-                firstUser.content.unshift({ type: "text", text: prefix });
-              }
+          for (const block of systemBlocks) {
+            const txt = typeof block === "string" ? block : (block.text ?? "");
+            if (txt.startsWith(BILLING_PREFIX) || txt.startsWith(SYSTEM_IDENTITY)) {
+              continue; // Already added above
+            }
+            if (txt.length > 0) {
+              newSystem.push(block);
             }
           }
+
+          anthropicBody.system = newSystem;
 
           // Prefix tool names: mcp_ + PascalCase (Claude Code convention)
           if (Array.isArray(anthropicBody.tools)) {
