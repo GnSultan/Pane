@@ -257,9 +257,8 @@ function PunkSection({
   onRun: (name: string, scope?: string) => void;
   onCheckPrevious: (name: string) => void;
 }) {
-  const setScope = useLensStore((s) => s.setPunkScope);
   const dismissFinding = useLensStore((s) => s.dismissFinding);
-  const [showScope, setShowScope] = useState(false);
+  const [command, setCommand] = useState("");
 
   const statusLabel: React.ReactNode =
     punkState.status === "running" ? "running..."
@@ -279,9 +278,17 @@ function PunkSection({
       })()
     : null;
 
-  const handleRun = () => {
-    const scope = punkState.scope.trim() || undefined;
-    onRun(punk.name, scope);
+  const handleSubmit = () => {
+    const task = command.trim() || undefined;
+    onRun(punk.name, task);
+    if (task) setCommand("");
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit();
+    }
   };
 
   return (
@@ -342,26 +349,6 @@ function PunkSection({
           )}
         </div>
         <div className="flex items-center gap-2">
-          {/* Scope toggle */}
-          <button
-            onClick={() => setShowScope(!showScope)}
-            className="font-mono transition-colors btn-press text-pane-text-secondary/30 hover:text-pane-text-secondary/60"
-            style={{ fontSize: "var(--pane-font-size-xs)" }}
-          >
-            {showScope ? "—" : "+"}
-          </button>
-          {/* Run button */}
-          <button
-            onClick={handleRun}
-            disabled={punkState.status === "running"}
-            className="font-mono transition-colors btn-press disabled:opacity-30"
-            style={{
-              fontSize: "var(--pane-font-size-xs)",
-              color: punkState.status === "running" ? "var(--pane-text-secondary)" : punk.color,
-            }}
-          >
-            {punkState.status === "running" ? "running..." : "run"}
-          </button>
           {/* Check previous */}
           {punkState.findings.length > 0 && punkState.status !== "running" && (
             <button
@@ -375,22 +362,32 @@ function PunkSection({
         </div>
       </div>
 
-      {/* Scope input (expandable) */}
-      {showScope && (
-        <div className="mb-3">
-          <input
-            type="text"
-            value={punkState.scope}
-            onChange={(e) => setScope(punk.name, e.target.value)}
-            placeholder={`e.g., focus on ${punk.role ? punk.role : "your area of interest"}`}
-            className="w-full bg-transparent font-mono text-pane-text border-b border-pane-border/20 outline-none pb-1 transition-colors focus:border-pane-border/60"
-            style={{
-              fontSize: "var(--pane-font-size-xs)",
-              color: punk.color,
-            }}
-          />
-        </div>
-      )}
+      {/* Command input — replaces the old scope field + run button */}
+      <div className="flex items-center gap-2 mb-3">
+        <input
+          type="text"
+          value={command}
+          onChange={(e) => setCommand(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder={punkState.status === "running" ? "running..." : `task for ${punk.displayName.toLowerCase()}... or enter to run`}
+          disabled={punkState.status === "running"}
+          className="flex-1 bg-transparent font-mono text-pane-text border-b border-pane-border/15 outline-none pb-1 transition-colors focus:border-pane-border/40 disabled:opacity-30 placeholder:text-pane-text-secondary/20"
+          style={{
+            fontSize: "var(--pane-font-size-xs)",
+          }}
+        />
+        <button
+          onClick={handleSubmit}
+          disabled={punkState.status === "running"}
+          className="font-mono transition-colors btn-press disabled:opacity-30 shrink-0"
+          style={{
+            fontSize: "var(--pane-font-size-xs)",
+            color: punkState.status === "running" ? "var(--pane-text-secondary)" : punk.color,
+          }}
+        >
+          {punkState.status === "running" ? "..." : "→"}
+        </button>
+      </div>
 
       {/* Error message */}
       {punkState.error && (

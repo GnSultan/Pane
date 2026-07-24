@@ -955,7 +955,11 @@ export function usePunk(projectId: string) {
         s.setIsPlanning(projectId, false);
 
         // Fire-and-forget: persist response summary for thread list UI
-        const conversation = s.projects.get(projectId)?.conversation;
+        // Re-read store state — setLastMessageStreamingDone above created a new
+        // state object, so `s` is stale. The fresh read ensures isStreaming is
+        // false on the last assistant message before we extract the summary.
+        const freshState = useProjectsStore.getState();
+        const conversation = freshState.projects.get(projectId)?.conversation;
         const msgs = conversation?.messages ?? [];
         let summary = "";
         // Walk backwards to find the last assistant message with text content
@@ -1399,7 +1403,7 @@ export function usePunk(projectId: string) {
         // providers with strict serde validation (DeepSeek, etc.). This is defense-
         // in-depth — the backend also sanitizes, but catching it at source prevents
         // the problematic message from entering the retry/error path at all.
-        const truncatedHistory = conversation.messages.slice(-20).map((msg) => ({
+        const truncatedHistory = conversation.messages.slice(-50).map((msg) => ({
           ...msg,
           content: Array.isArray(msg.content)
             ? msg.content.filter((c) => c && typeof c.type === "string")

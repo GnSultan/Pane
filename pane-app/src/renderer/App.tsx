@@ -60,7 +60,9 @@ function App() {
         const index = parseInt(e.key) - 1;
         const state = useProjectsStore.getState();
         const { projects, projectOrder, setActiveProject } = state;
-        const sortedOrder = [...projectOrder].sort((a, b) => {
+        const sortedOrder = [...projectOrder]
+          .filter((id) => !projects.get(id)?.archived)
+          .sort((a, b) => {
           const aTime = projects.get(a)?.lastActivityAt ?? null;
           const bTime = projects.get(b)?.lastActivityAt ?? null;
           if (aTime !== null && bTime !== null) return bTime - aTime;
