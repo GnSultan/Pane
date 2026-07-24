@@ -48,7 +48,6 @@ import {
   registerPunkHandlers,
   registerPunkHandlersSync,
   initPunkBackend,
-  preforkPunkWorker,
   shutdownPunkWorker,
   punkEngine,
 } from "./punk-engine.mjs";
@@ -61,7 +60,7 @@ import { DocPunk } from "./doc-punk.mjs";
 import { getModelRates } from "./pricing.mjs";
 import { updateLastPrompt, updateLastResponse, readThreadState } from "./thread-state.mjs";
 import { contextStore } from "./context-store.mjs";
-import { getPaneDb, extractMessageText, initPaneDb, runMigrationIfNeeded, pruneConversationMessages, completeCorrectionFold } from "./pane-db.mjs";
+import { getPaneDb, extractMessageText, initPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 import { loadRecentTurns } from "./session-turns.mjs";
 import { setCmdWorker, execThroughWorker, onCmdWorkerExit } from "./tool-executor.mjs";
 import { mergeState } from "./pane-system-prompt.mjs";
@@ -185,20 +184,6 @@ function registerClaudeHandlers() {
       rates[m] = getModelRates(m);
     }
     return rates;
-  });
-
-  ipcMain.handle("check_claude_version", async () => {
-    try {
-      const { stdout } = await execFileAsync("claude", ["--version"], {
-        env: getEnvWithPath(),
-      });
-      const versionMatch = stdout.trim().match(/^([\d.]+)/);
-      if (!versionMatch)
-        return { current: null, error: "Could not parse version" };
-      return { current: versionMatch[1], error: null };
-    } catch (error) {
-      return { current: null, error: error.message };
-    }
   });
 }
 function execFileAsync(cmd, args, options = {}) {
@@ -1151,6 +1136,11 @@ function sendToRenderer(channel, data) {
 }
 function registerWatcherHandlers() {
   ipcMain.handle("watch_directory", async (_event, args) => {
+    // An empty/missing path would resolve to process.cwd() inside chokidar —
+    // "/" in a Finder-launched packaged app — and recursively watch the
+    // entire filesystem, freezing the app. Refuse to watch anything that
+    // isn't an absolute path.
+    if (!args?.path || !path.isAbsolute(args.path)) return;
     if (watchers.has(args.path)) return;
     let pendingPaths = /* @__PURE__ */ new Set();
     let debounceTimer = null;
@@ -1203,8 +1193,8 @@ function registerWatcherHandlers() {
 }
 /**
  * Watch ~/.pane/projects and ~/.pane/session for changes written by the MCP
- * server's pane_roadmap tool. When an external CLI agent (Gemini, Claude CLI)
- * calls pane_roadmap, it writes files directly — no Electron IPC is involved.
+ * server's pane_roadmap tool. When an external agent calls pane_roadmap, it
+ * writes files directly — no Electron IPC is involved.
  * This watcher bridges the gap so the UI roadmap panel and phase indicator
  * stay in sync regardless of which backend is driving the agent.
  */
@@ -2357,31 +2347,10 @@ function registerIpcHandlers() {
 // DB migrations, backend detection (dynamic import of Claude SDK), and
 // worker prefork run here, after the window is already visible.
 async function initStartupServices() {
-  // DB migrations (reads JSON files from disk — can be slow on cold FS)
-  try {
-    const db = getPaneDb();
-    await runMigrationIfNeeded(db);
-    console.log("[main] Database migrations complete");
-  } catch (err) {
-    console.error("[main] Migration error (non-fatal):", err.message);
-  }
-
-  // Deferred heavy data fold for correction_events. The schema swap already
-  // happened synchronously at init; this migrates the legacy rows. Kept OFF the
-  // launch path so a new device restoring a large legacy backup doesn't freeze
-  // before the window appears. One-time, self-guarded (no-op once folded).
-  try {
-    completeCorrectionFold(getPaneDb());
-  } catch (err) {
-    console.error("[main] correction fold error (non-fatal):", err.message);
-  }
-
-  // Backend detection — this is the slow one (~10-30s on cold disk due to
-  // `await import("@anthropic-ai/claude-agent-sdk")`). Fire-and-forget so
+  // Initialize the API backend. Fire-and-forget so
   // handlers that call spawn() will lazy-init if they fire before this completes.
   initPunkBackend().then(() => {
     console.log("[main] Punk backends initialized");
-    preforkPunkWorker();  // safe to call now — initialize() is a no-op since backends are ready
   }).catch(err => {
     console.warn("[main] Punk backend init failed:", err.message);
   });
@@ -2555,9 +2524,9 @@ app.whenReady().then(async () => {
   });
 
   // Watch ~/.pane/projects/*/roadmap.json and ~/.pane/session/*/state.json so
-  // the UI reacts when an external CLI agent (Gemini, Claude) writes via the
-  // MCP server's pane_roadmap tool. Without this the roadmap panel and phase
-  // indicator only update when the Electron-side ToolExecutor fires events.
+  // the UI reacts when an external agent writes via the MCP server's
+  // pane_roadmap tool. Without this the roadmap panel and phase indicator
+  // only update when the Electron-side ToolExecutor fires events.
   startMcpFileWatcher();
 
   // ── Doc Punk Scheduler: nightly documentation draft at 10pm ────────────

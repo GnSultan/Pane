@@ -192,7 +192,7 @@ function fuzzyScore(text: string, query: string): number {
 const PROVIDER_NAMES: Record<string, string> = {
   anthropic: "Claude",
   "anthropic-api": "Anthropic API",
-  gemini: "Gemini CLI",
+  gemini: "Gemini",
   "gemini-api": "Gemini API",
   deepseek: "DeepSeek",
   openrouter: "OpenRouter",
@@ -1067,6 +1067,20 @@ export function InputBar({
             className="w-full"
             style={{
               padding: "1rem 1.25rem 0.75rem 1.25rem",
+            }}
+            onDropFiles={(paths) => {
+              const ta = textareaRef.current;
+              if (!ta) return;
+              const insertion = paths.map(p => `\`${p}\``).join(" ");
+              const pos = ta.selectionStart ?? ta.value.length;
+              const newValue = ta.value.slice(0, pos) + (pos > 0 && !ta.value.slice(pos - 1, pos).endsWith(" ") ? " " : "") + insertion + " " + ta.value.slice(pos);
+              setValue(newValue);
+              // Restore cursor after the inserted paths
+              const newCursorPos = pos + (pos > 0 && !ta.value.slice(pos - 1, pos).endsWith(" ") ? 1 : 0) + insertion.length + 1;
+              requestAnimationFrame(() => {
+                ta.focus();
+                ta.setSelectionRange(newCursorPos, newCursorPos);
+              });
             }}
           />
         )}

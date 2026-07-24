@@ -25,9 +25,7 @@
 import {
   runReflection,
   runGlobalReflection,
-  runPlaybookMigration,
   runStorageHygiene,
-  runCorpusCleanup,
 } from "./playbook-engine.mjs";
 
 // ============================================================================
@@ -166,17 +164,8 @@ export function touchMemory(db, nodeId) {
 export async function runMemoryLifecycle(db, projectId, quickCall = null) {
   const start = Date.now();
 
-  // 0. One-time migration: purge the dead weight from the old pipeline
-  //    (guarded internally — no-op after first run)
-  const migration = runPlaybookMigration(db);
-
-  // 0b. One-time storage hygiene: trim node version history + purge dead-type
-  //     nodes + VACUUM (guarded internally — no-op after first run)
+  // 0. Ongoing storage maintenance: trim node version history
   const hygiene = runStorageHygiene(db);
-
-  // 0c. One-time corpus cleanup: purge auto-generated error_fix noise so it
-  //     never reaches the reflection corpus (guarded internally)
-  const corpusCleanup = runCorpusCleanup(db);
 
   // 1. Decay unused memories
   const decayResult = applyDecay(db, projectId);
@@ -191,9 +180,7 @@ export async function runMemoryLifecycle(db, projectId, quickCall = null) {
   const duration = Date.now() - start;
 
   const result = {
-    migration,
     hygiene,
-    corpusCleanup,
     decay: decayResult,
     reflection,
     global,
@@ -202,15 +189,13 @@ export async function runMemoryLifecycle(db, projectId, quickCall = null) {
 
   const hasActivity = decayResult.decayed > 0 || decayResult.pruned > 0
     || reflection.added > 0 || reflection.retired > 0
-    || migration.deleted > 0 || hygiene.nodesDeleted > 0 || hygiene.versionsDeleted > 0
-    || corpusCleanup.purged > 0;
+    || hygiene.versionsDeleted > 0;
 
   if (hasActivity) {
     console.log(
       `[memory] Lifecycle for ${projectId}: ` +
       `decayed=${decayResult.decayed} pruned=${decayResult.pruned} ` +
       `reflection=${JSON.stringify(reflection)} ` +
-      (migration.deleted ? `migration_deleted=${migration.deleted} ` : "") +
       `(${duration}ms)`
     );
   }

@@ -40,7 +40,7 @@ interface WorkspaceState {
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
   selectedModelProvider: string; // The provider for the current model
   selectedModelThinking: boolean;
-  punkBackend: string; // "api" | "claude-code" | "gemini" - kept for backward compatibility
+  punkBackend: string; // Always "api" — kept for backward compatibility
   httpProvider: string; // "deepseek" | "kimi" | "anthropic" | etc.
   httpApiKeys: Record<string, string>;
   httpBaseUrls: Record<string, string>;
@@ -63,11 +63,10 @@ interface WorkspaceState {
 
   // Backend availability for transparent routing
   backendAvailability: {
-    claudeCode: boolean;
-    geminiCli: boolean;
+    paneClaude: boolean;
     api: boolean; // Always true
   };
-  setBackendAvailability: (availability: { claudeCode: boolean; geminiCli: boolean }) => void;
+  setBackendAvailability: (availability: { paneClaude?: boolean }) => void;
   // SDK metadata — populated after first backend session init
   sdkModels: import("../lib/punk-types").SdkModel[] | null;
   sdkAccount: import("../lib/punk-types").SdkAccount | null;
@@ -264,8 +263,7 @@ function createWorkspaceStore() {
     },
     // Backend availability for transparent routing
     backendAvailability: {
-      claudeCode: false,
-      geminiCli: false,
+      paneClaude: false,
       api: true, // Always available
     },
     setBackendAvailability: (availability) => 

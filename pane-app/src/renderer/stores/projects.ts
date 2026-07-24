@@ -347,10 +347,9 @@ function createProjectsStore() {
       if (!stableId) {
         project.id = ensureUniqueId(project.id, state.projects);
       }
-      // Threads without a root are marked as rootMissing until bound.
-      if (!root) {
-        project.rootMissing = true;
-      }
+      // A thread without a root is simply unbound, not an error — rootMissing
+      // is reserved for a root that existed and then disappeared (see
+      // markRootMissing / _checkMissingRoots in useSettingsPersistence).
       // Seed thread activity timestamp so newly added projects sort to top
       project.lastActivityAt = Date.now();
       const next = new Map(state.projects);
@@ -1095,7 +1094,6 @@ function createProjectsStore() {
             isRestored: true,
             error: null,
             todos: [],
-            isProcessActive: false,
             lastActivity: Date.now(),
             contextTokens: 0,
             contextPressure: "none",

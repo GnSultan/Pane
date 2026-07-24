@@ -159,7 +159,7 @@ export interface StreamEvent {
     type: string;
     index?: number;
     delta?: {
-      type: "text_delta" | "thinking_delta" | "partial_json_delta";
+      type: "text_delta" | "thinking_delta" | "partial_json_delta" | "signature_delta";
       text?: string;
       thinking?: string;
       signature?: string;
@@ -460,7 +460,6 @@ export interface ConversationState {
   error: string | null;
   todos: Todo[];
   // Session lifecycle
-  isProcessActive: boolean; // Is the Claude CLI child process currently running?
   lastActivity: number; // Timestamp of last user interaction with this project
   // Context pressure tracking
   contextTokens: number; // Latest input_tokens from usage
@@ -520,7 +519,6 @@ export function createEmptyConversation(): ConversationState {
     isRestored: false,
     error: null,
     todos: [],
-    isProcessActive: false,
     lastActivity: Date.now(),
     contextTokens: 0,
     contextPressure: "none",

@@ -49,10 +49,15 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
     (s) => s.projects.get(id)?.hasUnreadCompletion ?? false,
   );
   const isActive = useProjectsStore((s) => s.activeProjectId === id);
+  const root = useProjectsStore((s) => s.projects.get(id)?.root ?? "");
+  const activeProjectRoot = useProjectsStore((s) => {
+    if (!s.activeProjectId || s.activeProjectId === id) return "";
+    return s.projects.get(s.activeProjectId)?.root ?? "";
+  });
+  const isPeerThread = !isActive && root && activeProjectRoot === root;
   const rootMissing = useProjectsStore(
     (s) => s.projects.get(id)?.rootMissing ?? false,
   );
-  const root = useProjectsStore((s) => s.projects.get(id)?.root ?? "");
   const lastUserPromptText = useProjectsStore(
     (s) => s.projects.get(id)?.lastUserPromptText ?? null,
   );
@@ -71,6 +76,7 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState("");
   const [isRebinding, setIsRebinding] = useState(false);
+  const [bindExpanded, setBindExpanded] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const hasActivity = lastActivityAt !== null;
@@ -111,9 +117,25 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
     }
   };
 
-  // Unbound or missing root: show a compact rebind row
-  const isUnbound = !root || rootMissing;
-  if (isUnbound) {
+  const handleCreateFolder = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setIsRebinding(true);
+    try {
+      const created = await electronAPI.invoke("create-directory", "~/" + name);
+      const newRoot = await detectProjectRoot(created as string);
+      const result = await rebindProject(id, root, newRoot);
+      if (result.success) {
+        storeRebindProject(id, newRoot);
+        markRootMissing(id, false);
+      }
+    } finally {
+      setIsRebinding(false);
+    }
+  };
+
+  // Missing root (folder was moved/deleted): this is a real error state,
+  // keep it visually distinct so the user notices and reconnects it.
+  if (rootMissing) {
     return (
       <div
         className={`w-full flex items-center gap-1.5 h-8 px-2 rounded-md ${
@@ -121,7 +143,7 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
         }`}
         style={{ fontSize: "var(--pane-panel-font-size)" }}
       >
-        <span className={`truncate flex-1 text-left ${rootMissing ? "text-pane-text-secondary/50 line-through" : "text-pane-text-secondary/70"}`}>
+        <span className="truncate flex-1 text-left text-pane-text-secondary/50 line-through">
           {name}
         </span>
         <button
@@ -129,13 +151,41 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
           disabled={isRebinding}
           className="shrink-0 font-mono text-pane-status-modified hover:text-pane-text transition-colors disabled:opacity-40"
           style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
-          title={rootMissing ? `Folder not found at ${root} — click to rebind` : "Bind a folder to this thread"}
+          title={`Folder not found at ${root} — click to rebind`}
         >
           {isRebinding ? "..." : "bind"}
         </button>
       </div>
     );
   }
+
+  // A thread with no folder bound yet is a natural, unremarkable state —
+  // it reads and behaves like any other thread. Binding/creating a folder
+  // is offered as low-key text actions instead of an alarming CTA.
+  const isUnbound = !root;
+
+  const bindCreateActions = (
+    <div
+      className="flex items-center gap-1.5 leading-tight"
+      style={{ fontSize: "var(--pane-panel-font-size)" }}
+    >
+      <button
+        onClick={handleRebind}
+        disabled={isRebinding}
+        className="text-pane-text-secondary/40 hover:text-pane-text-secondary/70 transition-colors disabled:opacity-40"
+      >
+        {isRebinding ? "…" : "bind"}
+      </button>
+      <span className="text-pane-text-secondary/20">·</span>
+      <button
+        onClick={handleCreateFolder}
+        disabled={isRebinding}
+        className="text-pane-text-secondary/40 hover:text-pane-text-secondary/70 transition-colors disabled:opacity-40"
+      >
+        {isRebinding ? "…" : "new"}
+      </button>
+    </div>
+  );
 
   return (
     <div
@@ -173,12 +223,20 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
             style={{ fontSize: "var(--pane-panel-font-size)" }}
           />
         ) : (
-          <span
-            className="truncate text-pane-text font-medium"
-            style={{ fontSize: "var(--pane-panel-font-size)" }}
-          >
-            {name}
-          </span>
+          <>
+            <span
+              className="truncate text-pane-text font-medium"
+              style={{ fontSize: "var(--pane-panel-font-size)" }}
+            >
+              {name}
+            </span>
+            {isPeerThread && (
+              <span
+                className="shrink-0 inline-block w-1.5 h-1.5 rounded-full bg-pane-status-renamed/60 ml-1"
+                title="Peer thread — shares project root. Active intents may conflict."
+              />
+            )}
+          </>
         )}
 
         <div className="flex items-center gap-1.5 shrink-0 ml-2">
@@ -218,26 +276,30 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
                   <path d="M8.5 8.5h-7v-6h7v6zM3 3V1.5h4V3M1.5 3h7" />
                 </svg>
               </span>
-              {/* Change folder icon */}
-              <span
-                onClick={handleRebind}
-                className="shrink-0 text-pane-text-secondary/30 opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-3.5 h-3.5 btn-press"
-                title="Change folder"
-              >
-                <svg
-                  width="9"
-                  height="9"
-                  viewBox="0 0 10 10"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.25"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+              {/* Change folder icon — bind/create for unbound threads lives in
+                  the excerpt row below instead, so this is only for rebinding
+                  an already-bound thread to a different folder. */}
+              {!isUnbound && (
+                <span
+                  onClick={handleRebind}
+                  className="shrink-0 text-pane-text-secondary/30 opacity-0 group-hover:opacity-100 hover:text-pane-text cursor-pointer flex items-center justify-center w-3.5 h-3.5 btn-press"
+                  title="Change folder"
                 >
-                  <path d="M1.5 8V2.5L4.5 1l4 1.5V8L5 6.5 1.5 8z" />
-                  <path d="M1.5 8V5l3-1.5L8 5v3" />
-                </svg>
-              </span>
+                  <svg
+                    width="9"
+                    height="9"
+                    viewBox="0 0 10 10"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.25"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M1.5 8V2.5L4.5 1l4 1.5V8L5 6.5 1.5 8z" />
+                    <path d="M1.5 8V5l3-1.5L8 5v3" />
+                  </svg>
+                </span>
+              )}
               {/* Edit icon */}
               <span
                 onPointerDown={startEdit}
@@ -261,8 +323,43 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
         </div>
       </div>
 
-      {/* Excerpt row — only when the thread has activity */}
-      {hasActivity && (
+      {/* Excerpt row. Gated on actual excerpt text, not hasActivity —
+          lastActivityAt is seeded at creation (so new threads sort to top),
+          so it's true immediately and would otherwise mask the empty state.
+          - Unbound, no excerpt yet: show bind/create text actions directly.
+          - Unbound, has excerpt: show the excerpt with a hover "bind" toggle
+            on the right that expands inline to the same text actions —
+            same disclosure pattern as the tool-activity expand/collapse.
+          - Bound: excerpt only, as before. */}
+      {isUnbound && !truncatedExcerpt && (
+        <div className="mt-0.5">{bindCreateActions}</div>
+      )}
+
+      {isUnbound && truncatedExcerpt && (
+        <div className="flex flex-col gap-1 mt-0.5">
+          <div className="flex items-center gap-1.5">
+            <span
+              className="truncate flex-1 text-pane-text-secondary/50 leading-tight"
+              style={{ fontSize: "var(--pane-panel-font-size)" }}
+            >
+              {truncatedExcerpt}
+            </span>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setBindExpanded(!bindExpanded);
+              }}
+              className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-pane-text-secondary/30 hover:text-pane-text-secondary/70 font-mono"
+              style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
+            >
+              {bindExpanded ? "collapse" : "expand"}
+            </button>
+          </div>
+          {bindExpanded && bindCreateActions}
+        </div>
+      )}
+
+      {!isUnbound && truncatedExcerpt && (
         <span
           className="truncate text-pane-text-secondary/50 leading-tight mt-0.5"
           style={{ fontSize: "var(--pane-panel-font-size)" }}

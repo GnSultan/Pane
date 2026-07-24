@@ -14,18 +14,18 @@ import {
 import {
   brainGetProfile,
   brainUpdateDNA,
-  reinitializePunkBackend,
-  getBackendAvailability,
-  getClaudeAuthState,
   cloudLogin,
   cloudLogout,
   cloudGetUser,
   cloudGetStatus,
   cloudTriggerBackup,
   cloudRestore,
-  type ClaudeAuthState,
+  paneClaudeLogin,
+  paneClaudeLogout,
+  paneClaudeAuthState,
   type CloudUser,
   type CloudStatus,
+  type ClaudeAuthState,
 } from "../../lib/tauri-commands";
 import {
   ACTION_DEFINITIONS,
@@ -390,7 +390,7 @@ function EngineSelect({
     const labels: Record<string, string> = {
       anthropic: "Claude",
       "anthropic-api": "Anthropic API",
-      gemini: "Gemini CLI",
+      gemini: "Gemini",
       "gemini-api": "Gemini API",
       deepseek: "DeepSeek",
       openrouter: "OpenRouter",
@@ -404,8 +404,6 @@ function EngineSelect({
 
   const groupedOptions = useMemo(() => {
     const groups: Record<string, EngineOption[]> = {};
-    const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini";
-    const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-code";
     const hasCurated = curatedModels.length > 0;
 
     const isDisabled = (p: string) => disabledProviders.includes(p);
@@ -446,9 +444,9 @@ function EngineSelect({
 
       // Base provider for key lookup: "anthropic-api" → "anthropic"
       const baseProvider = provider.replace(/-api$/, "");
+      // CLI backends removed — Anthropic and Gemini are always available via API backend
       const isUsable =
-        provider === "anthropic" ? isClaudeBackend :
-        provider === "gemini" ? isGeminiBackend :
+        baseProvider === "anthropic" || baseProvider === "gemini" ||
         !!httpApiKeys?.[baseProvider];
       if (!isUsable) continue;
 
@@ -614,42 +612,20 @@ function PaneAutoSection({
   const curatedModels = useWorkspaceStore((s) => s.curatedModels);
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
 
-  const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
-  const [geminiAvailable, setGeminiAvailable] = useState(false);
-
-  useEffect(() => {
-    getBackendAvailability()
-      .then((availability) => {
-        setClaudeCodeAvailable(availability.claude);
-        setGeminiAvailable(availability.gemini);
-      })
-      .catch(() => {
-        setClaudeCodeAvailable(false);
-        setGeminiAvailable(false);
-      });
-  }, []);
+  // All providers use API keys (CLI backends have been removed).
+  // A provider is usable if it has an API key set OR if it's anthropic/gemini
+  // (which the API backend handles with its own key management).
+  const isProviderUsable = (provider: string) => {
+    const base = provider.replace(/-api$/, "");
+    return base === "anthropic" || base === "gemini" || !!httpApiKeys?.[base];
+  };
 
   // Build a flat list of all usable engines from dynamic data for auto-heal
   const usableEngines = useMemo(() => {
     const engines: EngineOption[] = [];
-    if (sdkModels && sdkModels.length > 0 && claudeCodeAvailable && !disabledProviders.includes("anthropic")) {
-      sdkModels.forEach((m) => engines.push({
-        label: m.displayName || m.value,
-        provider: "anthropic",
-        model: m.value,
-        thinking: false,
-        requiresKey: "anthropic",
-      }));
-    }
     for (const [provider, models] of Object.entries(allModels)) {
       if (!models || models.length === 0) continue;
-      if (provider === "anthropic" && engines.some((e) => e.provider === "anthropic")) continue;
-      const baseProvider = provider.replace(/-api$/, "");
-      const isUsable =
-        provider === "anthropic" ? claudeCodeAvailable :
-        provider === "gemini" ? geminiAvailable :
-        !!httpApiKeys?.[baseProvider];
-      if (!isUsable) continue;
+      if (!isProviderUsable(provider)) continue;
       if (disabledProviders.includes(provider)) continue;
       models.forEach((m) => engines.push({
         label: m.name || m.id,
@@ -661,7 +637,7 @@ function PaneAutoSection({
       }));
     }
     return engines;
-  }, [allModels, sdkModels, claudeCodeAvailable, geminiAvailable, httpApiKeys, disabledProviders]);
+  }, [allModels, httpApiKeys, disabledProviders]);
 
   const autoRoute = useWorkspaceStore((s) => s.autoEscalate);
   const setPowerCombo = useWorkspaceStore((s) => s.setPowerCombo);
@@ -686,12 +662,6 @@ function PaneAutoSection({
 
   // Auto-heal: when availability changes, reset any combo slot pointing to an unusable provider.
   useEffect(() => {
-    const isProviderUsable = (provider: string) => {
-      if (provider === "anthropic") return claudeCodeAvailable;
-      if (provider === "gemini") return geminiAvailable;
-      return !!httpApiKeys?.[provider];
-    };
-
     const firstUsable = usableEngines[0];
     if (!firstUsable) return;
 
@@ -710,7 +680,7 @@ function PaneAutoSection({
       setPowerCombo(healed);
       syncComboToProject(healed);
     }
-  }, [httpApiKeys, claudeCodeAvailable, geminiAvailable, syncComboToProject]);
+  }, [httpApiKeys, usableEngines, syncComboToProject]);
 
   const handleThinkingChange = (opt: EngineOption) => {
     const isReasoningProvider =
@@ -723,7 +693,6 @@ function PaneAutoSection({
     };
     setPowerCombo(newCombo);
     syncComboToProject(newCombo);
-    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleBuildingChange = (opt: EngineOption) => {
@@ -733,14 +702,12 @@ function PaneAutoSection({
     };
     setPowerCombo(newCombo);
     syncComboToProject(newCombo);
-    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleAutoRouteToggle = () => {
     const next = !autoRoute;
     setAutoEscalate(next);
     syncAutoRouteToProject(next);
-    reinitializePunkBackend("api").catch(() => {});
   };
 
   const resolveEngine = (
@@ -786,13 +753,8 @@ function PaneAutoSection({
   const thinkingEngine = resolveEngine(combo?.thinking);
   const buildingEngine = resolveEngine(combo?.execution);
 
-  // Check if each slot's provider is usable
-  const isProviderUsable = (provider: string) => {
-    if (provider === "anthropic") return claudeCodeAvailable;
-    if (provider === "gemini") return geminiAvailable;
-    return !!httpApiKeys[provider];
-  };
-
+  // All providers use API keys — CLI backends have been removed.
+  // Anthropic and Gemini are always available via the API backend.
   const missingThinkingKey = !isProviderUsable(thinkingEngine.provider);
   const missingBuildingKey = !isProviderUsable(buildingEngine.provider);
 
@@ -890,7 +852,7 @@ function PaneAutoSection({
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ {thinkingEngine.provider === "anthropic" ? "Claude not connected" : thinkingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${thinkingEngine.requiresKey}`} — {thinkingEngine.provider === "anthropic" ? "sign in below" : thinkingEngine.provider === "gemini" ? "install CLI" : "add key below"}
+                  ⚠ missing API key for {thinkingEngine.requiresKey} — add key below
                 </span>
               )}
             </div>
@@ -900,7 +862,7 @@ function PaneAutoSection({
                 <div className="flex flex-col gap-0.5">
                   <span
                     className="text-pane-text font-mono"
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
                   >
                     when building
                   </span>
@@ -926,7 +888,7 @@ function PaneAutoSection({
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ {buildingEngine.provider === "anthropic" ? "Claude not connected" : buildingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${buildingEngine.requiresKey}`} — {buildingEngine.provider === "anthropic" ? "sign in below" : buildingEngine.provider === "gemini" ? "install CLI" : "add key below"}
+                  ⚠ missing API key for {buildingEngine.requiresKey} — add key below
                 </span>
               )}
             </div>
@@ -958,6 +920,102 @@ interface ApiKeyProvider {
   defaultBaseUrl?: string;
 }
 
+function ClaudeSignInCard() {
+  const [auth, setAuth] = useState<ClaudeAuthState>({ authenticated: false, account: null });
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    paneClaudeAuthState().then(setAuth).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const cleanup = window.electronAPI.on("pane-claude-signin", (raw: unknown) => {
+      const data = raw as { type?: string; output?: string[] } | undefined;
+      if (data?.type === "status" && data.output?.length) {
+        setStatus(data.output[data.output.length - 1] ?? null);
+      }
+    });
+    return () => cleanup?.();
+  }, []);
+
+  const handleSignIn = async () => {
+    setLoading(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const result = await paneClaudeLogin();
+      if (result.success) {
+        setAuth({ authenticated: true, account: result.account ?? null });
+        setStatus(null);
+      } else {
+        setError(result.error || "sign in failed");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "sign in failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await paneClaudeLogout().catch(() => {});
+    setAuth({ authenticated: false, account: null });
+    setStatus(null);
+    setError(null);
+  };
+
+  return (
+    <div className="flex flex-col gap-2 pb-3 border-b border-pane-border/20 mb-3">
+      <span
+        className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        claude.ai subscription
+      </span>
+
+      {auth.authenticated ? (
+        <div className="flex items-center justify-between px-1">
+          <div className="flex flex-col gap-0.5 min-w-0">
+            <span className="text-pane-text font-mono text-xs truncate">
+              {auth.account?.email ?? "signed in"}
+            </span>
+            {auth.account?.billingType && (
+              <span className="text-pane-text-secondary/40 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                {auth.account.billingType}
+              </span>
+            )}
+          </div>
+          <button
+            onClick={handleSignOut}
+            className="text-pane-text-secondary/50 hover:text-pane-text font-mono transition-colors shrink-0 ml-3"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            sign out
+          </button>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5 px-1">
+          <button
+            onClick={handleSignIn}
+            disabled={loading}
+            className="text-left text-pane-text font-mono hover:text-pane-accent transition-colors disabled:opacity-40"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {loading ? (status ?? "signing in…") : "sign in with claude.ai"}
+          </button>
+          {error && (
+            <span className="text-red-400/70 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              {error}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   { key: "gemini", label: "Google Gemini", placeholder: "AI...", docsUrl: "https://aistudio.google.com/app/apikey", showBaseUrl: true, defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta" },
   { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys", showBaseUrl: true, defaultBaseUrl: "https://api.deepseek.com/v1/chat/completions" },
@@ -975,19 +1033,12 @@ function ApiKeysSection({
   onKeyChange,
   httpBaseUrls = {},
   onBaseUrlChange,
-  claudeCodeAvailable = false,
-  geminiAvailable: _geminiAvailable = false,
 }: {
   httpApiKeys: Record<string, string>;
   onKeyChange: (provider: string, key: string) => void;
   httpBaseUrls?: Record<string, string>;
   onBaseUrlChange?: (provider: string, url: string) => void;
-  claudeCodeAvailable?: boolean;
-  geminiAvailable?: boolean;
 }) {
-  void _geminiAvailable;
-  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
-  void (claudeCodeAvailable && sdkAccount != null);
   const [visible, setVisible] = useState<Record<string, boolean>>({});
   const [expandedActive, setExpandedActive] = useState<string | null>(null);
   const [expandedAvailable, setExpandedAvailable] = useState<string | null>(null);
@@ -1001,13 +1052,26 @@ function ApiKeysSection({
   const ProviderToggle = ({ toggleKey, label }: { toggleKey: string; label: string }) => {
     const off = disabledProviders.includes(toggleKey);
     return (
-      <button
-        onClick={() => toggleProvider(toggleKey)}
-        className={`w-6 h-3.5 rounded-full relative transition-colors shrink-0 ${off ? "bg-pane-text-secondary/20" : "bg-pane-status-added/60"}`}
+      <div
+        role="switch"
+        aria-checked={!off}
+        tabIndex={0}
+        onClick={(e) => {
+          e.stopPropagation();
+          toggleProvider(toggleKey);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleProvider(toggleKey);
+          }
+        }}
+        className={`w-6 h-3.5 rounded-full relative transition-colors shrink-0 cursor-pointer ${off ? "bg-pane-text-secondary/20" : "bg-pane-status-added/60"}`}
         title={off ? `enable ${label}` : `disable ${label}`}
       >
         <div className={`absolute top-0.5 w-2.5 h-2.5 rounded-full bg-white transition-all ${off ? "left-0.5" : "left-[11px]"}`} />
-      </button>
+      </div>
     );
   };
 
@@ -1866,45 +1930,7 @@ export function Profile() {
   // Accordion state - only one section expanded at a time
   const [expandedSection, setExpandedSection] = useState<string | null>("identity");
 
-  // Detect which CLI backends are available in PATH
-  const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
-  const [geminiAvailable, setGeminiAvailable] = useState(false);
-  const [, setClaudeAuthState] = useState<ClaudeAuthState | null>(null);
-  const [, setClaudeSigninStatus] = useState<string[]>([]);
-
-  useEffect(() => {
-    // Check backend availability (is the CLI installed?)
-    getBackendAvailability()
-      .then((availability) => {
-        setClaudeCodeAvailable(availability.claude);
-        setGeminiAvailable(availability.gemini);
-        useWorkspaceStore.getState().setBackendAvailability({
-          claudeCode: availability.claude,
-          geminiCli: availability.gemini,
-        });
-      })
-      .catch(() => {
-        setClaudeCodeAvailable(false);
-        setGeminiAvailable(false);
-      });
-
-    // Read Claude auth state directly from ~/.claude.json — no session needed.
-    // This gives us the real signed-in/out state immediately, regardless of
-    // whether the SDK prefetch has fired yet.
-    getClaudeAuthState()
-      .then(setClaudeAuthState)
-      .catch(() => setClaudeAuthState({ authenticated: false, account: null }));
-  }, []);
-
-  useEffect(() => {
-    const cleanup = window.electronAPI.on("pane-claude-signin", (raw: unknown) => {
-      const data = raw as { type?: string; output?: string[] | null } | undefined;
-      if (data?.type === "status" && data.output?.length) {
-        setClaudeSigninStatus(data.output);
-      }
-    });
-    return () => cleanup?.();
-  }, []);
+  // All backends use the HTTP API (CLI backends have been removed)
 
   useEffect(() => {
     brainGetProfile()
@@ -2063,6 +2089,8 @@ export function Profile() {
           <PaneAutoSection httpApiKeys={httpApiKeys} />
         </AccordionSection>
 
+
+
         {/* API Keys Section */}
         {punkBackend === "api" && (
           <AccordionSection
@@ -2071,13 +2099,12 @@ export function Profile() {
             isExpanded={expandedSection === "apiKeys"}
             onToggle={() => setExpandedSection(expandedSection === "apiKeys" ? null : "apiKeys")}
           >
+            <ClaudeSignInCard />
             <ApiKeysSection
               httpApiKeys={httpApiKeys}
               onKeyChange={handleApiKeyChange}
               httpBaseUrls={httpBaseUrls}
               onBaseUrlChange={handleBaseUrlChange}
-              claudeCodeAvailable={claudeCodeAvailable}
-              geminiAvailable={geminiAvailable}
             />
           </AccordionSection>
         )}

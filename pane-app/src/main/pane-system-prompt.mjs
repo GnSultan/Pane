@@ -79,6 +79,9 @@ function defaultState() {
 
     // Orchestration phase — tracks where in the pipeline this session is
     phase: "idle",  // "idle" | "discovery" | "planning" | "execution"
+
+    // Active skills — names of skills activated during this session
+    activeSkills: [],
   };
 }
 
@@ -559,7 +562,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
     frozen,    // Tier 1: never changes within session (cacheable prefix)
     session,   // Tier 2: changes when files/scope change (extends cache when stable)
     turn,      // Tier 3: changes every turn (never cached)
-    // Backward compat — used by CLI backends and existing callers
+    // Backward compat — used by existing callers
     stable,
     dynamic,
     full,

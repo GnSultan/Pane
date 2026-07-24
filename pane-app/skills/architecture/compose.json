@@ -1,0 +1,10 @@
+{
+  "name": "architecture",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["architecture", "adr", "deployment", "scalability"],
+  "tags": ["architecture", "adr", "deployment", "scalability", "patterns"],
+  "priority": 5
+}

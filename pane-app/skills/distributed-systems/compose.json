@@ -1,0 +1,10 @@
+{
+  "name": "distributed-systems",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["distributed-systems", "messaging", "event-sourcing", "consensus"],
+  "tags": ["distributed-systems", "consistency", "consensus", "messaging", "event-sourcing", "failure"],
+  "priority": 5
+}

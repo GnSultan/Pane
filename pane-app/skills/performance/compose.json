@@ -1,0 +1,10 @@
+{
+  "name": "performance",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["performance", "profiling", "optimization", "caching"],
+  "tags": ["performance", "optimization", "profiling", "caching", "bundle-size"],
+  "priority": 5
+}

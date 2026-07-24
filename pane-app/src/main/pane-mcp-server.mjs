@@ -17,8 +17,8 @@ import { createRequire } from "node:module";
 
 // better-sqlite3 is a native addon — it may not be resolvable when the MCP
 // server runs under a different Node.js binary than the one Pane was built
-// with (e.g. the system node used by Gemini CLI). Load it optionally so the
-// server can still start and serve all non-DB tools.
+// with. Load it optionally so the server can still start and serve all non-DB
+// tools.
 let Database = null;
 try {
   const _require = createRequire(import.meta.url);
@@ -577,6 +577,16 @@ const TOOLS = [
     name: "pane_get_recent_changes",
     description: "Get recent file changes: git diff summary, modified files since last turn, and current branch status. Call this to understand what changed recently.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "pane_check_intents",
+    description: "Check whether other threads are actively working on files in this project. Returns a list of active intents (file touches) from peer threads on the same project root. Use before editing a file to avoid colliding with another agent's in-progress work.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file: { type: "string", description: "Optional: check for conflicts on a specific file path (relative to project root). Omit to get all active peer intents." },
+      },
+    },
   },
   {
     name: "TodoWrite",
@@ -2259,6 +2269,51 @@ async function handleToolCall(name, args) {
       } catch {}
 
       return text(parts.join("\n"));
+    }
+
+    case "pane_check_intents": {
+      try {
+        const { readPeerIntents, checkConflict } = await import("./intents.mjs");
+        const file = (args?.file || "").trim();
+
+        if (file) {
+          const conflict = checkConflict(PROJECT_ROOT, PROJECT_ID, file);
+          if (conflict.conflicted) {
+            const peerList = conflict.by.map((c) =>
+              `- Thread \`${c.threadId.slice(0, 8)}\` touched \`${c.file}\` ${Math.round((Date.now() - c.ts) / 60000)}m ago`
+            ).join("\n");
+            return text(`⚠ Conflict: other threads recently touched \`${file}\`:\n${peerList}\n\nCoordinate with the user before modifying this file.`);
+          }
+          return text(`No conflicts on \`${file}\`. No other active threads have touched it recently.`);
+        }
+
+        const intents = readPeerIntents(PROJECT_ROOT, PROJECT_ID);
+        if (intents.length === 0) {
+          return text("No other threads are actively working on this project.");
+        }
+
+        const byThread = new Map();
+        for (const intent of intents) {
+          let list = byThread.get(intent.threadId);
+          if (!list) { list = []; byThread.set(intent.threadId, list); }
+          list.push(intent);
+        }
+
+        const lines = [`${intents.length} active intent(s) from ${byThread.size} peer thread(s):`];
+        for (const [threadId, threadIntents] of byThread) {
+          const shortId = threadId.slice(0, 8);
+          const fileList = [...new Set(threadIntents.map((i) => i.file))];
+          lines.push(`\nThread \`${shortId}\`:`);
+          for (const f of fileList.slice(0, 10)) {
+            const latest = threadIntents.filter((i) => i.file === f).reduce((a, b) => (b.ts > a.ts ? b : a));
+            lines.push(`  - \`${f}\` (${Math.round((Date.now() - latest.ts) / 60000)}m ago)`);
+          }
+          if (fileList.length > 10) lines.push(`  ... and ${fileList.length - 10} more files`);
+        }
+        return text(lines.join("\n"));
+      } catch (err) {
+        return text(`Intent check failed: ${err.message}`);
+      }
     }
 
     // ── Workflow tools ──────────────────────────────────────────────────

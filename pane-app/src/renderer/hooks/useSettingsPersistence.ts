@@ -403,10 +403,12 @@ export function useSettingsPersistence() {
 
           function _checkMissingRoots(entries: Array<{ id: string; root: string }>) {
             Promise.all(
-              entries.map(async ({ id, root }) => {
-                const exists = await checkPathExists(root).catch(() => true);
-                if (!exists) markRootMissing(id, true);
-              })
+              entries
+                .filter(({ root }) => root) // unbound threads have no path to check
+                .map(async ({ id, root }) => {
+                  const exists = await checkPathExists(root).catch(() => true);
+                  if (!exists) markRootMissing(id, true);
+                })
             ).catch(() => {});
           }
 

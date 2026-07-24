@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useLensStore, type PunkStatus, type PunkState } from "../../stores/lens";
 import { useProjectsStore } from "../../stores/projects";
-import { runSinglePunk, checkPreviousFindings, runReview, listPunks, createPunk } from "../../lib/tauri-commands";
+import { runSinglePunk, checkPreviousFindings, runReview, listPunks, createPunk, docPunkRun } from "../../lib/tauri-commands";
 import type { ReviewFinding } from "../../lib/tauri-commands";
 
 // ─── Icons ───────────────────────────────────────────────────────────────────
@@ -519,6 +519,16 @@ export function Lens({ projectId }: { projectId: string }) {
     });
   }, [projectId, workingDir, punks, setPunkStatus]);
 
+  // Handle doc punk (scribe)
+  const [docPunkRunning, setDocPunkRunning] = useState(false);
+  const handleDocPunk = useCallback(() => {
+    if (!projectId || !workingDir || docPunkRunning) return;
+    setDocPunkRunning(true);
+    docPunkRun(projectId, workingDir, true).finally(() => {
+      setTimeout(() => setDocPunkRunning(false), 5000); // debounce re-trigger
+    });
+  }, [projectId, workingDir, docPunkRunning]);
+
   const isAnyRunning = Object.values(punks).some((p) => p.status === "running");
 
   return (
@@ -532,6 +542,15 @@ export function Lens({ projectId }: { projectId: string }) {
           Lens
         </h1>
         <div className="flex items-center gap-3">
+          <button
+            onClick={handleDocPunk}
+            disabled={docPunkRunning}
+            className="font-mono transition-colors btn-press disabled:opacity-30 text-pane-text-secondary/40 hover:text-pane-text-secondary/70"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+            title="Draft documentation from recent conversation"
+          >
+            {docPunkRunning ? "scribing..." : "scribe"}
+          </button>
           <button
             onClick={() => setShowNewForm(!showNewForm)}
             className="font-mono transition-colors btn-press text-pane-text-secondary/40 hover:text-pane-text-secondary/70"

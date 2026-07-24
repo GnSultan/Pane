@@ -9,128 +9,8 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { BrowserWindow, utilityProcess, ipcMain } from "electron";
+import { BrowserWindow, ipcMain } from "electron";
 import { getPaneDb } from "./pane-db.mjs";
-
-// Enrich PATH for spawned CLIs — mirrors main.mjs and cli-worker.mjs.
-// Packaged Electron apps have a minimal PATH; this adds nvm, homebrew, etc.
-function getEnvWithPath() {
-  const home = os.homedir();
-  const nvmBins = [];
-  try {
-    for (const v of readdirSync(path.join(home, ".nvm", "versions", "node"))) {
-      nvmBins.push(path.join(home, ".nvm", "versions", "node", v, "bin"));
-    }
-  } catch {}
-  const extra = [...nvmBins, "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"];
-  const existing = process.env.PATH || "";
-  const combined = [...extra, ...existing.split(":")].filter(Boolean).join(":");
-  return { ...process.env, PATH: combined };
-}
-
-const STALL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes of silence = stalled
-
-/**
- * Run a CLI command and return its stdout as a string.
- * Kills the process only if it produces no output for STALL_TIMEOUT_MS.
- * Active output continuously resets the timer — a long but busy response never times out.
- *
- * Pass options.stdin to write a string to the process's stdin and close it.
- * This avoids shell argument length limits for large prompts.
- */
-function spawnWithStallTimeout(command, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      env: options.env || process.env,
-      cwd: options.cwd,
-      stdio: options.stdin != null ? ["pipe", "pipe", "pipe"] : undefined,
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let stallTimer = null;
-
-    const resetStall = () => {
-      clearTimeout(stallTimer);
-      stallTimer = setTimeout(() => {
-        child.kill();
-        reject(new Error(`Process stalled — no output for ${STALL_TIMEOUT_MS / 60000} minutes`));
-      }, STALL_TIMEOUT_MS);
-    };
-
-    resetStall();
-
-    // Write prompt via stdin and close it — avoids OS arg length limits
-    if (options.stdin != null) {
-      child.stdin.write(options.stdin, "utf8");
-      child.stdin.end();
-    }
-
-    child.stdout.on("data", (chunk) => {
-      const text = chunk.toString();
-      stdout += text;
-      resetStall();
-      if (options.onChunk) options.onChunk(text);
-    });
-
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-      resetStall();
-    });
-
-    child.on("error", (err) => {
-      clearTimeout(stallTimer);
-      reject(err);
-    });
-
-    child.on("close", (code) => {
-      clearTimeout(stallTimer);
-      if (code !== 0) {
-        reject(new Error(`Process exited with code ${code}: ${stderr.trim()}`));
-      } else {
-        resolve(stdout);
-      }
-    });
-  });
-}
-
-/**
- * Detect available backends for transparent routing.
- *
- * @returns {Object} - { claudeAgent: boolean, geminiCli: boolean, versions: { claudeAgent: string, gemini: string } }
- */
-async function detectBackendAvailability() {
-  const result = {
-    claudeAgent: false,
-    geminiCli: false,
-    versions: {}
-  };
-
-  // Check Claude Agent SDK (package installed)
-  try {
-    await import("@anthropic-ai/claude-agent-sdk");
-    result.claudeAgent = true;
-    result.versions.claudeAgent = "installed";
-  } catch {
-    // Not installed — non-fatal
-    // console.log("[punk] Claude Agent SDK not available");
-  }
-
-  // Check Gemini CLI binary
-  try {
-    const stdout = await spawnWithStallTimeout("gemini", ["--version"], { env: getEnvWithPath() });
-    result.geminiCli = true;
-    result.versions.gemini = stdout.trim();
-  } catch (err) {
-    if (!err.message.includes("not found")) {
-      console.warn("[punk] Gemini CLI detection failed:", err.message);
-    }
-  }
-
-  return result;
-}
 
 import { ApiBackend } from "./http-backend.mjs";
 
@@ -239,360 +119,18 @@ const DEFAULT_POWER_COMBO = {
  */
 
 
-// CLI Backend (wraps existing cli-worker.mjs)
-// ============================================================================
-
-class CliBackend extends PunkBackend {
-  constructor(onEvent, command) {
-    super(onEvent);
-    this.worker = null;
-    this.command = command;
-    this.activeRequests = new Map(); // requestId -> projectId
-    this._requestResolvers = new Map(); // requestId -> resolve function
-    this._requestCompletions = new Map(); // requestId -> Promise (awaited by abort)
-    this._abortPromises = new Map(); // projectId -> Promise (dedup concurrent aborts)
-    this._loginResolver = null;
-    this._idleTimer = null; // 15-min inactivity timeout
-  }
-
-  /** Kill the worker if 15 minutes pass with zero active requests. */
-  _resetIdleTimer() {
-    if (this._idleTimer) {
-      clearTimeout(this._idleTimer);
-      this._idleTimer = null;
-    }
-    if (this.activeRequests.size === 0) {
-      this._idleTimer = setTimeout(() => {
-        this._idleTimer = null;
-        if (this.activeRequests.size === 0 && this.worker && !this.worker.killed) {
-          console.log(`[punk] Killing idle CLI worker for ${this.command} (15 min inactivity)`);
-          this.worker.postMessage({ type: "shutdown" });
-          this.worker.kill();
-          this.worker = null;
-        }
-      }, 15 * 60 * 1000);
-      if (this._idleTimer.unref) this._idleTimer.unref();
-    }
-  }
-
-  getWorker() {
-    if (this.worker && !this.worker.killed) return this.worker;
-
-    const workerPath = path.join(__dirname, "cli-worker.mjs");
-    this.worker = utilityProcess.fork(workerPath, [], {
-      env: { ...getEnvWithPath(), PANE_CLI_COMMAND: this.command },
-    });
-
-    this.worker.on("message", (message) => {
-      if (message.type === "login_status") {
-        for (const win of BrowserWindow.getAllWindows()) {
-          if (!win.isDestroyed()) win.webContents.send("pane-claude-signin", { type: "status", ...message });
-        }
-        return;
-      }
-      if (message.type === "login_result") {
-        if (this._loginResolver) {
-          this._loginResolver(message);
-          this._loginResolver = null;
-        }
-        return;
-      }
-      // Persist CLI session IDs to cli_sessions table — keyed on
-      // (project_id, backend) so switching between Claude and Gemini in
-      // the same conversation doesn't clobber the other's session ID.
-      if (message.type === "persist_session_id") {
-        try {
-          const db = getPaneDb();
-          if (message.sessionId) {
-            db.stmts.upsertCliSession.run(
-              message.projectId,
-              message.backend || this.command,
-              message.sessionId,
-              Date.now(),
-            );
-          } else {
-            // null sessionId = stale session cleared by worker
-            db.stmts.deleteCliSession.run(
-              message.projectId,
-              message.backend || this.command,
-            );
-          }
-        } catch {}
-        return;
-      }
-      if (message.type !== "event") return;
-      if (message.event.event === "processEnded") {
-        const rid = message.requestId;
-        this.activeRequests.delete(rid);
-        this._resetIdleTimer(); // start 15-min countdown if no more requests
-        if (this._requestResolvers.has(rid)) {
-          this._requestResolvers.get(rid)(message.event.data);
-          this._requestResolvers.delete(rid);
-        }
-        // Clean completions — abort() may be awaiting this
-        this._requestCompletions.delete(rid);
-      }
-      this.onEvent(message.projectId, message.event, message.requestId);
-    });
-
-    this.worker.on("exit", (code) => {
-      console.warn(
-        `[punk] CLI worker for ${this.command} exited with code ${code}`,
-      );
-      if (this._idleTimer) {
-        clearTimeout(this._idleTimer);
-        this._idleTimer = null;
-      }
-      for (const [requestId, projectId] of this.activeRequests.entries()) {
-        const event = {
-          event: "processEnded",
-          data: { exit_code: null },
-        };
-        if (this._requestResolvers.has(requestId)) {
-          this._requestResolvers.get(requestId)(event.data);
-          this._requestResolvers.delete(requestId);
-        }
-        this._requestCompletions.delete(requestId);
-        this.onEvent(projectId, event, requestId);
-      }
-      this.activeRequests.clear();
-      this.worker = null;
-    });
-
-    // Restore persisted session IDs for THIS backend only.
-    // cli_sessions is keyed on (project_id, backend) so each worker
-    // only gets its own sessions — no cross-contamination.
-    try {
-      const db = getPaneDb();
-      const rows = db.stmts.getCliSessions.all(this.command);
-      for (const row of rows) {
-        this.worker.postMessage({
-          type: "restore_session_id",
-          projectId: row.project_id,
-          sessionId: row.session_id,
-        });
-      }
-    } catch {}
-
-    return this.worker;
-  }
-
-  async spawn(request) {
-    this._resetIdleTimer(); // clear idle timer — we have activity
-    const worker = this.getWorker();
-    this.activeRequests.set(request.requestId, request.projectId);
-
-    // Create a promise that resolves when this request ends
-    const completionPromise = new Promise((resolve) => {
-      this._requestResolvers.set(request.requestId, resolve);
-    });
-    this._requestCompletions.set(request.requestId, completionPromise);
-
-    // Fetch recent changes from SQLite to pass to worker context
-    let sqliteChanges = [];
-    try {
-      const db = getPaneDb();
-      if (db.stmts.getChanges) {
-        sqliteChanges = db.stmts.getChanges.all(request.projectId).slice(0, 10);
-      } else {
-        console.warn("[punk] Database not fully initialized, skipping SQLite changes fetch");
-      }
-    } catch (err) {
-      console.warn("[punk] Failed to fetch SQLite changes for worker context:", err.message);
-    }
-
-    worker.postMessage({
-      type: "spawn",
-      projectId: request.projectId,
-      prompt: request.prompt,
-      workingDir: request.workingDir,
-      model: request.model,
-      provider: request.provider,
-      intent: request.intent,
-      history: request.history,
-      command: this.command,
-      requestId: request.requestId,
-      todos: request.todos,
-      minds: request.minds,
-      tools: request.tools,
-      maxTurns: request.maxTurns,
-      systemPromptOverride: request.systemPromptOverride,
-      escalationHint: request.escalationHint,
-      // Mind sessions block shell execution — MCP context tools remain available
-      noExec: typeof request.projectId === "string" && request.projectId.startsWith("mind:"),
-      sqliteChanges,
-    });
-
-    return completionPromise;
-  }
-
-  async abort(projectId) {
-    // Deduplicate: if already aborting this project, return the existing promise.
-    // This handles the case where abortMessage and sendMessage both call abortPunk.
-    if (this._abortPromises.has(projectId)) {
-      return this._abortPromises.get(projectId);
-    }
-
-    if (this.worker && !this.worker.killed) {
-      this.worker.postMessage({ type: "abort", projectId });
-    }
-
-    // Collect completion promises and request IDs for this project
-    const completions = [];
-    const requestIds = [];
-    for (const [rid, pid] of this.activeRequests.entries()) {
-      if (pid === projectId) {
-        requestIds.push(rid);
-        const promise = this._requestCompletions.get(rid);
-        if (promise) completions.push(promise);
-      }
-    }
-    // Clean activeRequests immediately so no new events are dispatched for this project
-    for (const rid of requestIds) {
-      this.activeRequests.delete(rid);
-    }
-    this._resetIdleTimer();
-
-    // Wait for process termination with a 5s timeout.
-    // Even if the process ignores SIGTERM, the worker applies SIGKILL after 2s.
-    const abortPromise = (async () => {
-      try {
-        if (completions.length > 0) {
-          await Promise.race([
-            Promise.all(completions),
-            new Promise((r) => setTimeout(r, 5000)),
-          ]);
-        }
-      } finally {
-        // Clean up completions map regardless of timeout
-        for (const rid of requestIds) {
-          this._requestCompletions.delete(rid);
-        }
-        this._abortPromises.delete(projectId);
-      }
-    })();
-
-    this._abortPromises.set(projectId, abortPromise);
-    return abortPromise;
-  }
-
-  async terminate(projectId) {
-    if (this.worker && !this.worker.killed) {
-      this.worker.postMessage({ type: "terminate", projectId });
-    }
-    // Clean up all requests for this project
-    for (const [rid, pid] of this.activeRequests.entries()) {
-      if (pid === projectId) this.activeRequests.delete(rid);
-    }
-    this._resetIdleTimer(); // may now be idle
-  }
-
-  shutdown() {
-    if (this._idleTimer) {
-      clearTimeout(this._idleTimer);
-      this._idleTimer = null;
-    }
-    if (this.worker && !this.worker.killed) {
-      this.worker.postMessage({ type: "shutdown" });
-      this.worker.kill();
-      this.worker = null;
-    }
-    this.activeRequests.clear();
-    this._requestResolvers.clear();
-    this._requestCompletions.clear();
-    this._abortPromises.clear();
-  }
-
-  /**
-   * Make a lightweight planning call using the CLI's --print / non-interactive mode.
-   * `claude --print` and `gemini --prompt` both return text and exit immediately —
-   * no session, no tools, no streaming. Perfect for task decomposition.
-   *
-   * Falls back to HTTP backend if the CLI call fails (e.g. binary not found).
-   */
-  async planningCall(systemPrompt, userPrompt, request, onChunk) {
-    const combinedPrompt = `${systemPrompt}\n\n${userPrompt}`;
-
-    if (this.command === "claude") {
-      const args = ["--print"];
-      if (request.model) args.push("--model", request.model);
-      const stdout = await spawnWithStallTimeout("claude", args, {
-        stdin: combinedPrompt,
-        onChunk,
-        env: getEnvWithPath(),
-      });
-      return stdout.trim();
-    }
-
-    if (this.command === "gemini") {
-      const args = ["--prompt", "-"];
-      if (request.model && /gemini/i.test(request.model)) {
-        args.push("--model", request.model);
-      }
-      const stdout = await spawnWithStallTimeout("gemini", args, { stdin: combinedPrompt, onChunk, env: getEnvWithPath() });
-      return stdout.trim();
-    }
-
-    throw new Error(`Unknown CLI command: ${this.command}`);
-  }
-
-  /**
-   * Multi-turn conversation call for the discovery phase.
-   * Flattens the message array into a single prompt since CLI --print mode
-   * is stateless (no session between invocations). Each discovery turn
-   * is a fresh CLI call with full history embedded.
-   *
-   * Contract: returns raw text string.
-   */
-  async conversationCall(systemPrompt, messages, request) {
-    // Flatten multi-turn messages into a single prompt for stateless CLI
-    const parts = [systemPrompt, "\n---\nConversation so far:\n"];
-    for (const msg of messages) {
-      const role = msg.role === "user" ? "User" : "Assistant";
-      parts.push(`${role}: ${msg.content}\n`);
-    }
-    parts.push("\nRespond now as the assistant. You MUST respond with valid JSON only, no markdown fencing.");
-    const combinedPrompt = parts.join("\n");
-
-    if (this.command === "claude") {
-      const args = ["--print"];
-      if (request.model) args.push("--model", request.model);
-      const stdout = await spawnWithStallTimeout("claude", args, {
-        stdin: combinedPrompt,
-        env: getEnvWithPath(),
-      });
-      return stdout.trim();
-    }
-
-    if (this.command === "gemini") {
-      const args = ["--prompt", "-"];
-      if (request.model && /gemini/i.test(request.model)) {
-        args.push("--model", request.model);
-      }
-      const stdout = await spawnWithStallTimeout("gemini", args, { stdin: combinedPrompt, env: getEnvWithPath() });
-      return stdout.trim();
-    }
-
-    throw new Error(`Unknown CLI command: ${this.command}`);
-  }
-}
-
 // ============================================================================
 // Punk Engine Core
 // ============================================================================
 
 class PunkEngine {
   constructor() {
-    // Multiple backend instances for transparent routing
+    // Single API backend for HTTP-based model access
     this.backends = {
-      claude: null,  // CliBackend for claude
-      gemini: null,  // CliBackend for gemini
       api: null,     // ApiBackend for HTTP
     };
     this.backendAvailability = {
-      claude: false,
-      gemini: false,
-      api: true,     // API backend is always available (fallback)
+      api: true,     // API backend is always available
     };
     this.defaultBackend = null; // For backward compatibility
     
@@ -621,11 +159,6 @@ class PunkEngine {
     // _projectLastOutcome entries older than 30 minutes.
     this._sweepInterval = setInterval(() => this._sweepStaleOutcomes(), 5 * 60 * 1000);
     if (this._sweepInterval.unref) this._sweepInterval.unref(); // don't keep process alive
-
-    // Set after claude_signout to prevent a reinitialize() call from silently
-    // re-creating an authenticated claude backend from leftover keychain credentials.
-    // Cleared by claude_signin on successful auth.
-    this._claudeSignedOut = false;
 
   }
 
@@ -683,36 +216,14 @@ class PunkEngine {
 
   async initialize(backendOverride) {
     // If we already have backends initialized, just ensure they're ready
-    if (this.backends.claude || this.backends.gemini || this.backends.api) {
+    if (this.backends.api) {
       return;
     }
 
     const onEvent = (projectId, event, requestId) =>
       this.handleBackendEvent(projectId, event, requestId);
 
-    // Detect available backends
-    const availability = await detectBackendAvailability();
-    this.backendAvailability.claude = availability.claudeAgent;
-    this.backendAvailability.gemini = availability.geminiCli;
-    
-    console.log(`[punk] Backend availability: claude=${this.backendAvailability.claude}, gemini=${this.backendAvailability.gemini}, api=${this.backendAvailability.api}`);
-
-    // Create backend instances for available backends.
-    // Workers are NOT spawned here — they're lazily created on first request
-    // and killed after 15 minutes of inactivity. See CliBackend._resetIdleTimer().
-    // _claudeSignedOut is set by claude_signout to prevent re-auth from keychain
-    // after the user explicitly signs out. Cleared when the user signs back in.
-    if (this.backendAvailability.claude && !this._claudeSignedOut) {
-      this.backends.claude = new CliBackend(onEvent, "claude");
-      console.log("[punk] Claude CLI backend initialized (worker lazy)");
-    }
-
-    if (this.backendAvailability.gemini) {
-      this.backends.gemini = new CliBackend(onEvent, "gemini");
-      console.log("[punk] Gemini CLI backend initialized (worker lazy)");
-    }
-    
-    // API backend is always available as fallback
+    // API backend is always available
     this.backends.api = new ApiBackend(onEvent);
     console.log("[punk] HTTP API backend initialized");
 
@@ -720,9 +231,6 @@ class PunkEngine {
     const settings = await this.loadSettings();
     const backendType = backendOverride || settings.punk_backend || "api";
     this.defaultBackend = this.getBackendForType(backendType);
-
-    // Refresh CLI-backed models on the same hourly cadence as model-manager
-    setInterval(() => this.refreshCliModels(), 1000 * 60 * 60);
 
     // Seed benchmark priors (no-op after first run, refreshes weekly)
     ensurePriors().catch(err =>
@@ -739,119 +247,35 @@ class PunkEngine {
   }
 
   /**
-   * Eagerly prefetch Claude models via the worker.
-   * Only works if the worker already exists — does NOT spawn one.
-   */
-  prefetchClaudeModels() {
-    if (!this.backends.claude?.worker) return;
-    try {
-      this.backends.claude.worker.postMessage({ type: "prefetch_models" });
-    } catch (err) {
-      console.warn("[punk] Failed to prefetch Claude SDK models:", err.message);
-    }
-  }
-
-  /**
-   * Eagerly prefetch Gemini models via the worker.
-   * Only works if the worker already exists — does NOT spawn one.
-   */
-  prefetchGeminiModels() {
-    if (!this.backends.gemini?.worker) return;
-    try {
-      this.backends.gemini.worker.postMessage({ type: "prefetch_gemini_models" });
-    } catch (err) {
-      console.warn("[punk] Failed to prefetch Gemini models:", err.message);
-    }
-  }
-
-  /**
-   * Refresh CLI-backed model lists. Called on the same hourly cycle as
-   * model-manager's HTTP refresh so cached CLI models stay current.
-   * Only refreshes if the worker already exists — does NOT spawn one.
-   */
-  refreshCliModels() {
-    this.prefetchClaudeModels();
-    this.prefetchGeminiModels();
-  }
-
-  /**
    * Get backend instance for a specific backend type.
-   * Falls back to API backend if requested type is not available.
+   * CLI backends have been removed — always returns the API backend.
    */
   getBackendForType(backendType) {
-    const normalizedType = backendType === "claude-code" ? "claude" : backendType;
-    
-    if (this.backends[normalizedType] && this.backendAvailability[normalizedType]) {
-      return this.backends[normalizedType];
-    }
-    
-    // Fallback to API backend
-    console.log(`[punk] Backend ${backendType} not available, falling back to API`);
     return this.backends.api;
   }
 
   /**
    * Route request to appropriate backend based on provider and model.
-   * Logic:
-   * 1. If provider is "anthropic" → claude CLI backend (if available)
-   * 2. If provider is "gemini" → gemini CLI backend (if available)
-   * 3. If model contains "/" (OpenRouter format) → API backend
-   * 4. Otherwise → default backend (from settings)
+   * CLI backends have been removed — always returns the API backend.
    */
   getBackendForRequest(request) {
-    const { provider, model } = request;
-
-    // OpenRouter models (contain "/") always go to API backend
-    if (model && model.includes("/")) {
-      return this.backends.api;
-    }
-
-    // "-api" suffixed providers always go to HTTP API backend.
-    // The provider is normalized to the base name before the API call
-    // (handled in prepareRequest/mapModelName via http-backend).
-    if (provider === "anthropic-api" || provider === "gemini-api") {
-      return this.backends.api;
-    }
-
-    // CLI-backed providers
-    if (provider === "anthropic" && this.backendAvailability.claude) {
-      if (!this.backends.claude) {
-        throw new Error("Claude backend is not available — please sign in first");
-      }
-      return this.backends.claude;
-    }
-
-    if (provider === "gemini" && this.backendAvailability.gemini) {
-      return this.backends.gemini;
-    }
-
-    // Fallback to default backend
-    return this.defaultBackend || this.backends.api;
+    return this.backends.api;
   }
 
   /**
    * Get backend availability for UI display.
-   * Returns an object with availability status for each backend type.
+   * CLI backends have been removed — only the API backend is available.
    */
   getBackendAvailability() {
-    return { ...this.backendAvailability };
+    return { api: true };
   }
 
   async reinitialize(backendOverride) {
-    // Shutdown all backends
-    for (const [type, backend] of Object.entries(this.backends)) {
-      if (backend) {
-        await backend.shutdown().catch(() => {});
-        this.backends[type] = null;
-      }
+    // Shutdown the API backend
+    if (this.backends.api) {
+      await this.backends.api.shutdown().catch(() => {});
+      this.backends.api = null;
     }
-    
-    // Reset availability
-    this.backendAvailability = {
-      claude: false,
-      gemini: false,
-      api: true,
-    };
     
     this.defaultBackend = null;
     
@@ -995,7 +419,7 @@ class PunkEngine {
       }
     }
 
-    // ── Persist Gemini models from CLI package prefetch ──────────────────
+    // ── Persist Gemini models ──────────────────────────────────────────
     if (event.event === "gemini_models" && event.data?.models) {
       if (modelManager.updateModels("gemini", event.data.models)) {
         modelManager.saveCache();
@@ -1054,8 +478,7 @@ class PunkEngine {
       // ── Quality-based routing adjustment + behavioral fingerprinting ────
       // When the arbiter verdict arrives, adjust the routing score so models
       // that produce low-quality code get deprioritized in future routing.
-      // Also record quality metrics to SQLite (main process has DB access;
-      // cli-worker UtilityProcess does not).
+      // Also record quality metrics to SQLite.
       if (event.event === "arbiter_verdict" && event.data) {
         try {
           const v = event.data;
@@ -1516,10 +939,9 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       const settings = await this.loadSettings();
       try {
         // Determine effective backend from the user's active provider.
-        // If they selected anthropic → "claude-code", gemini → "gemini",
-        // otherwise use punk_backend (legacy) or "api".
+        // anthropic uses the API backend (OAuth or API key) — claude-code binary removed.
         const _activeProvider = settings.selected_model_provider || null;
-        const _providerBackendMap = { anthropic: "claude-code", gemini: "gemini" };
+        const _providerBackendMap = { gemini: "gemini" };
         const _effectiveBackend = _providerBackendMap[_activeProvider]
           || settings.punk_backend || "api";
 
@@ -1661,16 +1083,15 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       resolvedRequest.model    = tierMap[tier] || tierMap.mid;
       resolvedRequest.thinking = strategy.reasoning === "deep";
 
-      // For API backend, check key availability and remap if needed
+      // For API backend, check key availability and remap if needed.
+      // anthropic is exempt — OAuth covers it without an explicit API key.
       if (catalogData?.backend === "api") {
-        // Try to use the best model available from any provider with a key
         const keys = catalogData.apiKeys || {};
-        if (!keys[resolvedRequest.provider]) {
+        if (!keys[resolvedRequest.provider] && resolvedRequest.provider !== "anthropic") {
           const firstWithKey = Object.entries(keys).find(([, k]) => !!k)?.[0];
           if (firstWithKey) {
             console.log(`[punk] heuristic route ${resolvedRequest.provider} has no key → redirect to ${firstWithKey}`);
             resolvedRequest.provider = firstWithKey;
-            // Remap tier for the new provider
             const newTierMap = TIER_MODELS[firstWithKey] || {};
             resolvedRequest.model = newTierMap[tier] || null;
           }
@@ -1697,10 +1118,10 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       resolvedRequest.model    = intentRoute.model;
       resolvedRequest.thinking = intentRoute.thinking ?? false;
 
-      // Ensure fallback has a key
+      // Ensure fallback has a key. anthropic is exempt — OAuth covers it.
       if (catalogData?.backend === "api") {
         const keys = catalogData.apiKeys || {};
-        if (!keys[resolvedRequest.provider]) {
+        if (!keys[resolvedRequest.provider] && resolvedRequest.provider !== "anthropic") {
           const firstWithKey = Object.entries(keys).find(([, k]) => !!k)?.[0];
           if (firstWithKey) {
             resolvedRequest.provider = firstWithKey;
@@ -1844,7 +1265,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // results — regardless of their embedding similarity score.
     //
     // The brain search has already written {projectId}.json; we patch it here
-    // so cli-worker / compileContext picks up the pinned entries automatically.
+    // so compileContext picks up the pinned entries automatically.
     if (resolvedRequest.minds?.length && resolvedRequest.projectId) {
       try {
         const db = getPaneDb()
@@ -1953,7 +1374,6 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       
       // Get appropriate backend for this request
       const backend = this.getBackendForRequest(resolvedRequest);
-      console.log(`[punk] routing to ${backend === this.backends.claude ? 'claude' : backend === this.backends.gemini ? 'gemini' : 'api'} backend`);
       
       await backend.spawn(resolvedRequest);
     } catch (err) {
@@ -1968,20 +1388,14 @@ Respond with a single concise principle statement (one sentence, under 150 chara
   // automated plan→execute→verify pipelines.
 
   async abort(projectId) {
-    // Try all backends - the request could be in any of them
-    for (const backend of Object.values(this.backends)) {
-      if (backend) {
-        await backend.abort(projectId).catch(() => {});
-      }
+    if (this.backends.api) {
+      await this.backends.api.abort(projectId).catch(() => {});
     }
   }
 
   async terminate(projectId) {
-    // Try all backends - the request could be in any of them
-    for (const backend of Object.values(this.backends)) {
-      if (backend) {
-        await backend.terminate(projectId).catch(() => {});
-      }
+    if (this.backends.api) {
+      await this.backends.api.terminate(projectId).catch(() => {});
     }
   }
 
@@ -2046,11 +1460,9 @@ Respond with a single concise principle statement (one sentence, under 150 chara
   }
 
   shutdown() {
-    // Shutdown all backends — kill background tool processes, release workers
-    for (const backend of Object.values(this.backends)) {
-      if (backend) {
-        try { backend.shutdown(); } catch { /* best-effort during app quit — backend may be partially initialized */ }
-      }
+    // Shutdown the API backend
+    if (this.backends.api) {
+      try { this.backends.api.shutdown(); } catch { /* best-effort during app quit */ }
     }
   }
 
@@ -2223,9 +1635,12 @@ Respond with a single concise principle statement (one sentence, under 150 chara
 
 export const punkEngine = new PunkEngine();
 
-export async function registerPunkHandlers() {
-  await punkEngine.initialize();
-
+/**
+ * Register all punk IPC handlers synchronously — safe to call before backends
+ * are initialized. Each handler that needs backends (spawn, quickCall, etc.)
+ * lazy-initializes via `await this.initialize()` internally.
+ */
+export function registerPunkHandlersSync() {
   ipcMain.handle("send_to_punk", async (_event, args) => {
     const {
       projectId,
@@ -2334,155 +1749,12 @@ export async function registerPunkHandlers() {
     await punkEngine.terminate(args.projectId);
   });
 
-  ipcMain.handle("reinitialize_punk_backend", async (_event, args) => {
-    // When explicitly re-initializing the claude backend (called after successful
-    // sign-in), clear the sign-out gate so the fresh backend can be created and
-    // the prefetch runs. Routing config changes ("api") must NOT clear the gate.
-    if (args?.backend === "claude-code") {
-      punkEngine._claudeSignedOut = false;
-    }
-    await punkEngine.reinitialize(args?.backend);
-  });
-
-  ipcMain.handle("get_backend_availability", async () => {
-    await punkEngine.initialize();
-    return punkEngine.getBackendAvailability();
-  });
-
   ipcMain.handle("get_openrouter_models", async () => {
     return await modelManager.models["openrouter"] || [];
   });
 
   ipcMain.handle("get_all_models", async () => {
     return await modelManager.models;
-  });
-
-  // ── SDK session management ────────────────────────────────────────────────
-  // These call into the claude-agent-sdk directly, operating on the session
-  // store on disk. No active subprocess needed.
-
-  ipcMain.handle("sdk_list_sessions", async () => {
-    const { listSessions } = await import("@anthropic-ai/claude-agent-sdk");
-    return listSessions();
-  });
-
-  ipcMain.handle("sdk_get_session_messages", async (_event, { sessionId }) => {
-    const { getSessionMessages } = await import("@anthropic-ai/claude-agent-sdk");
-    return getSessionMessages(sessionId);
-  });
-
-  ipcMain.handle("sdk_fork_session", async (_event, { sessionId }) => {
-    const { forkSession } = await import("@anthropic-ai/claude-agent-sdk");
-    return forkSession(sessionId);
-  });
-
-  // ── Claude auth state — reads ~/.claude.json directly ────────────────────
-  // This is the source of truth regardless of whether a session is running.
-  // The prefetch only fires when the worker spawns, so we need this for
-  // immediate auth state on Profile open and after logout.
-  ipcMain.handle("get_claude_auth_state", () => {
-    const configPath = path.join(os.homedir(), ".claude.json");
-    try {
-      const raw = readFileSync(configPath, "utf-8");
-      const config = JSON.parse(raw);
-      const acct = config.oauthAccount;
-      if (!acct?.emailAddress && !acct?.accountUuid) {
-        return { authenticated: false, account: null };
-      }
-      return {
-        authenticated: true,
-        account: {
-          email: acct.emailAddress || null,
-          displayName: acct.displayName || null,
-          organizationName: acct.organizationName || null,
-          billingType: acct.billingType || null,
-          // normalize string "True"/"False" from the CLI config
-          hasExtraUsageEnabled:
-            acct.hasExtraUsageEnabled === true ||
-            acct.hasExtraUsageEnabled === "True",
-          subscriptionCreatedAt: acct.subscriptionCreatedAt || null,
-        },
-      };
-    } catch {
-      return { authenticated: false, account: null };
-    }
-  });
-
-  // ── Claude signin — triggers OAuth flow via SDK's forceLoginMethod ─────────
-  // The worker opens the SDK with forceLoginMethod: "claudeai" which causes
-  // the SDK to emit auth_status messages with the browser URL. Those get
-  // forwarded as "pane-claude-signin" events to the renderer. When auth
-  // completes, the resolver fires and we refresh auth state.
-  ipcMain.handle("claude_signin", async () => {
-    let backend = punkEngine.backends?.claude;
-
-    // If the backend was nulled by sign-out, create a fresh CliBackend for the
-    // OAuth flow. The _claudeSignedOut gate is cleared so the new backend is
-    // allowed. Once auth completes, the renderer calls reinitializePunkBackend
-    // which runs a full reinit with prefetch.
-    if (!backend) {
-      punkEngine._claudeSignedOut = false;
-      const onEvent = (projectId, event, requestId) =>
-        punkEngine.handleBackendEvent(projectId, event, requestId);
-      backend = new CliBackend(onEvent, "claude");
-      punkEngine.backends.claude = backend;
-    }
-
-    const worker = backend.getWorker();
-    return new Promise((resolve) => {
-      backend._loginResolver = resolve;
-      worker.postMessage({ type: "start_login" });
-    });
-  });
-
-  // ── Claude logout ─────────────────────────────────────────────────────────
-  // Three-step sign-out to close all credential doors:
-  //   1. Run `claude logout` via the CLI binary — clears tokens from the
-  //      macOS keychain and any other storage the CLI owns. Editing
-  //      ~/.claude.json alone is insufficient; the CLI caches credentials
-  //      outside the JSON file and a fresh worker can re-authenticate from
-  //      those cached sources even after oauthAccount is deleted.
-  //   2. Kill and null the CliBackend so getWorker() cannot spawn a new
-  //      authenticated process before step 1 completes.
-  //   3. Broadcast null account to all renderer windows.
-  ipcMain.handle("claude_signout", async () => {
-    // Step 1 — kill current worker first so it can't race with the logout cmd
-    const backend = punkEngine.backends?.claude;
-    if (backend) {
-      await backend.shutdown().catch(() => {});
-      punkEngine.backends.claude = null; // block getWorker() from respawning
-    }
-
-    // Mark as signed out BEFORE any reinitialize() can run (e.g. from routing
-    // config changes in Profile). Without this flag, reinitialize() would call
-    // detectBackendAvailability() → find the SDK installed → create a new
-    // CliBackend → worker picks up leftover keychain credentials → re-authed.
-    punkEngine._claudeSignedOut = true;
-
-    // Step 2 — run the CLI's own logout to clear keychain + all credential stores.
-    // Pass stdin: "" so the process doesn't hang waiting for input (some versions
-    // of `claude logout` prompt for confirmation). The empty string closes stdin
-    // immediately, causing any pending prompt to receive EOF and exit.
-    try {
-      await spawnWithStallTimeout("claude", ["logout"], { env: getEnvWithPath(), stdin: "" });
-    } catch {
-      // If the CLI isn't reachable, fall back to editing ~/.claude.json directly
-      try {
-        const configPath = path.join(os.homedir(), ".claude.json");
-        const raw = readFileSync(configPath, "utf-8");
-        const config = JSON.parse(raw);
-        delete config.oauthAccount;
-        writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
-      } catch {}
-    }
-
-    // Step 3 — broadcast cleared account so the UI reflects sign-out immediately
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) {
-        win.webContents.send("pane-sdk-auth", { account: null, models: null });
-      }
-    }
-    return { success: true };
   });
 
   // ── Memory Diagnostics ─────────────────────────────────────────────────
@@ -2533,6 +1805,59 @@ export async function registerPunkHandlers() {
       } : null,
     };
   });
+
+  // ── Pane-native Claude OAuth ──────────────────────────────────────────────
+
+  ipcMain.handle("pane_claude_login", async () => {
+    const { startLogin } = await import("./claude-login.mjs");
+    const result = await startLogin({
+      onStatus: (status) => {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            win.webContents.send("pane-claude-signin", { type: "status", output: [status] });
+          }
+        }
+      },
+    });
+    if (result.success) {
+      const { invalidateCache } = await import("./claude-oauth.mjs");
+      invalidateCache();
+    }
+    return result;
+  });
+
+  ipcMain.handle("pane_claude_logout", async () => {
+    const { clearCredentials } = await import("./claude-login.mjs");
+    await clearCredentials();
+    const { invalidateCache } = await import("./claude-oauth.mjs");
+    invalidateCache();
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send("pane-sdk-auth", { account: null, models: null });
+      }
+    }
+    return { success: true };
+  });
+
+  ipcMain.handle("pane_claude_auth_state", async () => {
+    const { getAuthState } = await import("./claude-login.mjs");
+    return await getAuthState();
+  });
+}
+
+/**
+ * Initialize the punk engine backends. Call in background after the window is shown.
+ */
+export async function initPunkBackend() {
+  await punkEngine.initialize();
+}
+
+/**
+ * Backwards-compat: register handlers AND initialize backends.
+ */
+export async function registerPunkHandlers() {
+  registerPunkHandlersSync();
+  await punkEngine.initialize();
 }
 
 /**
@@ -2722,10 +2047,6 @@ function _buildEscalationHint(struggleCount, taskType) {
     `[Escalation — ${struggleCount} consecutive failing turns | domain: ${bucket} | tier: ${tier}]\n` +
     hint
   );
-}
-
-export async function preforkPunkWorker() {
-  await punkEngine.initialize();
 }
 
 export function shutdownPunkWorker() {

@@ -43,6 +43,64 @@ import {
 
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 import { runTurnSentinel, recordQualityMetric, runDeepReview, saveDeepReview } from "./code-arbiter.mjs";
+import { getAccessToken, getOAuthHeaders, getOAuthApiUrl, hasOAuthCredentials, invalidateCache } from "./claude-oauth.mjs";
+import { buildBillingHeaderValue } from "./claude-signing.mjs";
+
+// ── OAuth body transformation helpers ─────────────────────────────────────
+
+/**
+ * Strip cache_control from a system block — billing and identity blocks
+ * must not carry cache_control when used as standalone entries.
+ *
+ * @param {{ type?: string, text?: string, cache_control?: object } | string} block
+ * @returns {{ type: string, text: string }}
+ */
+function stripCacheControl(block) {
+  if (typeof block === "string") return { type: "text", text: block };
+  const { cache_control: _, ...rest } = block;
+  return rest;
+}
+
+const TOOL_PREFIX = "mcp_";
+
+// Reverse mapping from prefixed tool names back to original internal names.
+// Populated by prefixToolName so that unprefixToolName can always recover
+// the exact internal name (e.g. mcp_Run_shell_command → run_shell_command,
+// mcp_TodoWrite → TodoWrite).
+const toolNameReverseMap = new Map();
+
+/**
+ * Prefix a tool name with mcp_ and uppercase the first character.
+ * Claude Code uses names like mcp_Bash, mcp_Read — only the first
+ * character after mcp_ is uppercased. Fully lowercase names
+ * (mcp_bash, mcp_read) are flagged as non-Claude-Code clients.
+ * Matches opencode-claude-auth's prefixName exactly.
+ *
+ * @param {string} name
+ * @returns {string}
+ */
+function prefixToolName(name) {
+  const prefixed = `${TOOL_PREFIX}${name.charAt(0).toUpperCase()}${name.slice(1)}`;
+  toolNameReverseMap.set(prefixed, name);
+  return prefixed;
+}
+
+/**
+ * Reverse prefixToolName: strips mcp_ prefix and lowercases first character.
+ * Used when processing tool_use blocks from API responses — the model returns
+ * mcp_-prefixed names but Pane's internal tool registry uses unprefixed names.
+ *
+ * @param {string} name
+ * @returns {string}
+ */
+function unprefixToolName(name) {
+  if (toolNameReverseMap.has(name)) return toolNameReverseMap.get(name);
+  if (name.startsWith(TOOL_PREFIX)) {
+    const rest = name.slice(TOOL_PREFIX.length);
+    return rest.charAt(0).toLowerCase() + rest.slice(1);
+  }
+  return name;
+}
 
 // ============================================================================
 // Context Window Manager — Pane-owned conversation lifecycle
@@ -938,6 +996,110 @@ const TOOL_DEFINITIONS = [
       parameters: { type: "object", properties: {}, required: [] },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "pane_check_intents",
+      description:
+        "Check whether other threads are actively working on files in this project. Returns a list of active intents (file touches) from peer threads on the same project root. Use before editing a file to avoid colliding with another agent's in-progress work.",
+      parameters: {
+        type: "object",
+        properties: {
+          file: {
+            type: "string",
+            description: "Optional: check for conflicts on a specific file path (relative to project root). Omit to get all active peer intents.",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  // ── Skill tools ──────────────────────────────────────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "pane_list_skills",
+      description:
+        "List all available skills with their names, descriptions, and tags. Use this to discover what specialized capabilities are available before deciding which to activate. Skills are composable capability packages — pentesting, frontend design, API building, code review, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Optional: filter skills by name or tag (e.g. 'frontend', 'security', 'design')",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_skill_info",
+      description:
+        "Get detailed information about a specific skill including its full instructions, compose rules (extends, conflicts, requires), and associated tools. Use this when considering whether to activate a skill or when you need to understand its compatibility with other active skills.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "The name of the skill to inspect",
+          },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "deactivate_skill",
+      description:
+        "Deactivates an active skill by name. Use this when a skill is no longer needed for the current task or when switching to a different domain. Does nothing if the skill isn't active.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "The name of the skill to deactivate",
+          },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_list_active_skills",
+      description:
+        "List currently active skills for this project. Use this to see which skills are loaded and influencing the current session — useful before deactivating or when context feels overloaded.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_install_skill",
+      description:
+        "Install a skill from a GitHub URL or local path. Skills are agent capability packages that specialize the model for specific domains. Supports github: URLs (e.g. 'github:owner/repo/path/to/skill') and local directory paths. Installed skills go to ~/.pane/skills/ and become available for activation immediately.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "The skill source — a github: URL (github:owner/repo/path/to/skill) or a local directory path.",
+          },
+          name: {
+            type: "string",
+            description: "Optional: rename the skill when installing. Defaults to the directory name.",
+          },
+        },
+        required: ["url"],
+      },
+    },
+  },
 ];
 
 // ── Phase-based tool lists ─────────────────────────────────────────────────
@@ -956,6 +1118,8 @@ const WRITE_TOOL_NAMES = new Set([
   "TodoWrite",
   "Task",
   "activate_skill",
+  "deactivate_skill",
+  "pane_install_skill",
   "save_memory",
 ]);
 
@@ -1393,14 +1557,31 @@ function validateMessageSequence(messages, provider) {
 function stripToolHistory(messages) {
   return messages
     .map((msg) => {
+      // OpenAI: strip tool_calls from assistant messages
       if (msg.role === "assistant" && msg.tool_calls) {
         const cleaned = { ...msg };
         delete cleaned.tool_calls;
         return cleaned;
       }
+      // Anthropic: strip tool_use blocks from assistant content, keep text
+      if (msg.role === "assistant" && Array.isArray(msg.content) && msg.content.some((c) => c.type === "tool_use")) {
+        const textOnly = msg.content.filter((c) => c.type !== "tool_use");
+        return { ...msg, content: textOnly.length > 0 ? textOnly : "" };
+      }
       return msg;
     })
-    .filter((msg) => msg.role !== "tool");
+    .filter((msg) => {
+      // OpenAI: drop role:"tool" messages
+      if (msg.role === "tool") return false;
+      // Anthropic: drop role:"user" messages that are purely tool_result blocks
+      if (
+        msg.role === "user" &&
+        Array.isArray(msg.content) &&
+        msg.content.length > 0 &&
+        msg.content.every((c) => c.type === "tool_result")
+      ) return false;
+      return true;
+    });
 }
 
 export class ApiBackend extends PunkBackend {
@@ -1480,6 +1661,19 @@ export class ApiBackend extends PunkBackend {
       const provider = rawProvider.replace(/-api$/, "");
 
       let apiKey = settings.http_api_keys?.[provider] || "";
+      let authType = apiKey ? "api_key" : undefined;
+
+      // If no API key for anthropic, try OAuth tokens from Claude Code keychain
+      if (provider === "anthropic" && !apiKey) {
+        try {
+          if (await hasOAuthCredentials()) {
+            authType = "oauth";
+            console.log("[http] getApiConfig: using Claude OAuth tokens (no API key)");
+          }
+        } catch (err) {
+          console.warn("[http] getApiConfig: OAuth check failed:", err.message);
+        }
+      }
 
       const baseUrl = settings.http_base_urls?.[provider];
 
@@ -1488,23 +1682,25 @@ export class ApiBackend extends PunkBackend {
         .filter(([, v]) => !!v)
         .map(([k]) => k);
       console.log(
-        `[http] getApiConfig: provider=${provider}, hasKey=${!!apiKey}, baseUrl=${baseUrl}, presentKeys=[${presentKeys.join(",")}]`,
+        `[http] getApiConfig: provider=${provider}, hasKey=${!!apiKey}, authType=${authType || "api_key"}, baseUrl=${baseUrl}, presentKeys=[${presentKeys.join(",")}]`,
       );
-      return { provider, apiKey, baseUrl };
+      return { provider, apiKey, baseUrl, authType };
     } catch {
       return {
         provider: providerOverride || "deepseek",
         apiKey: "",
         baseUrl: undefined,
+        authType: undefined,
       };
     }
   }
 
   validateApiConfig(config) {
-    if (!config.apiKey) {
-      throw new Error(
-        `No API key configured. Open settings (\u2318,) and add a key under API Keys.`,
-      );
+    if (!config.apiKey && config.authType !== "oauth") {
+      const msg = config.provider === "anthropic"
+        ? `Not signed in to Claude. Open settings (\u2318,) and click "sign in with claude.ai", or add an Anthropic API key.`
+        : `No API key configured. Open settings (\u2318,) and add a key under API Keys.`;
+      throw new Error(msg);
     }
     return true;
   }
@@ -1591,29 +1787,53 @@ export class ApiBackend extends PunkBackend {
         // System messages with tool_results bypass the normal tool handler
         // below, so we handle them here.
         if (
-          isOpenAI &&
           Array.isArray(content) &&
           content.some((c) => c.type === "tool_result")
         ) {
-          for (const c of content) {
-            if (c.type === "tool_result") {
-              const res = {
-                role: "tool",
-                tool_call_id: c.tool_use_id,
-                name: c.name,
-                content:
-                  typeof c.content === "string"
-                    ? c.content
-                    : safeStringify(c.content),
-                is_error: c.is_error,
-              };
-              if (pendingToolCallIds.has(res.tool_call_id)) {
-                normalized.push(res);
-                pendingToolCallIds.delete(res.tool_call_id);
-              } else {
-                console.warn(
-                  `[http] Pruning orphaned tool result (from system msg) for ${res.tool_call_id}`,
-                );
+          if (isOpenAI) {
+            for (const c of content) {
+              if (c.type === "tool_result") {
+                const res = {
+                  role: "tool",
+                  tool_call_id: c.tool_use_id,
+                  name: c.name,
+                  content:
+                    typeof c.content === "string"
+                      ? c.content
+                      : safeStringify(c.content),
+                  is_error: c.is_error,
+                };
+                if (pendingToolCallIds.has(res.tool_call_id)) {
+                  normalized.push(res);
+                  pendingToolCallIds.delete(res.tool_call_id);
+                } else {
+                  console.warn(
+                    `[http] Pruning orphaned tool result (from system msg) for ${res.tool_call_id}`,
+                  );
+                }
+              }
+            }
+          } else {
+            // Anthropic: convert system-stored tool_result blocks to role:"user" batched message
+            for (const c of content) {
+              if (c.type === "tool_result") {
+                const block = {
+                  type: "tool_result",
+                  tool_use_id: c.tool_use_id,
+                  content: typeof c.content === "string" ? c.content : safeStringify(c.content),
+                };
+                if (c.is_error) block.is_error = true;
+                pendingToolCallIds.delete(c.tool_use_id);
+                const prev = normalized[normalized.length - 1];
+                if (
+                  prev?.role === "user" &&
+                  Array.isArray(prev.content) &&
+                  prev.content.every((b) => b.type === "tool_result")
+                ) {
+                  prev.content.push(block);
+                } else {
+                  normalized.push({ role: "user", content: [block] });
+                }
               }
             }
           }
@@ -1725,8 +1945,49 @@ export class ApiBackend extends PunkBackend {
             lastToolCallAssistantIndex = normalized.length - 1;
           }
         } else {
-          // Anthropic/Gemini/etc. — preserve original structure
-          normalized.push(msg);
+          // Anthropic/Gemini/etc.
+          // History may contain assistant messages in OpenAI tool_calls format, or
+          // Anthropic tool_use blocks whose input was accidentally stringified.
+          // Both cause HTTP 400 ("Input should be an object"). Normalize here.
+          if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+            // OpenAI-style tool_calls → Anthropic tool_use content blocks
+            const textContent =
+              typeof content === "string"
+                ? content
+                : Array.isArray(content)
+                  ? content.filter((c) => c.type === "text").map((c) => c.text).join("\n")
+                  : "";
+            const toolUseBlocks = msg.tool_calls.map((tc) => {
+              let input = tc.function?.arguments ?? {};
+              if (typeof input === "string") {
+                try { input = JSON.parse(input); } catch { input = {}; }
+              }
+              if (input === null || typeof input !== "object") input = {};
+              return { type: "tool_use", id: tc.id, name: tc.function?.name, input };
+            });
+            const blocks = [];
+            if (textContent) blocks.push({ type: "text", text: textContent });
+            blocks.push(...toolUseBlocks);
+            normalized.push({ role: "assistant", content: blocks });
+            toolUseBlocks.forEach((tu) => pendingToolCallIds.add(tu.id));
+            lastToolCallAssistantIndex = normalized.length - 1;
+          } else if (Array.isArray(content) && content.some((c) => c.type === "tool_use")) {
+            // Already Anthropic format — ensure input is a plain object, not a string
+            const fixedContent = content.map((c) => {
+              if (c.type !== "tool_use") return c;
+              let input = c.input;
+              if (typeof input === "string") {
+                try { input = JSON.parse(input); } catch { input = {}; }
+              }
+              if (input === null || typeof input !== "object") input = {};
+              return { ...c, input };
+            });
+            normalized.push({ ...msg, content: fixedContent });
+            fixedContent.filter((c) => c.type === "tool_use").forEach((c) => pendingToolCallIds.add(c.id));
+            lastToolCallAssistantIndex = normalized.length - 1;
+          } else {
+            normalized.push(msg);
+          }
         }
         continue;
       }
@@ -1775,10 +2036,44 @@ export class ApiBackend extends PunkBackend {
               );
             }
           }
+        } else if (role === "tool") {
+          // Anthropic/Gemini: role:"tool" is not valid — convert to role:"user"
+          // with type:"tool_result" content blocks. Multiple consecutive tool
+          // results (one per tool call) must be batched into a single user turn.
+          const resolved = resolveResultRef(msg);
+          const block = {
+            type: "tool_result",
+            tool_use_id: resolved.tool_call_id,
+            content:
+              typeof resolved.content === "string"
+                ? resolved.content
+                : safeStringify(resolved.content),
+          };
+          if (resolved.is_error) block.is_error = true;
+          pendingToolCallIds.delete(resolved.tool_call_id);
+          // Merge into the previous user message if it already holds only
+          // tool_result blocks (same assistant turn), otherwise open a new one.
+          const prev = normalized[normalized.length - 1];
+          if (
+            prev?.role === "user" &&
+            Array.isArray(prev.content) &&
+            prev.content.length > 0 &&
+            prev.content.every((c) => c.type === "tool_result")
+          ) {
+            prev.content.push(block);
+          } else {
+            normalized.push({ role: "user", content: [block] });
+          }
         } else {
-          // Non-OpenAI (Anthropic, Gemini): resolve _resultRef before
-          // passing through — these providers don't support the envelope format
-          normalized.push(resolveResultRef(msg));
+          // Already role:"user" with tool_result content blocks (Anthropic native format).
+          // Resolve refs, pass through, and clear those IDs from pending.
+          const resolved = resolveResultRef(msg);
+          if (Array.isArray(resolved.content)) {
+            resolved.content.forEach((c) => {
+              if (c.type === "tool_result") pendingToolCallIds.delete(c.tool_use_id);
+            });
+          }
+          normalized.push(resolved);
         }
         continue;
       }
@@ -1827,6 +2122,25 @@ export class ApiBackend extends PunkBackend {
         normalized.length,
       );
       normalized.splice(insertAt, 0, ...fakeResults);
+    }
+
+    if (!isOpenAI && !isReasoner && pendingToolCallIds.size > 0) {
+      // Anthropic: orphaned tool_use blocks — insert a user message with fake
+      // tool_result blocks right after the assistant message that made the calls.
+      console.warn(
+        `[http] Anthropic: ${pendingToolCallIds.size} tool_use blocks missing results. Healing...`,
+      );
+      const fakeBlocks = [];
+      for (const id of pendingToolCallIds) {
+        fakeBlocks.push({
+          type: "tool_result",
+          tool_use_id: id,
+          content: "Error: Turn was interrupted before tool result could be processed.",
+          is_error: true,
+        });
+      }
+      const insertAt = Math.min(lastToolCallAssistantIndex + 1, normalized.length);
+      normalized.splice(insertAt, 0, { role: "user", content: fakeBlocks });
     }
 
     // --- 5. DEFENSIVE SANITIZATION (OpenAI providers) ---
@@ -2014,6 +2328,7 @@ export class ApiBackend extends PunkBackend {
         historyLength,
         backend: "http",
         model: request.model,
+        projectRoot: request.workingDir,
         sqliteChanges,
         conversationTokens,
         queryEmbeddingBase64: queryEmbB64,
@@ -2317,6 +2632,7 @@ export class ApiBackend extends PunkBackend {
         const state = {
           accumulated: "",
           thinking: "", // Track reasoning for resilience checks
+          thinkingSignature: null, // Anthropic signature for thinking blocks (required for multi-turn)
           toolUses: new Map(),
           finishReason: null,
           model: resolvedModel,
@@ -2619,6 +2935,15 @@ export class ApiBackend extends PunkBackend {
                 }
               }
 
+              // Strip runtime-only cache fields before serialization — they're set by
+              // estimateConversationTokens() above and must not reach any API endpoint.
+              if (sourceBody.messages) {
+                for (const msg of sourceBody.messages) {
+                  delete msg._tokenEstimate;
+                  delete msg._tiers;
+                }
+              }
+
               response = await fetch(url, {
                 method: "POST",
                 headers,
@@ -2657,7 +2982,11 @@ export class ApiBackend extends PunkBackend {
                     const errorBody = await response.text().catch(() => "");
                     lastResponseBody = errorBody; // Preserve for error message after retry loop
                     if (
-                      errorBody.includes("insufficient tool messages") &&
+                      (errorBody.includes("insufficient tool messages") ||
+                        errorBody.includes("tool_use id") ||
+                        errorBody.includes("tool_use block") ||
+                        errorBody.includes("tool_result block") ||
+                        (errorBody.includes("tool") && errorBody.includes("Unexpected role"))) &&
                       !this._healAttemptedThisTurn
                     ) {
                       this._healAttemptedThisTurn = true;
@@ -2776,6 +3105,22 @@ export class ApiBackend extends PunkBackend {
                     console.error(
                       `[http] Bad request (400): ${errorBody.slice(0, 300)}`,
                     );
+                    // Log full error body for OAuth diagnostics
+                    if (errorBody.length > 300) {
+                      console.error(`[http] Full error body:`, errorBody);
+                    }
+
+                    // Write error body to diagnostics file for OAuth debugging
+                    (async () => {
+                      try {
+                        const diagDir = path.join(os.homedir(), ".pane", "diagnostics");
+                        await fs.mkdir(diagDir, { recursive: true });
+                        await fs.writeFile(
+                          path.join(diagDir, "oauth-error.json"),
+                          JSON.stringify({ timestamp: new Date().toISOString(), status: 400, body: errorBody }, null, 2),
+                        );
+                      } catch {}
+                    })();
 
                     // Diagnostic: extract the offending message index from "missing field"
                     // errors (e.g. "messages[15]: missing field 'type' at line 1 column 54023")
@@ -2827,6 +3172,57 @@ export class ApiBackend extends PunkBackend {
                       }
                     }
                   } else if (status === 401) {
+                    // Read the error body for diagnostics
+                    const errorBody401 = await response.text().catch(() => response.statusText);
+                    lastResponseBody = errorBody401; // preserve for the error throw
+                    console.error(
+                      `[http] 401 UNAUTHORIZED:`,
+                      JSON.stringify({
+                        status,
+                        errorBody: errorBody401?.slice(0, 500),
+                        authType: apiConfig.authType,
+                        hasAuthHeader: !!headers.Authorization,
+                        authPrefix: headers.Authorization?.slice(0, 25),
+                        url,
+                        betaFlags: headers["anthropic-beta"]?.slice(0, 100),
+                      })
+                    );
+
+                    // Z.ai Coding Plan auto-detection: Coding Plan API keys are
+                    // only valid on the /coding/paas/v4 endpoint. The standard
+                    // /paas/v4 endpoint returns 401 for Coding Plan keys. When we
+                    // get a 401 and the user hasn't explicitly set a base URL,
+                    // retry with the Coding Plan endpoint before giving up.
+                    if (
+                      apiConfig.provider === "z-ai" &&
+                      !apiConfig.baseUrl
+                    ) {
+                      console.warn(
+                        "[http] Z.ai 401 on standard endpoint (no custom base URL) — retrying with Coding Plan endpoint"
+                      );
+                      url = "https://api.z.ai/api/coding/paas/v4/chat/completions";
+                      continue; // Don't consume an attempt — endpoint switch is free
+                    }
+
+                    // OAuth mode: token may have expired mid-session
+                    if (apiConfig.authType === "oauth") {
+                      console.warn("[http] OAuth 401 — invalidating cache and retrying with fresh token");
+                      invalidateCache();
+                      const freshToken = await getAccessToken();
+                      if (freshToken) {
+                        // Rebuild headers with fresh token.
+                        // Do NOT add prompt-caching-2024-07-31 — OAuth uses
+                        // prompt-caching-scope-2026-01-05 which is already in the OAuth betas.
+                        const oauthHeaders = getOAuthHeaders(freshToken, resolvedModel);
+                        headers = {
+                          ...headers,
+                          Authorization: oauthHeaders.Authorization,
+                          "anthropic-beta": oauthHeaders["anthropic-beta"],
+                        };
+                        // Don't consume an attempt — token refresh is a heal
+                        continue;
+                      }
+                    }
                     console.error(
                       `[http] Unauthorized (401): Check API key configuration`,
                     );
@@ -2851,6 +3247,23 @@ export class ApiBackend extends PunkBackend {
                   (isRateLimit || isTransientClientError) &&
                   attempt < MAX_RETRIES
                 ) {
+                  // Z.ai Coding Plan auto-detection: Coding Plan API keys hitting
+                  // the standard /paas/v4 endpoint return 429 ("Insufficient balance
+                  // or no resource package. Please recharge."). When we get a 429
+                  // and the user hasn't explicitly set a base URL, retry once with
+                  // the Coding Plan endpoint before entering backoff.
+                  if (
+                    isRateLimit &&
+                    apiConfig.provider === "z-ai" &&
+                    !apiConfig.baseUrl
+                  ) {
+                    console.warn(
+                      "[http] Z.ai 429 on standard endpoint (no custom base URL) — retrying with Coding Plan endpoint"
+                    );
+                    url = "https://api.z.ai/api/coding/paas/v4/chat/completions";
+                    continue; // Don't consume an attempt — endpoint switch is free
+                  }
+
                   const retryAfterSec = parseInt(
                     response.headers.get("retry-after") || "0",
                     10,
@@ -4327,8 +4740,8 @@ export class ApiBackend extends PunkBackend {
         }
       }
 
-      // Signal successful completion — mirrors cli-worker's "result" event so the
-      // renderer's resultReceived flag is set and no false "Process exited" error fires.
+      // Signal successful completion so the renderer's resultReceived flag is
+      // set and no false "Process exited" error fires.
       this.onEvent(
         request.projectId,
         {
@@ -4737,43 +5150,94 @@ export class ApiBackend extends PunkBackend {
       }
 
       case "anthropic": {
-        url = apiConfig.baseUrl || "https://api.anthropic.com/v1/messages";
-        headers = {
-          "Content-Type": "application/json",
-          "x-api-key": apiConfig.apiKey,
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": "prompt-caching-2024-07-31",
-        };
+        const isOAuth = apiConfig.authType === "oauth";
+
+        if (isOAuth) {
+          // OAuth mode: Bearer token from Claude Code/Pane keychain.
+          // URL must include ?beta=true for OAuth-authenticated requests.
+          url = getOAuthApiUrl(apiConfig.baseUrl || "https://api.anthropic.com/v1/messages");
+          const accessToken = await getAccessToken();
+          if (!accessToken) {
+            throw new Error(
+              "Claude OAuth credentials are unavailable or expired. Sign in via Settings → Claude Subscription."
+            );
+          }
+          // Pass model for beta exclusions (e.g. haiku → exclude interleaved-thinking)
+          const oauthHeaders = getOAuthHeaders(accessToken, request?.model);
+          // OAuth betas already include prompt-caching-scope-2026-01-05.
+          // Do NOT add prompt-caching-2024-07-31 — it's API-key-only and
+          // causes "Invalid request format" when combined with OAuth tokens.
+          headers = {
+            "Content-Type": "application/json",
+            ...oauthHeaders,
+          };
+          console.log("[http] Anthropic OAuth: using Bearer token, url:", url, "betas:", oauthHeaders["anthropic-beta"]);
+        } else {
+          url = apiConfig.baseUrl || "https://api.anthropic.com/v1/messages";
+          headers = {
+            "Content-Type": "application/json",
+            "x-api-key": apiConfig.apiKey,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "prompt-caching-2024-07-31",
+          };
+        }
+
         const sysMsg = body.messages.find((m) => m.role === "system");
         const anthropicBody = {
           ...body,
           metadata: { user_id: userTag },
-          // Top-level auto-caching: automatically caches the last block of
-          // the last message, handling conversation prefix caching without
-          // manual breakpoints. Simpler and handles long conversations better
-          // than the old sliding-cutoff approach.
-          cache_control: { type: "ephemeral" },
         };
         anthropicBody.messages = body.messages.filter(
           (m) => m.role !== "system",
         );
 
-        // ── Breakpoint 1: Cache tool definitions (most static content) ──
-        // Tools never change within a session — ~5k tokens saved per turn.
-        if (anthropicBody.tools?.length > 0) {
-          const lastTool = anthropicBody.tools[anthropicBody.tools.length - 1];
-          if (typeof lastTool === "object") {
-            lastTool.cache_control = { type: "ephemeral" };
+        // ── Thinking signature safety net ──
+        // Anthropic requires that thinking blocks in conversation history include
+        // their original signature (from signature_delta events). If a thinking
+        // block lacks a signature, the API rejects with 400 "thinking.signature:
+        // Field required". This strips any thinking blocks without signatures
+        // before sending, so old conversations (before signature capture was added)
+        // don't break on multi-turn requests.
+        if (Array.isArray(anthropicBody.messages)) {
+          for (const msg of anthropicBody.messages) {
+            if (msg.role === "assistant" && Array.isArray(msg.content)) {
+              msg.content = msg.content.filter(
+                (block) =>
+                  block.type !== "thinking" || typeof block.signature === "string",
+              );
+              // If content is now empty, keep at least a minimal text block
+              // so the message sequence stays valid
+              if (msg.content.length === 0) {
+                msg.content = [{ type: "text", text: "(thinking)" }];
+              }
+            }
+          }
+        }
+
+        // ── Cache optimizations: API-key only ──
+        // OAuth requests use prompt-caching-scope-2026-01-05 which has a
+        // different cache format. The legacy cache_control: { type: "ephemeral" }
+        // requires prompt-caching-2024-07-31 (API-key-only). Using the wrong
+        // cache format causes "400 Invalid request format" on OAuth requests.
+        // opencode-claude-auth never adds cache_control to OAuth bodies.
+        if (!isOAuth) {
+          // Top-level auto-caching: automatically caches the last block of
+          // the last message, handling conversation prefix caching without
+          // manual breakpoints.
+          anthropicBody.cache_control = { type: "ephemeral" };
+
+          // Breakpoint 1: Cache tool definitions (most static content)
+          if (anthropicBody.tools?.length > 0) {
+            const lastTool = anthropicBody.tools[anthropicBody.tools.length - 1];
+            if (typeof lastTool === "object") {
+              lastTool.cache_control = { type: "ephemeral" };
+            }
           }
         }
 
         if (sysMsg) {
           // ── Cache-aware system prompt for Anthropic ──
-          // Breakpoint layout (up to 4 total, 1 used on tools above):
-          //   Breakpoint 2: frozen tier → 1-hour TTL (survives breaks between turns)
-          //   Breakpoint 3: session tier → 5-min TTL (changes on scope change)
-          //   Turn tier: no breakpoint (changes every turn)
-          // Auto-caching (top-level): handles conversation prefix incrementally.
+          // OAuth: system tiers get cache_control stripped in the OAuth block below
           if (systemTiers && systemTiers.frozen) {
             const tiers = systemTiers;
             const blocks = [];
@@ -4782,7 +5246,7 @@ export class ApiBackend extends PunkBackend {
               blocks.push({
                 type: "text",
                 text: tiers.frozen,
-                cache_control: { type: "ephemeral", ttl: "1h" },
+                cache_control: isOAuth ? undefined : { type: "ephemeral", ttl: "1h" },
               });
             }
             // Session tier — 5-min cache (changes on scope change)
@@ -4790,7 +5254,7 @@ export class ApiBackend extends PunkBackend {
               blocks.push({
                 type: "text",
                 text: tiers.session,
-                cache_control: { type: "ephemeral" },
+                cache_control: isOAuth ? undefined : { type: "ephemeral" },
               });
             }
             // Turn tier — never cached, changes every turn
@@ -4798,12 +5262,149 @@ export class ApiBackend extends PunkBackend {
               blocks.push({ type: "text", text: tiers.turn });
             }
             anthropicBody.system = blocks;
-            console.log(
-              `[http] Anthropic cache: tools=cached frozen=${tiers.frozen.length}c(1h) session=${tiers.session.length}c(5m) turn=${tiers.turn.length}c`,
-            );
+            if (!isOAuth) {
+              console.log(
+                `[http] Anthropic cache: tools=cached frozen=${tiers.frozen.length}c(1h) session=${tiers.session.length}c(5m) turn=${tiers.turn.length}c`,
+              );
+            }
           } else {
             anthropicBody.system = sysMsg.content;
           }
+        }
+
+        // ── OAuth body transformation ──
+        // The Anthropic API validates OAuth-authenticated requests by checking:
+        // 1. Billing header: signed hash of first user message (proves "Claude Code" client)
+        // 2. System identity prefix: "You are Claude Code, Anthropic's official CLI for Claude."
+        // 3. Only billing + identity in system[] — other system content moved to user message
+        // 4. Tool names prefixed with mcp_ + PascalCase (lowercase = non-Claude-Code = rejected)
+        if (isOAuth) {
+          const systemBlocks = Array.isArray(anthropicBody.system)
+            ? anthropicBody.system
+            : typeof anthropicBody.system === "string"
+              ? [{ type: "text", text: anthropicBody.system }]
+              : anthropicBody.system
+                ? [anthropicBody.system]
+                : [];
+
+          const BILLING_PREFIX = "x-anthropic-billing-header";
+          const SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+          // Compute billing header from first user message
+          const billingHeader = buildBillingHeaderValue(anthropicBody.messages || []);
+
+          // Separate core (billing + identity) from everything else
+          const coreBlocks = [];
+          const movedTexts = [];
+          for (const block of systemBlocks) {
+            const txt = typeof block === "string" ? block : (block.text ?? "");
+            const stripped = stripCacheControl(block);
+            if (txt.startsWith(BILLING_PREFIX) || txt.startsWith(SYSTEM_IDENTITY)) {
+              coreBlocks.push(stripped);
+            } else if (txt.length > 0) {
+              movedTexts.push(txt);
+            }
+          }
+
+          // Build final system: [billing, identity]
+          // OAuth API validates system[] content — only billing + identity
+          // are allowed. ALL other content (frozen, session, turn tiers)
+          // must go to the first user message to avoid "400 Invalid request format".
+          // See: opencode-claude-auth PR #148.
+          const newSystem = [
+            { type: "text", text: billingHeader },
+            { type: "text", text: SYSTEM_IDENTITY },
+            ...coreBlocks,
+          ];
+
+          // Turn tier is already in movedTexts from the loop above
+          // (it was one of the systemBlocks). Nothing extra needed —
+          // it's already being relocated to the first user message.
+
+          anthropicBody.system = newSystem;
+
+          // Move non-core system content to first user message
+          if (movedTexts.length > 0 && Array.isArray(anthropicBody.messages)) {
+            const firstUser = anthropicBody.messages.find((m) => m.role === "user");
+            if (firstUser) {
+              const prefix = movedTexts.join("\n\n");
+              if (typeof firstUser.content === "string") {
+                firstUser.content = prefix + "\n\n" + firstUser.content;
+              } else if (Array.isArray(firstUser.content)) {
+                firstUser.content.unshift({ type: "text", text: prefix });
+              }
+            }
+          }
+
+          // Prefix tool names: mcp_ + PascalCase (Claude Code convention)
+          if (Array.isArray(anthropicBody.tools)) {
+            anthropicBody.tools = anthropicBody.tools.map((tool) => ({
+              ...tool,
+              name: tool.name ? prefixToolName(tool.name) : tool.name,
+            }));
+          }
+
+          // Prefix tool_use names in messages
+          if (Array.isArray(anthropicBody.messages)) {
+            anthropicBody.messages = anthropicBody.messages.map((msg) => {
+              if (!Array.isArray(msg.content)) return msg;
+              return {
+                ...msg,
+                content: msg.content.map((block) => {
+                  if (block.type !== "tool_use" || typeof block.name !== "string") return block;
+                  return { ...block, name: prefixToolName(block.name) };
+                }),
+              };
+            });
+          }
+
+          console.log("[http] Anthropic OAuth: injected billing header, system blocks:", newSystem.length);
+        }
+
+        // ── OAuth diagnostic: log key request properties ──
+        if (isOAuth) {
+          // Write full body synchronously to project dir so the agent can read it
+          const diagDir = path.join(os.homedir(), ".pane", "diagnostics");
+          try {
+            await fs.mkdir(diagDir, { recursive: true });
+            const bodyClone = JSON.parse(JSON.stringify(anthropicBody));
+            const bodyPath = path.join(diagDir, "oauth-body.json");
+            const headerPath = path.join(diagDir, "oauth-headers.json");
+            await fs.writeFile(bodyPath, JSON.stringify(bodyClone, null, 2));
+            await fs.writeFile(headerPath, JSON.stringify({
+              url,
+              model: anthropicBody.model,
+              messageCount: anthropicBody.messages?.length,
+              toolCount: anthropicBody.tools?.length,
+              toolNames: anthropicBody.tools?.map((t) => t.name),
+              systemBlockCount: Array.isArray(anthropicBody.system) ? anthropicBody.system.length : "not-array",
+              system: Array.isArray(anthropicBody.system)
+                ? anthropicBody.system.map((b) =>
+                    typeof b === "string" ? b.slice(0, 200) : { type: b.type, text: (b.text ?? "").slice(0, 200) }
+                  )
+                : null,
+              hasCacheControl: !!anthropicBody.cache_control,
+              headerKeys: Object.keys(headers).filter(k => k !== "Authorization"),
+              hasAuth: !!headers.Authorization,
+              authPrefix: headers.Authorization?.slice(0, 20),
+            }, null, 2));
+            console.log("[http] OAuth diagnostic written to:", diagDir);
+          } catch (e) {
+            console.error("[http] OAuth diagnostic write failed:", e.message);
+          }
+
+          console.log(
+            "[http] OAuth REQUEST DIAGNOSTIC:",
+            JSON.stringify({
+              url,
+              model: anthropicBody.model,
+              messageCount: anthropicBody.messages?.length,
+              toolCount: anthropicBody.tools?.length,
+              toolNames: anthropicBody.tools?.map((t) => t.name).slice(0, 10),
+              systemBlockCount: Array.isArray(anthropicBody.system) ? anthropicBody.system.length : "not-array",
+              headerKeys: Object.keys(headers).filter(k => k !== "Authorization"),
+            })
+          );
         }
 
         // Conversation caching handled by top-level cache_control (auto-caching).
@@ -5001,11 +5602,11 @@ export class ApiBackend extends PunkBackend {
         throw new Error(`Unsupported provider: ${apiConfig.provider}`);
     }
 
-    // Strip _tiers from finalBody before serialization — internal metadata
-    // that providers would reject or ignore as unknown fields.
+    // Strip internal metadata fields before serialization — providers reject unknown fields.
     if (finalBody.messages) {
       for (const msg of finalBody.messages) {
         if (msg._tiers) delete msg._tiers;
+        if (msg._tokenEstimate !== undefined) delete msg._tokenEstimate;
       }
     }
 
@@ -5415,11 +6016,49 @@ export class ApiBackend extends PunkBackend {
         )
           thinking = event.delta.thinking;
 
+        // Signature delta: Anthropic sends this after thinking content to
+        // provide the cryptographic signature required for multi-turn conversations.
+        // When interleaved thinking is enabled, subsequent turns MUST include the
+        // signature on thinking blocks. Without it, the API rejects with
+        // "thinking.signature: Field required" (400).
+        // Forward to frontend so it can attach the signature to the thinking block.
+        if (
+          event.type === "content_block_delta" &&
+          event.delta?.type === "signature_delta" &&
+          event.delta.signature
+        ) {
+          // Store in state for journal storage
+          state.thinkingSignature = event.delta.signature;
+          this.onEvent(
+            projectId,
+            {
+              event: "message",
+              data: {
+                parsed: {
+                  type: "stream_event",
+                  event: {
+                    type: "content_block_delta",
+                    index: 0,
+                    delta: {
+                      type: "signature_delta",
+                      signature: event.delta.signature,
+                    },
+                  },
+                },
+              },
+            },
+            requestId,
+          );
+          emitted = true;
+        }
+
         if (
           event.type === "content_block_start" &&
           event.content_block?.type === "tool_use"
         ) {
           const tb = event.content_block;
+          // Strip mcp_ prefix if present (Claude Code OAuth convention)
+          const strippedName = unprefixToolName(tb.name);
           this.onEvent(
             projectId,
             {
@@ -5433,7 +6072,7 @@ export class ApiBackend extends PunkBackend {
                     content_block: {
                       type: "tool_use",
                       id: tb.id,
-                      name: tb.name,
+                      name: strippedName,
                       input: {},
                     },
                   },
@@ -5442,7 +6081,7 @@ export class ApiBackend extends PunkBackend {
             },
             requestId,
           );
-          state.toolUses.set(tb.id, { id: tb.id, name: tb.name, input: "" });
+          state.toolUses.set(tb.id, { id: tb.id, name: strippedName, input: "" });
         }
 
         if (
@@ -5538,6 +6177,16 @@ export class ApiBackend extends PunkBackend {
 
     if (finishReason && (state.accumulated || state.toolUses.size > 0)) {
       const finalContent = [];
+      // Include thinking block with signature for Anthropic OAuth/interleaved-thinking.
+      // The API requires that thinking blocks in conversation history include their
+      // original signature. Without it, multi-turn requests fail with 400.
+      if (state.thinking && state.thinkingSignature) {
+        finalContent.push({
+          type: "thinking",
+          thinking: state.thinking,
+          signature: state.thinkingSignature,
+        });
+      }
       if (state.accumulated) {
         finalContent.push({ type: "text", text: state.accumulated });
       }
@@ -5686,13 +6335,28 @@ export class ApiBackend extends PunkBackend {
         ? apiConfig.baseUrl.replace(/\/chat\/completions\/?$/, "")
         : "https://api.z.ai/api/paas/v4";
       const baseUrlClean = base.replace(/\/$/, "");
-      const url = baseUrlClean.endsWith("/models")
+      let url = baseUrlClean.endsWith("/models")
         ? baseUrlClean
         : `${baseUrlClean}/models`;
-      const response = await fetch(url, {
+
+      let response = await fetch(url, {
         headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
         signal: AbortSignal.timeout(12_000),
       });
+
+      // Coding Plan fallback: if no custom base URL and the standard endpoint
+      // failed, try the Coding Plan endpoint (its key isn't valid on standard).
+      if (!response.ok && !apiConfig.baseUrl) {
+        console.warn(
+          "[http] Z.ai models: standard endpoint failed — retrying with Coding Plan endpoint"
+        );
+        url = "https://api.z.ai/api/coding/paas/v4/models";
+        response = await fetch(url, {
+          headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
+          signal: AbortSignal.timeout(12_000),
+        });
+      }
+
       if (!response.ok) return [];
 
       const json = await response.json();
@@ -5780,17 +6444,35 @@ export class ApiBackend extends PunkBackend {
    */
   async getAnthropicModels() {
     const apiConfig = await this.getApiConfig("anthropic");
-    if (!apiConfig.apiKey) return [];
+    const isOAuth = apiConfig.authType === "oauth";
+    if (!apiConfig.apiKey && !isOAuth) return [];
 
     try {
       const url = apiConfig.baseUrl
         ? apiConfig.baseUrl.replace(/\/messages\/?$/, "/models")
         : "https://api.anthropic.com/v1/models";
-      const response = await fetch(url, {
-        headers: {
+
+      let fetchHeaders;
+      if (isOAuth) {
+        const accessToken = await getAccessToken();
+        if (!accessToken) return [];
+        const oauthHeaders = getOAuthHeaders(accessToken);
+        fetchHeaders = {
+          Authorization: oauthHeaders.Authorization,
+          "anthropic-version": oauthHeaders["anthropic-version"],
+          "user-agent": oauthHeaders["user-agent"],
+          "anthropic-dangerous-direct-browser-access": oauthHeaders["anthropic-dangerous-direct-browser-access"],
+          "x-app": oauthHeaders["x-app"],
+        };
+      } else {
+        fetchHeaders = {
           "x-api-key": apiConfig.apiKey,
           "anthropic-version": "2023-06-01",
-        },
+        };
+      }
+
+      const response = await fetch(url, {
+        headers: fetchHeaders,
         signal: AbortSignal.timeout(12_000),
       });
       if (!response.ok) return [];

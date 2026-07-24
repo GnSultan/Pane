@@ -43,7 +43,11 @@ export function useFileWatcher() {
       const currentRoots = new Set<string>();
       for (const id of projectOrder) {
         const project = projects.get(id);
-        if (project) currentRoots.add(project.root);
+        // Rootless (unbound) threads have no folder to watch. Watching ""
+        // resolves to process.cwd() in the main process — "/" in a
+        // Finder-launched packaged app — which recursively walks the whole
+        // filesystem and freezes the app.
+        if (project && project.root) currentRoots.add(project.root);
       }
 
       // Start watching new roots

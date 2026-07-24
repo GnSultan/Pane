@@ -749,9 +749,8 @@ async function loadEmbedder() {
     embedderReady = true;
     sendToMain({ type: "embedder_ready" });
 
-    // Index atoms + migrate old embeddings + fill null embeddings in background
+    // Index atoms + fill null embeddings in background
     Promise.all([
-      migrateEmbeddings().catch(err => console.error("[brain] Embedding migration failed:", err.message)),
       fillNullEmbeddings().catch(err => console.error("[brain] Null embedding fill failed:", err.message)),
     ]);
   } catch (err) {
@@ -905,75 +904,6 @@ function cosineSimilarity(a, b) {
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
   return dot; // Vectors are already normalized, so dot product = cosine similarity
-}
-
-/**
- * Migrate old-dimension embeddings to current EMBEDDING_DIM.
- * Handles 384-dim (all-MiniLM-L6-v2, 1536 bytes) and 1024-dim (Jina v3, 4096 bytes).
- * Also handles any other non-matching dimension as a catch-all.
- * Runs once on startup after embedder is ready.
- */
-async function migrateEmbeddings() {
-  if (!db || !embedderReady) return;
-
-  const currentBytes = EMBEDDING_DIM * 4; // 3072 bytes for 768-dim
-
-  const oldNodes = db.prepare(`
-    SELECT id, content, name FROM nodes
-    WHERE embedding IS NOT NULL AND LENGTH(embedding) != ?
-    ORDER BY updated_at DESC
-  `).all(currentBytes);
-
-  if (oldNodes.length === 0) {
-    console.log("[brain] All embeddings match current dimension");
-    return;
-  }
-
-  console.log(`[brain] Migrating ${oldNodes.length} embeddings to ${EMBEDDING_DIM} dim (${currentBytes} bytes)...`);
-
-  // Batch-embed all texts at once to minimize WASM allocator pressure
-  const texts = oldNodes.map(node => {
-    try {
-      const content = JSON.parse(node.content || "{}");
-      return content.text || node.name;
-    } catch {
-      return node.name;
-    }
-  });
-
-  const embeddings = await embedBatch(texts);
-
-  let migrated = 0;
-  let failed = 0;
-
-  for (let i = 0; i < oldNodes.length; i++) {
-    const embedding = embeddings.get(texts[i]);
-    if (embedding) {
-      const embeddingBuffer = Buffer.from(embedding.buffer);
-      try {
-        db.prepare(`UPDATE nodes SET embedding = ?, updated_at = datetime('now') WHERE id = ?`).run(embeddingBuffer, oldNodes[i].id);
-        migrated++;
-      } catch (err) {
-        console.warn(`[brain] Migration DB update failed for ${oldNodes[i].id}: ${err.message}`);
-        failed++;
-      }
-    } else {
-      failed++;
-    }
-  }
-
-  console.log(`[brain] Migration complete: ${migrated} re-embedded, ${failed} failed`);
-
-  // Force WAL checkpoint after batch writes — prevents WAL bloat on large migrations
-  _walCheckpoint();
-
-  if (migrated > 0) {
-    // Update project exports that had migrated nodes
-    const projects = db.prepare(`SELECT DISTINCT project_id FROM nodes WHERE project_id IS NOT NULL`).all();
-    for (const p of projects) {
-      if (p.project_id) writeSearchExport(p.project_id);
-    }
-  }
 }
 
 /**

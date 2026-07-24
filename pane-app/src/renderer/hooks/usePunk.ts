@@ -1806,7 +1806,7 @@ function handlePunkMessage(
 
       if (
         evt.type === "content_block_delta" &&
-        evt.delta?.type === "text_delta" &&
+        evt.delta?.type === "signature_delta" &&
         evt.delta.signature
       ) {
         if (assistantMessageExists) {
