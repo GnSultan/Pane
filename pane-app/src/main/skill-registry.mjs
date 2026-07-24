@@ -572,9 +572,15 @@ export function getActiveSkillContext(projectId, projectRoot = null) {
 
     let block = `## Active Skill: ${name}\n\n${instructions}`;
 
-    // Include domain principles (playbook) if present
+    // Include domain principles (playbook) if present — capped like instructions
+    // above. Uncapped, a few active skills with sizeable playbooks compound every
+    // turn (skills don't auto-deactivate) and can push the system prompt well
+    // past what the guardrail's flat overhead assumption expects.
     if (body.playbook) {
-      block += `\n\n### Domain Principles for ${name}\n\n${body.playbook}`;
+      const playbook = body.playbook.length > 3000
+        ? body.playbook.slice(0, 3000) + "\n\n[...playbook truncated for context — use pane_skill_info for full content]"
+        : body.playbook;
+      block += `\n\n### Domain Principles for ${name}\n\n${playbook}`;
     }
 
     sections.push(block);

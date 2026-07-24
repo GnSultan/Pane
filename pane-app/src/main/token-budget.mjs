@@ -462,7 +462,7 @@ export const CACHE_TIERS = {
   SESSION_TIER_MAX_TOKENS: 6000,   // Max for session (symbols, memories)
   TURN_TIER_MAX_TOKENS: 3000,      // Max for per-turn dynamic content
   TIER1_MESSAGE_TOKENS: 15000,     // Rough: ~5 turns × 3K avg
-  TIER2_MESSAGE_TOKENS: 20000,     // Semantic pool: ~8 compressed turns × 2.5K
+  TIER2_MESSAGE_TOKENS: 40000,     // Semantic pool: ~15 compressed turns × 2.5K
 };
 
 /**
