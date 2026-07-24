@@ -666,6 +666,10 @@ export class ToolExecutor {
     this._quickCall = fn;
   }
 
+  setRunPunk(fn) {
+    this._runPunk = fn;
+  }
+
   setAgentCall(fn) {
     this._agentCall = fn;
   }
@@ -2744,6 +2748,93 @@ When you are done, return a summary with:
             { brainRequest: this._brainRequest },
           );
           return { success: true, output: result || "No relevant results found.", toolId };
+        }
+
+        case "pane_lens_findings": {
+          const action = (input?.action || "").trim();
+          if (!action) return { success: false, error: "Action is required: 'list', 'resolve', or 'run'.", toolId };
+
+          if (action === "list") {
+            // List all undismissed findings for this project, grouped by punk
+            if (!this._brainRequest) return { success: false, error: "Brain engine not available.", toolId };
+            try {
+              const result = await this._brainRequest("findings_list", {
+                projectId: this.projectId,
+                limit: 100,
+              });
+              const findings = result?.findings || [];
+              if (findings.length === 0) {
+                return { success: true, output: "No undismissed findings from any punk.", toolId };
+              }
+
+              // Group by punk
+              const byPunk = {};
+              for (const f of findings) {
+                if (!byPunk[f.punk]) byPunk[f.punk] = [];
+                byPunk[f.punk].push(f);
+              }
+
+              const sections = [];
+              for (const [punk, punkFindings] of Object.entries(byPunk)) {
+                const items = punkFindings.map(f => {
+                  let structured = {};
+                  try { structured = JSON.parse(f.structured || "{}"); } catch {}
+                  const loc = f.location ? ` @ ${f.location}` : "";
+                  const remediation = structured.remediation ? `\n   Fix: ${structured.remediation}` : "";
+                  return `  [${f.severity}] (id: ${f.id}) ${f.finding}${loc}${remediation}`;
+                }).join("\n\n");
+                sections.push(`## ${punk} (${punkFindings.length} finding${punkFindings.length > 1 ? "s" : ""})\n\n${items}`);
+              }
+
+              return { success: true, output: sections.join("\n\n"), toolId };
+            } catch (err) {
+              return { success: false, error: `Failed to list findings: ${err.message}`, toolId };
+            }
+          }
+
+          if (action === "resolve") {
+            const ids = input?.findingIds;
+            if (!Array.isArray(ids) || ids.length === 0) {
+              return { success: false, error: "findingIds array is required for resolve action.", toolId };
+            }
+            if (!this._brainRequest) return { success: false, error: "Brain engine not available.", toolId };
+
+            let resolved = 0;
+            let failed = 0;
+            for (const id of ids) {
+              try {
+                await this._brainRequest("finding_dismiss", { findingId: id });
+                resolved++;
+              } catch (err) {
+                console.warn(`[tool-executor] finding_dismiss failed for ${id}:`, err.message);
+                failed++;
+              }
+            }
+
+            const msg = `Resolved ${resolved} finding${resolved !== 1 ? "s" : ""}${failed > 0 ? `, ${failed} failed` : ""}.`;
+            return { success: true, output: msg, toolId };
+          }
+
+          if (action === "run") {
+            const punk = (input?.punk || "").trim();
+            if (!punk) return { success: false, error: "Punk name is required for run action (e.g. 'ghost', 'ash', 'sage').", toolId };
+            if (!this._runPunk) return { success: false, error: "Punk engine not available.", toolId };
+
+            // Fire-and-forget: the punk runs asynchronously and results arrive
+            // via pane://punk-complete events to the Lens UI. The model gets
+            // confirmation that the run was triggered.
+            try {
+              this._runPunk(punk, this.projectId, this.projectRoot, input?.task || null)
+                .catch(err => console.warn(`[tool-executor] punk ${punk} run failed:`, err.message));
+
+              const taskDesc = input?.task ? ` with task: "${input.task}"` : "";
+              return { success: true, output: `Triggered ${punk} punk${taskDesc}. Results will appear in Lens.`, toolId };
+            } catch (err) {
+              return { success: false, error: `Failed to trigger punk: ${err.message}`, toolId };
+            }
+          }
+
+          return { success: false, error: `Unknown action: ${action}. Use 'list', 'resolve', or 'run'.`, toolId };
         }
 
         case "pane_codebase_navigator": {

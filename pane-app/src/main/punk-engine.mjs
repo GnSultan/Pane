@@ -211,6 +211,13 @@ class PunkEngine {
     }
   }
 
+  setRunPunk(fn) {
+    this._runPunk = fn;
+    if (this.backends.api) {
+      this.backends.api.setRunPunk(fn);
+    }
+  }
+
   setBrainIndexer(fn) {    this._brainIndexer = fn;
   }
 

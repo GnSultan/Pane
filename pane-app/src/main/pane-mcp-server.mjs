@@ -352,6 +352,26 @@ const TOOLS = [
     },
   },
   {
+    name: "pane_lens_findings",
+    description: "Interact with Lens punk findings — the background code analysts. Use 'list' to read all undismissed findings grouped by punk. Use 'resolve' to mark findings as resolved after fixing them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["list", "resolve"],
+          description: "What to do: list findings or resolve them.",
+        },
+        findingIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Finding IDs to resolve (required when action is 'resolve').",
+        },
+      },
+      required: ["action"],
+    },
+  },
+  {
     name: "pane_profile",
     description: "View the user's profile — explicit rules, learned preferences, design philosophy, and known anti-patterns. Call this when you need to understand how the user likes to work before proposing an approach, or when their preferences are directly relevant to the task. Rules in this profile are binding.",
     inputSchema: { type: "object", properties: {} },
@@ -965,6 +985,62 @@ async function handleToolCall(name, args) {
         JSON.stringify(event) + "\n",
       );
       return text(`Saved to project memory: [${event.type}] ${event.content}`);
+    }
+
+    case "pane_lens_findings": {
+      const action = (args?.action || "").trim();
+      if (!action) return text("Action is required: 'list' or 'resolve'.");
+
+      const db = getDb();
+      if (!db) return text("Database not available — cannot access findings.");
+
+      if (action === "list") {
+        const findings = db.prepare(`
+          SELECT * FROM punk_findings
+          WHERE project_id = ? AND dismissed = 0
+          ORDER BY created_at DESC
+          LIMIT 100
+        `).all(PROJECT_ID);
+
+        if (findings.length === 0) return text("No undismissed findings from any punk.");
+
+        // Group by punk
+        const byPunk = {};
+        for (const f of findings) {
+          if (!byPunk[f.punk]) byPunk[f.punk] = [];
+          byPunk[f.punk].push(f);
+        }
+
+        const sections = [];
+        for (const [punk, punkFindings] of Object.entries(byPunk)) {
+          const items = punkFindings.map(f => {
+            let structured = {};
+            try { structured = JSON.parse(f.structured || "{}"); } catch { /* malformed structured JSON — ignore */ }
+            const loc = f.location ? ` @ ${f.location}` : "";
+            const remediation = structured.remediation ? `\n   Fix: ${structured.remediation}` : "";
+            return `  [${f.severity}] (id: ${f.id}) ${f.finding}${loc}${remediation}`;
+          }).join("\n\n");
+          sections.push(`## ${punk} (${punkFindings.length} finding${punkFindings.length > 1 ? "s" : ""})\n\n${items}`);
+        }
+
+        return text(sections.join("\n\n"));
+      }
+
+      if (action === "resolve") {
+        const ids = args?.findingIds;
+        if (!Array.isArray(ids) || ids.length === 0) return text("findingIds array is required for resolve action.");
+
+        let resolved = 0;
+        const dismiss = db.prepare(`UPDATE punk_findings SET dismissed = 1 WHERE id = ?`);
+        for (const id of ids) {
+          const result = dismiss.run(id);
+          if (result.changes > 0) resolved++;
+        }
+
+        return text(`Resolved ${resolved} finding${resolved !== 1 ? "s" : ""}.`);
+      }
+
+      return text(`Unknown action: ${action}. Use 'list' or 'resolve'.`);
     }
 
     case "pane_brief": {
