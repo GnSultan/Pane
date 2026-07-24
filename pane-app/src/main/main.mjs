@@ -12,6 +12,7 @@ import windowStateKeeper from "electron-window-state";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
+import { validateFilePath, validateDirectoryPath, validateProjectId } from "./path-guard.mjs";
 
 // ── FD Repair for macOS packaged app ─────────────────────────────────────
 // When Pane is launched as a macOS .app bundle (even from terminal via
@@ -342,6 +343,8 @@ function registerCommandHandlers() {
     return result;
   });
   ipcMain.handle("read_file", async (_event, args) => {
+    const guard = validateFilePath(args.path);
+    if (!guard.ok) throw new Error(guard.error);
     const stat = await fs.promises.stat(args.path);
     if (stat.size > 5 * 1024 * 1024) {
       throw new Error("File too large (>5MB)");
@@ -356,6 +359,8 @@ function registerCommandHandlers() {
     return buffer.toString("utf-8").replace(/\0+$/, "");
   });
   ipcMain.handle("write_file", async (_event, args) => {
+    const guard = validateFilePath(args.path);
+    if (!guard.ok) throw new Error(guard.error);
     await fs.promises.mkdir(path.dirname(args.path), { recursive: true });
     // Using 'w' flag explicitly to ensure truncation, though writeFile default is 'w'
     await fs.promises.writeFile(args.path, args.content, { encoding: "utf-8", flag: "w" });
@@ -387,9 +392,15 @@ function registerCommandHandlers() {
     }
   });
   ipcMain.handle("rename_file", async (_event, args) => {
+    const guardOld = validateFilePath(args.oldPath);
+    if (!guardOld.ok) throw new Error(`rename_file source: ${guardOld.error}`);
+    const guardNew = validateFilePath(args.newPath);
+    if (!guardNew.ok) throw new Error(`rename_file target: ${guardNew.error}`);
     await fs.promises.rename(args.oldPath, args.newPath);
   });
   ipcMain.handle("delete_file", async (_event, args) => {
+    const guard = validateFilePath(args.path);
+    if (!guard.ok) throw new Error(guard.error);
     // Move to Trash instead of permanent deletion.
     // Route through cmd-worker (utility process) to avoid SyncProcessRunner crash.
     const escapedPath = args.path.replace(/'/g, "'\\''");
@@ -829,6 +840,8 @@ Improvements
     const resolved = dirPath.startsWith("~/")
       ? path.join(os.homedir(), dirPath.slice(2))
       : dirPath;
+    const guard = validateDirectoryPath(resolved);
+    if (!guard.ok) throw new Error(guard.error);
     await fs.promises.mkdir(resolved, { recursive: true });
     return resolved;
   });
@@ -1643,6 +1656,8 @@ function registerMemoryHandlers() {
   const MEMORY_MAX_EVENTS = 500;
 
   function memoryDir(projectId) {
+    const guard = validateProjectId(projectId);
+    if (!guard.ok) throw new Error(`memoryDir: ${guard.error}`);
     return path.join(os.homedir(), ".pane", "memory", projectId);
   }
 
@@ -2515,6 +2530,11 @@ app.whenReady().then(async () => {
     agentCall: (sys, prompt, workingDir, options) => punkEngine.agentCall(sys, prompt, workingDir, options),
     sendToRenderer,
   });
+
+  // Wire punk runner into tool executor chain so pane_lens_findings can trigger punks
+  punkEngine.setRunPunk((punkName, projectId, workingDir, scope) =>
+    mindPunks.runSinglePunk(punkName, projectId, workingDir, scope)
+  );
 
   // Doc punk: nightly documentation drafter
   docPunk = new DocPunk({
