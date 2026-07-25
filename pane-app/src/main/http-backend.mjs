@@ -5294,7 +5294,20 @@ export class ApiBackend extends PunkBackend {
         // The cache_control format is identical — only the beta flags differ.
         // The original 400 error was from cache_control being added WITHOUT the
         // correct OAuth beta flag, not from cache_control itself being rejected.
+        //
+        // CRITICAL: Anthropic processes blocks in order: tools → system → messages.
+        // cache_control TTLs must be in DESCENDING order — a longer TTL must never
+        // come after a shorter one. So if the frozen system tier uses ttl="1h",
+        // the tools breakpoint must also use ttl="1h" (or no cache_control at all).
+        // Otherwise: HTTP 400 "a ttl='1h' cache_control block must not come after
+        // a ttl='5m' cache_control block".
         {
+          // Determine whether the frozen tier will use a 1h TTL.
+          // When extended-cache-ttl is available (OAuth), frozen gets "1h".
+          // API-key only has the default 5m ephemeral cache.
+          const frozenUses1h = isOAuth && systemTiers?.frozen;
+          const toolsTtl = frozenUses1h ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" };
+
           // Top-level auto-caching: automatically caches the last block of
           // the last message, handling conversation prefix caching without
           // manual breakpoints.
@@ -5304,7 +5317,7 @@ export class ApiBackend extends PunkBackend {
           if (anthropicBody.tools?.length > 0) {
             const lastTool = anthropicBody.tools[anthropicBody.tools.length - 1];
             if (typeof lastTool === "object") {
-              lastTool.cache_control = { type: "ephemeral" };
+              lastTool.cache_control = toolsTtl;
             }
           }
         }
@@ -5317,15 +5330,18 @@ export class ApiBackend extends PunkBackend {
           if (systemTiers && systemTiers.frozen) {
             const tiers = systemTiers;
             const blocks = [];
-            // Frozen tier — 1-hour cache (biggest win, survives user breaks)
-            // OAuth supports caching via prompt-caching-scope-2026-01-05 +
-            // extended-cache-ttl-2025-04-11 betas. The cache_control format is
-            // the same for both API-key and OAuth — only the beta flag differs.
+            // Frozen tier — 1-hour cache when extended-cache-ttl beta is available
+            // (OAuth only). API-key lacks the beta, so it gets the default 5m.
+            // TTL must not exceed any preceding breakpoint (tools uses the same
+            // ttl when this is 1h — see tools breakpoint logic above).
             if (tiers.frozen) {
+              const frozenCc = isOAuth
+                ? { type: "ephemeral", ttl: "1h" }
+                : { type: "ephemeral" };
               blocks.push({
                 type: "text",
                 text: tiers.frozen,
-                cache_control: { type: "ephemeral", ttl: "1h" },
+                cache_control: frozenCc,
               });
             }
             // Session tier — 5-min cache (changes on scope change)
