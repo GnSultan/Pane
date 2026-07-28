@@ -157,7 +157,7 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       return "plan";
     case "Task":
     case "agent":
-      return (input.description as string) || (input.prompt as string) || "subagent";
+      return (input.task as string) || (input.description as string) || (input.prompt as string) || "task";
     case "WebSearch":
     case "google_web_search":
       return (input.query as string) || "";
@@ -201,7 +201,7 @@ function getToolLabel(name: string): string {
     case "Bash":
     case "run_shell_command": return "bash";
     case "Task":
-    case "agent": return "agent";
+    case "agent": return "task";
     case "pane_plan": return "pane";
     case "Plan": return "plan";
     case "WebSearch":

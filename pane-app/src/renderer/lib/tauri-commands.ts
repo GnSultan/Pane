@@ -279,6 +279,7 @@ export interface UserSettings {
   theme: string | null;
   panel_width: number | null;
   completion_sound: string | null;
+  sidebar_collapsed: boolean | null;
   selected_model: string | null;
   selected_model_provider?: string;
   punk_backend: string;

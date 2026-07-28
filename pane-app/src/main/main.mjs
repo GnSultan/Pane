@@ -1039,6 +1039,7 @@ const defaultSettings = {
   http_base_urls: {},
   selected_model: null,
   completion_sound: null,
+  sidebar_collapsed: false,
   intent_routing: null,
   intent_auto_route: true,
 };

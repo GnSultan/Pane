@@ -40,6 +40,7 @@ interface WorkspaceState {
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
   selectedModelProvider: string; // The provider for the current model
   selectedModelThinking: boolean;
+  sidebarCollapsed: boolean;
   punkBackend: string; // Always "api" — kept for backward compatibility
   httpProvider: string; // "deepseek" | "kimi" | "anthropic" | etc.
   httpApiKeys: Record<string, string>;
@@ -99,6 +100,8 @@ interface WorkspaceState {
   setTheme: (theme: Theme) => void;
   setCompletionSound: (sound: string) => void;
   playCompletionSound: () => void;
+  toggleSidebar: () => void;
+  setSidebarCollapsed: (collapsed: boolean) => void;
   setSelectedModel: (
     model: string,
     thinking?: boolean,
@@ -199,6 +202,7 @@ function createWorkspaceStore() {
     selectedModel: "stepfun/step-3.5-flash:free",
     selectedModelProvider: "openrouter",
     selectedModelThinking: true,
+    sidebarCollapsed: false,
     punkBackend: "api",
     httpProvider: "openrouter",
     httpApiKeys: {},
@@ -405,6 +409,8 @@ function createWorkspaceStore() {
         sound: completionSound,
       });
     },
+    toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
+    setSidebarCollapsed: (collapsed: boolean) => set({ sidebarCollapsed: collapsed }),
     setSelectedModel: (
       model: string,
       thinking: boolean = false,

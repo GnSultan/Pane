@@ -1,6 +1,7 @@
 import { useEffect, useCallback } from "react";
 import { ProjectList } from "./ProjectList";
 import { useProjectsStore } from "../../stores/projects";
+import { useWorkspaceStore } from "../../stores/workspace";
 import { Menu, type PaneMode } from "./Menu";
 
 // --- ThreadPanel ---
@@ -8,6 +9,8 @@ import { Menu, type PaneMode } from "./Menu";
 export function ThreadPanel() {
   const activeProjectId = useProjectsStore((s) => s.activeProjectId);
   const setMode = useProjectsStore((s) => s.setMode);
+  const sidebarCollapsed = useWorkspaceStore((s) => s.sidebarCollapsed);
+  const toggleSidebar = useWorkspaceStore((s) => s.toggleSidebar);
 
   const mode = useProjectsStore((s) => {
     if (!s.activeProjectId) return "conversation" as const;
@@ -43,7 +46,7 @@ export function ThreadPanel() {
 
   return (
     <div
-      className="no-select flex flex-col h-full rounded-xl font-panel outline-none relative bg-pane-bg overflow-hidden ring-1 ring-pane-border/40"
+      className="no-select flex flex-col h-full rounded-xl font-panel outline-none relative bg-pane-bg overflow-hidden ring-1 ring-inset ring-pane-border/40 w-80"
       data-panel="thread"
       tabIndex={0}
     >
@@ -53,15 +56,38 @@ export function ThreadPanel() {
         <ProjectList />
       </div>
 
-      {/* Menu — overlaid at the bottom, floats over the content surface.
+      {/* Bottom bar — Menu on the left, collapse toggle on the right.
            px-1.5 pb-1.5 matches the InputBar '+' attach button padding (p-1.5). */}
-      <div className="absolute bottom-0 left-0 right-0 px-1.5 pb-1.5">
+      <div className="absolute bottom-0 left-0 right-0 px-1.5 pb-1.5 flex items-end justify-between">
         <Menu
           currentMode={mode}
           isGitRepo={isGitRepo}
           hasUnreadLens={hasUnreadLens}
           onSelectMode={handleSetMode}
         />
+        {/* Sidebar collapse toggle — bare glyph with no chrome. Low opacity until you look for it. */}
+        <button
+          onClick={toggleSidebar}
+          className="pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md text-pane-text-secondary/35 hover:text-pane-text-secondary/70 transition-colors btn-press shrink-0"
+          title={sidebarCollapsed ? "Show threads" : "Hide threads"}
+        >
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            style={{
+              transform: sidebarCollapsed ? "rotate(0deg)" : "rotate(180deg)",
+              transition: "transform 200ms ease-out",
+            }}
+          >
+            <path d="M10 4 6 8l4 4" />
+          </svg>
+        </button>
       </div>
     </div>
   );
