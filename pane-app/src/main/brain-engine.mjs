@@ -2214,6 +2214,125 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
+      case "update_memory": {
+        // Memory self-correction: rewrite an existing memory's content.
+        // The model calls this when it discovers something that refines or
+        // contradicts a prior memory. Saves the old version to node_versions,
+        // then updates the node in place with new content + fresh embedding.
+        try {
+          const { projectId, content: oldContent, newContent, type } = data;
+          if (!projectId || !oldContent || !newContent) {
+            sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: "Missing required fields (projectId, content, newContent)" });
+            break;
+          }
+
+          // Find the node by content substring match — the model provides
+          // the approximate old content it's correcting.
+          const nodeType = type || null;
+          const searchClause = nodeType
+            ? "AND entity_type = ?"
+            : "";
+          const params = nodeType
+            ? [projectId, `%${oldContent.slice(0, 60)}%`, nodeType]
+            : [projectId, `%${oldContent.slice(0, 60)}%`];
+          const nodes = db.prepare(
+            `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`
+          ).all(...params);
+
+          if (nodes.length === 0) {
+            sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: "No existing memory matching that content found." });
+            break;
+          }
+
+          const node = nodes[0];
+          // Save old version for audit trail
+          db._stmts.insertVersion.run(
+            node.id, node.version, node.content, node.confidence,
+            "memory_updated", `Old content replaced with refined version`,
+          );
+
+          // Re-embed the new content if embedder is ready
+          let embeddingBuffer = null;
+          if (embedderReady) {
+            const newEmbedding = await embed(newContent);
+            if (newEmbedding) {
+              embeddingBuffer = Buffer.from(newEmbedding.buffer);
+            }
+          }
+
+          // Update the node in place — preserve existing metadata
+          let oldParsed = {};
+          try { oldParsed = JSON.parse(node.content || "{}"); } catch (e) { /* malformed JSON in node.content, start fresh */ }
+          const mergedMetadata = {
+            ...(oldParsed.metadata || {}),
+            updated: true,
+            updated_at: new Date().toISOString(),
+          };
+          db._stmts.updateNodeVersion.run(
+            node.confidence, // Keep confidence
+            JSON.stringify({ text: newContent, metadata: mergedMetadata }),
+            node.id,
+          );
+
+          // Update embedding if we got a new one
+          if (embeddingBuffer) {
+            db.prepare("UPDATE nodes SET embedding = ? WHERE id = ?").run(embeddingBuffer, node.id);
+          }
+
+          console.log(`[brain] Memory updated: ${node.id} (${node.entity_type})`);
+          sendToMain({ type: "update_memory_result", requestId: data.requestId, success: true, nodeId: node.id, oldType: node.entity_type });
+        } catch (err) {
+          console.warn(`[brain] update_memory failed: ${err.message}`);
+          sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: err.message });
+        }
+        break;
+      }
+
+      case "delete_memory": {
+        // Memory self-correction: remove a memory that's obsolete or wrong.
+        // The model calls this when a prior observation turns out to be
+        // incorrect or no longer relevant. Removes the node, its versions,
+        // and its edges.
+        try {
+          const { projectId, content, type } = data;
+          if (!projectId || !content) {
+            sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: "Missing required fields (projectId, content)" });
+            break;
+          }
+
+          const nodeType = type || null;
+          const searchClause = nodeType
+            ? "AND entity_type = ?"
+            : "";
+          const params = nodeType
+            ? [projectId, `%${content.slice(0, 60)}%`, nodeType]
+            : [projectId, `%${content.slice(0, 60)}%`];
+          const nodes = db.prepare(
+            `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`
+          ).all(...params);
+
+          if (nodes.length === 0) {
+            sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: "No existing memory matching that content found." });
+            break;
+          }
+
+          const node = nodes[0];
+          // Delete edges referencing this node
+          db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(node.id, node.id);
+          // Delete version history
+          db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(node.id);
+          // Delete the node
+          db.prepare("DELETE FROM nodes WHERE id = ?").run(node.id);
+
+          console.log(`[brain] Memory deleted: ${node.id} (${node.entity_type})`);
+          sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: true, nodeId: node.id, deletedType: node.entity_type });
+        } catch (err) {
+          console.warn(`[brain] delete_memory failed: ${err.message}`);
+          sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: err.message });
+        }
+        break;
+      }
+
       case "contextual_search": {
         const result = await writeContextualExport(data.projectId, data.query, data.fileContext, data.intent, data.projectRoot || null, data.taskType || null, data.atomHints || [], data.projectWhy || "");
         sendToMain({ type: "contextual_result", requestId: data.requestId, ...result });

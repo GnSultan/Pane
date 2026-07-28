@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect } from "react";
+import { lineDiff, type DiffLine } from "../../lib/diff";
 import type {
   ToolUseBlock,
   ToolResultBlock,
@@ -105,6 +106,14 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
         return s ? `architecture ${s}` : "architecture brief";
       }
       case "pane_revert_change": return "revert";
+      case "pane_update_memory": {
+        const c = (input.content as string) || "";
+        return c ? `update memory ${c.slice(0, 40)}` : "update memory";
+      }
+      case "pane_delete_memory": {
+        const c = (input.content as string) || "";
+        return c ? `delete memory ${c.slice(0, 40)}` : "delete memory";
+      }
       default:
         return name.slice(5).replace(/_/g, " ");
     }
@@ -234,8 +243,9 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
   const lang = useMemo(() => detectLanguage(filePath), [filePath]);
 
   // Two-phase rendering:
-  // Phase 1: replacement hasn't started → old code as plain document (no strikethrough)
-  // Phase 2: new_string is streaming → old code struck through, new code streams in
+  // Phase 1: replacement hasn't started → old code as plain document (no decoration)
+  // Phase 2: new_string is streaming → compute line-level diff so only actual
+  //          changes are highlighted, context lines stay at full opacity
   const isReplacing = newStr.length > 0;
 
   // ── Phase 1 debounce: old code should materialize fully formed ──
@@ -247,7 +257,7 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
 
   useEffect(() => {
     if (isReplacing) {
-      // Phase 2: old code is complete — show it immediately (struck through)
+      // Phase 2: old code is complete — show it immediately
       setDisplayOldStr(oldStr);
     } else {
       // Phase 1: debounce — old code is still streaming in via partial JSON
@@ -266,9 +276,12 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
     }
   }, [newStr, isReplacing]);
 
-  // Compute lines for both phases (must be before any early return — Rules of Hooks)
-  const oldLines = useMemo(() => (oldStr ? oldStr.split("\n") : []), [oldStr]);
-  const newLines = useMemo(() => (newStr ? newStr.split("\n") : []), [newStr]);
+  // ── Phase 2: Diff-based replacement rendering ──
+  // Computed unconditionally (hooks can't be called after an early return).
+  // Compute a line-level diff so only changed lines are marked. Context lines
+  // (unchanged) render at full opacity with no decoration. Removed lines get
+  // strikethrough + deletion tint. Added lines get an addition tint.
+  const diffLines = useMemo(() => lineDiff(oldStr, newStr), [oldStr, newStr]);
 
   // ── Phase 1: Old code rendered as it appears in the actual document ──
   // Uses debounced displayOldStr — code appears fully formed, not typed out
@@ -283,7 +296,6 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
         <div className="px-4 py-4 space-y-0">
           {displayLines.map((line, i) => (
             <div key={i} className="whitespace-pre-wrap break-words flex gap-3">
-              {/* Line number — matches file viewer style */}
               <span
                 className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
                 style={{
@@ -294,7 +306,6 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
               >
                 {fileStartLine + i}
               </span>
-              {/* Code — full opacity, no strikethrough, syntax highlighted */}
               <span>
                 {line.length > 0
                   ? renderHighlightedCode(line, lang)
@@ -307,10 +318,7 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
     );
   }
 
-  // ── Phase 2: Replacement streaming ──
-  // Old lines: instantly struck through, full opacity — they're in the file, always there
-  // New lines: stream in below, full opacity — the replacement arriving
-  if (oldLines.length === 0 && newLines.length === 0) return null;
+  if (diffLines.length === 0) return null;
 
   return (
     <div
@@ -319,56 +327,75 @@ export function ExpandedEditInput({ input, result }: { input: Record<string, unk
       style={{ fontSize: "calc(var(--pane-font-size) - 2px)" }}
     >
       <div className="px-4 py-4 space-y-0">
-        {/* Struck-through old lines — always there, full opacity */}
-        {oldLines.map((line, i) => (
-          <div
-            key={`old-${i}`}
-            className="whitespace-pre-wrap break-words flex gap-3"
-            style={{ opacity: 0.75 }}
-          >
-            <span
-              className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
-              style={{
-                width: "3em",
-                opacity: 0.4,
-                fontSize: "calc(var(--pane-font-size) - 2px)",
-              }}
+        {diffLines.map((dl: DiffLine, i: number) => {
+          // Compute the line number to display in the gutter.
+          // For equal/remove lines, use the old file position (where the user
+          // would see it). For add lines, use the new position.
+          const lineNum = dl.oldLine !== null
+            ? fileStartLine + dl.oldLine - 1
+            : (dl.newLine !== null ? fileStartLine + dl.newLine - 1 : "");
+
+          if (dl.type === "equal") {
+            return (
+              <div key={i} className="whitespace-pre-wrap break-words flex gap-3">
+                <span
+                  className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
+                  style={{ width: "3em", opacity: 0.4, fontSize: "calc(var(--pane-font-size) - 2px)" }}
+                >
+                  {lineNum}
+                </span>
+                <span>
+                  {dl.text.length > 0
+                    ? renderHighlightedCode(dl.text, lang)
+                    : <>&nbsp;</>}
+                </span>
+              </div>
+            );
+          }
+
+          if (dl.type === "remove") {
+            return (
+              <div
+                key={i}
+                className="whitespace-pre-wrap break-words flex gap-3"
+                style={{ background: "var(--pane-status-deleted-bg, rgba(166, 114, 114, 0.08))" }}
+              >
+                <span
+                  className="select-none shrink-0 text-right tracking-wider"
+                  style={{ width: "3em", opacity: 0.4, fontSize: "calc(var(--pane-font-size) - 2px)" }}
+                >
+                  {lineNum}
+                </span>
+                <span>
+                  {dl.text.length > 0
+                    ? renderHighlightedCode(dl.text, lang)
+                    : <>&nbsp;</>}
+                </span>
+              </div>
+            );
+          }
+
+          // add
+          return (
+            <div
+              key={i}
+              className="whitespace-pre-wrap break-words flex gap-3"
+              style={{ background: "var(--pane-status-added-bg, rgba(138, 154, 108, 0.1))" }}
             >
-              {fileStartLine + i}
-            </span>
-            <span
-              className="line-through"
-              style={{ textDecorationColor: "var(--pane-error)" }}
-            >
-              {line.length > 0
-                ? renderHighlightedCode(line, lang)
-                : <>&nbsp;</>}
-            </span>
-          </div>
-        ))}
-        {/* Streaming new lines — full opacity, sequential line numbers from start position */}
-        {newLines.map((line, i) => (
-          <div
-            key={`new-${i}`}
-            className="whitespace-pre-wrap break-words flex gap-3"
-          >
-            <span
-              className="select-none shrink-0 text-right text-pane-text-secondary tracking-wider"
-              style={{
-                width: "3em",
-                opacity: 0.4,
-                fontSize: "calc(var(--pane-font-size) - 2px)",
-              }}
-            >
-              {fileStartLine + i}
-            </span>
-            <span>
-              {line.length > 0
-                ? renderHighlightedCode(line, lang)
-                : <>&nbsp;</>}
-            </span>
-          </div>
-        ))}
+              <span
+                className="select-none shrink-0 text-right tracking-wider"
+                style={{ width: "3em", opacity: 0.4, fontSize: "calc(var(--pane-font-size) - 2px)" }}
+              >
+                {lineNum}
+              </span>
+              <span>
+                {dl.text.length > 0
+                  ? renderHighlightedCode(dl.text, lang)
+                  : <>&nbsp;</>}
+              </span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

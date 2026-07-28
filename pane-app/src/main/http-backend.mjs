@@ -43,6 +43,7 @@ import {
 
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 import { runTurnSentinel, recordQualityMetric, runDeepReview, saveDeepReview } from "./code-arbiter.mjs";
+import { recordActivity } from "./intents.mjs";
 import { getAccessToken, getOAuthHeaders, getOAuthApiUrl, hasOAuthCredentials, invalidateCache } from "./claude-oauth.mjs";
 import { buildBillingHeaderValue } from "./claude-signing.mjs";
 
@@ -413,6 +414,56 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ["type", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_update_memory",
+      description:
+        "Update an existing memory with refined or corrected content. Use when you discover something that refines, contradicts, or supersedes a prior memory — rewrite it instead of adding a duplicate. Always search first (pane_recall) to find the exact old content before updating. This keeps memory self-correcting instead of accumulating contradictions.",
+      parameters: {
+        type: "object",
+        properties: {
+          type: {
+            type: "string",
+            enum: ["decision", "lesson", "pattern", "error_fix"],
+            description: "Category of the memory being updated",
+          },
+          content: {
+            type: "string",
+            description: "The approximate existing content to find and replace. Provide enough to uniquely identify the memory.",
+          },
+          newContent: {
+            type: "string",
+            description: "The refined content that replaces the old memory.",
+          },
+        },
+        required: ["content", "newContent"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_delete_memory",
+      description:
+        "Delete a memory that is obsolete, incorrect, or no longer relevant. Use when a prior observation turns out to be wrong, or when a memory has been fully superseded and keeping it would create noise. Always search first (pane_recall) to confirm the memory exists before deleting.",
+      parameters: {
+        type: "object",
+        properties: {
+          type: {
+            type: "string",
+            enum: ["decision", "lesson", "pattern", "error_fix"],
+            description: "Category of the memory being deleted",
+          },
+          content: {
+            type: "string",
+            description: "The approximate content of the memory to delete. Provide enough to uniquely identify it.",
+          },
+        },
+        required: ["content"],
       },
     },
   },
@@ -1001,7 +1052,7 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_check_intents",
       description:
-        "Check whether other threads are actively working on files in this project. Returns a list of active intents (file touches) from peer threads on the same project root. Use before editing a file to avoid colliding with another agent's in-progress work.",
+        "Check whether other threads are actively working on this project root. Returns a summary of peer thread activity — what they're working on, tools they're using, files they've touched. Use before editing a file to avoid colliding with another agent's in-progress work.",
       parameters: {
         type: "object",
         properties: {
@@ -1144,6 +1195,8 @@ const WRITE_TOOL_NAMES = new Set([
   "replace",
   "pane_revert_change",
   "pane_remember",
+  "pane_update_memory",
+  "pane_delete_memory",
   "pane_set_rule",
   "pane_set_philosophy",
   "pane_set_about",
@@ -2330,6 +2383,34 @@ export class ApiBackend extends PunkBackend {
         }
       }
 
+      // ── Proactive Memory Retrieval ──
+      // The model shouldn't have to remember to search memory — the system
+      // does it structurally. Search the brain for memories relevant to the
+      // user's prompt and inject them into the session tier BEFORE the model
+      // starts reasoning. This is the difference between passive memory
+      // (waiting to be asked) and active memory (surfacing itself).
+      let proactiveMemories = null;
+      if (this._brainRequest && request.prompt) {
+        try {
+          const memResult = await Promise.race([
+            this._brainRequest("search", { query: request.prompt, projectId: request.projectId, limit: 5 }),
+            new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 1500)),
+          ]);
+          const memories = (memResult?.results || []).filter(r => r.score > 0.35);
+          if (memories.length > 0) {
+            const lines = ["[Pane Memory — proactively surfaced for this task]"];
+            for (const m of memories) {
+              lines.push(`- [${m.type}] ${m.content}`);
+            }
+            lines.push("[Consider these when working. Use pane_recall for deeper search.]");
+            proactiveMemories = lines.join("\n");
+          }
+        } catch (err) {
+          // Non-fatal — proactive retrieval is a bonus, not a dependency
+          console.warn(`[http] proactive memory retrieval failed: ${err.message}`);
+        }
+      }
+
       // ── Fetch & embed turn summaries (needed for session tier semantic pool) ──
       // Moved up to run before orchestrator so the semantic pool can be injected
       // into systemTiers.session. Reuses the same queryEmbB64 computed above.
@@ -2409,6 +2490,19 @@ export class ApiBackend extends PunkBackend {
       if (request.escalationHint) {
         systemPrompt += `\n\n${request.escalationHint}`;
         if (systemTiers) systemTiers.turn += `\n\n${request.escalationHint}`;
+      }
+
+      // ── Inject proactive memories into session tier ──
+      // These are brain memories that were proactively retrieved above based
+      // on the user's prompt. They go into the session tier alongside the
+      // semantic turn pool so both are available during tool-call loops.
+      if (proactiveMemories) {
+        if (systemTiers) {
+          systemTiers.session = (systemTiers.session || "") + "\n\n" + proactiveMemories;
+        }
+        // Always inject into systemPrompt — even if tiers aren't available
+        // (e.g. systemPromptOverride path, or orchestrator didn't expose tiers).
+        systemPrompt += "\n\n" + proactiveMemories;
       }
 
       // ── Inject semantic turn pool into session tier ──
@@ -2648,6 +2742,18 @@ export class ApiBackend extends PunkBackend {
 
       // Journal the new user message (the one we just pushed)
       journal.append(messages[messages.length - 1]);
+
+      // ── Cross-thread activity heartbeat ──
+      // Record a turn_start activity so peer threads on the same root can
+      // see this thread is active and what it's working on. This fires on
+      // every turn, not just file writes — an agent that's only reading or
+      // planning still shows up to peers.
+      try {
+        recordActivity(request.projectId, {
+          activityType: "turn_start",
+          detail: (request.prompt || "").slice(0, 200),
+        });
+      } catch {}
 
       let turn = 0;
       const maxTurns = 500;

@@ -25,7 +25,7 @@ import { replay as replayJournal, readLastProgress } from "./session-journal.mjs
 import { sanitizeString } from "./sanitize.mjs";
 import { validateCommand, hasWriteIntent } from "./command-validator.mjs";
 import { readFileForJournal, snapshotAllFiles, flushJournal } from "./checkpoint-engine.mjs";
-import { recordIntent, checkConflict, readPeerIntents } from "./intents.mjs";
+import { recordIntent, recordActivity, checkConflict, readPeerIntents, readPeerActivityGrouped } from "./intents.mjs";
 import {
   activateSkill,
   deactivateSkill,
@@ -1645,6 +1645,28 @@ export class ToolExecutor {
     };
 
     try {
+      // ── Cross-thread activity awareness ──
+      // Record tool calls so peer threads on the same root can see this
+      // thread is active and what it's working on. We don't record file
+      // writes here — those go through executeWriteFile/executeReplace
+      // which call recordIntent (which calls recordActivity with file_write).
+      // Skip noise: pane_check_intents, pane_checkpoint, Task, ask_user —
+      // these don't represent file/code activity.
+      {
+        const _skipActivity = new Set(["pane_check_intents", "pane_checkpoint", "Task", "ask_user"]);
+        if (!_skipActivity.has(toolName)) {
+          const _fileArg = input?.file_path || input?.path || input?.dir_path || null;
+          const _filesArg = Array.isArray(input?.paths) ? input.paths : null;
+          recordActivity(this.projectId, {
+            activityType: "tool_call",
+            tool: toolName,
+            file: _fileArg,
+            files: _filesArg,
+            detail: _fileArg ? null : (input?.command || input?.pattern || input?.query || input?.description || null),
+          });
+        }
+      }
+
       switch (toolName) {
         case "pane_codebase_compass": {
           if (!this._brainRequest) return { success: false, error: "Brain worker not available for codebase compass.", toolId };
@@ -1877,6 +1899,108 @@ export class ToolExecutor {
           }
           const tagNote = skillTags.length > 0 ? ` [skills: ${skillTags.join(", ")}]` : "";
           return { success: true, output: `Saved to project memory: [${event.type}] ${event.content}${tagNote}`, toolId };
+        }
+
+        case "pane_update_memory": {
+          const { content: oldContent, newContent, type } = input;
+          if (!oldContent) return { success: false, error: "Content of the memory to update is required.", toolId };
+          if (!newContent) return { success: false, error: "New content is required.", toolId };
+
+          // Update in brain knowledge graph via IPC
+          if (this._brainRequest) {
+            try {
+              const result = await Promise.race([
+                this._brainRequest("update_memory", {
+                  projectId: this.projectId,
+                  content: oldContent,
+                  newContent,
+                  type: type || null,
+                }),
+                new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 5000)),
+              ]);
+              if (!result?.success) {
+                return { success: false, error: result?.error || "Memory update failed in brain engine.", toolId };
+              }
+
+              // Also update events.jsonl so the file-based fallback stays in sync
+              const eventsPath = path.join(memoryDir, "events.jsonl");
+              try {
+                const raw = await fsPromises.readFile(eventsPath, "utf-8");
+                const lines = raw.trim().split("\n");
+                let updated = 0;
+                const updatedLines = lines.map(line => {
+                  try {
+                    const e = JSON.parse(line);
+                    if (e.content && e.content.includes(oldContent.slice(0, 40))) {
+                      e.content = newContent;
+                      e.metadata = { ...(e.metadata || {}), updated: true, updated_at: new Date().toISOString() };
+                      updated++;
+                    }
+                    return JSON.stringify(e);
+                  } catch { return line; }
+                });
+                if (updated > 0) {
+                  await fsPromises.writeFile(eventsPath, updatedLines.join("\n") + "\n");
+                }
+              } catch (e) { console.warn("[pane_update_memory] events.jsonl sync failed:", e.message); }
+
+              return {
+                success: true,
+                output: `Memory updated: [${type || "memory"}] replaced "${oldContent.slice(0, 60)}..." with refined content.`,
+                toolId,
+              };
+            } catch (err) {
+              return { success: false, error: `Memory update failed: ${err.message}`, toolId };
+            }
+          }
+          return { success: false, error: "Brain engine not available — cannot update memory.", toolId };
+        }
+
+        case "pane_delete_memory": {
+          const { content: memContent, type } = input;
+          if (!memContent) return { success: false, error: "Content of the memory to delete is required.", toolId };
+
+          // Delete from brain knowledge graph via IPC
+          if (this._brainRequest) {
+            try {
+              const result = await Promise.race([
+                this._brainRequest("delete_memory", {
+                  projectId: this.projectId,
+                  content: memContent,
+                  type: type || null,
+                }),
+                new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 5000)),
+              ]);
+              if (!result?.success) {
+                return { success: false, error: result?.error || "Memory deletion failed in brain engine.", toolId };
+              }
+
+              // Also remove from events.jsonl to keep the file-based fallback in sync
+              const eventsPath = path.join(memoryDir, "events.jsonl");
+              try {
+                const raw = await fsPromises.readFile(eventsPath, "utf-8");
+                const lines = raw.trim().split("\n");
+                const filteredLines = lines.filter(line => {
+                  try {
+                    const e = JSON.parse(line);
+                    return !(e.content && e.content.includes(memContent.slice(0, 40)));
+                  } catch { return true; }
+                });
+                if (filteredLines.length < lines.length) {
+                  await fsPromises.writeFile(eventsPath, filteredLines.join("\n") + "\n");
+                }
+              } catch (e) { console.warn("[pane_delete_memory] events.jsonl sync failed:", e.message); }
+
+              return {
+                success: true,
+                output: `Memory deleted: [${type || "memory"}] removed "${memContent.slice(0, 60)}...".`,
+                toolId,
+              };
+            } catch (err) {
+              return { success: false, error: `Memory deletion failed: ${err.message}`, toolId };
+            }
+          }
+          return { success: false, error: "Brain engine not available — cannot delete memory.", toolId };
         }
 
         case "pane_recall_all": {
@@ -2291,30 +2415,27 @@ export class ToolExecutor {
             };
           }
 
-          // Get all peer intents
-          const intents = readPeerIntents(this.projectRoot, this.projectId);
-          if (intents.length === 0) {
-            return { success: true, output: "No other threads are actively working on this project.", toolId };
+          // Get all peer activity — activity-based, not just file writes
+          const grouped = readPeerActivityGrouped(this.projectRoot, this.projectId);
+          if (grouped.size === 0) {
+            return { success: true, output: "No other threads are actively working on this project root.", toolId };
           }
 
-          // Group by threadId
-          const byThread = new Map();
-          for (const intent of intents) {
-            let list = byThread.get(intent.threadId);
-            if (!list) { list = []; byThread.set(intent.threadId, list); }
-            list.push(intent);
-          }
-
-          const lines = [`${intents.length} active intent(s) from ${byThread.size} peer thread(s):`];
-          for (const [threadId, threadIntents] of byThread) {
-            const shortId = threadId.slice(0, 8);
-            const fileList = [...new Set(threadIntents.map((i) => i.file))];
-            lines.push(`\nThread \`${shortId}\`:`);
-            for (const f of fileList.slice(0, 10)) {
-              const latest = threadIntents.filter((i) => i.file === f).reduce((a, b) => (b.ts > a.ts ? b : a));
-              lines.push(`  - \`${f}\` (${Math.round((Date.now() - latest.ts) / 60000)}m ago)`);
+          const lines = [`Active peer thread(s) on this project root (${grouped.size}):`];
+          for (const [, entry] of grouped) {
+            const shortId = entry.threadId.slice(0, 8);
+            const ago = Math.round((Date.now() - entry.lastActivity) / 60000);
+            const agoStr = ago < 1 ? "just now" : `${ago}m ago`;
+            lines.push(`\nThread \`${shortId}\` (active ${agoStr}):`);
+            if (entry.task) lines.push(`  Working on: ${entry.task}`);
+            if (entry.tools.length > 0) lines.push(`  Tools: ${entry.tools.slice(0, 6).join(", ")}`);
+            if (entry.files.length > 0) {
+              lines.push(`  Files:`);
+              for (const f of entry.files.slice(0, 8)) {
+                lines.push(`    - \`${f}\``);
+              }
+              if (entry.files.length > 8) lines.push(`    ... and ${entry.files.length - 8} more`);
             }
-            if (fileList.length > 10) lines.push(`  ... and ${fileList.length - 10} more files`);
           }
 
           return { success: true, output: lines.join("\n"), toolId };

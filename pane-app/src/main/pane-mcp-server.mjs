@@ -299,6 +299,31 @@ const TOOLS = [
     },
   },
   {
+    name: "pane_update_memory",
+    description: "Update an existing memory with refined or corrected content. Use when you discover something that refines, contradicts, or supersedes a prior memory — rewrite it instead of adding a duplicate. Always search first (pane_recall) to find the exact old content before updating.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        type: { type: "string", enum: ["decision", "lesson", "pattern", "error_fix"], description: "Category of the memory being updated" },
+        content: { type: "string", description: "The approximate existing content to find and replace." },
+        newContent: { type: "string", description: "The refined content that replaces the old memory." },
+      },
+      required: ["content", "newContent"],
+    },
+  },
+  {
+    name: "pane_delete_memory",
+    description: "Delete a memory that is obsolete, incorrect, or no longer relevant. Use when a prior observation turns out to be wrong or has been fully superseded. Always search first (pane_recall) to confirm the memory exists before deleting.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        type: { type: "string", enum: ["decision", "lesson", "pattern", "error_fix"], description: "Category of the memory being deleted" },
+        content: { type: "string", description: "The approximate content of the memory to delete." },
+      },
+      required: ["content"],
+    },
+  },
+  {
     name: "pane_brief",
     description: "Read the project's accumulated memory brief — top decisions, lessons, frequently modified files, and the last session summary. Good starting point when resuming work or when you need a quick read on project history.",
     inputSchema: { type: "object", properties: {} },
@@ -600,7 +625,7 @@ const TOOLS = [
   },
   {
     name: "pane_check_intents",
-    description: "Check whether other threads are actively working on files in this project. Returns a list of active intents (file touches) from peer threads on the same project root. Use before editing a file to avoid colliding with another agent's in-progress work.",
+    description: "Check whether other threads are actively working on this project root. Returns a summary of peer thread activity — what they're working on, tools they're using, files they've touched. Use before editing a file to avoid colliding with another agent's in-progress work.",
     inputSchema: {
       type: "object",
       properties: {
@@ -985,6 +1010,63 @@ async function handleToolCall(name, args) {
         JSON.stringify(event) + "\n",
       );
       return text(`Saved to project memory: [${event.type}] ${event.content}`);
+    }
+
+    case "pane_update_memory": {
+      const { content: oldContent, newContent, type } = args;
+      if (!oldContent) return text("Content of the memory to update is required.");
+      if (!newContent) return text("New content is required.");
+
+      // Update in events.jsonl (MCP server has no brain engine access)
+      const eventsPath = path.join(memoryDir, "events.jsonl");
+      try {
+        const raw = await fs.promises.readFile(eventsPath, "utf-8");
+        const lines = raw.trim().split("\n");
+        let updated = 0;
+        const updatedLines = lines.map(line => {
+          try {
+            const e = JSON.parse(line);
+            if (e.content && e.content.includes(oldContent.slice(0, 40))) {
+              e.content = newContent;
+              e.metadata = { ...(e.metadata || {}), updated: true, updated_at: new Date().toISOString() };
+              updated++;
+            }
+            return JSON.stringify(e);
+          } catch { return line; }
+        });
+        if (updated > 0) {
+          await fs.promises.writeFile(eventsPath, updatedLines.join("\n") + "\n");
+          return text(`Memory updated: [${type || "memory"}] replaced "${oldContent.slice(0, 60)}..." with refined content.`);
+        }
+        return text(`No existing memory matching "${oldContent.slice(0, 40)}..." found to update.`);
+      } catch {
+        return text("No project memory found — nothing to update.");
+      }
+    }
+
+    case "pane_delete_memory": {
+      const { content: memContent, type } = args;
+      if (!memContent) return text("Content of the memory to delete is required.");
+
+      // Delete from events.jsonl
+      const eventsPath = path.join(memoryDir, "events.jsonl");
+      try {
+        const raw = await fs.promises.readFile(eventsPath, "utf-8");
+        const lines = raw.trim().split("\n");
+        const filteredLines = lines.filter(line => {
+          try {
+            const e = JSON.parse(line);
+            return !(e.content && e.content.includes(memContent.slice(0, 40)));
+          } catch { return true; }
+        });
+        if (filteredLines.length < lines.length) {
+          await fs.promises.writeFile(eventsPath, filteredLines.join("\n") + "\n");
+          return text(`Memory deleted: [${type || "memory"}] removed "${memContent.slice(0, 60)}...".`);
+        }
+        return text(`No existing memory matching "${memContent.slice(0, 40)}..." found to delete.`);
+      } catch {
+        return text("No project memory found — nothing to delete.");
+      }
     }
 
     case "pane_lens_findings": {
@@ -2349,7 +2431,7 @@ async function handleToolCall(name, args) {
 
     case "pane_check_intents": {
       try {
-        const { readPeerIntents, checkConflict } = await import("./intents.mjs");
+        const { checkConflict, readPeerActivityGrouped } = await import("./intents.mjs");
         const file = (args?.file || "").trim();
 
         if (file) {
@@ -2363,28 +2445,26 @@ async function handleToolCall(name, args) {
           return text(`No conflicts on \`${file}\`. No other active threads have touched it recently.`);
         }
 
-        const intents = readPeerIntents(PROJECT_ROOT, PROJECT_ID);
-        if (intents.length === 0) {
-          return text("No other threads are actively working on this project.");
+        const grouped = readPeerActivityGrouped(PROJECT_ROOT, PROJECT_ID);
+        if (grouped.size === 0) {
+          return text("No other threads are actively working on this project root.");
         }
 
-        const byThread = new Map();
-        for (const intent of intents) {
-          let list = byThread.get(intent.threadId);
-          if (!list) { list = []; byThread.set(intent.threadId, list); }
-          list.push(intent);
-        }
-
-        const lines = [`${intents.length} active intent(s) from ${byThread.size} peer thread(s):`];
-        for (const [threadId, threadIntents] of byThread) {
-          const shortId = threadId.slice(0, 8);
-          const fileList = [...new Set(threadIntents.map((i) => i.file))];
-          lines.push(`\nThread \`${shortId}\`:`);
-          for (const f of fileList.slice(0, 10)) {
-            const latest = threadIntents.filter((i) => i.file === f).reduce((a, b) => (b.ts > a.ts ? b : a));
-            lines.push(`  - \`${f}\` (${Math.round((Date.now() - latest.ts) / 60000)}m ago)`);
+        const lines = [`Active peer thread(s) on this project root (${grouped.size}):`];
+        for (const [, entry] of grouped) {
+          const shortId = entry.threadId.slice(0, 8);
+          const ago = Math.round((Date.now() - entry.lastActivity) / 60000);
+          const agoStr = ago < 1 ? "just now" : `${ago}m ago`;
+          lines.push(`\nThread \`${shortId}\` (active ${agoStr}):`);
+          if (entry.task) lines.push(`  Working on: ${entry.task}`);
+          if (entry.tools.length > 0) lines.push(`  Tools: ${entry.tools.slice(0, 6).join(", ")}`);
+          if (entry.files.length > 0) {
+            lines.push(`  Files:`);
+            for (const f of entry.files.slice(0, 8)) {
+              lines.push(`    - \`${f}\``);
+            }
+            if (entry.files.length > 8) lines.push(`    ... and ${entry.files.length - 8} more`);
           }
-          if (fileList.length > 10) lines.push(`  ... and ${fileList.length - 10} more files`);
         }
         return text(lines.join("\n"));
       } catch (err) {

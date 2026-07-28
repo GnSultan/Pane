@@ -207,6 +207,7 @@
   --pane-status-added-bg: rgba(138, 154, 108, 0.1);
   --pane-status-modified: #B8A56A;
   --pane-status-deleted: #A67272;
+  --pane-status-deleted-bg: rgba(166, 114, 114, 0.08);
   --pane-status-renamed: #7E97AA;
   --pane-status-untracked: #6D6A63;
   --pane-error: #A67272;
@@ -294,6 +295,7 @@
   --pane-status-added-bg: rgba(91, 112, 64, 0.1);
   --pane-status-modified: #8A7530;
   --pane-status-deleted: #8C4A4A;
+  --pane-status-deleted-bg: rgba(140, 74, 74, 0.06);
   --pane-status-renamed: #4A708A;
   --pane-status-untracked: #8A877F;
   --pane-error: #8C4A4A;
@@ -366,6 +368,7 @@
   --pane-status-added-bg: rgba(45, 122, 58, 0.1);
   --pane-status-modified: #7A6520;
   --pane-status-deleted: #9A3333;
+  --pane-status-deleted-bg: rgba(154, 51, 51, 0.06);
   --pane-status-renamed: #2A5A7A;
   --pane-status-untracked: #808080;
   --pane-error: #9A3333;
@@ -439,6 +442,7 @@
   --pane-status-added-bg: rgba(138, 154, 108, 0.1);
   --pane-status-modified: #B8A56A;
   --pane-status-deleted: #A67272;
+  --pane-status-deleted-bg: rgba(166, 114, 114, 0.08);
   --pane-status-renamed: #7E97AA;
   --pane-status-untracked: #6D6A63;
   --pane-error: #A67272;

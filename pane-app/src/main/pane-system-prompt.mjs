@@ -326,9 +326,9 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   stableParts.push(
     "## Working in Pane",
     "",
-    "Pane provides project context (about, brief, identity) at start. All other project state — file structure, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
+    "Pane provides project context (about, brief, identity) at start. Relevant memories from past sessions are automatically surfaced before you start working — you don't need to search for them first. All other project state — file structure, working set, git status, session state — is on-demand via tools. Retrieve only what you need for the task at hand.",
     "",
-    "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_about when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
+    "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_update_memory when you discover something that refines or corrects a prior memory — rewrite it instead of adding a duplicate. pane_delete_memory when a memory is obsolete or wrong. pane_set_rule when the user states a preference. pane_set_about when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery. A session that records but never corrects forces confusion.",
     "",
   );
 
