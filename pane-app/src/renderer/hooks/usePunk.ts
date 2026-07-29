@@ -859,6 +859,12 @@ export function usePunk(projectId: string) {
   // processEnded from calling finishProcessing (which would play completion sound,
   // set unread badges, etc. — unwanted on manual stop).
   const intentionalAbortRef = useRef(false);
+  // Set to true when abortMessage stops an in-progress turn. The NEXT
+  // sendMessage call reads and clears this, telling the backend the previous
+  // turn was cut off mid-task (not completed) so it can tell the model
+  // explicitly — otherwise the model has no signal that it was interrupted
+  // and tends to treat the redirect as if starting the task over.
+  const wasInterruptedRef = useRef(false);
   const retryAttemptRef = useRef<Record<string, number>>({});
   const messageQueueRef = useRef<Array<{ prompt: string; minds?: Array<{ id: string }>; phase?: string }>>([]);
 
@@ -1411,6 +1417,11 @@ export function usePunk(projectId: string) {
         }));
         const todos = conversation.todos;
 
+        // Consume the interrupted flag — it only applies to the very next
+        // send after an abort, not to any send after that.
+        const wasInterrupted = wasInterruptedRef.current;
+        wasInterruptedRef.current = false;
+
         await sendToPunk(
           projectId,
           prompt,
@@ -1427,6 +1438,7 @@ export function usePunk(projectId: string) {
             powerCombo: projectCombo,
             minds,
             phase: effectivePhase,
+            ...(wasInterrupted ? { wasInterrupted: true } : {}),
           }
         );
       } catch (err) {
@@ -1451,6 +1463,9 @@ export function usePunk(projectId: string) {
     // before sessionIdRef takes effect, finishProcessing is still skipped
     // (avoids completion sound, unread badge on manual stop).
     intentionalAbortRef.current = true;
+    // Flag for the next sendMessage: the turn being stopped was cut off
+    // mid-task, not completed — see declaration above.
+    wasInterruptedRef.current = true;
 
     try {
       // abortPunk now waits for the backend process to actually terminate
@@ -1466,10 +1481,33 @@ export function usePunk(projectId: string) {
       store.setLastMessageStreamingDone(projectId);
       store.setIsPlanning(projectId, false);
       resetStreamingState(projectId);
+
+      // Drain anything queued while the aborted turn was running. Without
+      // this, a message queued during the task (because it was busy) got
+      // silently stuck forever — the only other drain site is inside
+      // finishProcessing(), which is deliberately skipped on manual abort
+      // (see the processEnded handler's intentionalAbortRef check above).
+      //
+      // Queued messages were written as independent next turns, not as a
+      // reaction to this abort, so they must NOT inherit the "interrupted"
+      // framing meant for a message the user types right after hitting stop
+      // — clear the flag before sending so it stays reserved for that case.
+      if (messageQueueRef.current.length > 0) {
+        wasInterruptedRef.current = false;
+        const next = messageQueueRef.current.shift();
+        if (next) {
+          setTimeout(() => {
+            sendMessage(next.prompt, next.minds, next.phase);
+          }, 500);
+        }
+      }
     }
-  }, [projectId]);
+  }, [projectId, sendMessage]);
 
   const clearConversation = useCallback(() => {
+    // Stale flag would otherwise wrongly frame the first message of a brand
+    // new conversation as a continuation of interrupted work.
+    wasInterruptedRef.current = false;
     // Promote session state to long-term memory before wiping it.
     // Decisions, method violations, and high-touch file patterns die on clear
     // otherwise — this bridges the session layer → brain layer.

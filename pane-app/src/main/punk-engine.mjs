@@ -1664,6 +1664,7 @@ export function registerPunkHandlersSync() {
       powerCombo,
       minds,
       phase,
+      wasInterrupted,
       // Mind chat fields — when projectId starts with "mind:", these override defaults
       systemPromptOverride,
       _systemOverride,
@@ -1685,6 +1686,7 @@ export function registerPunkHandlersSync() {
       powerCombo,
       minds,
       phase,
+      ...(wasInterrupted ? { wasInterrupted } : {}),
       ...(systemPromptOverride ? { systemPromptOverride } : {}),
       ...(_systemOverride ? { _systemOverride } : {}),
       ...(tools ? { tools } : {}),

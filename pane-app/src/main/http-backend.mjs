@@ -1677,6 +1677,7 @@ export class ApiBackend extends PunkBackend {
   constructor(onEvent) {
     super(onEvent);
     this.activeRequests = new Map(); // projectId -> AbortController
+    this.activeSpawnPromises = new Map(); // projectId -> in-flight spawn() promise, so abort() can wait for real termination
     this.requestStates = new Map(); // projectId -> { accumulated: string, toolUses: Map }
     this.paneDir = path.join(os.homedir(), ".pane");
     this.toolExecutors = new Map(); // projectId -> ToolExecutor
@@ -2208,15 +2209,30 @@ export class ApiBackend extends PunkBackend {
             normalized.push({ role: "user", content: newBlocks });
           }
         } else {
-          // Already role:"user" with tool_result content blocks (Anthropic native format).
-          // Resolve refs, pass through, and clear those IDs from pending.
+          // Already role:"user" with tool_result content blocks (Anthropic native format) —
+          // e.g. messages Pane's own turn loop appends directly mid-session. Same orphan
+          // risk as the other two branches above (journal replay can start mid-turn, with
+          // no preceding tool_use in the replayed slice), so prune the same way instead of
+          // passing every block through unconditionally.
           const resolved = resolveResultRef(msg);
           if (Array.isArray(resolved.content)) {
-            resolved.content.forEach((c) => {
-              if (c.type === "tool_result") pendingToolCallIds.delete(c.tool_use_id);
+            const filtered = resolved.content.filter((c) => {
+              if (c.type !== "tool_result") return true;
+              if (pendingToolCallIds.has(c.tool_use_id)) {
+                pendingToolCallIds.delete(c.tool_use_id);
+                return true;
+              }
+              console.warn(
+                `[http] Pruning orphaned tool result for ${c.tool_use_id}`,
+              );
+              return false;
             });
+            if (filtered.length > 0) {
+              normalized.push({ ...resolved, content: filtered });
+            }
+          } else {
+            normalized.push(resolved);
           }
-          normalized.push(resolved);
         }
         continue;
       }
@@ -2354,7 +2370,28 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
+  // Thin wrapper around _spawnInner that tracks the in-flight promise per
+  // project. abort() awaits this before returning — without it, abort()
+  // only signals the AbortController and returns almost immediately, while
+  // the aborted call's own catch/finally (journal clearing, handoff writes)
+  // keeps running in the background. A renderer that immediately sends a
+  // follow-up message after abort would then race a brand-new spawn() call
+  // against the old one's cleanup, both touching the same on-disk journal
+  // file with no synchronization — corrupting it (e.g. interleaved/partial
+  // writes producing an orphaned tool_result with no preceding tool_use).
   async spawn(request) {
+    const promise = this._spawnInner(request);
+    this.activeSpawnPromises.set(request.projectId, promise);
+    try {
+      return await promise;
+    } finally {
+      if (this.activeSpawnPromises.get(request.projectId) === promise) {
+        this.activeSpawnPromises.delete(request.projectId);
+      }
+    }
+  }
+
+  async _spawnInner(request) {
     // Reset healing flags for this new session — ensured fresh regardless
     // of previous spawn's state (e.g. auto-resume re-enters spawn).
     this._healAttemptedThisTurn = false;
@@ -2644,7 +2681,17 @@ export class ApiBackend extends PunkBackend {
         }
       }
 
-      const resumeCheck = canResume(request.projectId);
+      // Only ever consult the journal when the renderer already has an
+      // ongoing conversation. A genuinely new conversation (empty
+      // request.history) must never inherit a stray journal fragment left
+      // behind by an earlier, unrelated failed attempt on the same project —
+      // the `>=` completeness check below is trivially satisfied by any
+      // non-empty journal when clientMessages.length is 0, which resurrected
+      // old orphaned fragments (e.g. a dangling tool_result with no preceding
+      // tool_use) as if they were the current conversation.
+      const resumeCheck = isNewConversation
+        ? { resumable: false }
+        : canResume(request.projectId);
       if (resumeCheck.resumable && resumeCheck.meta) {
         const journalData = replay(request.projectId);
         if (
@@ -2793,6 +2840,30 @@ export class ApiBackend extends PunkBackend {
         messages.push({
           role: "user",
           content: [{ type: "text", text: resumeParts.join("\n") }],
+        });
+      } else if (request.wasInterrupted) {
+        // ── User-initiated abort, not a crash ──────────────────────────────
+        // The renderer's history (already loaded into `messages` above) has
+        // the full, real conversation up to the stop, including whatever the
+        // model had started saying/doing — the model just has no explicit
+        // signal that IT was cut off rather than the task being finished or
+        // failed. Without this, a turn ending abruptly (mid-sentence, or a
+        // tool call whose result got auto-healed into an interruption error
+        // by normalizeMessages) reads ambiguously, and the model tends to
+        // treat the next message as starting a new task instead of steering
+        // the one it was already doing.
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "[The previous turn was stopped by you the user before it finished — not a crash, not a failure. " +
+                "Everything above actually happened; treat it as real, ongoing context. " +
+                "The message below is a correction or new direction for that same task — incorporate it and continue, do not restart from scratch or re-do work already done.]\n\n" +
+                request.prompt,
+            },
+          ],
         });
       } else {
         messages.push({
@@ -5103,11 +5174,14 @@ export class ApiBackend extends PunkBackend {
         );
 
         // Re-spawn the entire session from scratch. The journal on disk has
-        // all messages; this.spawn() detects it via canResume() and replays.
+        // all messages; this._spawnInner() detects it via canResume() and
+        // replays. Call the inner method directly, not the public spawn()
+        // wrapper — we're already inside the tracked outer promise for this
+        // project, so re-wrapping would just churn activeSpawnPromises.
         // If spawn succeeds, this call returns normally and the catch block
         // ends here — no error emitted to the user.
         try {
-          await this.spawn(request);
+          await this._spawnInner(request);
           return; // Success — exit without emitting error
         } catch (respawnErr) {
           // Re-spawn also failed — fall through to the real error handling
@@ -6512,6 +6586,22 @@ export class ApiBackend extends PunkBackend {
     if (executor) {
       executor.cleanup();
       this.toolExecutors.delete(projectId);
+    }
+
+    // Wait for the in-flight spawn() call to actually finish unwinding
+    // (its catch/finally — journal clearing, emergency handoff writes)
+    // before returning. Callers (sendMessage, abortMessage) await this
+    // and only then allow a new spawn() for the same project. Without
+    // this wait, controller.abort() above just signals cancellation and
+    // returns almost instantly while the old call's cleanup keeps running
+    // in the background — a new spawn() could start and race it, with
+    // both touching the same on-disk journal file with no locking.
+    const inFlight = this.activeSpawnPromises.get(projectId);
+    if (inFlight) {
+      await Promise.race([
+        inFlight.catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 5000)),
+      ]);
     }
   }
 

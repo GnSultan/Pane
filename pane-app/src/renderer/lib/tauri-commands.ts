@@ -318,6 +318,11 @@ export interface SendToPunkOptions {
    *  "think" uses thinking model (plan+verify), "build" uses execution model.
    *  When set, overrides heuristic router so routing stays consistent across turns. */
   phase?: string;
+  /** True only on the message immediately following a manual abort — tells the
+   *  backend the previous turn was cut off mid-task, not completed, so it can
+   *  tell the model explicitly rather than leaving it to infer from a dangling
+   *  tool call or an abruptly-cut-off reply. */
+  wasInterrupted?: boolean;
   // Mind chat overrides — when projectId starts with "mind:", these control behavior
   systemPromptOverride?: string;
   _systemOverride?: boolean;
@@ -475,6 +480,7 @@ export async function sendToPunk(
       powerCombo: opts.powerCombo,
       minds: opts.minds,
       phase: opts.phase,
+      ...(opts.wasInterrupted ? { wasInterrupted: true } : {}),
       // Mind chat overrides — forwarded when present
       ...(opts.systemPromptOverride ? { systemPromptOverride: opts.systemPromptOverride } : {}),
       ...(opts._systemOverride ? { _systemOverride: opts._systemOverride } : {}),
