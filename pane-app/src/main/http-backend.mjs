@@ -2135,17 +2135,65 @@ export class ApiBackend extends PunkBackend {
           // Anthropic/Gemini: role:"tool" is not valid — convert to role:"user"
           // with type:"tool_result" content blocks. Multiple consecutive tool
           // results (one per tool call) must be batched into a single user turn.
-          const resolved = resolveResultRef(msg);
-          const block = {
-            type: "tool_result",
-            tool_use_id: resolved.tool_call_id,
-            content:
-              typeof resolved.content === "string"
-                ? resolved.content
-                : safeStringify(resolved.content),
-          };
-          if (resolved.is_error) block.is_error = true;
-          pendingToolCallIds.delete(resolved.tool_call_id);
+          //
+          // Two shapes reach here: the journal stores tool results as flat
+          // single messages (tool_call_id on the message itself); the renderer's
+          // conversation history stores them as already-batched Anthropic-native
+          // blocks (tool_use_id nested inside each content block). Handle both —
+          // reading `.tool_call_id` off a batched message produces `undefined`,
+          // which JSON.stringify silently drops, causing a 400
+          // "tool_use_id: Field required" from the API.
+          // Anthropic rejects any tool_result whose tool_use_id doesn't have a
+          // matching tool_use in the immediately preceding assistant message —
+          // e.g. when the renderer's slice(-50) truncation cuts between a
+          // tool_use and its tool_result. Prune orphans instead of sending
+          // them, same as the isOpenAI branch above already does.
+          const newBlocks = Array.isArray(content)
+            ? content
+                .filter((c) => c.type === "tool_result")
+                .filter((c) => {
+                  if (pendingToolCallIds.has(c.tool_use_id)) return true;
+                  console.warn(
+                    `[http] Pruning orphaned tool result for ${c.tool_use_id}`,
+                  );
+                  return false;
+                })
+                .map((c) => {
+                  pendingToolCallIds.delete(c.tool_use_id);
+                  // Rebuild clean — the renderer's stored blocks carry extra
+                  // bookkeeping fields (e.g. `name`, for UI display) that
+                  // Anthropic's tool_result schema rejects outright.
+                  const block = {
+                    type: "tool_result",
+                    tool_use_id: c.tool_use_id,
+                    content:
+                      typeof c.content === "string"
+                        ? c.content
+                        : safeStringify(c.content),
+                  };
+                  if (c.is_error) block.is_error = true;
+                  return block;
+                })
+            : (() => {
+                const resolved = resolveResultRef(msg);
+                if (!pendingToolCallIds.has(resolved.tool_call_id)) {
+                  console.warn(
+                    `[http] Pruning orphaned tool result for ${resolved.tool_call_id}`,
+                  );
+                  return [];
+                }
+                const block = {
+                  type: "tool_result",
+                  tool_use_id: resolved.tool_call_id,
+                  content:
+                    typeof resolved.content === "string"
+                      ? resolved.content
+                      : safeStringify(resolved.content),
+                };
+                if (resolved.is_error) block.is_error = true;
+                pendingToolCallIds.delete(resolved.tool_call_id);
+                return [block];
+              })();
           // Merge into the previous user message if it already holds only
           // tool_result blocks (same assistant turn), otherwise open a new one.
           const prev = normalized[normalized.length - 1];
@@ -2155,9 +2203,9 @@ export class ApiBackend extends PunkBackend {
             prev.content.length > 0 &&
             prev.content.every((c) => c.type === "tool_result")
           ) {
-            prev.content.push(block);
-          } else {
-            normalized.push({ role: "user", content: [block] });
+            prev.content.push(...newBlocks);
+          } else if (newBlocks.length > 0) {
+            normalized.push({ role: "user", content: newBlocks });
           }
         } else {
           // Already role:"user" with tool_result content blocks (Anthropic native format).
@@ -2554,69 +2602,92 @@ export class ApiBackend extends PunkBackend {
         { role: "system", content: systemPrompt, _tiers: systemTiers },
       ];
 
-      // ── Session Resume: journal-first message loading ─────────────────────
-      // Check if a previous session died mid-work. If a journal exists and is
-      // fresh, replay it instead of using the renderer's truncated history.
-      // The journal has the FULL conversation state including tool results,
-      // auto-continuation prompts, and responses that the renderer may never
-      // have received (stream died before delivery).
+      // ── Session Resume: completeness-first message loading ────────────────
+      // Two sources of truth exist: the renderer's request.history (built from
+      // conversation.messages, authoritative in the normal case) and the
+      // on-disk journal (a per-turn crash-safety net, cleared on every clean
+      // turn completion but left behind on error/abort — see the `finally`
+      // block at the bottom of spawn()). Because the journal is wiped on
+      // success and reopened per-turn, a journal found on disk almost never
+      // holds the full conversation — it holds whatever fragment was appended
+      // during the single turn that errored or was aborted. Blindly preferring
+      // "any resumable journal" over request.history meant one failed/aborted
+      // turn silently replaced the real conversation with that fragment on
+      // every turn afterward (up to canResume's 4h window) — the model would
+      // appear to forget everything, including its own prior replies. This is
+      // NOT provider-specific, but explicit-cache providers (Anthropic) have
+      // more failure surface (thinking-signature checks, cache_control TTL
+      // ordering, OAuth billing/tool-name validation) than other providers,
+      // so it manifested almost exclusively there.
       //
-      // Cache impact: messages replay verbatim, so Anthropic's prefix cache
-      // hits on everything the model already saw. The system prompt is fresh
-      // (it changes per-session), but frozen/session tiers still cache-hit
-      // if content hasn't changed.
+      // Fix: only trust the journal when it's actually MORE complete than
+      // request.history — i.e. genuine crash recovery, where the renderer's
+      // own state is missing or behind what the backend already journaled
+      // (stream died before delivery). Otherwise request.history wins, same
+      // as every other provider, with no special-casing.
       const isNewConversation =
         !request.history || request.history.length === 0;
       let journalResumed = false;
       let lastProgress = null;
 
-      if (!isNewConversation) {
-        const resumeCheck = canResume(request.projectId);
-        if (resumeCheck.resumable && resumeCheck.meta) {
-          const journalData = replay(request.projectId);
-          if (journalData.messages.length > 0) {
-            // Journal has more context than the renderer's slice(-20) —
-            // use it as the source of truth
-            for (const msg of journalData.messages) {
-              messages.push(msg);
-            }
-            lastProgress = journalData.progress;
-            journalResumed = true;
-            console.log(
-              `[http] ⟲ RESUMED from journal: ${journalData.messages.length} messages, ` +
-                `last activity ${Math.round((Date.now() - resumeCheck.meta.lastAppendAt) / 1000)}s ago` +
-                (lastProgress
-                  ? `, progress: ${lastProgress.accomplishments?.length || 0} accomplishments`
-                  : ""),
-            );
-
-            // Surface the resume to the UI
-            this.onEvent(
-              request.projectId,
-              {
-                event: "status",
-                data: { message: "resuming previous session..." },
-              },
-              request.requestId,
-            );
+      const clientMessages = [];
+      if (request.history) {
+        for (const msg of request.history) {
+          if (msg.type === "user") {
+            clientMessages.push({ role: "user", content: msg.content });
+          } else if (msg.type === "assistant") {
+            clientMessages.push({ role: "assistant", content: msg.content });
+          } else if (msg.type === "system") {
+            // In Pane history, 'system' role is used for tool results (from local workers)
+            clientMessages.push({ role: "tool", content: msg.content });
           }
         }
       }
 
-      // Fall back to renderer history if no journal resume
-      if (!journalResumed && request.history) {
-        for (const msg of request.history) {
-          if (msg.type === "user") {
-            messages.push({
-              role: "user",
-              content: msg.content,
-            });
-          } else if (msg.type === "assistant") {
-            messages.push({ role: "assistant", content: msg.content });
-          } else if (msg.type === "system") {
-            // In Pane history, 'system' role is used for tool results (from local workers)
-            messages.push({ role: "tool", content: msg.content });
+      const resumeCheck = canResume(request.projectId);
+      if (resumeCheck.resumable && resumeCheck.meta) {
+        const journalData = replay(request.projectId);
+        if (
+          journalData.messages.length > 0 &&
+          journalData.messages.length >= clientMessages.length
+        ) {
+          // Journal is at least as complete as what the renderer has —
+          // genuine crash recovery. Use it as the source of truth.
+          for (const msg of journalData.messages) {
+            messages.push(msg);
           }
+          lastProgress = journalData.progress;
+          journalResumed = true;
+          console.log(
+            `[http] ⟲ RESUMED from journal: ${journalData.messages.length} messages ` +
+              `(renderer had ${clientMessages.length}), ` +
+              `last activity ${Math.round((Date.now() - resumeCheck.meta.lastAppendAt) / 1000)}s ago` +
+              (lastProgress
+                ? `, progress: ${lastProgress.accomplishments?.length || 0} accomplishments`
+                : ""),
+          );
+
+          // Surface the resume to the UI
+          this.onEvent(
+            request.projectId,
+            {
+              event: "status",
+              data: { message: "resuming previous session..." },
+            },
+            request.requestId,
+          );
+        } else if (journalData.messages.length > 0) {
+          console.log(
+            `[http] ⊘ Ignoring stale journal fragment: ${journalData.messages.length} messages ` +
+              `vs renderer's ${clientMessages.length} — renderer history is more complete`,
+          );
+        }
+      }
+
+      // Renderer history wins whenever the journal isn't strictly more complete
+      if (!journalResumed) {
+        for (const msg of clientMessages) {
+          messages.push(msg);
         }
       }
 
@@ -5067,6 +5138,12 @@ export class ApiBackend extends PunkBackend {
       }
 
       if (error.name === "AbortError") {
+        // User-cancelled, not a crash — nothing to resume. Clear the journal
+        // fragment now instead of leaving it on disk for up to 4h where a
+        // completeness check would otherwise just end up ignoring it anyway.
+        try {
+          clearJournal(request.projectId);
+        } catch {}
         this.onEvent(
           request.projectId,
           {
@@ -5496,23 +5573,33 @@ export class ApiBackend extends PunkBackend {
 
           const BILLING_PREFIX = "x-anthropic-billing-header";
           const SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+          // Anthropic only validates the billing header + this exact identity
+          // line (see comment above) — everything after is unrestricted, same
+          // as Claude Code's own 166+ line system prompt. So we immediately
+          // counter the CLI framing before Pane's real system prompt loads:
+          // left unchecked, "You are Claude Code" biases the model toward a
+          // single-shot/stateless CLI persona, which reads as the model
+          // "forgetting" prior turns even though full history is in messages[].
+          const REORIENT =
+            "Note: despite the CLI label above, this request is part of an ongoing multi-turn conversation inside Pane, not a fresh single-shot invocation. The message history below is real — you already said and did those things. Continue naturally from where the conversation left off.";
 
           // Compute billing header from the ACTUAL first user message text.
           // This must happen BEFORE any modification to messages — the hash
           // is tied to what the user actually typed, not to injected prefixes.
           const billingHeader = buildBillingHeaderValue(anthropicBody.messages || []);
 
-          // Build final system: [billing, identity, ...all other tiers]
+          // Build final system: [billing, identity, reorient, ...all other tiers]
           // All system content stays in system[] — no demotion to user messages.
-          // Strip any pre-existing billing/identity blocks to avoid duplicates.
+          // Strip any pre-existing billing/identity/reorient blocks to avoid duplicates.
           const newSystem = [
             { type: "text", text: billingHeader },
             { type: "text", text: SYSTEM_IDENTITY },
+            { type: "text", text: REORIENT },
           ];
 
           for (const block of systemBlocks) {
             const txt = typeof block === "string" ? block : (block.text ?? "");
-            if (txt.startsWith(BILLING_PREFIX) || txt.startsWith(SYSTEM_IDENTITY)) {
+            if (txt.startsWith(BILLING_PREFIX) || txt.startsWith(SYSTEM_IDENTITY) || txt.startsWith(REORIENT)) {
               continue; // Already added above
             }
             if (txt.length > 0) {
