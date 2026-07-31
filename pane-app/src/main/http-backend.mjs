@@ -1356,6 +1356,25 @@ function _zaiContextLength(id) {
   return 128000;
 }
 
+// ─── Kimi (Moonshot) model helpers ──────────────────────────────────────────
+
+function _kimiDisplayName(id) {
+  // moonshot-v1-8k → Kimi V1 8K, kimi-k2 → Kimi K2
+  return id
+    .replace(/^moonshot-/, "Kimi ")
+    .replace(/^kimi-/, "Kimi ")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function _kimiContextLength(id) {
+  if (id.includes("128k") || id.includes("moonshot-v1-128k")) return 131072;
+  if (id.includes("32k")  || id.includes("moonshot-v1-32k"))  return  32768;
+  if (id.includes("8k")   || id.includes("moonshot-v1-8k"))   return   8192;
+  if (id.includes("kimi-k2"))                                  return 131072;
+  return 131072; // Kimi default
+}
+
 // ─── Anthropic model helpers ─────────────────────────────────────────────────
 
 function _anthropicDisplayName(id) {
@@ -6823,6 +6842,50 @@ export class ApiBackend extends PunkBackend {
         .sort(_byRelevance);
     } catch (err) {
       console.error("[http] Failed to fetch Z.ai models:", err);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch available Kimi (Moonshot) models via their OpenAI-compatible /models endpoint.
+   * Endpoint: https://api.moonshot.cn/v1/models
+   */
+  async getKimiModels() {
+    const apiConfig = await this.getApiConfig("kimi");
+    if (!apiConfig.apiKey) return [];
+
+    try {
+      const base = apiConfig.baseUrl
+        ? apiConfig.baseUrl.replace(/\/chat\/completions\/?$/, "")
+        : "https://api.moonshot.cn/v1";
+      const baseUrlClean = base.replace(/\/$/, "");
+      const url = baseUrlClean.endsWith("/models")
+        ? baseUrlClean
+        : `${baseUrlClean}/models`;
+
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!response.ok) return [];
+
+      const json = await response.json();
+      if (!json.data) return [];
+
+      return json.data
+        .filter((m) => m.id && !m.id.includes("embed") && !m.id.includes("vision"))
+        .map((m) => ({
+          id: m.id,
+          name: _kimiDisplayName(m.id),
+          context_length: m.context_length || _kimiContextLength(m.id),
+          provider: "Kimi",
+          tier: (m.id.includes("128k") || m.id.includes("kimi-k2")) ? 1 : 2,
+          input_cost: null,
+          output_cost: null,
+        }))
+        .sort(_byRelevance);
+    } catch (err) {
+      console.error("[http] Failed to fetch Kimi models:", err);
       return [];
     }
   }
