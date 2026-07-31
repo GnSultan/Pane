@@ -2660,7 +2660,7 @@ export class ApiBackend extends PunkBackend {
       );
 
       // Attach tier metadata to the system message for prepareRequest() to consume
-      const messages = [
+      let messages = [
         { role: "system", content: systemPrompt, _tiers: systemTiers },
       ];
 
