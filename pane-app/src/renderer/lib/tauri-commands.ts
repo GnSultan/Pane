@@ -513,6 +513,19 @@ export async function previewRoute(message: string, projectId: string): Promise<
   return electronAPI.invoke("preview_route", { message, projectId });
 }
 
+export interface SteerClassification {
+  decision: "steer" | "queue";
+  reason: string;
+}
+
+export async function classifySteerIntent(projectId: string, message: string): Promise<SteerClassification> {
+  return electronAPI.invoke("classify_steer_intent", { projectId, message });
+}
+
+export async function steerPunk(projectId: string, message: string): Promise<{ accepted: boolean }> {
+  return electronAPI.invoke("steer_punk", { projectId, message });
+}
+
 export async function terminatePunkSession(projectId: string): Promise<void> {
   return electronAPI.invoke("terminate_punk_session", { projectId });
 }

@@ -336,6 +336,11 @@ export interface PunkEventPhaseChanged {
   data: { phase: PanePhase };
 }
 
+export interface PunkEventSteerMissed {
+  event: "steer_missed";
+  data: { texts: string[] };
+}
+
 export type PunkStreamEvent = (
   | PunkEventMessage
   | PunkEventProcessStarted
@@ -354,6 +359,7 @@ export type PunkStreamEvent = (
   | PunkEventTokenUsage
   | PunkEventAwaitingInput
   | PunkEventPhaseChanged
+  | PunkEventSteerMissed
 ) & { requestId?: string };
 
 // Plan message types — the blueprint Pane produces before execution
@@ -418,6 +424,9 @@ export interface ConversationMessage {
   outputTokens?: number;
   numTurns?: number;
   checkpointId?: string;
+  // Set when this message was injected into an already-running task rather
+  // than sent as a fresh turn — see classifySteerIntent/steerPunk.
+  deliveryMode?: "steered";
   // Present when type === "plan"
   planData?: PlanData;
   // Present on punk-generated turns (bug, reflection, sentinel)

@@ -1400,6 +1400,20 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     }
   }
 
+  // Whether a message sent while projectId's task is running should steer
+  // into it or queue for after — see ApiBackend.classifySteerIntent.
+  classifySteerIntent(projectId, message) {
+    if (!this.backends.api) return { decision: "queue", reason: "no-backend" };
+    return this.backends.api.classifySteerIntent(projectId, message);
+  }
+
+  // Queue a message for injection into the running task at its next turn
+  // boundary — see ApiBackend.steer.
+  steer(projectId, message) {
+    if (!this.backends.api) return { accepted: false };
+    return this.backends.api.steer(projectId, message);
+  }
+
   async terminate(projectId) {
     if (this.backends.api) {
       await this.backends.api.terminate(projectId).catch(() => {});
@@ -1702,6 +1716,17 @@ export function registerPunkHandlersSync() {
   // the predicted model as the user types. Lightweight, no side effects.
   ipcMain.handle("preview_route", async (_event, args) => {
     return punkEngine.previewRoute(args.message, args.projectId);
+  });
+
+  // Classify a message sent while a task is running as steer-into-current
+  // vs queue-for-after. Lightweight, no side effects.
+  ipcMain.handle("classify_steer_intent", async (_event, args) => {
+    return punkEngine.classifySteerIntent(args.projectId, args.message);
+  });
+
+  // Inject a message into the running task at its next turn boundary.
+  ipcMain.handle("steer_punk", async (_event, args) => {
+    return punkEngine.steer(args.projectId, args.message);
   });
 
   ipcMain.handle("send_to_mind", async (_event, args) => {

@@ -43,6 +43,7 @@ import {
 
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 import { runTurnSentinel, recordQualityMetric, runDeepReview, saveDeepReview } from "./code-arbiter.mjs";
+import { classifySteerIntent } from "./steering-classifier.mjs";
 import { recordActivity } from "./intents.mjs";
 import { getAccessToken, getOAuthHeaders, getOAuthApiUrl, hasOAuthCredentials, invalidateCache } from "./claude-oauth.mjs";
 import { buildBillingHeaderValue } from "./claude-signing.mjs";
@@ -1678,6 +1679,8 @@ export class ApiBackend extends PunkBackend {
     super(onEvent);
     this.activeRequests = new Map(); // projectId -> AbortController
     this.activeSpawnPromises = new Map(); // projectId -> in-flight spawn() promise, so abort() can wait for real termination
+    this.activeTaskAnchors = new Map(); // projectId -> { prompt, startedAt } for the running task, used by the steering classifier
+    this.pendingSteerMessages = new Map(); // projectId -> [{ text, timestamp }] waiting to be injected at the next turn boundary
     this.requestStates = new Map(); // projectId -> { accumulated: string, toolUses: Map }
     this.paneDir = path.join(os.homedir(), ".pane");
     this.toolExecutors = new Map(); // projectId -> ToolExecutor
@@ -2402,6 +2405,9 @@ export class ApiBackend extends PunkBackend {
 
     const abortController = new AbortController();
     this.activeRequests.set(request.projectId, abortController);
+    // Anchor for the steering classifier — fixed for this task's lifetime,
+    // not updated as steer messages land (see classifySteerIntent).
+    this.activeTaskAnchors.set(request.projectId, { prompt: request.prompt, startedAt: Date.now() });
     const spawnStartTime = Date.now();
     let journal = null; // Hoisted — opened inside try, closed in finally
 
@@ -5052,6 +5058,35 @@ export class ApiBackend extends PunkBackend {
           phase: "post-turn",
         });
 
+        // ── Steer injection ────────────────────────────────────────────────
+        // A message the user sent while this task was running, classified as
+        // relevant to it (see classifySteerIntent). This is the one point
+        // between turns where new input can be spliced into the running
+        // conversation without aborting anything — see steer() for how
+        // pendingSteerMessages gets populated.
+        const pendingSteers = this.pendingSteerMessages.get(request.projectId);
+        if (pendingSteers?.length > 0) {
+          this.pendingSteerMessages.delete(request.projectId);
+          const combinedText = pendingSteers.map((s) => s.text).join("\n\n");
+          const steerMsg = {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text:
+                  "[The user sent this while you were still working on the task above — a correction or refinement for THAT task, not a new unrelated request. Incorporate it and continue; do not restart from scratch or redo completed work.]\n\n" +
+                  combinedText,
+              },
+            ],
+          };
+          messages.push(steerMsg);
+          journal.append(steerMsg);
+          console.log(`[http] steered ${pendingSteers.length} message(s) into turn ${turn}`);
+          // A steer supersedes an ask_user pause — treat it as the reply
+          // instead of stopping the loop to wait for one.
+          awaitingUserInput = false;
+        }
+
         // The model called ask_user — it is explicitly handing control back and
         // waiting for a reply. Stop the loop cleanly (all post-turn processing
         // above has run); the user's next message resumes the conversation.
@@ -5287,7 +5322,23 @@ export class ApiBackend extends PunkBackend {
       );
 
       this.activeRequests.delete(request.projectId);
+      this.activeTaskAnchors.delete(request.projectId);
       this.requestStates.delete(request.projectId);
+
+      // Missed-injection fallback: a steer message that never got a chance
+      // to be injected (task finished, hit maxTurns, or paused on ask_user
+      // right before this landed) must not be silently dropped — surface it
+      // so the renderer can requeue and send it as a normal next message,
+      // via the same drain mechanism the abort-queue-drain fix already uses.
+      const missedSteers = this.pendingSteerMessages.get(request.projectId);
+      if (missedSteers?.length > 0) {
+        this.pendingSteerMessages.delete(request.projectId);
+        this.onEvent(
+          request.projectId,
+          { event: "steer_missed", data: { texts: missedSteers.map((m) => m.text) } },
+          request.requestId,
+        );
+      }
     }
   }
 
@@ -6574,6 +6625,37 @@ export class ApiBackend extends PunkBackend {
     return emitted;
   }
 
+  /**
+   * Decide whether a message sent while `projectId`'s task is running should
+   * steer into that task or queue for after. Returns "queue" if there's no
+   * active task for this project — the renderer's isProcessing check should
+   * already have gated this call, so absence here means state went stale
+   * between that check and this one; queueing (== sending normally once the
+   * renderer re-checks) is the correct, safe fallback, never steer into
+   * nothing.
+   */
+  classifySteerIntent(projectId, message) {
+    const anchor = this.activeTaskAnchors.get(projectId);
+    if (!anchor) return { decision: "queue", reason: "no-active-task" };
+    return classifySteerIntent(message, anchor.prompt);
+  }
+
+  /**
+   * Queue a message for injection into the running task at the next turn
+   * boundary. Returns { accepted: false } if the task already finished —
+   * the race between the renderer's classify call and this one landing.
+   */
+  steer(projectId, message) {
+    if (!this.activeRequests.has(projectId)) {
+      return { accepted: false };
+    }
+    if (!this.pendingSteerMessages.has(projectId)) {
+      this.pendingSteerMessages.set(projectId, []);
+    }
+    this.pendingSteerMessages.get(projectId).push({ text: message, timestamp: Date.now() });
+    return { accepted: true };
+  }
+
   async abort(projectId) {
     const controller = this.activeRequests.get(projectId);
     if (controller) {
@@ -6612,6 +6694,8 @@ export class ApiBackend extends PunkBackend {
   shutdown() {
     for (const controller of this.activeRequests.values()) controller.abort();
     this.activeRequests.clear();
+    this.activeTaskAnchors.clear();
+    this.pendingSteerMessages.clear();
     this.requestStates.clear();
     // Clean up ALL tool executors — kill background processes, release references
     for (const [, executor] of this.toolExecutors) {

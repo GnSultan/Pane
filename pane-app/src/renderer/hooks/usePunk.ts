@@ -33,6 +33,8 @@ import {
   resumeFromCheckpoint,
   recordLastPrompt,
   recordLastResponse,
+  classifySteerIntent,
+  steerPunk,
 } from "../lib/tauri-commands";
 import type {
   PunkStreamEvent,
@@ -874,9 +876,33 @@ export function usePunk(projectId: string) {
       const project = store.projects.get(projectId);
       if (!project) return;
 
-      // If already processing, queue the message instead of aborting.
-      // This prevents the "Hard Kill" where follow-up messages reset the model mid-task.
+      // If already processing, either steer the message into the running
+      // task (if it's a correction/refinement for that same task) or queue
+      // it for after (unrelated new topic) — classification is local/regex,
+      // no network call, negligible latency. This prevents the "Hard Kill"
+      // where an unrelated follow-up used to reset the model mid-task, while
+      // still letting a genuine correction land immediately instead of
+      // waiting for the whole task to finish.
       if (project.conversation.isProcessing) {
+        const { decision } = await classifySteerIntent(projectId, prompt).catch(
+          () => ({ decision: "queue" as const, reason: "classify-failed" }),
+        );
+        if (decision === "steer") {
+          const { accepted } = await steerPunk(projectId, prompt).catch(() => ({ accepted: false }));
+          if (accepted) {
+            store.addConversationMessage(projectId, {
+              id: nextMessageId(),
+              type: "user",
+              content: [{ type: "text", text: prompt.trim() }],
+              timestamp: Date.now(),
+              isStreaming: false,
+              deliveryMode: "steered",
+            });
+            return;
+          }
+          // accepted:false — task finished in the race between classify and
+          // steer landing; fall through to the normal queue path below.
+        }
         messageQueueRef.current.push({ prompt, minds, phase });
         store.setConversationStatusMessage(projectId, "Message queued (agent is busy)");
         setTimeout(() => {
@@ -1373,6 +1399,26 @@ export function usePunk(projectId: string) {
             // Tool execution is paused waiting for user input.
             // Store the pending state so the UI can render the appropriate prompt.
             useProjectsStore.getState().setPendingInput(projectId, event.data);
+            break;
+          }
+
+          case "steer_missed": {
+            // A steer message never got a chance to inject (task finished,
+            // hit maxTurns, or paused right before it landed) — degrade
+            // gracefully into "queued and sent next" via the same drain
+            // mechanism used elsewhere, rather than dropping it silently.
+            const { texts } = event.data;
+            for (const text of texts) {
+              messageQueueRef.current.push({ prompt: text });
+            }
+            if (messageQueueRef.current.length > 0) {
+              const next = messageQueueRef.current.shift();
+              if (next) {
+                setTimeout(() => {
+                  sendMessage(next.prompt, next.minds, next.phase);
+                }, 500);
+              }
+            }
             break;
           }
         }
