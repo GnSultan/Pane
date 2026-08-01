@@ -111,8 +111,11 @@ export function useFileWatcher() {
               .catch(console.error);
           }
 
-          // Re-read affected expanded directories
-          const affectedDirs = new Set<string>();
+          // Re-read affected directories.
+          // Always include the project root — it's the always-visible entry
+          // point and new top-level files would otherwise require a restart.
+          // Also refresh any expanded/loaded subdirs that contain changed files.
+          const affectedDirs = new Set<string>([project.root]);
           for (const changedPath of relevantPaths) {
             const parentDir = getParentDir(changedPath);
             if (project.expandedDirs.has(parentDir) || project.dirContents.has(parentDir)) {
