@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { lineDiff, type DiffLine } from "../../lib/diff";
 import type {
   ToolUseBlock,
@@ -10,11 +10,66 @@ import type {
 } from "../../lib/punk-types";
 import { MarkdownText, renderHighlightedCode } from "./MarkdownText";
 import { MicroIndicator } from "../shared";
+import { useProjectsStore } from "../../stores/projects";
+import { readFile } from "../../lib/tauri-commands";
 
 interface ToolActivityProps {
   toolUse: ToolUseBlock;
   toolResult?: ToolResultBlock;
   isHistorical?: boolean;
+}
+
+// Tools that operate on a single file and can be promoted to viewer mode
+const FILE_TOOLS = new Set(["Edit", "Write", "Read", "replace", "write_file", "read_file"]);
+
+function getFilePath(name: string, input: Record<string, unknown>): string | null {
+  if (!FILE_TOOLS.has(name)) return null;
+  return (input.file_path as string) || null;
+}
+
+// For write_file / Write tools we already have the content in the input.
+// For read_file / Read / Edit the content lives in the tool result.
+function getFileContent(
+  name: string,
+  input: Record<string, unknown>,
+  result?: ToolResultBlock,
+): string | null {
+  if (name === "write_file" || name === "Write") {
+    return (input.content as string) ?? null;
+  }
+  if (name === "read_file" || name === "Read") {
+    if (!result || result.is_error) return null;
+    return typeof result.content === "string" ? result.content : null;
+  }
+  // Edit / replace — read fresh from disk (result contains a success message, not content)
+  return null;
+}
+
+function useOpenFile(
+  name: string,
+  input: Record<string, unknown>,
+  result?: ToolResultBlock,
+) {
+  const activeProjectId = useProjectsStore((s) => s.activeProjectId);
+  const openFile = useProjectsStore((s) => s.openFile);
+
+  return useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!activeProjectId) return;
+    const filePath = getFilePath(name, input);
+    if (!filePath) return;
+
+    // Prefer inline content; fall back to reading from disk (Edit/replace)
+    let content = getFileContent(name, input, result);
+    if (content === null) {
+      try {
+        content = await readFile(filePath);
+      } catch {
+        return;
+      }
+    }
+    openFile(activeProjectId, filePath, content);
+  }, [activeProjectId, openFile, name, input, result]);
 }
 
 // Parse MCP tool names: "mcp__server-name__tool_name" → { server, tool }
@@ -728,6 +783,10 @@ export function ToolActivity({ toolUse, toolResult, isHistorical }: ToolActivity
   const isComplete = !!toolResult;
   const isFailed = toolResult?.is_error ?? false;
 
+  // "edit" button — available once a file tool completes successfully
+  const handleOpenFile = useOpenFile(toolUse.name, toolUse.input, toolResult);
+  const canOpenFile = isComplete && !isFailed && FILE_TOOLS.has(toolUse.name) && !!getFilePath(toolUse.name, toolUse.input);
+
   // Stable expansion rules - NO SHAPE-SHIFTING:
   // 1. User manually toggled → respect that always
   // 2. Edit/Write → always expanded (must see changes)
@@ -785,11 +844,24 @@ export function ToolActivity({ toolUse, toolResult, isHistorical }: ToolActivity
         {isFailed && (
           <span className="text-pane-error/80 shrink-0">err</span>
         )}
-        <span 
-          className="ml-auto shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-pane-text-secondary/20 font-mono"
-          style={{ fontSize: "var(--pane-font-size-sm)" }}
-        >
-          {expanded ? "collapse" : "expand"}
+        <span className="ml-auto shrink-0 flex items-center gap-3 opacity-0 group-hover:opacity-100 transition-opacity">
+          {canOpenFile && (
+            <span
+              role="button"
+              onClick={handleOpenFile}
+              className="text-pane-text-secondary/40 hover:text-pane-text-secondary font-mono transition-colors"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+              title="open in editor"
+            >
+              edit
+            </span>
+          )}
+          <span
+            className="text-pane-text-secondary/20 font-mono"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          >
+            {expanded ? "collapse" : "expand"}
+          </span>
         </span>
       </button>
 
