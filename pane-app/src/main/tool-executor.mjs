@@ -1916,7 +1916,7 @@ export class ToolExecutor {
                   newContent,
                   type: type || null,
                 }),
-                new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 5000)),
+                new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 15000)),
               ]);
               if (!result?.success) {
                 return { success: false, error: result?.error || "Memory update failed in brain engine.", toolId };
@@ -1969,7 +1969,7 @@ export class ToolExecutor {
                   content: memContent,
                   type: type || null,
                 }),
-                new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 5000)),
+                new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 15000)),
               ]);
               if (!result?.success) {
                 return { success: false, error: result?.error || "Memory deletion failed in brain engine.", toolId };

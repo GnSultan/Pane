@@ -2251,15 +2251,6 @@ process.parentPort.on("message", async ({ data }) => {
             "memory_updated", `Old content replaced with refined version`,
           );
 
-          // Re-embed the new content if embedder is ready
-          let embeddingBuffer = null;
-          if (embedderReady) {
-            const newEmbedding = await embed(newContent);
-            if (newEmbedding) {
-              embeddingBuffer = Buffer.from(newEmbedding.buffer);
-            }
-          }
-
           // Update the node in place — preserve existing metadata
           let oldParsed = {};
           try { oldParsed = JSON.parse(node.content || "{}"); } catch (e) { /* malformed JSON in node.content, start fresh */ }
@@ -2274,9 +2265,18 @@ process.parentPort.on("message", async ({ data }) => {
             node.id,
           );
 
-          // Update embedding if we got a new one
-          if (embeddingBuffer) {
-            db.prepare("UPDATE nodes SET embedding = ? WHERE id = ?").run(embeddingBuffer, node.id);
+          // Re-embed in the background — don't block the response.
+          // The embedding is for search relevance, not for the update itself.
+          // Blocking on embed() here caused timeouts (cold start, pipeline recycle,
+          // or worker thread busy with other embedding work).
+          if (embedderReady) {
+            embed(newContent).then(newEmbedding => {
+              if (newEmbedding) {
+                const embeddingBuffer = Buffer.from(newEmbedding.buffer);
+                db.prepare("UPDATE nodes SET embedding = ? WHERE id = ?").run(embeddingBuffer, node.id);
+                console.log(`[brain] Memory re-embedded: ${node.id}`);
+              }
+            }).catch(err => console.warn(`[brain] Background re-embed failed for ${node.id}: ${err.message}`));
           }
 
           console.log(`[brain] Memory updated: ${node.id} (${node.entity_type})`);
