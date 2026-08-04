@@ -304,7 +304,30 @@ async function deletePaneCredentials() {
  * @returns {{ accessToken: string, refreshToken: string|null, expiresAt: number, account: object|null } | null}
  */
 async function readCliCredentials() {
-  // macOS Keychain: Claude Code stores under "Claude Code-credentials" service
+  // File-first: avoids macOS keychain ACL prompts on every auth state check.
+  // This was previously keychain-first, which triggered password prompts
+  // repeatedly because the Claude Code keychain item lacks ACL trust entries
+  // for Pane's process. The file ~/.claude/.credentials.json is always
+  // readable and prompt-free.
+  try {
+    const credPath = join(homedir(), ".claude", ".credentials.json");
+    const raw = readFileSync(credPath, "utf-8");
+    const parsed = JSON.parse(raw);
+    const oauth = parsed.claudeAiOauth ?? parsed;
+    if (typeof oauth.accessToken === "string" && oauth.accessToken) {
+      return {
+        accessToken: oauth.accessToken,
+        refreshToken: oauth.refreshToken || null,
+        expiresAt: oauth.expiresAt || 0,
+        account: {
+          subscriptionType: oauth.subscriptionType || null,
+          rateLimitTier: oauth.rateLimitTier || null,
+        },
+      };
+    }
+  } catch {}
+
+  // Keychain fallback only if file is missing or unreadable
   if (process.platform === "darwin") {
     try {
       const account = userInfo().username;
@@ -328,25 +351,6 @@ async function readCliCredentials() {
       console.warn("[claude-login] Keychain read warning:", err.message);
     }
   }
-
-  // Credentials file fallback: ~/.claude/.credentials.json
-  try {
-    const credPath = join(homedir(), ".claude", ".credentials.json");
-    const raw = readFileSync(credPath, "utf-8");
-    const parsed = JSON.parse(raw);
-    const oauth = parsed.claudeAiOauth ?? parsed;
-    if (typeof oauth.accessToken === "string" && oauth.accessToken) {
-      return {
-        accessToken: oauth.accessToken,
-        refreshToken: oauth.refreshToken || null,
-        expiresAt: oauth.expiresAt || 0,
-        account: {
-          subscriptionType: oauth.subscriptionType || null,
-          rateLimitTier: oauth.rateLimitTier || null,
-        },
-      };
-    }
-  } catch {}
 
   return null;
 }

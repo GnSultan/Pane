@@ -369,37 +369,16 @@ function writeBackClaudeFile(creds) {
 async function writeBackCredentials(creds) {
   const source = creds._source || "claude-code";
 
-  // File-first write-back: always write to file (prompt-free, secure with 0600).
-  // Keychain write-back is secondary and non-blocking — if it fails, we don't care
-  // because the file is the primary source now.
+  // File-only write-back. We intentionally do NOT write to keychain.
+  // Keychain items created by Pane/Electron don't have stable ACL trust entries,
+  // so keytar.setPassword() triggers a macOS password prompt on every refresh.
+  // The file is the primary store (mode 0600) — prompt-free and secure.
+  // Keychain is kept as a read-only fallback for pre-migration installations only.
   if (source === "pane") {
-    const fileOk = writeBackPaneFile(creds);
-    if (fileOk) {
-      // Best-effort keychain sync — don't let ACL failures block us
-      if (process.platform === "darwin") {
-        writeBackPaneKeychain(creds).catch(() => {});
-      }
-      return true;
-    }
-    // File failed — try keychain as last resort
-    if (process.platform === "darwin") {
-      return writeBackPaneKeychain(creds);
-    }
-    return false;
+    return writeBackPaneFile(creds);
   }
 
-  // Claude Code source
-  const fileOk = writeBackClaudeFile(creds);
-  if (fileOk) {
-    if (process.platform === "darwin") {
-      writeBackClaudeKeychain(creds).catch(() => {});
-    }
-    return true;
-  }
-  if (process.platform === "darwin") {
-    return writeBackClaudeKeychain(creds);
-  }
-  return false;
+  return writeBackClaudeFile(creds);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
