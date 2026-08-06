@@ -609,37 +609,6 @@ function ThoughtsPicker({
   );
 }
 
-/** Sidebar expand button — only visible when ThreadPanel is collapsed.
- *  Lives inline with the ghost trigger, same baseline as "let's build". */
-function SidebarExpandButton() {
-  const sidebarCollapsed = useWorkspaceStore((s) => s.sidebarCollapsed);
-  if (!sidebarCollapsed) return null;
-
-  return (
-    <button
-      onClick={(e) => {
-        e.stopPropagation();
-        useWorkspaceStore.getState().toggleSidebar();
-      }}
-      className="flex items-center justify-center btn-press text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors"
-      title="Show threads"
-    >
-      <svg
-        width="14"
-        height="14"
-        viewBox="0 0 16 16"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        <path d="M10 4 6 8l4 4" />
-      </svg>
-    </button>
-  );
-}
-
 export function InputBar({
   projectId,
   onSend,
@@ -1019,8 +988,6 @@ export function InputBar({
           style={{ fontSize: "var(--pane-font-size-xs)" }}
         >
           <div className="pointer-events-auto flex items-center gap-2">
-            {/* Sidebar expand — visible only when collapsed. Same line as "let's build". */}
-            <SidebarExpandButton />
             <button
               onClick={() => setExpandedSection("input")}
               className="text-left text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors"

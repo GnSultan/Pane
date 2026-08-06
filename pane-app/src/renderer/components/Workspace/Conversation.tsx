@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback, useMemo, memo, useState, startTransition } from "react";
 import { useProjectsStore } from "../../stores/projects";
+import { useWorkspaceStore } from "../../stores/workspace";
 import { usePunk } from "../../hooks/usePunk";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
@@ -72,6 +73,7 @@ export const Conversation = memo(function Conversation({
   const messages = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.messages ?? EMPTY_MESSAGES,
   );
+  const sidebarCollapsed = useWorkspaceStore((s) => s.sidebarCollapsed);
   const isProcessing = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.isProcessing ?? false,
   );
@@ -312,47 +314,49 @@ export const Conversation = memo(function Conversation({
     <div className="relative flex flex-col h-full w-full">
       <div
         ref={scrollRef}
-        className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto px-10 pb-8 pt-8 bg-pane-bg"
+        className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto pb-8 pt-8 bg-pane-bg"
         data-conv-scroll
       >
-        {hasOlderMessages && (
-          <div className="flex flex-col items-center py-3">
-            {loadOlderError && (
-              <span
-                className="font-mono text-[10px] text-pane-error mb-1"
+        <div className="max-w-5xl mx-auto px-10 min-h-full">
+          {hasOlderMessages && (
+            <div className="flex flex-col items-center py-3">
+              {loadOlderError && (
+                <span
+                  className="font-mono text-[10px] text-pane-error mb-1"
+                >
+                  {loadOlderError}
+                </span>
+              )}
+              <button
+                onClick={handleLoadOlder}
+                disabled={isLoadingOlder}
+                className="font-mono text-[10px] text-[var(--pane-terminal)] opacity-60 hover:opacity-100 disabled:opacity-30 transition-opacity"
               >
-                {loadOlderError}
+                {isLoadingOlder ? "loading..." : "load older messages"}
+              </button>
+            </div>
+          )}
+
+          {messages.length === 0 && !hasOlderMessages && (
+            <div className="flex items-center justify-center h-full select-none">
+              <span
+                className="text-pane-text-secondary/40 font-mono tracking-[0.25em] uppercase"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+              >
+                ready
               </span>
-            )}
-            <button
-              onClick={handleLoadOlder}
-              disabled={isLoadingOlder}
-              className="font-mono text-[10px] text-[var(--pane-terminal)] opacity-60 hover:opacity-100 disabled:opacity-30 transition-opacity"
-            >
-              {isLoadingOlder ? "loading..." : "load older messages"}
-            </button>
-          </div>
-        )}
+            </div>
+          )}
 
-        {messages.length === 0 && !hasOlderMessages && (
-          <div className="flex items-center justify-center h-full select-none">
-            <span
-              className="text-pane-text-secondary/40 font-mono tracking-[0.25em] uppercase"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              ready
-            </span>
-          </div>
-        )}
-
-        {messages.map((message) => (
-          <MemoizedMessage
-            key={message.id}
-            message={message}
-            toolResults={toolResultMap}
-            projectId={projectId}
-          />
-        ))}
+          {messages.map((message) => (
+            <MemoizedMessage
+              key={message.id}
+              message={message}
+              toolResults={toolResultMap}
+              projectId={projectId}
+            />
+          ))}
+        </div>
       </div>
 
       {showRefreshToast && (
@@ -365,7 +369,7 @@ export const Conversation = memo(function Conversation({
 
       {visibleError && (
         <div className="absolute bottom-0 left-0 right-0 z-40 px-4 pb-4 pointer-events-none">
-          <div className="pointer-events-auto flex items-start gap-3 font-mono text-[11px] text-pane-error bg-pane-error-bg ring-1 ring-pane-error-border px-4 py-3 rounded-md animate-fade-in leading-[1.6]">
+          <div className="pointer-events-auto max-w-5xl mx-auto flex items-start gap-3 font-mono text-[11px] text-pane-error bg-pane-error-bg ring-1 ring-pane-error-border px-4 py-3 rounded-md animate-fade-in leading-[1.6]">
             <span
               className="flex-1 overflow-y-auto max-h-[100px] select-text"
               style={{ overflowWrap: "anywhere" }}
@@ -381,7 +385,7 @@ export const Conversation = memo(function Conversation({
           </div>
         </div>
       )}
-      <div className="relative z-10 shrink-0 flex flex-col">
+      <div className={`relative z-10 shrink-0 flex flex-col ${sidebarCollapsed ? "max-w-5xl mx-auto w-full" : ""}`}>
         <InputBar
           projectId={projectId}
           onSend={handleSend}

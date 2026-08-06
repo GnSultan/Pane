@@ -10,6 +10,7 @@ import { FileSearch } from "../FileSearch/FileSearch";
 import { GitStatus } from "../ThreadPanel/GitStatus";
 import { Menu, type PaneMode } from "../ThreadPanel/Menu";
 import { useProjectsStore } from "../../stores/projects";
+import { useWorkspaceStore } from "../../stores/workspace";
 import { detectProjectRoot } from "../../lib/tauri-commands";
 
 import type { ElectronAPI } from '../../lib/electron';
@@ -176,6 +177,7 @@ export function Workspace() {
     return id ? s.projects.get(id)?.hasUnreadLens ?? false : false;
   });
   const setMode = useProjectsStore((s) => s.setMode);
+  const sidebarCollapsed = useWorkspaceStore((s) => s.sidebarCollapsed);
 
   const handleSelectMode = useCallback((newMode: PaneMode) => {
     const id = useProjectsStore.getState().activeProjectId;
@@ -246,6 +248,20 @@ export function Workspace() {
             onSelectMode={handleSelectMode}
           />
         </div>
+      )}
+
+      {/* Sidebar expand — appears at the same bottom-left corner where the Menu icon
+           sits inside ThreadPanel. Only when sidebar is collapsed and in conversation mode. */}
+      {mode === "conversation" && sidebarCollapsed && (
+        <button
+          onClick={() => useWorkspaceStore.getState().toggleSidebar()}
+          className="absolute bottom-1.5 left-1.5 z-50 w-6 h-6 flex items-center justify-center rounded-md text-pane-text-secondary/50 hover:text-pane-text-secondary transition-colors btn-press pointer-events-auto"
+          title="Show threads"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M10 4 6 8l4 4" />
+          </svg>
+        </button>
       )}
 
 
