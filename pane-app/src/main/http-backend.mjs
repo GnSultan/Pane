@@ -2279,49 +2279,67 @@ export class ApiBackend extends PunkBackend {
     }
 
     // --- 4. AUTO-HEAL: Close orphaned tool calls ---
-    // Insert fake results at the correct position — right after the assistant
-    // message that made those tool calls — instead of appending at the end.
-    // Skip for non-tool DeepSeek models — they have no tool support so tool
-    // messages must never appear in the history regardless.
-    if (isOpenAI && !isReasoner && pendingToolCallIds.size > 0) {
-      console.warn(
-        `[http] history sequence error: ${pendingToolCallIds.size} tool calls missing results. Healing...`,
-      );
-      const fakeResults = [];
-      for (const id of pendingToolCallIds) {
-        fakeResults.push({
-          role: "tool",
-          tool_call_id: id,
-          content:
-            "Error: Turn was interrupted before tool result could be processed.",
-          is_error: true,
-        });
-      }
-      // Insert after the last assistant with tool_calls, or fall back to append
-      const insertAt = Math.min(
-        lastToolCallAssistantIndex + 1,
-        normalized.length,
-      );
-      normalized.splice(insertAt, 0, ...fakeResults);
-    }
+    // Walk backward through normalized[] and insert fake results IMMEDIATELY
+    // AFTER each assistant that has orphaned tool_use blocks. The old code
+    // inserted all fake results at a single position (lastToolCallAssistantIndex+1),
+    // which violated Anthropic's "tool_result must be in the NEXT message"
+    // rule when multiple assistants at different positions had orphans.
+    //
+    // We iterate backward so splice insertions don't shift indices of
+    // assistants we haven't processed yet.
+    if (!isReasoner && pendingToolCallIds.size > 0) {
+      let healed = 0;
+      for (let i = normalized.length - 1; i >= 0; i--) {
+        const msg = normalized[i];
+        if (msg.role !== "assistant") continue;
 
-    if (!isOpenAI && !isReasoner && pendingToolCallIds.size > 0) {
-      // Anthropic: orphaned tool_use blocks — insert a user message with fake
-      // tool_result blocks right after the assistant message that made the calls.
-      console.warn(
-        `[http] Anthropic: ${pendingToolCallIds.size} tool_use blocks missing results. Healing...`,
-      );
-      const fakeBlocks = [];
-      for (const id of pendingToolCallIds) {
-        fakeBlocks.push({
-          type: "tool_result",
-          tool_use_id: id,
-          content: "Error: Turn was interrupted before tool result could be processed.",
-          is_error: true,
-        });
+        // Collect orphaned tool call IDs from this specific assistant
+        const orphanIds = [];
+
+        // OpenAI-style tool_calls
+        if (Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            if (tc.id && pendingToolCallIds.has(tc.id)) orphanIds.push(tc.id);
+          }
+        }
+        // Anthropic-style tool_use content blocks
+        if (Array.isArray(msg.content)) {
+          for (const c of msg.content) {
+            if (c.type === "tool_use" && c.id && pendingToolCallIds.has(c.id)) {
+              orphanIds.push(c.id);
+            }
+          }
+        }
+
+        if (orphanIds.length === 0) continue;
+
+        if (isOpenAI) {
+          const fakeResults = orphanIds.map((id) => ({
+            role: "tool",
+            tool_call_id: id,
+            content:
+              "Error: Turn was interrupted before tool result could be processed.",
+            is_error: true,
+          }));
+          normalized.splice(i + 1, 0, ...fakeResults);
+        } else {
+          // Anthropic: batch into a single user message with tool_result blocks
+          const fakeBlocks = orphanIds.map((id) => ({
+            type: "tool_result",
+            tool_use_id: id,
+            content:
+              "Error: Turn was interrupted before tool result could be processed.",
+            is_error: true,
+          }));
+          normalized.splice(i + 1, 0, { role: "user", content: fakeBlocks });
+        }
+        healed += orphanIds.length;
       }
-      const insertAt = Math.min(lastToolCallAssistantIndex + 1, normalized.length);
-      normalized.splice(insertAt, 0, { role: "user", content: fakeBlocks });
+      if (healed > 0) {
+        console.warn(
+          `[http] ${isOpenAI ? "OpenAI" : "Anthropic"}: healed ${healed} orphaned tool calls with fake results`,
+        );
+      }
     }
 
     // --- 5. DEFENSIVE SANITIZATION (OpenAI providers) ---
@@ -3324,12 +3342,16 @@ export class ApiBackend extends PunkBackend {
                     // didn't fully resolve the tool_call→tool_result chain.
                     const errorBody = await response.text().catch(() => "");
                     lastResponseBody = errorBody; // Preserve for error message after retry loop
+                    // Strip backticks so patterns match both raw and markdown-formatted errors.
+                    // Anthropic sends: `tool_use` ids were found without `tool_result` blocks
+                    const plainBody = errorBody.replace(/`/g, "");
                     if (
-                      (errorBody.includes("insufficient tool messages") ||
-                        errorBody.includes("tool_use id") ||
-                        errorBody.includes("tool_use block") ||
-                        errorBody.includes("tool_result block") ||
-                        (errorBody.includes("tool") && errorBody.includes("Unexpected role"))) &&
+                      (plainBody.includes("insufficient tool messages") ||
+                        plainBody.includes("tool_use id") ||
+                        plainBody.includes("tool_use block") ||
+                        plainBody.includes("tool_result block") ||
+                        plainBody.includes("tool_use") && plainBody.includes("tool_result") ||
+                        (plainBody.includes("tool") && plainBody.includes("Unexpected role"))) &&
                       !this._healAttemptedThisTurn
                     ) {
                       this._healAttemptedThisTurn = true;
