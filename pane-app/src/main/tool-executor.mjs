@@ -1906,101 +1906,83 @@ export class ToolExecutor {
           if (!oldContent) return { success: false, error: "Content of the memory to update is required.", toolId };
           if (!newContent) return { success: false, error: "New content is required.", toolId };
 
-          // Update in brain knowledge graph via IPC
-          if (this._brainRequest) {
-            try {
-              const result = await Promise.race([
-                this._brainRequest("update_memory", {
-                  projectId: this.projectId,
-                  content: oldContent,
-                  newContent,
-                  type: type || null,
-                }),
-                new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 15000)),
-              ]);
-              if (!result?.success) {
-                return { success: false, error: result?.error || "Memory update failed in brain engine.", toolId };
-              }
-
-              // Also update events.jsonl so the file-based fallback stays in sync
-              const eventsPath = path.join(memoryDir, "events.jsonl");
-              try {
-                const raw = await fsPromises.readFile(eventsPath, "utf-8");
-                const lines = raw.trim().split("\n");
-                let updated = 0;
-                const updatedLines = lines.map(line => {
-                  try {
-                    const e = JSON.parse(line);
-                    if (e.content && e.content.includes(oldContent.slice(0, 40))) {
-                      e.content = newContent;
-                      e.metadata = { ...(e.metadata || {}), updated: true, updated_at: new Date().toISOString() };
-                      updated++;
-                    }
-                    return JSON.stringify(e);
-                  } catch { return line; }
-                });
-                if (updated > 0) {
-                  await fsPromises.writeFile(eventsPath, updatedLines.join("\n") + "\n");
-                }
-              } catch (e) { console.warn("[pane_update_memory] events.jsonl sync failed:", e.message); }
-
-              return {
-                success: true,
-                output: `Memory updated: [${type || "memory"}] replaced "${oldContent.slice(0, 60)}..." with refined content.`,
-                toolId,
-              };
-            } catch (err) {
-              return { success: false, error: `Memory update failed: ${err.message}`, toolId };
-            }
+          // Direct SQLite mutation — bypasses brain worker IPC entirely.
+          // The brain worker is single-threaded and blocks on ONNX inference
+          // (416MB model), causing 15s+ timeouts for what should be <5ms SQLite ops.
+          const { directUpdateMemory, notifyBrainReembed } = await import("./memory-direct.mjs");
+          const result = directUpdateMemory(this.projectId, oldContent, newContent, type || null);
+          if (!result.success) {
+            return { success: false, error: result.error || "Memory update failed.", toolId };
           }
-          return { success: false, error: "Brain engine not available — cannot update memory.", toolId };
+
+          // Notify brain worker to re-embed in background (fire-and-forget, non-blocking)
+          if (this._brainRequest) {
+            notifyBrainReembed(this._brainRequest, result.nodeId, newContent);
+          }
+
+          // Also update events.jsonl so the file-based fallback stays in sync
+          const eventsPath = path.join(memoryDir, "events.jsonl");
+          try {
+            const raw = await fsPromises.readFile(eventsPath, "utf-8");
+            const lines = raw.trim().split("\n");
+            let updated = 0;
+            const updatedLines = lines.map(line => {
+              try {
+                const e = JSON.parse(line);
+                if (e.content && e.content.includes(oldContent.slice(0, 40))) {
+                  e.content = newContent;
+                  e.metadata = { ...(e.metadata || {}), updated: true, updated_at: new Date().toISOString() };
+                  updated++;
+                }
+                return JSON.stringify(e);
+              } catch { return line; }
+            });
+            if (updated > 0) {
+              await fsPromises.writeFile(eventsPath, updatedLines.join("\n") + "\n");
+            }
+          } catch (e) { console.warn("[pane_update_memory] events.jsonl sync failed:", e.message); }
+
+          return {
+            success: true,
+            output: `Memory updated: [${type || "memory"}] replaced "${oldContent.slice(0, 60)}..." with refined content.`,
+            toolId,
+          };
         }
 
         case "pane_delete_memory": {
           const { content: memContent, type } = input;
           if (!memContent) return { success: false, error: "Content of the memory to delete is required.", toolId };
 
-          // Delete from brain knowledge graph via IPC
-          if (this._brainRequest) {
-            try {
-              const result = await Promise.race([
-                this._brainRequest("delete_memory", {
-                  projectId: this.projectId,
-                  content: memContent,
-                  type: type || null,
-                }),
-                new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 15000)),
-              ]);
-              if (!result?.success) {
-                return { success: false, error: result?.error || "Memory deletion failed in brain engine.", toolId };
-              }
-
-              // Also remove from events.jsonl to keep the file-based fallback in sync
-              const eventsPath = path.join(memoryDir, "events.jsonl");
-              try {
-                const raw = await fsPromises.readFile(eventsPath, "utf-8");
-                const lines = raw.trim().split("\n");
-                const filteredLines = lines.filter(line => {
-                  try {
-                    const e = JSON.parse(line);
-                    return !(e.content && e.content.includes(memContent.slice(0, 40)));
-                  } catch { return true; }
-                });
-                if (filteredLines.length < lines.length) {
-                  await fsPromises.writeFile(eventsPath, filteredLines.join("\n") + "\n");
-                }
-              } catch (e) { console.warn("[pane_delete_memory] events.jsonl sync failed:", e.message); }
-
-              return {
-                success: true,
-                output: `Memory deleted: [${type || "memory"}] removed "${memContent.slice(0, 60)}...".`,
-                toolId,
-              };
-            } catch (err) {
-              return { success: false, error: `Memory deletion failed: ${err.message}`, toolId };
-            }
+          // Direct SQLite mutation — bypasses brain worker IPC entirely.
+          // The brain worker is single-threaded and blocks on ONNX inference
+          // (416MB model), causing 15s+ timeouts for what should be <5ms SQLite ops.
+          const { directDeleteMemory } = await import("./memory-direct.mjs");
+          const result = directDeleteMemory(this.projectId, memContent, type || null);
+          if (!result.success) {
+            return { success: false, error: result.error || "Memory deletion failed.", toolId };
           }
-          return { success: false, error: "Brain engine not available — cannot delete memory.", toolId };
+
+          // Also remove from events.jsonl to keep the file-based fallback in sync
+          const eventsPath = path.join(memoryDir, "events.jsonl");
+          try {
+            const raw = await fsPromises.readFile(eventsPath, "utf-8");
+            const lines = raw.trim().split("\n");
+            const filteredLines = lines.filter(line => {
+              try {
+                const e = JSON.parse(line);
+                return !(e.content && e.content.includes(memContent.slice(0, 40)));
+              } catch { return true; }
+            });
+            if (filteredLines.length < lines.length) {
+              await fsPromises.writeFile(eventsPath, filteredLines.join("\n") + "\n");
+            }
+          } catch (e) { console.warn("[pane_delete_memory] events.jsonl sync failed:", e.message); }
+
+          return {
+            success: true,
+            output: `Memory deleted: [${type || "memory"}] removed "${memContent.slice(0, 60)}...".`,
+            toolId,
+          };
         }
 
         case "pane_recall_all": {

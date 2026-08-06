@@ -2214,6 +2214,31 @@ process.parentPort.on("message", async ({ data }) => {
         break;
       }
 
+      case "reembed_node": {
+        // Background re-embedding of a single node after direct memory update.
+        // Called from memory-direct.mjs via brainRequest — fire-and-forget,
+        // the mutation already succeeded via the direct connection. This just
+        // refreshes the embedding vector for search relevance.
+        try {
+          if (embedderReady && data.nodeId) {
+            const node = db._stmts.getNode.get(data.nodeId);
+            if (node && data.content) {
+              const newEmbedding = await embed(data.content);
+              if (newEmbedding) {
+                const embeddingBuffer = Buffer.from(newEmbedding.buffer);
+                db.prepare("UPDATE nodes SET embedding = ? WHERE id = ?").run(embeddingBuffer, data.nodeId);
+                console.log(`[brain] Node re-embedded via direct path: ${data.nodeId}`);
+              }
+            }
+          }
+          sendToMain({ type: "reembed_done", requestId: data.requestId });
+        } catch (err) {
+          console.warn(`[brain] reembed_node failed: ${err.message}`);
+          sendToMain({ type: "reembed_done", requestId: data.requestId });
+        }
+        break;
+      }
+
       case "update_memory": {
         // Memory self-correction: rewrite an existing memory's content.
         // The model calls this when it discovers something that refines or
