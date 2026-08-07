@@ -432,10 +432,14 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_update_memory",
       description:
-        "Update an existing memory with refined or corrected content. Use when you discover something that refines, contradicts, or supersedes a prior memory — rewrite it instead of adding a duplicate. Always search first (pane_recall) to find the exact old content before updating. This keeps memory self-correcting instead of accumulating contradictions.",
+        "Update an existing memory with refined or corrected content. Use when you discover something that refines, contradicts, or supersedes a prior memory — rewrite it instead of adding a duplicate. Always search first (pane_recall) to find the memory's id, then pass it here for reliable targeting. This keeps memory self-correcting instead of accumulating contradictions.",
       parameters: {
         type: "object",
         properties: {
+          id: {
+            type: "string",
+            description: "The memory id from pane_recall or pane_knowledge_graph. Preferred — deterministic, no wording guessing required.",
+          },
           type: {
             type: "string",
             enum: ["decision", "lesson", "pattern", "error_fix"],
@@ -443,14 +447,14 @@ const TOOL_DEFINITIONS = [
           },
           content: {
             type: "string",
-            description: "The approximate existing content to find and replace. Provide enough to uniquely identify the memory.",
+            description: "The approximate existing content to find and replace. Only needed if id is not provided — provide enough to uniquely identify the memory.",
           },
           newContent: {
             type: "string",
             description: "The refined content that replaces the old memory.",
           },
         },
-        required: ["content", "newContent"],
+        required: ["newContent"],
       },
     },
   },
@@ -459,10 +463,14 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "pane_delete_memory",
       description:
-        "Delete a memory that is obsolete, incorrect, or no longer relevant. Use when a prior observation turns out to be wrong, or when a memory has been fully superseded and keeping it would create noise. Always search first (pane_recall) to confirm the memory exists before deleting.",
+        "Delete a memory that is obsolete, incorrect, or no longer relevant. Use when a prior observation turns out to be wrong, or when a memory has been fully superseded and keeping it would create noise. Always search first (pane_recall) to get the memory's id, then pass it for reliable targeting. Content-based matching is fragile and often fails.",
       parameters: {
         type: "object",
         properties: {
+          id: {
+            type: "string",
+            description: "The memory id from pane_recall or pane_knowledge_graph. Preferred — deterministic, no wording guessing required.",
+          },
           type: {
             type: "string",
             enum: ["decision", "lesson", "pattern", "error_fix"],
@@ -470,10 +478,10 @@ const TOOL_DEFINITIONS = [
           },
           content: {
             type: "string",
-            description: "The approximate content of the memory to delete. Provide enough to uniquely identify it.",
+            description: "The approximate content of the memory to delete. Only needed if id is not provided — provide enough to uniquely identify it.",
           },
         },
-        required: ["content"],
+        required: [],
       },
     },
   },
@@ -2537,7 +2545,8 @@ export class ApiBackend extends PunkBackend {
           if (memories.length > 0) {
             const lines = ["[Pane Memory — proactively surfaced for this task]"];
             for (const m of memories) {
-              lines.push(`- [${m.type}] ${m.content}`);
+              const idTag = m.id ? ` (id: ${m.id})` : "";
+              lines.push(`- [${m.type}]${idTag} ${m.content}`);
             }
             lines.push("[Consider these when working. Use pane_recall for deeper search.]");
             proactiveMemories = lines.join("\n");

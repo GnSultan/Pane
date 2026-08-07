@@ -181,7 +181,7 @@ export function orchestrateContext(projectId, options = {}) {
     "Retrieve only what you need for the task at hand.\n\n" +
     "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. " +
     "pane_update_memory when you discover something that refines or corrects a prior memory — rewrite it instead of adding a duplicate. " +
-    "pane_delete_memory when a memory is obsolete or wrong. " +
+    "pane_delete_memory when a memory is obsolete or wrong. Both accept an `id` — always recall first to get the id for reliable targeting. " +
     "pane_set_rule when the user states a preference. pane_set_about when you understand the project's purpose. " +
     "A session that discovers but doesn't record forces re-discovery. A session that records but never corrects forces confusion."
   );

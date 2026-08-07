@@ -17,6 +17,7 @@ import path from "node:path";
 import { spawn, execSync } from "node:child_process";
 import os from "node:os";
 import vm from "node:vm";
+import crypto from "node:crypto";
 
 import { getPaneDb, pruneChangeHistory } from "./pane-db.mjs";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
@@ -1818,7 +1819,8 @@ export class ToolExecutor {
               if (scored.length > 0) {
                 const matches = scored.slice(0, 30);
                 const out = matches.map(r => {
-                  return `[${r.type}] (match: ${(r.score * 100).toFixed(0)}%)\n${r.content}`;
+                  const idTag = r.id ? ` (id: ${r.id})` : "";
+                  return `[${r.type}] (match: ${(r.score * 100).toFixed(0)}%)${idTag}\n${r.content}`;
                 }).join("\n\n");
                 return { success: true, output: out, toolId };
               }
@@ -1861,10 +1863,17 @@ export class ToolExecutor {
             return `${Math.floor(seconds / 86400)}d ago`;
           };
 
+          // Compute deterministic node IDs for JSONL events — same hash as brain-engine.mjs nodeId()
+          const computeNodeId = (type, content) => {
+            const hash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 12);
+            return `${type}-${hash}`;
+          };
+
           const out = matches.map(e => {
             const ago = e.timestamp ? timeSince(e.timestamp) : "";
             const meta = e.metadata ? Object.entries(e.metadata).map(([k, v]) => `${k}=${v}`).join(" ") : "";
-            return `[${e.type}]${ago ? ` (${ago})` : ""}${meta ? ` {${meta}}` : ""}\n${e.content}`;
+            const memId = computeNodeId(e.type, e.content);
+            return `[${e.type}]${ago ? ` (${ago})` : ""} (id: ${memId})${meta ? ` {${meta}}` : ""}\n${e.content}`;
           }).join("\n\n");
           return { success: true, output: out, toolId };
         }
@@ -1902,15 +1911,15 @@ export class ToolExecutor {
         }
 
         case "pane_update_memory": {
-          const { content: oldContent, newContent, type } = input;
-          if (!oldContent) return { success: false, error: "Content of the memory to update is required.", toolId };
+          const { content: oldContent, newContent, type, id } = input;
+          if (!oldContent && !id) return { success: false, error: "Either the memory id or content of the memory to update is required.", toolId };
           if (!newContent) return { success: false, error: "New content is required.", toolId };
 
           // Direct SQLite mutation — bypasses brain worker IPC entirely.
           // The brain worker is single-threaded and blocks on ONNX inference
           // (416MB model), causing 15s+ timeouts for what should be <5ms SQLite ops.
           const { directUpdateMemory, notifyBrainReembed } = await import("./memory-direct.mjs");
-          const result = directUpdateMemory(this.projectId, oldContent, newContent, type || null);
+          const result = directUpdateMemory(this.projectId, oldContent || "", newContent, type || null, id || null);
           if (!result.success) {
             return { success: false, error: result.error || "Memory update failed.", toolId };
           }
@@ -1929,7 +1938,8 @@ export class ToolExecutor {
             const updatedLines = lines.map(line => {
               try {
                 const e = JSON.parse(line);
-                if (e.content && e.content.includes(oldContent.slice(0, 40))) {
+                const matchKey = id || oldContent.slice(0, 40);
+                if (e.content && (id ? e.id === id || e.nodeId === id : e.content.includes(matchKey))) {
                   e.content = newContent;
                   e.metadata = { ...(e.metadata || {}), updated: true, updated_at: new Date().toISOString() };
                   updated++;
@@ -1944,20 +1954,20 @@ export class ToolExecutor {
 
           return {
             success: true,
-            output: `Memory updated: [${type || "memory"}] replaced "${oldContent.slice(0, 60)}..." with refined content.`,
+            output: `Memory updated (id: ${result.nodeId}): replaced with refined content.`,
             toolId,
           };
         }
 
         case "pane_delete_memory": {
-          const { content: memContent, type } = input;
-          if (!memContent) return { success: false, error: "Content of the memory to delete is required.", toolId };
+          const { content: memContent, type, id } = input;
+          if (!memContent && !id) return { success: false, error: "Either the memory id or content of the memory to delete is required.", toolId };
 
           // Direct SQLite mutation — bypasses brain worker IPC entirely.
           // The brain worker is single-threaded and blocks on ONNX inference
           // (416MB model), causing 15s+ timeouts for what should be <5ms SQLite ops.
           const { directDeleteMemory } = await import("./memory-direct.mjs");
-          const result = directDeleteMemory(this.projectId, memContent, type || null);
+          const result = directDeleteMemory(this.projectId, memContent || "", type || null, id || null);
           if (!result.success) {
             return { success: false, error: result.error || "Memory deletion failed.", toolId };
           }
@@ -1967,10 +1977,11 @@ export class ToolExecutor {
           try {
             const raw = await fsPromises.readFile(eventsPath, "utf-8");
             const lines = raw.trim().split("\n");
+            const matchKey = id || memContent.slice(0, 40);
             const filteredLines = lines.filter(line => {
               try {
                 const e = JSON.parse(line);
-                return !(e.content && e.content.includes(memContent.slice(0, 40)));
+                return !(e.content && (id ? e.id === id || e.nodeId === id : e.content.includes(matchKey)));
               } catch { return true; }
             });
             if (filteredLines.length < lines.length) {
@@ -1980,7 +1991,7 @@ export class ToolExecutor {
 
           return {
             success: true,
-            output: `Memory deleted: [${type || "memory"}] removed "${memContent.slice(0, 60)}...".`,
+            output: `Memory deleted (id: ${result.nodeId}).`,
             toolId,
           };
         }
@@ -2075,7 +2086,8 @@ export class ToolExecutor {
                 const label = typeLabel(n.entity_type);
                 const conf = (n.confidence * 100).toFixed(0);
                 const accesses = n.access_count || 0;
-                parts.push(`  [${label}] (${conf}% conf, ${accesses}x) ${n.content?.slice(0, 200) || n.name}`);
+                const idTag = n.id ? ` (id: ${n.id})` : "";
+                parts.push(`  [${label}]${idTag} (${conf}% conf, ${accesses}x) ${n.content?.slice(0, 200) || n.name}`);
               }
               if (nodes.length > 10) parts.push(`  ... and ${nodes.length - 10} more`);
             }
@@ -2245,7 +2257,8 @@ export class ToolExecutor {
             parts.push(`## ${type} (${nodes.length} total, showing top ${sorted.length})`);
             for (const n of sorted) {
               const conf = n.confidence != null ? ` [confidence: ${n.confidence.toFixed(2)}]` : "";
-              parts.push(`- ${n.content}${conf}`);
+              const idTag = n.id ? ` (id: ${n.id})` : "";
+              parts.push(`- ${n.content}${conf}${idTag}`);
             }
             parts.push("");
           }
@@ -2295,7 +2308,7 @@ export class ToolExecutor {
 
           if (top.length === 0) return { success: true, output: `No cross-project insights found for "${query}".`, toolId };
 
-          const out = top.map(r => `[${r.project}] [${r.type}] (match: ${(r.score * 100).toFixed(0)}%)\n${r.content}`).join("\n\n");
+          const out = top.map(r => `[${r.project}] [${r.type}] (match: ${(r.score * 100).toFixed(0)}%)${r.id ? ` (id: ${r.id})` : ""}\n${r.content}`).join("\n\n");
           return { success: true, output: out, toolId };
         }
 

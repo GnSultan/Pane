@@ -65,27 +65,40 @@ function getDirectBrainDb() {
  * @param {string|null} type - optional entity_type filter
  * @returns {{ success: boolean, nodeId?: string, deletedType?: string, error?: string }}
  */
-export function directDeleteMemory(projectId, content, type = null) {
+export function directDeleteMemory(projectId, content, type = null, id = null) {
   try {
     const db = getDirectBrainDb();
 
-    const nodeType = type || null;
-    const searchClause = nodeType ? "AND entity_type = ?" : "";
-    const params = nodeType
-      ? [projectId, `%${content.slice(0, 60)}%`, nodeType]
-      : [projectId, `%${content.slice(0, 60)}%`];
+    let node;
 
-    const nodes = db.prepare(
-      `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause}
-       AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')
-       ORDER BY confidence DESC LIMIT 5`
-    ).all(...params);
+    // ── ID-based lookup (preferred — deterministic, no wording drift) ──
+    if (id) {
+      node = db.prepare(
+        `SELECT * FROM nodes WHERE id = ? AND project_id = ?
+         AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')`
+      ).get(id, projectId);
+      if (!node) {
+        return { success: false, error: `No memory with id "${id}" found.` };
+      }
+    } else {
+      // ── Content-based fallback (legacy — fuzzy, error-prone) ──
+      const nodeType = type || null;
+      const searchClause = nodeType ? "AND entity_type = ?" : "";
+      const params = nodeType
+        ? [projectId, `%${content.slice(0, 60)}%`, nodeType]
+        : [projectId, `%${content.slice(0, 60)}%`];
 
-    if (nodes.length === 0) {
-      return { success: false, error: "No existing memory matching that content found." };
+      const nodes = db.prepare(
+        `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause}
+         AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')
+         ORDER BY confidence DESC LIMIT 5`
+      ).all(...params);
+
+      if (nodes.length === 0) {
+        return { success: false, error: "No existing memory matching that content found. Tip: use pane_recall to get the memory's id, then pass it to pane_delete_memory for reliable targeting." };
+      }
+      node = nodes[0];
     }
-
-    const node = nodes[0];
     db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(node.id, node.id);
     db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(node.id);
     db.prepare("DELETE FROM nodes WHERE id = ?").run(node.id);
@@ -111,27 +124,40 @@ export function directDeleteMemory(projectId, content, type = null) {
  * @param {string|null} type - optional entity_type filter
  * @returns {{ success: boolean, nodeId?: string, oldType?: string, error?: string }}
  */
-export function directUpdateMemory(projectId, oldContent, newContent, type = null) {
+export function directUpdateMemory(projectId, oldContent, newContent, type = null, id = null) {
   try {
     const db = getDirectBrainDb();
 
-    const nodeType = type || null;
-    const searchClause = nodeType ? "AND entity_type = ?" : "";
-    const params = nodeType
-      ? [projectId, `%${oldContent.slice(0, 60)}%`, nodeType]
-      : [projectId, `%${oldContent.slice(0, 60)}%`];
+    let node;
 
-    const nodes = db.prepare(
-      `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause}
-       AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')
-       ORDER BY confidence DESC LIMIT 5`
-    ).all(...params);
+    // ── ID-based lookup (preferred — deterministic, no wording drift) ──
+    if (id) {
+      node = db.prepare(
+        `SELECT * FROM nodes WHERE id = ? AND project_id = ?
+         AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')`
+      ).get(id, projectId);
+      if (!node) {
+        return { success: false, error: `No memory with id "${id}" found.` };
+      }
+    } else {
+      // ── Content-based fallback (legacy — fuzzy, error-prone) ──
+      const nodeType = type || null;
+      const searchClause = nodeType ? "AND entity_type = ?" : "";
+      const params = nodeType
+        ? [projectId, `%${oldContent.slice(0, 60)}%`, nodeType]
+        : [projectId, `%${oldContent.slice(0, 60)}%`];
 
-    if (nodes.length === 0) {
-      return { success: false, error: "No existing memory matching that content found." };
+      const nodes = db.prepare(
+        `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause}
+         AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')
+         ORDER BY confidence DESC LIMIT 5`
+      ).all(...params);
+
+      if (nodes.length === 0) {
+        return { success: false, error: "No existing memory matching that content found. Tip: use pane_recall to get the memory's id, then pass it to pane_update_memory for reliable targeting." };
+      }
+      node = nodes[0];
     }
-
-    const node = nodes[0];
 
     // Save old version for audit trail
     db.prepare(

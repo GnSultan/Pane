@@ -300,27 +300,29 @@ const TOOLS = [
   },
   {
     name: "pane_update_memory",
-    description: "Update an existing memory with refined or corrected content. Use when you discover something that refines, contradicts, or supersedes a prior memory — rewrite it instead of adding a duplicate. Always search first (pane_recall) to find the exact old content before updating.",
+    description: "Update an existing memory with refined or corrected content. Use when you discover something that refines, contradicts, or supersedes a prior memory — rewrite it instead of adding a duplicate. Always search first (pane_recall) to get the memory's id for reliable targeting.",
     inputSchema: {
       type: "object",
       properties: {
+        id: { type: "string", description: "The memory id from pane_recall. Preferred — deterministic, no wording guessing." },
         type: { type: "string", enum: ["decision", "lesson", "pattern", "error_fix"], description: "Category of the memory being updated" },
-        content: { type: "string", description: "The approximate existing content to find and replace." },
+        content: { type: "string", description: "Approximate existing content. Only needed if id is not provided." },
         newContent: { type: "string", description: "The refined content that replaces the old memory." },
       },
-      required: ["content", "newContent"],
+      required: ["newContent"],
     },
   },
   {
     name: "pane_delete_memory",
-    description: "Delete a memory that is obsolete, incorrect, or no longer relevant. Use when a prior observation turns out to be wrong or has been fully superseded. Always search first (pane_recall) to confirm the memory exists before deleting.",
+    description: "Delete a memory that is obsolete, incorrect, or no longer relevant. Use when a prior observation turns out to be wrong or has been fully superseded. Always search first (pane_recall) to get the memory's id for reliable targeting.",
     inputSchema: {
       type: "object",
       properties: {
+        id: { type: "string", description: "The memory id from pane_recall. Preferred — deterministic, no wording guessing." },
         type: { type: "string", enum: ["decision", "lesson", "pattern", "error_fix"], description: "Category of the memory being deleted" },
-        content: { type: "string", description: "The approximate content of the memory to delete." },
+        content: { type: "string", description: "Approximate content of the memory. Only needed if id is not provided." },
       },
-      required: ["content"],
+      required: [],
     },
   },
   {
@@ -1013,9 +1015,16 @@ async function handleToolCall(name, args) {
     }
 
     case "pane_update_memory": {
-      const { content: oldContent, newContent, type } = args;
-      if (!oldContent) return text("Content of the memory to update is required.");
+      const { content: oldContent, newContent, type, id } = args;
+      if (!oldContent && !id) return text("Either the memory id or content of the memory to update is required.");
       if (!newContent) return text("New content is required.");
+
+      // Compute deterministic node ID for matching (same hash as brain-engine.mjs)
+      const crypto = await import("node:crypto");
+      const computeNodeId = (t, content) => {
+        const hash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 12);
+        return `${t}-${hash}`;
+      };
 
       // Update in events.jsonl (MCP server has no brain engine access)
       const eventsPath = path.join(memoryDir, "events.jsonl");
@@ -1026,7 +1035,10 @@ async function handleToolCall(name, args) {
         const updatedLines = lines.map(line => {
           try {
             const e = JSON.parse(line);
-            if (e.content && e.content.includes(oldContent.slice(0, 40))) {
+            const matches = id
+              ? computeNodeId(e.type, e.content) === id
+              : e.content.includes(oldContent.slice(0, 40));
+            if (matches) {
               e.content = newContent;
               e.metadata = { ...(e.metadata || {}), updated: true, updated_at: new Date().toISOString() };
               updated++;
@@ -1036,34 +1048,46 @@ async function handleToolCall(name, args) {
         });
         if (updated > 0) {
           await fs.promises.writeFile(eventsPath, updatedLines.join("\n") + "\n");
-          return text(`Memory updated: [${type || "memory"}] replaced "${oldContent.slice(0, 60)}..." with refined content.`);
+          return text(`Memory updated (${updated} entr${updated === 1 ? "y" : "ies"}).`);
         }
-        return text(`No existing memory matching "${oldContent.slice(0, 40)}..." found to update.`);
+        return text(id ? `No memory with id "${id}" found.` : `No existing memory matching that content found.`);
       } catch {
         return text("No project memory found — nothing to update.");
       }
     }
 
     case "pane_delete_memory": {
-      const { content: memContent, type } = args;
-      if (!memContent) return text("Content of the memory to delete is required.");
+      const { content: memContent, type, id } = args;
+      if (!memContent && !id) return text("Either the memory id or content of the memory to delete is required.");
+
+      // Compute deterministic node ID for matching
+      const crypto = await import("node:crypto");
+      const computeNodeId = (t, content) => {
+        const hash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 12);
+        return `${t}-${hash}`;
+      };
 
       // Delete from events.jsonl
       const eventsPath = path.join(memoryDir, "events.jsonl");
       try {
         const raw = await fs.promises.readFile(eventsPath, "utf-8");
         const lines = raw.trim().split("\n");
+        let deleted = 0;
         const filteredLines = lines.filter(line => {
           try {
             const e = JSON.parse(line);
-            return !(e.content && e.content.includes(memContent.slice(0, 40)));
+            const matches = id
+              ? computeNodeId(e.type, e.content) === id
+              : e.content.includes(memContent.slice(0, 40));
+            if (matches) deleted++;
+            return !matches;
           } catch { return true; }
         });
-        if (filteredLines.length < lines.length) {
+        if (deleted > 0) {
           await fs.promises.writeFile(eventsPath, filteredLines.join("\n") + "\n");
-          return text(`Memory deleted: [${type || "memory"}] removed "${memContent.slice(0, 60)}...".`);
+          return text(`Memory deleted (${deleted} entr${deleted === 1 ? "y" : "ies"}).`);
         }
-        return text(`No existing memory matching "${memContent.slice(0, 40)}..." found to delete.`);
+        return text(id ? `No memory with id "${id}" found.` : `No existing memory matching that content found.`);
       } catch {
         return text("No project memory found — nothing to delete.");
       }

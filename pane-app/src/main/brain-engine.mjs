@@ -2303,31 +2303,30 @@ process.parentPort.on("message", async ({ data }) => {
         // contradicts a prior memory. Saves the old version to node_versions,
         // then updates the node in place with new content + fresh embedding.
         try {
-          const { projectId, content: oldContent, newContent, type } = data;
-          if (!projectId || !oldContent || !newContent) {
-            sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: "Missing required fields (projectId, content, newContent)" });
+          const { projectId, content: oldContent, newContent, type, id } = data;
+          if (!projectId || !newContent || (!oldContent && !id)) {
+            sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: "Missing required fields (projectId, newContent, and either id or content)" });
             break;
           }
 
-          // Find the node by content substring match — the model provides
-          // the approximate old content it's correcting.
-          const nodeType = type || null;
-          const searchClause = nodeType
-            ? "AND entity_type = ?"
-            : "";
-          const params = nodeType
-            ? [projectId, `%${oldContent.slice(0, 60)}%`, nodeType]
-            : [projectId, `%${oldContent.slice(0, 60)}%`];
-          const nodes = db.prepare(
-            `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`
-          ).all(...params);
-
-          if (nodes.length === 0) {
-            sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: "No existing memory matching that content found." });
-            break;
+          let node;
+          if (id) {
+            node = db.prepare("SELECT * FROM nodes WHERE id = ? AND project_id = ? AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')").get(id, projectId);
+            if (!node) {
+              sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: `No memory with id "${id}" found.` });
+              break;
+            }
+          } else {
+            const nodeType = type || null;
+            const searchClause = nodeType ? "AND entity_type = ?" : "";
+            const params = nodeType ? [projectId, `%${oldContent.slice(0, 60)}%`, nodeType] : [projectId, `%${oldContent.slice(0, 60)}%`];
+            const nodes = db.prepare(`SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`).all(...params);
+            if (nodes.length === 0) {
+              sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: "No existing memory matching that content found." });
+              break;
+            }
+            node = nodes[0];
           }
-
-          const node = nodes[0];
           // Save old version for audit trail
           db._stmts.insertVersion.run(
             node.id, node.version, node.content, node.confidence,
@@ -2377,29 +2376,30 @@ process.parentPort.on("message", async ({ data }) => {
         // incorrect or no longer relevant. Removes the node, its versions,
         // and its edges.
         try {
-          const { projectId, content, type } = data;
-          if (!projectId || !content) {
-            sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: "Missing required fields (projectId, content)" });
+          const { projectId, content, type, id } = data;
+          if (!projectId || (!content && !id)) {
+            sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: "Missing required fields (projectId, and either id or content)" });
             break;
           }
 
-          const nodeType = type || null;
-          const searchClause = nodeType
-            ? "AND entity_type = ?"
-            : "";
-          const params = nodeType
-            ? [projectId, `%${content.slice(0, 60)}%`, nodeType]
-            : [projectId, `%${content.slice(0, 60)}%`];
-          const nodes = db.prepare(
-            `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`
-          ).all(...params);
-
-          if (nodes.length === 0) {
-            sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: "No existing memory matching that content found." });
-            break;
+          let node;
+          if (id) {
+            node = db.prepare("SELECT * FROM nodes WHERE id = ? AND project_id = ? AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')").get(id, projectId);
+            if (!node) {
+              sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: `No memory with id "${id}" found.` });
+              break;
+            }
+          } else {
+            const nodeType = type || null;
+            const searchClause = nodeType ? "AND entity_type = ?" : "";
+            const params = nodeType ? [projectId, `%${content.slice(0, 60)}%`, nodeType] : [projectId, `%${content.slice(0, 60)}%`];
+            const nodes = db.prepare(`SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`).all(...params);
+            if (nodes.length === 0) {
+              sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: "No existing memory matching that content found." });
+              break;
+            }
+            node = nodes[0];
           }
-
-          const node = nodes[0];
           // Delete edges referencing this node
           db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(node.id, node.id);
           // Delete version history
