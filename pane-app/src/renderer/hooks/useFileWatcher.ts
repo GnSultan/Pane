@@ -82,21 +82,54 @@ export function useFileWatcher() {
   useEffect(() => {
     // Debounce file index invalidation — fuzzy finder doesn't need instant updates
     const indexDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    // Debounce brain index cleanup — coalesce rapid bursts (e.g. git checkout)
+    const brainCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
     const unlisten = electronAPI.on(
       "pane://file-changed",
-      (raw: string[] | { paths: string[] }) => {
+      (
+        raw:
+          | string[]
+          | { path: string; type: string }[]
+          | { paths: string[] },
+      ) => {
         if (restoreInProgress) return;
-        // Backend sends string[] directly; handle legacy { paths } wrapper defensively
-        const paths = Array.isArray(raw) ? raw : raw?.paths;
-        if (!paths || !Array.isArray(paths)) return;
+
+        // Normalize to {path, type} events.
+        // New format: Array<{path, type}> with chokidar event types
+        //   (add, change, unlink, unlinkDir, addDir, etc.)
+        // Legacy format: string[] (no event type — treat as change)
+        let events: { path: string; type: string }[];
+        if (Array.isArray(raw)) {
+          events = raw
+            .map((item) => {
+              if (typeof item === "string")
+                return { path: item, type: "change" };
+              if (item && typeof item.path === "string")
+                return { path: item.path, type: item.type || "change" };
+              return null;
+            })
+            .filter(Boolean) as { path: string; type: string }[];
+        } else if (raw && Array.isArray((raw as { paths: string[] }).paths)) {
+          events = (raw as { paths: string[] }).paths.map((p) => ({
+            path: p,
+            type: "change",
+          }));
+        } else {
+          return;
+        }
+        if (events.length === 0) return;
 
         const state = useProjectsStore.getState();
 
         // For each project, check if any changed paths belong to it
         for (const [projectId, project] of state.projects) {
-          const relevantPaths = paths.filter((p) => p.startsWith(project.root));
-          if (relevantPaths.length === 0) continue;
+          const relevant = events.filter((e) =>
+            e.path.startsWith(project.root),
+          );
+          if (relevant.length === 0) continue;
+
+          const relevantPaths = relevant.map((e) => e.path);
 
           // Re-read active file if it was modified externally
           if (
@@ -106,7 +139,9 @@ export function useFileWatcher() {
           ) {
             readFile(project.activeFilePath)
               .then((content) => {
-                useProjectsStore.getState().updateFileContent(projectId, content);
+                useProjectsStore
+                  .getState()
+                  .updateFileContent(projectId, content);
               })
               .catch(console.error);
           }
@@ -116,9 +151,12 @@ export function useFileWatcher() {
           // point and new top-level files would otherwise require a restart.
           // Also refresh any expanded/loaded subdirs that contain changed files.
           const affectedDirs = new Set<string>([project.root]);
-          for (const changedPath of relevantPaths) {
+          for (const { path: changedPath } of relevant) {
             const parentDir = getParentDir(changedPath);
-            if (project.expandedDirs.has(parentDir) || project.dirContents.has(parentDir)) {
+            if (
+              project.expandedDirs.has(parentDir) ||
+              project.dirContents.has(parentDir)
+            ) {
               affectedDirs.add(parentDir);
             }
           }
@@ -126,9 +164,36 @@ export function useFileWatcher() {
           for (const dir of affectedDirs) {
             readDirectory(dir)
               .then((entries) => {
-                useProjectsStore.getState().setDirContents(projectId, dir, entries);
+                useProjectsStore
+                  .getState()
+                  .setDirContents(projectId, dir, entries);
               })
               .catch(console.error);
+          }
+
+          // Brain index cleanup for deleted files — remove from symbol index
+          // and file nodes immediately so explore/compass don't return ghosts.
+          // Debounced to coalesce bursts (e.g. deleting a directory tree).
+          const deletedPaths = relevant
+            .filter((e) => e.type === "unlink" || e.type === "unlinkDir")
+            .map((e) => e.path);
+
+          if (deletedPaths.length > 0 && project.root) {
+            const existing = brainCleanupTimers.get(projectId);
+            if (existing) clearTimeout(existing);
+            brainCleanupTimers.set(
+              projectId,
+              setTimeout(() => {
+                for (const delPath of deletedPaths) {
+                  window.electronAPI?.invoke?.("brain_remove_file_from_index", {
+                    projectId,
+                    filePath: delPath,
+                    projectRoot: project.root,
+                  });
+                }
+                brainCleanupTimers.delete(projectId);
+              }, 600),
+            );
           }
 
           // Debounce file index invalidation — coalesce rapid file changes
@@ -148,6 +213,7 @@ export function useFileWatcher() {
     return () => {
       unlisten();
       for (const timer of indexDebounceTimers.values()) clearTimeout(timer);
+      for (const timer of brainCleanupTimers.values()) clearTimeout(timer);
     };
   }, []);
 }

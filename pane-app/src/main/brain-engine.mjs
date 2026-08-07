@@ -18,6 +18,7 @@ import {
   initSymbolTables,
   indexFileSymbols,
   indexProjectSymbols,
+  removeFileFromSymbolIndex,
   findSymbols,
   findRelevantSymbols,
   getFileSymbols,
@@ -138,7 +139,7 @@ async function findCodebaseCompass(query, projectId, projectRoot, limit = 8) {
   if (!db) return [];
 
   // 1. Semantic Hits (Layer 2)
-  const semanticHits = await findRelevantFiles(query, projectId, 10);
+  const semanticHits = await findRelevantFiles(query, projectId, 10, projectRoot);
   
   // 2. Structural Hits (Layer 1)
   const symbolHits = findRelevantSymbols(db, projectId, query);
@@ -197,7 +198,10 @@ async function findCodebaseCompass(query, projectId, projectRoot, limit = 8) {
       reasons: Array.from(new Set(data.reasons)).slice(0, 3)
     }))
     .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+    .slice(0, limit)
+    // Defense-in-depth: filter out files that no longer exist on disk.
+    // Reconciliation should catch these, but this is a cheap final guard.
+    .filter(r => fs.existsSync(path.join(projectRoot, r.path)));
 
   // Add descriptions from DB
   for (const res of results) {
@@ -409,17 +413,55 @@ async function indexProjectFiles(projectId, projectRoot) {
     await new Promise(r => setTimeout(r, 150));
   }
 
+  // Reconciliation: delete file nodes for files that no longer exist on disk.
+  // Without this, deleted files (schema-init.ts, packages/sync, etc.) leave
+  // phantom nodes that make explore/compass return ghost results and pollute
+  // the codebaseMap injected into the system prompt.
+  const orphaned = reconcileDeletedFileNodes(db, projectId, projectRoot, files);
+
   const stillFailing = nowFailed.size;
   console.log(`[brain] Indexed ${indexed}/${toIndex.length} files for ${projectId}${
     stillFailing > 0 ? ` (${stillFailing} failed, will retry on next request)` : ""
-  }`);
+  }${orphaned > 0 ? `, removed ${orphaned} orphaned file node(s)` : ""}`);
+}
+
+/**
+ * Delete 'file' nodes for files that have been removed from the filesystem.
+ * Called after a full project walk in indexProjectFiles.
+ *
+ * @param {object} db - better-sqlite3 database
+ * @param {string} projectId
+ * @param {string} projectRoot
+ * @param {string[]} currentFiles - absolute paths returned by the walk
+ * @returns {number} count of orphaned nodes removed
+ */
+function reconcileDeletedFileNodes(db, projectId, projectRoot, currentFiles) {
+  const currentRelPaths = new Set(
+    currentFiles.map(f => path.relative(projectRoot, f))
+  );
+
+  const knownNodes = db.prepare(
+    `SELECT id, name FROM nodes WHERE entity_type = 'file' AND project_id = ?`
+  ).all(projectId);
+
+  const orphans = knownNodes.filter(n => !currentRelPaths.has(n.name));
+  if (orphans.length === 0) return 0;
+
+  const deleteNode = db.prepare(`DELETE FROM nodes WHERE id = ?`);
+  const purge = db.transaction((toDelete) => {
+    for (const node of toDelete) {
+      deleteNode.run(node.id);
+    }
+  });
+  purge(orphans);
+  return orphans.length;
 }
 
 /**
  * Semantic search over indexed file nodes for a project.
  * Returns files most relevant to the query, sorted by similarity.
  */
-async function findRelevantFiles(query, projectId, limit = 5) {
+async function findRelevantFiles(query, projectId, limit = 5, projectRoot = null) {
   if (!db) return [];
 
   const fileNodes = db.prepare(
@@ -463,7 +505,15 @@ async function findRelevantFiles(query, projectId, limit = 5) {
   }
 
   results.sort((a, b) => b.score - a.score);
-  return results.slice(0, limit);
+  const top = results.slice(0, limit);
+
+  // Defense-in-depth: filter out files that no longer exist on disk.
+  // The reconciliation pass should catch these, but this is a cheap guard
+  // that prevents phantom results from any edge case the reconciler misses.
+  if (projectRoot) {
+    return top.filter(r => fs.existsSync(path.join(projectRoot, r.path)));
+  }
+  return top;
 }
 
 // --- Communication with main process ---
@@ -1482,7 +1532,7 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
   const profileAtoms = [];
 
   // Relevant files: always retrieve if we have indexed files for this project
-  const relevantFiles = projectRoot ? await findRelevantFiles(query, projectId, 5) : [];
+  const relevantFiles = projectRoot ? await findRelevantFiles(query, projectId, 5, projectRoot) : [];
 
   // Short imperative prompts skip project memory (lessons/decisions/tensions).
   // Atom pool has been removed — atoms/profileAtoms are always empty.
@@ -1697,15 +1747,23 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
       const fileNodes = db.prepare(
         `SELECT name, content FROM nodes WHERE entity_type = 'file' AND project_id = ? ORDER BY name`
       ).all(projectId);
-      result.codebaseMap = fileNodes.map(n => {
-        const text = JSON.parse(n.content || "{}").text || "";
-        // First sentence only — keep it compact
-        const firstSentence = text.split(/\.\s/)[0] || text;
-        return {
-          path: n.name,
-          desc: firstSentence.length > 120 ? firstSentence.slice(0, 117) + "..." : firstSentence + (firstSentence.endsWith(".") ? "" : "."),
-        };
-      });
+      result.codebaseMap = fileNodes
+        .filter(n => {
+          // Defense-in-depth: skip files that no longer exist on disk.
+          // Reconciliation should catch these, but the codebaseMap is injected
+          // directly into the system prompt — no room for phantom entries.
+          if (!projectRoot) return true;
+          return fs.existsSync(path.join(projectRoot, n.name));
+        })
+        .map(n => {
+          const text = JSON.parse(n.content || "{}").text || "";
+          // First sentence only — keep it compact
+          const firstSentence = text.split(/\.\s/)[0] || text;
+          return {
+            path: n.name,
+            desc: firstSentence.length > 120 ? firstSentence.slice(0, 117) + "..." : firstSentence + (firstSentence.endsWith(".") ? "" : "."),
+          };
+        });
     } catch {
       result.codebaseMap = [];
     }
@@ -2406,8 +2464,11 @@ process.parentPort.on("message", async ({ data }) => {
           (async () => {
             if (!db) return;
             try {
-              const { added, files_changed } = indexProjectSymbols(db, data.projectId, data.projectRoot, walkProjectFiles);
-              if (added > 0 || files_changed > 0) {
+              const { added, files_changed, orphaned } = indexProjectSymbols(db, data.projectId, data.projectRoot, walkProjectFiles);
+              // Re-export when anything changed: new symbols, modified files,
+              // or deleted files (orphaned > 0). Without the orphaned check,
+              // deleting files wouldn't refresh the MCP server's symbol list.
+              if (added > 0 || files_changed > 0 || orphaned > 0) {
                 writeSymbolExport(db, data.projectId, BRAIN_DIR);
               }
             } catch (err) {
@@ -2461,6 +2522,28 @@ process.parentPort.on("message", async ({ data }) => {
         } catch (err) {
           console.error("[brain] reindex_file_symbols error:", err.message);
           sendToMain({ type: "file_symbols_reindexed", requestId: data.requestId, skipped: true });
+        }
+        break;
+      }
+
+      case "remove_file_from_index": {
+        // Called when a file is deleted (from file watcher unlink events).
+        // Removes symbols, relationships, and file nodes immediately so
+        // explore/compass/find_symbol don't return ghost results.
+        if (!db) { sendToMain({ type: "file_removed_from_index", requestId: data.requestId, removed: 0 }); break; }
+        try {
+          const relPath = path.relative(data.projectRoot, data.filePath);
+          // Remove symbols + relationships
+          const symResult = removeFileFromSymbolIndex(db, data.projectId, data.filePath, data.projectRoot);
+          // Remove file node (semantic layer)
+          const fileNodeId = nodeId("file", relPath);
+          db.prepare(`DELETE FROM nodes WHERE id = ?`).run(fileNodeId);
+          // Re-export symbols so external consumers (MCP server) stay consistent
+          writeSymbolExport(db, data.projectId, BRAIN_DIR);
+          sendToMain({ type: "file_removed_from_index", requestId: data.requestId, removed: symResult.removed });
+        } catch (err) {
+          console.error("[brain] remove_file_from_index error:", err.message);
+          sendToMain({ type: "file_removed_from_index", requestId: data.requestId, removed: 0 });
         }
         break;
       }

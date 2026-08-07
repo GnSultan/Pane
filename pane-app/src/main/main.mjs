@@ -419,6 +419,31 @@ function registerCommandHandlers() {
   });
   ipcMain.handle("get_home_dir", () => os.homedir());
   ipcMain.handle("get_cwd", () => process.cwd());
+
+  // ── Settings read/write ──────────────────────────────────────────────────
+  // Minimal settings.json access for the Profile UI (e.g. Z.ai plan tier).
+  // read-settings: return all settings as an object, or null if file doesn't exist.
+  // write-settings: deep-merge the provided partial object into settings.json.
+  const _settingsPath = () => path.join(os.homedir(), ".pane", "settings.json");
+  ipcMain.handle("read-settings", async () => {
+    try {
+      const raw = await fs.promises.readFile(_settingsPath(), "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  });
+  ipcMain.handle("write-settings", async (_event, partial) => {
+    const settingsFile = _settingsPath();
+    let current = {};
+    try {
+      current = JSON.parse(await fs.promises.readFile(settingsFile, "utf-8"));
+    } catch {}
+    const merged = { ...current, ...partial };
+    await fs.promises.mkdir(path.dirname(settingsFile), { recursive: true });
+    await fs.promises.writeFile(settingsFile, JSON.stringify(merged, null, 2));
+  });
+
   ipcMain.handle("detect_project_root", async (_event, args) => {
     let current = args.startPath;
     while (true) {
@@ -615,8 +640,15 @@ function registerCommandHandlers() {
   });
   ipcMain.handle("git_push", async (_event, args) => {
     try {
-      await execFileAsync("git", ["push"], { cwd: args.path });
-      return { success: true };
+      const { stdout, stderr } = await execFileAsync("git", ["push"], {
+        cwd: args.path,
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0", // never block on credential prompt
+        },
+        maxBuffer: 1024 * 1024 * 5, // 5MB — large diffs in pre-push hooks
+      });
+      return { success: true, stdout, stderr };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: message };
@@ -624,8 +656,16 @@ function registerCommandHandlers() {
   });
   ipcMain.handle("git_pull", async (_event, args) => {
     try {
-      await execFileAsync("git", ["pull"], { cwd: args.path });
-      return { success: true };
+      const { stdout, stderr } = await execFileAsync("git", ["pull", "--no-edit"], {
+        cwd: args.path,
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0", // never block on credential prompt
+          GIT_EDITOR: "true",       // accept default merge message (--no-edit is belt-and-suspenders)
+        },
+        maxBuffer: 1024 * 1024 * 5,
+      });
+      return { success: true, stdout, stderr };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: message };
@@ -1156,13 +1196,13 @@ function registerWatcherHandlers() {
     // isn't an absolute path.
     if (!args?.path || !path.isAbsolute(args.path)) return;
     if (watchers.has(args.path)) return;
-    let pendingPaths = /* @__PURE__ */ new Set();
+    let pendingEvents = /* @__PURE__ */ new Map(); // path → eventType
     let debounceTimer = null;
     const flush = () => {
-      if (pendingPaths.size > 0) {
-        const paths = Array.from(pendingPaths);
-        sendToRenderer("pane://file-changed", paths);
-        pendingPaths = /* @__PURE__ */ new Set();
+      if (pendingEvents.size > 0) {
+        const events = Array.from(pendingEvents.entries()).map(([p, type]) => ({ path: p, type }));
+        sendToRenderer("pane://file-changed", events);
+        pendingEvents = /* @__PURE__ */ new Map();
       }
       debounceTimer = null;
     };
@@ -1190,8 +1230,10 @@ function registerWatcherHandlers() {
     watcher.on("error", (err) => {
       console.error("Chokidar watcher error:", err.message);
     });
-    watcher.on("all", (_eventType, filePath) => {
-      pendingPaths.add(filePath);
+    watcher.on("all", (eventType, filePath) => {
+      // Keep the latest event type per path — if a file is rapidly deleted
+      // then recreated, the newest event wins (add overwrites unlink).
+      pendingEvents.set(filePath, eventType);
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(flush, 800);
     });
@@ -2165,6 +2207,11 @@ function registerBrainHandlers() {
 
   ipcMain.handle("brain_extract_profile", async () => {
     return brainRequest("extract_profile", {});
+  });
+
+  ipcMain.handle("brain_remove_file_from_index", async (_event, args) => {
+    const { projectId, filePath, projectRoot } = args;
+    return brainRequest("remove_file_from_index", { projectId, filePath, projectRoot });
   });
 
   ipcMain.handle("brain_update_identity", async (_event, args) => {
