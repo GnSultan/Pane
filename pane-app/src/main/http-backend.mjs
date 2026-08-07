@@ -47,6 +47,15 @@ import { classifySteerIntent } from "./steering-classifier.mjs";
 import { recordActivity } from "./intents.mjs";
 import { getAccessToken, getOAuthHeaders, getOAuthApiUrl, hasOAuthCredentials, invalidateCache } from "./claude-oauth.mjs";
 import { buildBillingHeaderValue } from "./claude-signing.mjs";
+import {
+  parseClaudeRateLimitHeaders,
+  calculateZaiCredits,
+  recordZaiUsage,
+  resetZaiUsage,
+  classifyZaiError,
+  formatZaiQuotaError,
+  getZaiPlanLimits,
+} from "./provider-monitor.mjs";
 
 // ── OAuth body transformation helpers ─────────────────────────────────────
 
@@ -3632,6 +3641,50 @@ export class ApiBackend extends PunkBackend {
                     continue; // Don't consume an attempt — endpoint switch is free
                   }
 
+                  // Z.ai terminal error detection: quota exhaustion codes (1113,
+                  // 1308-1321) are permanent until the reset window. Retrying
+                  // wastes 2+ minutes in exponential backoff for a condition
+                  // that won't resolve. Break immediately and surface the error.
+                  if (isRateLimit && apiConfig.provider === "z-ai") {
+                    const errBodyText = lastResponseBody ||
+                      (await response.text().catch(() => ""));
+                    const classified = classifyZaiError(errBodyText);
+                    if (classified && classified.isTerminal) {
+                      const friendlyMsg = formatZaiQuotaError(classified);
+                      console.warn(
+                        `[http] Z.ai terminal error ${classified.errorCode} — breaking retry loop: ${friendlyMsg}`,
+                      );
+
+                      // Emit quota-exhausted rate_limit event so the UI can show
+                      // a persistent banner with the reset time.
+                      this.onEvent(
+                        request.projectId,
+                        {
+                          event: "rate_limit",
+                          data: {
+                            status: "rejected",
+                            rateLimitType: "quota_exhausted",
+                            resetsAt: classified.resetTime
+                              ? Math.floor(classified.resetTime / 1000)
+                              : undefined,
+                            provider: "z-ai",
+                            errorCode: classified.errorCode,
+                            message: friendlyMsg,
+                          },
+                        },
+                        request.requestId,
+                      );
+
+                      // Surface the friendly error, not raw JSON
+                      throw new Error(friendlyMsg);
+                    }
+
+                    // Preserve body for error message if we exhaust retries
+                    if (!lastResponseBody && errBodyText) {
+                      lastResponseBody = errBodyText;
+                    }
+                  }
+
                   const retryAfterSec = parseInt(
                     response.headers.get("retry-after") || "0",
                     10,
@@ -3840,6 +3893,35 @@ export class ApiBackend extends PunkBackend {
 
           if (!response.body) throw new Error("Response body is null");
 
+          // ── Claude rate limit header parsing ──────────────────────────────
+          // Anthropic returns rate limit headers on EVERY response (not just 429).
+          // Parse them to feed the InputBar rate limit indicator with live data.
+          if (apiConfig.provider === "anthropic") {
+            const rlData = parseClaudeRateLimitHeaders(response.headers);
+            if (rlData) {
+              // Determine status from utilization
+              let status = "allowed";
+              if (rlData.utilization != null) {
+                if (rlData.utilization >= 1) status = "rejected";
+                else if (rlData.utilization >= 0.8) status = "allowed_warning";
+              }
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "rate_limit",
+                  data: {
+                    status,
+                    utilization: rlData.utilization,
+                    resetsAt: rlData.resetsAt || undefined,
+                    rateLimitType: "tokens",
+                    provider: "anthropic",
+                  },
+                },
+                request.requestId,
+              );
+            }
+          }
+
           const reader = response.body.getReader();
           const decoder = new TextDecoder("utf-8");
           let buffer = "";
@@ -3970,6 +4052,69 @@ export class ApiBackend extends PunkBackend {
             console.log(
               `[cache] ${apiConfig.provider}/${state.model}: ${hitRate}% hit (${cacheRead} cached / ${totalInput} total input tokens)`,
             );
+          }
+
+          // ── Z.ai credit tracking ──────────────────────────────────────────
+          // Compute credits consumed for this request and update rolling windows.
+          // Emit a rate_limit event so the InputBar quota indicator stays live.
+          if (apiConfig.provider === "z-ai") {
+            const credits = calculateZaiCredits(state.usage, state.model);
+            if (credits > 0) {
+              const { fiveHourUsed, weeklyUsed } = recordZaiUsage(credits);
+
+              // Read plan tier from settings.json
+              let planTier = null;
+              try {
+                const settingsRaw = await fs.readFile(
+                  path.join(this.paneDir, "settings.json"),
+                  "utf-8",
+                );
+                const parsed = JSON.parse(settingsRaw);
+                planTier = parsed.zai_plan_tier || null;
+              } catch {}
+
+              const limits = planTier ? getZaiPlanLimits(planTier) : null;
+
+              // Compute utilization for the binding constraint (whichever is higher)
+              let utilization = null;
+              if (limits) {
+                const fiveHourPct = fiveHourUsed / limits.fiveHour;
+                const weeklyPct = weeklyUsed / limits.weekly;
+                utilization = Math.max(fiveHourPct, weeklyPct);
+              }
+
+              // Determine status
+              let status = "allowed";
+              if (utilization != null) {
+                if (utilization >= 1) status = "rejected";
+                else if (utilization >= 0.8) status = "allowed_warning";
+              }
+
+              // Estimate when the 5h window resets — approximate with rolling window
+              const fiveHourResetSec = Math.floor(
+                (Date.now() + 5 * 60 * 60 * 1000) / 1000,
+              );
+
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "rate_limit",
+                  data: {
+                    status,
+                    utilization,
+                    resetsAt: fiveHourResetSec,
+                    rateLimitType: "credits",
+                    provider: "z-ai",
+                    // Extra fields for the UI to display credit counts
+                    creditsUsed: fiveHourUsed,
+                    creditsLimit: limits?.fiveHour || null,
+                    weeklyCreditsUsed: weeklyUsed,
+                    weeklyCreditsLimit: limits?.weekly || null,
+                  },
+                },
+                request.requestId,
+              );
+            }
           }
 
           const finalContent = [];

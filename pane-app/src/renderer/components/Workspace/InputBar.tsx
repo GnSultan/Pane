@@ -63,81 +63,49 @@ function formatRelativeTime(epochMs: number): string {
 }
 
 function RateLimitIndicator() {
-  const info = useWorkspaceStore((s) => s.rateLimitInfo);
   const provider = useWorkspaceStore((s) => s.selectedModelProvider);
-  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
-  const setRateLimitInfo = useWorkspaceStore((s) => s.setRateLimitInfo);
+  const info = useWorkspaceStore((s) => s.rateLimitByProvider[provider]);
+  const setRateLimitForProvider = useWorkspaceStore((s) => s.setRateLimitForProvider);
 
-  // Compute before the conditional return so useEffect is always called unconditionally.
-  const resetEpochMs = info?.resetsAt ? info.resetsAt * 1000 : null;
-  const overageResetMs = info?.overageResetsAt ? info.overageResetsAt * 1000 : null;
+  const resetEpochMs = info?.resetsAt ? info.resetsAt * 1000 : info?.overageResetsAt ? info.overageResetsAt * 1000 : null;
 
-  // Auto-expire: schedule a clear when the reset time passes so the warning
-  // disappears on its own without needing another backend event.
+  // Auto-expire when reset window passes.
   useEffect(() => {
-    const epochMs = resetEpochMs ?? overageResetMs;
-    if (!epochMs) return;
-    const delay = epochMs - Date.now();
-    if (delay <= 0) {
-      setRateLimitInfo(null);
-      return;
-    }
-    const t = setTimeout(() => setRateLimitInfo(null), delay);
+    if (!resetEpochMs) return;
+    const delay = resetEpochMs - Date.now();
+    if (delay <= 0) { setRateLimitForProvider(provider, null); return; }
+    const t = setTimeout(() => setRateLimitForProvider(provider, null), delay);
     return () => clearTimeout(t);
-  }, [resetEpochMs, overageResetMs, setRateLimitInfo]);
+  }, [resetEpochMs, setRateLimitForProvider, provider]);
 
-  // Only show for Claude (anthropic) provider — rate limits are Claude-specific.
-  if (!info || provider !== "anthropic") return null;
+  if (!info) return null;
 
   const pct = info.utilization != null ? Math.round(info.utilization * 100) : null;
-  const isOverage = info.isUsingOverage === true;
   const isRejected = info.status === "rejected";
-  // overageStatus: "rejected" means "overage billing is disabled on this account" — the API
-  // sends this on every response for accounts that haven't enabled pay-as-you-go overage.
-  // Only treat it as actionable when the request itself was also rejected (status: "rejected"),
-  // otherwise it's a false positive for subscription users who are well within their limits.
-  const overageRejected = info.overageStatus === "rejected" && isRejected;
+  const resetTime = resetEpochMs ? formatRelativeTime(resetEpochMs) : null;
 
-  // Subscription users: don't show until 60% utilization — below that is noise.
-  // Credit users (pay-as-you-go): show overage state immediately since it has
-  // direct cost implications.
-  const isSubscription =
-    (sdkAccount as Record<string, unknown> | null)?.billingType === "stripe_subscription" ||
-    sdkAccount?.subscription != null;
-
-  // Overage rejected (exhausted all usage / overage disabled and request blocked)
-  if (overageRejected) {
-    const resetTime = overageResetMs ? formatRelativeTime(overageResetMs) : null;
-    // "out of credits" only makes sense for credit/pay-as-you-go users.
-    // Subscription users see "limit reached · resets in Xh" instead.
-    const label = isSubscription
-      ? `limit reached${resetTime ? ` · resets ${resetTime}` : ""}`
-      : `extra usage · out of credits${resetTime ? ` · resets ${resetTime}` : ""}`;
+  // Exhausted / rejected — short word, reset time.
+  if (isRejected) {
     return (
       <span className="font-mono tabular-nums text-pane-error" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-        {label}
+        limit{resetTime && ` · ${resetTime}`}
       </span>
     );
   }
 
-  // Standard rate limit at ≥60% — this takes priority over the generic
-  // "extra usage" label because a concrete percentage is always more
-  // informative. If the SDK sends utilization even in overage state, show it.
-  if (pct != null && pct >= 60) {
-    const resetTime = resetEpochMs ? formatRelativeTime(resetEpochMs) : null;
-    const prefix = isOverage ? "extra usage · " : "";
+  // Always visible — color escalates as usage climbs.
+  if (pct != null) {
+    const color = pct >= 90 ? "text-pane-error" : pct >= 60 ? "text-[var(--pane-status-modified)]" : "text-pane-text-secondary/30";
     return (
-      <span
-        className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-[var(--pane-status-modified)]"}`}
-        style={{ fontSize: "var(--pane-font-size-xs)" }}
-      >
-        {prefix}{pct}%{isRejected ? " · limit reached" : " · limit"}{resetTime && ` · resets ${resetTime}`}
+      <span className={`font-mono tabular-nums ${color}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        usage {pct}%
       </span>
     );
   }
 
   return null;
 }
+
 
 // ─── Static caret (no-blink) ─────────────────────────────────────────────────
 //
@@ -954,6 +922,7 @@ export function InputBar({
             </button>
           )}
           <div className="ml-auto shrink-0 flex items-center gap-1.5">
+            <RateLimitIndicator />
             {/* Mode pill — shows active phase in collapsed bar */}
             <button
               onClick={() => setExpandedSection("input")}
@@ -996,6 +965,7 @@ export function InputBar({
             </button>
           </div>
           <div className="pointer-events-auto shrink-0 flex items-center gap-1.5">
+            <RateLimitIndicator />
             {/* Mode pill — shows active phase in ghost trigger */}
             <button
               onClick={() => setExpandedSection("input")}
@@ -1142,7 +1112,7 @@ export function InputBar({
             />
           ) : (
             <>
-              {/* Left group: attach + mind toggle, side by side with explicit gap */}
+              {/* Left group: attach + mind toggle */}
               <div className="shrink-0 flex items-center gap-3">
                 {/* Attach (+) button */}
                 {attachMenu === "menu" ? (
@@ -1213,6 +1183,8 @@ export function InputBar({
 
               <div className="flex-1" />
 
+              <RateLimitIndicator />
+
               {(() => {
                 if (isMindMode) {
                   return (
@@ -1247,7 +1219,6 @@ export function InputBar({
                   </button>
                 );
               })()}
-              <RateLimitIndicator />
               <div className="pointer-events-auto">
                 <ModelPickerTrigger
                   value={selectedModel}

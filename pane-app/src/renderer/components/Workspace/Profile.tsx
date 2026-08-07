@@ -1016,6 +1016,67 @@ function ClaudeSignInCard() {
   );
 }
 
+// ─── Z.ai Coding Plan Tier Selector ──────────────────────────────────────────
+// Lets the user pick their Z.ai Coding Plan (Lite/Pro/Max) so Pane can compute
+// quota utilization. Stored in settings.json as zai_plan_tier.
+const ZAI_TIERS = [
+  { value: "lite", label: "Lite", fiveHour: "2k", weekly: "10k" },
+  { value: "pro", label: "Pro", fiveHour: "12k", weekly: "60k" },
+  { value: "max", label: "Max", fiveHour: "28k", weekly: "140k" },
+] as const;
+
+function ZaiPlanTierSelector() {
+  const [tier, setTier] = useState<string>("");
+
+  useEffect(() => {
+    window.electronAPI?.invoke("read-settings").then((s: Record<string, unknown> | null) => {
+      setTier((s?.zai_plan_tier as string) || "");
+    }).catch(() => {});
+  }, []);
+
+  const handleChange = (newTier: string) => {
+    const next = newTier === tier ? "" : newTier;
+    setTier(next);
+    window.electronAPI?.invoke("write-settings", { zai_plan_tier: next }).catch(() => {});
+  };
+
+  return (
+    <div className="flex items-center gap-2 pl-4 border-l border-pane-border/20">
+      <span
+        className="text-pane-text-secondary/40 font-mono whitespace-nowrap"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        plan
+      </span>
+      <div className="flex items-center gap-1">
+        {ZAI_TIERS.map((t) => (
+          <button
+            key={t.value}
+            onClick={() => handleChange(t.value)}
+            className={`px-2 py-0.5 rounded-md font-mono transition-colors ${
+              tier === t.value
+                ? "text-pane-text bg-pane-text/10 ring-1 ring-pane-border/40"
+                : "text-pane-text-secondary/40 hover:text-pane-text-secondary/70"
+            }`}
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+            title={`5h: ${t.fiveHour} credits · weekly: ${t.weekly} credits`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {!tier && (
+        <span
+          className="text-pane-text-secondary/25 font-mono italic"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          select for quota tracking
+        </span>
+      )}
+    </div>
+  );
+}
+
 const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   { key: "gemini", label: "Google Gemini", placeholder: "AI...", docsUrl: "https://aistudio.google.com/app/apikey", showBaseUrl: true, defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta" },
   { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys", showBaseUrl: true, defaultBaseUrl: "https://api.deepseek.com/v1/chat/completions" },
@@ -1206,6 +1267,7 @@ function ApiKeysSection({
                             />
                           </div>
                         )}
+                        {key === "z-ai" && <ZaiPlanTierSelector />}
                       </div>
                     </motion.div>
                   )}

@@ -1063,22 +1063,18 @@ export function usePunk(projectId: string) {
           case "sdk_init_info": {
             const { models, account } = event.data;
             useWorkspaceStore.getState().setSdkInfo(models, account);
-            // Clear rateLimitInfo only when its reset window has definitively
-            // passed. sdk_init_info fires on session start AND on the hourly
-            // refreshCliModels background cycle, so we must not blindly clear —
-            // that wipes valid data on every background tick. We only clear when
-            // resetsAt (or overageResetsAt) is in the past. Future-window data is
-            // kept. This fixes stale isUsingOverage state persisting across reset
-            // windows (the auto-expire timer in InputBar only runs while mounted,
-            // so it doesn't catch app-restart staleness).
-            const current = useWorkspaceStore.getState().rateLimitInfo;
-            if (current) {
+            // Clear stale rate limit data per-provider. sdk_init_info fires on
+            // session start AND on the hourly refreshCliModels background cycle,
+            // so we must not blindly clear — that wipes valid data on every
+            // background tick. We only clear when resetsAt (or overageResetsAt)
+            // is in the past.
+            const allLimits = useWorkspaceStore.getState().rateLimitByProvider;
+            for (const [provider, current] of Object.entries(allLimits)) {
               const mainExpired = current.resetsAt && current.resetsAt * 1000 < Date.now();
               const overageExpired = current.overageResetsAt && current.overageResetsAt * 1000 < Date.now();
-              // Clear if the relevant reset window has passed
               const hasOnlyOverage = !current.resetsAt && current.overageResetsAt;
               if (hasOnlyOverage ? overageExpired : mainExpired) {
-                useWorkspaceStore.getState().setRateLimitInfo(null);
+                useWorkspaceStore.getState().setRateLimitForProvider(provider, null);
               }
             }
             break;
@@ -1092,7 +1088,8 @@ export function usePunk(projectId: string) {
             // but preserve existing utilization + status when the new event has neither,
             // as long as we're still in the same reset window.
             const incoming = event.data;
-            const current = useWorkspaceStore.getState().rateLimitInfo;
+            const provider = incoming.provider || "unknown";
+            const current = useWorkspaceStore.getState().rateLimitByProvider[provider];
             const isSameWindow =
               !current?.resetsAt ||
               !incoming.resetsAt ||
@@ -1103,7 +1100,7 @@ export function usePunk(projectId: string) {
               isSameWindow
                 ? { ...incoming, utilization: current.utilization, status: current.status }
                 : incoming;
-            useWorkspaceStore.getState().setRateLimitInfo(merged);
+            useWorkspaceStore.getState().setRateLimitForProvider(provider, merged);
             break;
           }
 

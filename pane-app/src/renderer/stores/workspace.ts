@@ -72,8 +72,8 @@ interface WorkspaceState {
   sdkModels: import("../lib/punk-types").SdkModel[] | null;
   sdkAccount: import("../lib/punk-types").SdkAccount | null;
   setSdkInfo: (models: import("../lib/punk-types").SdkModel[] | null, account: import("../lib/punk-types").SdkAccount | null) => void;
-  rateLimitInfo: import("../lib/punk-types").RateLimitInfo | null;
-  setRateLimitInfo: (info: import("../lib/punk-types").RateLimitInfo | null) => void;
+  rateLimitByProvider: Record<string, import("../lib/punk-types").RateLimitInfo>;
+  setRateLimitForProvider: (provider: string, info: import("../lib/punk-types").RateLimitInfo | null) => void;
   lastTokenUsageAt: number;
   // Profile data
   increaseFontSize: () => void;
@@ -281,19 +281,29 @@ function createWorkspaceStore() {
     sdkModels: null,
     sdkAccount: null,
     setSdkInfo: (models, account) => set({ sdkModels: models, sdkAccount: account }),
-    rateLimitInfo: null,
-    setRateLimitInfo: (info) => {
-      // Persist to localStorage so the Profile session bar survives app restarts.
-      // rate_limit_event only fires on message send — without this, the bar is
-      // always 0% on cold open until the first message goes out.
-      try {
-        if (info) {
-          localStorage.setItem("pane:rateLimitInfo", JSON.stringify(info));
+    rateLimitByProvider: {},
+    setRateLimitForProvider: (provider, info) => {
+      // Persist the full per-provider map to localStorage so the indicator
+      // survives app restarts. rate_limit_event only fires on message send —
+      // without this, the bar is always 0% on cold open until the first message.
+      set((state) => {
+        let next: Record<string, import("../lib/punk-types").RateLimitInfo>;
+        if (info === null) {
+          const { [provider]: _, ...rest } = state.rateLimitByProvider;
+          next = rest;
         } else {
-          localStorage.removeItem("pane:rateLimitInfo");
+          next = { ...state.rateLimitByProvider, [provider]: info };
         }
-      } catch {}
-      set({ rateLimitInfo: info });
+        try {
+          const keys = Object.keys(next);
+          if (keys.length > 0) {
+            localStorage.setItem("pane:rateLimitByProvider", JSON.stringify(next));
+          } else {
+            localStorage.removeItem("pane:rateLimitByProvider");
+          }
+        } catch {}
+        return { rateLimitByProvider: next };
+      });
     },
     lastTokenUsageAt: 0,
     increaseFontSize: () =>
@@ -486,23 +496,46 @@ window.electronAPI.on("pane-sdk-auth", (raw: unknown) => {
   } else {
     // Explicit null broadcast (logout) — clear account and stale usage indicators
     useWorkspaceStore.getState().setSdkInfo(null, null);
-    useWorkspaceStore.getState().setRateLimitInfo(null);
+    const allProviders = Object.keys(useWorkspaceStore.getState().rateLimitByProvider);
+    for (const p of allProviders) {
+      useWorkspaceStore.getState().setRateLimitForProvider(p, null);
+    }
   }
 });
 
-// Hydrate rateLimitInfo from localStorage on startup — without this the
-// Profile session bar shows 0% until the first message fires a rate_limit_event.
-// Only restore if the reset window is still in the future; expired data is dropped.
+// Hydrate rateLimitByProvider from localStorage on startup — without this the
+// indicator shows 0% until the first message fires a rate_limit_event.
+// Only restore entries whose reset window is still in the future.
 try {
-  const raw = localStorage.getItem("pane:rateLimitInfo");
+  const raw = localStorage.getItem("pane:rateLimitByProvider");
   if (raw) {
-    const stored = JSON.parse(raw) as import("../lib/punk-types").RateLimitInfo;
-    const resetsAt = stored?.resetsAt ?? stored?.overageResetsAt;
-    if (resetsAt && resetsAt * 1000 > Date.now()) {
-      useWorkspaceStore.getState().setRateLimitInfo(stored);
-    } else {
-      localStorage.removeItem("pane:rateLimitInfo");
+    const stored = JSON.parse(raw) as Record<string, import("../lib/punk-types").RateLimitInfo>;
+    const now = Date.now();
+    const valid: Record<string, import("../lib/punk-types").RateLimitInfo> = {};
+    let hasValid = false;
+    for (const [provider, info] of Object.entries(stored)) {
+      const resetsAt = info?.resetsAt ?? info?.overageResetsAt;
+      if (resetsAt && resetsAt * 1000 > now) {
+        valid[provider] = info;
+        hasValid = true;
+      }
     }
+    if (hasValid) {
+      useWorkspaceStore.setState({ rateLimitByProvider: valid });
+    } else {
+      localStorage.removeItem("pane:rateLimitByProvider");
+    }
+  }
+  // Migrate old single-provider key if present
+  const oldRaw = localStorage.getItem("pane:rateLimitInfo");
+  if (oldRaw) {
+    const oldInfo = JSON.parse(oldRaw) as import("../lib/punk-types").RateLimitInfo;
+    const provider = oldInfo?.provider || "anthropic";
+    const resetsAt = oldInfo?.resetsAt ?? oldInfo?.overageResetsAt;
+    if (resetsAt && resetsAt * 1000 > Date.now()) {
+      useWorkspaceStore.getState().setRateLimitForProvider(provider, oldInfo);
+    }
+    localStorage.removeItem("pane:rateLimitInfo");
   }
 } catch {}
 

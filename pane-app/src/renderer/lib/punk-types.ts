@@ -294,12 +294,23 @@ export interface RateLimitInfo {
   status: "allowed" | "allowed_warning" | "rejected";
   utilization?: number;
   resetsAt?: number;
-  rateLimitType?: "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet" | "overage" | string;
+  rateLimitType?: "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet" | "overage" | "tokens" | "credits" | "quota_exhausted" | string;
   isUsingOverage?: boolean;
   overageStatus?: "allowed" | "allowed_warning" | "rejected";
   overageResetsAt?: number;
   overageDisabledReason?: string;
   surpassedThreshold?: number;
+  // ── Provider-agnostic extensions ──────────────────────────────────────────
+  // Which provider this rate limit data is from (e.g. "anthropic", "z-ai").
+  provider?: string;
+  // Z.ai Coding Plan credit tracking
+  creditsUsed?: number;
+  creditsLimit?: number | null;
+  weeklyCreditsUsed?: number;
+  weeklyCreditsLimit?: number | null;
+  // Terminal error details (for quota exhaustion display)
+  errorCode?: string;
+  message?: string;
 }
 
 export interface PunkEventTokenUsage {
