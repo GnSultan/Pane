@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { setWindowTitle } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ThreadPanel } from "./components/ThreadPanel/ThreadPanel";
+import { ActiveThreadTabs } from "./components/ActiveThreadTabs";
 import { Workspace } from "./components/Workspace/Workspace";
 import { TaskNotification } from "./components/shared/TaskNotification";
 import { useWorkspaceStore } from "./stores/workspace";
@@ -248,11 +249,15 @@ function App() {
       {/* Titlebar drag region — must stay at App root level for full-width coverage.
            z-30 sits above active pages (z-20), below interactive headers (z-40).
            Uses app-region: drag (not -webkit-app-region — dead since Chromium 118+).
-           No background needed — app-region works regardless of element opacity. */}
+           No background needed — app-region works regardless of element opacity.
+           When sidebar is collapsed, active thread tabs render inside — they're
+           data-no-drag (clickable) while the surrounding region stays draggable. */}
       <div
         className="absolute top-0 left-0 right-0 h-[50px] z-30"
         data-tauri-drag-region
-      />
+      >
+        {sidebarCollapsed && <ActiveThreadTabs />}
+      </div>
       <div className="flex h-full pt-2 pb-2 pl-2 gap-1">
         {inConversationMode && (
           <div

@@ -29,6 +29,8 @@
   --color-pane-syn-string: var(--pane-syn-data);
   --color-pane-syn-number: var(--pane-syn-data-number);
   --color-pane-accent: var(--pane-accent);
+  --color-pane-accent-tab: var(--pane-accent-tab);
+  --color-pane-inactive-tab: var(--pane-inactive-tab);
 
   --font-mono: "Geist Mono Variable", ui-monospace, monospace;
   --font-sans: "Geist Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -217,6 +219,13 @@
   /* Terminal accent — the machine's voice */
   --pane-terminal: #8AACCA;
   --pane-accent: var(--pane-status-added);
+  /* Active thread tab: same visual composite as ThreadPanel's accent/[0.10]
+     on solid panel — 10% accent blended into the surface color. Resolves
+     per-theme since both vars are theme-aware. */
+  --pane-accent-tab: color-mix(in srgb, var(--pane-accent) 10%, var(--pane-surface));
+  /* Inactive thread tab: subtle presence matching ThreadPanel's new-thread
+     hover. 8% text color blended into surface — visible but quiet. */
+  --pane-inactive-tab: color-mix(in srgb, var(--pane-text) 8%, var(--pane-surface));
 
   /* Overlay */
   --pane-overlay: rgba(20, 19, 18, 0.7);
