@@ -145,13 +145,13 @@ const TabButton = ({ id, name, isActive, isProcessing, hasUnread, onSelect }: Ta
       }`}
       title={name}
     >
-      {isProcessing && <ProcessingDots />}
       <span
         className="truncate font-medium flex-1 text-left"
         style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
       >
         {name}
       </span>
+      {isProcessing && <ProcessingDots />}
       {hasUnread && !isProcessing && (
         <span className="shrink-0 inline-block w-1.5 h-1.5 rounded-full bg-pane-status-added" />
       )}

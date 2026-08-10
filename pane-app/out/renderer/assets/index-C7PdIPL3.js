@@ -3,7 +3,7 @@ var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 var require_index_001 = __commonJS({
-  "assets/index-DD6dBIsm.js"(exports, module) {
+  "assets/index-C7PdIPL3.js"(exports, module) {
     var commonjsGlobal = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : {};
     function getDefaultExportFromCjs(x2) {
       return x2 && x2.__esModule && Object.prototype.hasOwnProperty.call(x2, "default") ? x2["default"] : x2;
@@ -9692,7 +9692,6 @@ var require_index_001 = __commonJS({
           className: `flex-1 min-w-0 h-7 mx-0.5 flex items-center gap-1.5 px-2 rounded-md transition-colors ${isActive ? "bg-pane-accent-tab text-pane-text" : "bg-pane-inactive-tab text-pane-text-secondary/50 hover:text-pane-text-secondary/80"}`,
           title: name,
           children: [
-            isProcessing && /* @__PURE__ */ jsxRuntimeExports.jsx(ProcessingDots, {}),
             /* @__PURE__ */ jsxRuntimeExports.jsx(
               "span",
               {
@@ -9701,6 +9700,7 @@ var require_index_001 = __commonJS({
                 children: name
               }
             ),
+            isProcessing && /* @__PURE__ */ jsxRuntimeExports.jsx(ProcessingDots, {}),
             hasUnread && !isProcessing && /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "shrink-0 inline-block w-1.5 h-1.5 rounded-full bg-pane-status-added" })
           ]
         }
