@@ -17,17 +17,19 @@ const DRAG_THRESHOLD = 5;
 // Activity window — threads active within this period show as tabs.
 const ACTIVITY_WINDOW_MS = 30 * 60_000; // 30 minutes
 
-/** Slow three-dot processing indicator — matches ProjectList's ProcessingDots. */
+/** Slow three-dot processing indicator — slightly larger and more visible
+ *  than ProjectList's version since tabs have less visual context than a
+ *  full sidebar row. Calm pulse, but clearly readable. */
 function ProcessingDots() {
   return (
-    <span className="inline-flex items-center gap-[3px] shrink-0">
-      <span className="processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40" />
+    <span className="inline-flex items-center gap-[3.5px] shrink-0">
+      <span className="processing-dot w-[4px] h-[4px] rounded-full bg-pane-text-secondary/70" />
       <span
-        className="processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40"
+        className="processing-dot w-[4px] h-[4px] rounded-full bg-pane-text-secondary/70"
         style={{ animationDelay: "0.4s" }}
       />
       <span
-        className="processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40"
+        className="processing-dot w-[4px] h-[4px] rounded-full bg-pane-text-secondary/70"
         style={{ animationDelay: "0.8s" }}
       />
     </span>

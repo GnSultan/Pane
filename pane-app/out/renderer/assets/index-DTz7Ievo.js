@@ -3,7 +3,7 @@ var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 var require_index_001 = __commonJS({
-  "assets/index-C7PdIPL3.js"(exports, module) {
+  "assets/index-DTz7Ievo.js"(exports, module) {
     var commonjsGlobal = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : {};
     function getDefaultExportFromCjs(x2) {
       return x2 && x2.__esModule && Object.prototype.hasOwnProperty.call(x2, "default") ? x2["default"] : x2;
@@ -9614,19 +9614,19 @@ var require_index_001 = __commonJS({
     const DRAG_THRESHOLD = 5;
     const ACTIVITY_WINDOW_MS = 30 * 6e4;
     function ProcessingDots() {
-      return /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "inline-flex items-center gap-[3px] shrink-0", children: [
-        /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40" }),
+      return /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "inline-flex items-center gap-[3.5px] shrink-0", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "processing-dot w-[4px] h-[4px] rounded-full bg-pane-text-secondary/70" }),
         /* @__PURE__ */ jsxRuntimeExports.jsx(
           "span",
           {
-            className: "processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40",
+            className: "processing-dot w-[4px] h-[4px] rounded-full bg-pane-text-secondary/70",
             style: { animationDelay: "0.4s" }
           }
         ),
         /* @__PURE__ */ jsxRuntimeExports.jsx(
           "span",
           {
-            className: "processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40",
+            className: "processing-dot w-[4px] h-[4px] rounded-full bg-pane-text-secondary/70",
             style: { animationDelay: "0.8s" }
           }
         )
