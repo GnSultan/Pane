@@ -1835,14 +1835,22 @@ export class ToolExecutor {
             }
 
           // Fallback: JSONL fuzzy search
-          const eventsPath = path.join(memoryDir, "events.jsonl");
-          let raw = "";
-          try { raw = await fsPromises.readFile(eventsPath, "utf-8"); }
-          catch { return { success: true, output: "No project memory yet — this is the first session.", toolId }; }
-
-          const events = raw.trim().split("\n").map(line => {
-            try { return JSON.parse(line); } catch { return null; }
-          }).filter(Boolean);
+          // Root-scoped JSONL fallback: aggregate events from all sibling threads
+          // (scopeIds already declared above from brain export attempt)
+          let events = [];
+          for (const sid of scopeIds) {
+            const eventsPath = path.join(paneDir, "memory", sid, "events.jsonl");
+            try {
+              const raw = await fsPromises.readFile(eventsPath, "utf-8");
+              const parsed = raw.trim().split("\n").map(line => {
+                try { return JSON.parse(line); } catch { return null; }
+              }).filter(Boolean);
+              events.push(...parsed);
+            } catch { /* sibling may not have events.jsonl yet */ }
+          }
+          if (events.length === 0) {
+            return { success: true, output: "No project memory yet — this is the first session.", toolId };
+          }
 
           let matches;
           if (query) {
@@ -2106,10 +2114,18 @@ export class ToolExecutor {
         }
 
         case "pane_brief": {
-          const briefPath = path.join(memoryDir, "brief.md");
+          // Root-scoped: try current thread first, then siblings
+          const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveScope(this.projectId);
           let brief = "";
-          try { brief = await fsPromises.readFile(briefPath, "utf-8"); }
-          catch { return { success: true, output: "No project brief yet — memory will accumulate as you work.", toolId }; }
+          for (const sid of scopeIds) {
+            const briefPath = path.join(paneDir, "memory", sid, "brief.md");
+            try {
+              brief = await fsPromises.readFile(briefPath, "utf-8");
+              if (brief.trim()) break;
+            } catch { /* try next sibling */ }
+          }
+          if (!brief.trim()) return { success: true, output: "No project brief yet — memory will accumulate as you work.", toolId };
           return { success: true, output: brief, toolId };
         }
 
@@ -2160,8 +2176,12 @@ export class ToolExecutor {
         }
 
         case "pane_change_history": {
-          const db = getPaneDb();
-          const rows = db.stmts.getChanges.all(this.projectId);
+          const paneDb = getPaneDb();
+          // Root-scoped: include edits from sibling threads sharing the same root
+          const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveScope(this.projectId);
+          const ph = scopeIds.map(() => "?").join(", ");
+          const rows = paneDb.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) ORDER BY timestamp DESC LIMIT 500`).all(...scopeIds);
           if (rows.length === 0) return { success: true, output: "No change history yet. Changes will be recorded as you edit files.", toolId };
 
           const out = rows.map(c => {
@@ -2177,16 +2197,21 @@ export class ToolExecutor {
 
         case "pane_search_changes": {
           const { query, file_path: filePath } = input;
-          const db = getPaneDb();
+          const paneDb = getPaneDb();
+          // Root-scoped: include edits from sibling threads
+          const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveScope(this.projectId);
+          const ph = scopeIds.map(() => "?").join(", ");
           let rows = [];
 
           if (filePath) {
-            rows = db.stmts.searchChangesByFile.all(this.projectId, filePath);
+            rows = paneDb.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) AND file_path = ? ORDER BY timestamp DESC LIMIT 200`).all(...scopeIds, filePath);
           } else if (query) {
             const like = `%${query}%`;
-            rows = db.stmts.searchChanges.all(this.projectId, like, like, like, like);
+            rows = paneDb.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) AND (file_path LIKE ? OR description LIKE ? OR new_string LIKE ? OR old_string LIKE ?) ORDER BY timestamp DESC LIMIT 200`)
+              .all(...scopeIds, like, like, like, like);
           } else {
-            rows = db.stmts.getChanges.all(this.projectId);
+            rows = paneDb.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) ORDER BY timestamp DESC LIMIT 500`).all(...scopeIds);
           }
 
           if (rows.length === 0) return { success: true, output: "No matching changes found.", toolId };
@@ -2323,10 +2348,18 @@ export class ToolExecutor {
           const query = (input?.query || "").trim();
           if (!query) return { success: false, error: "Query is required.", toolId };
 
-          const symbolsPath = path.join(paneDir, "brain", "symbols", `${this.projectId}.json`);
+          // Root-scoped: fall back to sibling threads sharing the same root
+          const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveScope(this.projectId);
           let exported = null;
-          try { exported = JSON.parse(await fsPromises.readFile(symbolsPath, "utf-8")); }
-          catch { return { success: true, output: "Symbol index not available yet — it builds automatically when you open a project in Pane.", toolId }; }
+          for (const sid of scopeIds) {
+            const symbolsPath = path.join(paneDir, "brain", "symbols", `${sid}.json`);
+            try {
+              const candidate = JSON.parse(await fsPromises.readFile(symbolsPath, "utf-8"));
+              if (candidate?.symbols?.length > 0) { exported = candidate; break; }
+            } catch { /* try next sibling */ }
+          }
+          if (!exported) return { success: true, output: "Symbol index not available yet — it builds automatically when you open a project in Pane.", toolId };
 
           if (!exported?.symbols?.length) return { success: true, output: "No symbols indexed for this project.", toolId };
 

@@ -11,6 +11,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { resolveProjectScope } from "./root-scope.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -545,8 +546,9 @@ function reconcileDeletedFiles(db, projectId, projectRoot, currentFiles) {
  * @returns Symbol rows sorted by relevance.
  */
 export function findSymbols(db, projectId, query, { kind, file, limit = 20 } = {}) {
-  let sql = `SELECT * FROM symbols WHERE project_id = ?`;
-  const params = [projectId];
+  const scopeIds = resolveProjectScope(projectId);
+  let sql = `SELECT * FROM symbols WHERE project_id IN (${scopeIds.map(() => "?").join(",")})`;
+  const params = [...scopeIds];
 
   if (kind)  { sql += ` AND kind = ?`;            params.push(kind); }
   if (file)  { sql += ` AND file_path LIKE ?`;    params.push(`%${file}%`); }
@@ -587,12 +589,13 @@ export function getFileSymbols(db, projectId, filePath) {
  */
 export function resolveSymbolNames(db, projectId, names) {
   if (!names || names.length === 0) return [];
+  const scopeIds = resolveProjectScope(projectId);
   const ph = names.map(() => "?").join(",");
   return db.prepare(
     `SELECT name, kind, file_path, line, doc FROM symbols
-     WHERE project_id = ? AND name IN (${ph})
+     WHERE project_id IN (${scopeIds.map(() => "?").join(",")}) AND name IN (${ph})
      ORDER BY name COLLATE NOCASE`
-  ).all(projectId, ...names);
+  ).all(...scopeIds, ...names);
 }
 
 /**

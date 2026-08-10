@@ -932,15 +932,23 @@ async function handleToolCall(name, args) {
         }
       }
 
-      // Fallback: JSONL fuzzy search
+      // Root-scoped JSONL fallback: aggregate events from all sibling threads
       const queryLower = query.toLowerCase();
-      const eventsPath = path.join(memoryDir, "events.jsonl");
-      const raw = await readText(eventsPath);
-      if (!raw) return text("No project memory yet — this is the first session.");
-
-      const events = raw.trim().split("\n").map(line => {
-        try { return JSON.parse(line); } catch { return null; }
-      }).filter(Boolean);
+      let events = [];
+      try {
+        const { resolveProjectScope } = await import("./root-scope.mjs");
+        const scopeIds = resolveProjectScope(PROJECT_ID);
+        for (const sid of scopeIds) {
+          const raw = await readText(path.join(PANE_DIR, "memory", sid, "events.jsonl"));
+          if (raw) {
+            const parsed = raw.trim().split("\n").map(line => {
+              try { return JSON.parse(line); } catch { return null; }
+            }).filter(Boolean);
+            events.push(...parsed);
+          }
+        }
+      } catch { /* root-scope not available */ }
+      if (events.length === 0) return text("No project memory yet — this is the first session.");
 
       let matches;
       if (queryLower) {
@@ -1113,12 +1121,16 @@ async function handleToolCall(name, args) {
       if (!db) return text("Database not available — cannot access findings.");
 
       if (action === "list") {
+        // Root-scoped: include findings from sibling threads
+        const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+        const scopeIds = resolveScope(PROJECT_ID);
+        const ph = scopeIds.map(() => "?").join(", ");
         const findings = db.prepare(`
           SELECT * FROM punk_findings
-          WHERE project_id = ? AND dismissed = 0
+          WHERE project_id IN (${ph}) AND dismissed = 0
           ORDER BY created_at DESC
           LIMIT 100
-        `).all(PROJECT_ID);
+        `).all(...scopeIds);
 
         if (findings.length === 0) return text("No undismissed findings from any punk.");
 
@@ -1202,7 +1214,10 @@ async function handleToolCall(name, args) {
       if (!db) return text("Change history requires the native SQLite module, which is only available when running inside Pane. Use the Claude backend for this tool.");
       let rows = [];
       try {
-        rows = db.prepare("SELECT * FROM change_history WHERE project_id = ? ORDER BY timestamp DESC LIMIT 500").all(PROJECT_ID);
+        const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+        const scopeIds = resolveScope(PROJECT_ID);
+        const ph = scopeIds.map(() => "?").join(", ");
+        rows = db.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) ORDER BY timestamp DESC LIMIT 500`).all(...scopeIds);
       } catch (err) {
         return text(`Error: Failed to query change history from SQLite: ${err.message}`);
       }
@@ -1228,14 +1243,17 @@ async function handleToolCall(name, args) {
       let rows = [];
 
       try {
+        const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+        const scopeIds = resolveScope(PROJECT_ID);
+        const ph = scopeIds.map(() => "?").join(", ");
         if (filePath) {
-          rows = db.prepare("SELECT * FROM change_history WHERE project_id = ? AND file_path = ? ORDER BY timestamp DESC LIMIT 200").all(PROJECT_ID, filePath);
+          rows = db.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) AND file_path = ? ORDER BY timestamp DESC LIMIT 200`).all(...scopeIds, filePath);
         } else if (query) {
           const like = `%${query}%`;
-          rows = db.prepare("SELECT * FROM change_history WHERE project_id = ? AND (file_path LIKE ? OR description LIKE ? OR new_string LIKE ? OR old_string LIKE ?) ORDER BY timestamp DESC LIMIT 200")
-            .all(PROJECT_ID, like, like, like, like);
+          rows = db.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) AND (file_path LIKE ? OR description LIKE ? OR new_string LIKE ? OR old_string LIKE ?) ORDER BY timestamp DESC LIMIT 200`)
+            .all(...scopeIds, like, like, like, like);
         } else {
-          rows = db.prepare("SELECT * FROM change_history WHERE project_id = ? ORDER BY timestamp DESC LIMIT 500").all(PROJECT_ID);
+          rows = db.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) ORDER BY timestamp DESC LIMIT 500`).all(...scopeIds);
         }
       } catch (err) {
         return text(`Error: Failed to query change history from SQLite: ${err.message}`);
@@ -1480,8 +1498,17 @@ async function handleToolCall(name, args) {
       const query = (args?.query || "").trim();
       if (!query) return text("Query is required.");
 
-      const symbolsPath = path.join(PANE_DIR, "brain", "symbols", `${PROJECT_ID}.json`);
-      const exported = await readJson(symbolsPath);
+      // Root-scoped: try current thread first, then siblings
+      let exported = null;
+      try {
+        const { resolveProjectScope } = await import("./root-scope.mjs");
+        const scopeIds = resolveProjectScope(PROJECT_ID);
+        for (const sid of scopeIds) {
+          const symbolsPath = path.join(PANE_DIR, "brain", "symbols", `${sid}.json`);
+          const candidate = await readJson(symbolsPath);
+          if (candidate?.symbols?.length > 0) { exported = candidate; break; }
+        }
+      } catch { /* root-scope not available */ }
       if (!exported?.symbols?.length) {
         return text("Symbol index not available yet — it builds automatically when you open a project in Pane.");
       }
@@ -1551,8 +1578,16 @@ async function handleToolCall(name, args) {
     case "pane_ui_constraints": {
       const projectId = args?.projectId || PROJECT_ID;
       const componentKey = (args?.component || "").toLowerCase();
-      const constraintsPath = path.join(PANE_DIR, "memory", projectId, "ui-constraints.json");
-      const data = await readJson(constraintsPath);
+      // Root-scoped: try current thread first, then siblings
+      let data = null;
+      try {
+        const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+        const scopeIds = resolveScope(projectId);
+        for (const sid of scopeIds) {
+          data = await readJson(path.join(PANE_DIR, "memory", sid, "ui-constraints.json"));
+          if (data) break;
+        }
+      } catch {}
       if (!data) {
         return text("No UI constraints registered yet for this project. Use pane_record_ui_decision to add them.");
       }
@@ -1930,8 +1965,16 @@ async function handleToolCall(name, args) {
       const subsystemArg = (args?.subsystem || "").trim();
       if (!subsystemArg) return text("Subsystem is required.");
 
-      const subsystemsPath = path.join(PANE_DIR, "memory", projectId, "subsystems.json");
-      const data = await readJson(subsystemsPath);
+      // Root-scoped: try current thread first, then siblings
+      let data = null;
+      try {
+        const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+        const scopeIds = resolveScope(projectId);
+        for (const sid of scopeIds) {
+          data = await readJson(path.join(PANE_DIR, "memory", sid, "subsystems.json"));
+          if (data) break;
+        }
+      } catch {}
       if (!data) {
         return text("No subsystem registry found. Create one at ~/.pane/memory/{projectId}/subsystems.json or use pane_record_architecture_decision to start one.");
       }
@@ -2421,11 +2464,20 @@ async function handleToolCall(name, args) {
     }
 
     case "pane_get_project_map": {
-      // Read the codebase map from brain context export
-      const mapPath = path.join(PANE_DIR, "brain", "context", `${PROJECT_ID}.json`);
+      // Root-scoped: read codebase map from brain context export, trying siblings
+      let data = null;
       try {
-        const data = JSON.parse(await fs.promises.readFile(mapPath, "utf-8"));
-        if (data.codebaseMap) {
+        const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+        const scopeIds = resolveScope(PROJECT_ID);
+        for (const sid of scopeIds) {
+          try {
+            data = JSON.parse(await fs.promises.readFile(path.join(PANE_DIR, "brain", "context", `${sid}.json`), "utf-8"));
+            if (data) break;
+          } catch { /* try next sibling */ }
+        }
+      } catch {}
+      try {
+        if (data?.codebaseMap) {
           return text(data.codebaseMap);
         }
         if (Array.isArray(data) && data.length > 0) {
@@ -2570,38 +2622,47 @@ async function handleToolCall(name, args) {
       const query = (args?.query || "").toLowerCase();
       const limit = args?.limit || 8;
 
-      // Read brain context export — same approach as explore
-      const mapPath = path.join(PANE_DIR, "brain", "context", `${PROJECT_ID}.json`);
+      // Root-scoped: try current thread first, then siblings
       let files = [];
+      let data = null;
       try {
-        const data = JSON.parse(await fs.promises.readFile(mapPath, "utf-8"));
-
-        // Extract file entries
-        const entries = [];
-        if (data.codebaseMap) {
-          // Parse codebase map format: each line is "path — description"
-          for (const line of data.codebaseMap.split("\n")) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith("#")) continue;
-            entries.push({ path: trimmed, description: "" });
-          }
-        } else if (Array.isArray(data)) {
-          for (const node of data) {
-            if (node.path) entries.push({ path: node.path, description: node.description || node.content || "" });
-          }
+        const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+        const scopeIds = resolveScope(PROJECT_ID);
+        for (const sid of scopeIds) {
+          try {
+            data = JSON.parse(await fs.promises.readFile(path.join(PANE_DIR, "brain", "context", `${sid}.json`), "utf-8"));
+            if (data) break;
+          } catch { /* try next sibling */ }
         }
 
-        // Fuzzy match against query
-        const scored = entries
-          .map(e => ({
-            ...e,
-            score: fuzzyScore(query, `${e.path} ${e.description}`),
-          }))
-          .filter(e => e.score > 0)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, limit);
+        if (data) {
+          // Extract file entries
+          const entries = [];
+          if (data.codebaseMap) {
+            // Parse codebase map format: each line is "path — description"
+            for (const line of data.codebaseMap.split("\n")) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed.startsWith("#")) continue;
+              entries.push({ path: trimmed, description: "" });
+            }
+          } else if (Array.isArray(data)) {
+            for (const node of data) {
+              if (node.path) entries.push({ path: node.path, description: node.description || node.content || "" });
+            }
+          }
 
-        files = scored;
+          // Fuzzy match against query
+          const scored = entries
+            .map(e => ({
+              ...e,
+              score: fuzzyScore(query, `${e.path} ${e.description}`),
+            }))
+            .filter(e => e.score > 0)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, limit);
+
+          files = scored;
+        }
       } catch {
         // No brain export — graceful fallback
       }

@@ -167,15 +167,17 @@ async function findCodebaseCompass(query, projectId, projectRoot, limit = 8) {
   }
 
   // Expand to neighbors (1 level deep)
+  const compassScopeIds = resolveProjectScope(projectId);
+  const compassScopePh = compassScopeIds.map(() => "?").join(",");
   const allCore = Array.from(coreFiles);
   for (const file of allCore) {
     const rels = db.prepare(`
       SELECT target_file, type FROM file_relationships 
-      WHERE project_id = ? AND source_file = ?
+      WHERE project_id IN (${compassScopePh}) AND source_file = ?
       UNION
       SELECT source_file, type FROM file_relationships
-      WHERE project_id = ? AND target_file = ?
-    `).all(projectId, file, projectId, file);
+      WHERE project_id IN (${compassScopePh}) AND target_file = ?
+    `).all(...compassScopeIds, file, ...compassScopeIds, file);
 
     for (const rel of rels) {
       const neighbor = rel.target_file || rel.source_file;
@@ -206,7 +208,7 @@ async function findCodebaseCompass(query, projectId, projectRoot, limit = 8) {
 
   // Add descriptions from DB
   for (const res of results) {
-    const node = db.prepare(`SELECT content FROM nodes WHERE entity_type = 'file' AND name = ? AND project_id = ?`).get(res.path, projectId);
+    const node = db.prepare(`SELECT content FROM nodes WHERE entity_type = 'file' AND name = ? AND project_id IN (${compassScopePh})`).get(res.path, ...compassScopeIds);
     if (node) {
       try {
         const content = JSON.parse(node.content);
@@ -3128,24 +3130,28 @@ process.parentPort.on("message", async ({ data }) => {
       // ── Punk finding queries for Lens v2 ──────────────────────────────────
       case "findings_list": {
         if (!db) { sendToMain({ type: "findings_list_result", requestId: data.requestId, findings: [] }); break; }
+        const flScopeIds = resolveProjectScope(data.projectId);
+        const flScopePh = flScopeIds.map(() => "?").join(", ");
         const fList = db.prepare(`
           SELECT * FROM punk_findings
-          WHERE project_id = ? AND dismissed = 0
+          WHERE project_id IN (${flScopePh}) AND dismissed = 0
           ORDER BY created_at DESC
           LIMIT ?
-        `).all(data.projectId, data.limit ?? 50);
+        `).all(...flScopeIds, data.limit ?? 50);
         sendToMain({ type: "findings_list_result", requestId: data.requestId, findings: fList });
         break;
       }
 
       case "findings_by_punk": {
         if (!db) { sendToMain({ type: "findings_by_punk_result", requestId: data.requestId, findings: [] }); break; }
+        const fbpScopeIds = resolveProjectScope(data.projectId);
+        const fbpScopePh = fbpScopeIds.map(() => "?").join(", ");
         const fByPunk = db.prepare(`
           SELECT * FROM punk_findings
-          WHERE project_id = ? AND punk = ? AND dismissed = 0
+          WHERE project_id IN (${fbpScopePh}) AND punk = ? AND dismissed = 0
           ORDER BY created_at DESC
           LIMIT ?
-        `).all(data.projectId, data.punk, data.limit ?? 50);
+        `).all(...fbpScopeIds, data.punk, data.limit ?? 50);
         sendToMain({ type: "findings_by_punk_result", requestId: data.requestId, findings: fByPunk });
         break;
       }
