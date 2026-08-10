@@ -12,6 +12,7 @@ import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 import { validateCommand } from "./command-validator.mjs";
 import { readState, readHandoff, mergeState } from "./pane-system-prompt.mjs";
 import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
+import { resolveProjectScope } from "./root-scope.mjs";
 
 import { createRequire } from "node:module";
 
@@ -211,8 +212,19 @@ async function embedText(text) {
 }
 
 // Read brain export for a project (written by brain-engine.mjs)
+// Root-scoped: falls back to sibling threads sharing the same root.
 async function readBrainExport(projectId) {
-  return readJson(path.join(PANE_DIR, "brain", "exports", `${projectId}.json`));
+  // Try the exact project first
+  let exported = await readJson(path.join(PANE_DIR, "brain", "exports", `${projectId}.json`));
+  if (exported && exported.length > 0) return exported;
+
+  // Fall back to sibling threads
+  for (const sid of resolveProjectScope(projectId)) {
+    if (sid === projectId) continue;
+    exported = await readJson(path.join(PANE_DIR, "brain", "exports", `${sid}.json`));
+    if (exported && exported.length > 0) return exported;
+  }
+  return null;
 }
 
 // Semantic search using brain export + optional embedder
@@ -1151,13 +1163,23 @@ async function handleToolCall(name, args) {
 
     case "pane_brief": {
       const parts = [];
-      const about = await readText(path.join(memoryDir, "about.md"));
+      // Root-scoped: fall back to sibling threads for about/brief files
+      let about = null;
+      let brief = null;
+      for (const sid of resolveProjectScope(PROJECT_ID)) {
+        if (!about) {
+          about = await readText(path.join(PANE_DIR, "memory", sid, "about.md"));
+        }
+        if (!brief) {
+          brief = await readText(path.join(PANE_DIR, "memory", sid, "brief.md"));
+        }
+        if (about && brief) break;
+      }
       if (about) {
         parts.push("## About");
         parts.push(about.trim());
         parts.push("");
       }
-      const brief = await readText(path.join(memoryDir, "brief.md"));
       if (brief) parts.push(brief);
       if (!parts.length) return text("No project brief yet — memory will accumulate as you work.");
       return text(parts.join("\n"));

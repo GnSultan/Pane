@@ -7,6 +7,7 @@ import {
   app,
   utilityProcess,
   nativeImage,
+  screen,
 } from "electron";
 import windowStateKeeper from "electron-window-state";
 import { execFile } from "node:child_process";
@@ -68,6 +69,7 @@ import { mergeState } from "./pane-system-prompt.mjs";
 import { runModelProfileReflection } from "./playbook-engine.mjs";
 import { restoreCheckpoint, snapshotAllFiles, flushJournal } from "./checkpoint-engine.mjs";
 import { bustRootMapCache } from "./intents.mjs";
+import { bustRootScopeCache } from "./root-scope.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -844,6 +846,39 @@ Improvements
     const win = BrowserWindow.getFocusedWindow();
     if (win) win.setTitle(args.title);
   });
+
+  // ── Manual window dragging ───────────────────────────────────────────
+  // The active thread tabs surface is app-region: no-drag so it can receive
+  // click events. When the user mousedowns and moves > threshold, we switch
+  // to window dragging via IPC: main reads the cursor screen position and
+  // moves the window by the same delta. Fire-and-forget (send, not invoke)
+  // because drag-move fires 60-120x/sec and we don't need round-trip acks.
+  let dragOrigin = null; // { mouse: {x,y}, bounds: {x,y} }
+
+  ipcMain.on("window-drag-start", () => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return;
+    dragOrigin = {
+      mouse: screen.getCursorScreenPoint(),
+      bounds: win.getBounds(),
+    };
+  });
+
+  ipcMain.on("window-drag-move", () => {
+    if (!dragOrigin) return;
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return;
+    const pos = screen.getCursorScreenPoint();
+    win.setPosition(
+      dragOrigin.bounds.x + (pos.x - dragOrigin.mouse.x),
+      dragOrigin.bounds.y + (pos.y - dragOrigin.mouse.y),
+      false, // no animation — instant follow
+    );
+  });
+
+  ipcMain.on("window-drag-end", () => {
+    dragOrigin = null;
+  });
   ipcMain.handle("set_vibrancy", (_event, args) => {
     if (!mainWindow) return;
     mainWindow.setVibrancy(args.vibrancy ?? null);
@@ -1023,6 +1058,7 @@ Improvements
       await fs.promises.writeFile(tmpPath, json, "utf-8");
       await fs.promises.rename(tmpPath, filePath);
       bustRootMapCache();
+      bustRootScopeCache();
       return { success: true };
     } catch (err) {
       return { success: false, error: err.message };

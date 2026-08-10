@@ -31,6 +31,8 @@ const BRAIN_DIR = path.join(os.homedir(), ".pane", "brain");
 const BRAIN_DB_PATH = path.join(BRAIN_DIR, "brain.db");
 const EXPORTS_DIR = path.join(BRAIN_DIR, "exports");
 
+import { resolveProjectScope } from "./root-scope.mjs";
+
 let _db = null;
 
 /**
@@ -69,14 +71,18 @@ export function directDeleteMemory(projectId, content, type = null, id = null) {
   try {
     const db = getDirectBrainDb();
 
+    // Root-scoped: can delete memories from sibling threads (same root)
+    const scopeIds = resolveProjectScope(projectId);
+    const scopePh = scopeIds.map(() => "?").join(", ");
+
     let node;
 
     // ── ID-based lookup (preferred — deterministic, no wording drift) ──
     if (id) {
       node = db.prepare(
-        `SELECT * FROM nodes WHERE id = ? AND project_id = ?
+        `SELECT * FROM nodes WHERE id = ? AND project_id IN (${scopePh})
          AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')`
-      ).get(id, projectId);
+      ).get(id, ...scopeIds);
       if (!node) {
         return { success: false, error: `No memory with id "${id}" found.` };
       }
@@ -85,11 +91,11 @@ export function directDeleteMemory(projectId, content, type = null, id = null) {
       const nodeType = type || null;
       const searchClause = nodeType ? "AND entity_type = ?" : "";
       const params = nodeType
-        ? [projectId, `%${content.slice(0, 60)}%`, nodeType]
-        : [projectId, `%${content.slice(0, 60)}%`];
+        ? [...scopeIds, `%${content.slice(0, 60)}%`, nodeType]
+        : [...scopeIds, `%${content.slice(0, 60)}%`];
 
       const nodes = db.prepare(
-        `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause}
+        `SELECT * FROM nodes WHERE project_id IN (${scopePh}) AND content LIKE ? ${searchClause}
          AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')
          ORDER BY confidence DESC LIMIT 5`
       ).all(...params);
@@ -128,14 +134,18 @@ export function directUpdateMemory(projectId, oldContent, newContent, type = nul
   try {
     const db = getDirectBrainDb();
 
+    // Root-scoped: can update memories from sibling threads (same root)
+    const scopeIds = resolveProjectScope(projectId);
+    const scopePh = scopeIds.map(() => "?").join(", ");
+
     let node;
 
     // ── ID-based lookup (preferred — deterministic, no wording drift) ──
     if (id) {
       node = db.prepare(
-        `SELECT * FROM nodes WHERE id = ? AND project_id = ?
+        `SELECT * FROM nodes WHERE id = ? AND project_id IN (${scopePh})
          AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')`
-      ).get(id, projectId);
+      ).get(id, ...scopeIds);
       if (!node) {
         return { success: false, error: `No memory with id "${id}" found.` };
       }
@@ -144,11 +154,11 @@ export function directUpdateMemory(projectId, oldContent, newContent, type = nul
       const nodeType = type || null;
       const searchClause = nodeType ? "AND entity_type = ?" : "";
       const params = nodeType
-        ? [projectId, `%${oldContent.slice(0, 60)}%`, nodeType]
-        : [projectId, `%${oldContent.slice(0, 60)}%`];
+        ? [...scopeIds, `%${oldContent.slice(0, 60)}%`, nodeType]
+        : [...scopeIds, `%${oldContent.slice(0, 60)}%`];
 
       const nodes = db.prepare(
-        `SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause}
+        `SELECT * FROM nodes WHERE project_id IN (${scopePh}) AND content LIKE ? ${searchClause}
          AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')
          ORDER BY confidence DESC LIMIT 5`
       ).all(...params);
@@ -197,12 +207,15 @@ export function directUpdateMemory(projectId, oldContent, newContent, type = nul
  */
 function refreshSearchExport(db, projectId) {
   try {
+    // Root-scoped: export includes memories from sibling threads
+    const scopeIds = resolveProjectScope(projectId);
+    const scopePh = scopeIds.map(() => "?").join(", ");
     const nodes = db.prepare(`
       SELECT id, name, entity_type, content, confidence
       FROM nodes
-      WHERE project_id = ?
+      WHERE project_id IN (${scopePh})
         AND entity_type IN ('decision','lesson','pattern','error','error_fix','file','project')
-    `).all(projectId);
+    `).all(...scopeIds);
 
     const exported = nodes.map(n => {
       const content = JSON.parse(n.content || "{}").text || n.name;

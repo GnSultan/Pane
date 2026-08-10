@@ -1800,10 +1800,18 @@ export class ToolExecutor {
           const query = (input?.query || "").trim();
 
           // Try brain semantic search first (if export exists)
-          const brainExportPath = path.join(paneDir, "brain", "exports", `${this.projectId}.json`);
-          if (query && fs.existsSync(brainExportPath)) {
-            const exported = await readJson(brainExportPath);
-            if (exported && exported.length > 0) {
+          // Root-scoped: fall back to sibling threads sharing the same root
+          const { resolveProjectScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveProjectScope(this.projectId);
+          let exported = null;
+          for (const sid of scopeIds) {
+            const brainExportPath = path.join(paneDir, "brain", "exports", `${sid}.json`);
+            if (query && fs.existsSync(brainExportPath)) {
+              const candidate = await readJson(brainExportPath);
+              if (candidate && candidate.length > 0) { exported = candidate; break; }
+            }
+          }
+          if (query && exported && exported.length > 0) {
               const queryEmbedding = await embedText(query, paneDir);
               const queryLower = query.toLowerCase();
 
@@ -1825,7 +1833,6 @@ export class ToolExecutor {
                 return { success: true, output: out, toolId };
               }
             }
-          }
 
           // Fallback: JSONL fuzzy search
           const eventsPath = path.join(memoryDir, "events.jsonl");

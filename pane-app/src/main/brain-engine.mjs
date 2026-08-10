@@ -13,6 +13,7 @@ import crypto from "node:crypto";
 import { runMemoryLifecycle, touchMemory, reinforceMemory } from "./memory-lifecycle.mjs";
 import { recordPlaybookFeedback, getPlaybookLedger, KNOWLEDGE_TYPES } from "./playbook-engine.mjs";
 import { isSignalNoise } from "./signal-filters.mjs";
+import { resolveProjectScope, resolveProjectScopeSql, bustRootScopeCache } from "./root-scope.mjs";
 
 import {
   initSymbolTables,
@@ -464,9 +465,11 @@ function reconcileDeletedFileNodes(db, projectId, projectRoot, currentFiles) {
 async function findRelevantFiles(query, projectId, limit = 5, projectRoot = null) {
   if (!db) return [];
 
+  // Root-scoped: include files indexed by sibling threads sharing the same root
+  const scopeIds = resolveProjectScope(projectId);
   const fileNodes = db.prepare(
-    `SELECT * FROM nodes WHERE entity_type = 'file' AND project_id = ? AND embedding IS NOT NULL`
-  ).all(projectId);
+    `SELECT * FROM nodes WHERE entity_type = 'file' AND project_id IN (${scopeIds.map(() => "?").join(", ")}) AND embedding IS NOT NULL`
+  ).all(...scopeIds);
 
   if (fileNodes.length === 0) return [];
 
@@ -1267,8 +1270,11 @@ async function search(query, projectId, limit = 10) {
   if (!db) return [];
 
   const results = [];
-  const nodes = projectId
-    ? db._stmts.getAllProjectNodes.all(projectId)
+  // Root-scoped: query memories from ALL threads sharing the same root directory.
+  // A new thread on an existing project inherits the full memory corpus.
+  const scopeIds = projectId ? resolveProjectScope(projectId) : null;
+  const nodes = scopeIds
+    ? db.prepare(`SELECT * FROM nodes WHERE project_id IN (${scopeIds.map(() => "?").join(", ")})`).all(...scopeIds)
     : db.prepare("SELECT * FROM nodes WHERE embedding IS NOT NULL").all();
 
   if (embedderReady) {
@@ -1340,8 +1346,11 @@ async function detectTensions(projectId, newDecisions) {
 
   const tensions = [];
 
-  // Get existing high-confidence decisions for this project
-  const existingDecisions = db._stmts.getNodesByType.all("decision", projectId)
+  // Get existing high-confidence decisions for this project (root-scoped)
+  const scopeIds = resolveProjectScope(projectId);
+  const existingDecisions = db.prepare(
+    `SELECT * FROM nodes WHERE entity_type = 'decision' AND project_id IN (${scopeIds.map(() => "?").join(", ")})`
+  ).all(...scopeIds)
     .filter(n => n.confidence > 0.5 && n.embedding);
 
   for (const newDec of newDecisions) {
@@ -1597,9 +1606,13 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
   // Principles are intentionally excluded from `allowedTypes` above so they
   // don't compete with general memories. They get their own retrieval path
   // and their own section in the system prompt.
+  // Root-scoped: include principles from sibling threads.
   let principles = [];
   try {
-    const principleNodes = db._stmts.getNodesByType.all("principle", projectId);
+    const scopeIds = resolveProjectScope(projectId);
+    const principleNodes = db.prepare(
+      `SELECT * FROM nodes WHERE entity_type = ? AND project_id IN (${scopeIds.map(() => "?").join(", ")})`
+    ).all("principle", ...scopeIds);
     if (principleNodes.length > 0 && queryEmbedding) {
       const scored = [];
       for (const n of principleNodes) {
@@ -1645,13 +1658,15 @@ async function contextualSearch(query, fileContext, projectId, intent, projectRo
 function writeSearchExport(projectId) {
   if (!db) return;
   try {
-    // Only export meaningful knowledge types — not transient noise like commands
+    // Root-scoped: export memories from all sibling threads sharing the same root
+    const scopeIds = resolveProjectScope(projectId);
+    const scopePlaceholders = scopeIds.map(() => "?").join(", ");
     const nodes = db.prepare(`
       SELECT id, name, entity_type, content, confidence
       FROM nodes
-      WHERE project_id = ?
+      WHERE project_id IN (${scopePlaceholders})
         AND entity_type IN ('decision','lesson','pattern','error','error_fix','file','project')
-    `).all(projectId);
+    `).all(...scopeIds);
 
     const exported = nodes.map(n => {
       const content = JSON.parse(n.content || "{}").text || n.name;
@@ -1677,12 +1692,22 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
 
   // Layer 1: Symbol map — resolve symbols mentioned in the query + working set exports.
   // The model sees key symbols pre-resolved so it doesn't grep for them.
+  // Root-scoped: a new thread hasn't indexed yet, but siblings sharing the same
+  // root have. Try each sibling until we find one with symbols.
   result.relevantSymbols = [];
   if (db) {
     try {
+      const scopeIds = resolveProjectScope(projectId);
+      // Find the sibling that actually has symbols indexed
+      let symbolProjectId = projectId;
+      for (const sid of scopeIds) {
+        const count = db.prepare("SELECT COUNT(*) AS cnt FROM symbols WHERE project_id = ?").get(sid);
+        if (count?.cnt > 0) { symbolProjectId = sid; break; }
+      }
+
       // From query text: extract symbol names and resolve them
       if (query) {
-        result.relevantSymbols = findRelevantSymbols(db, projectId, query);
+        result.relevantSymbols = findRelevantSymbols(db, symbolProjectId, query);
       }
 
       // From working set: pull top exports from active files so the model
@@ -1693,7 +1718,7 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
         const queryNames = new Set(result.relevantSymbols.map(s => s.name));
         for (const wsFile of wsFiles) {
           const filePath = wsFile.path || wsFile;
-          const fileSyms = getFileSymbols(db, projectId, filePath);
+          const fileSyms = getFileSymbols(db, symbolProjectId, filePath);
           // Add up to 3 key exports per file (functions, classes, types — not consts)
           const meaningful = fileSyms
             .filter(s => !queryNames.has(s.name) && ["function", "class", "interface", "type"].includes(s.kind))
@@ -1714,15 +1739,17 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
   // These are decisions the brain has accumulated enough evidence for (confidence >= 0.80)
   // to treat as binding constraints. The orchestrator places them at CRITICAL priority
   // with frozen tier so the model sees them every turn and cannot contradict them.
+  // Root-scoped: authoritative decisions from sibling threads are equally binding.
   if (db) {
     try {
+      const scopeIds = resolveProjectScope(projectId);
       const authNodes = db.prepare(`
         SELECT id, name, content, confidence, created_at
         FROM nodes
-        WHERE project_id = ? AND entity_type = 'decision' AND confidence >= 0.80
+        WHERE project_id IN (${scopeIds.map(() => "?").join(", ")}) AND entity_type = 'decision' AND confidence >= 0.80
         ORDER BY confidence DESC, access_count DESC
         LIMIT 10
-      `).all(projectId);
+      `).all(...scopeIds);
       result.authoritativeDecisions = authNodes.map(n => {
         const parsed = JSON.parse(n.content || '{}');
         return {
@@ -1742,11 +1769,13 @@ async function writeContextualExport(projectId, query, fileContext, intent, proj
   // Full codebase map — every indexed file with a one-line description.
   // The model sees the entire project structure, not just 5 "relevant" files.
   // ~2-4k tokens for a 100-file project. Injected into the stable prompt.
+  // Root-scoped: include files indexed by sibling threads.
   if (db) {
     try {
+      const scopeIds = resolveProjectScope(projectId);
       const fileNodes = db.prepare(
-        `SELECT name, content FROM nodes WHERE entity_type = 'file' AND project_id = ? ORDER BY name`
-      ).all(projectId);
+        `SELECT DISTINCT name, content FROM nodes WHERE entity_type = 'file' AND project_id IN (${scopeIds.map(() => "?").join(", ")}) ORDER BY name`
+      ).all(...scopeIds);
       result.codebaseMap = fileNodes
         .filter(n => {
           // Defense-in-depth: skip files that no longer exist on disk.
@@ -2302,6 +2331,7 @@ process.parentPort.on("message", async ({ data }) => {
         // The model calls this when it discovers something that refines or
         // contradicts a prior memory. Saves the old version to node_versions,
         // then updates the node in place with new content + fresh embedding.
+        // Root-scoped: can update memories from sibling threads (same root).
         try {
           const { projectId, content: oldContent, newContent, type, id } = data;
           if (!projectId || !newContent || (!oldContent && !id)) {
@@ -2309,9 +2339,12 @@ process.parentPort.on("message", async ({ data }) => {
             break;
           }
 
+          const scopeIds = resolveProjectScope(projectId);
+          const scopePlaceholders = scopeIds.map(() => "?").join(", ");
+
           let node;
           if (id) {
-            node = db.prepare("SELECT * FROM nodes WHERE id = ? AND project_id = ? AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')").get(id, projectId);
+            node = db.prepare(`SELECT * FROM nodes WHERE id = ? AND project_id IN (${scopePlaceholders}) AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')`).get(id, ...scopeIds);
             if (!node) {
               sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: `No memory with id "${id}" found.` });
               break;
@@ -2319,8 +2352,8 @@ process.parentPort.on("message", async ({ data }) => {
           } else {
             const nodeType = type || null;
             const searchClause = nodeType ? "AND entity_type = ?" : "";
-            const params = nodeType ? [projectId, `%${oldContent.slice(0, 60)}%`, nodeType] : [projectId, `%${oldContent.slice(0, 60)}%`];
-            const nodes = db.prepare(`SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`).all(...params);
+            const params = nodeType ? [...scopeIds, `%${oldContent.slice(0, 60)}%`, nodeType] : [...scopeIds, `%${oldContent.slice(0, 60)}%`];
+            const nodes = db.prepare(`SELECT * FROM nodes WHERE project_id IN (${scopePlaceholders}) AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`).all(...params);
             if (nodes.length === 0) {
               sendToMain({ type: "update_memory_result", requestId: data.requestId, success: false, error: "No existing memory matching that content found." });
               break;
@@ -2375,6 +2408,7 @@ process.parentPort.on("message", async ({ data }) => {
         // The model calls this when a prior observation turns out to be
         // incorrect or no longer relevant. Removes the node, its versions,
         // and its edges.
+        // Root-scoped: can delete memories from sibling threads (same root).
         try {
           const { projectId, content, type, id } = data;
           if (!projectId || (!content && !id)) {
@@ -2382,9 +2416,12 @@ process.parentPort.on("message", async ({ data }) => {
             break;
           }
 
+          const scopeIds = resolveProjectScope(projectId);
+          const scopePlaceholders = scopeIds.map(() => "?").join(", ");
+
           let node;
           if (id) {
-            node = db.prepare("SELECT * FROM nodes WHERE id = ? AND project_id = ? AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')").get(id, projectId);
+            node = db.prepare(`SELECT * FROM nodes WHERE id = ? AND project_id IN (${scopePlaceholders}) AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix')`).get(id, ...scopeIds);
             if (!node) {
               sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: `No memory with id "${id}" found.` });
               break;
@@ -2392,8 +2429,8 @@ process.parentPort.on("message", async ({ data }) => {
           } else {
             const nodeType = type || null;
             const searchClause = nodeType ? "AND entity_type = ?" : "";
-            const params = nodeType ? [projectId, `%${content.slice(0, 60)}%`, nodeType] : [projectId, `%${content.slice(0, 60)}%`];
-            const nodes = db.prepare(`SELECT * FROM nodes WHERE project_id = ? AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`).all(...params);
+            const params = nodeType ? [...scopeIds, `%${content.slice(0, 60)}%`, nodeType] : [...scopeIds, `%${content.slice(0, 60)}%`];
+            const nodes = db.prepare(`SELECT * FROM nodes WHERE project_id IN (${scopePlaceholders}) AND content LIKE ? ${searchClause} AND entity_type IN ('decision', 'lesson', 'pattern', 'error_fix') ORDER BY confidence DESC LIMIT 5`).all(...params);
             if (nodes.length === 0) {
               sendToMain({ type: "delete_memory_result", requestId: data.requestId, success: false, error: "No existing memory matching that content found." });
               break;
@@ -3124,26 +3161,28 @@ process.parentPort.on("message", async ({ data }) => {
       case "knowledge_graph": {
         if (!db) { sendToMain({ type: "knowledge_graph_result", requestId: data.requestId, error: "db not ready" }); break; }
 
-        const kgProjectId = data.projectId;
+        // Root-scoped: include nodes from all sibling threads
+        const kgScopeIds = resolveProjectScope(data.projectId);
+        const kgScopePh = kgScopeIds.map(() => "?").join(", ");
 
         // Get type counts (atoms have been removed — no longer excluded)
         const typeCounts = db.prepare(`
           SELECT entity_type, COUNT(*) as count
           FROM nodes
-          WHERE project_id = ?
+          WHERE project_id IN (${kgScopePh})
           GROUP BY entity_type
           ORDER BY count DESC
-        `).all(kgProjectId);
+        `).all(...kgScopeIds);
 
         // Get top nodes (highest confidence, most accessed)
         const topNodes = db.prepare(`
           SELECT id, name, entity_type, content, confidence, access_count, priority
           FROM nodes
-          WHERE project_id = ? AND entity_type NOT IN ('project')
+          WHERE project_id IN (${kgScopePh}) AND entity_type NOT IN ('project')
             AND content != '{}'
           ORDER BY confidence DESC, access_count DESC
           LIMIT 20
-        `).all(kgProjectId);
+        `).all(...kgScopeIds);
 
         // Parse node content from JSON storage format
         const parsedNodes = topNodes.map(n => {
@@ -3168,11 +3207,11 @@ process.parentPort.on("message", async ({ data }) => {
         const edges = db.prepare(`
           SELECT e.type, COUNT(*) as count
           FROM edges e
-          WHERE e.source_id IN (SELECT id FROM nodes WHERE project_id = ?)
-             OR e.target_id IN (SELECT id FROM nodes WHERE project_id = ?)
+          WHERE e.source_id IN (SELECT id FROM nodes WHERE project_id IN (${kgScopePh}))
+             OR e.target_id IN (SELECT id FROM nodes WHERE project_id IN (${kgScopePh}))
           GROUP BY e.type
           ORDER BY count DESC
-        `).all(kgProjectId, kgProjectId);
+        `).all(...kgScopeIds, ...kgScopeIds);
 
         const edgeTypes = {};
         let totalEdges = 0;

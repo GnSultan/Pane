@@ -39,6 +39,7 @@ import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs
 import { getActiveJournal, applyMergeDelta } from "./session-journal.mjs";
 import { getIdentity } from "./identity.mjs";
 import { lookupModelContext } from "./model-registry.mjs";
+import { resolveProjectScope } from "./root-scope.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -356,9 +357,14 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   // Skip for mind: threads — those are thought journals, not code projects.
   if (!projectId.startsWith("mind:")) {
     let projectAbout = "";
-    try {
-      projectAbout = fs.readFileSync(path.join(MEMORY_DIR, projectId, "about.md"), "utf-8").trim();
-    } catch {}
+    // Root-scoped: fall back to sibling threads sharing the same root.
+    // A new thread inherits the project's about.md from its siblings.
+    for (const sid of resolveProjectScope(projectId)) {
+      try {
+        const candidate = fs.readFileSync(path.join(MEMORY_DIR, sid, "about.md"), "utf-8").trim();
+        if (candidate) { projectAbout = candidate; break; }
+      } catch {}
+    }
 
     if (projectAbout) {
       stableParts.push("## About");
