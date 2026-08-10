@@ -86,92 +86,148 @@ function parseMcpName(name: string): { server: string; tool: string } | null {
 
 
 
+// Label = colored accent prefix (the action verb)
+function getPaneToolLabel(name: string): string | null {
+  switch (name) {
+    case "pane_run_in_terminal": return "terminal";
+    case "pane_recall": return "recall";
+    case "pane_recall_all": return "recall";
+    case "pane_remember": return "remember";
+    case "pane_brief": return "brief";
+    case "pane_search_changes": return "changes";
+    case "pane_checkpoints": return "checkpoints";
+    case "pane_checkpoint": return "checkpoint";
+    case "pane_change_history": return "history";
+    case "pane_set_about": return "about";
+    case "pane_set_philosophy": return "philosophy";
+    case "pane_set_rule": return "rule";
+    case "pane_delegate": return "delegate";
+    case "pane_cross_project": return "cross";
+    case "pane_knowledge_graph": return "graph";
+    case "pane_find_symbol": return "symbol";
+    case "pane_open_files": return "files";
+    case "pane_profile": return "profile";
+    case "pane_project_context": return "context";
+    case "pane_read_files": return "read";
+    case "pane_find_references": return "references";
+    case "pane_codebase_compass": return "compass";
+    case "pane_codebase_navigator": return "navigate";
+    case "pane_ui_constraints": return "ui";
+    case "pane_architecture_brief": return "architecture";
+    case "pane_revert_change": return "revert";
+    case "pane_update_memory": return "memory";
+    case "pane_delete_memory": return "memory";
+    case "pane_directory": return "directory";
+    case "pane_get_session_state": return "state";
+    case "pane_get_project_map": return "map";
+    case "pane_get_recent_changes": return "changes";
+    case "pane_get_handoff": return "handoff";
+    case "pane_read_journal": return "journal";
+    case "pane_check_intents": return "intents";
+    case "pane_list_skills": return "skills";
+    case "pane_list_active_skills": return "skills";
+    case "pane_skill_info": return "skill";
+    case "pane_install_skill": return "install";
+    case "pane_ui_constraints": return "ui";
+    case "pane_lens_findings": return "lens";
+    default: return null;
+  }
+}
+
+// Summary = descriptive detail after the label
+function summarizePaneTool(name: string, input: Record<string, unknown>): string {
+  switch (name) {
+    case "pane_run_in_terminal": {
+      const cmd = (input.command as string) || "";
+      return cmd ? (cmd.length > 60 ? cmd.slice(0, 60) + "…" : cmd) : "";
+    }
+    case "pane_recall": {
+      const q = (input.query as string) || "";
+      return q ? q.slice(0, 60) : "recent";
+    }
+    case "pane_recall_all": {
+      const q = (input.query as string) || "";
+      return q ? `all ${q.slice(0, 60)}` : "all projects";
+    }
+    case "pane_remember": {
+      const c = (input.content as string) || "";
+      return c ? c.slice(0, 60) : "";
+    }
+    case "pane_brief": return "";
+    case "pane_search_changes": {
+      const q = (input.query as string) || "";
+      return q || "all";
+    }
+    case "pane_checkpoints": return "";
+    case "pane_checkpoint": {
+      const label = (input.label as string) || "";
+      return label || "";
+    }
+    case "pane_change_history": return "";
+    case "pane_set_about":
+    case "pane_set_philosophy":
+    case "pane_set_rule": return "";
+    case "pane_delegate": {
+      const obj = (input.objective as string) || "";
+      return obj ? obj.slice(0, 60) : "";
+    }
+    case "pane_cross_project": {
+      const q = (input.query as string) || "";
+      return q ? q.slice(0, 50) : "";
+    }
+    case "pane_knowledge_graph": return "";
+    case "pane_find_symbol": {
+      const q = (input.query as string) || (input.symbol as string) || "";
+      return q ? q.slice(0, 50) : "";
+    }
+    case "pane_open_files": return "";
+    case "pane_profile": return "";
+    case "pane_project_context": return "";
+    case "pane_read_files": {
+      const paths = input.paths as string[] | undefined;
+      return paths?.length ? `${paths.length} files` : "";
+    }
+    case "pane_find_references": {
+      const sym = (input.symbol as string) || "";
+      return sym ? sym.slice(0, 50) : "";
+    }
+    case "pane_codebase_compass": {
+      const q = (input.query as string) || "";
+      return q ? q.slice(0, 50) : "";
+    }
+    case "pane_codebase_navigator": {
+      const t = (input.target as string) || "";
+      return t ? t.slice(0, 50) : "";
+    }
+    case "pane_ui_constraints": {
+      const c = (input.component as string) || "";
+      return c ? c.slice(0, 50) : "";
+    }
+    case "pane_architecture_brief": {
+      const s = (input.subsystem as string) || "";
+      return s ? s.slice(0, 50) : "";
+    }
+    case "pane_revert_change": return "";
+    case "pane_update_memory": {
+      const c = (input.content as string) || "";
+      return c ? c.slice(0, 40) : "";
+    }
+    case "pane_delete_memory": {
+      const c = (input.content as string) || "";
+      return c ? c.slice(0, 40) : "";
+    }
+    case "pane_directory": {
+      return (input.dir_path as string) || "";
+    }
+    default:
+      return name.slice(5).replace(/_/g, " ");
+  }
+}
+
 function summarizeTool(name: string, input: Record<string, unknown>): string {
   // Bare pane_* tool names from API backend (no mcp__ prefix)
   if (name.startsWith("pane_")) {
-    switch (name) {
-      case "pane_run_in_terminal": {
-        const cmd = (input.command as string) || "";
-        return "terminal" + (cmd ? ` ${cmd.length > 60 ? cmd.slice(0, 60) + "…" : cmd}` : "");
-      }
-      case "pane_recall": {
-        const q = (input.query as string) || "";
-        return q ? `recall ${q}` : "recall";
-      }
-      case "pane_recall_all": {
-        const q = (input.query as string) || "";
-        return q ? `recall all ${q}` : "recall all";
-      }
-      case "pane_remember": {
-        const c = (input.content as string) || "";
-        return "remember" + (c ? ` ${c.slice(0, 60)}` : "");
-      }
-      case "pane_brief": return "brief";
-      case "pane_search_changes": {
-        const q = (input.query as string) || "";
-        return q ? `search changes ${q}` : "search changes";
-      }
-      case "pane_checkpoints": return "checkpoints";
-      case "pane_checkpoint": {
-        const label = (input.label as string) || "";
-        return label ? `checkpoint ${label}` : "checkpoint";
-      }
-      case "pane_change_history": return "change history";
-      case "pane_set_about": return "set about";
-      case "pane_set_philosophy": return "set philosophy";
-      case "pane_set_rule": return "set rule";
-      case "pane_delegate": {
-        const obj = (input.objective as string) || "";
-        return obj ? `delegate ${obj.slice(0, 60)}` : "delegate";
-      }
-      case "pane_cross_project": {
-        const q = (input.query as string) || "";
-        return q ? `cross project ${q}` : "cross project";
-      }
-      case "pane_knowledge_graph": return "knowledge graph";
-      case "pane_find_symbol": {
-        const q = (input.query as string) || (input.symbol as string) || "";
-        return q ? `find symbol ${q}` : "find symbol";
-      }
-      case "pane_open_files": return "open files";
-      case "pane_profile": return "profile";
-      case "pane_project_context": return "project context";
-      case "pane_read_files": {
-        const paths = input.paths as string[] | undefined;
-        return paths?.length ? `read ${paths.length} files` : "read files";
-      }
-      case "pane_find_references": {
-        const sym = (input.symbol as string) || "";
-        return sym ? `references ${sym}` : "references";
-      }
-      case "pane_codebase_compass": {
-        const q = (input.query as string) || "";
-        return q ? `compass ${q.slice(0, 50)}` : "compass";
-      }
-      case "pane_codebase_navigator": {
-        const t = (input.target as string) || "";
-        return t ? `navigate ${t}` : "navigate";
-      }
-      case "pane_ui_constraints": {
-        const c = (input.component as string) || "";
-        return c ? `ui ${c}` : "ui";
-      }
-      case "pane_architecture_brief": {
-        const s = (input.subsystem as string) || "";
-        return s ? `architecture ${s}` : "architecture brief";
-      }
-      case "pane_revert_change": return "revert";
-      case "pane_update_memory": {
-        const c = (input.content as string) || "";
-        return c ? `update memory ${c.slice(0, 40)}` : "update memory";
-      }
-      case "pane_delete_memory": {
-        const c = (input.content as string) || "";
-        return c ? `delete memory ${c.slice(0, 40)}` : "delete memory";
-      }
-      default:
-        return name.slice(5).replace(/_/g, " ");
-    }
+    return summarizePaneTool(name, input);
   }
 
   const mcp = parseMcpName(name);
@@ -208,8 +264,6 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       const steps = (input.steps as Array<{ action: string }>) || [];
       return summary || `${steps.length} steps`;
     }
-    case "pane_plan":
-      return "plan";
     case "Task":
     case "agent":
       return (input.task as string) || (input.description as string) || (input.prompt as string) || "task";
@@ -218,14 +272,14 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       return (input.query as string) || "";
     case "explore": {
       const q = (input.query as string) || "";
-      return q ? `explore ${q.slice(0, 50)}` : "explore";
+      return q ? q.slice(0, 50) : "";
     }
     case "evaluate_js":
-      return "evaluate";
-    case "pane_directory":
-      return (input.dir_path as string) || "list directory";
-    case "web_fetch":
-      return "fetch";
+      return "";
+    case "web_fetch": {
+      const url = (input.url as string) || "";
+      return url ? url.slice(0, 60) : "";
+    }
     case "EnterPlanMode":
       return "entering plan mode";
     case "ExitPlanMode":
@@ -237,7 +291,8 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
 
 function getToolLabel(name: string): string {
   // Bare pane_* tool names from API backend (no mcp__ prefix)
-  if (name.startsWith("pane_")) return "pane";
+  const paneLabel = getPaneToolLabel(name);
+  if (name.startsWith("pane_") && paneLabel) return paneLabel;
 
   const mcp = parseMcpName(name);
   if (mcp) return mcp.server;
@@ -257,7 +312,9 @@ function getToolLabel(name: string): string {
     case "run_shell_command": return "bash";
     case "Task":
     case "agent": return "task";
-    case "pane_plan": return "pane";
+    case "explore": return "explore";
+    case "evaluate_js": return "evaluate";
+    case "web_fetch": return "fetch";
     case "Plan": return "plan";
     case "WebSearch":
     case "google_web_search": return "search";
