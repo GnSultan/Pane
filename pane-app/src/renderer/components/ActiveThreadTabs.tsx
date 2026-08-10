@@ -20,7 +20,7 @@ const ACTIVITY_WINDOW_MS = 30 * 60_000; // 30 minutes
 /** Slow three-dot processing indicator — matches ProjectList's ProcessingDots. */
 function ProcessingDots() {
   return (
-    <span className="inline-flex items-center gap-[3px] mr-1 shrink-0">
+    <span className="inline-flex items-center gap-[3px] shrink-0">
       <span className="processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40" />
       <span
         className="processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40"
@@ -138,7 +138,7 @@ const TabButton = ({ id, name, isActive, isProcessing, hasUnread, onSelect }: Ta
   return (
     <button
       onPointerDown={handlePointerDown}
-      className={`flex-1 min-w-0 h-7 mx-0.5 flex items-center px-2 rounded-md transition-colors ${
+      className={`flex-1 min-w-0 h-7 mx-0.5 flex items-center gap-1.5 px-2 rounded-md transition-colors ${
         isActive
           ? "bg-pane-accent-tab text-pane-text"
           : "bg-pane-inactive-tab text-pane-text-secondary/50 hover:text-pane-text-secondary/80"
@@ -147,13 +147,13 @@ const TabButton = ({ id, name, isActive, isProcessing, hasUnread, onSelect }: Ta
     >
       {isProcessing && <ProcessingDots />}
       <span
-        className="truncate font-medium"
+        className="truncate font-medium flex-1 text-left"
         style={{ fontSize: "var(--pane-panel-font-size-xs)" }}
       >
         {name}
       </span>
       {hasUnread && !isProcessing && (
-        <span className="shrink-0 inline-block w-1.5 h-1.5 rounded-full bg-pane-status-added ml-1.5 animate-pulse" />
+        <span className="shrink-0 inline-block w-1.5 h-1.5 rounded-full bg-pane-status-added" />
       )}
     </button>
   );
@@ -169,7 +169,9 @@ const TabButton = ({ id, name, isActive, isProcessing, hasUnread, onSelect }: Ta
  * are shown.
  */
 export function ActiveThreadTabs() {
-  // Collect active threads: processing or active within 30 min.
+  // Collect active threads: processing, recently active (30 min), or unread.
+  // The currently active thread is ALWAYS included — you should never see
+  // the conversation you're reading disappear from the tabs.
   // useShallow so we only re-render when the actual list changes.
   const activeThreads = useProjectsStore(
     useShallow((s) => {
@@ -179,6 +181,7 @@ export function ActiveThreadTabs() {
         const p = s.projects.get(id);
         if (!p || p.archived) continue;
         if (
+          id === s.activeProjectId ||
           p.conversation.isProcessing ||
           p.hasUnreadCompletion ||
           (p.lastActivityAt !== null &&

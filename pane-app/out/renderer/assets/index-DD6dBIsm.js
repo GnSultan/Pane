@@ -3,7 +3,7 @@ var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 var require_index_001 = __commonJS({
-  "assets/index-BVL6CvMq.js"(exports, module) {
+  "assets/index-DD6dBIsm.js"(exports, module) {
     var commonjsGlobal = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : {};
     function getDefaultExportFromCjs(x2) {
       return x2 && x2.__esModule && Object.prototype.hasOwnProperty.call(x2, "default") ? x2["default"] : x2;
@@ -8168,6 +8168,7 @@ var require_index_001 = __commonJS({
             const updatedProject = {
               ...project,
               hasUnreadCompletion: false,
+              lastActivityAt: Date.now(),
               ...carryMode && !isTransientMode ? { mode: carryMode } : {}
             };
             updatedProjects.set(id2, updatedProject);
@@ -9613,7 +9614,7 @@ var require_index_001 = __commonJS({
     const DRAG_THRESHOLD = 5;
     const ACTIVITY_WINDOW_MS = 30 * 6e4;
     function ProcessingDots() {
-      return /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "inline-flex items-center gap-[3px] mr-1 shrink-0", children: [
+      return /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "inline-flex items-center gap-[3px] shrink-0", children: [
         /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "processing-dot w-[3px] h-[3px] rounded-full bg-pane-text-secondary/40" }),
         /* @__PURE__ */ jsxRuntimeExports.jsx(
           "span",
@@ -9688,19 +9689,19 @@ var require_index_001 = __commonJS({
         "button",
         {
           onPointerDown: handlePointerDown,
-          className: `flex-1 min-w-0 h-7 mx-0.5 flex items-center px-2 rounded-md transition-colors ${isActive ? "bg-pane-accent-tab text-pane-text" : "bg-pane-inactive-tab text-pane-text-secondary/50 hover:text-pane-text-secondary/80"}`,
+          className: `flex-1 min-w-0 h-7 mx-0.5 flex items-center gap-1.5 px-2 rounded-md transition-colors ${isActive ? "bg-pane-accent-tab text-pane-text" : "bg-pane-inactive-tab text-pane-text-secondary/50 hover:text-pane-text-secondary/80"}`,
           title: name,
           children: [
             isProcessing && /* @__PURE__ */ jsxRuntimeExports.jsx(ProcessingDots, {}),
             /* @__PURE__ */ jsxRuntimeExports.jsx(
               "span",
               {
-                className: "truncate font-medium",
+                className: "truncate font-medium flex-1 text-left",
                 style: { fontSize: "var(--pane-panel-font-size-xs)" },
                 children: name
               }
             ),
-            hasUnread && !isProcessing && /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "shrink-0 inline-block w-1.5 h-1.5 rounded-full bg-pane-status-added ml-1.5 animate-pulse" })
+            hasUnread && !isProcessing && /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "shrink-0 inline-block w-1.5 h-1.5 rounded-full bg-pane-status-added" })
           ]
         }
       );
@@ -9713,7 +9714,7 @@ var require_index_001 = __commonJS({
           for (const id2 of s.projectOrder) {
             const p2 = s.projects.get(id2);
             if (!p2 || p2.archived) continue;
-            if (p2.conversation.isProcessing || p2.hasUnreadCompletion || p2.lastActivityAt !== null && now2 - p2.lastActivityAt < ACTIVITY_WINDOW_MS) {
+            if (id2 === s.activeProjectId || p2.conversation.isProcessing || p2.hasUnreadCompletion || p2.lastActivityAt !== null && now2 - p2.lastActivityAt < ACTIVITY_WINDOW_MS) {
               ids.push(id2);
             }
           }
