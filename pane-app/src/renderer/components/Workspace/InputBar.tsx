@@ -63,7 +63,13 @@ function formatRelativeTime(epochMs: number): string {
 }
 
 function RateLimitIndicator() {
-  const provider = useWorkspaceStore((s) => s.selectedModelProvider);
+  const activeProjectId = useProjectsStore((s) => s.activeProjectId);
+  const projectProvider = useProjectsStore(
+    (s) => (activeProjectId ? s.projects.get(activeProjectId)?.selectedModelProvider : undefined) ?? null,
+  );
+  const wsProvider = useWorkspaceStore((s) => s.selectedModelProvider);
+  // Per-project provider takes priority, matching how InputBar resolves the model.
+  const provider = projectProvider ?? wsProvider;
   const info = useWorkspaceStore((s) => s.rateLimitByProvider[provider]);
   const setRateLimitForProvider = useWorkspaceStore((s) => s.setRateLimitForProvider);
 

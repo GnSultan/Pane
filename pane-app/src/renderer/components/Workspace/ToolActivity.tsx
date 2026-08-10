@@ -128,7 +128,6 @@ function getPaneToolLabel(name: string): string | null {
     case "pane_list_active_skills": return "skills";
     case "pane_skill_info": return "skill";
     case "pane_install_skill": return "install";
-    case "pane_ui_constraints": return "ui";
     case "pane_lens_findings": return "lens";
     default: return null;
   }
