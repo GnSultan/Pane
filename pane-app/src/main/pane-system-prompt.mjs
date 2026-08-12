@@ -323,7 +323,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   // ── PANE OPERATING PRINCIPLES ───────────────────────────────────────────
   // Compressed from the former ~1,276-token Pane Intelligence Guide.
   // Tool-specific behavioral guidance now lives in tool descriptions
-  // (http-backend.mjs / pane-mcp-server.mjs) where it has maximum impact.
+  // (http-backend.mjs) where it has maximum impact.
   stableParts.push(
     "## Working in Pane",
     "",

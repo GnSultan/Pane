@@ -459,6 +459,7 @@ function createProjectsStore() {
         const updatedProject = {
           ...project,
           hasUnreadCompletion: false,
+          lastActivityAt: Date.now(),
           ...(carryMode && !isTransientMode ? { mode: carryMode } : {}),
         };
         updatedProjects.set(id, updatedProject);

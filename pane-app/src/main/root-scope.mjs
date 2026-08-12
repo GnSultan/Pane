@@ -11,7 +11,7 @@
  * not per thread.
  *
  * Used by: brain-engine.mjs (brain worker), pane-system-prompt.mjs (compileContext),
- * memory-direct.mjs (mutations), pane-mcp-server.mjs, http-backend.mjs.
+ * memory-direct.mjs (mutations), http-backend.mjs.
  *
  * Safe in both the main process and UtilityProcess workers — only uses
  * node:fs and node:path, no Electron dependencies.
