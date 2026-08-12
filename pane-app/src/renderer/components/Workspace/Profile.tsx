@@ -23,9 +23,12 @@ import {
   paneClaudeLogin,
   paneClaudeLogout,
   paneClaudeAuthState,
+  loadSettings,
+  saveSettings,
   type CloudUser,
   type CloudStatus,
   type ClaudeAuthState,
+  type McpServerConfig,
 } from "../../lib/tauri-commands";
 import {
   ACTION_DEFINITIONS,
@@ -1643,6 +1646,224 @@ function CuratedModelsSection() {
   );
 }
 
+// ─── MCP Servers Section ──────────────────────────────────────────────────────
+
+function McpServersSection() {
+  const [servers, setServers] = useState<Record<string, McpServerConfig>>({});
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newCommand, setNewCommand] = useState("");
+  const [newArgs, setNewArgs] = useState("");
+  const [newEnv, setNewEnv] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  // Load MCP server configs from settings
+  useEffect(() => {
+    loadSettings()
+      .then((s) => {
+        setServers(s.mcp_servers || {});
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
+  const persistServers = useCallback((updated: Record<string, McpServerConfig>) => {
+    setServers(updated);
+    saveSettings({ mcp_servers: updated }).catch((err: unknown) => {
+      console.error("[mcp] Failed to save server config:", err);
+    });
+  }, []);
+
+  const handleAdd = () => {
+    setError(null);
+    const name = newName.trim();
+    if (!name) { setError("Server name is required."); return; }
+    if (!newCommand.trim()) { setError("Command is required."); return; }
+    if (servers[name]) { setError(`A server named "${name}" already exists.`); return; }
+
+    /** @type {McpServerConfig} */
+    const config: McpServerConfig = {
+      command: newCommand.trim(),
+      enabled: true,
+    };
+
+    // Parse args — whitespace-separated, respecting quotes
+    const parsedArgs = newArgs.trim().match(/(?:[^\s"]+|"[^"]*")+/g);
+    if (parsedArgs) {
+      config.args = parsedArgs.map((a) => a.replace(/^"|"$/g, ""));
+    }
+
+    // Parse env — KEY=value per line
+    if (newEnv.trim()) {
+      /** @type {Record<string, string>} */
+      const envObj: Record<string, string> = {};
+      for (const line of newEnv.trim().split("\n")) {
+        const eq = line.indexOf("=");
+        if (eq > 0) {
+          envObj[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+        }
+      }
+      if (Object.keys(envObj).length > 0) config.env = envObj;
+    }
+
+    persistServers({ ...servers, [name]: config });
+    setAdding(false);
+    setNewName("");
+    setNewCommand("");
+    setNewArgs("");
+    setNewEnv("");
+  };
+
+  const handleToggle = (name: string) => {
+    const existing = servers[name];
+    if (!existing) return;
+    persistServers({
+      ...servers,
+      [name]: { ...existing, enabled: existing.enabled === false ? true : false },
+    });
+  };
+
+  const handleDelete = (name: string) => {
+    const updated = { ...servers };
+    delete updated[name];
+    persistServers(updated);
+  };
+
+  if (loading) {
+    return (
+      <div className="text-pane-text-secondary/40 font-mono py-4" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        loading...
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <p
+        className="text-pane-text-secondary/50 font-mono leading-relaxed"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        Connect external MCP servers (Figma, GitHub, Notion, etc.). Their tools become available to the model. Changes take effect on the next message.
+      </p>
+
+      {/* Existing servers */}
+      {Object.entries(servers).length > 0 && (
+        <div className="flex flex-col gap-2">
+          {Object.entries(servers).map(([name, config]) => (
+            <div
+              key={name}
+              className="flex items-center justify-between py-2 px-3 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20"
+            >
+              <div className="flex flex-col gap-0.5 min-w-0">
+                <span
+                  className="text-pane-text font-mono truncate"
+                  style={{ fontSize: "var(--pane-font-size-sm)" }}
+                >
+                  {name}
+                </span>
+                <span
+                  className="text-pane-text-secondary/40 font-mono truncate"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  {config.command} {(config.args || []).join(" ")}
+                </span>
+              </div>
+              <div className="flex items-center gap-3 shrink-0">
+                <button
+                  onClick={() => handleToggle(name)}
+                  className={`w-4 h-4 rounded-full transition-all duration-200 ${
+                    config.enabled !== false
+                      ? "bg-pane-accent ring-2 ring-pane-accent/30"
+                      : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"
+                  }`}
+                  title={config.enabled !== false ? "Enabled" : "Disabled"}
+                />
+                <button
+                  onClick={() => handleDelete(name)}
+                  className="text-pane-text-secondary/40 hover:text-pane-error transition-colors font-mono"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  title="Remove server"
+                >
+                  remove
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Add new server form */}
+      {adding ? (
+        <div className="flex flex-col gap-2 py-2 px-3 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20">
+          {error && (
+            <span className="text-pane-error font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              {error}
+            </span>
+          )}
+          <input
+            type="text"
+            placeholder="server name (e.g. figma)"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+            autoFocus
+          />
+          <input
+            type="text"
+            placeholder="command (e.g. npx)"
+            value={newCommand}
+            onChange={(e) => setNewCommand(e.target.value)}
+            className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          />
+          <input
+            type="text"
+            placeholder='arguments (e.g. -y figma-developer-mcp --stdio)'
+            value={newArgs}
+            onChange={(e) => setNewArgs(e.target.value)}
+            className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          />
+          <textarea
+            placeholder={"environment variables (one per line):\nFIGMA_API_KEY=fig_...\nGITHUB_TOKEN=ghp_..."}
+            value={newEnv}
+            onChange={(e) => setNewEnv(e.target.value)}
+            rows={3}
+            className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30 resize-none"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          />
+          <div className="flex items-center gap-3 pt-1">
+            <button
+              onClick={handleAdd}
+              className="text-pane-accent font-mono hover:text-pane-accent/80 transition-colors"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              add
+            </button>
+            <button
+              onClick={() => { setAdding(false); setError(null); }}
+              className="text-pane-text-secondary/40 font-mono hover:text-pane-text-secondary/70 transition-colors"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          onClick={() => setAdding(true)}
+          className="text-pane-text-secondary/40 font-mono hover:text-pane-text-secondary/70 transition-colors text-left"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          + add server
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ─── Cloud Section ────────────────────────────────────────────────────────────
 
 const electronAPI = window.electronAPI;
@@ -2343,6 +2564,16 @@ export function Profile() {
           onToggle={() => setExpandedSection(expandedSection === "shortcuts" ? null : "shortcuts")}
         >
           <KeybindingsSection />
+        </AccordionSection>
+
+        {/* MCP Servers Section */}
+        <AccordionSection
+          title="integrations"
+          icon={icons.integrations}
+          isExpanded={expandedSection === "integrations"}
+          onToggle={() => setExpandedSection(expandedSection === "integrations" ? null : "integrations")}
+        >
+          <McpServersSection />
         </AccordionSection>
 
         {/* Cloud Section */}

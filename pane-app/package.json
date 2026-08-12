@@ -73,6 +73,7 @@
       "src/main/context-manager.mjs",
       "src/main/session-context.mjs",
       "src/main/tool-executor.mjs",
+      "src/main/mcp-client.mjs",
       "src/main/classify-intent.mjs",
       "src/main/intent-classifier.mjs",
       "src/main/planning-agent.mjs",

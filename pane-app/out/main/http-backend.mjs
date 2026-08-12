@@ -56,6 +56,7 @@ import {
   formatZaiQuotaError,
   getZaiPlanLimits,
 } from "./provider-monitor.mjs";
+import { mcpClient } from "./mcp-client.mjs";
 
 // ── OAuth body transformation helpers ─────────────────────────────────────
 
@@ -1230,14 +1231,15 @@ function getToolsForPhase(phase) {
   // User-facing phases "think"/"analyze" and internal "planning" are all read-only.
   // "build"/"execution" get the full tool set.
   const readOnlyPhases = new Set(["planning", "think", "analyze"]);
-  if (readOnlyPhases.has(phase)) {
-    // Read/explore only — model cannot modify files during think/planning phases
-    return TOOL_DEFINITIONS.filter(
-      (t) => !WRITE_TOOL_NAMES.has(t.function.name),
-    );
-  }
-  // execution — all tools
-  return TOOL_DEFINITIONS;
+  const builtIn = readOnlyPhases.has(phase)
+    ? TOOL_DEFINITIONS.filter((t) => !WRITE_TOOL_NAMES.has(t.function.name))
+    : TOOL_DEFINITIONS;
+
+  // External MCP tools — always included regardless of phase. External tools
+  // are typically data-source connectors (Figma, GitHub) needed for context
+  // during planning and execution alike.
+  const external = mcpClient.getExternalTools();
+  return [...builtIn, ...external];
 }
 
 function getAnthropicToolsForPhase(phase) {
@@ -2477,6 +2479,16 @@ export class ApiBackend extends PunkBackend {
         `[http] spawn: request.provider=${request.provider}, resolved.provider=${apiConfig.provider}, model=${request.model}, hasKey=${!!apiConfig.apiKey}, prefix=${apiConfig.apiKey?.slice(0, 10)}`,
       );
       this.validateApiConfig(apiConfig);
+
+      // ── Connect to external MCP servers ──
+      // Lazy-connect before the first turn so external tools are available
+      // when the tool list is assembled. Already-connected servers are skipped.
+      // Non-blocking on failure — external tools just won't appear.
+      try {
+        await mcpClient.ensureConnected();
+      } catch (err) {
+        console.warn(`[http] MCP client connection failed (non-blocking): ${err.message}`);
+      }
 
       const gitStatus = await this.getGitStatus(request.workingDir);
 

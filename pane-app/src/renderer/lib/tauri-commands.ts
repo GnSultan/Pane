@@ -291,6 +291,18 @@ export interface UserSettings {
   intent_routing?: Record<string, unknown>;  // deprecated — migration only
   power_combo?: PowerCombo;
   intent_auto_route?: boolean;
+  /** External MCP server configs — each entry spawns a stdio MCP server
+   *  process whose tools become available to the model. Keyed by server
+   *  name (e.g. "figma", "github"). */
+  mcp_servers?: Record<string, McpServerConfig>;
+}
+
+/** Configuration for a single external MCP server. */
+export interface McpServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  enabled?: boolean;
 }
 
 export async function loadSettings(): Promise<UserSettings> {

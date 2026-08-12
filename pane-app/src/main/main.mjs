@@ -1146,6 +1146,15 @@ function registerSettingsHandlers() {
     const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
     await fs.promises.writeFile(tmpPath, json, "utf-8");
     await fs.promises.rename(tmpPath, filePath);
+
+    // Invalidate MCP client config cache — server list may have changed.
+    // The next model turn will re-read the config and connect/disconnect as needed.
+    try {
+      const { mcpClient } = await import("./mcp-client.mjs");
+      mcpClient.invalidateConfig();
+    } catch (err) {
+      console.warn("[settings] MCP config invalidation skipped:", err.message);
+    }
   });
 
   // Dock icon switches with theme — clear (glass) = no bg, default = semi-transparent dark, dark = solid dark.

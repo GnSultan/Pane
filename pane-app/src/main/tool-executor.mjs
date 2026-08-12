@@ -38,6 +38,7 @@ import {
   installSkill,
   ensureGlobalSkillsDir,
 } from "./skill-registry.mjs";
+import { mcpClient } from "./mcp-client.mjs";
 
 // ── CMD Worker (utility process for shell execution) ──────────────────────
 // In Electron 40's packaged macOS app, child_process.spawn/execSync fails with
@@ -1666,6 +1667,14 @@ export class ToolExecutor {
             detail: _fileArg ? null : (input?.command || input?.pattern || input?.query || input?.description || null),
           });
         }
+      }
+
+      // ── External MCP tools ──
+      // Tools from external MCP servers (Figma, GitHub, etc.) are namespaced
+      // with ext__server__toolname and routed to the MCP client.
+      if (mcpClient.isExternalTool(toolName)) {
+        const result = await mcpClient.callTool(toolName, input);
+        return { ...result, toolId };
       }
 
       switch (toolName) {
