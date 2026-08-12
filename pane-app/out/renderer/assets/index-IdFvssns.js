@@ -3,7 +3,7 @@ var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 var require_index_001 = __commonJS({
-  "assets/index-DTz7Ievo.js"(exports, module) {
+  "assets/index-IdFvssns.js"(exports, module) {
     var commonjsGlobal = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : {};
     function getDefaultExportFromCjs(x2) {
       return x2 && x2.__esModule && Object.prototype.hasOwnProperty.call(x2, "default") ? x2["default"] : x2;
@@ -93717,6 +93717,224 @@ ${content}
         ] })
       ] });
     }
+    function McpServersSection() {
+      const [servers, setServers] = reactExports.useState({});
+      const [loading, setLoading] = reactExports.useState(true);
+      const [adding, setAdding] = reactExports.useState(false);
+      const [newName, setNewName] = reactExports.useState("");
+      const [newCommand, setNewCommand] = reactExports.useState("");
+      const [newArgs, setNewArgs] = reactExports.useState("");
+      const [newEnv, setNewEnv] = reactExports.useState("");
+      const [error, setError] = reactExports.useState(null);
+      reactExports.useEffect(() => {
+        loadSettings().then((s) => {
+          setServers(s.mcp_servers || {});
+          setLoading(false);
+        }).catch(() => setLoading(false));
+      }, []);
+      const persistServers = reactExports.useCallback((updated) => {
+        setServers(updated);
+        saveSettings({ mcp_servers: updated }).catch((err) => {
+          console.error("[mcp] Failed to save server config:", err);
+        });
+      }, []);
+      const handleAdd = () => {
+        setError(null);
+        const name = newName.trim();
+        if (!name) {
+          setError("Server name is required.");
+          return;
+        }
+        if (!newCommand.trim()) {
+          setError("Command is required.");
+          return;
+        }
+        if (servers[name]) {
+          setError(`A server named "${name}" already exists.`);
+          return;
+        }
+        const config = {
+          command: newCommand.trim(),
+          enabled: true
+        };
+        const parsedArgs = newArgs.trim().match(/(?:[^\s"]+|"[^"]*")+/g);
+        if (parsedArgs) {
+          config.args = parsedArgs.map((a) => a.replace(/^"|"$/g, ""));
+        }
+        if (newEnv.trim()) {
+          const envObj = {};
+          for (const line of newEnv.trim().split("\n")) {
+            const eq2 = line.indexOf("=");
+            if (eq2 > 0) {
+              envObj[line.slice(0, eq2).trim()] = line.slice(eq2 + 1).trim();
+            }
+          }
+          if (Object.keys(envObj).length > 0) config.env = envObj;
+        }
+        persistServers({ ...servers, [name]: config });
+        setAdding(false);
+        setNewName("");
+        setNewCommand("");
+        setNewArgs("");
+        setNewEnv("");
+      };
+      const handleToggle = (name) => {
+        const existing = servers[name];
+        if (!existing) return;
+        persistServers({
+          ...servers,
+          [name]: { ...existing, enabled: existing.enabled === false ? true : false }
+        });
+      };
+      const handleDelete = (name) => {
+        const updated = { ...servers };
+        delete updated[name];
+        persistServers(updated);
+      };
+      if (loading) {
+        return /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "text-pane-text-secondary/40 font-mono py-4", style: { fontSize: "var(--pane-font-size-xs)" }, children: "loading..." });
+      }
+      return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-3", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "p",
+          {
+            className: "text-pane-text-secondary/50 font-mono leading-relaxed",
+            style: { fontSize: "var(--pane-font-size-xs)" },
+            children: "Connect external MCP servers (Figma, GitHub, Notion, etc.). Their tools become available to the model. Changes take effect on the next message."
+          }
+        ),
+        Object.entries(servers).length > 0 && /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex flex-col gap-2", children: Object.entries(servers).map(([name, config]) => /* @__PURE__ */ jsxRuntimeExports.jsxs(
+          "div",
+          {
+            className: "flex items-center justify-between py-2 px-3 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20",
+            children: [
+              /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-0.5 min-w-0", children: [
+                /* @__PURE__ */ jsxRuntimeExports.jsx(
+                  "span",
+                  {
+                    className: "text-pane-text font-mono truncate",
+                    style: { fontSize: "var(--pane-font-size-sm)" },
+                    children: name
+                  }
+                ),
+                /* @__PURE__ */ jsxRuntimeExports.jsxs(
+                  "span",
+                  {
+                    className: "text-pane-text-secondary/40 font-mono truncate",
+                    style: { fontSize: "var(--pane-font-size-xs)" },
+                    children: [
+                      config.command,
+                      " ",
+                      (config.args || []).join(" ")
+                    ]
+                  }
+                )
+              ] }),
+              /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-3 shrink-0", children: [
+                /* @__PURE__ */ jsxRuntimeExports.jsx(
+                  "button",
+                  {
+                    onClick: () => handleToggle(name),
+                    className: `w-4 h-4 rounded-full transition-all duration-200 ${config.enabled !== false ? "bg-pane-accent ring-2 ring-pane-accent/30" : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"}`,
+                    title: config.enabled !== false ? "Enabled" : "Disabled"
+                  }
+                ),
+                /* @__PURE__ */ jsxRuntimeExports.jsx(
+                  "button",
+                  {
+                    onClick: () => handleDelete(name),
+                    className: "text-pane-text-secondary/40 hover:text-pane-error transition-colors font-mono",
+                    style: { fontSize: "var(--pane-font-size-xs)" },
+                    title: "Remove server",
+                    children: "remove"
+                  }
+                )
+              ] })
+            ]
+          },
+          name
+        )) }),
+        adding ? /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-2 py-2 px-3 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20", children: [
+          error && /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-pane-error font-mono", style: { fontSize: "var(--pane-font-size-xs)" }, children: error }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "input",
+            {
+              type: "text",
+              placeholder: "server name (e.g. figma)",
+              value: newName,
+              onChange: (e) => setNewName(e.target.value),
+              className: "w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30",
+              style: { fontSize: "var(--pane-font-size-sm)" },
+              autoFocus: true
+            }
+          ),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "input",
+            {
+              type: "text",
+              placeholder: "command (e.g. npx)",
+              value: newCommand,
+              onChange: (e) => setNewCommand(e.target.value),
+              className: "w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30",
+              style: { fontSize: "var(--pane-font-size-sm)" }
+            }
+          ),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "input",
+            {
+              type: "text",
+              placeholder: "arguments (e.g. -y figma-developer-mcp --stdio)",
+              value: newArgs,
+              onChange: (e) => setNewArgs(e.target.value),
+              className: "w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30",
+              style: { fontSize: "var(--pane-font-size-sm)" }
+            }
+          ),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "textarea",
+            {
+              placeholder: "environment variables (one per line):\nFIGMA_API_KEY=fig_...\nGITHUB_TOKEN=ghp_...",
+              value: newEnv,
+              onChange: (e) => setNewEnv(e.target.value),
+              rows: 3,
+              className: "w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30 resize-none",
+              style: { fontSize: "var(--pane-font-size-sm)" }
+            }
+          ),
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-3 pt-1", children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "button",
+              {
+                onClick: handleAdd,
+                className: "text-pane-accent font-mono hover:text-pane-accent/80 transition-colors",
+                style: { fontSize: "var(--pane-font-size-xs)" },
+                children: "add"
+              }
+            ),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "button",
+              {
+                onClick: () => {
+                  setAdding(false);
+                  setError(null);
+                },
+                className: "text-pane-text-secondary/40 font-mono hover:text-pane-text-secondary/70 transition-colors",
+                style: { fontSize: "var(--pane-font-size-xs)" },
+                children: "cancel"
+              }
+            )
+          ] })
+        ] }) : /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "button",
+          {
+            onClick: () => setAdding(true),
+            className: "text-pane-text-secondary/40 font-mono hover:text-pane-text-secondary/70 transition-colors text-left",
+            style: { fontSize: "var(--pane-font-size-xs)" },
+            children: "+ add server"
+          }
+        )
+      ] });
+    }
     const electronAPI$3 = window.electronAPI;
     function CloudSection() {
       const [user, setUser] = reactExports.useState(null);
@@ -94078,6 +94296,12 @@ ${content}
           /* @__PURE__ */ jsxRuntimeExports.jsx("path", { d: "M18 20V4" }),
           /* @__PURE__ */ jsxRuntimeExports.jsx("path", { d: "M6 20v-4" })
         ] }),
+        integrations: /* @__PURE__ */ jsxRuntimeExports.jsxs("svg", { width: "14", height: "14", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", strokeLinejoin: "round", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx("path", { d: "M4 11a9 9 0 0118 0" }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("path", { d: "M12 11V2" }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("path", { d: "M8 22h8" }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("path", { d: "M12 22v-6" })
+        ] }),
         models: /* @__PURE__ */ jsxRuntimeExports.jsx("svg", { width: "14", height: "14", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", strokeLinejoin: "round", children: /* @__PURE__ */ jsxRuntimeExports.jsx("polygon", { points: "12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" }) })
       };
       return /* @__PURE__ */ jsxRuntimeExports.jsx(
@@ -94329,6 +94553,16 @@ ${content}
                 isExpanded: expandedSection === "shortcuts",
                 onToggle: () => setExpandedSection(expandedSection === "shortcuts" ? null : "shortcuts"),
                 children: /* @__PURE__ */ jsxRuntimeExports.jsx(KeybindingsSection, {})
+              }
+            ),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              AccordionSection,
+              {
+                title: "integrations",
+                icon: icons.integrations,
+                isExpanded: expandedSection === "integrations",
+                onToggle: () => setExpandedSection(expandedSection === "integrations" ? null : "integrations"),
+                children: /* @__PURE__ */ jsxRuntimeExports.jsx(McpServersSection, {})
               }
             ),
             /* @__PURE__ */ jsxRuntimeExports.jsx(
