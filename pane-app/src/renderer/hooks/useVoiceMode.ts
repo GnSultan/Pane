@@ -75,9 +75,10 @@ const WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions";
 // STT timeout — don't hang forever on network issues
 const STT_TIMEOUT_MS = 15_000;
 
-// Silence detection
-const SILENCE_THRESHOLD = 0.02;  // audio level below this = silence
+// Silence detection — threshold is checked against RAW avg (not amplified visual level)
+const SILENCE_THRESHOLD = 0.008; // raw avg below this = silence (mic noise floor ~0.003-0.01)
 const SILENCE_DURATION_MS = 1800; // 1.8s of silence → auto-stop
+const MIN_RECORDING_MS = 800;    // don't auto-stop in first 800ms
 
 // TTS — OpenAI fallback
 const OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech";
@@ -128,6 +129,11 @@ export function useVoiceMode(): UseVoiceModeReturn {
   // Stable ref to avoid stale closure — tick() reads this instead of capturing triggerAutoStop directly
   const triggerAutoStopRef = useRef<() => void>(() => {});
 
+  // Refs for auto-reopen mic after TTS (avoids stale closures in speak callback)
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
+  const startRecordingRef = useRef<() => Promise<void>>();
+
   // Get API keys from workspace store
   const openaiKey = useWorkspaceStore((s) => s.httpApiKeys?.openai || "");
   const elevenLabsKey = useWorkspaceStore((s) => s.httpApiKeys?.elevenlabs || "");
@@ -150,40 +156,42 @@ export function useVoiceMode(): UseVoiceModeReturn {
       autoStopTriggeredRef.current = false;
 
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const recordingStartTime = Date.now();
 
       const tick = () => {
         if (!analyserRef.current) return;
 
         analyser.getByteFrequencyData(dataArray);
 
-        // RMS-ish level: average of frequency magnitudes, normalized to 0–1
+        // Raw level: average of frequency magnitudes, normalized to 0–1
         let sum = 0;
         for (let i = 0; i < dataArray.length; i++) {
           sum += dataArray[i]!;
         }
         const avg = sum / dataArray.length / 255;
-        // Apply slight curve so quiet sounds register more visibly
-        const level = Math.min(1, Math.pow(avg, 0.6) * 2.5);
 
-        setGlobalAudioLevel(level);
+        // Visual level: amplified curve for glow responsiveness
+        const visualLevel = Math.min(1, Math.pow(avg, 0.6) * 2.5);
+        setGlobalAudioLevel(visualLevel);
 
-        // ── Silence detection ────────────────────────────────────────
-        if (level < SILENCE_THRESHOLD) {
-          if (silenceStartRef.current === null) {
-            silenceStartRef.current = Date.now();
-          } else if (
-            !autoStopTriggeredRef.current &&
-            Date.now() - silenceStartRef.current > SILENCE_DURATION_MS
-          ) {
-            // Silence exceeded threshold — auto-stop
-            autoStopTriggeredRef.current = true;
-            // Trigger stop via ref to avoid stale closure
-            triggerAutoStopRef.current();
-            return; // Stop the loop
+        // ── Silence detection (uses raw avg, not amplified visual level) ──
+        // Don't auto-stop in the first 800ms — give user time to start speaking
+        const elapsed = Date.now() - recordingStartTime;
+        if (elapsed > MIN_RECORDING_MS) {
+          if (avg < SILENCE_THRESHOLD) {
+            if (silenceStartRef.current === null) {
+              silenceStartRef.current = Date.now();
+            } else if (
+              !autoStopTriggeredRef.current &&
+              Date.now() - silenceStartRef.current > SILENCE_DURATION_MS
+            ) {
+              autoStopTriggeredRef.current = true;
+              triggerAutoStopRef.current();
+              return;
+            }
+          } else {
+            silenceStartRef.current = null;
           }
-        } else {
-          // Voice detected — reset silence timer
-          silenceStartRef.current = null;
         }
 
         animFrameRef.current = requestAnimationFrame(tick);
@@ -360,6 +368,9 @@ export function useVoiceMode(): UseVoiceModeReturn {
       setState("idle");
     }
   }, [hasApiKey, setState, startAudioMonitoring]);
+
+  // Keep ref in sync for speak's onended callback
+  startRecordingRef.current = startRecording;
 
   // ── Stop recording and transcribe ────────────────────────────────────────
   const stopAndTranscribe = useCallback(async (): Promise<string | null> => {
@@ -551,6 +562,14 @@ export function useVoiceMode(): UseVoiceModeReturn {
           URL.revokeObjectURL(url);
           audioUrlRef.current = null;
           audioElementRef.current = null;
+
+          // Auto-reopen mic after TTS finishes for continuous conversation
+          // Small delay so mic doesn't pick up speaker tail / echo
+          setTimeout(() => {
+            if (enabledRef.current && mediaRecorderRef.current?.state !== "recording") {
+              startRecordingRef.current?.();
+            }
+          }, 400);
         };
 
         audio.onerror = () => {

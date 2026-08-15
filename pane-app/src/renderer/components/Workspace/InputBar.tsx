@@ -817,6 +817,32 @@ export function InputBar({
     return () => window.removeEventListener("keydown", handler);
   }, [expandedSection]);
 
+  // Cmd+Shift+Space — toggle voice recording hands-free (from anywhere)
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === "Space") {
+        if (!isConversationVisible()) return;
+        if (!voice.hasApiKey) return;
+        e.preventDefault();
+        if (voice.state === "recording") {
+          // Stop and send — same as pressing the stop button
+          voice.stopAndTranscribe().then((text) => {
+            if (text) {
+              onSend(buildPrompt(text), undefined, currentPhase);
+            }
+          });
+        } else if (voice.state === "speaking") {
+          voice.stopSpeaking();
+        } else if (voice.state === "idle") {
+          if (!voice.enabled) voice.toggleEnabled();
+          voice.startRecording();
+        }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [voice, onSend, currentPhase, isConversationVisible, buildPrompt]);
+
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
     const pos = e.target.selectionStart ?? next.length;
