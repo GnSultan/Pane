@@ -75,10 +75,14 @@ const WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions";
 // STT timeout — don't hang forever on network issues
 const STT_TIMEOUT_MS = 15_000;
 
-// Silence detection — threshold is checked against RAW avg (not amplified visual level)
-const SILENCE_THRESHOLD = 0.008; // raw avg below this = silence (mic noise floor ~0.003-0.01)
+// Silence detection — adaptive, calibrated to the mic's actual noise floor.
+// Fixed thresholds don't work: getByteFrequencyData is dB-mapped, so every
+// mic/hardware produces a different "silent" baseline.
 const SILENCE_DURATION_MS = 1800; // 1.8s of silence → auto-stop
-const MIN_RECORDING_MS = 800;    // don't auto-stop in first 800ms
+const MIN_RECORDING_MS = 800;     // don't auto-stop in first 800ms
+const MIN_FLOOR = 0.01;           // clamp so dead-silent mics don't break detection
+const SPEECH_RATIO = 2.5;         // avg above floor×2.5 = voice
+const SILENCE_RATIO = 2.0;        // avg below floor×2.0 = silence
 
 // TTS — OpenAI fallback
 const OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech";
@@ -158,6 +162,11 @@ export function useVoiceMode(): UseVoiceModeReturn {
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       const recordingStartTime = Date.now();
 
+      // Adaptive noise floor: running minimum of the raw avg. Only ever
+      // decreases within a recording, so speaking at the start can't poison
+      // it — dips between words pull it toward the true floor immediately.
+      let noiseFloor = 1;
+
       const tick = () => {
         if (!analyserRef.current) return;
 
@@ -174,25 +183,36 @@ export function useVoiceMode(): UseVoiceModeReturn {
         const visualLevel = Math.min(1, Math.pow(avg, 0.6) * 2.5);
         setGlobalAudioLevel(visualLevel);
 
-        // ── Silence detection (uses raw avg, not amplified visual level) ──
-        // Don't auto-stop in the first 800ms — give user time to start speaking
+        // ── Adaptive silence detection ──
+        // Noise floor = running minimum of raw avg within this recording.
+        // Only decreases, so speaking at the start can't poison it — dips
+        // between words pull it toward the true floor immediately.
         const elapsed = Date.now() - recordingStartTime;
-        if (elapsed > MIN_RECORDING_MS) {
-          if (avg < SILENCE_THRESHOLD) {
-            if (silenceStartRef.current === null) {
-              silenceStartRef.current = Date.now();
-            } else if (
-              !autoStopTriggeredRef.current &&
-              Date.now() - silenceStartRef.current > SILENCE_DURATION_MS
-            ) {
-              autoStopTriggeredRef.current = true;
-              triggerAutoStopRef.current();
-              return;
-            }
-          } else {
-            silenceStartRef.current = null;
+        if (avg < noiseFloor) {
+          // Adopt quieter level, but at most 3% per frame — one glitchy
+          // frame can't collapse the floor.
+          noiseFloor = Math.max(avg, noiseFloor * 0.97);
+        }
+        const floor = Math.max(noiseFloor, MIN_FLOOR);
+
+        if (avg > floor * SPEECH_RATIO) {
+          // Voice detected — reset silence timer
+          silenceStartRef.current = null;
+        } else if (avg < floor * SILENCE_RATIO) {
+          if (silenceStartRef.current === null) {
+            silenceStartRef.current = Date.now();
+          } else if (
+            elapsed > MIN_RECORDING_MS &&
+            !autoStopTriggeredRef.current &&
+            Date.now() - silenceStartRef.current > SILENCE_DURATION_MS
+          ) {
+            autoStopTriggeredRef.current = true;
+            triggerAutoStopRef.current();
+            return;
           }
         }
+        // Between SILENCE_RATIO and SPEECH_RATIO = hysteresis band:
+        // borderline noise neither resets nor advances the silence timer.
 
         animFrameRef.current = requestAnimationFrame(tick);
       };
