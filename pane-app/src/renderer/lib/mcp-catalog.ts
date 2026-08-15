@@ -12,8 +12,19 @@
 
 /** A single required input for a catalog server (usually an API key or path). */
 export interface CatalogInput {
-  /** Env var name that the server reads (e.g. "GITHUB_PERSONAL_ACCESS_TOKEN"). */
+  /**
+   * Env var name that the server reads (e.g. "GITHUB_PERSONAL_ACCESS_TOKEN").
+   *
+   * Two special values route the input somewhere other than process env:
+   * - "_PATH_ARG": appended as a trailing positional CLI argument.
+   * - "_HEADER_ARG": passed as a `--header` CLI argument (for mcp-remote),
+   *   formatted via `headerTemplate` with "{value}" as the user's input.
+   *   Use this for remote servers that accept static Bearer tokens — it
+   *   bypasses the OAuth browser flow entirely.
+   */
   envKey: string;
+  /** Template for _HEADER_ARG inputs, e.g. "Authorization: Bearer {value}". */
+  headerTemplate?: string;
   /** Human label for the form field (e.g. "GitHub Personal Access Token"). */
   label: string;
   /** Brief hint text shown as placeholder. */
@@ -270,12 +281,17 @@ export const MCP_CATALOG: CatalogServer[] = [
     description: "Manage Vercel projects, deployments, and environment variables.",
     category: "code",
     command: "npx",
+    // mcp-remote is an OAuth bridge but Vercel's MCP server accepts a personal
+    // access token directly as a Bearer header — with it, no browser OAuth at
+    // all (Vercel's OAuth grants 1h tokens with NO refresh_token, so the env
+    // variant forced a browser re-auth on every launch).
     args: ["-y", "mcp-remote", "https://mcp.vercel.com"],
     inputs: [
       {
-        envKey: "VERCEL_TOKEN",
+        envKey: "_HEADER_ARG",
+        headerTemplate: "Authorization: Bearer {value}",
         label: "Vercel Access Token",
-        placeholder: "vrt_xxxxxxxx",
+        placeholder: "vcp_xxxxxxxx",
         obtainUrl: "https://vercel.com/account/tokens",
         obtainLabel: "Create a token →",
         secret: true,

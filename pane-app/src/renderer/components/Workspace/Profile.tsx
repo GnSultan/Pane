@@ -1676,6 +1676,15 @@ function buildCatalogConfig(
     if (input.envKey === "_PATH_ARG") {
       // Path/connection-string servers: append as trailing positional argument
       finalArgs.push(val);
+    } else if (input.envKey === "_HEADER_ARG") {
+      // mcp-remote servers with static auth: pass as --header argument.
+      // Static Authorization headers bypass the OAuth browser flow entirely.
+      finalArgs.push("--header");
+      finalArgs.push(
+        input.headerTemplate
+          ? input.headerTemplate.replace("{value}", val)
+          : val,
+      );
     } else {
       env[input.envKey] = val;
     }
