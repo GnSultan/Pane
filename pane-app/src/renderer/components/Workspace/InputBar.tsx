@@ -669,6 +669,18 @@ export function InputBar({
     return () => window.removeEventListener("pane:prefill-prompt", handler);
   }, []);
 
+  // Voice auto-stop: silence detection auto-transcribes and fires this event
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const text = (e as CustomEvent).detail?.text;
+      if (text) {
+        onSend(buildPrompt(text), undefined, currentPhase);
+      }
+    };
+    window.addEventListener("voice-auto-transcribed", handler);
+    return () => window.removeEventListener("voice-auto-transcribed", handler);
+  }, [onSend, currentPhase]);
+
 
   // No directive prepending needed — phase is passed as a separate field.
   const buildPrompt = useCallback((trimmed: string) => trimmed, []);
