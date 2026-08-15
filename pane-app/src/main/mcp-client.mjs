@@ -41,9 +41,11 @@ const SETTINGS_PATH = path.join(PANE_DIR, "settings.json");
 const EXT_PREFIX = "ext__";
 
 /** Timeout for server initialization handshake.
- *  30s because npx package resolution + node boot + MCP init can take 15-20s
- *  on first spawn in Electron's minimal PATH environment. */
-const INIT_TIMEOUT_MS = 30_000;
+ *  75s because package resolution can be slow: npx needs 15-30s, and uvx
+ *  (python) downloads the package + builds a venv on first run — observed
+ *  60-90s for workspace-mcp. Preconnect happens at app launch in the
+ *  background, so a long timeout costs nothing when the cache is warm. */
+const INIT_TIMEOUT_MS = 75_000;
 
 /** Timeout for a single tool call to an external server. */
 const CALL_TIMEOUT_MS = 30_000;
@@ -62,6 +64,11 @@ function getEnvWithPath() {
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/Library/Frameworks/Python.framework/Versions/3.13/bin",
+    // uv/uvx installed via pip (python3 -m pip install uv) lands here —
+    // this location is on NO default PATH: not Electron's, not even zsh's.
+    "/usr/local/lib/python3.13/site-packages/bin",
+    "/usr/local/lib/python3.12/site-packages/bin",
+    "/usr/local/lib/python3.11/site-packages/bin",
   ];
   const combined = [...extra, ...existing.split(":")].filter(Boolean).join(":");
   return { ...process.env, PATH: combined };

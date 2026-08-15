@@ -100,17 +100,6 @@ export const MCP_CATALOG: CatalogServer[] = [
     official: true,
   },
   {
-    id: "memory",
-    name: "Memory",
-    description:
-      "Knowledge-graph-based persistent memory across conversations.",
-    category: "reasoning",
-    command: "npx",
-    args: ["-y", "@modelcontextprotocol/server-memory"],
-    inputs: [],
-    official: true,
-  },
-  {
     id: "git",
     name: "Git",
     description:
@@ -217,6 +206,33 @@ export const MCP_CATALOG: CatalogServer[] = [
         label: "Connection string",
         placeholder: "postgresql://user:pass@localhost:5432/mydb",
         secret: false,
+      },
+    ],
+  },
+  {
+    id: "gmail",
+    name: "Gmail",
+    description:
+      "Read, search, send, and label email via the Google Workspace MCP (workspace-mcp).",
+    category: "productivity",
+    command: "uvx",
+    args: ["workspace-mcp", "--tools", "gmail"],
+    inputs: [
+      {
+        envKey: "GOOGLE_OAUTH_CLIENT_ID",
+        label: "Google OAuth Client ID",
+        placeholder: "1234567890-abc123.apps.googleusercontent.com",
+        obtainUrl: "https://console.cloud.google.com/apis/credentials",
+        obtainLabel: "Create OAuth credentials →",
+        secret: false,
+      },
+      {
+        envKey: "GOOGLE_OAUTH_CLIENT_SECRET",
+        label: "Google OAuth Client Secret",
+        placeholder: "GOCSPX-xxxxxxxxxxxxxxxx",
+        obtainUrl: "https://console.cloud.google.com/apis/credentials",
+        obtainLabel: "Create OAuth credentials →",
+        secret: true,
       },
     ],
   },
