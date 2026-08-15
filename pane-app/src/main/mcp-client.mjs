@@ -40,14 +40,32 @@ const SETTINGS_PATH = path.join(PANE_DIR, "settings.json");
 /** Namespace prefix for external tools — prevents collisions with built-ins. */
 const EXT_PREFIX = "ext__";
 
-/** Timeout for server initialization handshake. */
-const INIT_TIMEOUT_MS = 15_000;
+/** Timeout for server initialization handshake.
+ *  30s because npx package resolution + node boot + MCP init can take 15-20s
+ *  on first spawn in Electron's minimal PATH environment. */
+const INIT_TIMEOUT_MS = 30_000;
 
 /** Timeout for a single tool call to an external server. */
 const CALL_TIMEOUT_MS = 30_000;
 
 /** Timeout for tool list discovery. */
-const LIST_TIMEOUT_MS = 10_000;
+const LIST_TIMEOUT_MS = 15_000;
+
+/**
+ * Extend PATH with common binary locations.
+ * Electron launched from Finder/Dock gets a minimal PATH (/usr/bin:/bin:...)
+ * that misses npx (node), uvx (python), and homebrew tools.
+ */
+function getEnvWithPath() {
+  const existing = process.env.PATH || "";
+  const extra = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/Library/Frameworks/Python.framework/Versions/3.13/bin",
+  ];
+  const combined = [...extra, ...existing.split(":")].filter(Boolean).join(":");
+  return { ...process.env, PATH: combined };
+}
 
 // ─── Types (JSDoc) ─────────────────────────────────────────────────────────
 
@@ -147,7 +165,7 @@ class McpClientManager {
 
     const proc = spawn(cfg.command, cfg.args || [], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...(cfg.env || {}) },
+      env: { ...getEnvWithPath(), ...(cfg.env || {}) },
       cwd: PANE_DIR,
     });
 
@@ -247,6 +265,44 @@ class McpClientManager {
         toConnect.map((n) => this.connect(n, config[n]))
       );
     }
+
+    // Retry failed servers once — npx cold starts can time out on first attempt
+    // but succeed on retry (package is now cached).
+    const stillDisconnected = enabled.filter(
+      (n) => !this.connections.has(n),
+    );
+    if (stillDisconnected.length > 0) {
+      console.log(
+        `[mcp-client] Retrying ${stillDisconnected.length} failed server(s): ${stillDisconnected.join(", ")}`,
+      );
+      await Promise.allSettled(
+        stillDisconnected.map((n) => this.connect(n, config[n])),
+      );
+    }
+  }
+
+  /**
+   * Start connecting servers in the background without awaiting.
+   * Called on app startup so servers are ready by the first model turn.
+   * Non-blocking — failures are logged but don't affect the caller.
+   */
+  preconnect() {
+    this._ensureConnectedAsync().catch((err) => {
+      console.warn(`[mcp-client] Preconnect failed: ${err.message}`);
+    });
+  }
+
+  /** @private Internal async wrapper for preconnect */
+  async _ensureConnectedAsync() {
+    await this.ensureConnected();
+    const connected = [...this.connections.keys()];
+    const config = this._loadConfig();
+    const enabled = this._getEnabledServers();
+    const failed = enabled.filter((n) => !this.connections.has(n));
+    console.log(
+      `[mcp-client] Preconnect complete: ${connected.length}/${enabled.length} connected` +
+        (failed.length ? `, failed: ${failed.join(", ")}` : ""),
+    );
   }
 
   /**

@@ -2490,6 +2490,33 @@ export class ApiBackend extends PunkBackend {
         console.warn(`[http] MCP client connection failed (non-blocking): ${err.message}`);
       }
 
+      // ── Build MCP awareness text for the system prompt ──
+      // The model receives external tools in its tools[] array, but without
+      // prompt-level awareness it doesn't know they exist or what they do.
+      // The namespaced names (ext__server__toolname) are opaque otherwise.
+      const mcpStatus = mcpClient.getStatus();
+      const connectedServers = mcpStatus.filter(
+        (s) => s.status === "connected" && s.toolCount > 0,
+      );
+      let _mcpAwareness = "";
+      if (connectedServers.length > 0) {
+        const lines = connectedServers.map((s) => {
+          const tools = mcpClient.getExternalTools()
+            .filter(
+              (t) => t.function.name.startsWith(`ext__${s.name}__`),
+            )
+            .map(
+              (t) =>
+                `  - ${t.function.name}: ${t.function.description?.slice(0, 120) || "External tool"}`,
+            );
+          return `${s.name} (${s.toolCount} tools):\n${tools.join("\n")}`;
+        });
+        _mcpAwareness =
+          "You have access to external integrations via MCP servers. " +
+          "These are real tools connected to external services — use them directly when the user asks about those services:\n\n" +
+          lines.join("\n\n");
+      }
+
       const gitStatus = await this.getGitStatus(request.workingDir);
 
       const historyLength = request.history ? request.history.length : 0;
@@ -2686,6 +2713,17 @@ export class ApiBackend extends PunkBackend {
           }
         } catch (err) {
           console.warn(`[http] semantic pool injection failed: ${err.message}`);
+        }
+      }
+
+      // ── Inject MCP external tool awareness into turn tier ──
+      // External MCP tools (ext__server__toolname) are in the tools[] array,
+      // but without prompt-level context the model doesn't know they exist.
+      // This goes in the turn tier — connections can change between turns.
+      if (_mcpAwareness) {
+        systemPrompt += "\n\n" + _mcpAwareness;
+        if (systemTiers) {
+          systemTiers.turn = (systemTiers.turn || "") + "\n\n" + _mcpAwareness;
         }
       }
 
@@ -4922,16 +4960,14 @@ export class ApiBackend extends PunkBackend {
             }
           }
 
-          // Window management — V4-direct when turn selection is available
-          // Only for explicit-caching providers (Anthropic). Auto-caching
-          // providers skip body-level pruning to keep the cache prefix stable.
-          // Offloaded to a Worker thread to avoid freezing the main process.
-          if (turnSelection && PROVIDERS_WITH_EXPLICIT_CACHE.has(request.provider)) {
-            const compResult = await compactMessages("applyV4TurnSelection", {
-              messages, turnSelection, projectId: request.projectId,
-            });
-            messages = compResult.messages;
-          }
+          // NOTE: We intentionally do NOT call applyV4TurnSelection here.
+          // Context was already managed once at turn start (before the tool loop).
+          // Calling it again with the same turnSelection would cause turn index
+          // mismatches: detectTurns() re-runs on the updated messages array
+          // (which now includes newly appended tool results), so the same
+          // droppedTurnIndices now point to different turns than intended —
+          // potentially the live current turn, orphaning its tool_use blocks
+          // and producing HTTP 400 "tool_use ids without tool_result" errors.
         } catch (turnError) {
           // Per-turn error handling — retry recoverable errors inside the loop
           if (turnError.name === "AbortError") throw turnError; // propagate to outer

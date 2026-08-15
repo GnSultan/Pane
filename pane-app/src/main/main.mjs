@@ -2560,6 +2560,15 @@ app.whenReady().then(async () => {
   getBrainWorker(); // SQLite + embedding model (loads lazily on first embed)
   getCmdWorker();   // isolated libuv loop for command execution
 
+  // Preconnect MCP servers — npx cold starts take 15-30s. Starting
+  // at app launch means they're ready by the first model turn.
+  try {
+    const { mcpClient } = await import("./mcp-client.mjs");
+    mcpClient.preconnect();
+  } catch (err) {
+    console.warn("[startup] MCP preconnect skipped:", err.message);
+  }
+
   // Wire brain contextual search into punk-engine so it fires every turn.
   // This is the critical link: brain searches the knowledge graph for query-
   // relevant context and writes it to disk BEFORE compileContext() reads it.

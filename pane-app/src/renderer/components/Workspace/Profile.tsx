@@ -29,7 +29,14 @@ import {
   type CloudStatus,
   type ClaudeAuthState,
   type McpServerConfig,
+  type UserSettings,
 } from "../../lib/tauri-commands";
+import {
+  MCP_CATALOG,
+  CATEGORY_LABELS,
+  CATEGORY_ORDER,
+  type CatalogServer,
+} from "../../lib/mcp-catalog";
 import {
   ACTION_DEFINITIONS,
   DEFAULT_BINDINGS,
@@ -1032,9 +1039,12 @@ function ZaiPlanTierSelector() {
   const [tier, setTier] = useState<string>("");
 
   useEffect(() => {
-    window.electronAPI?.invoke("read-settings").then((s: Record<string, unknown> | null) => {
-      setTier((s?.zai_plan_tier as string) || "");
-    }).catch(() => {});
+    window.electronAPI?.invoke("read-settings")
+      .then((s: unknown) => {
+        const settings = (s && typeof s === "object" ? s : null) as Record<string, unknown> | null;
+        setTier((settings?.zai_plan_tier as string) || "");
+      })
+      .catch(() => {});
   }, []);
 
   const handleChange = (newTier: string) => {
@@ -1648,20 +1658,55 @@ function CuratedModelsSection() {
 
 // ─── MCP Servers Section ──────────────────────────────────────────────────────
 
+/** View mode for the add-server flow. */
+type McpAddMode = "idle" | "catalog" | "manual";
+
+/** Builds a McpServerConfig from a catalog entry + user inputs. */
+function buildCatalogConfig(
+  entry: CatalogServer,
+  inputValues: Record<string, string>,
+): McpServerConfig {
+  const env: Record<string, string> = { ...(entry.fixedEnv || {}) };
+  const finalArgs = [...entry.args];
+
+  for (const input of entry.inputs) {
+    const val = inputValues[input.envKey]?.trim();
+    if (!val) continue;
+
+    if (input.envKey === "_PATH_ARG") {
+      // Path/connection-string servers: append as trailing positional argument
+      finalArgs.push(val);
+    } else {
+      env[input.envKey] = val;
+    }
+  }
+
+  const config: McpServerConfig = {
+    command: entry.command,
+    args: finalArgs,
+    enabled: true,
+  };
+  if (Object.keys(env).length > 0) config.env = env;
+  return config;
+}
+
 function McpServersSection() {
   const [servers, setServers] = useState<Record<string, McpServerConfig>>({});
   const [loading, setLoading] = useState(true);
-  const [adding, setAdding] = useState(false);
+  const [addMode, setAddMode] = useState<McpAddMode>("idle");
+  const [installing, setInstalling] = useState<CatalogServer | null>(null);
+  const [installInputs, setInstallInputs] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  // Manual entry state
   const [newName, setNewName] = useState("");
   const [newCommand, setNewCommand] = useState("");
   const [newArgs, setNewArgs] = useState("");
   const [newEnv, setNewEnv] = useState("");
-  const [error, setError] = useState<string | null>(null);
 
-  // Load MCP server configs from settings
   useEffect(() => {
     loadSettings()
-      .then((s) => {
+      .then((s: UserSettings) => {
         setServers(s.mcp_servers || {});
         setLoading(false);
       })
@@ -1674,46 +1719,6 @@ function McpServersSection() {
       console.error("[mcp] Failed to save server config:", err);
     });
   }, []);
-
-  const handleAdd = () => {
-    setError(null);
-    const name = newName.trim();
-    if (!name) { setError("Server name is required."); return; }
-    if (!newCommand.trim()) { setError("Command is required."); return; }
-    if (servers[name]) { setError(`A server named "${name}" already exists.`); return; }
-
-    /** @type {McpServerConfig} */
-    const config: McpServerConfig = {
-      command: newCommand.trim(),
-      enabled: true,
-    };
-
-    // Parse args — whitespace-separated, respecting quotes
-    const parsedArgs = newArgs.trim().match(/(?:[^\s"]+|"[^"]*")+/g);
-    if (parsedArgs) {
-      config.args = parsedArgs.map((a) => a.replace(/^"|"$/g, ""));
-    }
-
-    // Parse env — KEY=value per line
-    if (newEnv.trim()) {
-      /** @type {Record<string, string>} */
-      const envObj: Record<string, string> = {};
-      for (const line of newEnv.trim().split("\n")) {
-        const eq = line.indexOf("=");
-        if (eq > 0) {
-          envObj[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
-        }
-      }
-      if (Object.keys(envObj).length > 0) config.env = envObj;
-    }
-
-    persistServers({ ...servers, [name]: config });
-    setAdding(false);
-    setNewName("");
-    setNewCommand("");
-    setNewArgs("");
-    setNewEnv("");
-  };
 
   const handleToggle = (name: string) => {
     const existing = servers[name];
@@ -1728,6 +1733,82 @@ function McpServersSection() {
     const updated = { ...servers };
     delete updated[name];
     persistServers(updated);
+  };
+
+  // ── Catalog install ──────────────────────────────────────────────────
+
+  const startInstall = (entry: CatalogServer) => {
+    setError(null);
+    setInstalling(entry);
+    setInstallInputs({});
+    // If the server has no required inputs, install immediately
+    if (entry.inputs.length === 0) {
+      confirmInstall(entry, {});
+    }
+  };
+
+  const confirmInstall = (
+    entry: CatalogServer,
+    inputs: Record<string, string>,
+  ) => {
+    setError(null);
+    // Check required inputs
+    for (const input of entry.inputs) {
+      if (!inputs[input.envKey]?.trim()) {
+        setError(`${input.label} is required.`);
+        return;
+      }
+    }
+
+    // Use catalog id as server name, suffix if collision
+    let name = entry.id;
+    let suffix = 1;
+    while (servers[name]) {
+      name = `${entry.id}-${++suffix}`;
+    }
+
+    const config = buildCatalogConfig(entry, inputs);
+    persistServers({ ...servers, [name]: config });
+    setInstalling(null);
+    setInstallInputs({});
+  };
+
+  // ── Manual add ───────────────────────────────────────────────────────
+
+  const handleManualAdd = () => {
+    setError(null);
+    const name = newName.trim();
+    if (!name) { setError("Server name is required."); return; }
+    if (!newCommand.trim()) { setError("Command is required."); return; }
+    if (servers[name]) { setError(`A server named "${name}" already exists.`); return; }
+
+    const config: McpServerConfig = {
+      command: newCommand.trim(),
+      enabled: true,
+    };
+
+    const parsedArgs = newArgs.trim().match(/(?:[^\s"]+|"[^"]*")+/g);
+    if (parsedArgs) {
+      config.args = parsedArgs.map((a: string) => a.replace(/^"|"$/g, ""));
+    }
+
+    if (newEnv.trim()) {
+      const envObj: Record<string, string> = {};
+      for (const line of newEnv.trim().split("\n")) {
+        const eq = line.indexOf("=");
+        if (eq > 0) {
+          envObj[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+        }
+      }
+      if (Object.keys(envObj).length > 0) config.env = envObj;
+    }
+
+    persistServers({ ...servers, [name]: config });
+    setAddMode("idle");
+    setNewName("");
+    setNewCommand("");
+    setNewArgs("");
+    setNewEnv("");
   };
 
   if (loading) {
@@ -1750,51 +1831,196 @@ function McpServersSection() {
       {/* Existing servers */}
       {Object.entries(servers).length > 0 && (
         <div className="flex flex-col gap-2">
-          {Object.entries(servers).map(([name, config]) => (
-            <div
-              key={name}
-              className="flex items-center justify-between py-2 px-3 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20"
-            >
-              <div className="flex flex-col gap-0.5 min-w-0">
-                <span
-                  className="text-pane-text font-mono truncate"
-                  style={{ fontSize: "var(--pane-font-size-sm)" }}
-                >
-                  {name}
-                </span>
-                <span
-                  className="text-pane-text-secondary/40 font-mono truncate"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                >
-                  {config.command} {(config.args || []).join(" ")}
-                </span>
+          {Object.entries(servers).map(([name, config]) => {
+            return (
+              <div
+                key={name}
+                className="flex items-center justify-between py-2 px-3 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20"
+              >
+                <div className="flex flex-col gap-0.5 min-w-0">
+                  <span
+                    className="text-pane-text font-mono truncate"
+                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                  >
+                    {name}
+                  </span>
+                  <span
+                    className="text-pane-text-secondary/40 font-mono truncate"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {config.command} {(config.args || []).join(" ")}
+                  </span>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => handleToggle(name)}
+                    className={`w-4 h-4 rounded-full transition-all duration-200 ${
+                      config.enabled !== false
+                        ? "bg-pane-accent ring-2 ring-pane-accent/30"
+                        : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"
+                    }`}
+                    title={config.enabled !== false ? "Enabled" : "Disabled"}
+                  />
+                  <button
+                    onClick={() => handleDelete(name)}
+                    className="text-pane-text-secondary/40 hover:text-pane-error transition-colors font-mono"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    title="Remove server"
+                  >
+                    remove
+                  </button>
+                </div>
               </div>
-              <div className="flex items-center gap-3 shrink-0">
-                <button
-                  onClick={() => handleToggle(name)}
-                  className={`w-4 h-4 rounded-full transition-all duration-200 ${
-                    config.enabled !== false
-                      ? "bg-pane-accent ring-2 ring-pane-accent/30"
-                      : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"
-                  }`}
-                  title={config.enabled !== false ? "Enabled" : "Disabled"}
-                />
-                <button
-                  onClick={() => handleDelete(name)}
-                  className="text-pane-text-secondary/40 hover:text-pane-error transition-colors font-mono"
-                  style={{ fontSize: "var(--pane-font-size-xs)" }}
-                  title="Remove server"
-                >
-                  remove
-                </button>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
-      {/* Add new server form */}
-      {adding ? (
+      {/* Install flow: catalog browser or credential form */}
+      {installing ? (
+        <div className="flex flex-col gap-3 py-3 px-4 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20">
+          <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-0.5">
+              <span
+                className="text-pane-text font-mono"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+              >
+                {installing.name}
+              </span>
+              <span
+                className="text-pane-text-secondary/40 font-mono"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                {installing.description}
+              </span>
+            </div>
+            <button
+              onClick={() => { setInstalling(null); setError(null); }}
+              className="text-pane-text-secondary/40 hover:text-pane-text-secondary/70 transition-colors font-mono"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              cancel
+            </button>
+          </div>
+
+          {error && (
+            <span className="text-pane-error font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              {error}
+            </span>
+          )}
+
+          {installing.inputs.length > 0 && (
+            <div className="flex flex-col gap-3">
+              {installing.inputs.map((input) => (
+                <div key={input.envKey} className="flex flex-col gap-1">
+                  <label
+                    className="text-pane-text-secondary/60 font-mono"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {input.label}
+                  </label>
+                  <input
+                    type={input.secret !== false ? "password" : "text"}
+                    placeholder={input.placeholder}
+                    value={installInputs[input.envKey] || ""}
+                    onChange={(e) =>
+                      setInstallInputs((prev) => ({ ...prev, [input.envKey]: e.target.value }))
+                    }
+                    className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30 border-b border-pane-border/30 focus:border-pane-accent/50 transition-colors pb-1"
+                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                    autoFocus={installing.inputs[0]?.envKey === input.envKey}
+                  />
+                  {input.obtainUrl && (
+                    <a
+                      href={input.obtainUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-pane-accent/70 hover:text-pane-accent font-mono transition-colors"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {input.obtainLabel || "Get key →"}
+                    </a>
+                  )}
+                </div>
+              ))}
+              <button
+                onClick={() => confirmInstall(installing, installInputs)}
+                className="text-pane-accent font-mono hover:text-pane-accent/80 transition-colors text-left"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                install
+              </button>
+            </div>
+          )}
+        </div>
+      ) : addMode === "catalog" ? (
+        <div className="flex flex-col gap-3 py-2">
+          {/* Catalog browser */}
+          {CATEGORY_ORDER.map((cat) => {
+            const entries = MCP_CATALOG.filter((e) => e.category === cat);
+            if (entries.length === 0) return null;
+            return (
+              <div key={cat} className="flex flex-col gap-1.5">
+                <span
+                  className="text-pane-text-secondary/30 font-mono uppercase tracking-wider"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  {CATEGORY_LABELS[cat]}
+                </span>
+                {entries.map((entry) => {
+                  const alreadyInstalled = entry.id in servers;
+                  return (
+                    <button
+                      key={entry.id}
+                      onClick={() => startInstall(entry)}
+                      disabled={alreadyInstalled}
+                      className="flex items-start gap-2.5 py-2 px-3 rounded-md text-left transition-all duration-150 group disabled:opacity-30 disabled:cursor-not-allowed hover:bg-pane-text/[0.04] ring-1 ring-pane-border/10 hover:ring-pane-border/30"
+                    >
+                      <div className="flex flex-col gap-0.5 min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className="text-pane-text font-mono"
+                            style={{ fontSize: "var(--pane-font-size-sm)" }}
+                          >
+                            {entry.name}
+                          </span>
+                          {entry.official && (
+                            <span
+                              className="text-pane-accent/40 font-mono"
+                              style={{ fontSize: "9px" }}
+                            >
+                              official
+                            </span>
+                          )}
+                        </div>
+                        <span
+                          className="text-pane-text-secondary/40 font-mono leading-snug"
+                          style={{ fontSize: "var(--pane-font-size-xs)" }}
+                        >
+                          {entry.description}
+                        </span>
+                      </div>
+                      <span
+                        className="text-pane-text-secondary/30 group-hover:text-pane-accent font-mono shrink-0 mt-0.5"
+                        style={{ fontSize: "var(--pane-font-size-xs)" }}
+                      >
+                        {alreadyInstalled ? "✓" : "+"}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            );
+          })}
+          <button
+            onClick={() => setAddMode("idle")}
+            className="text-pane-text-secondary/40 font-mono hover:text-pane-text-secondary/70 transition-colors text-left pt-1"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            close
+          </button>
+        </div>
+      ) : addMode === "manual" ? (
         <div className="flex flex-col gap-2 py-2 px-3 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20">
           {error && (
             <span className="text-pane-error font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
@@ -1836,14 +2062,14 @@ function McpServersSection() {
           />
           <div className="flex items-center gap-3 pt-1">
             <button
-              onClick={handleAdd}
+              onClick={handleManualAdd}
               className="text-pane-accent font-mono hover:text-pane-accent/80 transition-colors"
               style={{ fontSize: "var(--pane-font-size-xs)" }}
             >
               add
             </button>
             <button
-              onClick={() => { setAdding(false); setError(null); }}
+              onClick={() => { setAddMode("idle"); setError(null); }}
               className="text-pane-text-secondary/40 font-mono hover:text-pane-text-secondary/70 transition-colors"
               style={{ fontSize: "var(--pane-font-size-xs)" }}
             >
@@ -1852,13 +2078,22 @@ function McpServersSection() {
           </div>
         </div>
       ) : (
-        <button
-          onClick={() => setAdding(true)}
-          className="text-pane-text-secondary/40 font-mono hover:text-pane-text-secondary/70 transition-colors text-left"
-          style={{ fontSize: "var(--pane-font-size-xs)" }}
-        >
-          + add server
-        </button>
+        <div className="flex flex-col gap-1.5">
+          <button
+            onClick={() => setAddMode("catalog")}
+            className="text-pane-text-secondary/50 hover:text-pane-accent font-mono transition-colors text-left flex items-center gap-2"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            + browse servers
+          </button>
+          <button
+            onClick={() => setAddMode("manual")}
+            className="text-pane-text-secondary/30 hover:text-pane-text-secondary/60 font-mono transition-colors text-left"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            + add custom server
+          </button>
+        </div>
       )}
     </div>
   );

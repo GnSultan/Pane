@@ -72,16 +72,71 @@ function useOpenFile(
   }, [activeProjectId, openFile, name, input, result]);
 }
 
-// Parse MCP tool names: "mcp__server-name__tool_name" → { server, tool }
+// Parse MCP tool names — handles both "ext__server__tool" (Pane's MCP client)
+// and legacy "mcp__server__tool" formats.
 function parseMcpName(name: string): { server: string; tool: string } | null {
-  if (!name.startsWith("mcp__")) return null;
-  const parts = name.slice(5).split("__");
-  if (parts.length < 2) return null;
-  const server = parts[0]!.replace(/-/g, " ");
-  let tool = parts.slice(1).join(" ").replace(/_/g, " ");
-  // Strip redundant server prefix: "pane pane recall" → "pane recall"
-  if (tool.startsWith(server + " ")) tool = tool.slice(server.length + 1);
-  return { server, tool };
+  // Pane's MCP client uses ext__ prefix: ext__notion__API-post-search
+  if (name.startsWith("ext__")) {
+    const rest = name.slice(5);
+    const sepIdx = rest.indexOf("__");
+    if (sepIdx === -1) return null;
+    return {
+      server: rest.slice(0, sepIdx),
+      tool: rest.slice(sepIdx + 2),
+    };
+  }
+  // Legacy mcp__ prefix: mcp__server-name__tool_name
+  if (name.startsWith("mcp__")) {
+    const parts = name.slice(5).split("__");
+    if (parts.length < 2) return null;
+    const server = parts[0]!.replace(/-/g, " ");
+    let tool = parts.slice(1).join(" ").replace(/_/g, " ");
+    if (tool.startsWith(server + " ")) tool = tool.slice(server.length + 1);
+    return { server, tool };
+  }
+  return null;
+}
+
+/** Humanize a raw MCP tool name for display: "API-post-search" → "search", "get_figma_data" → "get figma data" */
+function humanizeMcpToolName(tool: string): string {
+  // Strip Notion's API- prefix
+  let t = tool.replace(/^API-/i, "");
+  // Drop leading HTTP verb: "post-search" → "search", "get-user" → "user"
+  t = t.replace(/^(post|get|put|patch|delete|retrieve|create|update|list|move|append|query)-/i, "");
+  // Convert separators to spaces
+  t = t.replace(/[-_]/g, " ");
+  // Split camelCase: "sequentialthinking" stays, but "getPageMarkdown" → "get page markdown"
+  t = t.replace(/([a-z])([A-Z])/g, "$1 $2");
+  return t.toLowerCase().trim();
+}
+
+/** Extract the most meaningful parameter from MCP tool input for the summary line */
+function summarizeMcpTool(tool: string, input: Record<string, unknown>): string {
+  const humanTool = humanizeMcpToolName(tool);
+
+  // Priority list — first non-empty match wins
+  const paramPriority = [
+    "query", "q", "search",
+    "url",
+    "path", "filePath", "file_path",
+    "fileKey", "file_key",
+    "page_id", "block_id", "database_id", "data_source_id",
+    "libraryId", "library_id", "libraryName", "library_name",
+    "domain", "name", "command", "pattern",
+    "projectId", "project_id", "teamId", "team_id",
+    "content",
+  ];
+
+  for (const key of paramPriority) {
+    const val = input[key];
+    if (val !== null && val !== undefined && val !== "") {
+      const strVal = typeof val === "string" ? val : JSON.stringify(val);
+      const truncated = strVal.length > 50 ? strVal.slice(0, 50) + "…" : strVal;
+      return `${humanTool}: ${truncated}`;
+    }
+  }
+
+  return humanTool;
 }
 
 
@@ -230,7 +285,7 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
   }
 
   const mcp = parseMcpName(name);
-  if (mcp) return mcp.tool;
+  if (mcp) return summarizeMcpTool(mcp.tool, input);
 
   switch (name) {
     case "Read":
@@ -668,14 +723,20 @@ function ExpandedMcpInput({ input }: { input: Record<string, unknown> }) {
       className="font-mono leading-[1.6]"
       style={{ fontSize: "var(--pane-font-size-sm)" }}
     >
-      {entries.map(([key, val]) => (
-        <div key={key} className="flex gap-2 px-4 py-4 border-b border-pane-border/5 last:border-b-0">
-          <span className="text-pane-text-secondary shrink-0">{key.replace(/_/g, " ")}</span>
-          <span className="text-pane-text-secondary truncate">
-            {typeof val === "string" ? val : JSON.stringify(val)}
-          </span>
-        </div>
-      ))}
+      {entries.map(([key, val]) => {
+        const strVal = typeof val === "string" ? val : JSON.stringify(val, null, 2);
+        const isLong = strVal.length > 120;
+        return (
+          <div key={key} className="flex gap-2 px-4 py-3 border-b border-pane-border/5 last:border-b-0">
+            <span className="text-pane-text-secondary/60 shrink-0 w-28 text-right">{key.replace(/_/g, " ")}</span>
+            <span
+              className={`text-pane-text-secondary/90 flex-1 ${isLong ? "whitespace-pre-wrap break-words" : "truncate"}`}
+            >
+              {strVal}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -737,7 +798,7 @@ function ExpandedPlanInput({ input }: { input: Record<string, unknown> }) {
 }
 
 function renderExpandedInput(name: string, input: Record<string, unknown>, result?: ToolResultBlock) {
-  if (name.startsWith("pane_") || parseMcpName(name)) {
+  if (name.startsWith("pane_") || parseMcpName(name) || name.startsWith("ext__")) {
     return <ExpandedMcpInput input={input} />;
   }
   switch (name) {
@@ -854,6 +915,13 @@ export function ToolActivity({ toolUse, toolResult, isHistorical }: ToolActivity
 
   // Determine base tool name (expand MCP tools to the actual tool name)
   const baseToolName = (() => {
+    // Pane's MCP client: ext__server__tool
+    if (toolUse.name.startsWith("ext__")) {
+      const rest = toolUse.name.slice(5);
+      const sepIdx = rest.indexOf("__");
+      if (sepIdx !== -1) return rest.slice(sepIdx + 2);
+    }
+    // Legacy mcp__ prefix
     if (toolUse.name.startsWith("mcp__")) {
       const parts = toolUse.name.slice(5).split("__");
       if (parts.length >= 2) return parts.slice(1).join(" ");
