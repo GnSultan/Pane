@@ -8,7 +8,20 @@
  */
 
 import { useState, useCallback, useRef, useEffect } from "react";
+import { create } from "zustand";
 import { useWorkspaceStore } from "../stores/workspace";
+
+// ── Global voice state store (for VoiceGlow overlay) ─────────────────────────
+
+interface VoiceStateStore {
+  state: VoiceState;
+  setState: (s: VoiceState) => void;
+}
+
+export const useVoiceStateStore = create<VoiceStateStore>((set) => ({
+  state: "idle",
+  setState: (s) => set({ state: s }),
+}));
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -55,9 +68,16 @@ const TTS_INSTRUCTIONS =
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useVoiceMode(): UseVoiceModeReturn {
-  const [state, setState] = useState<VoiceState>("idle");
+  const [state, setStateLocal] = useState<VoiceState>("idle");
   const [enabled, setEnabled] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Sync to global store so VoiceGlow can read it from App level
+  const setGlobalState = useVoiceStateStore((s) => s.setState);
+  const setState = useCallback((s: VoiceState) => {
+    setStateLocal(s);
+    setGlobalState(s);
+  }, [setGlobalState]);
 
   // Refs for cleanup
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
