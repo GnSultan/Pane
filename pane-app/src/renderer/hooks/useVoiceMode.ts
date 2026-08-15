@@ -125,6 +125,8 @@ export function useVoiceMode(): UseVoiceModeReturn {
   const autoStopTriggeredRef = useRef(false);
   // Store the resolve callback for auto-stop to call
   const pendingResolveRef = useRef<((text: string | null) => void) | null>(null);
+  // Stable ref to avoid stale closure — tick() reads this instead of capturing triggerAutoStop directly
+  const triggerAutoStopRef = useRef<() => void>(() => {});
 
   // Get API keys from workspace store
   const openaiKey = useWorkspaceStore((s) => s.httpApiKeys?.openai || "");
@@ -175,8 +177,8 @@ export function useVoiceMode(): UseVoiceModeReturn {
           ) {
             // Silence exceeded threshold — auto-stop
             autoStopTriggeredRef.current = true;
-            // Trigger stop from outside the animation frame
-            triggerAutoStop();
+            // Trigger stop via ref to avoid stale closure
+            triggerAutoStopRef.current();
             return; // Stop the loop
           }
         } else {
@@ -436,6 +438,9 @@ export function useVoiceMode(): UseVoiceModeReturn {
 
     recorder.stop();
   }, [stopAudioMonitoring, transcribeBlob, setState]);
+
+  // Keep ref in sync so tick() always calls the latest version
+  triggerAutoStopRef.current = triggerAutoStop;
 
   // ── Toggle: start if idle, stop+transcribe if recording ──────────────────
   const toggleRecording = useCallback(async (): Promise<string | null> => {
