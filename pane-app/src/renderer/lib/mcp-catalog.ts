@@ -254,6 +254,25 @@ export const MCP_CATALOG: CatalogServer[] = [
     ],
   },
   {
+    id: "resend",
+    name: "Resend",
+    description:
+      "Send emails and query delivery status of everything sent via Resend — plus contacts, audiences, and templates.",
+    category: "productivity",
+    command: "npx",
+    args: ["-y", "resend-mcp"],
+    inputs: [
+      {
+        envKey: "RESEND_API_KEY",
+        label: "Resend API Key",
+        placeholder: "re_xxxxxxxxxxxx",
+        obtainUrl: "https://resend.com/api-keys",
+        obtainLabel: "Create an API key →",
+        secret: true,
+      },
+    ],
+  },
+  {
     id: "context7",
     name: "Context7",
     description:
