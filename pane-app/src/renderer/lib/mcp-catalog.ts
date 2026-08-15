@@ -228,6 +228,12 @@ export const MCP_CATALOG: CatalogServer[] = [
     category: "productivity",
     command: "uvx",
     args: ["workspace-mcp", "--tools", "gmail"],
+    fixedEnv: {
+      // Pin the OAuth callback + redirect port away from 8000, which is
+      // commonly occupied (e.g. ChromaDB launchd service, dev servers).
+      // Google's desktop-client OAuth accepts any loopback port.
+      WORKSPACE_MCP_PORT: "8001",
+    },
     inputs: [
       {
         envKey: "GOOGLE_OAUTH_CLIENT_ID",
