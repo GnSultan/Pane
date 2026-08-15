@@ -1148,10 +1148,14 @@ function registerSettingsHandlers() {
     await fs.promises.rename(tmpPath, filePath);
 
     // Invalidate MCP client config cache — server list may have changed.
-    // The next model turn will re-read the config and connect/disconnect as needed.
+    // Also preconnect immediately: new uvx servers can take 60s+ on first
+    // launch (package download + venv build). Starting now means the cold
+    // start happens while the user types their next message, not during
+    // the turn itself where it eats the init timeout budget.
     try {
       const { mcpClient } = await import("./mcp-client.mjs");
       mcpClient.invalidateConfig();
+      mcpClient.preconnect();
     } catch (err) {
       console.warn("[settings] MCP config invalidation skipped:", err.message);
     }
