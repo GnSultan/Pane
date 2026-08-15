@@ -1121,49 +1121,6 @@ export function InputBar({
         </div>
       )}
 
-      {/* Voice recording/transcribing indicator */}
-      {expandedSection === "input" && (voice.state === "recording" || voice.state === "transcribing" || voice.state === "speaking") && (
-        <div className="flex items-center gap-3 px-3 pb-2 bg-transparent animate-fadeIn">
-          <div className={`w-2 h-2 rounded-full shrink-0 ${
-            voice.state === "recording" ? "bg-pane-error animate-pulse"
-              : voice.state === "speaking" ? "bg-pane-accent animate-pulse"
-                : "bg-pane-accent"
-          }`} />
-          <span
-            className="font-mono text-pane-text-secondary/60"
-            style={{ fontSize: "var(--pane-font-size-xs)" }}
-          >
-            {voice.state === "recording" ? "listening..."
-              : voice.state === "transcribing" ? "transcribing..."
-                : "speaking..."}
-          </span>
-          {voice.state === "recording" && (
-            <button
-              onClick={async () => {
-                const text = await voice.stopAndTranscribe();
-                if (text) {
-                  onSend(buildPrompt(text), undefined, currentPhase);
-                  setExpandedSection("none");
-                }
-              }}
-              className="ml-auto text-pane-accent font-mono hover:text-pane-accent/80 btn-press shrink-0"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              send
-            </button>
-          )}
-          {voice.state === "speaking" && (
-            <button
-              onClick={() => voice.stopSpeaking()}
-              className="ml-auto text-pane-text-secondary font-mono hover:text-pane-text btn-press shrink-0"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              stop
-            </button>
-          )}
-        </div>
-      )}
-
       {/* Voice error */}
       {voice.error && expandedSection === "input" && (
         <div className="flex items-center gap-2 px-3 pb-2 bg-transparent">
@@ -1176,8 +1133,65 @@ export function InputBar({
         </div>
       )}
 
-      {/* One card. Textarea + thoughts picker + button bar in column. */}
-      {expandedSection === "input" && <div ref={cardRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40 mx-px mb-px">
+      {/* ── Voice takeover — replaces textarea when voice is active ─────── */}
+      {expandedSection === "input" && (voice.state === "recording" || voice.state === "transcribing" || voice.state === "speaking") && (
+        <div className="mx-px mb-px px-5 py-6 animate-fadeIn">
+          <div className="flex flex-col items-center gap-4">
+            {/* Central mic button */}
+            <button
+              onClick={async () => {
+                if (voice.state === "recording") {
+                  const text = await voice.stopAndTranscribe();
+                  if (text) {
+                    onSend(buildPrompt(text), undefined, currentPhase);
+                    setExpandedSection("none");
+                  }
+                } else if (voice.state === "speaking") {
+                  voice.stopSpeaking();
+                }
+              }}
+              className={`w-14 h-14 rounded-full flex items-center justify-center btn-press transition-all ${
+                voice.state === "recording"
+                  ? "bg-pane-error/15 text-pane-error ring-1 ring-pane-error/30"
+                  : voice.state === "speaking"
+                    ? "bg-pane-accent/15 text-pane-accent ring-1 ring-pane-accent/30"
+                    : "bg-pane-accent/10 text-pane-accent ring-1 ring-pane-accent/20"
+              }`}
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                {voice.state === "recording" ? (
+                  <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
+                ) : voice.state === "transcribing" ? (
+                  <>
+                    <circle cx="8" cy="12" r="1.5" fill="currentColor" className="animate-pulse" />
+                    <circle cx="12" cy="12" r="1.5" fill="currentColor" className="animate-pulse" style={{ animationDelay: "0.15s" }} />
+                    <circle cx="16" cy="12" r="1.5" fill="currentColor" className="animate-pulse" style={{ animationDelay: "0.3s" }} />
+                  </>
+                ) : (
+                  <>
+                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                    <line x1="12" x2="12" y1="19" y2="22" />
+                  </>
+                )}
+              </svg>
+            </button>
+
+            {/* State label */}
+            <span
+              className="font-mono text-pane-text-secondary/50"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              {voice.state === "recording" ? "listening — tap to send"
+                : voice.state === "transcribing" ? "transcribing..."
+                  : "speaking — tap to stop"}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* One card. Textarea + thoughts picker + button bar in column. Hidden when voice is active. */}
+      {expandedSection === "input" && !(voice.state === "recording" || voice.state === "transcribing" || voice.state === "speaking") && <div ref={cardRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40 mx-px mb-px">
         {attachMenu !== "thoughts" && (
           <CaretTextArea
             ref={textareaRef}
@@ -1332,71 +1346,34 @@ export function InputBar({
                   </svg>
                 </button>
 
-                {/* Voice mode toggle + mic */}
+                {/* Voice mic — starts recording (card hides, voice takeover appears) */}
                 {voice.hasApiKey && (
                   <button
-                    onClick={async () => {
-                      if (voice.state === "recording") {
-                        const text = await voice.stopAndTranscribe();
-                        if (text) {
-                          onSend(buildPrompt(text), undefined, currentPhase);
-                          setExpandedSection("none");
-                        }
-                      } else if (voice.state === "transcribing") {
-                        // Wait — transcription in progress
-                      } else if (voice.state === "speaking") {
-                        voice.stopSpeaking();
-                      } else {
-                        // Idle — start recording (also enables voice mode)
-                        if (!voice.enabled) voice.toggleEnabled();
-                        voice.startRecording();
-                      }
+                    onClick={() => {
+                      if (!voice.enabled) voice.toggleEnabled();
+                      voice.startRecording();
                     }}
                     onContextMenu={(e) => {
                       e.preventDefault();
-                      // Right-click toggles voice mode (TTS) without recording
                       voice.toggleEnabled();
                     }}
                     className={`pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md btn-press transition-all ring-1 ${
-                      voice.state === "recording"
-                        ? "text-pane-error bg-pane-error/10 ring-pane-error/30 animate-pulse"
-                        : voice.state === "transcribing"
-                          ? "text-pane-accent bg-pane-accent/10 ring-pane-accent/30"
-                          : voice.state === "speaking"
-                            ? "text-pane-accent bg-pane-bg ring-pane-border/25"
-                            : voice.enabled
-                              ? "text-pane-accent bg-pane-bg ring-pane-border/25"
-                              : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
+                      voice.enabled
+                        ? "text-pane-accent bg-pane-bg ring-pane-border/25"
+                        : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
                     }`}
                     title={
-                      voice.state === "recording" ? "Stop recording & send"
-                        : voice.state === "transcribing" ? "Transcribing..."
-                          : voice.state === "speaking" ? "Stop speaking"
-                            : voice.enabled ? "Voice mode on — click to record (right-click to disable)"
-                              : "Voice input (right-click to toggle voice replies)"
+                      voice.enabled
+                        ? "Voice mode on — click to record (right-click to disable)"
+                        : "Voice input (right-click to toggle voice replies)"
                     }
                   >
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
-                      style={voice.enabled || voice.state === "recording" ? { filter: `drop-shadow(0 0 4px ${voice.state === "recording" ? "var(--pane-error)" : "var(--pane-accent)"})` } : undefined}
+                      style={voice.enabled ? { filter: "drop-shadow(0 0 4px var(--pane-accent))" } : undefined}
                     >
-                      {voice.state === "recording" ? (
-                        /* Stop square when recording */
-                        <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
-                      ) : voice.state === "transcribing" ? (
-                        /* Dots/loading when transcribing */
-                        <>
-                          <circle cx="8" cy="12" r="1.5" fill="currentColor" className="animate-pulse" />
-                          <circle cx="12" cy="12" r="1.5" fill="currentColor" className="animate-pulse" style={{ animationDelay: "0.15s" }} />
-                          <circle cx="16" cy="12" r="1.5" fill="currentColor" className="animate-pulse" style={{ animationDelay: "0.3s" }} />
-                        </>
-                      ) : (
-                        /* Mic icon */
-                        <>
-                          <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                          <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                          <line x1="12" x2="12" y1="19" y2="22" />
-                        </>
-                      )}
+                      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                      <line x1="12" x2="12" y1="19" y2="22" />
                     </svg>
                   </button>
                 )}
