@@ -2,11 +2,12 @@ import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } fr
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
-import type { Todo } from "../../lib/punk-types";
+import type { Todo, TextBlock } from "../../lib/punk-types";
 import { isThinkingModel } from "../../lib/models";
 import { showFilePicker, brainMindGetAll, brainMindAdd, type MindEntry } from "../../lib/tauri-commands";
 import { useMindStore } from "../../stores/mind";
 import { CaretTextArea } from "../shared";
+import { useVoiceMode } from "../../hooks/useVoiceMode";
 
 const EMPTY_TODOS: Todo[] = [];
 
@@ -616,6 +617,40 @@ export function InputBar({
 
   const currentPhase: PhaseName = phaseOverride ?? storePhase;
 
+  // ── Voice mode ───────────────────────────────────────────────────────────
+  const voice = useVoiceMode();
+  const prevProcessingRef = useRef(false);
+
+  // Auto-speak: when voice mode is enabled and processing completes,
+  // extract the last assistant's text and speak it.
+  useEffect(() => {
+    const wasProcessing = prevProcessingRef.current;
+    prevProcessingRef.current = isProcessing;
+
+    if (wasProcessing && !isProcessing && voice.enabled) {
+      // Processing just finished — grab the last assistant message
+      const project = useProjectsStore.getState().projects.get(projectId);
+      const messages = project?.conversation.messages;
+      if (!messages || messages.length === 0) return;
+
+      // Find the last assistant message
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i]!;
+        if (msg.type === "assistant" && !msg.isStreaming) {
+          // Extract text blocks only (skip tool_use, thinking, etc.)
+          const textParts = msg.content
+            .filter((b): b is TextBlock => b.type === "text")
+            .map((b) => b.text)
+            .join("\n");
+          if (textParts.trim()) {
+            voice.speak(textParts);
+          }
+          break;
+        }
+      }
+    }
+  }, [isProcessing, voice.enabled, projectId]);
+
   // Prefill from external sources (e.g., Lens "fix" button)
   useEffect(() => {
     const handler = (e: Event) => {
@@ -969,6 +1004,50 @@ export function InputBar({
             >
               let's build
             </button>
+            {/* Voice mic — quick access from ghost trigger */}
+            {voice.hasApiKey && (
+              <button
+                onClick={async () => {
+                  if (voice.state === "recording") {
+                    const text = await voice.stopAndTranscribe();
+                    if (text) {
+                      onSend(buildPrompt(text), undefined, currentPhase);
+                    }
+                  } else if (voice.state === "speaking") {
+                    voice.stopSpeaking();
+                  } else {
+                    if (!voice.enabled) voice.toggleEnabled();
+                    voice.startRecording();
+                  }
+                }}
+                className={`w-6 h-6 flex items-center justify-center rounded transition-all ${
+                  voice.state === "recording"
+                    ? "text-pane-error animate-pulse"
+                    : voice.state === "speaking"
+                      ? "text-pane-accent"
+                      : "text-pane-text-secondary/25 hover:text-pane-text-secondary/50"
+                }`}
+                title={
+                  voice.state === "recording" ? "Stop recording"
+                    : voice.state === "speaking" ? "Stop speaking"
+                      : "Voice input"
+                }
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  {voice.state === "recording" ? (
+                    /* Stop square when recording */
+                    <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
+                  ) : (
+                    /* Mic icon */
+                    <>
+                      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                      <line x1="12" x2="12" y1="19" y2="22" />
+                    </>
+                  )}
+                </svg>
+              </button>
+            )}
           </div>
           <div className="pointer-events-auto shrink-0 flex items-center gap-1.5">
             <RateLimitIndicator />
@@ -1027,6 +1106,61 @@ export function InputBar({
           >
             stop
           </button>
+        </div>
+      )}
+
+      {/* Voice recording/transcribing indicator */}
+      {expandedSection === "input" && (voice.state === "recording" || voice.state === "transcribing" || voice.state === "speaking") && (
+        <div className="flex items-center gap-3 px-3 pb-2 bg-transparent animate-fadeIn">
+          <div className={`w-2 h-2 rounded-full shrink-0 ${
+            voice.state === "recording" ? "bg-pane-error animate-pulse"
+              : voice.state === "speaking" ? "bg-pane-accent animate-pulse"
+                : "bg-pane-accent"
+          }`} />
+          <span
+            className="font-mono text-pane-text-secondary/60"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {voice.state === "recording" ? "listening..."
+              : voice.state === "transcribing" ? "transcribing..."
+                : "speaking..."}
+          </span>
+          {voice.state === "recording" && (
+            <button
+              onClick={async () => {
+                const text = await voice.stopAndTranscribe();
+                if (text) {
+                  onSend(buildPrompt(text), undefined, currentPhase);
+                  setExpandedSection("none");
+                }
+              }}
+              className="ml-auto text-pane-accent font-mono hover:text-pane-accent/80 btn-press shrink-0"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              send
+            </button>
+          )}
+          {voice.state === "speaking" && (
+            <button
+              onClick={() => voice.stopSpeaking()}
+              className="ml-auto text-pane-text-secondary font-mono hover:text-pane-text btn-press shrink-0"
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              stop
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Voice error */}
+      {voice.error && expandedSection === "input" && (
+        <div className="flex items-center gap-2 px-3 pb-2 bg-transparent">
+          <span
+            className="font-mono text-pane-error/70"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {voice.error}
+          </span>
         </div>
       )}
 
@@ -1185,6 +1319,75 @@ export function InputBar({
                     <circle cx="12" cy="12" r="3" fill={isMindMode ? "currentColor" : "none"} />
                   </svg>
                 </button>
+
+                {/* Voice mode toggle + mic */}
+                {voice.hasApiKey && (
+                  <button
+                    onClick={async () => {
+                      if (voice.state === "recording") {
+                        const text = await voice.stopAndTranscribe();
+                        if (text) {
+                          onSend(buildPrompt(text), undefined, currentPhase);
+                          setExpandedSection("none");
+                        }
+                      } else if (voice.state === "transcribing") {
+                        // Wait — transcription in progress
+                      } else if (voice.state === "speaking") {
+                        voice.stopSpeaking();
+                      } else {
+                        // Idle — start recording (also enables voice mode)
+                        if (!voice.enabled) voice.toggleEnabled();
+                        voice.startRecording();
+                      }
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      // Right-click toggles voice mode (TTS) without recording
+                      voice.toggleEnabled();
+                    }}
+                    className={`pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md btn-press transition-all ring-1 ${
+                      voice.state === "recording"
+                        ? "text-pane-error bg-pane-error/10 ring-pane-error/30 animate-pulse"
+                        : voice.state === "transcribing"
+                          ? "text-pane-accent bg-pane-accent/10 ring-pane-accent/30"
+                          : voice.state === "speaking"
+                            ? "text-pane-accent bg-pane-bg ring-pane-border/25"
+                            : voice.enabled
+                              ? "text-pane-accent bg-pane-bg ring-pane-border/25"
+                              : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
+                    }`}
+                    title={
+                      voice.state === "recording" ? "Stop recording & send"
+                        : voice.state === "transcribing" ? "Transcribing..."
+                          : voice.state === "speaking" ? "Stop speaking"
+                            : voice.enabled ? "Voice mode on — click to record (right-click to disable)"
+                              : "Voice input (right-click to toggle voice replies)"
+                    }
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+                      style={voice.enabled || voice.state === "recording" ? { filter: `drop-shadow(0 0 4px ${voice.state === "recording" ? "var(--pane-error)" : "var(--pane-accent)"})` } : undefined}
+                    >
+                      {voice.state === "recording" ? (
+                        /* Stop square when recording */
+                        <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
+                      ) : voice.state === "transcribing" ? (
+                        /* Dots/loading when transcribing */
+                        <>
+                          <circle cx="8" cy="12" r="1.5" fill="currentColor" className="animate-pulse" />
+                          <circle cx="12" cy="12" r="1.5" fill="currentColor" className="animate-pulse" style={{ animationDelay: "0.15s" }} />
+                          <circle cx="16" cy="12" r="1.5" fill="currentColor" className="animate-pulse" style={{ animationDelay: "0.3s" }} />
+                        </>
+                      ) : (
+                        /* Mic icon */
+                        <>
+                          <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                          <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                          <line x1="12" x2="12" y1="19" y2="22" />
+                        </>
+                      )}
+                    </svg>
+                  </button>
+                )}
               </div>
 
               <div className="flex-1" />
