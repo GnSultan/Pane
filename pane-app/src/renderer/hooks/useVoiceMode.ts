@@ -1,11 +1,12 @@
 /**
- * useVoiceMode — voice input (STT via Whisper) + voice output (TTS via ElevenLabs or OpenAI)
+ * useVoiceMode — voice input (STT) + voice output (TTS)
  *
  * Same request-response model as typing. Click mic → record → transcribe → onSend().
  * When voice mode is active, assistant responses are spoken aloud via TTS.
  *
- * TTS provider priority: ElevenLabs (if key present) > OpenAI (fallback).
- * STT always uses OpenAI Whisper — requires httpApiKeys.openai.
+ * Provider priority (ElevenLabs key present → full ElevenLabs pipeline, no OpenAI needed):
+ *   STT: ElevenLabs Scribe v2 > OpenAI Whisper
+ *   TTS: ElevenLabs Flash v2.5 > OpenAI gpt-4o-mini-tts
  */
 
 import { useState, useCallback, useRef, useEffect } from "react";
@@ -49,7 +50,7 @@ interface UseVoiceModeReturn {
   speak: (text: string) => Promise<void>;
   /** Stop any currently playing TTS audio */
   stopSpeaking: () => void;
-  /** Whether an OpenAI key is configured (needed for Whisper STT) */
+  /** Whether a voice API key is configured (ElevenLabs or OpenAI) */
   hasApiKey: boolean;
   /** Which TTS provider is active */
   ttsProvider: "elevenlabs" | "openai" | "none";
@@ -59,7 +60,8 @@ interface UseVoiceModeReturn {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-// STT — always Whisper
+// STT — ElevenLabs Scribe v2 (preferred) or OpenAI Whisper (fallback)
+const ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text";
 const WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions";
 
 // TTS — OpenAI fallback
@@ -101,9 +103,9 @@ export function useVoiceMode(): UseVoiceModeReturn {
   // Get API keys from workspace store
   const openaiKey = useWorkspaceStore((s) => s.httpApiKeys?.openai || "");
   const elevenLabsKey = useWorkspaceStore((s) => s.httpApiKeys?.elevenlabs || "");
-  // STT needs OpenAI (Whisper). TTS uses ElevenLabs if available, else OpenAI.
-  const hasApiKey = !!openaiKey;
+  // Voice mode works with either provider. ElevenLabs preferred for both STT+TTS.
   const useElevenLabs = !!elevenLabsKey;
+  const hasApiKey = useElevenLabs || !!openaiKey;
 
   // ── Cleanup on unmount ───────────────────────────────────────────────────
   useEffect(() => {
@@ -149,7 +151,7 @@ export function useVoiceMode(): UseVoiceModeReturn {
   // ── Start recording ──────────────────────────────────────────────────────
   const startRecording = useCallback(async () => {
     if (!hasApiKey) {
-      setError("OpenAI API key required for voice mode. Add it in settings.");
+      setError("API key required for voice mode. Add ElevenLabs or OpenAI key in settings.");
       return;
     }
     setError(null);
@@ -223,26 +225,53 @@ export function useVoiceMode(): UseVoiceModeReturn {
         setState("transcribing");
 
         try {
-          const formData = new FormData();
-          formData.append("file", audioBlob, "recording.webm");
-          formData.append("model", "whisper-1");
-          formData.append("response_format", "json");
+          let text: string | undefined;
 
-          const response = await fetch(WHISPER_URL, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${openaiKey}`,
-            },
-            body: formData,
-          });
+          if (useElevenLabs) {
+            // ── ElevenLabs Scribe v2 STT ─────────────────────────────
+            const formData = new FormData();
+            formData.append("file", audioBlob, "recording.webm");
+            formData.append("model_id", "scribe_v2");
+            formData.append("language_code", "en");
 
-          if (!response.ok) {
-            const errBody = await response.text();
-            throw new Error(`Whisper API error ${response.status}: ${errBody}`);
+            const response = await fetch(ELEVENLABS_STT_URL, {
+              method: "POST",
+              headers: {
+                "xi-api-key": elevenLabsKey,
+              },
+              body: formData,
+            });
+
+            if (!response.ok) {
+              const errBody = await response.text();
+              throw new Error(`ElevenLabs STT error ${response.status}: ${errBody}`);
+            }
+
+            const result = await response.json();
+            text = result.text?.trim();
+          } else {
+            // ── OpenAI Whisper STT (fallback) ────────────────────────
+            const formData = new FormData();
+            formData.append("file", audioBlob, "recording.webm");
+            formData.append("model", "whisper-1");
+            formData.append("response_format", "json");
+
+            const response = await fetch(WHISPER_URL, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${openaiKey}`,
+              },
+              body: formData,
+            });
+
+            if (!response.ok) {
+              const errBody = await response.text();
+              throw new Error(`Whisper API error ${response.status}: ${errBody}`);
+            }
+
+            const result = await response.json();
+            text = result.text?.trim();
           }
-
-          const result = await response.json();
-          const text = result.text?.trim();
 
           setState("idle");
 
@@ -261,7 +290,7 @@ export function useVoiceMode(): UseVoiceModeReturn {
 
       recorder.stop();
     });
-  }, [openaiKey]);
+  }, [openaiKey, elevenLabsKey, useElevenLabs]);
 
   // ── Toggle: start if idle, stop+transcribe if recording ──────────────────
   const toggleRecording = useCallback(async (): Promise<string | null> => {
