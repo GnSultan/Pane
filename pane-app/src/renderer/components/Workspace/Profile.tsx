@@ -1098,6 +1098,8 @@ const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   { key: "xiaomi", label: "Xiaomi MiMo", placeholder: "sk-...", docsUrl: "https://platform.xiaomimimo.com/", showBaseUrl: true, defaultBaseUrl: "https://api.xiaomimimo.com/v1" },
   { key: "kimi", label: "Kimi (Moonshot)", placeholder: "sk-...", docsUrl: "https://platform.moonshot.cn/", showBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1/chat/completions" },
   { key: "z-ai", label: "Z.ai (GLM)", placeholder: "sk-...", docsUrl: "https://z.ai/manage-apikey/apikey-list", showBaseUrl: true, defaultBaseUrl: "https://api.z.ai/api/paas/v4/chat/completions" },
+  { key: "openai", label: "OpenAI (Voice STT)", placeholder: "sk-...", docsUrl: "https://platform.openai.com/api-keys" },
+  { key: "elevenlabs", label: "ElevenLabs (Voice TTS)", placeholder: "sk_...", docsUrl: "https://elevenlabs.io/app/settings/api-keys" },
   { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
   { key: "jina", label: "Jina AI", placeholder: "jina_...", docsUrl: "https://jina.ai/embeddings/" },
 ];

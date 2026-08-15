@@ -1,10 +1,11 @@
 /**
- * useVoiceMode — voice input (STT via Whisper) + voice output (TTS via OpenAI)
+ * useVoiceMode — voice input (STT via Whisper) + voice output (TTS via ElevenLabs or OpenAI)
  *
  * Same request-response model as typing. Click mic → record → transcribe → onSend().
  * When voice mode is active, assistant responses are spoken aloud via TTS.
  *
- * Requires an OpenAI API key in settings (httpApiKeys.openai).
+ * TTS provider priority: ElevenLabs (if key present) > OpenAI (fallback).
+ * STT always uses OpenAI Whisper — requires httpApiKeys.openai.
  */
 
 import { useState, useCallback, useRef, useEffect } from "react";
@@ -48,22 +49,33 @@ interface UseVoiceModeReturn {
   speak: (text: string) => Promise<void>;
   /** Stop any currently playing TTS audio */
   stopSpeaking: () => void;
-  /** Whether an OpenAI key is configured */
+  /** Whether an OpenAI key is configured (needed for Whisper STT) */
   hasApiKey: boolean;
+  /** Which TTS provider is active */
+  ttsProvider: "elevenlabs" | "openai" | "none";
   /** Error message if something went wrong */
   error: string | null;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
+// STT — always Whisper
 const WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions";
-const TTS_URL = "https://api.openai.com/v1/audio/speech";
-const TTS_MODEL = "gpt-4o-mini-tts";
-const TTS_VOICE = "ash";
-const TTS_INSTRUCTIONS =
+
+// TTS — OpenAI fallback
+const OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech";
+const OPENAI_TTS_MODEL = "gpt-4o-mini-tts";
+const OPENAI_TTS_VOICE = "ash";
+const OPENAI_TTS_INSTRUCTIONS =
   "Voice and personality: direct, concise, technical. " +
   "You are a collaborator — not an assistant. Speak naturally but efficiently. " +
   "No filler words, no hedging. When reading code or file paths, say them clearly.";
+
+// TTS — ElevenLabs (preferred when key is present)
+// Chris: natural, conversational, down-to-earth — fits a coding collaborator
+const ELEVENLABS_TTS_VOICE_ID = "iP95p4xoKVk53GoZ742B";
+// Flash v2.5: ~75ms latency, best for real-time interaction
+const ELEVENLABS_TTS_MODEL = "eleven_flash_v2_5";
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
@@ -86,9 +98,12 @@ export function useVoiceMode(): UseVoiceModeReturn {
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
 
-  // Get OpenAI API key from workspace store
-  const apiKey = useWorkspaceStore((s) => s.httpApiKeys?.openai || "");
-  const hasApiKey = !!apiKey;
+  // Get API keys from workspace store
+  const openaiKey = useWorkspaceStore((s) => s.httpApiKeys?.openai || "");
+  const elevenLabsKey = useWorkspaceStore((s) => s.httpApiKeys?.elevenlabs || "");
+  // STT needs OpenAI (Whisper). TTS uses ElevenLabs if available, else OpenAI.
+  const hasApiKey = !!openaiKey;
+  const useElevenLabs = !!elevenLabsKey;
 
   // ── Cleanup on unmount ───────────────────────────────────────────────────
   useEffect(() => {
@@ -216,7 +231,7 @@ export function useVoiceMode(): UseVoiceModeReturn {
           const response = await fetch(WHISPER_URL, {
             method: "POST",
             headers: {
-              Authorization: `Bearer ${apiKey}`,
+              Authorization: `Bearer ${openaiKey}`,
             },
             body: formData,
           });
@@ -246,7 +261,7 @@ export function useVoiceMode(): UseVoiceModeReturn {
 
       recorder.stop();
     });
-  }, [apiKey]);
+  }, [openaiKey]);
 
   // ── Toggle: start if idle, stop+transcribe if recording ──────────────────
   const toggleRecording = useCallback(async (): Promise<string | null> => {
@@ -259,10 +274,11 @@ export function useVoiceMode(): UseVoiceModeReturn {
     return null;
   }, [state, startRecording, stopAndTranscribe]);
 
-  // ── Speak text via TTS ───────────────────────────────────────────────────
+  // ── Speak text via TTS (ElevenLabs preferred, OpenAI fallback) ─────────
   const speak = useCallback(
     async (text: string) => {
-      if (!hasApiKey || !text.trim()) return;
+      // Need at least one TTS provider
+      if ((!useElevenLabs && !hasApiKey) || !text.trim()) return;
 
       // Stop any current playback
       if (audioElementRef.current) {
@@ -298,24 +314,54 @@ export function useVoiceMode(): UseVoiceModeReturn {
       setState("speaking");
 
       try {
-        const response = await fetch(TTS_URL, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: TTS_MODEL,
-            input: truncated,
-            voice: TTS_VOICE,
-            instructions: TTS_INSTRUCTIONS,
-            response_format: "mp3",
-          }),
-        });
+        let response: Response;
+
+        if (useElevenLabs) {
+          // ── ElevenLabs TTS ─────────────────────────────────────────
+          response = await fetch(
+            `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_TTS_VOICE_ID}`,
+            {
+              method: "POST",
+              headers: {
+                "xi-api-key": elevenLabsKey,
+                "Content-Type": "application/json",
+                Accept: "audio/mpeg",
+              },
+              body: JSON.stringify({
+                text: truncated,
+                model_id: ELEVENLABS_TTS_MODEL,
+                voice_settings: {
+                  stability: 0.4,
+                  similarity_boost: 0.8,
+                  style: 0.15,
+                  use_speaker_boost: true,
+                  speed: 1.05,
+                },
+              }),
+            },
+          );
+        } else {
+          // ── OpenAI TTS (fallback) ──────────────────────────────────
+          response = await fetch(OPENAI_TTS_URL, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${openaiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model: OPENAI_TTS_MODEL,
+              input: truncated,
+              voice: OPENAI_TTS_VOICE,
+              instructions: OPENAI_TTS_INSTRUCTIONS,
+              response_format: "mp3",
+            }),
+          });
+        }
 
         if (!response.ok) {
           const errBody = await response.text();
-          throw new Error(`TTS API error ${response.status}: ${errBody}`);
+          const provider = useElevenLabs ? "ElevenLabs" : "OpenAI";
+          throw new Error(`${provider} TTS error ${response.status}: ${errBody}`);
         }
 
         const audioBlob = await response.blob();
@@ -346,7 +392,7 @@ export function useVoiceMode(): UseVoiceModeReturn {
         setState("idle");
       }
     },
-    [apiKey, hasApiKey],
+    [openaiKey, elevenLabsKey, hasApiKey, useElevenLabs],
   );
 
   // ── Stop speaking ────────────────────────────────────────────────────────
@@ -374,6 +420,7 @@ export function useVoiceMode(): UseVoiceModeReturn {
     speak,
     stopSpeaking,
     hasApiKey,
+    ttsProvider: useElevenLabs ? "elevenlabs" as const : hasApiKey ? "openai" as const : "none" as const,
     error,
   };
 }
