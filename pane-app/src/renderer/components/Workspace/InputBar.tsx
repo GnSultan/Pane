@@ -2,12 +2,11 @@ import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } fr
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
-import type { Todo, TextBlock } from "../../lib/punk-types";
+import type { Todo } from "../../lib/punk-types";
 import { isThinkingModel } from "../../lib/models";
 import { showFilePicker, brainMindGetAll, brainMindAdd, type MindEntry } from "../../lib/tauri-commands";
 import { useMindStore } from "../../stores/mind";
 import { CaretTextArea } from "../shared";
-import { useVoiceMode } from "../../hooks/useVoiceMode";
 
 const EMPTY_TODOS: Todo[] = [];
 
@@ -617,40 +616,6 @@ export function InputBar({
 
   const currentPhase: PhaseName = phaseOverride ?? storePhase;
 
-  // ── Voice mode ───────────────────────────────────────────────────────────
-  const voice = useVoiceMode();
-  const prevProcessingRef = useRef(false);
-
-  // Auto-speak: when voice mode is enabled and processing completes,
-  // extract the last assistant's text and speak it.
-  useEffect(() => {
-    const wasProcessing = prevProcessingRef.current;
-    prevProcessingRef.current = isProcessing;
-
-    if (wasProcessing && !isProcessing && voice.enabled) {
-      // Processing just finished — grab the last assistant message
-      const project = useProjectsStore.getState().projects.get(projectId);
-      const messages = project?.conversation.messages;
-      if (!messages || messages.length === 0) return;
-
-      // Find the last assistant message
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i]!;
-        if (msg.type === "assistant" && !msg.isStreaming) {
-          // Extract text blocks only (skip tool_use, thinking, etc.)
-          const textParts = msg.content
-            .filter((b): b is TextBlock => b.type === "text")
-            .map((b) => b.text)
-            .join("\n");
-          if (textParts.trim()) {
-            voice.speak(textParts);
-          }
-          break;
-        }
-      }
-    }
-  }, [isProcessing, voice.enabled, projectId]);
-
   // Prefill from external sources (e.g., Lens "fix" button)
   useEffect(() => {
     const handler = (e: Event) => {
@@ -668,18 +633,6 @@ export function InputBar({
     window.addEventListener("pane:prefill-prompt", handler);
     return () => window.removeEventListener("pane:prefill-prompt", handler);
   }, []);
-
-  // Voice auto-stop: silence detection auto-transcribes and fires this event
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const text = (e as CustomEvent).detail?.text;
-      if (text) {
-        onSend(buildPrompt(text), undefined, currentPhase);
-      }
-    };
-    window.addEventListener("voice-auto-transcribed", handler);
-    return () => window.removeEventListener("voice-auto-transcribed", handler);
-  }, [onSend, currentPhase]);
 
 
   // No directive prepending needed — phase is passed as a separate field.
@@ -816,32 +769,6 @@ export function InputBar({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [expandedSection]);
-
-  // Cmd+Shift+Space — toggle voice recording hands-free (from anywhere)
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === "Space") {
-        if (!isConversationVisible()) return;
-        if (!voice.hasApiKey) return;
-        e.preventDefault();
-        if (voice.state === "recording") {
-          // Stop and send — same as pressing the stop button
-          voice.stopAndTranscribe().then((text) => {
-            if (text) {
-              onSend(buildPrompt(text), undefined, currentPhase);
-            }
-          });
-        } else if (voice.state === "speaking") {
-          voice.stopSpeaking();
-        } else if (voice.state === "idle") {
-          if (!voice.enabled) voice.toggleEnabled();
-          voice.startRecording();
-        }
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [voice, onSend, currentPhase, isConversationVisible, buildPrompt]);
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const next = e.target.value;
@@ -1042,50 +969,6 @@ export function InputBar({
             >
               let's build
             </button>
-            {/* Voice mic — quick access from ghost trigger */}
-            {voice.hasApiKey && (
-              <button
-                onClick={async () => {
-                  if (voice.state === "recording") {
-                    const text = await voice.stopAndTranscribe();
-                    if (text) {
-                      onSend(buildPrompt(text), undefined, currentPhase);
-                    }
-                  } else if (voice.state === "speaking") {
-                    voice.stopSpeaking();
-                  } else {
-                    if (!voice.enabled) voice.toggleEnabled();
-                    voice.startRecording();
-                  }
-                }}
-                className={`w-6 h-6 flex items-center justify-center rounded transition-all ${
-                  voice.state === "recording"
-                    ? "text-pane-error animate-pulse"
-                    : voice.state === "speaking"
-                      ? "text-pane-accent"
-                      : "text-pane-text-secondary/25 hover:text-pane-text-secondary/50"
-                }`}
-                title={
-                  voice.state === "recording" ? "Stop recording"
-                    : voice.state === "speaking" ? "Stop speaking"
-                      : "Voice input"
-                }
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  {voice.state === "recording" ? (
-                    /* Stop square when recording */
-                    <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
-                  ) : (
-                    /* Mic icon */
-                    <>
-                      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                      <line x1="12" x2="12" y1="19" y2="22" />
-                    </>
-                  )}
-                </svg>
-              </button>
-            )}
           </div>
           <div className="pointer-events-auto shrink-0 flex items-center gap-1.5">
             <RateLimitIndicator />
@@ -1147,77 +1030,8 @@ export function InputBar({
         </div>
       )}
 
-      {/* Voice error */}
-      {voice.error && expandedSection === "input" && (
-        <div className="flex items-center gap-2 px-3 pb-2 bg-transparent">
-          <span
-            className="font-mono text-pane-error/70"
-            style={{ fontSize: "var(--pane-font-size-xs)" }}
-          >
-            {voice.error}
-          </span>
-        </div>
-      )}
-
-      {/* ── Voice takeover — replaces textarea when voice is active ─────── */}
-      {expandedSection === "input" && (voice.state === "recording" || voice.state === "transcribing" || voice.state === "speaking") && (
-        <div className="mx-px mb-px px-5 py-6 animate-fadeIn">
-          <div className="flex flex-col items-center gap-4">
-            {/* Central mic button */}
-            <button
-              onClick={async () => {
-                if (voice.state === "recording") {
-                  const text = await voice.stopAndTranscribe();
-                  if (text) {
-                    onSend(buildPrompt(text), undefined, currentPhase);
-                    setExpandedSection("none");
-                  }
-                } else if (voice.state === "speaking") {
-                  voice.stopSpeaking();
-                }
-              }}
-              className={`w-14 h-14 rounded-full flex items-center justify-center btn-press transition-all ${
-                voice.state === "recording"
-                  ? "bg-pane-error/15 text-pane-error ring-1 ring-pane-error/30"
-                  : voice.state === "speaking"
-                    ? "bg-pane-accent/15 text-pane-accent ring-1 ring-pane-accent/30"
-                    : "bg-pane-accent/10 text-pane-accent ring-1 ring-pane-accent/20"
-              }`}
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                {voice.state === "recording" ? (
-                  <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
-                ) : voice.state === "transcribing" ? (
-                  <>
-                    <circle cx="8" cy="12" r="1.5" fill="currentColor" className="animate-pulse" />
-                    <circle cx="12" cy="12" r="1.5" fill="currentColor" className="animate-pulse" style={{ animationDelay: "0.15s" }} />
-                    <circle cx="16" cy="12" r="1.5" fill="currentColor" className="animate-pulse" style={{ animationDelay: "0.3s" }} />
-                  </>
-                ) : (
-                  <>
-                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                    <line x1="12" x2="12" y1="19" y2="22" />
-                  </>
-                )}
-              </svg>
-            </button>
-
-            {/* State label */}
-            <span
-              className="font-mono text-pane-text-secondary/50"
-              style={{ fontSize: "var(--pane-font-size-xs)" }}
-            >
-              {voice.state === "recording" ? "listening — tap to send"
-                : voice.state === "transcribing" ? "transcribing..."
-                  : "speaking — tap to stop"}
-            </span>
-          </div>
-        </div>
-      )}
-
-      {/* One card. Textarea + thoughts picker + button bar in column. Hidden when voice is active. */}
-      {expandedSection === "input" && !(voice.state === "recording" || voice.state === "transcribing" || voice.state === "speaking") && <div ref={cardRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40 mx-px mb-px">
+      {/* One card. Textarea + thoughts picker + button bar in column. */}
+      {expandedSection === "input" && <div ref={cardRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40 mx-px mb-px">
         {attachMenu !== "thoughts" && (
           <CaretTextArea
             ref={textareaRef}
@@ -1371,38 +1185,6 @@ export function InputBar({
                     <circle cx="12" cy="12" r="3" fill={isMindMode ? "currentColor" : "none"} />
                   </svg>
                 </button>
-
-                {/* Voice mic — starts recording (card hides, voice takeover appears) */}
-                {voice.hasApiKey && (
-                  <button
-                    onClick={() => {
-                      if (!voice.enabled) voice.toggleEnabled();
-                      voice.startRecording();
-                    }}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      voice.toggleEnabled();
-                    }}
-                    className={`pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md btn-press transition-all ring-1 ${
-                      voice.enabled
-                        ? "text-pane-accent bg-pane-bg ring-pane-border/25"
-                        : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
-                    }`}
-                    title={
-                      voice.enabled
-                        ? "Voice mode on — click to record (right-click to disable)"
-                        : "Voice input (right-click to toggle voice replies)"
-                    }
-                  >
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
-                      style={voice.enabled ? { filter: "drop-shadow(0 0 4px var(--pane-accent))" } : undefined}
-                    >
-                      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                      <line x1="12" x2="12" y1="19" y2="22" />
-                    </svg>
-                  </button>
-                )}
               </div>
 
               <div className="flex-1" />

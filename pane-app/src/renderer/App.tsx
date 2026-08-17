@@ -5,10 +5,8 @@ import { ThreadPanel } from "./components/ThreadPanel/ThreadPanel";
 import { ActiveThreadTabs } from "./components/ActiveThreadTabs";
 import { Workspace } from "./components/Workspace/Workspace";
 import { TaskNotification } from "./components/shared/TaskNotification";
-import { VoiceGlow } from "./components/VoiceGlow";
 import { useWorkspaceStore } from "./stores/workspace";
 import { useProjectsStore } from "./stores/projects";
-import { useVoiceStateStore } from "./hooks/useVoiceMode";
 import { useFileWatcher } from "./hooks/useFileWatcher";
 import { useGitStatus } from "./hooks/useGitStatus";
 import { useSettingsPersistence } from "./hooks/useSettingsPersistence";
@@ -274,7 +272,6 @@ function App() {
         </div>
       </div>
 
-      <VoiceGlow state={useVoiceStateStore((s) => s.state)} />
       <TaskNotification />
     </div>
   );

@@ -185,21 +185,6 @@
   }
 }
 
-/* Voice glow — edge light for voice mode, no box-shadows */
-@keyframes voice-glow-breathe {
-  0%, 100% { opacity: 0.4; }
-  50% { opacity: 1; }
-}
-@keyframes voice-glow-shimmer {
-  0%, 100% { opacity: 0.3; }
-  40% { opacity: 1; }
-  60% { opacity: 0.7; }
-}
-@keyframes voice-glow-speak {
-  0%, 100% { opacity: 0.3; }
-  50% { opacity: 0.8; }
-}
-
 :root {
   /*
    * Default — "Dusk"
