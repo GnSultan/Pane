@@ -122,8 +122,12 @@ export function useFileWatcher() {
 
         const state = useProjectsStore.getState();
 
-        // For each project, check if any changed paths belong to it
+        // For each project, check if any changed paths belong to it.
+        // Rootless threads have root "" — startsWith("") matches every path,
+        // which would route foreign events into them and call
+        // readDirectory("") → ENOENT. Same guard as the watch effect above.
         for (const [projectId, project] of state.projects) {
+          if (!project.root) continue;
           const relevant = events.filter((e) =>
             e.path.startsWith(project.root),
           );
