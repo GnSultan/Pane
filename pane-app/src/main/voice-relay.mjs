@@ -204,11 +204,17 @@ export class VoiceRelay {
           session: {
             type: "realtime",
             model: REALTIME_MODEL,
-            voice: VOICE,
             instructions,
             tools: VOICE_TOOLS,
-            input_audio_transcription: { model: "whisper-1" },
             turn_detection: { type: "semantic_vad" },
+            // Current schema (verified against realtime-sessions API reference,
+            // Aug 2026): voice nests under audio.output, transcription under
+            // audio.input. The old flat `voice`/`input_audio_transcription`
+            // fields belong to the deprecated gpt-4o-realtime shape.
+            audio: {
+              input: { transcription: { model: "whisper-1" } },
+              output: { voice: VOICE },
+            },
           },
         }),
       });

@@ -274,9 +274,11 @@ export function useRealtimeVoice(opts: {
         agentStatus: statusLine,
       })) as { ok: boolean; token?: string; instructions?: string; error?: string };
       if (!mint?.ok || !mint.token) {
+        const reason = mint?.error ?? "token mint failed";
+        console.error("[voice] session could not start:", reason);
         setState("error");
         setAvailable(false);
-        setError(mint?.error ?? "token mint failed");
+        setError(reason);
         enabledRef.current = false;
         return;
       }
