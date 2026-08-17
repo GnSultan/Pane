@@ -70,6 +70,7 @@ import { runModelProfileReflection } from "./playbook-engine.mjs";
 import { restoreCheckpoint, snapshotAllFiles, flushJournal } from "./checkpoint-engine.mjs";
 import { bustRootMapCache } from "./intents.mjs";
 import { bustRootScopeCache } from "./root-scope.mjs";
+import { voiceRelay } from "./voice-relay.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -96,6 +97,17 @@ function registerClaudeHandlers() {
   // Punk is the default engine; keep these names for backwards compatibility.
   // Use sync version — handlers lazy-init backends on first call.
   registerPunkHandlersSync();
+
+  // ── Voice relay (OpenAI Realtime) ──────────────────────────────────────
+  // Broker only: mints ephemeral tokens (key stays in main) and executes
+  // whitelisted read-only knowledge tools. Audio flows renderer↔OpenAI via
+  // WebRTC directly — never through the main process.
+  ipcMain.handle("voice_mint_token", (_event, { projectId, projectRoot, agentStatus }) => {
+    return voiceRelay.mintToken(projectId, projectRoot, agentStatus || "idle");
+  });
+  ipcMain.handle("voice_tool_call", (_event, { projectId, projectRoot, tool, args }) => {
+    return voiceRelay.runTool(projectId, projectRoot, tool, args);
+  });
 
   // ── Token Usage Persistence Hook ───────────────────────────────────────
   // Intercept all token_usage events from backends (HTTP and CLI) and record

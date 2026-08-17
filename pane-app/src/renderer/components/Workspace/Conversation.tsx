@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback, useMemo, memo, useState, startTransitio
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { usePunk } from "../../hooks/usePunk";
+import { useRealtimeVoice } from "../../hooks/useRealtimeVoice";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
@@ -81,6 +82,9 @@ export const Conversation = memo(function Conversation({
     (s) =>
       s.projects.get(projectId)?.conversation.statusMessage === "thinking...",
   );
+  const projectRoot = useProjectsStore(
+    (s) => s.projects.get(projectId)?.root ?? null,
+  );
   const error = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.error ?? null,
   );
@@ -155,6 +159,53 @@ export const Conversation = memo(function Conversation({
 
   const isActive = isProcessing || isThinking;
   streamingRef.current = isActive;
+
+  // ── Always-on voice relay (OpenAI Realtime) ─────────────────────────────
+  // Voice shares the agent's brain and delegates execution. Agent status is
+  // read imperatively from the store — voice never causes re-renders here.
+  // handleSend is defined below; a ref bridges so delegation never goes stale.
+  const handleSendRef = useRef<(msg: string, minds?: Array<{ id: string }>, phase?: string) => void>(() => {});
+  const pushAgentStatusRef = useRef<(() => void) | null>(null);
+
+  const getAgentStatus = useCallback((): { running: boolean; lastLine: string | null } => {
+    const proj = useProjectsStore.getState().projects.get(projectId);
+    const conv = proj?.conversation;
+    const running = Boolean(
+      conv?.isProcessing || conv?.statusMessage === "thinking...",
+    );
+    let lastLine: string | null = null;
+    if (running && conv?.messages) {
+      const msgs = conv.messages;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (!m || m.type !== "assistant") continue;
+        const blocks = m.content;
+        if (Array.isArray(blocks)) {
+          for (let j = blocks.length - 1; j >= 0; j--) {
+            const b = blocks[j] as { type: string; text?: string } | undefined;
+            if (b?.type === "text" && b.text && b.text.trim()) {
+              lastLine = b.text.trim().slice(0, 200);
+              break;
+            }
+          }
+        }
+        if (lastLine) break;
+      }
+    }
+    return { running, lastLine };
+  }, [projectId]);
+
+  const voice = useRealtimeVoice({
+    projectId,
+    projectRoot: projectRoot,
+    getAgentStatus,
+    onDelegate: (instruction: string, phase: "think" | "build") => {
+      handleSendRef.current(instruction, undefined, phase);
+      // Let voice confirm aloud that the agent picked it up.
+      setTimeout(() => pushAgentStatusRef.current?.(), 1500);
+    },
+  });
+  pushAgentStatusRef.current = voice.pushAgentStatus;
 
   const { applyRestored } = useScrollPosition(projectId, scrollRef, followRef, streamingRef);
 
@@ -277,6 +328,7 @@ export const Conversation = memo(function Conversation({
     },
     [sendMessage, scrollToBottom],
   );
+  handleSendRef.current = handleSend;
 
   // Listen for send-message events from EmptyState (first message on thread creation)
   useEffect(() => {
@@ -391,6 +443,13 @@ export const Conversation = memo(function Conversation({
           onSend={handleSend}
           onAbort={abortMessage}
           isProcessing={isProcessing}
+          voice={{
+            state: voice.state,
+            error: voice.error,
+            transcript: voice.transcript,
+            toggle: () => void voice.toggle(),
+            interrupt: voice.interrupt,
+          }}
         />
       </div>
     </div>

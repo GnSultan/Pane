@@ -129,6 +129,14 @@ interface InputBarProps {
   onSend: (message: string, minds?: Array<{ id: string }>, phase?: string) => void;
   onAbort: () => void;
   isProcessing: boolean;
+  /** Always-on voice relay controls. Optional to keep InputBar usable standalone. */
+  voice?: {
+    state: string;
+    error: string | null;
+    transcript: string;
+    toggle: () => void;
+    interrupt: () => void;
+  };
 }
 
 function isConversationVisible(): boolean {
@@ -588,6 +596,7 @@ export function InputBar({
   onSend,
   onAbort,
   isProcessing,
+  voice,
 }: InputBarProps) {
   const [value, setValue] = useState("");
   const [modelPickerExpanded, setModelPickerExpanded] = useState(false);
@@ -969,6 +978,47 @@ export function InputBar({
             >
               let's build
             </button>
+            {/* Voice relay — always-on conversational layer. Mic = session toggle. */}
+            {voice && (
+              <button
+                onClick={() => {
+                  if (voice.state === "speaking") voice.interrupt();
+                  else void voice.toggle();
+                }}
+                className={`w-6 h-6 flex items-center justify-center rounded transition-all ${
+                  voice.state === "listening"
+                    ? "text-pane-error animate-pulse"
+                    : voice.state === "speaking"
+                      ? "text-pane-accent"
+                      : voice.state === "error"
+                        ? "text-pane-error/60"
+                        : voice.state === "off"
+                          ? "text-pane-text-secondary/25 hover:text-pane-text-secondary/50"
+                          : "text-pane-accent/70"
+                }`}
+                title={
+                  voice.state === "off"
+                    ? "Start voice session"
+                    : voice.state === "error"
+                      ? voice.error ?? "voice error — click to retry"
+                      : voice.state === "speaking"
+                        ? "Interrupt"
+                        : "voice active — click to end session"
+                }
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  {voice.state === "listening" ? (
+                    <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
+                  ) : (
+                    <>
+                      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                      <line x1="12" x2="12" y1="19" y2="22" />
+                    </>
+                  )}
+                </svg>
+              </button>
+            )}
           </div>
           <div className="pointer-events-auto shrink-0 flex items-center gap-1.5">
             <RateLimitIndicator />

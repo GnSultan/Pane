@@ -1099,6 +1099,7 @@ const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   { key: "kimi", label: "Kimi (Moonshot)", placeholder: "sk-...", docsUrl: "https://platform.moonshot.cn/", showBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1/chat/completions" },
   { key: "z-ai", label: "Z.ai (GLM)", placeholder: "sk-...", docsUrl: "https://z.ai/manage-apikey/apikey-list", showBaseUrl: true, defaultBaseUrl: "https://api.z.ai/api/paas/v4/chat/completions" },
   { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
+  { key: "openai", label: "OpenAI (Voice)", placeholder: "sk-...", docsUrl: "https://platform.openai.com/api-keys" },
   { key: "jina", label: "Jina AI", placeholder: "jina_...", docsUrl: "https://jina.ai/embeddings/" },
 ];
 
