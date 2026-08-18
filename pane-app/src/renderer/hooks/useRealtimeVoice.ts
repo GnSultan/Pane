@@ -78,18 +78,32 @@ export function useRealtimeVoice(opts: {
   const projectRef = useRef({ projectId, projectRoot });
   const lastStatusPushRef = useRef<string | null>(null);
   const eventCountRef = useRef(0);
+  const deltaCountRef = useRef(0); // audio deltas are high-rate — counted, not logged
+  // Events fired while the data channel is still handshaking. The channel
+  // opens ~400ms AFTER pc.connectionState becomes "connected" (DTLS/SCTP
+  // completes after ICE) — sends in that window used to be silent no-ops,
+  // dropping the session's initial context item every single time.
+  const pendingSendsRef = useRef<RealtimeEvent[]>([]);
+  const statsTimerRef = useRef<number | null>(null);
 
   statusRef.current = getAgentStatus;
   delegateRef.current = onDelegate;
   projectRef.current = { projectId, projectRoot };
 
-  /** Send a client event over the data channel (no-op when closed). */
+  /** Send a client event over the data channel. Sends issued while the
+   *  channel is still handshaking are QUEUED and flushed when it opens —
+   *  the old version silently dropped them, losing the session's initial
+   *  context item every time (the channel opens ~400ms after the peer
+   *  connection reports "connected"). */
   const send = useCallback((event: RealtimeEvent): void => {
     const dc = dcRef.current;
     if (dc && dc.readyState === "open") {
       dc.send(JSON.stringify(event));
+    } else if (enabledRef.current) {
+      pendingSendsRef.current.push(event);
+      vlog("send queued (channel not open):", event.type);
     } else {
-      vlog("send skipped — data channel not open:", event.type, "readyState:", dc?.readyState);
+      vlog("send dropped (channel closed, voice off):", event.type);
     }
   }, []);
 
@@ -99,6 +113,11 @@ export function useRealtimeVoice(opts: {
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
+    if (statsTimerRef.current !== null) {
+      clearInterval(statsTimerRef.current);
+      statsTimerRef.current = null;
+    }
+    pendingSendsRef.current = [];
     const dc = dcRef.current;
     if (dc) {
       dc.onmessage = null;
@@ -220,11 +239,17 @@ export function useRealtimeVoice(opts: {
   /** Route an incoming server event. */
   const handleEvent = useCallback(
     (event: RealtimeEvent): void => {
-      // Lifecycle counter — lets us distinguish "never connected" from
-      // "connected but VAD never fires" from "VAD fires, no response".
+      // Per-event trace — with timestamps this reconstructs exactly what the
+      // session did (VAD fired? response streamed? errors?). Audio deltas are
+      // high-rate; counted instead of logged.
       eventCountRef.current += 1;
-      if (eventCountRef.current === 1 || eventCountRef.current === 50 || eventCountRef.current === 500) {
-        vlog("events received so far:", eventCountRef.current, "first type:", event.type);
+      if (!event.type.endsWith(".delta")) {
+        vlog("event #" + eventCountRef.current + ":", event.type);
+      } else {
+        deltaCountRef.current += 1;
+        if (deltaCountRef.current % 25 === 1) {
+          vlog("…audio deltas:", deltaCountRef.current, "last type:", event.type);
+        }
       }
       switch (event.type) {
         case "input_audio_buffer.speech_started":
@@ -331,7 +356,25 @@ export function useRealtimeVoice(opts: {
 
       const dc = pc.createDataChannel("oai-events");
       dcRef.current = dc;
-      dc.onopen = () => vlog("data channel OPEN");
+      dc.onopen = () => {
+        vlog("data channel OPEN — flushing", pendingSendsRef.current.length, "queued sends");
+        for (const ev of pendingSendsRef.current) dc.send(JSON.stringify(ev));
+        pendingSendsRef.current = [];
+        // Proof of outbound audio: if bytesSent rises while you speak,
+        // mic audio reaches OpenAI and any silence is server/model-side.
+        statsTimerRef.current = window.setInterval(() => {
+          const p = pcRef.current;
+          if (!p) return;
+          void p.getStats().then((report) => {
+            for (const entry of report.values()) {
+              const t = entry as { type?: string; kind?: string; bytesSent?: number; bytesReceived?: number };
+              if (t.type === "outbound-rtp" && t.kind === "audio" && typeof t.bytesSent === "number") {
+                vlog("stats outbound-rtp audio bytesSent:", t.bytesSent);
+              }
+            }
+          }).catch(() => undefined);
+        }, 5000) as unknown as number;
+      };
       dc.onmessage = (e: MessageEvent<string>) => {
         try {
           handleEvent(JSON.parse(e.data) as RealtimeEvent);
