@@ -248,13 +248,16 @@ export class VoiceRelay {
             model: REALTIME_MODEL,
             instructions: sessionInstructions,
             tools: VOICE_TOOLS,
-            turn_detection: { type: "semantic_vad" },
-            // Current schema (verified against realtime-sessions API reference,
-            // Aug 2026): voice nests under audio.output, transcription under
-            // audio.input. The old flat `voice`/`input_audio_transcription`
-            // fields belong to the deprecated gpt-4o-realtime shape.
+            // Schema note (probed live against /v1/realtime/client_secrets,
+            // Aug 2026): turn_detection is REJECTED as a flat top-level
+            // session param (400 unknown_parameter) — it must nest under
+            // audio.input. A flat param silently killed every live session;
+            // the fix is shape only, semantics identical.
             audio: {
-              input: { transcription: { model: "whisper-1" } },
+              input: {
+                transcription: { model: "whisper-1" },
+                turn_detection: { type: "semantic_vad" },
+              },
               output: { voice },
             },
           },
