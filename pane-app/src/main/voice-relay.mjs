@@ -193,10 +193,14 @@ export class VoiceRelay {
    */
   async getApiKey() {
     try {
-      const content = await fs.readFile(path.join(this.paneDir, "settings.json"), "utf-8");
+      const content = await fs.readFile(this.paneDir + "/settings.json", "utf-8");
       const settings = JSON.parse(content);
       return settings.http_api_keys?.openai || "";
-    } catch {
+    } catch (err) {
+      // Parse/read failures are NOT "no key" — they mean settings.json is
+      // unreadable (concurrent write, corruption). Surface the real cause
+      // so intermittent failures are diagnosable instead of masked.
+      console.error("[voice] settings.json unreadable:", err?.message);
       return "";
     }
   }

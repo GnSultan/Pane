@@ -458,15 +458,21 @@ function registerCommandHandlers() {
     } catch {}
     const merged = { ...current, ...partial };
     // Per-key merge for key maps — same rationale as save_settings: never
-    // let a stale snapshot erase keys it never saw.
-    for (const mapKey of ["http_api_keys", "http_base_urls"]) {
+    // let a stale snapshot erase keys it never saw. Keep this list in sync
+    // with save_settings below.
+    for (const mapKey of ["http_api_keys", "http_base_urls", "voice_settings"]) {
       const partialMap = partial?.[mapKey];
       if (partialMap && typeof partialMap === "object" && !Array.isArray(partialMap)) {
         merged[mapKey] = { ...(current[mapKey] || {}), ...partialMap };
       }
     }
     await fs.promises.mkdir(path.dirname(settingsFile), { recursive: true });
-    await fs.promises.writeFile(settingsFile, JSON.stringify(merged, null, 2));
+    // Atomic write — same as save_settings. Plain writeFile truncates first;
+    // a concurrent reader (voice getApiKey, http config) then parses truncated
+    // JSON and fails, surfacing as intermittent "no API key" errors.
+    const tmpPath = settingsFile + ".tmp." + process.hrtime.bigint();
+    await fs.promises.writeFile(tmpPath, JSON.stringify(merged, null, 2), "utf-8");
+    await fs.promises.rename(tmpPath, settingsFile);
   });
 
   ipcMain.handle("detect_project_root", async (_event, args) => {
