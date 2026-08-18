@@ -43,6 +43,12 @@ function backoffDelay(attempt: number): number {
   return Math.min(1000 * 2 ** attempt, 15000);
 }
 
+/** Voice lifecycle log — main mirrors [voice] console lines to
+ *  ~/.pane/voice-debug.log so production failures are diagnosable. */
+function vlog(...parts: unknown[]): void {
+  console.log("[voice]", ...parts);
+}
+
 export function useRealtimeVoice(opts: {
   projectId: string;
   projectRoot: string | null;
@@ -71,6 +77,7 @@ export function useRealtimeVoice(opts: {
   const delegateRef = useRef(onDelegate);
   const projectRef = useRef({ projectId, projectRoot });
   const lastStatusPushRef = useRef<string | null>(null);
+  const eventCountRef = useRef(0);
 
   statusRef.current = getAgentStatus;
   delegateRef.current = onDelegate;
@@ -81,6 +88,8 @@ export function useRealtimeVoice(opts: {
     const dc = dcRef.current;
     if (dc && dc.readyState === "open") {
       dc.send(JSON.stringify(event));
+    } else {
+      vlog("send skipped — data channel not open:", event.type, "readyState:", dc?.readyState);
     }
   }, []);
 
@@ -211,6 +220,12 @@ export function useRealtimeVoice(opts: {
   /** Route an incoming server event. */
   const handleEvent = useCallback(
     (event: RealtimeEvent): void => {
+      // Lifecycle counter — lets us distinguish "never connected" from
+      // "connected but VAD never fires" from "VAD fires, no response".
+      eventCountRef.current += 1;
+      if (eventCountRef.current === 1 || eventCountRef.current === 50 || eventCountRef.current === 500) {
+        vlog("events received so far:", eventCountRef.current, "first type:", event.type);
+      }
       switch (event.type) {
         case "input_audio_buffer.speech_started":
           setState("listening");
@@ -294,6 +309,13 @@ export function useRealtimeVoice(opts: {
       setAvailable(true);
 
       // ── WebRTC setup (verified flow from OpenAI realtime-webrtc docs) ──
+      const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = mic;
+      setMicStream(mic);
+      const micTrack = mic.getTracks()[0];
+      if (!micTrack) throw new Error("microphone granted no audio track");
+      vlog("mic acquired — label:", micTrack.label || "(no label)", "enabled:", micTrack.enabled);
+
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
 
@@ -302,17 +324,14 @@ export function useRealtimeVoice(opts: {
       audioElRef.current = audioEl;
       pc.ontrack = (e: RTCTrackEvent) => {
         audioEl.srcObject = e.streams[0] ?? null;
+        vlog("remote track arrived — audio element updated");
       };
 
-      const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micStreamRef.current = mic;
-      setMicStream(mic);
-      const micTrack = mic.getTracks()[0];
-      if (!micTrack) throw new Error("microphone granted no audio track");
       pc.addTrack(micTrack);
 
       const dc = pc.createDataChannel("oai-events");
       dcRef.current = dc;
+      dc.onopen = () => vlog("data channel OPEN");
       dc.onmessage = (e: MessageEvent<string>) => {
         try {
           handleEvent(JSON.parse(e.data) as RealtimeEvent);
@@ -321,12 +340,14 @@ export function useRealtimeVoice(opts: {
         }
       };
       dc.onclose = () => {
+        vlog("data channel closed", enabledRef.current ? "(unexpected — will reconnect)" : "(expected — user off)");
         // Unexpected drop while enabled → reconnect with backoff.
         if (enabledRef.current && pcRef.current) scheduleReconnect();
       };
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      vlog("SDP offer created, posting to /v1/realtime/calls…");
       const sdpRes = await fetch("https://api.openai.com/v1/realtime/calls", {
         method: "POST",
         body: offer.sdp,
@@ -337,24 +358,32 @@ export function useRealtimeVoice(opts: {
       });
       if (!sdpRes.ok) {
         const body = await sdpRes.text().catch(() => "");
+        vlog("SDP exchange FAILED", sdpRes.status, body.slice(0, 300));
         throw new Error(`SDP exchange failed ${sdpRes.status}: ${body.slice(0, 300)}`);
       }
       await pc.setRemoteDescription({
         type: "answer",
         sdp: await sdpRes.text(),
       });
+      vlog("SDP answer applied — waiting for ICE/connection");
 
+      pc.oniceconnectionstatechange = () => {
+        vlog("ICE state:", pc.iceConnectionState);
+      };
       pc.onconnectionstatechange = () => {
         const st = pc.connectionState;
+        vlog("PC state:", st);
         if (st === "connected") {
           reconnectAttemptRef.current = 0;
           setState("idle");
           pushAgentStatus(true);
         } else if ((st === "failed" || st === "disconnected" || st === "closed") && enabledRef.current) {
+          vlog("connection lost — scheduling reconnect, attempt", reconnectAttemptRef.current + 1);
           scheduleReconnect();
         }
       };
     } catch (err) {
+      vlog("connect failed:", err instanceof Error ? err.message : String(err));
       console.error("[voice] connect failed:", err);
       teardown();
       setState("error");
@@ -377,6 +406,7 @@ export function useRealtimeVoice(opts: {
 
   /** User toggles voice on/off. */
   const toggle = useCallback(async (): Promise<void> => {
+    vlog("toggle — enabled:", enabledRef.current ? "on→off" : "off→on");
     if (enabledRef.current) {
       enabledRef.current = false;
       teardown();
@@ -385,6 +415,7 @@ export function useRealtimeVoice(opts: {
     }
     enabledRef.current = true;
     reconnectAttemptRef.current = 0;
+    eventCountRef.current = 0;
     await connect();
   }, [connect, teardown]);
 

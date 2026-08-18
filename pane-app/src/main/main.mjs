@@ -112,6 +112,22 @@ function registerClaudeHandlers() {
     return voiceRelay.previewVoice(voice);
   });
 
+  // ── Voice debug log (renderer → disk, bypassing invisible console) ────
+  // Voice failures were silent: the hook's console.error vanishes in prod.
+  // The renderer calls voice_debug_log; main appends a timestamped line to
+  // ~/.pane/voice-debug.log. Diagnostic plumbing only — never blocks.
+  ipcMain.handle("voice_debug_log", (_event, { lines }) => {
+    try {
+      const arr = Array.isArray(lines) ? lines : [String(lines)];
+      const stamp = new Date().toISOString();
+      const out = arr.map((l) => `[${stamp}] ${typeof l === "string" ? l : JSON.stringify(l)}`).join("\n") + "\n";
+      fs.appendFileSync(path.join(os.homedir(), ".pane", "voice-debug.log"), out);
+      return { ok: true };
+    } catch {
+      return { ok: false }; // diagnostics must never break the session
+    }
+  });
+
   // ── Token Usage Persistence Hook ───────────────────────────────────────
   // Intercept all token_usage events from backends (HTTP and CLI) and record
   // them to SQLite for long-term analytics.
@@ -2553,6 +2569,19 @@ function createWindow() {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: "deny" };
+  });
+  // Mirror renderer console messages (incl. [voice] errors) to
+  // ~/.pane/voice-debug.log. Uncaught renderer errors land there too —
+  // no more invisible failures.
+  mainWindow.webContents.on("console-message", (_e, _level, message) => {
+    try {
+      if (message && (message.includes("[voice]") || message.includes("realtime") || message.includes("webrtc"))) {
+        const line = `[${new Date().toISOString()}][renderer-console] ${String(message).slice(0, 500)}\n`;
+        fs.appendFileSync(path.join(os.homedir(), ".pane", "voice-debug.log"), line);
+      }
+    } catch {
+      /* diagnostics must never break the app */
+    }
   });
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
