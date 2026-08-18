@@ -25,8 +25,26 @@ import { orchestrateContext } from "./context-orchestrator.mjs";
 const { fetch } = globalThis;
 
 const OPENAI_REALTIME_SECRET_URL = "https://api.openai.com/v1/realtime/client_secrets";
+const OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech";
 const REALTIME_MODEL = "gpt-realtime-2.1";
-const VOICE = "marin";
+// Verified against the live realtime-conversations guide (Aug 2026):
+// current realtime voice options. marin/cedar recommended by OpenAI.
+export const REALTIME_VOICES = [
+  "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar",
+];
+const DEFAULT_VOICE = "marin";
+
+/** Read the user's chosen voice from settings.json (voice_settings.voice). */
+async function readVoiceSetting() {
+  try {
+    const content = await fs.readFile(path.join(os.homedir(), ".pane", "settings.json"), "utf-8");
+    const settings = JSON.parse(content);
+    const v = settings?.voice_settings?.voice;
+    return REALTIME_VOICES.includes(v) ? v : DEFAULT_VOICE;
+  } catch {
+    return DEFAULT_VOICE;
+  }
+}
 
 // Read-only tools the voice assistant may execute through the shared ToolExecutor.
 // No writes, no shell, no git mutations — voice observes and converses, never implements.
@@ -192,6 +210,7 @@ export class VoiceRelay {
       console.warn("[voice] context assembly failed, continuing with relay-only instructions:", err?.message);
     }
     const instructions = buildVoiceInstructions(sharedContext, agentStatusLine);
+    const voice = await readVoiceSetting();
 
     try {
       const res = await fetch(OPENAI_REALTIME_SECRET_URL, {
@@ -213,7 +232,7 @@ export class VoiceRelay {
             // fields belong to the deprecated gpt-4o-realtime shape.
             audio: {
               input: { transcription: { model: "whisper-1" } },
-              output: { voice: VOICE },
+              output: { voice },
             },
           },
         }),
@@ -228,7 +247,56 @@ export class VoiceRelay {
       if (!token) {
         return { ok: false, error: "OpenAI returned no client secret value." };
       }
-      return { ok: true, token, instructions, tools: VOICE_TOOLS };
+      return { ok: true, token, instructions, tools: VOICE_TOOLS, voice };
+    } catch (err) {
+      return { ok: false, error: `Failed to reach OpenAI: ${err?.message || err}` };
+    }
+  }
+
+  /**
+   * Speak a short test line through gpt-4o-mini-tts (all 10 realtime voices
+   * are supported there too — verified in the TTS guide). Runs in MAIN so
+   * the API key never enters the renderer; audio plays via an <audio> sink
+   * with a data: URL returned for the renderer to play. Returns a data URL
+   * so playback (and any autoplay policy) stays in the renderer.
+   *
+   * @returns {Promise<{ ok: true, audio: string, voice: string } |
+   *                     { ok: false, error: string }>}
+   */
+  async previewVoice(voiceId) {
+    if (!REALTIME_VOICES.includes(voiceId)) {
+      return { ok: false, error: `Unknown voice '${voiceId}'.` };
+    }
+    const apiKey = await this.getApiKey();
+    if (!apiKey) {
+      return { ok: false, error: "No OpenAI API key set — add it in Profile → API Keys." };
+    }
+    try {
+      const res = await fetch(OPENAI_TTS_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini-tts",
+          voice: voiceId,
+          input: `Hi, I'm ${voiceId}. This is how I'll sound in Pane.`,
+          instructions: "Speak briefly, warmly, and directly. No theatrical delivery.",
+          response_format: "mp3",
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        return { ok: false, error: `OpenAI TTS ${res.status}: ${body.slice(0, 300)}` };
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      // ~short greeting; mp3 data URL for renderer <audio> playback.
+      return {
+        ok: true,
+        voice: voiceId,
+        audio: `data:audio/mp3;base64,${buf.toString("base64")}`,
+      };
     } catch (err) {
       return { ok: false, error: `Failed to reach OpenAI: ${err?.message || err}` };
     }

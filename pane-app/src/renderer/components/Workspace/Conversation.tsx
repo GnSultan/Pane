@@ -449,6 +449,8 @@ export const Conversation = memo(function Conversation({
             transcript: voice.transcript,
             toggle: () => void voice.toggle(),
             interrupt: voice.interrupt,
+            micStream: voice.micStream,
+            audioPulseRef: voice.audioPulseRef,
           }}
         />
       </div>

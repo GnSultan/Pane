@@ -56,6 +56,8 @@ export function useRealtimeVoice(opts: {
   const [transcript, setTranscript] = useState<string>(""); // last user utterance (live)
   const [lastSpoken, setLastSpoken] = useState<string>(""); // last model utterance
   const [available, setAvailable] = useState<boolean | null>(null); // null = unchecked
+  const [micStream, setMicStream] = useState<MediaStream | null>(null); // for the orb analyser
+  const audioPulseRef = useRef(0); // mutable counter, bumped per model audio delta — no re-renders
 
   // ── Refs (stable across renders; session state lives here) ────────────
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -105,6 +107,7 @@ export function useRealtimeVoice(opts: {
     if (micStreamRef.current) {
       for (const track of micStreamRef.current.getTracks()) track.stop();
       micStreamRef.current = null;
+      setMicStream(null);
     }
     if (audioElRef.current) {
       audioElRef.current.srcObject = null;
@@ -244,6 +247,12 @@ export function useRealtimeVoice(opts: {
           break;
         case "response.output_audio.delta":
           setState("speaking");
+          audioPulseRef.current += 1;
+          break;
+        case "response.audio.delta":
+          // Legacy event name — same meaning, some models still emit it.
+          setState("speaking");
+          audioPulseRef.current += 1;
           break;
         case "error": {
           const detail = (event as { error?: { message?: string } | string }).error;
@@ -297,6 +306,7 @@ export function useRealtimeVoice(opts: {
 
       const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStreamRef.current = mic;
+      setMicStream(mic);
       const micTrack = mic.getTracks()[0];
       if (!micTrack) throw new Error("microphone granted no audio track");
       pc.addTrack(micTrack);
@@ -425,6 +435,8 @@ export function useRealtimeVoice(opts: {
     transcript,
     lastSpoken,
     available,
+    micStream,
+    audioPulseRef,
     toggle,
     interrupt,
     /** Imperative status push — e.g. right after delegation fires. */

@@ -1700,6 +1700,129 @@ function buildCatalogConfig(
   return config;
 }
 
+// ── Voice section ─────────────────────────────────────────────────────────
+// Realtime voice settings: which voice Pane speaks with + live preview.
+// Voices verified against the realtime-conversations guide (Aug 2026):
+// alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar.
+const VOICE_OPTIONS: Array<{ id: string; note: string }> = [
+  { id: "alloy", note: "neutral · balanced" },
+  { id: "ash", note: "calm · grounded" },
+  { id: "ballad", note: "expressive · warm" },
+  { id: "coral", note: "bright · friendly" },
+  { id: "echo", note: "clear · steady" },
+  { id: "sage", note: "soft · thoughtful" },
+  { id: "shimmer", note: "airy · upbeat" },
+  { id: "verse", note: "versatile · neutral" },
+  { id: "marin", note: "natural · recommended" },
+  { id: "cedar", note: "warm · recommended" },
+];
+
+function VoiceSection() {
+  const [voice, setVoice] = useState<string>("marin");
+  const [testing, setTesting] = useState(false);
+  const [testError, setTestError] = useState<string | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    loadSettings()
+      .then((s: UserSettings) => {
+        const v = (s as { voice_settings?: { voice?: string } }).voice_settings?.voice;
+        if (v) setVoice(v);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const pick = (id: string): void => {
+    setVoice(id);
+    setTestError(null);
+    saveSettings({ voice_settings: { voice: id } } as unknown as Partial<UserSettings>)
+      .catch((err: unknown) => console.error("[voice] failed to save voice setting:", err));
+  };
+
+  const test = async (): Promise<void> => {
+    if (testing || playing) return;
+    setTesting(true);
+    setTestError(null);
+    try {
+      const res = (await electronAPI.invoke("voice_preview", { voice })) as {
+        ok: boolean;
+        audio?: string;
+        error?: string;
+      };
+      if (!res.ok || !res.audio) {
+        setTestError(res.error ?? "preview failed");
+        setTesting(false);
+        return;
+      }
+      const el = new Audio(res.audio);
+      audioRef.current = el;
+      el.onended = () => setPlaying(false);
+      el.onerror = () => {
+        setPlaying(false);
+        setTestError("playback failed — click test again");
+      };
+      setTesting(false);
+      setPlaying(true);
+      await el.play();
+    } catch (err: unknown) {
+      setTesting(false);
+      setPlaying(false);
+      setTestError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="grid grid-cols-2 gap-x-6 gap-y-1.5">
+        {VOICE_OPTIONS.map((v) => {
+          const selected = v.id === voice;
+          return (
+            <button
+              key={v.id}
+              onClick={() => pick(v.id)}
+              className={`flex items-baseline justify-between gap-2 px-3 py-2 rounded-md text-left font-mono btn-press transition-colors ring-1 ${
+                selected
+                  ? "bg-pane-accent/10 ring-pane-accent/40 text-pane-text"
+                  : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
+              }`}
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              <span>{v.id}</span>
+              <span className="text-pane-text-secondary/50" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                {v.note}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="flex items-center gap-3 mt-1">
+        <button
+          onClick={() => void test()}
+          disabled={testing || playing}
+          className={`font-mono btn-press px-3 py-1.5 rounded-md ring-1 transition-colors ${
+            testing || playing
+              ? "text-pane-text-secondary/40 ring-pane-border/25"
+              : "text-pane-accent ring-pane-accent/40 hover:bg-pane-accent/10"
+          }`}
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          {testing ? "testing…" : playing ? "playing…" : `test ${voice}`}
+        </button>
+        {testError && (
+          <span className="text-pane-error font-mono truncate" style={{ fontSize: "var(--pane-font-size-xs)" }} title={testError}>
+            {testError}
+          </span>
+        )}
+      </div>
+      <span className="text-pane-text-secondary/50 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        changing voice reconnects an active session · needs an openai key in providers
+      </span>
+    </div>
+  );
+}
+
 function McpServersSection() {
   const [servers, setServers] = useState<Record<string, McpServerConfig>>({});
   const [loading, setLoading] = useState(true);
@@ -2567,6 +2690,13 @@ export function Profile() {
         <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
       </svg>
     ),
+    voice: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+        <line x1="12" x2="12" y1="19" y2="22" />
+      </svg>
+    ),
   };
 
   return (
@@ -2636,6 +2766,16 @@ export function Profile() {
             />
           </AccordionSection>
         )}
+
+        {/* Voice Section */}
+        <AccordionSection
+          title="voice"
+          icon={icons.voice}
+          isExpanded={expandedSection === "voice"}
+          onToggle={() => setExpandedSection(expandedSection === "voice" ? null : "voice")}
+        >
+          <VoiceSection />
+        </AccordionSection>
 
         {/* Curate Models Section */}
         {punkBackend === "api" && (

@@ -108,6 +108,9 @@ function registerClaudeHandlers() {
   ipcMain.handle("voice_tool_call", (_event, { projectId, projectRoot, tool, args }) => {
     return voiceRelay.runTool(projectId, projectRoot, tool, args);
   });
+  ipcMain.handle("voice_preview", (_event, { voice }) => {
+    return voiceRelay.previewVoice(voice);
+  });
 
   // ── Token Usage Persistence Hook ───────────────────────────────────────
   // Intercept all token_usage events from backends (HTTP and CLI) and record
@@ -454,6 +457,14 @@ function registerCommandHandlers() {
       current = JSON.parse(await fs.promises.readFile(settingsFile, "utf-8"));
     } catch {}
     const merged = { ...current, ...partial };
+    // Per-key merge for key maps — same rationale as save_settings: never
+    // let a stale snapshot erase keys it never saw.
+    for (const mapKey of ["http_api_keys", "http_base_urls"]) {
+      const partialMap = partial?.[mapKey];
+      if (partialMap && typeof partialMap === "object" && !Array.isArray(partialMap)) {
+        merged[mapKey] = { ...(current[mapKey] || {}), ...partialMap };
+      }
+    }
     await fs.promises.mkdir(path.dirname(settingsFile), { recursive: true });
     await fs.promises.writeFile(settingsFile, JSON.stringify(merged, null, 2));
   });
@@ -1152,6 +1163,18 @@ function registerSettingsHandlers() {
     } catch {}
 
     const merged = { ...existing, ...args.settings };
+
+    // Per-key merge for key maps — a full-map replace lets a stale instance
+    // (one whose store loaded before a key was added elsewhere) erase keys
+    // it never saw. Keys present in the partial overwrite; absent keys stay.
+    // Clearing a key still works: the renderer persists it as "".
+    for (const mapKey of ["http_api_keys", "http_base_urls"]) {
+      const partialMap = args.settings?.[mapKey];
+      if (partialMap && typeof partialMap === "object" && !Array.isArray(partialMap)) {
+        merged[mapKey] = { ...(existing[mapKey] || {}), ...partialMap };
+      }
+    }
+
     const json = JSON.stringify(merged, null, 2);
 
     // Unique tmp path per write — safe against concurrent saves.
