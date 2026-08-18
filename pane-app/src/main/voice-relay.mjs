@@ -41,8 +41,9 @@ const DEFAULT_VOICE = "marin";
 const ACCENT_INSTRUCTIONS = {
   none: "",
   british:
-    "Speak with a natural British (RP-leaning) accent at all times. " +
-    "Crisp consonants, understated delivery — never caricature or stage-British.",
+    "Speak with a natural British RP accent at all times. Non-rhotic: drop the r in 'water', 'hard', 'letter' unless a vowel follows. " +
+    "Long broad a in 'can't', 'dance', 'example', 'ask'. British vowels: 'schedule' as SHED-yool, 'lieutenant' as lef-TEN-ant. " +
+    "Understated, even pace — never caricature or stage-British.",
 };
 
 /** Read the user's chosen voice + accent from settings.json (voice_settings). */
@@ -304,7 +305,13 @@ export class VoiceRelay {
         body: JSON.stringify({
           model: "gpt-4o-mini-tts",
           voice: voiceId,
-          input: `Hi, I'm ${voiceId}. This is how I'll sound in Pane.`,
+          // Distinctive test line: British pronunciation cues that are easy
+          // to judge by ear (schedule, water, can't, lieutenant), plus a
+          // warm greeting so it's easy to follow, not a technical murmur.
+          input:
+            accent === "british"
+              ? "Hello! Can't we schedule a call about the water shortage? The lieutenant said it's better to ask directly."
+              : `Hi, I'm ${voiceId}. This is how I'll sound in Pane.`,
           instructions:
             "Speak briefly, warmly, and directly. No theatrical delivery." +
             (accent === "british" ? " " + ACCENT_INSTRUCTIONS.british : ""),
