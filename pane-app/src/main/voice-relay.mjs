@@ -291,11 +291,12 @@ export class VoiceRelay {
         return { ok: false, error: `OpenAI TTS ${res.status}: ${body.slice(0, 300)}` };
       }
       const buf = Buffer.from(await res.arrayBuffer());
-      // ~short greeting; mp3 data URL for renderer <audio> playback.
+      // Return raw base64 — the renderer wraps it in a Blob + object URL,
+      // because CSP media-src allows blob: but not data:.
       return {
         ok: true,
         voice: voiceId,
-        audio: `data:audio/mp3;base64,${buf.toString("base64")}`,
+        audioB64: buf.toString("base64"),
       };
     } catch (err) {
       return { ok: false, error: `Failed to reach OpenAI: ${err?.message || err}` };

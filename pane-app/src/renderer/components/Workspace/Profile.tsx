@@ -1747,18 +1747,27 @@ function VoiceSection() {
     try {
       const res = (await electronAPI.invoke("voice_preview", { voice })) as {
         ok: boolean;
-        audio?: string;
+        audioB64?: string;
         error?: string;
       };
-      if (!res.ok || !res.audio) {
+      if (!res.ok || !res.audioB64) {
         setTestError(res.error ?? "preview failed");
         setTesting(false);
         return;
       }
-      const el = new Audio(res.audio);
+      // CSP media-src allows blob: but not data: — decode base64 into a Blob.
+      const bin = atob(res.audioB64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mp3" }));
+      const el = new Audio(url);
       audioRef.current = el;
-      el.onended = () => setPlaying(false);
+      el.onended = () => {
+        URL.revokeObjectURL(url);
+        setPlaying(false);
+      };
       el.onerror = () => {
+        URL.revokeObjectURL(url);
         setPlaying(false);
         setTestError("playback failed — click test again");
       };
