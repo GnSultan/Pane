@@ -1168,7 +1168,9 @@ function registerSettingsHandlers() {
     // (one whose store loaded before a key was added elsewhere) erase keys
     // it never saw. Keys present in the partial overwrite; absent keys stay.
     // Clearing a key still works: the renderer persists it as "".
-    for (const mapKey of ["http_api_keys", "http_base_urls"]) {
+    // voice_settings merges per-key too: voice and accent are saved from
+    // different moments in the UI — a wholesale replace would drop one.
+    for (const mapKey of ["http_api_keys", "http_base_urls", "voice_settings"]) {
       const partialMap = args.settings?.[mapKey];
       if (partialMap && typeof partialMap === "object" && !Array.isArray(partialMap)) {
         merged[mapKey] = { ...(existing[mapKey] || {}), ...partialMap };

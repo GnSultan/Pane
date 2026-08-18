@@ -34,15 +34,30 @@ export const REALTIME_VOICES = [
 ];
 const DEFAULT_VOICE = "marin";
 
-/** Read the user's chosen voice from settings.json (voice_settings.voice). */
+// OpenAI voices are persona presets, not accent variants — there is no
+// native British voice (confirmed against live docs + OpenAI forum, Aug 2026).
+// Accent is steered instead via session instructions on gpt-realtime, which
+// shifts delivery while keeping the chosen voice's timbre.
+const ACCENT_INSTRUCTIONS = {
+  none: "",
+  british:
+    "Speak with a natural British (RP-leaning) accent at all times. " +
+    "Crisp consonants, understated delivery — never caricature or stage-British.",
+};
+
+/** Read the user's chosen voice + accent from settings.json (voice_settings). */
 async function readVoiceSetting() {
   try {
     const content = await fs.readFile(path.join(os.homedir(), ".pane", "settings.json"), "utf-8");
     const settings = JSON.parse(content);
     const v = settings?.voice_settings?.voice;
-    return REALTIME_VOICES.includes(v) ? v : DEFAULT_VOICE;
+    const a = settings?.voice_settings?.accent;
+    return {
+      voice: REALTIME_VOICES.includes(v) ? v : DEFAULT_VOICE,
+      accent: a === "british" ? "british" : "none",
+    };
   } catch {
-    return DEFAULT_VOICE;
+    return { voice: DEFAULT_VOICE, accent: "none" };
   }
 }
 
@@ -210,7 +225,10 @@ export class VoiceRelay {
       console.warn("[voice] context assembly failed, continuing with relay-only instructions:", err?.message);
     }
     const instructions = buildVoiceInstructions(sharedContext, agentStatusLine);
-    const voice = await readVoiceSetting();
+    const { voice, accent } = await readVoiceSetting();
+    const sessionInstructions = ACCENT_INSTRUCTIONS[accent]
+      ? instructions + "\n\n" + ACCENT_INSTRUCTIONS[accent]
+      : instructions;
 
     try {
       const res = await fetch(OPENAI_REALTIME_SECRET_URL, {
@@ -223,7 +241,7 @@ export class VoiceRelay {
           session: {
             type: "realtime",
             model: REALTIME_MODEL,
-            instructions,
+            instructions: sessionInstructions,
             tools: VOICE_TOOLS,
             turn_detection: { type: "semantic_vad" },
             // Current schema (verified against realtime-sessions API reference,
@@ -271,6 +289,7 @@ export class VoiceRelay {
     if (!apiKey) {
       return { ok: false, error: "No OpenAI API key set — add it in Profile → API Keys." };
     }
+    const { accent } = await readVoiceSetting();
     try {
       const res = await fetch(OPENAI_TTS_URL, {
         method: "POST",
@@ -282,7 +301,9 @@ export class VoiceRelay {
           model: "gpt-4o-mini-tts",
           voice: voiceId,
           input: `Hi, I'm ${voiceId}. This is how I'll sound in Pane.`,
-          instructions: "Speak briefly, warmly, and directly. No theatrical delivery.",
+          instructions:
+            "Speak briefly, warmly, and directly. No theatrical delivery." +
+            (accent === "british" ? " " + ACCENT_INSTRUCTIONS.british : ""),
           response_format: "mp3",
         }),
       });

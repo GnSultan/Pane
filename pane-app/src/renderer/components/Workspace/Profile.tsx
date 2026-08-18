@@ -1719,6 +1719,7 @@ const VOICE_OPTIONS: Array<{ id: string; note: string }> = [
 
 function VoiceSection() {
   const [voice, setVoice] = useState<string>("marin");
+  const [accent, setAccent] = useState<string>("none");
   const [testing, setTesting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -1727,8 +1728,9 @@ function VoiceSection() {
   useEffect(() => {
     loadSettings()
       .then((s: UserSettings) => {
-        const v = (s as { voice_settings?: { voice?: string } }).voice_settings?.voice;
-        if (v) setVoice(v);
+        const vs = (s as { voice_settings?: { voice?: string; accent?: string } }).voice_settings;
+        if (vs?.voice) setVoice(vs.voice);
+        if (vs?.accent) setAccent(vs.accent);
       })
       .catch(() => undefined);
   }, []);
@@ -1738,6 +1740,13 @@ function VoiceSection() {
     setTestError(null);
     saveSettings({ voice_settings: { voice: id } } as unknown as Partial<UserSettings>)
       .catch((err: unknown) => console.error("[voice] failed to save voice setting:", err));
+  };
+
+  const pickAccent = (id: string): void => {
+    setAccent(id);
+    setTestError(null);
+    saveSettings({ voice_settings: { accent: id } } as unknown as Partial<UserSettings>)
+      .catch((err: unknown) => console.error("[voice] failed to save accent setting:", err));
   };
 
   const test = async (): Promise<void> => {
@@ -1804,6 +1813,33 @@ function VoiceSection() {
             </button>
           );
         })}
+      </div>
+
+      <div className="flex items-center gap-2 mt-1">
+        <span className="text-pane-text-secondary/50 font-mono shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+          accent
+        </span>
+        {(["none", "british"] as const).map((a) => (
+          <button
+            key={a}
+            onClick={() => pickAccent(a)}
+            className={`font-mono btn-press px-2.5 py-1 rounded-md ring-1 transition-colors ${
+              accent === a
+                ? "bg-pane-accent/10 ring-pane-accent/40 text-pane-text"
+                : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
+            }`}
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {a}
+          </button>
+        ))}
+        <span
+          className="text-pane-text-secondary/40 font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+          title="OpenAI has no native accent variants — accent is steered via session instructions on top of the chosen voice."
+        >
+          no native uk voices · steered by prompt
+        </span>
       </div>
 
       <div className="flex items-center gap-3 mt-1">
