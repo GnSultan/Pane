@@ -1,0 +1,10 @@
+{
+  "name": "debugger",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["debugging", "root-cause-analysis", "diagnosis"],
+  "tags": ["debugging", "root-cause", "diagnosis"],
+  "priority": 5
+}

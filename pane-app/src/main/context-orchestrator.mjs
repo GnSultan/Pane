@@ -13,9 +13,9 @@
  * This gives the model maximum attention for the conversation.
  * Prefix caching is automatic — a static prompt hits every time.
  *
- * HTTP backends and CLI backends (Claude SDK, Gemini CLI) receive
- * the same context. Model swapping is seamless — the handoff data
- * is the same, the tools are the same, the instructions are the same.
+ * All backends receive the same context. Model swapping is seamless —
+ * the handoff data is the same, the tools are the same, the instructions
+ * are the same.
  */
 
 import fs from "node:fs";
@@ -25,10 +25,21 @@ import { estimateTokens } from "./token-budget.mjs";
 import { getIdentity } from "./identity.mjs";
 import { readVerdict, formatVerdictForContext, formatQualityStatsForContext, formatGuidanceForContext } from "./code-arbiter.mjs";
 import { getPaneDb } from "./pane-db.mjs";
+import { buildPeerSummary, pruneIntents } from "./intents.mjs";
+import { buildSkillListing, getActiveSkillContext, hydrateActiveSkills } from "./skill-registry.mjs";
+import { readState } from "./pane-system-prompt.mjs";
 
 const MEMORY_DIR = path.join(os.homedir(), ".pane", "memory");
 const PLAYBOOKS_DIR = path.join(os.homedir(), ".pane", "profile", "playbooks");
 const MODELS_DIR = path.join(os.homedir(), ".pane", "profile", "models");
+
+// ── Prune throttle ──────────────────────────────────────────────────────
+// pruneIntents rewrites the intent log to remove expired entries.
+// It's cheap but we don't need to do it every turn — once per 5 minutes
+// per project is plenty.
+
+const _lastPrune = new Map(); // projectId → timestamp
+const PRUNE_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
 
 // Playbooks are small by construction (≤30 principles per project, ≤15
 // global) but cap defensively — a runaway file must not eat the prompt.
@@ -137,7 +148,26 @@ export function orchestrateContext(projectId, options = {}) {
   const playbook = readPlaybook(projectId);
   if (playbook) parts.push(playbook);
 
-  // 3b. Model directives — counter-directives specific to the active model,
+  // 3a. Available skills — compact listing of installable skills (names + descriptions only).
+  //     Full instructions stay out of context until the model activates a skill.
+  const skillListing = buildSkillListing(options.projectRoot);
+  if (skillListing) parts.push(skillListing);
+
+  // 3b. Hydrate active skills from persistent state on cold start.
+  //     mergeState persists activeSkills to state.json; this call restores
+  //     them into the in-memory registry so they survive process restarts.
+  const state = readState(projectId);
+  if (state?.activeSkills?.length > 0) {
+    hydrateActiveSkills(projectId, state.activeSkills);
+  }
+
+  // 3c. Active skill context — injected when one or more skills are active.
+  //     Provides the full skill instructions so they persist across turns
+  //     without needing re-activation every turn.
+  const activeSkillContext = getActiveSkillContext(projectId, options.projectRoot);
+  if (activeSkillContext) parts.push(activeSkillContext);
+
+  // 3c. Model directives — counter-directives specific to the active model,
   //     earned from its own failure history in this workflow. Different models
   //     have different failure modes; this section adapts to whoever is driving.
   const modelProfile = readModelProfile(options.model);
@@ -146,12 +176,14 @@ export function orchestrateContext(projectId, options = {}) {
   // 4. Working in Pane instruction
   parts.push(
     "## Working in Pane\n\n" +
-    "Pane provides project context (about, brief, identity) at start. All other project state — " +
-    "file structure, working set, git status, session state, memories — is on-demand via tools. " +
+    "Pane provides project context (about, brief, identity) at start. Relevant memories from past sessions are automatically surfaced before you start working — you don't need to search for them first. All other project state — " +
+    "file structure, working set, git status, session state — is on-demand via tools. " +
     "Retrieve only what you need for the task at hand.\n\n" +
     "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. " +
+    "pane_update_memory when you discover something that refines or corrects a prior memory — rewrite it instead of adding a duplicate. " +
+    "pane_delete_memory when a memory is obsolete or wrong. Both accept an `id` — always recall first to get the id for reliable targeting. " +
     "pane_set_rule when the user states a preference. pane_set_about when you understand the project's purpose. " +
-    "A session that discovers but doesn't record forces re-discovery."
+    "A session that discovers but doesn't record forces re-discovery. A session that records but never corrects forces confusion."
   );
 
   // 4b. Terminal-state awareness (API turn-loop only — ask_user exists there).
@@ -171,19 +203,32 @@ export function orchestrateContext(projectId, options = {}) {
     );
   }
 
-  // 5. Arbiter findings — if unresolved errors exist, surface them immediately
+  // 5. Cross-thread awareness — if other threads are active on the same
+  //    project root, surface their file touches so this agent avoids collisions.
+  if (options.projectRoot) {
+    // Prune expired intents periodically (throttled)
+    const lastPrune = _lastPrune.get(projectId) || 0;
+    if (Date.now() - lastPrune > PRUNE_THROTTLE_MS) {
+      pruneIntents(projectId);
+      _lastPrune.set(projectId, Date.now());
+    }
+    const peerSummary = buildPeerSummary(options.projectRoot, projectId);
+    if (peerSummary) parts.push(peerSummary);
+  }
+
+  // 6. Arbiter findings — if unresolved errors exist, surface them immediately
   const verdict = readVerdict(projectId);
   const arbiterText = formatVerdictForContext(verdict);
   if (arbiterText) parts.push(arbiterText);
 
-  // 6. Quality trend — if concerning, nudge the model
+  // 7. Quality trend — if concerning, nudge the model
   try {
     const qdb = getPaneDb();
     const qualityText = formatQualityStatsForContext(qdb, projectId);
     if (qualityText) parts.push(qualityText);
   } catch {}
 
-  // 7. Proactive guidance from last verdict
+  // 8. Proactive guidance from last verdict
   if (verdict?.guidance) {
     const guidanceText = formatGuidanceForContext(verdict.guidance);
     if (guidanceText) parts.push(guidanceText);

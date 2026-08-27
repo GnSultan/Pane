@@ -43,6 +43,89 @@ import {
 
 import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 import { runTurnSentinel, recordQualityMetric, runDeepReview, saveDeepReview } from "./code-arbiter.mjs";
+import { classifySteerIntent } from "./steering-classifier.mjs";
+import { recordActivity } from "./intents.mjs";
+import { getAccessToken, getOAuthHeaders, getOAuthApiUrl, hasOAuthCredentials, invalidateCache } from "./claude-oauth.mjs";
+import { buildBillingHeaderValue } from "./claude-signing.mjs";
+import {
+  getAccessToken as getOpenAIAccessToken,
+  hasOAuthCredentials as hasOpenAIOAuthCredentials,
+  getCodexBaseUrl,
+  getAccountId as getOpenAIAccountId,
+  invalidateCache as invalidateOpenAICache,
+} from "./openai-oauth.mjs";
+import {
+  codexFetch,
+  codexModels,
+  buildResponsesRequest,
+  responsesEventToChatChunks,
+} from "./codex-client.mjs";
+import {
+  parseClaudeRateLimitHeaders,
+  calculateZaiCredits,
+  recordZaiUsage,
+  resetZaiUsage,
+  classifyZaiError,
+  formatZaiQuotaError,
+  getZaiPlanLimits,
+} from "./provider-monitor.mjs";
+import { mcpClient } from "./mcp-client.mjs";
+
+// ── OAuth body transformation helpers ─────────────────────────────────────
+
+/**
+ * Strip cache_control from a system block — billing and identity blocks
+ * must not carry cache_control when used as standalone entries.
+ *
+ * @param {{ type?: string, text?: string, cache_control?: object } | string} block
+ * @returns {{ type: string, text: string }}
+ */
+function stripCacheControl(block) {
+  if (typeof block === "string") return { type: "text", text: block };
+  const { cache_control: _, ...rest } = block;
+  return rest;
+}
+
+const TOOL_PREFIX = "mcp_";
+
+// Reverse mapping from prefixed tool names back to original internal names.
+// Populated by prefixToolName so that unprefixToolName can always recover
+// the exact internal name (e.g. mcp_Run_shell_command → run_shell_command,
+// mcp_TodoWrite → TodoWrite).
+const toolNameReverseMap = new Map();
+
+/**
+ * Prefix a tool name with mcp_ and uppercase the first character.
+ * Claude Code uses names like mcp_Bash, mcp_Read — only the first
+ * character after mcp_ is uppercased. Fully lowercase names
+ * (mcp_bash, mcp_read) are flagged as non-Claude-Code clients.
+ * Matches opencode-claude-auth's prefixName exactly.
+ *
+ * @param {string} name
+ * @returns {string}
+ */
+function prefixToolName(name) {
+  const prefixed = `${TOOL_PREFIX}${name.charAt(0).toUpperCase()}${name.slice(1)}`;
+  toolNameReverseMap.set(prefixed, name);
+  return prefixed;
+}
+
+/**
+ * Reverse prefixToolName: strips mcp_ prefix and lowercases first character.
+ * Used when processing tool_use blocks from API responses — the model returns
+ * mcp_-prefixed names but Pane's internal tool registry uses unprefixed names.
+ *
+ * @param {string} name
+ * @returns {string}
+ */
+function unprefixToolName(name) {
+  if (toolNameReverseMap.has(name)) return toolNameReverseMap.get(name);
+  if (name.startsWith(TOOL_PREFIX)) {
+    const rest = name.slice(TOOL_PREFIX.length);
+    return rest.charAt(0).toLowerCase() + rest.slice(1);
+  }
+  return name;
+}
 
 // ============================================================================
 // Context Window Manager — Pane-owned conversation lifecycle
@@ -355,6 +438,64 @@ const TOOL_DEFINITIONS = [
           },
         },
         required: ["type", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_update_memory",
+      description:
+        "Update an existing memory with refined or corrected content. Use when you discover something that refines, contradicts, or supersedes a prior memory — rewrite it instead of adding a duplicate. Always search first (pane_recall) to find the memory's id, then pass it here for reliable targeting. This keeps memory self-correcting instead of accumulating contradictions.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {
+            type: "string",
+            description: "The memory id from pane_recall or pane_knowledge_graph. Preferred — deterministic, no wording guessing required.",
+          },
+          type: {
+            type: "string",
+            enum: ["decision", "lesson", "pattern", "error_fix"],
+            description: "Category of the memory being updated",
+          },
+          content: {
+            type: "string",
+            description: "The approximate existing content to find and replace. Only needed if id is not provided — provide enough to uniquely identify the memory.",
+          },
+          newContent: {
+            type: "string",
+            description: "The refined content that replaces the old memory.",
+          },
+        },
+        required: ["newContent"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_delete_memory",
+      description:
+        "Delete a memory that is obsolete, incorrect, or no longer relevant. Use when a prior observation turns out to be wrong, or when a memory has been fully superseded and keeping it would create noise. Always search first (pane_recall) to get the memory's id, then pass it for reliable targeting. Content-based matching is fragile and often fails.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {
+            type: "string",
+            description: "The memory id from pane_recall or pane_knowledge_graph. Preferred — deterministic, no wording guessing required.",
+          },
+          type: {
+            type: "string",
+            enum: ["decision", "lesson", "pattern", "error_fix"],
+            description: "Category of the memory being deleted",
+          },
+          content: {
+            type: "string",
+            description: "The approximate content of the memory to delete. Only needed if id is not provided — provide enough to uniquely identify it.",
+          },
+        },
+        required: [],
       },
     },
   },
@@ -938,6 +1079,142 @@ const TOOL_DEFINITIONS = [
       parameters: { type: "object", properties: {}, required: [] },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "pane_check_intents",
+      description:
+        "Check whether other threads are actively working on this project root. Returns a summary of peer thread activity — what they're working on, tools they're using, files they've touched. Use before editing a file to avoid colliding with another agent's in-progress work.",
+      parameters: {
+        type: "object",
+        properties: {
+          file: {
+            type: "string",
+            description: "Optional: check for conflicts on a specific file path (relative to project root). Omit to get all active peer intents.",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  // ── Skill tools ──────────────────────────────────────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "pane_list_skills",
+      description:
+        "List all available skills with their names, descriptions, and tags. Use this to discover what specialized capabilities are available before deciding which to activate. Skills are composable capability packages — pentesting, frontend design, API building, code review, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Optional: filter skills by name or tag (e.g. 'frontend', 'security', 'design')",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_skill_info",
+      description:
+        "Get detailed information about a specific skill including its full instructions, compose rules (extends, conflicts, requires), and associated tools. Use this when considering whether to activate a skill or when you need to understand its compatibility with other active skills.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "The name of the skill to inspect",
+          },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "deactivate_skill",
+      description:
+        "Deactivates an active skill by name. Use this when a skill is no longer needed for the current task or when switching to a different domain. Does nothing if the skill isn't active.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "The name of the skill to deactivate",
+          },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_list_active_skills",
+      description:
+        "List currently active skills for this project. Use this to see which skills are loaded and influencing the current session — useful before deactivating or when context feels overloaded.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_install_skill",
+      description:
+        "Install a skill from a GitHub URL or local path. Skills are agent capability packages that specialize the model for specific domains. Supports github: URLs (e.g. 'github:owner/repo/path/to/skill') and local directory paths. Installed skills go to ~/.pane/skills/ and become available for activation immediately.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "The skill source — a github: URL (github:owner/repo/path/to/skill) or a local directory path.",
+          },
+          name: {
+            type: "string",
+            description: "Optional: rename the skill when installing. Defaults to the directory name.",
+          },
+        },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pane_lens_findings",
+      description:
+        "Interact with Lens punk findings — the background code analysts that watch the codebase. Use 'list' to read all undismissed findings grouped by punk. Use 'resolve' to mark findings as resolved after fixing them. Use 'run' to trigger a specific punk with an optional task directive.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["list", "resolve", "run"],
+            description: "What to do: list findings, resolve them, or run a punk.",
+          },
+          findingIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Finding IDs to resolve (required when action is 'resolve').",
+          },
+          punk: {
+            type: "string",
+            description: "Punk name to run, e.g. 'ghost', 'ash', 'sage' (required when action is 'run').",
+          },
+          task: {
+            type: "string",
+            description: "Optional task directive when running a punk, e.g. 'trace the auth flow and find any bypass'.",
+          },
+        },
+        required: ["action"],
+      },
+    },
+  },
 ];
 
 // ── Phase-based tool lists ─────────────────────────────────────────────────
@@ -950,12 +1227,16 @@ const WRITE_TOOL_NAMES = new Set([
   "replace",
   "pane_revert_change",
   "pane_remember",
+  "pane_update_memory",
+  "pane_delete_memory",
   "pane_set_rule",
   "pane_set_philosophy",
   "pane_set_about",
   "TodoWrite",
   "Task",
   "activate_skill",
+  "deactivate_skill",
+  "pane_install_skill",
   "save_memory",
 ]);
 
@@ -963,14 +1244,15 @@ function getToolsForPhase(phase) {
   // User-facing phases "think"/"analyze" and internal "planning" are all read-only.
   // "build"/"execution" get the full tool set.
   const readOnlyPhases = new Set(["planning", "think", "analyze"]);
-  if (readOnlyPhases.has(phase)) {
-    // Read/explore only — model cannot modify files during think/planning phases
-    return TOOL_DEFINITIONS.filter(
-      (t) => !WRITE_TOOL_NAMES.has(t.function.name),
-    );
-  }
-  // execution — all tools
-  return TOOL_DEFINITIONS;
+  const builtIn = readOnlyPhases.has(phase)
+    ? TOOL_DEFINITIONS.filter((t) => !WRITE_TOOL_NAMES.has(t.function.name))
+    : TOOL_DEFINITIONS;
+
+  // External MCP tools — always included regardless of phase. External tools
+  // are typically data-source connectors (Figma, GitHub) needed for context
+  // during planning and execution alike.
+  const external = mcpClient.getExternalTools();
+  return [...builtIn, ...external];
 }
 
 function getAnthropicToolsForPhase(phase) {
@@ -1104,6 +1386,40 @@ function _zaiContextLength(id) {
   if (id.includes("glm-4.6")) return 128000;
   if (id.includes("glm-4.5")) return 128000;
   return 128000;
+}
+
+// ─── Kimi (Moonshot) model helpers ──────────────────────────────────────────
+
+function _kimiDisplayName(id) {
+  // moonshot-v1-8k → Kimi V1 8K, kimi-k2 → Kimi K2
+  return id
+    .replace(/^moonshot-/, "Kimi ")
+    .replace(/^kimi-/, "Kimi ")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function _kimiContextLength(id) {
+  if (id.includes("128k") || id.includes("moonshot-v1-128k")) return 131072;
+  if (id.includes("32k")  || id.includes("moonshot-v1-32k"))  return  32768;
+  if (id.includes("8k")   || id.includes("moonshot-v1-8k"))   return   8192;
+  if (id.includes("kimi-k2"))                                  return 131072;
+  return 131072; // Kimi default
+}
+
+// ─── OpenAI model helpers ────────────────────────────────────────────────────
+
+function _openaiContextLength(id) {
+  const lower = id.toLowerCase();
+  if (lower.includes("gpt-4.1"))  return 1047576; // 1M context
+  if (lower.includes("gpt-4.5"))  return 131072;
+  if (lower.includes("gpt-4o"))   return 128000;
+  if (lower.includes("gpt-4-turbo")) return 128000;
+  if (lower.startsWith("o1"))     return 200000;
+  if (lower.startsWith("o3"))     return 200000;
+  if (lower.startsWith("o4"))     return 200000;
+  if (lower.includes("codex"))    return 192000;
+  return 128000; // sensible default
 }
 
 // ─── Anthropic model helpers ─────────────────────────────────────────────────
@@ -1393,14 +1709,31 @@ function validateMessageSequence(messages, provider) {
 function stripToolHistory(messages) {
   return messages
     .map((msg) => {
+      // OpenAI: strip tool_calls from assistant messages
       if (msg.role === "assistant" && msg.tool_calls) {
         const cleaned = { ...msg };
         delete cleaned.tool_calls;
         return cleaned;
       }
+      // Anthropic: strip tool_use blocks from assistant content, keep text
+      if (msg.role === "assistant" && Array.isArray(msg.content) && msg.content.some((c) => c.type === "tool_use")) {
+        const textOnly = msg.content.filter((c) => c.type !== "tool_use");
+        return { ...msg, content: textOnly.length > 0 ? textOnly : "" };
+      }
       return msg;
     })
-    .filter((msg) => msg.role !== "tool");
+    .filter((msg) => {
+      // OpenAI: drop role:"tool" messages
+      if (msg.role === "tool") return false;
+      // Anthropic: drop role:"user" messages that are purely tool_result blocks
+      if (
+        msg.role === "user" &&
+        Array.isArray(msg.content) &&
+        msg.content.length > 0 &&
+        msg.content.every((c) => c.type === "tool_result")
+      ) return false;
+      return true;
+    });
 }
 
 export class ApiBackend extends PunkBackend {
@@ -1411,6 +1744,9 @@ export class ApiBackend extends PunkBackend {
   constructor(onEvent) {
     super(onEvent);
     this.activeRequests = new Map(); // projectId -> AbortController
+    this.activeSpawnPromises = new Map(); // projectId -> in-flight spawn() promise, so abort() can wait for real termination
+    this.activeTaskAnchors = new Map(); // projectId -> { prompt, startedAt } for the running task, used by the steering classifier
+    this.pendingSteerMessages = new Map(); // projectId -> [{ text, timestamp }] waiting to be injected at the next turn boundary
     this.requestStates = new Map(); // projectId -> { accumulated: string, toolUses: Map }
     this.paneDir = path.join(os.homedir(), ".pane");
     this.toolExecutors = new Map(); // projectId -> ToolExecutor
@@ -1442,6 +1778,13 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
+  setRunPunk(fn) {
+    this._runPunk = fn;
+    for (const executor of this.toolExecutors.values()) {
+      if (executor.setRunPunk) executor.setRunPunk(fn);
+    }
+  }
+
   getToolExecutor(projectId, projectRoot) {
     let executor = this.toolExecutors.get(projectId);
     if (!executor) {
@@ -1456,6 +1799,9 @@ export class ApiBackend extends PunkBackend {
       }
       if (this._agentCall && executor.setAgentCall) {
         executor.setAgentCall(this._agentCall);
+      }
+      if (this._runPunk && executor.setRunPunk) {
+        executor.setRunPunk(this._runPunk);
       }
       this.toolExecutors.set(projectId, executor);
     }
@@ -1480,6 +1826,31 @@ export class ApiBackend extends PunkBackend {
       const provider = rawProvider.replace(/-api$/, "");
 
       let apiKey = settings.http_api_keys?.[provider] || "";
+      let authType = apiKey ? "api_key" : undefined;
+
+      // If no API key for anthropic, try OAuth tokens from Claude Code keychain
+      if (provider === "anthropic" && !apiKey) {
+        try {
+          if (await hasOAuthCredentials()) {
+            authType = "oauth";
+            console.log("[http] getApiConfig: using Claude OAuth tokens (no API key)");
+          }
+        } catch (err) {
+          console.warn("[http] getApiConfig: OAuth check failed:", err.message);
+        }
+      }
+
+      // If no API key for openai, try OAuth tokens from Codex CLI
+      if (provider === "openai" && !apiKey) {
+        try {
+          if (hasOpenAIOAuthCredentials()) {
+            authType = "openai-oauth";
+            console.log("[http] getApiConfig: using OpenAI OAuth tokens (Codex CLI, no API key)");
+          }
+        } catch (err) {
+          console.warn("[http] getApiConfig: OpenAI OAuth check failed:", err.message);
+        }
+      }
 
       const baseUrl = settings.http_base_urls?.[provider];
 
@@ -1488,23 +1859,27 @@ export class ApiBackend extends PunkBackend {
         .filter(([, v]) => !!v)
         .map(([k]) => k);
       console.log(
-        `[http] getApiConfig: provider=${provider}, hasKey=${!!apiKey}, baseUrl=${baseUrl}, presentKeys=[${presentKeys.join(",")}]`,
+        `[http] getApiConfig: provider=${provider}, hasKey=${!!apiKey}, authType=${authType || "api_key"}, baseUrl=${baseUrl}, presentKeys=[${presentKeys.join(",")}]`,
       );
-      return { provider, apiKey, baseUrl };
+      return { provider, apiKey, baseUrl, authType };
     } catch {
       return {
         provider: providerOverride || "deepseek",
         apiKey: "",
         baseUrl: undefined,
+        authType: undefined,
       };
     }
   }
 
   validateApiConfig(config) {
-    if (!config.apiKey) {
-      throw new Error(
-        `No API key configured. Open settings (\u2318,) and add a key under API Keys.`,
-      );
+    if (!config.apiKey && config.authType !== "oauth" && config.authType !== "openai-oauth") {
+      const msg = config.provider === "anthropic"
+        ? `Not signed in to Claude. Open settings (\u2318,) and click "sign in with claude.ai", or add an Anthropic API key.`
+        : config.provider === "openai"
+          ? `No OpenAI API key or ChatGPT subscription found. Run "npx @openai/codex login" to sign in with your ChatGPT account, or add an OpenAI API key in settings.`
+          : `No API key configured. Open settings (\u2318,) and add a key under API Keys.`;
+      throw new Error(msg);
     }
     return true;
   }
@@ -1517,6 +1892,7 @@ export class ApiBackend extends PunkBackend {
 
     const isOpenAI =
       isDeepSeek ||
+      provider === "openai" ||
       provider === "z-ai" ||
       provider === "kimi" ||
       provider === "openrouter" ||
@@ -1591,29 +1967,53 @@ export class ApiBackend extends PunkBackend {
         // System messages with tool_results bypass the normal tool handler
         // below, so we handle them here.
         if (
-          isOpenAI &&
           Array.isArray(content) &&
           content.some((c) => c.type === "tool_result")
         ) {
-          for (const c of content) {
-            if (c.type === "tool_result") {
-              const res = {
-                role: "tool",
-                tool_call_id: c.tool_use_id,
-                name: c.name,
-                content:
-                  typeof c.content === "string"
-                    ? c.content
-                    : safeStringify(c.content),
-                is_error: c.is_error,
-              };
-              if (pendingToolCallIds.has(res.tool_call_id)) {
-                normalized.push(res);
-                pendingToolCallIds.delete(res.tool_call_id);
-              } else {
-                console.warn(
-                  `[http] Pruning orphaned tool result (from system msg) for ${res.tool_call_id}`,
-                );
+          if (isOpenAI) {
+            for (const c of content) {
+              if (c.type === "tool_result") {
+                const res = {
+                  role: "tool",
+                  tool_call_id: c.tool_use_id,
+                  name: c.name,
+                  content:
+                    typeof c.content === "string"
+                      ? c.content
+                      : safeStringify(c.content),
+                  is_error: c.is_error,
+                };
+                if (pendingToolCallIds.has(res.tool_call_id)) {
+                  normalized.push(res);
+                  pendingToolCallIds.delete(res.tool_call_id);
+                } else {
+                  console.warn(
+                    `[http] Pruning orphaned tool result (from system msg) for ${res.tool_call_id}`,
+                  );
+                }
+              }
+            }
+          } else {
+            // Anthropic: convert system-stored tool_result blocks to role:"user" batched message
+            for (const c of content) {
+              if (c.type === "tool_result") {
+                const block = {
+                  type: "tool_result",
+                  tool_use_id: c.tool_use_id,
+                  content: typeof c.content === "string" ? c.content : safeStringify(c.content),
+                };
+                if (c.is_error) block.is_error = true;
+                pendingToolCallIds.delete(c.tool_use_id);
+                const prev = normalized[normalized.length - 1];
+                if (
+                  prev?.role === "user" &&
+                  Array.isArray(prev.content) &&
+                  prev.content.every((b) => b.type === "tool_result")
+                ) {
+                  prev.content.push(block);
+                } else {
+                  normalized.push({ role: "user", content: [block] });
+                }
               }
             }
           }
@@ -1725,8 +2125,49 @@ export class ApiBackend extends PunkBackend {
             lastToolCallAssistantIndex = normalized.length - 1;
           }
         } else {
-          // Anthropic/Gemini/etc. — preserve original structure
-          normalized.push(msg);
+          // Anthropic/Gemini/etc.
+          // History may contain assistant messages in OpenAI tool_calls format, or
+          // Anthropic tool_use blocks whose input was accidentally stringified.
+          // Both cause HTTP 400 ("Input should be an object"). Normalize here.
+          if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+            // OpenAI-style tool_calls → Anthropic tool_use content blocks
+            const textContent =
+              typeof content === "string"
+                ? content
+                : Array.isArray(content)
+                  ? content.filter((c) => c.type === "text").map((c) => c.text).join("\n")
+                  : "";
+            const toolUseBlocks = msg.tool_calls.map((tc) => {
+              let input = tc.function?.arguments ?? {};
+              if (typeof input === "string") {
+                try { input = JSON.parse(input); } catch { input = {}; }
+              }
+              if (input === null || typeof input !== "object") input = {};
+              return { type: "tool_use", id: tc.id, name: tc.function?.name, input };
+            });
+            const blocks = [];
+            if (textContent) blocks.push({ type: "text", text: textContent });
+            blocks.push(...toolUseBlocks);
+            normalized.push({ role: "assistant", content: blocks });
+            toolUseBlocks.forEach((tu) => pendingToolCallIds.add(tu.id));
+            lastToolCallAssistantIndex = normalized.length - 1;
+          } else if (Array.isArray(content) && content.some((c) => c.type === "tool_use")) {
+            // Already Anthropic format — ensure input is a plain object, not a string
+            const fixedContent = content.map((c) => {
+              if (c.type !== "tool_use") return c;
+              let input = c.input;
+              if (typeof input === "string") {
+                try { input = JSON.parse(input); } catch { input = {}; }
+              }
+              if (input === null || typeof input !== "object") input = {};
+              return { ...c, input };
+            });
+            normalized.push({ ...msg, content: fixedContent });
+            fixedContent.filter((c) => c.type === "tool_use").forEach((c) => pendingToolCallIds.add(c.id));
+            lastToolCallAssistantIndex = normalized.length - 1;
+          } else {
+            normalized.push(msg);
+          }
         }
         continue;
       }
@@ -1775,10 +2216,107 @@ export class ApiBackend extends PunkBackend {
               );
             }
           }
+        } else if (role === "tool") {
+          // Anthropic/Gemini: role:"tool" is not valid — convert to role:"user"
+          // with type:"tool_result" content blocks. Multiple consecutive tool
+          // results (one per tool call) must be batched into a single user turn.
+          //
+          // Two shapes reach here: the journal stores tool results as flat
+          // single messages (tool_call_id on the message itself); the renderer's
+          // conversation history stores them as already-batched Anthropic-native
+          // blocks (tool_use_id nested inside each content block). Handle both —
+          // reading `.tool_call_id` off a batched message produces `undefined`,
+          // which JSON.stringify silently drops, causing a 400
+          // "tool_use_id: Field required" from the API.
+          // Anthropic rejects any tool_result whose tool_use_id doesn't have a
+          // matching tool_use in the immediately preceding assistant message —
+          // e.g. when the renderer's slice(-50) truncation cuts between a
+          // tool_use and its tool_result. Prune orphans instead of sending
+          // them, same as the isOpenAI branch above already does.
+          const newBlocks = Array.isArray(content)
+            ? content
+                .filter((c) => c.type === "tool_result")
+                .filter((c) => {
+                  if (pendingToolCallIds.has(c.tool_use_id)) return true;
+                  console.warn(
+                    `[http] Pruning orphaned tool result for ${c.tool_use_id}`,
+                  );
+                  return false;
+                })
+                .map((c) => {
+                  pendingToolCallIds.delete(c.tool_use_id);
+                  // Rebuild clean — the renderer's stored blocks carry extra
+                  // bookkeeping fields (e.g. `name`, for UI display) that
+                  // Anthropic's tool_result schema rejects outright.
+                  const block = {
+                    type: "tool_result",
+                    tool_use_id: c.tool_use_id,
+                    content:
+                      typeof c.content === "string"
+                        ? c.content
+                        : safeStringify(c.content),
+                  };
+                  if (c.is_error) block.is_error = true;
+                  return block;
+                })
+            : (() => {
+                const resolved = resolveResultRef(msg);
+                if (!pendingToolCallIds.has(resolved.tool_call_id)) {
+                  console.warn(
+                    `[http] Pruning orphaned tool result for ${resolved.tool_call_id}`,
+                  );
+                  return [];
+                }
+                const block = {
+                  type: "tool_result",
+                  tool_use_id: resolved.tool_call_id,
+                  content:
+                    typeof resolved.content === "string"
+                      ? resolved.content
+                      : safeStringify(resolved.content),
+                };
+                if (resolved.is_error) block.is_error = true;
+                pendingToolCallIds.delete(resolved.tool_call_id);
+                return [block];
+              })();
+          // Merge into the previous user message if it already holds only
+          // tool_result blocks (same assistant turn), otherwise open a new one.
+          const prev = normalized[normalized.length - 1];
+          if (
+            prev?.role === "user" &&
+            Array.isArray(prev.content) &&
+            prev.content.length > 0 &&
+            prev.content.every((c) => c.type === "tool_result")
+          ) {
+            prev.content.push(...newBlocks);
+          } else if (newBlocks.length > 0) {
+            normalized.push({ role: "user", content: newBlocks });
+          }
         } else {
-          // Non-OpenAI (Anthropic, Gemini): resolve _resultRef before
-          // passing through — these providers don't support the envelope format
-          normalized.push(resolveResultRef(msg));
+          // Already role:"user" with tool_result content blocks (Anthropic native format) —
+          // e.g. messages Pane's own turn loop appends directly mid-session. Same orphan
+          // risk as the other two branches above (journal replay can start mid-turn, with
+          // no preceding tool_use in the replayed slice), so prune the same way instead of
+          // passing every block through unconditionally.
+          const resolved = resolveResultRef(msg);
+          if (Array.isArray(resolved.content)) {
+            const filtered = resolved.content.filter((c) => {
+              if (c.type !== "tool_result") return true;
+              if (pendingToolCallIds.has(c.tool_use_id)) {
+                pendingToolCallIds.delete(c.tool_use_id);
+                return true;
+              }
+              console.warn(
+                `[http] Pruning orphaned tool result for ${c.tool_use_id}`,
+              );
+              return false;
+            });
+            if (filtered.length > 0) {
+              normalized.push({ ...resolved, content: filtered });
+            }
+          } else {
+            normalized.push(resolved);
+          }
         }
         continue;
       }
@@ -1803,30 +2341,67 @@ export class ApiBackend extends PunkBackend {
     }
 
     // --- 4. AUTO-HEAL: Close orphaned tool calls ---
-    // Insert fake results at the correct position — right after the assistant
-    // message that made those tool calls — instead of appending at the end.
-    // Skip for non-tool DeepSeek models — they have no tool support so tool
-    // messages must never appear in the history regardless.
-    if (isOpenAI && !isReasoner && pendingToolCallIds.size > 0) {
-      console.warn(
-        `[http] history sequence error: ${pendingToolCallIds.size} tool calls missing results. Healing...`,
-      );
-      const fakeResults = [];
-      for (const id of pendingToolCallIds) {
-        fakeResults.push({
-          role: "tool",
-          tool_call_id: id,
-          content:
-            "Error: Turn was interrupted before tool result could be processed.",
-          is_error: true,
-        });
+    // Walk backward through normalized[] and insert fake results IMMEDIATELY
+    // AFTER each assistant that has orphaned tool_use blocks. The old code
+    // inserted all fake results at a single position (lastToolCallAssistantIndex+1),
+    // which violated Anthropic's "tool_result must be in the NEXT message"
+    // rule when multiple assistants at different positions had orphans.
+    //
+    // We iterate backward so splice insertions don't shift indices of
+    // assistants we haven't processed yet.
+    if (!isReasoner && pendingToolCallIds.size > 0) {
+      let healed = 0;
+      for (let i = normalized.length - 1; i >= 0; i--) {
+        const msg = normalized[i];
+        if (msg.role !== "assistant") continue;
+
+        // Collect orphaned tool call IDs from this specific assistant
+        const orphanIds = [];
+
+        // OpenAI-style tool_calls
+        if (Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            if (tc.id && pendingToolCallIds.has(tc.id)) orphanIds.push(tc.id);
+          }
+        }
+        // Anthropic-style tool_use content blocks
+        if (Array.isArray(msg.content)) {
+          for (const c of msg.content) {
+            if (c.type === "tool_use" && c.id && pendingToolCallIds.has(c.id)) {
+              orphanIds.push(c.id);
+            }
+          }
+        }
+
+        if (orphanIds.length === 0) continue;
+
+        if (isOpenAI) {
+          const fakeResults = orphanIds.map((id) => ({
+            role: "tool",
+            tool_call_id: id,
+            content:
+              "Error: Turn was interrupted before tool result could be processed.",
+            is_error: true,
+          }));
+          normalized.splice(i + 1, 0, ...fakeResults);
+        } else {
+          // Anthropic: batch into a single user message with tool_result blocks
+          const fakeBlocks = orphanIds.map((id) => ({
+            type: "tool_result",
+            tool_use_id: id,
+            content:
+              "Error: Turn was interrupted before tool result could be processed.",
+            is_error: true,
+          }));
+          normalized.splice(i + 1, 0, { role: "user", content: fakeBlocks });
+        }
+        healed += orphanIds.length;
       }
-      // Insert after the last assistant with tool_calls, or fall back to append
-      const insertAt = Math.min(
-        lastToolCallAssistantIndex + 1,
-        normalized.length,
-      );
-      normalized.splice(insertAt, 0, ...fakeResults);
+      if (healed > 0) {
+        console.warn(
+          `[http] ${isOpenAI ? "OpenAI" : "Anthropic"}: healed ${healed} orphaned tool calls with fake results`,
+        );
+      }
     }
 
     // --- 5. DEFENSIVE SANITIZATION (OpenAI providers) ---
@@ -1897,7 +2472,28 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
+  // Thin wrapper around _spawnInner that tracks the in-flight promise per
+  // project. abort() awaits this before returning — without it, abort()
+  // only signals the AbortController and returns almost immediately, while
+  // the aborted call's own catch/finally (journal clearing, handoff writes)
+  // keeps running in the background. A renderer that immediately sends a
+  // follow-up message after abort would then race a brand-new spawn() call
+  // against the old one's cleanup, both touching the same on-disk journal
+  // file with no synchronization — corrupting it (e.g. interleaved/partial
+  // writes producing an orphaned tool_result with no preceding tool_use).
   async spawn(request) {
+    const promise = this._spawnInner(request);
+    this.activeSpawnPromises.set(request.projectId, promise);
+    try {
+      return await promise;
+    } finally {
+      if (this.activeSpawnPromises.get(request.projectId) === promise) {
+        this.activeSpawnPromises.delete(request.projectId);
+      }
+    }
+  }
+
+  async _spawnInner(request) {
     // Reset healing flags for this new session — ensured fresh regardless
     // of previous spawn's state (e.g. auto-resume re-enters spawn).
     this._healAttemptedThisTurn = false;
@@ -1908,6 +2504,9 @@ export class ApiBackend extends PunkBackend {
 
     const abortController = new AbortController();
     this.activeRequests.set(request.projectId, abortController);
+    // Anchor for the steering classifier — fixed for this task's lifetime,
+    // not updated as steer messages land (see classifySteerIntent).
+    this.activeTaskAnchors.set(request.projectId, { prompt: request.prompt, startedAt: Date.now() });
     const spawnStartTime = Date.now();
     let journal = null; // Hoisted — opened inside try, closed in finally
 
@@ -1923,6 +2522,43 @@ export class ApiBackend extends PunkBackend {
         `[http] spawn: request.provider=${request.provider}, resolved.provider=${apiConfig.provider}, model=${request.model}, hasKey=${!!apiConfig.apiKey}, prefix=${apiConfig.apiKey?.slice(0, 10)}`,
       );
       this.validateApiConfig(apiConfig);
+
+      // ── Connect to external MCP servers ──
+      // Lazy-connect before the first turn so external tools are available
+      // when the tool list is assembled. Already-connected servers are skipped.
+      // Non-blocking on failure — external tools just won't appear.
+      try {
+        await mcpClient.ensureConnected();
+      } catch (err) {
+        console.warn(`[http] MCP client connection failed (non-blocking): ${err.message}`);
+      }
+
+      // ── Build MCP awareness text for the system prompt ──
+      // The model receives external tools in its tools[] array, but without
+      // prompt-level awareness it doesn't know they exist or what they do.
+      // The namespaced names (ext__server__toolname) are opaque otherwise.
+      const mcpStatus = mcpClient.getStatus();
+      const connectedServers = mcpStatus.filter(
+        (s) => s.status === "connected" && s.toolCount > 0,
+      );
+      let _mcpAwareness = "";
+      if (connectedServers.length > 0) {
+        const lines = connectedServers.map((s) => {
+          const tools = mcpClient.getExternalTools()
+            .filter(
+              (t) => t.function.name.startsWith(`ext__${s.name}__`),
+            )
+            .map(
+              (t) =>
+                `  - ${t.function.name}: ${t.function.description?.slice(0, 120) || "External tool"}`,
+            );
+          return `${s.name} (${s.toolCount} tools):\n${tools.join("\n")}`;
+        });
+        _mcpAwareness =
+          "You have access to external integrations via MCP servers. " +
+          "These are real tools connected to external services — use them directly when the user asks about those services:\n\n" +
+          lines.join("\n\n");
+      }
 
       const gitStatus = await this.getGitStatus(request.workingDir);
 
@@ -1974,6 +2610,35 @@ export class ApiBackend extends PunkBackend {
         }
       }
 
+      // ── Proactive Memory Retrieval ──
+      // The model shouldn't have to remember to search memory — the system
+      // does it structurally. Search the brain for memories relevant to the
+      // user's prompt and inject them into the session tier BEFORE the model
+      // starts reasoning. This is the difference between passive memory
+      // (waiting to be asked) and active memory (surfacing itself).
+      let proactiveMemories = null;
+      if (this._brainRequest && request.prompt) {
+        try {
+          const memResult = await Promise.race([
+            this._brainRequest("search", { query: request.prompt, projectId: request.projectId, limit: 5 }),
+            new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 1500)),
+          ]);
+          const memories = (memResult?.results || []).filter(r => r.score > 0.35);
+          if (memories.length > 0) {
+            const lines = ["[Pane Memory — proactively surfaced for this task]"];
+            for (const m of memories) {
+              const idTag = m.id ? ` (id: ${m.id})` : "";
+              lines.push(`- [${m.type}]${idTag} ${m.content}`);
+            }
+            lines.push("[Consider these when working. Use pane_recall for deeper search.]");
+            proactiveMemories = lines.join("\n");
+          }
+        } catch (err) {
+          // Non-fatal — proactive retrieval is a bonus, not a dependency
+          console.warn(`[http] proactive memory retrieval failed: ${err.message}`);
+        }
+      }
+
       // ── Fetch & embed turn summaries (needed for session tier semantic pool) ──
       // Moved up to run before orchestrator so the semantic pool can be injected
       // into systemTiers.session. Reuses the same queryEmbB64 computed above.
@@ -2014,6 +2679,7 @@ export class ApiBackend extends PunkBackend {
         historyLength,
         backend: "http",
         model: request.model,
+        projectRoot: request.workingDir,
         sqliteChanges,
         conversationTokens,
         queryEmbeddingBase64: queryEmbB64,
@@ -2054,6 +2720,19 @@ export class ApiBackend extends PunkBackend {
         if (systemTiers) systemTiers.turn += `\n\n${request.escalationHint}`;
       }
 
+      // ── Inject proactive memories into session tier ──
+      // These are brain memories that were proactively retrieved above based
+      // on the user's prompt. They go into the session tier alongside the
+      // semantic turn pool so both are available during tool-call loops.
+      if (proactiveMemories) {
+        if (systemTiers) {
+          systemTiers.session = (systemTiers.session || "") + "\n\n" + proactiveMemories;
+        }
+        // Always inject into systemPrompt — even if tiers aren't available
+        // (e.g. systemPromptOverride path, or orchestrator didn't expose tiers).
+        systemPrompt += "\n\n" + proactiveMemories;
+      }
+
       // ── Inject semantic turn pool into session tier ──
       // The pool surfaces the most relevant past turns for the current query.
       // Injected into the session tier so auto-caching providers (DeepSeek, Kimi)
@@ -2080,6 +2759,17 @@ export class ApiBackend extends PunkBackend {
         }
       }
 
+      // ── Inject MCP external tool awareness into turn tier ──
+      // External MCP tools (ext__server__toolname) are in the tools[] array,
+      // but without prompt-level context the model doesn't know they exist.
+      // This goes in the turn tier — connections can change between turns.
+      if (_mcpAwareness) {
+        systemPrompt += "\n\n" + _mcpAwareness;
+        if (systemTiers) {
+          systemTiers.turn = (systemTiers.turn || "") + "\n\n" + _mcpAwareness;
+        }
+      }
+
       // Emit synthetic init event after config is validated
       this.onEvent(
         request.projectId,
@@ -2099,73 +2789,106 @@ export class ApiBackend extends PunkBackend {
       );
 
       // Attach tier metadata to the system message for prepareRequest() to consume
-      const messages = [
+      let messages = [
         { role: "system", content: systemPrompt, _tiers: systemTiers },
       ];
 
-      // ── Session Resume: journal-first message loading ─────────────────────
-      // Check if a previous session died mid-work. If a journal exists and is
-      // fresh, replay it instead of using the renderer's truncated history.
-      // The journal has the FULL conversation state including tool results,
-      // auto-continuation prompts, and responses that the renderer may never
-      // have received (stream died before delivery).
+      // ── Session Resume: completeness-first message loading ────────────────
+      // Two sources of truth exist: the renderer's request.history (built from
+      // conversation.messages, authoritative in the normal case) and the
+      // on-disk journal (a per-turn crash-safety net, cleared on every clean
+      // turn completion but left behind on error/abort — see the `finally`
+      // block at the bottom of spawn()). Because the journal is wiped on
+      // success and reopened per-turn, a journal found on disk almost never
+      // holds the full conversation — it holds whatever fragment was appended
+      // during the single turn that errored or was aborted. Blindly preferring
+      // "any resumable journal" over request.history meant one failed/aborted
+      // turn silently replaced the real conversation with that fragment on
+      // every turn afterward (up to canResume's 4h window) — the model would
+      // appear to forget everything, including its own prior replies. This is
+      // NOT provider-specific, but explicit-cache providers (Anthropic) have
+      // more failure surface (thinking-signature checks, cache_control TTL
+      // ordering, OAuth billing/tool-name validation) than other providers,
+      // so it manifested almost exclusively there.
       //
-      // Cache impact: messages replay verbatim, so Anthropic's prefix cache
-      // hits on everything the model already saw. The system prompt is fresh
-      // (it changes per-session), but frozen/session tiers still cache-hit
-      // if content hasn't changed.
+      // Fix: only trust the journal when it's actually MORE complete than
+      // request.history — i.e. genuine crash recovery, where the renderer's
+      // own state is missing or behind what the backend already journaled
+      // (stream died before delivery). Otherwise request.history wins, same
+      // as every other provider, with no special-casing.
       const isNewConversation =
         !request.history || request.history.length === 0;
       let journalResumed = false;
       let lastProgress = null;
 
-      if (!isNewConversation) {
-        const resumeCheck = canResume(request.projectId);
-        if (resumeCheck.resumable && resumeCheck.meta) {
-          const journalData = replay(request.projectId);
-          if (journalData.messages.length > 0) {
-            // Journal has more context than the renderer's slice(-20) —
-            // use it as the source of truth
-            for (const msg of journalData.messages) {
-              messages.push(msg);
-            }
-            lastProgress = journalData.progress;
-            journalResumed = true;
-            console.log(
-              `[http] ⟲ RESUMED from journal: ${journalData.messages.length} messages, ` +
-                `last activity ${Math.round((Date.now() - resumeCheck.meta.lastAppendAt) / 1000)}s ago` +
-                (lastProgress
-                  ? `, progress: ${lastProgress.accomplishments?.length || 0} accomplishments`
-                  : ""),
-            );
-
-            // Surface the resume to the UI
-            this.onEvent(
-              request.projectId,
-              {
-                event: "status",
-                data: { message: "resuming previous session..." },
-              },
-              request.requestId,
-            );
+      const clientMessages = [];
+      if (request.history) {
+        for (const msg of request.history) {
+          if (msg.type === "user") {
+            clientMessages.push({ role: "user", content: msg.content });
+          } else if (msg.type === "assistant") {
+            clientMessages.push({ role: "assistant", content: msg.content });
+          } else if (msg.type === "system") {
+            // In Pane history, 'system' role is used for tool results (from local workers)
+            clientMessages.push({ role: "tool", content: msg.content });
           }
         }
       }
 
-      // Fall back to renderer history if no journal resume
-      if (!journalResumed && request.history) {
-        for (const msg of request.history) {
-          if (msg.type === "user") {
-            messages.push({
-              role: "user",
-              content: msg.content,
-            });
-          } else if (msg.type === "assistant") {
-            messages.push({ role: "assistant", content: msg.content });
-          } else if (msg.type === "system") {
-            // In Pane history, 'system' role is used for tool results (from local workers)
-            messages.push({ role: "tool", content: msg.content });
+      // Only ever consult the journal when the renderer already has an
+      // ongoing conversation. A genuinely new conversation (empty
+      // request.history) must never inherit a stray journal fragment left
+      // behind by an earlier, unrelated failed attempt on the same project —
+      // the `>=` completeness check below is trivially satisfied by any
+      // non-empty journal when clientMessages.length is 0, which resurrected
+      // old orphaned fragments (e.g. a dangling tool_result with no preceding
+      // tool_use) as if they were the current conversation.
+      const resumeCheck = isNewConversation
+        ? { resumable: false }
+        : canResume(request.projectId);
+      if (resumeCheck.resumable && resumeCheck.meta) {
+        const journalData = replay(request.projectId);
+        if (
+          journalData.messages.length > 0 &&
+          journalData.messages.length >= clientMessages.length
+        ) {
+          // Journal is at least as complete as what the renderer has —
+          // genuine crash recovery. Use it as the source of truth.
+          for (const msg of journalData.messages) {
+            messages.push(msg);
           }
+          lastProgress = journalData.progress;
+          journalResumed = true;
+          console.log(
+            `[http] ⟲ RESUMED from journal: ${journalData.messages.length} messages ` +
+              `(renderer had ${clientMessages.length}), ` +
+              `last activity ${Math.round((Date.now() - resumeCheck.meta.lastAppendAt) / 1000)}s ago` +
+              (lastProgress
+                ? `, progress: ${lastProgress.accomplishments?.length || 0} accomplishments`
+                : ""),
+          );
+
+          // Surface the resume to the UI
+          this.onEvent(
+            request.projectId,
+            {
+              event: "status",
+              data: { message: "resuming previous session..." },
+            },
+            request.requestId,
+          );
+        } else if (journalData.messages.length > 0) {
+          console.log(
+            `[http] ⊘ Ignoring stale journal fragment: ${journalData.messages.length} messages ` +
+              `vs renderer's ${clientMessages.length} — renderer history is more complete`,
+          );
+        }
+      }
+
+      // Renderer history wins whenever the journal isn't strictly more complete
+      if (!journalResumed) {
+        for (const msg of clientMessages) {
+          messages.push(msg);
         }
       }
 
@@ -2272,6 +2995,30 @@ export class ApiBackend extends PunkBackend {
           role: "user",
           content: [{ type: "text", text: resumeParts.join("\n") }],
         });
+      } else if (request.wasInterrupted) {
+        // ── User-initiated abort, not a crash ──────────────────────────────
+        // The renderer's history (already loaded into `messages` above) has
+        // the full, real conversation up to the stop, including whatever the
+        // model had started saying/doing — the model just has no explicit
+        // signal that IT was cut off rather than the task being finished or
+        // failed. Without this, a turn ending abruptly (mid-sentence, or a
+        // tool call whose result got auto-healed into an interruption error
+        // by normalizeMessages) reads ambiguously, and the model tends to
+        // treat the next message as starting a new task instead of steering
+        // the one it was already doing.
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "[The previous turn was stopped by you the user before it finished — not a crash, not a failure. " +
+                "Everything above actually happened; treat it as real, ongoing context. " +
+                "The message below is a correction or new direction for that same task — incorporate it and continue, do not restart from scratch or re-do work already done.]\n\n" +
+                request.prompt,
+            },
+          ],
+        });
       } else {
         messages.push({
           role: "user",
@@ -2291,6 +3038,18 @@ export class ApiBackend extends PunkBackend {
 
       // Journal the new user message (the one we just pushed)
       journal.append(messages[messages.length - 1]);
+
+      // ── Cross-thread activity heartbeat ──
+      // Record a turn_start activity so peer threads on the same root can
+      // see this thread is active and what it's working on. This fires on
+      // every turn, not just file writes — an agent that's only reading or
+      // planning still shows up to peers.
+      try {
+        recordActivity(request.projectId, {
+          activityType: "turn_start",
+          detail: (request.prompt || "").slice(0, 200),
+        });
+      } catch {}
 
       let turn = 0;
       const maxTurns = 500;
@@ -2317,6 +3076,7 @@ export class ApiBackend extends PunkBackend {
         const state = {
           accumulated: "",
           thinking: "", // Track reasoning for resilience checks
+          thinkingSignature: null, // Anthropic signature for thinking blocks (required for multi-turn)
           toolUses: new Map(),
           finishReason: null,
           model: resolvedModel,
@@ -2386,10 +3146,13 @@ export class ApiBackend extends PunkBackend {
           // Request usage data in streaming response for OpenAI-compatible providers.
           // Without this flag, some APIs (DeepSeek, Kimi, etc.) omit the usage object
           // from the final SSE chunk, breaking cost and cache rate tracking entirely.
+          // NOT for openai-oauth: Codex Responses API rejects unknown params,
+          // usage arrives in the response.completed event instead.
           if (
-            ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter", "z-ai"].includes(
+            ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter", "z-ai", "openai"].includes(
               apiConfig.provider,
-            )
+            ) &&
+            apiConfig.authType !== "openai-oauth"
           ) {
             body.stream_options = { include_usage: true };
           }
@@ -2524,6 +3287,34 @@ export class ApiBackend extends PunkBackend {
             }
           }
 
+          if (
+            request.thinking &&
+            apiConfig.provider === "anthropic"
+          ) {
+            // Anthropic extended thinking (interleaved-thinking-2025-05-14 beta):
+            //   thinking: { type: "enabled", budget_tokens: N }
+            //
+            // Claude Code uses thinking: { type: "adaptive" } but the API also
+            // supports explicit budget_tokens. We use a generous budget so Claude
+            // can reason deeply before acting — especially important for complex
+            // coding tasks. Temperature MUST be 1 when thinking is enabled.
+            //
+            // The interleaved-thinking-2025-05-14 beta flag (already in OAuth
+            // headers via getOAuthHeaders) enables interleaved thinking blocks
+            // between tool calls.
+            body.thinking = { type: "enabled", budget_tokens: 16000 };
+            body.temperature = 1;
+            if (!omitMaxTokens) {
+              const contextLimit = getModelLimit(resolvedModel);
+              const promptTokens = estimateConversationTokens(validatedMessages);
+              const safetyReserve = 4000;
+              const dynamicMax = contextLimit - promptTokens - safetyReserve;
+              // thinking tokens share the max_tokens budget — ensure room for both
+              const cap = (maxTokens ?? DEFAULT_MAX_TOKENS) * 4;
+              body.max_tokens = dynamicMax > 0 ? Math.min(dynamicMax, cap) : cap;
+            }
+          }
+
           const { url, headers, finalBody } = await this.prepareRequest(
             apiConfig,
             body,
@@ -2619,12 +3410,37 @@ export class ApiBackend extends PunkBackend {
                 }
               }
 
-              response = await fetch(url, {
-                method: "POST",
-                headers,
-                body: safeStringify(sourceBody),
-                signal: abortController.signal,
-              });
+              // Strip runtime-only cache fields before serialization — they're set by
+              // estimateConversationTokens() above and must not reach any API endpoint.
+              if (sourceBody.messages) {
+                for (const msg of sourceBody.messages) {
+                  delete msg._tokenEstimate;
+                  delete msg._tiers;
+                }
+              }
+
+              // ── Codex OAuth dispatch ─────────────────────────────────────
+              // codex://responses marker: chatgpt.com must be hit via Electron
+              // net.fetch (Node TLS is Cloudflare-blocked) with the Responses
+              // API body prepared in prepareRequest. The SSE translator at the
+              // read loop converts events to chat/completions chunk shape.
+              if (url.startsWith("codex://")) {
+                const codexToken = await getOpenAIAccessToken();
+                if (!codexToken) {
+                  throw new Error("OpenAI OAuth token expired — run codex login again.");
+                }
+                const codexBody = sourceBody._codexResponses || buildResponsesRequest(sourceBody);
+                delete sourceBody._codexResponses;
+                response = await codexFetch(codexToken, getOpenAIAccountId(), codexBody);
+                response.codex = true; // flag for SSE translation in read loop
+              } else {
+                response = await fetch(url, {
+                  method: "POST",
+                  headers,
+                  body: safeStringify(sourceBody),
+                  signal: abortController.signal,
+                });
+              }
 
               if (!response.ok) {
                 const status = response.status;
@@ -2656,8 +3472,16 @@ export class ApiBackend extends PunkBackend {
                     // didn't fully resolve the tool_call→tool_result chain.
                     const errorBody = await response.text().catch(() => "");
                     lastResponseBody = errorBody; // Preserve for error message after retry loop
+                    // Strip backticks so patterns match both raw and markdown-formatted errors.
+                    // Anthropic sends: `tool_use` ids were found without `tool_result` blocks
+                    const plainBody = errorBody.replace(/`/g, "");
                     if (
-                      errorBody.includes("insufficient tool messages") &&
+                      (plainBody.includes("insufficient tool messages") ||
+                        plainBody.includes("tool_use id") ||
+                        plainBody.includes("tool_use block") ||
+                        plainBody.includes("tool_result block") ||
+                        plainBody.includes("tool_use") && plainBody.includes("tool_result") ||
+                        (plainBody.includes("tool") && plainBody.includes("Unexpected role"))) &&
                       !this._healAttemptedThisTurn
                     ) {
                       this._healAttemptedThisTurn = true;
@@ -2747,11 +3571,14 @@ export class ApiBackend extends PunkBackend {
                       // blocks (turn tier) until it fits in a reasonable budget.
                       if (sourceBody.system && Array.isArray(sourceBody.system)) {
                         const systemBudget = 80000; // generous: 80K tokens max for system
+                        // Track the estimate incrementally — re-stringifying the whole
+                        // (shrinking) array on every pop is O(n^2) and can pin the main
+                        // thread for tens of seconds when there are many/large blocks.
                         let sysEstimate = estimateTokens(JSON.stringify(sourceBody.system));
                         while (sysEstimate > systemBudget && sourceBody.system.length > 1) {
                           // Drop the last (turn) block — it's the lowest priority, changes every turn
-                          sourceBody.system.pop();
-                          sysEstimate = estimateTokens(JSON.stringify(sourceBody.system));
+                          const dropped = sourceBody.system.pop();
+                          sysEstimate -= estimateTokens(JSON.stringify(dropped));
                         }
                         console.log(
                           `[http] Context-heal pruned system prompt to ${sourceBody.system.length} blocks (estimated ${sysEstimate} tokens)`
@@ -2773,9 +3600,61 @@ export class ApiBackend extends PunkBackend {
                       continue; // Don't consume an attempt — heal is free
                     }
 
+                    // ── HEALABLE 400: assistant message prefill (Anthropic-only) ──
+                    // Anthropic requires the conversation to end with a user message.
+                    // Error: "This model does not support assistant message prefill.
+                    //          The conversation must end with a user message."
+                    // This happens when compaction/turn-selection drops the trailing user
+                    // turn. Append a minimal user message and retry.
+                    if (
+                      plainBody.includes("does not support assistant message prefill") ||
+                      (plainBody.includes("conversation must end with a user message") &&
+                       !this._healAttemptedThisTurn)
+                    ) {
+                      console.warn(
+                        `[http] auto-healing: appending user message (400: assistant message prefill)`,
+                      );
+                      body.messages.push({
+                        role: "user",
+                        content: [{ type: "text", text: "Continue." }],
+                      });
+                      if (
+                        finalBody &&
+                        finalBody !== body &&
+                        Array.isArray(finalBody.messages)
+                      ) {
+                        finalBody.messages.push({
+                          role: "user",
+                          content: [{ type: "text", text: "Continue." }],
+                        });
+                      }
+                      this.onEvent(
+                        request.projectId,
+                        { event: "status", data: { message: null } },
+                        request.requestId,
+                      );
+                      continue; // Don't consume an attempt — heal is free
+                    }
+
                     console.error(
                       `[http] Bad request (400): ${errorBody.slice(0, 300)}`,
                     );
+                    // Log full error body for OAuth diagnostics
+                    if (errorBody.length > 300) {
+                      console.error(`[http] Full error body:`, errorBody);
+                    }
+
+                    // Write error body to diagnostics file for OAuth debugging
+                    (async () => {
+                      try {
+                        const diagDir = path.join(os.homedir(), ".pane", "diagnostics");
+                        await fs.mkdir(diagDir, { recursive: true });
+                        await fs.writeFile(
+                          path.join(diagDir, "oauth-error.json"),
+                          JSON.stringify({ timestamp: new Date().toISOString(), status: 400, body: errorBody }, null, 2),
+                        );
+                      } catch {}
+                    })();
 
                     // Diagnostic: extract the offending message index from "missing field"
                     // errors (e.g. "messages[15]: missing field 'type' at line 1 column 54023")
@@ -2827,6 +3706,66 @@ export class ApiBackend extends PunkBackend {
                       }
                     }
                   } else if (status === 401) {
+                    // Read the error body for diagnostics
+                    const errorBody401 = await response.text().catch(() => response.statusText);
+                    lastResponseBody = errorBody401; // preserve for the error throw
+                    console.error(
+                      `[http] 401 UNAUTHORIZED:`,
+                      JSON.stringify({
+                        status,
+                        errorBody: errorBody401?.slice(0, 500),
+                        authType: apiConfig.authType,
+                        hasAuthHeader: !!headers.Authorization,
+                        authPrefix: headers.Authorization?.slice(0, 25),
+                        url,
+                        betaFlags: headers["anthropic-beta"]?.slice(0, 100),
+                      })
+                    );
+
+                    // Z.ai Coding Plan auto-detection: Coding Plan API keys are
+                    // only valid on the /coding/paas/v4 endpoint. The standard
+                    // /paas/v4 endpoint returns 401 for Coding Plan keys. When we
+                    // get a 401 and the user hasn't explicitly set a base URL,
+                    // retry with the Coding Plan endpoint before giving up.
+                    if (
+                      apiConfig.provider === "z-ai" &&
+                      !apiConfig.baseUrl
+                    ) {
+                      console.warn(
+                        "[http] Z.ai 401 on standard endpoint (no custom base URL) — retrying with Coding Plan endpoint"
+                      );
+                      url = "https://api.z.ai/api/coding/paas/v4/chat/completions";
+                      continue; // Don't consume an attempt — endpoint switch is free
+                    }
+
+                    // OAuth mode: token may have expired mid-session
+                    if (apiConfig.authType === "openai-oauth") {
+                      // OpenAI OAuth: invalidate cache; the codex:// dispatch
+                      // path re-reads the token (refreshed by getOpenAIAccessToken)
+                      // on every attempt, so a retry picks up the fresh token.
+                      console.warn("[http] OpenAI OAuth 401 — invalidating cache and retrying");
+                      invalidateOpenAICache();
+                      continue; // Don't consume an attempt — token refresh is a heal
+                    }
+                    // Claude OAuth: token may have expired mid-session
+                    if (apiConfig.authType === "oauth") {
+                      console.warn("[http] OAuth 401 — invalidating cache and retrying with fresh token");
+                      invalidateCache();
+                      const freshToken = await getAccessToken();
+                      if (freshToken) {
+                        // Rebuild headers with fresh token.
+                        // Do NOT add prompt-caching-2024-07-31 — OAuth uses
+                        // prompt-caching-scope-2026-01-05 which is already in the OAuth betas.
+                        const oauthHeaders = getOAuthHeaders(freshToken, resolvedModel);
+                        headers = {
+                          ...headers,
+                          Authorization: oauthHeaders.Authorization,
+                          "anthropic-beta": oauthHeaders["anthropic-beta"],
+                        };
+                        // Don't consume an attempt — token refresh is a heal
+                        continue;
+                      }
+                    }
                     console.error(
                       `[http] Unauthorized (401): Check API key configuration`,
                     );
@@ -2851,6 +3790,67 @@ export class ApiBackend extends PunkBackend {
                   (isRateLimit || isTransientClientError) &&
                   attempt < MAX_RETRIES
                 ) {
+                  // Z.ai Coding Plan auto-detection: Coding Plan API keys hitting
+                  // the standard /paas/v4 endpoint return 429 ("Insufficient balance
+                  // or no resource package. Please recharge."). When we get a 429
+                  // and the user hasn't explicitly set a base URL, retry once with
+                  // the Coding Plan endpoint before entering backoff.
+                  if (
+                    isRateLimit &&
+                    apiConfig.provider === "z-ai" &&
+                    !apiConfig.baseUrl
+                  ) {
+                    console.warn(
+                      "[http] Z.ai 429 on standard endpoint (no custom base URL) — retrying with Coding Plan endpoint"
+                    );
+                    url = "https://api.z.ai/api/coding/paas/v4/chat/completions";
+                    continue; // Don't consume an attempt — endpoint switch is free
+                  }
+
+                  // Z.ai terminal error detection: quota exhaustion codes (1113,
+                  // 1308-1321) are permanent until the reset window. Retrying
+                  // wastes 2+ minutes in exponential backoff for a condition
+                  // that won't resolve. Break immediately and surface the error.
+                  if (isRateLimit && apiConfig.provider === "z-ai") {
+                    const errBodyText = lastResponseBody ||
+                      (await response.text().catch(() => ""));
+                    const classified = classifyZaiError(errBodyText);
+                    if (classified && classified.isTerminal) {
+                      const friendlyMsg = formatZaiQuotaError(classified);
+                      console.warn(
+                        `[http] Z.ai terminal error ${classified.errorCode} — breaking retry loop: ${friendlyMsg}`,
+                      );
+
+                      // Emit quota-exhausted rate_limit event so the UI can show
+                      // a persistent banner with the reset time.
+                      this.onEvent(
+                        request.projectId,
+                        {
+                          event: "rate_limit",
+                          data: {
+                            status: "rejected",
+                            rateLimitType: "quota_exhausted",
+                            resetsAt: classified.resetTime
+                              ? Math.floor(classified.resetTime / 1000)
+                              : undefined,
+                            provider: "z-ai",
+                            errorCode: classified.errorCode,
+                            message: friendlyMsg,
+                          },
+                        },
+                        request.requestId,
+                      );
+
+                      // Surface the friendly error, not raw JSON
+                      throw new Error(friendlyMsg);
+                    }
+
+                    // Preserve body for error message if we exhaust retries
+                    if (!lastResponseBody && errBodyText) {
+                      lastResponseBody = errBodyText;
+                    }
+                  }
+
                   const retryAfterSec = parseInt(
                     response.headers.get("retry-after") || "0",
                     10,
@@ -3059,6 +4059,35 @@ export class ApiBackend extends PunkBackend {
 
           if (!response.body) throw new Error("Response body is null");
 
+          // ── Claude rate limit header parsing ──────────────────────────────
+          // Anthropic returns rate limit headers on EVERY response (not just 429).
+          // Parse them to feed the InputBar rate limit indicator with live data.
+          if (apiConfig.provider === "anthropic") {
+            const rlData = parseClaudeRateLimitHeaders(response.headers);
+            if (rlData) {
+              // Determine status from utilization
+              let status = "allowed";
+              if (rlData.utilization != null) {
+                if (rlData.utilization >= 1) status = "rejected";
+                else if (rlData.utilization >= 0.8) status = "allowed_warning";
+              }
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "rate_limit",
+                  data: {
+                    status,
+                    utilization: rlData.utilization,
+                    resetsAt: rlData.resetsAt || undefined,
+                    rateLimitType: "tokens",
+                    provider: "anthropic",
+                  },
+                },
+                request.requestId,
+              );
+            }
+          }
+
           const reader = response.body.getReader();
           const decoder = new TextDecoder("utf-8");
           let buffer = "";
@@ -3099,6 +4128,20 @@ export class ApiBackend extends PunkBackend {
 
               try {
                 const parsed = JSON.parse(data);
+                // Codex OAuth: Responses API events → chat/completions chunk
+                // shape so the existing openai parser works unchanged.
+                if (response.codex) {
+                  const chunks = responsesEventToChatChunks(parsed);
+                  for (const chunk of chunks) {
+                    this.handleStreamEvent(
+                      request.projectId,
+                      chunk,
+                      "openai",
+                      request.requestId,
+                    );
+                  }
+                  continue;
+                }
                 const emitted = this.handleStreamEvent(
                   request.projectId,
                   parsed,
@@ -3189,6 +4232,69 @@ export class ApiBackend extends PunkBackend {
             console.log(
               `[cache] ${apiConfig.provider}/${state.model}: ${hitRate}% hit (${cacheRead} cached / ${totalInput} total input tokens)`,
             );
+          }
+
+          // ── Z.ai credit tracking ──────────────────────────────────────────
+          // Compute credits consumed for this request and update rolling windows.
+          // Emit a rate_limit event so the InputBar quota indicator stays live.
+          if (apiConfig.provider === "z-ai") {
+            const credits = calculateZaiCredits(state.usage, state.model);
+            if (credits > 0) {
+              const { fiveHourUsed, weeklyUsed } = recordZaiUsage(credits);
+
+              // Read plan tier from settings.json
+              let planTier = null;
+              try {
+                const settingsRaw = await fs.readFile(
+                  path.join(this.paneDir, "settings.json"),
+                  "utf-8",
+                );
+                const parsed = JSON.parse(settingsRaw);
+                planTier = parsed.zai_plan_tier || null;
+              } catch {}
+
+              const limits = planTier ? getZaiPlanLimits(planTier) : null;
+
+              // Compute utilization for the binding constraint (whichever is higher)
+              let utilization = null;
+              if (limits) {
+                const fiveHourPct = fiveHourUsed / limits.fiveHour;
+                const weeklyPct = weeklyUsed / limits.weekly;
+                utilization = Math.max(fiveHourPct, weeklyPct);
+              }
+
+              // Determine status
+              let status = "allowed";
+              if (utilization != null) {
+                if (utilization >= 1) status = "rejected";
+                else if (utilization >= 0.8) status = "allowed_warning";
+              }
+
+              // Estimate when the 5h window resets — approximate with rolling window
+              const fiveHourResetSec = Math.floor(
+                (Date.now() + 5 * 60 * 60 * 1000) / 1000,
+              );
+
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "rate_limit",
+                  data: {
+                    status,
+                    utilization,
+                    resetsAt: fiveHourResetSec,
+                    rateLimitType: "credits",
+                    provider: "z-ai",
+                    // Extra fields for the UI to display credit counts
+                    creditsUsed: fiveHourUsed,
+                    creditsLimit: limits?.fiveHour || null,
+                    weeklyCreditsUsed: weeklyUsed,
+                    weeklyCreditsLimit: limits?.weekly || null,
+                  },
+                },
+                request.requestId,
+              );
+            }
           }
 
           const finalContent = [];
@@ -3667,10 +4773,16 @@ export class ApiBackend extends PunkBackend {
                   request.requestId,
                 );
               }
-              // Signal the renderer that the session is waiting on the user.
+              // Signal the renderer that the session is paused on ask_user.
+              // Payload matches PunkEventAwaitingInput: toolId (correlation
+              // key) and question. The renderer mounts the question card;
+              // the next user message resumes the loop.
               this.onEvent(
                 request.projectId,
-                { event: "awaiting_input", data: { question } },
+                {
+                  event: "awaiting_input",
+                  data: { toolId: tool.id, question },
+                },
                 request.requestId,
               );
               awaitingUserInput = true;
@@ -3939,16 +5051,14 @@ export class ApiBackend extends PunkBackend {
             }
           }
 
-          // Window management — V4-direct when turn selection is available
-          // Only for explicit-caching providers (Anthropic). Auto-caching
-          // providers skip body-level pruning to keep the cache prefix stable.
-          // Offloaded to a Worker thread to avoid freezing the main process.
-          if (turnSelection && PROVIDERS_WITH_EXPLICIT_CACHE.has(request.provider)) {
-            const compResult = await compactMessages("applyV4TurnSelection", {
-              messages, turnSelection, projectId: request.projectId,
-            });
-            messages = compResult.messages;
-          }
+          // NOTE: We intentionally do NOT call applyV4TurnSelection here.
+          // Context was already managed once at turn start (before the tool loop).
+          // Calling it again with the same turnSelection would cause turn index
+          // mismatches: detectTurns() re-runs on the updated messages array
+          // (which now includes newly appended tool results), so the same
+          // droppedTurnIndices now point to different turns than intended —
+          // potentially the live current turn, orphaning its tool_use blocks
+          // and producing HTTP 400 "tool_use ids without tool_result" errors.
         } catch (turnError) {
           // Per-turn error handling — retry recoverable errors inside the loop
           if (turnError.name === "AbortError") throw turnError; // propagate to outer
@@ -4318,6 +5428,35 @@ export class ApiBackend extends PunkBackend {
           phase: "post-turn",
         });
 
+        // ── Steer injection ────────────────────────────────────────────────
+        // A message the user sent while this task was running, classified as
+        // relevant to it (see classifySteerIntent). This is the one point
+        // between turns where new input can be spliced into the running
+        // conversation without aborting anything — see steer() for how
+        // pendingSteerMessages gets populated.
+        const pendingSteers = this.pendingSteerMessages.get(request.projectId);
+        if (pendingSteers?.length > 0) {
+          this.pendingSteerMessages.delete(request.projectId);
+          const combinedText = pendingSteers.map((s) => s.text).join("\n\n");
+          const steerMsg = {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text:
+                  "[The user sent this while you were still working on the task above — a correction or refinement for THAT task, not a new unrelated request. Incorporate it and continue; do not restart from scratch or redo completed work.]\n\n" +
+                  combinedText,
+              },
+            ],
+          };
+          messages.push(steerMsg);
+          journal.append(steerMsg);
+          console.log(`[http] steered ${pendingSteers.length} message(s) into turn ${turn}`);
+          // A steer supersedes an ask_user pause — treat it as the reply
+          // instead of stopping the loop to wait for one.
+          awaitingUserInput = false;
+        }
+
         // The model called ask_user — it is explicitly handing control back and
         // waiting for a reply. Stop the loop cleanly (all post-turn processing
         // above has run); the user's next message resumes the conversation.
@@ -4327,8 +5466,8 @@ export class ApiBackend extends PunkBackend {
         }
       }
 
-      // Signal successful completion — mirrors cli-worker's "result" event so the
-      // renderer's resultReceived flag is set and no false "Process exited" error fires.
+      // Signal successful completion so the renderer's resultReceived flag is
+      // set and no false "Process exited" error fires.
       this.onEvent(
         request.projectId,
         {
@@ -4440,11 +5579,14 @@ export class ApiBackend extends PunkBackend {
         );
 
         // Re-spawn the entire session from scratch. The journal on disk has
-        // all messages; this.spawn() detects it via canResume() and replays.
+        // all messages; this._spawnInner() detects it via canResume() and
+        // replays. Call the inner method directly, not the public spawn()
+        // wrapper — we're already inside the tracked outer promise for this
+        // project, so re-wrapping would just churn activeSpawnPromises.
         // If spawn succeeds, this call returns normally and the catch block
         // ends here — no error emitted to the user.
         try {
-          await this.spawn(request);
+          await this._spawnInner(request);
           return; // Success — exit without emitting error
         } catch (respawnErr) {
           // Re-spawn also failed — fall through to the real error handling
@@ -4475,6 +5617,12 @@ export class ApiBackend extends PunkBackend {
       }
 
       if (error.name === "AbortError") {
+        // User-cancelled, not a crash — nothing to resume. Clear the journal
+        // fragment now instead of leaving it on disk for up to 4h where a
+        // completeness check would otherwise just end up ignoring it anyway.
+        try {
+          clearJournal(request.projectId);
+        } catch {}
         this.onEvent(
           request.projectId,
           {
@@ -4544,7 +5692,23 @@ export class ApiBackend extends PunkBackend {
       );
 
       this.activeRequests.delete(request.projectId);
+      this.activeTaskAnchors.delete(request.projectId);
       this.requestStates.delete(request.projectId);
+
+      // Missed-injection fallback: a steer message that never got a chance
+      // to be injected (task finished, hit maxTurns, or paused on ask_user
+      // right before this landed) must not be silently dropped — surface it
+      // so the renderer can requeue and send it as a normal next message,
+      // via the same drain mechanism the abort-queue-drain fix already uses.
+      const missedSteers = this.pendingSteerMessages.get(request.projectId);
+      if (missedSteers?.length > 0) {
+        this.pendingSteerMessages.delete(request.projectId);
+        this.onEvent(
+          request.projectId,
+          { event: "steer_missed", data: { texts: missedSteers.map((m) => m.text) } },
+          request.requestId,
+        );
+      }
     }
   }
 
@@ -4737,52 +5901,125 @@ export class ApiBackend extends PunkBackend {
       }
 
       case "anthropic": {
-        url = apiConfig.baseUrl || "https://api.anthropic.com/v1/messages";
-        headers = {
-          "Content-Type": "application/json",
-          "x-api-key": apiConfig.apiKey,
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": "prompt-caching-2024-07-31",
-        };
+        const isOAuth = apiConfig.authType === "oauth";
+
+        if (isOAuth) {
+          // OAuth mode: Bearer token from Claude Code/Pane keychain.
+          // URL must include ?beta=true for OAuth-authenticated requests.
+          url = getOAuthApiUrl(apiConfig.baseUrl || "https://api.anthropic.com/v1/messages");
+          const accessToken = await getAccessToken();
+          if (!accessToken) {
+            throw new Error(
+              "Claude OAuth credentials are unavailable or expired. Sign in via Settings → Claude Subscription."
+            );
+          }
+          // Pass model for beta exclusions (e.g. haiku → exclude interleaved-thinking)
+          const oauthHeaders = getOAuthHeaders(accessToken, request?.model);
+          // OAuth betas already include prompt-caching-scope-2026-01-05.
+          // Do NOT add prompt-caching-2024-07-31 — it's API-key-only and
+          // causes "Invalid request format" when combined with OAuth tokens.
+          headers = {
+            "Content-Type": "application/json",
+            ...oauthHeaders,
+          };
+          console.log("[http] Anthropic OAuth: using Bearer token, url:", url, "betas:", oauthHeaders["anthropic-beta"]);
+        } else {
+          url = apiConfig.baseUrl || "https://api.anthropic.com/v1/messages";
+          headers = {
+            "Content-Type": "application/json",
+            "x-api-key": apiConfig.apiKey,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "prompt-caching-2024-07-31",
+          };
+        }
+
         const sysMsg = body.messages.find((m) => m.role === "system");
         const anthropicBody = {
           ...body,
           metadata: { user_id: userTag },
-          // Top-level auto-caching: automatically caches the last block of
-          // the last message, handling conversation prefix caching without
-          // manual breakpoints. Simpler and handles long conversations better
-          // than the old sliding-cutoff approach.
-          cache_control: { type: "ephemeral" },
         };
         anthropicBody.messages = body.messages.filter(
           (m) => m.role !== "system",
         );
 
-        // ── Breakpoint 1: Cache tool definitions (most static content) ──
-        // Tools never change within a session — ~5k tokens saved per turn.
-        if (anthropicBody.tools?.length > 0) {
-          const lastTool = anthropicBody.tools[anthropicBody.tools.length - 1];
-          if (typeof lastTool === "object") {
-            lastTool.cache_control = { type: "ephemeral" };
+        // ── Thinking signature safety net ──
+        // Anthropic requires that thinking blocks in conversation history include
+        // their original signature (from signature_delta events). If a thinking
+        // block lacks a signature, the API rejects with 400 "thinking.signature:
+        // Field required". This strips any thinking blocks without signatures
+        // before sending, so old conversations (before signature capture was added)
+        // don't break on multi-turn requests.
+        if (Array.isArray(anthropicBody.messages)) {
+          for (const msg of anthropicBody.messages) {
+            if (msg.role === "assistant" && Array.isArray(msg.content)) {
+              msg.content = msg.content.filter(
+                (block) =>
+                  block.type !== "thinking" || typeof block.signature === "string",
+              );
+              // If content is now empty, keep at least a minimal text block
+              // so the message sequence stays valid
+              if (msg.content.length === 0) {
+                msg.content = [{ type: "text", text: "(thinking)" }];
+              }
+            }
+          }
+        }
+
+        // ── Cache optimizations ──
+        // Both API-key and OAuth support cache_control: { type: "ephemeral" }.
+        // API-key uses prompt-caching-2024-07-31 beta; OAuth uses
+        // prompt-caching-scope-2026-01-05 + extended-cache-ttl-2025-04-11.
+        // The cache_control format is identical — only the beta flags differ.
+        // The original 400 error was from cache_control being added WITHOUT the
+        // correct OAuth beta flag, not from cache_control itself being rejected.
+        //
+        // CRITICAL: Anthropic processes blocks in order: tools → system → messages.
+        // cache_control TTLs must be in DESCENDING order — a longer TTL must never
+        // come after a shorter one. So if the frozen system tier uses ttl="1h",
+        // the tools breakpoint must also use ttl="1h" (or no cache_control at all).
+        // Otherwise: HTTP 400 "a ttl='1h' cache_control block must not come after
+        // a ttl='5m' cache_control block".
+        {
+          // Determine whether the frozen tier will use a 1h TTL.
+          // When extended-cache-ttl is available (OAuth), frozen gets "1h".
+          // API-key only has the default 5m ephemeral cache.
+          const frozenUses1h = isOAuth && systemTiers?.frozen;
+          const toolsTtl = frozenUses1h ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" };
+
+          // Top-level auto-caching: automatically caches the last block of
+          // the last message, handling conversation prefix caching without
+          // manual breakpoints.
+          anthropicBody.cache_control = { type: "ephemeral" };
+
+          // Breakpoint 1: Cache tool definitions (most static content)
+          if (anthropicBody.tools?.length > 0) {
+            const lastTool = anthropicBody.tools[anthropicBody.tools.length - 1];
+            if (typeof lastTool === "object") {
+              lastTool.cache_control = toolsTtl;
+            }
           }
         }
 
         if (sysMsg) {
           // ── Cache-aware system prompt for Anthropic ──
-          // Breakpoint layout (up to 4 total, 1 used on tools above):
-          //   Breakpoint 2: frozen tier → 1-hour TTL (survives breaks between turns)
-          //   Breakpoint 3: session tier → 5-min TTL (changes on scope change)
-          //   Turn tier: no breakpoint (changes every turn)
-          // Auto-caching (top-level): handles conversation prefix incrementally.
+          // Both API-key and OAuth use cache_control: { type: "ephemeral" }.
+          // The betas differ (prompt-caching-2024-07-31 vs prompt-caching-scope)
+          // but the cache_control format is identical.
           if (systemTiers && systemTiers.frozen) {
             const tiers = systemTiers;
             const blocks = [];
-            // Frozen tier — 1-hour cache (biggest win, survives user breaks)
+            // Frozen tier — 1-hour cache when extended-cache-ttl beta is available
+            // (OAuth only). API-key lacks the beta, so it gets the default 5m.
+            // TTL must not exceed any preceding breakpoint (tools uses the same
+            // ttl when this is 1h — see tools breakpoint logic above).
             if (tiers.frozen) {
+              const frozenCc = isOAuth
+                ? { type: "ephemeral", ttl: "1h" }
+                : { type: "ephemeral" };
               blocks.push({
                 type: "text",
                 text: tiers.frozen,
-                cache_control: { type: "ephemeral", ttl: "1h" },
+                cache_control: frozenCc,
               });
             }
             // Session tier — 5-min cache (changes on scope change)
@@ -4799,10 +6036,166 @@ export class ApiBackend extends PunkBackend {
             }
             anthropicBody.system = blocks;
             console.log(
-              `[http] Anthropic cache: tools=cached frozen=${tiers.frozen.length}c(1h) session=${tiers.session.length}c(5m) turn=${tiers.turn.length}c`,
+              `[http] Anthropic cache: tools=cached frozen=${tiers.frozen.length}c(1h) session=${tiers.session.length}c(5m) turn=${tiers.turn.length}c${isOAuth ? " [oauth]" : ""}`,
             );
           } else {
             anthropicBody.system = sysMsg.content;
+          }
+        }
+
+        // ── OAuth body transformation ──
+        // The Anthropic API validates OAuth-authenticated requests by checking:
+        // 1. Billing header: signed hash of first user message (proves "Claude Code" client)
+        // 2. System identity prefix: "You are Claude Code, Anthropic's official CLI for Claude."
+        // 3. Tool names prefixed with mcp_ + PascalCase (lowercase = non-Claude-Code = rejected)
+        //
+        // IMPORTANT: The API does NOT validate or restrict system[] content beyond
+        // billing + identity. Claude Code itself sends its full system prompt (166+ lines)
+        // in system[]. All system tiers (frozen, session, turn) stay in system[] with
+        // their cache_control intact. The original 400 error (opencode-claude-auth PR #148)
+        // was caused by cache_control: { type: "ephemeral" } sent WITHOUT the correct
+        // OAuth beta flag, NOT by system content validation. Conflating these two issues
+        // caused all system instructions to be demoted to user messages — fundamentally
+        // weakening instruction adherence for 6+ months.
+        if (isOAuth) {
+          const systemBlocks = Array.isArray(anthropicBody.system)
+            ? anthropicBody.system
+            : typeof anthropicBody.system === "string"
+              ? [{ type: "text", text: anthropicBody.system }]
+              : anthropicBody.system
+                ? [anthropicBody.system]
+                : [];
+
+          const BILLING_PREFIX = "x-anthropic-billing-header";
+          const SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+          // Anthropic only validates the billing header + this exact identity
+          // line (see comment above) — everything after is unrestricted, same
+          // as Claude Code's own 166+ line system prompt. So we immediately
+          // counter the CLI framing before Pane's real system prompt loads:
+          // left unchecked, "You are Claude Code" biases the model toward a
+          // single-shot/stateless CLI persona, which reads as the model
+          // "forgetting" prior turns even though full history is in messages[].
+          const REORIENT =
+            "Note: despite the CLI label above, this request is part of an ongoing multi-turn conversation inside Pane, not a fresh single-shot invocation. The message history below is real — you already said and did those things. Continue naturally from where the conversation left off.";
+
+          // Compute billing header from the ACTUAL first user message text.
+          // This must happen BEFORE any modification to messages — the hash
+          // is tied to what the user actually typed, not to injected prefixes.
+          const billingHeader = buildBillingHeaderValue(anthropicBody.messages || []);
+
+          // Build final system: [billing, identity, reorient, ...all other tiers]
+          // All system content stays in system[] — no demotion to user messages.
+          // Strip any pre-existing billing/identity/reorient blocks to avoid duplicates.
+          const newSystem = [
+            { type: "text", text: billingHeader },
+            { type: "text", text: SYSTEM_IDENTITY },
+            { type: "text", text: REORIENT },
+          ];
+
+          for (const block of systemBlocks) {
+            const txt = typeof block === "string" ? block : (block.text ?? "");
+            if (txt.startsWith(BILLING_PREFIX) || txt.startsWith(SYSTEM_IDENTITY) || txt.startsWith(REORIENT)) {
+              continue; // Already added above
+            }
+            if (txt.length > 0) {
+              newSystem.push(block);
+            }
+          }
+
+          anthropicBody.system = newSystem;
+
+          // Prefix tool names: mcp_ + PascalCase (Claude Code convention)
+          if (Array.isArray(anthropicBody.tools)) {
+            anthropicBody.tools = anthropicBody.tools.map((tool) => ({
+              ...tool,
+              name: tool.name ? prefixToolName(tool.name) : tool.name,
+            }));
+          }
+
+          // Prefix tool_use names in messages
+          if (Array.isArray(anthropicBody.messages)) {
+            anthropicBody.messages = anthropicBody.messages.map((msg) => {
+              if (!Array.isArray(msg.content)) return msg;
+              return {
+                ...msg,
+                content: msg.content.map((block) => {
+                  if (block.type !== "tool_use" || typeof block.name !== "string") return block;
+                  return { ...block, name: prefixToolName(block.name) };
+                }),
+              };
+            });
+          }
+
+          console.log("[http] Anthropic OAuth: injected billing header, system blocks:", newSystem.length);
+        }
+
+        // ── OAuth diagnostic: log key request properties ──
+        if (isOAuth) {
+          // Write full body synchronously to project dir so the agent can read it
+          const diagDir = path.join(os.homedir(), ".pane", "diagnostics");
+          try {
+            await fs.mkdir(diagDir, { recursive: true });
+            const bodyClone = JSON.parse(JSON.stringify(anthropicBody));
+            const bodyPath = path.join(diagDir, "oauth-body.json");
+            const headerPath = path.join(diagDir, "oauth-headers.json");
+            await fs.writeFile(bodyPath, JSON.stringify(bodyClone, null, 2));
+            await fs.writeFile(headerPath, JSON.stringify({
+              url,
+              model: anthropicBody.model,
+              messageCount: anthropicBody.messages?.length,
+              toolCount: anthropicBody.tools?.length,
+              toolNames: anthropicBody.tools?.map((t) => t.name),
+              systemBlockCount: Array.isArray(anthropicBody.system) ? anthropicBody.system.length : "not-array",
+              system: Array.isArray(anthropicBody.system)
+                ? anthropicBody.system.map((b) =>
+                    typeof b === "string" ? b.slice(0, 200) : { type: b.type, text: (b.text ?? "").slice(0, 200) }
+                  )
+                : null,
+              hasCacheControl: !!anthropicBody.cache_control,
+              headerKeys: Object.keys(headers).filter(k => k !== "Authorization"),
+              hasAuth: !!headers.Authorization,
+              authPrefix: headers.Authorization?.slice(0, 20),
+            }, null, 2));
+            console.log("[http] OAuth diagnostic written to:", diagDir);
+          } catch (e) {
+            console.error("[http] OAuth diagnostic write failed:", e.message);
+          }
+
+          console.log(
+            "[http] OAuth REQUEST DIAGNOSTIC:",
+            JSON.stringify({
+              url,
+              model: anthropicBody.model,
+              messageCount: anthropicBody.messages?.length,
+              toolCount: anthropicBody.tools?.length,
+              toolNames: anthropicBody.tools?.map((t) => t.name).slice(0, 10),
+              systemBlockCount: Array.isArray(anthropicBody.system) ? anthropicBody.system.length : "not-array",
+              headerKeys: Object.keys(headers).filter(k => k !== "Authorization"),
+            })
+          );
+        }
+
+        // ── Anthropic ending-message guard ──────────────────────────────────
+        // Anthropic requires the messages array to end with a user message.
+        // "This model does not support assistant message prefill."
+        // This can happen when:
+        //   • V4 turn selection drops the last user turn
+        //   • Session resume where the last message was an assistant response
+        //   • Thinking-signature filter removes content from the last message
+        // OpenAI-compatible providers don't have this constraint.
+        if (Array.isArray(anthropicBody.messages) && anthropicBody.messages.length > 0) {
+          const lastMsg = anthropicBody.messages[anthropicBody.messages.length - 1];
+          const lastRole = lastMsg?.role;
+          // "user" messages that are pure tool_result blocks also count as user
+          // for Anthropic, so we only need to worry about assistant/system endings.
+          if (lastRole === "assistant" || lastRole === "system") {
+            anthropicBody.messages.push({
+              role: "user",
+              content: [{ type: "text", text: "Continue." }],
+            });
+            console.warn(
+              `[http] Anthropic: appended trailing user message — original last role was ${lastRole}`,
+            );
           }
         }
 
@@ -4997,15 +6390,57 @@ export class ApiBackend extends PunkBackend {
         break;
       }
 
+      case "openai": {
+        const isOpenAIOAuth = apiConfig.authType === "openai-oauth";
+
+        if (isOpenAIOAuth) {
+          // OAuth mode: ChatGPT subscription via Codex backend (Responses API).
+          // chatgpt.com speaks Responses API — NOT chat/completions — and
+          // requires Electron net.fetch (Node TLS is Cloudflare-blocked).
+          // Body translation happens here; dispatch via codexFetch happens
+          // in executeTurn by recognizing the codex:// marker URL.
+          const accessToken = await getOpenAIAccessToken();
+          if (!accessToken) {
+            throw new Error(
+              "OpenAI OAuth token unavailable. Run `npx @openai/codex login` to sign in with your ChatGPT account."
+            );
+          }
+          url = "codex://responses"; // marker — dispatcher routes via codexFetch (net.fetch)
+          headers = {}; // set at dispatch time (token may refresh)
+          finalBody = {
+            ...body,
+            _codexResponses: buildResponsesRequest(body),
+          };
+        } else {
+          // API key mode: standard OpenAI chat/completions API
+          url = apiConfig.baseUrl || "https://api.openai.com/v1/chat/completions";
+          headers = {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiConfig.apiKey}`,
+          };
+        }
+
+        if (!isOpenAIOAuth) {
+          finalBody = {
+            ...body,
+            messages: systemTiers
+              ? applyPrefixCacheOptimization(body.messages, systemTiers)
+              : body.messages,
+            user: userTag,
+          };
+        }
+        break;
+      }
+
       default:
         throw new Error(`Unsupported provider: ${apiConfig.provider}`);
     }
 
-    // Strip _tiers from finalBody before serialization — internal metadata
-    // that providers would reject or ignore as unknown fields.
+    // Strip internal metadata fields before serialization — providers reject unknown fields.
     if (finalBody.messages) {
       for (const msg of finalBody.messages) {
         if (msg._tiers) delete msg._tiers;
+        if (msg._tokenEstimate !== undefined) delete msg._tokenEstimate;
       }
     }
 
@@ -5030,6 +6465,10 @@ export class ApiBackend extends PunkBackend {
         return "claude-sonnet-4-6";
       case "openrouter":
         return "stepfun/step-3.5-flash:free";
+      case "openai":
+        // Codex backend (OAuth mode) only accepts Codex slugs; the API-key
+        // path accepts standard names. gpt-5.4-mini exists in both registries.
+        return "gpt-5.4-mini";
       default:
         return "gpt-4";
     }
@@ -5039,6 +6478,9 @@ export class ApiBackend extends PunkBackend {
     if (!model) return this.getDefaultModel(provider);
 
     if (provider === "openrouter") return model;
+
+    // OpenAI model IDs are used as-is (gpt-4.1-mini, o4-mini, etc.)
+    if (provider === "openai") return model;
 
     // StepFun model IDs are used as-is (step-3.5-flash, step-2-mini, etc.)
     if (provider === "stepfun") return model;
@@ -5415,11 +6857,49 @@ export class ApiBackend extends PunkBackend {
         )
           thinking = event.delta.thinking;
 
+        // Signature delta: Anthropic sends this after thinking content to
+        // provide the cryptographic signature required for multi-turn conversations.
+        // When interleaved thinking is enabled, subsequent turns MUST include the
+        // signature on thinking blocks. Without it, the API rejects with
+        // "thinking.signature: Field required" (400).
+        // Forward to frontend so it can attach the signature to the thinking block.
+        if (
+          event.type === "content_block_delta" &&
+          event.delta?.type === "signature_delta" &&
+          event.delta.signature
+        ) {
+          // Store in state for journal storage
+          state.thinkingSignature = event.delta.signature;
+          this.onEvent(
+            projectId,
+            {
+              event: "message",
+              data: {
+                parsed: {
+                  type: "stream_event",
+                  event: {
+                    type: "content_block_delta",
+                    index: 0,
+                    delta: {
+                      type: "signature_delta",
+                      signature: event.delta.signature,
+                    },
+                  },
+                },
+              },
+            },
+            requestId,
+          );
+          emitted = true;
+        }
+
         if (
           event.type === "content_block_start" &&
           event.content_block?.type === "tool_use"
         ) {
           const tb = event.content_block;
+          // Strip mcp_ prefix if present (Claude Code OAuth convention)
+          const strippedName = unprefixToolName(tb.name);
           this.onEvent(
             projectId,
             {
@@ -5433,7 +6913,7 @@ export class ApiBackend extends PunkBackend {
                     content_block: {
                       type: "tool_use",
                       id: tb.id,
-                      name: tb.name,
+                      name: strippedName,
                       input: {},
                     },
                   },
@@ -5442,7 +6922,7 @@ export class ApiBackend extends PunkBackend {
             },
             requestId,
           );
-          state.toolUses.set(tb.id, { id: tb.id, name: tb.name, input: "" });
+          state.toolUses.set(tb.id, { id: tb.id, name: strippedName, input: "" });
         }
 
         if (
@@ -5538,6 +7018,16 @@ export class ApiBackend extends PunkBackend {
 
     if (finishReason && (state.accumulated || state.toolUses.size > 0)) {
       const finalContent = [];
+      // Include thinking block with signature for Anthropic OAuth/interleaved-thinking.
+      // The API requires that thinking blocks in conversation history include their
+      // original signature. Without it, multi-turn requests fail with 400.
+      if (state.thinking && state.thinkingSignature) {
+        finalContent.push({
+          type: "thinking",
+          thinking: state.thinking,
+          signature: state.thinkingSignature,
+        });
+      }
       if (state.accumulated) {
         finalContent.push({ type: "text", text: state.accumulated });
       }
@@ -5578,6 +7068,37 @@ export class ApiBackend extends PunkBackend {
     return emitted;
   }
 
+  /**
+   * Decide whether a message sent while `projectId`'s task is running should
+   * steer into that task or queue for after. Returns "queue" if there's no
+   * active task for this project — the renderer's isProcessing check should
+   * already have gated this call, so absence here means state went stale
+   * between that check and this one; queueing (== sending normally once the
+   * renderer re-checks) is the correct, safe fallback, never steer into
+   * nothing.
+   */
+  classifySteerIntent(projectId, message) {
+    const anchor = this.activeTaskAnchors.get(projectId);
+    if (!anchor) return { decision: "queue", reason: "no-active-task" };
+    return classifySteerIntent(message, anchor.prompt);
+  }
+
+  /**
+   * Queue a message for injection into the running task at the next turn
+   * boundary. Returns { accepted: false } if the task already finished —
+   * the race between the renderer's classify call and this one landing.
+   */
+  steer(projectId, message) {
+    if (!this.activeRequests.has(projectId)) {
+      return { accepted: false };
+    }
+    if (!this.pendingSteerMessages.has(projectId)) {
+      this.pendingSteerMessages.set(projectId, []);
+    }
+    this.pendingSteerMessages.get(projectId).push({ text: message, timestamp: Date.now() });
+    return { accepted: true };
+  }
+
   async abort(projectId) {
     const controller = this.activeRequests.get(projectId);
     if (controller) {
@@ -5591,6 +7112,22 @@ export class ApiBackend extends PunkBackend {
       executor.cleanup();
       this.toolExecutors.delete(projectId);
     }
+
+    // Wait for the in-flight spawn() call to actually finish unwinding
+    // (its catch/finally — journal clearing, emergency handoff writes)
+    // before returning. Callers (sendMessage, abortMessage) await this
+    // and only then allow a new spawn() for the same project. Without
+    // this wait, controller.abort() above just signals cancellation and
+    // returns almost instantly while the old call's cleanup keeps running
+    // in the background — a new spawn() could start and race it, with
+    // both touching the same on-disk journal file with no locking.
+    const inFlight = this.activeSpawnPromises.get(projectId);
+    if (inFlight) {
+      await Promise.race([
+        inFlight.catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 5000)),
+      ]);
+    }
   }
 
   async terminate(projectId) {
@@ -5600,6 +7137,8 @@ export class ApiBackend extends PunkBackend {
   shutdown() {
     for (const controller of this.activeRequests.values()) controller.abort();
     this.activeRequests.clear();
+    this.activeTaskAnchors.clear();
+    this.pendingSteerMessages.clear();
     this.requestStates.clear();
     // Clean up ALL tool executors — kill background processes, release references
     for (const [, executor] of this.toolExecutors) {
@@ -5686,13 +7225,28 @@ export class ApiBackend extends PunkBackend {
         ? apiConfig.baseUrl.replace(/\/chat\/completions\/?$/, "")
         : "https://api.z.ai/api/paas/v4";
       const baseUrlClean = base.replace(/\/$/, "");
-      const url = baseUrlClean.endsWith("/models")
+      let url = baseUrlClean.endsWith("/models")
         ? baseUrlClean
         : `${baseUrlClean}/models`;
-      const response = await fetch(url, {
+
+      let response = await fetch(url, {
         headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
         signal: AbortSignal.timeout(12_000),
       });
+
+      // Coding Plan fallback: if no custom base URL and the standard endpoint
+      // failed, try the Coding Plan endpoint (its key isn't valid on standard).
+      if (!response.ok && !apiConfig.baseUrl) {
+        console.warn(
+          "[http] Z.ai models: standard endpoint failed — retrying with Coding Plan endpoint"
+        );
+        url = "https://api.z.ai/api/coding/paas/v4/models";
+        response = await fetch(url, {
+          headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
+          signal: AbortSignal.timeout(12_000),
+        });
+      }
+
       if (!response.ok) return [];
 
       const json = await response.json();
@@ -5712,6 +7266,50 @@ export class ApiBackend extends PunkBackend {
         .sort(_byRelevance);
     } catch (err) {
       console.error("[http] Failed to fetch Z.ai models:", err);
+      return [];
+    }
+  }
+
+  /**
+   * Fetch available Kimi (Moonshot) models via their OpenAI-compatible /models endpoint.
+   * Endpoint: https://api.moonshot.cn/v1/models
+   */
+  async getKimiModels() {
+    const apiConfig = await this.getApiConfig("kimi");
+    if (!apiConfig.apiKey) return [];
+
+    try {
+      const base = apiConfig.baseUrl
+        ? apiConfig.baseUrl.replace(/\/chat\/completions\/?$/, "")
+        : "https://api.moonshot.cn/v1";
+      const baseUrlClean = base.replace(/\/$/, "");
+      const url = baseUrlClean.endsWith("/models")
+        ? baseUrlClean
+        : `${baseUrlClean}/models`;
+
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiConfig.apiKey}` },
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!response.ok) return [];
+
+      const json = await response.json();
+      if (!json.data) return [];
+
+      return json.data
+        .filter((m) => m.id && !m.id.includes("embed") && !m.id.includes("vision"))
+        .map((m) => ({
+          id: m.id,
+          name: _kimiDisplayName(m.id),
+          context_length: m.context_length || _kimiContextLength(m.id),
+          provider: "Kimi",
+          tier: (m.id.includes("128k") || m.id.includes("kimi-k2")) ? 1 : 2,
+          input_cost: null,
+          output_cost: null,
+        }))
+        .sort(_byRelevance);
+    } catch (err) {
+      console.error("[http] Failed to fetch Kimi models:", err);
       return [];
     }
   }
@@ -5780,17 +7378,35 @@ export class ApiBackend extends PunkBackend {
    */
   async getAnthropicModels() {
     const apiConfig = await this.getApiConfig("anthropic");
-    if (!apiConfig.apiKey) return [];
+    const isOAuth = apiConfig.authType === "oauth";
+    if (!apiConfig.apiKey && !isOAuth) return [];
 
     try {
       const url = apiConfig.baseUrl
         ? apiConfig.baseUrl.replace(/\/messages\/?$/, "/models")
         : "https://api.anthropic.com/v1/models";
-      const response = await fetch(url, {
-        headers: {
+
+      let fetchHeaders;
+      if (isOAuth) {
+        const accessToken = await getAccessToken();
+        if (!accessToken) return [];
+        const oauthHeaders = getOAuthHeaders(accessToken);
+        fetchHeaders = {
+          Authorization: oauthHeaders.Authorization,
+          "anthropic-version": oauthHeaders["anthropic-version"],
+          "user-agent": oauthHeaders["user-agent"],
+          "anthropic-dangerous-direct-browser-access": oauthHeaders["anthropic-dangerous-direct-browser-access"],
+          "x-app": oauthHeaders["x-app"],
+        };
+      } else {
+        fetchHeaders = {
           "x-api-key": apiConfig.apiKey,
           "anthropic-version": "2023-06-01",
-        },
+        };
+      }
+
+      const response = await fetch(url, {
+        headers: fetchHeaders,
         signal: AbortSignal.timeout(12_000),
       });
       if (!response.ok) return [];
@@ -5859,6 +7475,68 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
+  /**
+   * Fetch available OpenAI models via API key or Codex CLI OAuth.
+   * Uses the standard OpenAI /models endpoint for API key mode,
+   * or the Codex /models endpoint for OAuth mode.
+   */
+  async getOpenAIModels() {
+    const apiConfig = await this.getApiConfig("openai");
+    const isOAuth = apiConfig.authType === "openai-oauth";
+    if (!apiConfig.apiKey && !isOAuth) return [];
+
+    try {
+      let url, fetchHeaders;
+
+      if (isOAuth) {
+        // Codex /models requires net.fetch (Cloudflare) + client_version param.
+        // Returns Codex-specific slugs (gpt-5.6-sol etc.) — already mapped
+        // to chat-style model objects by codexModels().
+        const accessToken = await getOpenAIAccessToken();
+        if (!accessToken) return [];
+        return await codexModels(accessToken, getOpenAIAccountId());
+      } else {
+        const url = "https://api.openai.com/v1/models";
+        const fetchHeaders = {
+          Authorization: `Bearer ${apiConfig.apiKey}`,
+        };
+
+        const response = await fetch(url, {
+          headers: fetchHeaders,
+          signal: AbortSignal.timeout(12_000),
+        });
+        if (!response.ok) return [];
+
+        const json = await response.json();
+        if (!json.data) return [];
+
+        // Filter to chat-capable models — exclude embeddings, audio, TTS, etc.
+        const chatModels = json.data.filter((m) => {
+          const id = m.id?.toLowerCase() || "";
+          if (id.includes("embed") || id.includes("tts") || id.includes("whisper")) return false;
+          if (id.includes("dall-e") || id.includes("moderation")) return false;
+          // Keep GPT, o-series, and codex models
+          return id.startsWith("gpt-") || id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4") || id.includes("codex");
+        });
+
+        return chatModels
+          .map((m) => ({
+            id: m.id,
+            name: m.id,
+            context_length: _openaiContextLength(m.id),
+            provider: "OpenAI",
+            tier: m.id.includes("mini") ? 2 : 1,
+            input_cost: null,
+            output_cost: null,
+          }))
+          .sort(_byRelevance);
+      }
+    } catch (err) {
+      console.error("[http] Failed to fetch OpenAI models:", err);
+      return [];
+    }
+  }
+
   // ==========================================================================
   // Task Runner Support — Planning Call & Step Execution (class methods)
   // ==========================================================================
@@ -5891,10 +7569,12 @@ export class ApiBackend extends PunkBackend {
     };
 
     // Request usage data in streaming response for OpenAI-compatible providers
+    // NOT for openai-oauth: Codex Responses API rejects unknown params.
     if (
-      ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(
+      ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter", "openai"].includes(
         apiConfig.provider,
-      )
+      ) &&
+      apiConfig.authType !== "openai-oauth"
     ) {
       body.stream_options = { include_usage: true };
     }
@@ -5917,11 +7597,21 @@ export class ApiBackend extends PunkBackend {
 
     while (true) {
       try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers,
-          body: safeStringify(cleanBody),
-        });
+        let response;
+        if (url.startsWith("codex://")) {
+          const codexToken = await getOpenAIAccessToken();
+          if (!codexToken) throw new Error("OpenAI OAuth token expired — run codex login again.");
+          const codexBody = cleanBody._codexResponses || buildResponsesRequest(cleanBody);
+          delete cleanBody._codexResponses;
+          response = await codexFetch(codexToken, getOpenAIAccountId(), codexBody);
+          response.codex = true;
+        } else {
+          response = await fetch(url, {
+            method: "POST",
+            headers,
+            body: safeStringify(cleanBody),
+          });
+        }
 
         if (!response.ok) {
           const status = response.status;
@@ -6030,7 +7720,10 @@ export class ApiBackend extends PunkBackend {
             }
 
             let delta = "";
-            if (apiConfig.provider === "anthropic") {
+            if (response.codex) {
+              // Codex Responses API: text arrives in response.output_text.delta
+              if (parsed.type === "response.output_text.delta") delta = parsed.delta || "";
+            } else if (apiConfig.provider === "anthropic") {
               // Anthropic: content_block_delta with text_delta
               if (
                 parsed.type === "content_block_delta" &&
@@ -6189,11 +7882,21 @@ export class ApiBackend extends PunkBackend {
 
     while (true) {
       try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers,
-          body: safeStringify(cleanBody),
-        });
+        let response;
+        if (url.startsWith("codex://")) {
+          const codexToken = await getOpenAIAccessToken();
+          if (!codexToken) throw new Error("OpenAI OAuth token expired — run codex login again.");
+          const codexBody = cleanBody._codexResponses || buildResponsesRequest(cleanBody);
+          delete cleanBody._codexResponses;
+          response = await codexFetch(codexToken, getOpenAIAccountId(), codexBody);
+          response.codex = true;
+        } else {
+          response = await fetch(url, {
+            method: "POST",
+            headers,
+            body: safeStringify(cleanBody),
+          });
+        }
 
         if (!response.ok) {
           const status = response.status;
@@ -6237,6 +7940,32 @@ export class ApiBackend extends PunkBackend {
           throw new Error(
             `Conversation call failed after ${MAX_RETRIES} attempts: HTTP ${status}: ${errorText}`,
           );
+        }
+
+        // Codex Responses API always streams (stream:false rejected) —
+        // accumulate text from SSE events instead of parsing JSON.
+        if (response.codex) {
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let fullText = "";
+          let buffer = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop();
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              const payload = line.slice(6).trim();
+              if (!payload || payload === "[DONE]") continue;
+              try {
+                const ev = JSON.parse(payload);
+                if (ev.type === "response.output_text.delta") fullText += ev.delta || "";
+              } catch { /* skip keep-alive fragments */ }
+            }
+          }
+          return fullText;
         }
 
         const json = await response.json();

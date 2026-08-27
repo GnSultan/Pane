@@ -29,6 +29,8 @@
   --color-pane-syn-string: var(--pane-syn-data);
   --color-pane-syn-number: var(--pane-syn-data-number);
   --color-pane-accent: var(--pane-accent);
+  --color-pane-accent-tab: var(--pane-accent-tab);
+  --color-pane-inactive-tab: var(--pane-inactive-tab);
 
   --font-mono: "Geist Mono Variable", ui-monospace, monospace;
   --font-sans: "Geist Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -207,6 +209,7 @@
   --pane-status-added-bg: rgba(138, 154, 108, 0.1);
   --pane-status-modified: #B8A56A;
   --pane-status-deleted: #A67272;
+  --pane-status-deleted-bg: rgba(166, 114, 114, 0.08);
   --pane-status-renamed: #7E97AA;
   --pane-status-untracked: #6D6A63;
   --pane-error: #A67272;
@@ -216,6 +219,13 @@
   /* Terminal accent — the machine's voice */
   --pane-terminal: #8AACCA;
   --pane-accent: var(--pane-status-added);
+  /* Active thread tab: same visual composite as ThreadPanel's accent/[0.10]
+     on solid panel — 10% accent blended into the surface color. Resolves
+     per-theme since both vars are theme-aware. */
+  --pane-accent-tab: color-mix(in srgb, var(--pane-accent) 10%, var(--pane-surface));
+  /* Inactive thread tab: subtle presence matching ThreadPanel's new-thread
+     hover. 8% text color blended into surface — visible but quiet. */
+  --pane-inactive-tab: color-mix(in srgb, var(--pane-text) 8%, var(--pane-surface));
 
   /* Overlay */
   --pane-overlay: rgba(20, 19, 18, 0.7);
@@ -294,6 +304,7 @@
   --pane-status-added-bg: rgba(91, 112, 64, 0.1);
   --pane-status-modified: #8A7530;
   --pane-status-deleted: #8C4A4A;
+  --pane-status-deleted-bg: rgba(140, 74, 74, 0.06);
   --pane-status-renamed: #4A708A;
   --pane-status-untracked: #8A877F;
   --pane-error: #8C4A4A;
@@ -366,6 +377,7 @@
   --pane-status-added-bg: rgba(45, 122, 58, 0.1);
   --pane-status-modified: #7A6520;
   --pane-status-deleted: #9A3333;
+  --pane-status-deleted-bg: rgba(154, 51, 51, 0.06);
   --pane-status-renamed: #2A5A7A;
   --pane-status-untracked: #808080;
   --pane-error: #9A3333;
@@ -439,6 +451,7 @@
   --pane-status-added-bg: rgba(138, 154, 108, 0.1);
   --pane-status-modified: #B8A56A;
   --pane-status-deleted: #A67272;
+  --pane-status-deleted-bg: rgba(166, 114, 114, 0.08);
   --pane-status-renamed: #7E97AA;
   --pane-status-untracked: #6D6A63;
   --pane-error: #A67272;

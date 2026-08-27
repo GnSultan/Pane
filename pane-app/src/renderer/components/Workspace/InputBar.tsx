@@ -6,6 +6,7 @@ import type { Todo } from "../../lib/punk-types";
 import { isThinkingModel } from "../../lib/models";
 import { showFilePicker, brainMindGetAll, brainMindAdd, type MindEntry } from "../../lib/tauri-commands";
 import { useMindStore } from "../../stores/mind";
+import { VoiceOrb } from "./VoiceOrb";
 import { CaretTextArea } from "../shared";
 
 const EMPTY_TODOS: Todo[] = [];
@@ -63,81 +64,55 @@ function formatRelativeTime(epochMs: number): string {
 }
 
 function RateLimitIndicator() {
-  const info = useWorkspaceStore((s) => s.rateLimitInfo);
-  const provider = useWorkspaceStore((s) => s.selectedModelProvider);
-  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
-  const setRateLimitInfo = useWorkspaceStore((s) => s.setRateLimitInfo);
+  const activeProjectId = useProjectsStore((s) => s.activeProjectId);
+  const projectProvider = useProjectsStore(
+    (s) => (activeProjectId ? s.projects.get(activeProjectId)?.selectedModelProvider : undefined) ?? null,
+  );
+  const wsProvider = useWorkspaceStore((s) => s.selectedModelProvider);
+  // Per-project provider takes priority, matching how InputBar resolves the model.
+  const provider = projectProvider ?? wsProvider;
+  const info = useWorkspaceStore((s) => s.rateLimitByProvider[provider]);
+  const setRateLimitForProvider = useWorkspaceStore((s) => s.setRateLimitForProvider);
 
-  // Compute before the conditional return so useEffect is always called unconditionally.
-  const resetEpochMs = info?.resetsAt ? info.resetsAt * 1000 : null;
-  const overageResetMs = info?.overageResetsAt ? info.overageResetsAt * 1000 : null;
+  const resetEpochMs = info?.resetsAt ? info.resetsAt * 1000 : info?.overageResetsAt ? info.overageResetsAt * 1000 : null;
 
-  // Auto-expire: schedule a clear when the reset time passes so the warning
-  // disappears on its own without needing another backend event.
+  // Auto-expire when reset window passes.
   useEffect(() => {
-    const epochMs = resetEpochMs ?? overageResetMs;
-    if (!epochMs) return;
-    const delay = epochMs - Date.now();
-    if (delay <= 0) {
-      setRateLimitInfo(null);
-      return;
-    }
-    const t = setTimeout(() => setRateLimitInfo(null), delay);
+    if (!resetEpochMs) return;
+    const delay = resetEpochMs - Date.now();
+    if (delay <= 0) { setRateLimitForProvider(provider, null); return; }
+    const t = setTimeout(() => setRateLimitForProvider(provider, null), delay);
     return () => clearTimeout(t);
-  }, [resetEpochMs, overageResetMs, setRateLimitInfo]);
+  }, [resetEpochMs, setRateLimitForProvider, provider]);
 
-  // Only show for Claude (anthropic) provider — rate limits are Claude-specific.
-  if (!info || provider !== "anthropic") return null;
+  if (!info) return null;
 
   const pct = info.utilization != null ? Math.round(info.utilization * 100) : null;
-  const isOverage = info.isUsingOverage === true;
   const isRejected = info.status === "rejected";
-  // overageStatus: "rejected" means "overage billing is disabled on this account" — the API
-  // sends this on every response for accounts that haven't enabled pay-as-you-go overage.
-  // Only treat it as actionable when the request itself was also rejected (status: "rejected"),
-  // otherwise it's a false positive for subscription users who are well within their limits.
-  const overageRejected = info.overageStatus === "rejected" && isRejected;
+  const resetTime = resetEpochMs ? formatRelativeTime(resetEpochMs) : null;
 
-  // Subscription users: don't show until 60% utilization — below that is noise.
-  // Credit users (pay-as-you-go): show overage state immediately since it has
-  // direct cost implications.
-  const isSubscription =
-    (sdkAccount as Record<string, unknown> | null)?.billingType === "stripe_subscription" ||
-    sdkAccount?.subscription != null;
-
-  // Overage rejected (exhausted all usage / overage disabled and request blocked)
-  if (overageRejected) {
-    const resetTime = overageResetMs ? formatRelativeTime(overageResetMs) : null;
-    // "out of credits" only makes sense for credit/pay-as-you-go users.
-    // Subscription users see "limit reached · resets in Xh" instead.
-    const label = isSubscription
-      ? `limit reached${resetTime ? ` · resets ${resetTime}` : ""}`
-      : `extra usage · out of credits${resetTime ? ` · resets ${resetTime}` : ""}`;
+  // Exhausted / rejected — short word, reset time.
+  if (isRejected) {
     return (
       <span className="font-mono tabular-nums text-pane-error" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-        {label}
+        limit{resetTime && ` · ${resetTime}`}
       </span>
     );
   }
 
-  // Standard rate limit at ≥60% — this takes priority over the generic
-  // "extra usage" label because a concrete percentage is always more
-  // informative. If the SDK sends utilization even in overage state, show it.
-  if (pct != null && pct >= 60) {
-    const resetTime = resetEpochMs ? formatRelativeTime(resetEpochMs) : null;
-    const prefix = isOverage ? "extra usage · " : "";
+  // Always visible — color escalates as usage climbs.
+  if (pct != null) {
+    const color = pct >= 90 ? "text-pane-error" : pct >= 60 ? "text-[var(--pane-status-modified)]" : "text-pane-text-secondary/30";
     return (
-      <span
-        className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-[var(--pane-status-modified)]"}`}
-        style={{ fontSize: "var(--pane-font-size-xs)" }}
-      >
-        {prefix}{pct}%{isRejected ? " · limit reached" : " · limit"}{resetTime && ` · resets ${resetTime}`}
+      <span className={`font-mono tabular-nums ${color}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        usage {pct}%
       </span>
     );
   }
 
   return null;
 }
+
 
 // ─── Static caret (no-blink) ─────────────────────────────────────────────────
 //
@@ -155,7 +130,31 @@ interface InputBarProps {
   onSend: (message: string, minds?: Array<{ id: string }>, phase?: string) => void;
   onAbort: () => void;
   isProcessing: boolean;
+  /** Always-on voice relay controls. Optional to keep InputBar usable standalone. */
+  voice?: {
+    state: string;
+    error: string | null;
+    transcript: string;
+    toggle: () => void;
+    interrupt: () => void;
+    micStream?: MediaStream | null;
+    micDevices?: Array<{ deviceId: string; label: string }>;
+    activeMicId?: string | null;
+    onSelectMic?: (deviceId: string) => void;
+    onRefreshMics?: () => void;
+    audioPulseRef?: { current: number };
+  };
 }
+
+/** Voice states the orb understands (subset of VoiceState from the hook). */
+type VoiceOrbPropsState =
+  | "off"
+  | "idle"
+  | "connecting"
+  | "listening"
+  | "thinking"
+  | "speaking"
+  | "error";
 
 function isConversationVisible(): boolean {
   const { activeProjectId, projects } = useProjectsStore.getState();
@@ -192,7 +191,7 @@ function fuzzyScore(text: string, query: string): number {
 const PROVIDER_NAMES: Record<string, string> = {
   anthropic: "Claude",
   "anthropic-api": "Anthropic API",
-  gemini: "Gemini CLI",
+  gemini: "Gemini",
   "gemini-api": "Gemini API",
   deepseek: "DeepSeek",
   openrouter: "OpenRouter",
@@ -614,6 +613,7 @@ export function InputBar({
   onSend,
   onAbort,
   isProcessing,
+  voice,
 }: InputBarProps) {
   const [value, setValue] = useState("");
   const [modelPickerExpanded, setModelPickerExpanded] = useState(false);
@@ -641,6 +641,12 @@ export function InputBar({
   );
 
   const currentPhase: PhaseName = phaseOverride ?? storePhase;
+
+  // Active skills for this thread — visibility affordance only. The registry
+  // in main is authoritative; this chip just surfaces what's loaded.
+  const activeSkills = useProjectsStore(
+    (s) => s.projects.get(projectId)?.activeSkills ?? [],
+  );
 
   // Prefill from external sources (e.g., Lens "fix" button)
   useEffect(() => {
@@ -954,6 +960,7 @@ export function InputBar({
             </button>
           )}
           <div className="ml-auto shrink-0 flex items-center gap-1.5">
+            <RateLimitIndicator />
             {/* Mode pill — shows active phase in collapsed bar */}
             <button
               onClick={() => setExpandedSection("input")}
@@ -987,13 +994,33 @@ export function InputBar({
           className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-transparent font-mono px-5 py-3 pointer-events-none"
           style={{ fontSize: "var(--pane-font-size-xs)" }}
         >
-          <button
-            onClick={() => setExpandedSection("input")}
-            className="pointer-events-auto text-left text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors"
-          >
-            let's build
-          </button>
+          <div className="pointer-events-auto flex items-center gap-2">
+            <button
+              onClick={() => setExpandedSection("input")}
+              className="text-left text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors"
+            >
+              let's build
+            </button>
+            {/* Voice presence — the living orb. Click = wake/end, speaking = interrupt. */}
+            {voice && (
+              <div className="pointer-events-auto -mb-0.5">
+                <VoiceOrb
+                  state={voice.state as VoiceOrbPropsState}
+                  error={voice.error}
+                  micStream={voice.micStream}
+                  audioPulseRef={voice.audioPulseRef}
+                  micDevices={voice.micDevices}
+                  activeMicId={voice.activeMicId}
+                  onSelectMic={voice.onSelectMic}
+                  onRefreshMics={voice.onRefreshMics}
+                  onToggle={voice.toggle}
+                  onInterrupt={voice.interrupt}
+                />
+              </div>
+            )}
+          </div>
           <div className="pointer-events-auto shrink-0 flex items-center gap-1.5">
+            <RateLimitIndicator />
             {/* Mode pill — shows active phase in ghost trigger */}
             <button
               onClick={() => setExpandedSection("input")}
@@ -1068,6 +1095,20 @@ export function InputBar({
             style={{
               padding: "1rem 1.25rem 0.75rem 1.25rem",
             }}
+            onDropFiles={(paths) => {
+              const ta = textareaRef.current;
+              if (!ta) return;
+              const insertion = paths.map(p => `\`${p}\``).join(" ");
+              const pos = ta.selectionStart ?? ta.value.length;
+              const newValue = ta.value.slice(0, pos) + (pos > 0 && !ta.value.slice(pos - 1, pos).endsWith(" ") ? " " : "") + insertion + " " + ta.value.slice(pos);
+              setValue(newValue);
+              // Restore cursor after the inserted paths
+              const newCursorPos = pos + (pos > 0 && !ta.value.slice(pos - 1, pos).endsWith(" ") ? 1 : 0) + insertion.length + 1;
+              requestAnimationFrame(() => {
+                ta.focus();
+                ta.setSelectionRange(newCursorPos, newCursorPos);
+              });
+            }}
           />
         )}
 
@@ -1126,7 +1167,7 @@ export function InputBar({
             />
           ) : (
             <>
-              {/* Left group: attach + mind toggle, side by side with explicit gap */}
+              {/* Left group: attach + mind toggle */}
               <div className="shrink-0 flex items-center gap-3">
                 {/* Attach (+) button */}
                 {attachMenu === "menu" ? (
@@ -1193,9 +1234,40 @@ export function InputBar({
                     <circle cx="12" cy="12" r="3" fill={isMindMode ? "currentColor" : "none"} />
                   </svg>
                 </button>
+
+                {/* Voice presence — beside mind. Wakes the always-on voice layer. */}
+                {voice && (
+                  <VoiceOrb
+                    state={voice.state as VoiceOrbPropsState}
+                    error={voice.error}
+                    micStream={voice.micStream}
+                    audioPulseRef={voice.audioPulseRef}
+                    micDevices={voice.micDevices}
+                    activeMicId={voice.activeMicId}
+                    onSelectMic={voice.onSelectMic}
+                    onRefreshMics={voice.onRefreshMics}
+                    onToggle={voice.toggle}
+                    onInterrupt={voice.interrupt}
+                  />
+                )}
               </div>
 
               <div className="flex-1" />
+
+              <RateLimitIndicator />
+
+              {activeSkills.length > 0 && (
+                <div
+                  className="pointer-events-none font-mono shrink-0 px-3 py-1.5 rounded-md inline-flex items-center gap-1.5 max-w-56"
+                  title={activeSkills.join(", ")}
+                  style={{ fontSize: "var(--pane-font-size-sm)", color: "var(--pane-accent)" }}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                    <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+                  </svg>
+                  <span className="truncate">{activeSkills.join(" · ")}</span>
+                </div>
+              )}
 
               {(() => {
                 if (isMindMode) {
@@ -1231,7 +1303,6 @@ export function InputBar({
                   </button>
                 );
               })()}
-              <RateLimitIndicator />
               <div className="pointer-events-auto">
                 <ModelPickerTrigger
                   value={selectedModel}

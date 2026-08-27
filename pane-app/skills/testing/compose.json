@@ -1,0 +1,10 @@
+{
+  "name": "testing",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["testing", "tdd", "test-strategy", "mocking"],
+  "tags": ["testing", "tdd", "unit-tests", "integration-tests", "mocking"],
+  "priority": 5
+}

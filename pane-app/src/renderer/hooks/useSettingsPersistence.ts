@@ -133,6 +133,8 @@ export function useSettingsPersistence() {
         if (settings.theme) ws.setTheme(settings.theme as Theme);
         if (settings.completion_sound)
           ws.setCompletionSound(settings.completion_sound);
+        if (settings.sidebar_collapsed !== null && settings.sidebar_collapsed !== undefined)
+          ws.setSidebarCollapsed(settings.sidebar_collapsed);
 
         // 2. Provider & Model state
         const backend = settings.punk_backend || "api";
@@ -403,10 +405,12 @@ export function useSettingsPersistence() {
 
           function _checkMissingRoots(entries: Array<{ id: string; root: string }>) {
             Promise.all(
-              entries.map(async ({ id, root }) => {
-                const exists = await checkPathExists(root).catch(() => true);
-                if (!exists) markRootMissing(id, true);
-              })
+              entries
+                .filter(({ root }) => root) // unbound threads have no path to check
+                .map(async ({ id, root }) => {
+                  const exists = await checkPathExists(root).catch(() => true);
+                  if (!exists) markRootMissing(id, true);
+                })
             ).catch(() => {});
           }
 
@@ -595,6 +599,7 @@ export function useSettingsPersistence() {
         keybindings: ws.keybindings,
         theme: ws.theme,
         completion_sound: ws.completionSound,
+        sidebar_collapsed: ws.sidebarCollapsed,
         selected_model: ws.selectedModel,
         selected_model_provider: ws.selectedModelProvider,
 
@@ -634,6 +639,7 @@ export function useSettingsPersistence() {
         state.keybindings !== prev.keybindings ||
         state.theme !== prev.theme ||
         state.completionSound !== prev.completionSound ||
+        state.sidebarCollapsed !== prev.sidebarCollapsed ||
         state.selectedModel !== prev.selectedModel ||
         state.selectedModelProvider !== prev.selectedModelProvider ||
         state.punkBackend !== prev.punkBackend ||

@@ -5,10 +5,12 @@ export interface CaretTextAreaProps extends React.TextareaHTMLAttributes<HTMLTex
   minHeight?: number;
   maxHeight?: number;
   autoResize?: boolean;
+  /** Called when files/folders are dropped onto the textarea. paths are absolute filesystem paths. */
+  onDropFiles?: (paths: string[]) => void;
 }
 
 export const CaretTextArea = forwardRef<HTMLTextAreaElement, CaretTextAreaProps>(
-  ({ value = "", onChange, onFocus, onBlur, onKeyDown, onScroll, placeholder, className, style, minHeight = 56, maxHeight = 400, autoResize = true, ...props }, ref) => {
+  ({ value = "", onChange, onFocus, onBlur, onKeyDown, onScroll, placeholder, className, style, minHeight = 56, maxHeight = 400, autoResize = true, onDropFiles, ...props }, ref) => {
     const internalRef = useRef<HTMLTextAreaElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [caretPos, setCaretPos] = useState<{ top: number; left: number; lineHeight: number; fontSize: number } | null>(null);
@@ -73,8 +75,53 @@ export const CaretTextArea = forwardRef<HTMLTextAreaElement, CaretTextAreaProps>
       ...style,
     };
 
+    // Drag-and-drop: extract filesystem paths from dropped files
+    const [dragOver, setDragOver] = useState(false);
+    const handleDragOver = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer.types.includes("Files")) {
+        e.dataTransfer.dropEffect = "copy";
+        setDragOver(true);
+      }
+    }, []);
+    const handleDragLeave = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // Only set false if we're leaving the container itself (not a child)
+      if (e.currentTarget === e.target) setDragOver(false);
+    }, []);
+    const handleDrop = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragOver(false);
+      if (!onDropFiles) return;
+      const files = e.dataTransfer.files;
+      if (!files || files.length === 0) return;
+      const paths: string[] = [];
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i] as File & { path?: string };
+        if (file.path) paths.push(file.path);
+      }
+      if (paths.length > 0) onDropFiles(paths);
+    }, [onDropFiles]);
+
     return (
-      <div ref={containerRef} className={`relative overflow-hidden ${className || ""}`}>
+      <div
+        ref={containerRef}
+        className={`relative overflow-hidden ${className || ""}`}
+        onDragOver={onDropFiles ? handleDragOver : undefined}
+        onDragLeave={onDropFiles ? handleDragLeave : undefined}
+        onDrop={onDropFiles ? handleDrop : undefined}
+      >
+        {/* Drop indicator — dashed accent border when dragging files over */}
+        {dragOver && (
+          <div
+            aria-hidden
+            className="absolute inset-0 z-10 pointer-events-none rounded-xl"
+            style={{ border: "2px dashed var(--pane-accent)" }}
+          />
+        )}
         <textarea
           {...props}
           ref={internalRef}

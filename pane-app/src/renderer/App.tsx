@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { setWindowTitle } from "./lib/tauri-commands";
 import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ThreadPanel } from "./components/ThreadPanel/ThreadPanel";
+import { ActiveThreadTabs } from "./components/ActiveThreadTabs";
 import { Workspace } from "./components/Workspace/Workspace";
 import { TaskNotification } from "./components/shared/TaskNotification";
 import { useWorkspaceStore } from "./stores/workspace";
@@ -9,11 +10,16 @@ import { useProjectsStore } from "./stores/projects";
 import { useFileWatcher } from "./hooks/useFileWatcher";
 import { useGitStatus } from "./hooks/useGitStatus";
 import { useSettingsPersistence } from "./hooks/useSettingsPersistence";
+import { useSkillsSync } from "./hooks/useSkillsSync";
 
 function App() {
-  // Sidebar visibility derived from active mode — shown only in conversation mode.
+  // Sidebar visibility: conversation mode + not collapsed.
   // When no project exists (empty state), sidebar is visible to show the thread list.
-  const sidebarVisible = useProjectsStore((s) => {
+  const sidebarCollapsed = useWorkspaceStore((s) => s.sidebarCollapsed);
+  // Sidebar is rendered only in conversation mode (and empty state).
+  // When collapsed, it animates to width 0 instead of unmounting —
+  // preserves scroll position and ThreadPanel state.
+  const inConversationMode = useProjectsStore((s) => {
     const id = s.activeProjectId;
     return id ? s.projects.get(id)?.mode === "conversation" : true;
   });
@@ -27,6 +33,7 @@ function App() {
   useFileWatcher();
   useGitStatus();
   useSettingsPersistence();
+  useSkillsSync();
 
   // Fetch models on app launch
   useEffect(() => {
@@ -60,7 +67,9 @@ function App() {
         const index = parseInt(e.key) - 1;
         const state = useProjectsStore.getState();
         const { projects, projectOrder, setActiveProject } = state;
-        const sortedOrder = [...projectOrder].sort((a, b) => {
+        const sortedOrder = [...projectOrder]
+          .filter((id) => !projects.get(id)?.archived)
+          .sort((a, b) => {
           const aTime = projects.get(a)?.lastActivityAt ?? null;
           const bTime = projects.get(b)?.lastActivityAt ?? null;
           if (aTime !== null && bTime !== null) return bTime - aTime;
@@ -101,11 +110,17 @@ function App() {
 
       switch (finalAction) {
         case "toggle-panel": {
-          // Cmd+B now goes to conversation mode — the conceptual equivalent of "showing the sidebar"
-          const { activeProjectId: pid, setMode: sm } = useProjectsStore.getState();
+          // Cmd+B toggles the sidebar (thread panel) between expanded and collapsed.
+          // If we're not in conversation mode, switch to conversation mode first.
+          const { activeProjectId: pid, projects, setMode: sm } = useProjectsStore.getState();
           if (pid) {
-            sm(pid, "conversation");
-            requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-input")));
+            const project = projects.get(pid);
+            if (project && project.mode !== "conversation") {
+              sm(pid, "conversation");
+              requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("pane:focus-input")));
+            } else {
+              useWorkspaceStore.getState().toggleSidebar();
+            }
           }
           break;
         }
@@ -236,14 +251,21 @@ function App() {
       {/* Titlebar drag region — must stay at App root level for full-width coverage.
            z-30 sits above active pages (z-20), below interactive headers (z-40).
            Uses app-region: drag (not -webkit-app-region — dead since Chromium 118+).
-           No background needed — app-region works regardless of element opacity. */}
+           No background needed — app-region works regardless of element opacity.
+           When sidebar is collapsed, active thread tabs render inside — they're
+           data-no-drag (clickable) while the surrounding region stays draggable. */}
       <div
         className="absolute top-0 left-0 right-0 h-[50px] z-30"
         data-tauri-drag-region
-      />
+      >
+        {sidebarCollapsed && <ActiveThreadTabs />}
+      </div>
       <div className="flex h-full pt-2 pb-2 pl-2 gap-1">
-        {sidebarVisible && (
-          <div className="shrink-0 w-80">
+        {inConversationMode && (
+          <div
+            className="shrink-0 overflow-hidden transition-[width] duration-200 ease-out"
+            style={{ width: sidebarCollapsed ? "0px" : "320px" }}
+          >
             <ThreadPanel />
           </div>
         )}

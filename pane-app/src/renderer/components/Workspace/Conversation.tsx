@@ -1,9 +1,13 @@
 import { useRef, useEffect, useCallback, useMemo, memo, useState, startTransition } from "react";
 import { useProjectsStore } from "../../stores/projects";
+import { useWorkspaceStore } from "../../stores/workspace";
 import { usePunk } from "../../hooks/usePunk";
+import { useRealtimeVoice } from "../../hooks/useRealtimeVoice";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
+import { AskUserCard } from "./AskUserCard";
+import { VoiceFloorGlow } from "./VoiceFloorGlow";
 import { getConversationSlice, listCheckpoints, readFile } from "../../lib/tauri-commands";
 import { restoringProjects } from "../../hooks/useSettingsPersistence";
 import type {
@@ -72,12 +76,16 @@ export const Conversation = memo(function Conversation({
   const messages = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.messages ?? EMPTY_MESSAGES,
   );
+  const sidebarCollapsed = useWorkspaceStore((s) => s.sidebarCollapsed);
   const isProcessing = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.isProcessing ?? false,
   );
   const isThinking = useProjectsStore(
     (s) =>
       s.projects.get(projectId)?.conversation.statusMessage === "thinking...",
+  );
+  const projectRoot = useProjectsStore(
+    (s) => s.projects.get(projectId)?.root ?? null,
   );
   const error = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.error ?? null,
@@ -86,6 +94,9 @@ export const Conversation = memo(function Conversation({
     (s) => s.projects.get(projectId)?.conversation.historyStartIndex ?? 0,
   );
   const hasOlderMessages = historyStartIndex > 0;
+  const pendingInput = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.pendingInput ?? null,
+  );
 
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
   const [loadOlderError, setLoadOlderError] = useState<string | null>(null);
@@ -153,6 +164,53 @@ export const Conversation = memo(function Conversation({
 
   const isActive = isProcessing || isThinking;
   streamingRef.current = isActive;
+
+  // ── Always-on voice relay (OpenAI Realtime) ─────────────────────────────
+  // Voice shares the agent's brain and delegates execution. Agent status is
+  // read imperatively from the store — voice never causes re-renders here.
+  // handleSend is defined below; a ref bridges so delegation never goes stale.
+  const handleSendRef = useRef<(msg: string, minds?: Array<{ id: string }>, phase?: string) => void>(() => {});
+  const pushAgentStatusRef = useRef<(() => void) | null>(null);
+
+  const getAgentStatus = useCallback((): { running: boolean; lastLine: string | null } => {
+    const proj = useProjectsStore.getState().projects.get(projectId);
+    const conv = proj?.conversation;
+    const running = Boolean(
+      conv?.isProcessing || conv?.statusMessage === "thinking...",
+    );
+    let lastLine: string | null = null;
+    if (running && conv?.messages) {
+      const msgs = conv.messages;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (!m || m.type !== "assistant") continue;
+        const blocks = m.content;
+        if (Array.isArray(blocks)) {
+          for (let j = blocks.length - 1; j >= 0; j--) {
+            const b = blocks[j] as { type: string; text?: string } | undefined;
+            if (b?.type === "text" && b.text && b.text.trim()) {
+              lastLine = b.text.trim().slice(0, 200);
+              break;
+            }
+          }
+        }
+        if (lastLine) break;
+      }
+    }
+    return { running, lastLine };
+  }, [projectId]);
+
+  const voice = useRealtimeVoice({
+    projectId,
+    projectRoot: projectRoot,
+    getAgentStatus,
+    onDelegate: (instruction: string, phase: "think" | "build") => {
+      handleSendRef.current(instruction, undefined, phase);
+      // Let voice confirm aloud that the agent picked it up.
+      setTimeout(() => pushAgentStatusRef.current?.(), 1500);
+    },
+  });
+  pushAgentStatusRef.current = voice.pushAgentStatus;
 
   const { applyRestored } = useScrollPosition(projectId, scrollRef, followRef, streamingRef);
 
@@ -275,6 +333,7 @@ export const Conversation = memo(function Conversation({
     },
     [sendMessage, scrollToBottom],
   );
+  handleSendRef.current = handleSend;
 
   // Listen for send-message events from EmptyState (first message on thread creation)
   useEffect(() => {
@@ -310,49 +369,53 @@ export const Conversation = memo(function Conversation({
 
   return (
     <div className="relative flex flex-col h-full w-full">
+      {/* Ambient voice light — the room reacts before you look at the orb. */}
+      <VoiceFloorGlow />
       <div
         ref={scrollRef}
-        className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto px-10 pb-8 pt-8 bg-pane-bg"
+        className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto pb-8 pt-8 bg-pane-bg"
         data-conv-scroll
       >
-        {hasOlderMessages && (
-          <div className="flex flex-col items-center py-3">
-            {loadOlderError && (
-              <span
-                className="font-mono text-[10px] text-pane-error mb-1"
+        <div className="max-w-5xl mx-auto px-10 min-h-full">
+          {hasOlderMessages && (
+            <div className="flex flex-col items-center py-3">
+              {loadOlderError && (
+                <span
+                  className="font-mono text-[10px] text-pane-error mb-1"
+                >
+                  {loadOlderError}
+                </span>
+              )}
+              <button
+                onClick={handleLoadOlder}
+                disabled={isLoadingOlder}
+                className="font-mono text-[10px] text-[var(--pane-terminal)] opacity-60 hover:opacity-100 disabled:opacity-30 transition-opacity"
               >
-                {loadOlderError}
+                {isLoadingOlder ? "loading..." : "load older messages"}
+              </button>
+            </div>
+          )}
+
+          {messages.length === 0 && !hasOlderMessages && (
+            <div className="flex items-center justify-center h-full select-none">
+              <span
+                className="text-pane-text-secondary/40 font-mono tracking-[0.25em] uppercase"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+              >
+                ready
               </span>
-            )}
-            <button
-              onClick={handleLoadOlder}
-              disabled={isLoadingOlder}
-              className="font-mono text-[10px] text-[var(--pane-terminal)] opacity-60 hover:opacity-100 disabled:opacity-30 transition-opacity"
-            >
-              {isLoadingOlder ? "loading..." : "load older messages"}
-            </button>
-          </div>
-        )}
+            </div>
+          )}
 
-        {messages.length === 0 && !hasOlderMessages && (
-          <div className="flex items-center justify-center h-full select-none">
-            <span
-              className="text-pane-text-secondary/40 font-mono tracking-[0.25em] uppercase"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              ready
-            </span>
-          </div>
-        )}
-
-        {messages.map((message) => (
-          <MemoizedMessage
-            key={message.id}
-            message={message}
-            toolResults={toolResultMap}
-            projectId={projectId}
-          />
-        ))}
+          {messages.map((message) => (
+            <MemoizedMessage
+              key={message.id}
+              message={message}
+              toolResults={toolResultMap}
+              projectId={projectId}
+            />
+          ))}
+        </div>
       </div>
 
       {showRefreshToast && (
@@ -365,7 +428,7 @@ export const Conversation = memo(function Conversation({
 
       {visibleError && (
         <div className="absolute bottom-0 left-0 right-0 z-40 px-4 pb-4 pointer-events-none">
-          <div className="pointer-events-auto flex items-start gap-3 font-mono text-[11px] text-pane-error bg-pane-error-bg ring-1 ring-pane-error-border px-4 py-3 rounded-md animate-fade-in leading-[1.6]">
+          <div className="pointer-events-auto max-w-5xl mx-auto flex items-start gap-3 font-mono text-[11px] text-pane-error bg-pane-error-bg ring-1 ring-pane-error-border px-4 py-3 rounded-md animate-fade-in leading-[1.6]">
             <span
               className="flex-1 overflow-y-auto max-h-[100px] select-text"
               style={{ overflowWrap: "anywhere" }}
@@ -381,12 +444,33 @@ export const Conversation = memo(function Conversation({
           </div>
         </div>
       )}
-      <div className="relative z-10 shrink-0 flex flex-col">
+      <div className={`relative z-10 shrink-0 flex flex-col ${sidebarCollapsed ? "max-w-5xl mx-auto w-full" : ""}`}>
+        {pendingInput && (
+          <AskUserCard
+            projectId={projectId}
+            toolId={pendingInput.toolId}
+            question={pendingInput.question}
+            onReply={handleSend}
+          />
+        )}
         <InputBar
           projectId={projectId}
           onSend={handleSend}
           onAbort={abortMessage}
           isProcessing={isProcessing}
+          voice={{
+            state: voice.state,
+            error: voice.error,
+            transcript: voice.transcript,
+            toggle: () => void voice.toggle(),
+            interrupt: voice.interrupt,
+            micStream: voice.micStream,
+            micDevices: voice.micDevices,
+            activeMicId: voice.activeMicId,
+            onSelectMic: voice.selectMic,
+            onRefreshMics: () => void voice.refreshMicDevices(),
+            audioPulseRef: voice.audioPulseRef,
+          }}
         />
       </div>
     </div>

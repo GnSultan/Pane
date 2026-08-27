@@ -1,0 +1,10 @@
+{
+  "name": "design",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["design", "api-design", "data-modeling", "system-design"],
+  "tags": ["design", "api-design", "data-modeling", "patterns", "tradeoffs"],
+  "priority": 5
+}

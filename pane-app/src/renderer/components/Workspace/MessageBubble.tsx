@@ -351,6 +351,14 @@ export function MessageBubble({
           )}
         </div>
         <div className="flex items-center justify-end gap-2 mt-1">
+          {message.deliveryMode === "steered" && (
+            <span
+              className="text-pane-text-secondary/40 font-mono"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              steered in
+            </span>
+          )}
           {message.checkpointId && (
             <CheckpointIndicator
               checkpointId={message.checkpointId}

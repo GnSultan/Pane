@@ -159,7 +159,7 @@ export interface StreamEvent {
     type: string;
     index?: number;
     delta?: {
-      type: "text_delta" | "thinking_delta" | "partial_json_delta";
+      type: "text_delta" | "thinking_delta" | "partial_json_delta" | "signature_delta";
       text?: string;
       thinking?: string;
       signature?: string;
@@ -294,12 +294,23 @@ export interface RateLimitInfo {
   status: "allowed" | "allowed_warning" | "rejected";
   utilization?: number;
   resetsAt?: number;
-  rateLimitType?: "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet" | "overage" | string;
+  rateLimitType?: "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet" | "overage" | "tokens" | "credits" | "quota_exhausted" | string;
   isUsingOverage?: boolean;
   overageStatus?: "allowed" | "allowed_warning" | "rejected";
   overageResetsAt?: number;
   overageDisabledReason?: string;
   surpassedThreshold?: number;
+  // ── Provider-agnostic extensions ──────────────────────────────────────────
+  // Which provider this rate limit data is from (e.g. "anthropic", "z-ai").
+  provider?: string;
+  // Z.ai Coding Plan credit tracking
+  creditsUsed?: number;
+  creditsLimit?: number | null;
+  weeklyCreditsUsed?: number;
+  weeklyCreditsLimit?: number | null;
+  // Terminal error details (for quota exhaustion display)
+  errorCode?: string;
+  message?: string;
 }
 
 export interface PunkEventTokenUsage {
@@ -322,9 +333,9 @@ export interface PunkEventAwaitingInput {
   data: {
     toolId: string;
     question: string | null;
-    inputType: "plan_approval" | "question";
   };
 }
+
 
 // ── Phase system ─────────────────────────────────────────────────────────────
 // think = discuss + brainstorm + plan (thinking model, read-only)
@@ -334,6 +345,11 @@ export type PanePhase = "think" | "build" | "idle";
 export interface PunkEventPhaseChanged {
   event: "phase_changed";
   data: { phase: PanePhase };
+}
+
+export interface PunkEventSteerMissed {
+  event: "steer_missed";
+  data: { texts: string[] };
 }
 
 export type PunkStreamEvent = (
@@ -354,6 +370,7 @@ export type PunkStreamEvent = (
   | PunkEventTokenUsage
   | PunkEventAwaitingInput
   | PunkEventPhaseChanged
+  | PunkEventSteerMissed
 ) & { requestId?: string };
 
 // Plan message types — the blueprint Pane produces before execution
@@ -418,6 +435,9 @@ export interface ConversationMessage {
   outputTokens?: number;
   numTurns?: number;
   checkpointId?: string;
+  // Set when this message was injected into an already-running task rather
+  // than sent as a fresh turn — see classifySteerIntent/steerPunk.
+  deliveryMode?: "steered";
   // Present when type === "plan"
   planData?: PlanData;
   // Present on punk-generated turns (bug, reflection, sentinel)
@@ -453,14 +473,12 @@ export interface ConversationState {
   routedModel: string | null; // Model chosen by smart router for current request
   serviceTier: string | null;
   isProcessing: boolean;
-  isPlanning: boolean;
   phase: PanePhase;
 
   isRestored: boolean; // true once loaded from disk at startup
   error: string | null;
   todos: Todo[];
   // Session lifecycle
-  isProcessActive: boolean; // Is the Claude CLI child process currently running?
   lastActivity: number; // Timestamp of last user interaction with this project
   // Context pressure tracking
   contextTokens: number; // Latest input_tokens from usage
@@ -476,11 +494,10 @@ export interface ConversationState {
   // Pagination — how much history is on disk vs. loaded in memory
   historyTotalCount: number; // Total messages in the conversation file
   historyStartIndex: number; // Index of the first loaded message (0 = all loaded)
-  // Suspended tool call awaiting user input (plan approval or AskUserQuestion)
+  // Paused ask_user call awaiting the user's answer
   pendingInput: {
     toolId: string;
     question: string | null;
-    inputType: "plan_approval" | "question";
   } | null;
 }
 
@@ -515,12 +532,10 @@ export function createEmptyConversation(): ConversationState {
     routedModel: null,
     serviceTier: null,
     isProcessing: false,
-    isPlanning: false,
     phase: "idle",
     isRestored: false,
     error: null,
     todos: [],
-    isProcessActive: false,
     lastActivity: Date.now(),
     contextTokens: 0,
     contextPressure: "none",

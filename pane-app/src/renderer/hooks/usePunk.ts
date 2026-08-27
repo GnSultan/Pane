@@ -33,6 +33,8 @@ import {
   resumeFromCheckpoint,
   recordLastPrompt,
   recordLastResponse,
+  classifySteerIntent,
+  steerPunk,
 } from "../lib/tauri-commands";
 import type {
   PunkStreamEvent,
@@ -859,6 +861,12 @@ export function usePunk(projectId: string) {
   // processEnded from calling finishProcessing (which would play completion sound,
   // set unread badges, etc. — unwanted on manual stop).
   const intentionalAbortRef = useRef(false);
+  // Set to true when abortMessage stops an in-progress turn. The NEXT
+  // sendMessage call reads and clears this, telling the backend the previous
+  // turn was cut off mid-task (not completed) so it can tell the model
+  // explicitly — otherwise the model has no signal that it was interrupted
+  // and tends to treat the redirect as if starting the task over.
+  const wasInterruptedRef = useRef(false);
   const retryAttemptRef = useRef<Record<string, number>>({});
   const messageQueueRef = useRef<Array<{ prompt: string; minds?: Array<{ id: string }>; phase?: string }>>([]);
 
@@ -868,9 +876,37 @@ export function usePunk(projectId: string) {
       const project = store.projects.get(projectId);
       if (!project) return;
 
-      // If already processing, queue the message instead of aborting.
-      // This prevents the "Hard Kill" where follow-up messages reset the model mid-task.
+      // Whether this send is the reply to an ask_user pause — captured BEFORE
+      // any await so the clear happens even if steering/queueing runs first.
+      const pendingClear = !!project.conversation.pendingInput;
+
+      // If already processing, either steer the message into the running
+      // task (if it's a correction/refinement for that same task) or queue
+      // it for after (unrelated new topic) — classification is local/regex,
+      // no network call, negligible latency. This prevents the "Hard Kill"
+      // where an unrelated follow-up used to reset the model mid-task, while
+      // still letting a genuine correction land immediately instead of
+      // waiting for the whole task to finish.
       if (project.conversation.isProcessing) {
+        const { decision } = await classifySteerIntent(projectId, prompt).catch(
+          () => ({ decision: "queue" as const, reason: "classify-failed" }),
+        );
+        if (decision === "steer") {
+          const { accepted } = await steerPunk(projectId, prompt).catch(() => ({ accepted: false }));
+          if (accepted) {
+            store.addConversationMessage(projectId, {
+              id: nextMessageId(),
+              type: "user",
+              content: [{ type: "text", text: prompt.trim() }],
+              timestamp: Date.now(),
+              isStreaming: false,
+              deliveryMode: "steered",
+            });
+            return;
+          }
+          // accepted:false — task finished in the race between classify and
+          // steer landing; fall through to the normal queue path below.
+        }
         messageQueueRef.current.push({ prompt, minds, phase });
         store.setConversationStatusMessage(projectId, "Message queued (agent is busy)");
         setTimeout(() => {
@@ -898,6 +934,12 @@ export function usePunk(projectId: string) {
       const effectivePhaseEarly = (phase === "think" || phase === "build" ? phase : "build") as PanePhase;
       store.setConversationPhase(projectId, effectivePhaseEarly);
 
+      // If the agent was paused on ask_user, this message IS the reply —
+      // clear the suspended card so it can't outlive its answer.
+      if (pendingClear) {
+        useProjectsStore.getState().clearPendingInput(projectId);
+      }
+
       const userMessage: ConversationMessage = {
         id: messageId,
         type: "user",
@@ -906,6 +948,12 @@ export function usePunk(projectId: string) {
         isStreaming: false,
         phase: effectivePhaseEarly,
       };
+
+      // If the agent was paused on ask_user, this message IS the reply —
+      // clear the suspended card so it can't outlive its answer.
+      if (pendingClear) {
+        useProjectsStore.getState().clearPendingInput(projectId);
+      }
 
       // Fire-and-forget: persist prompt text for thread list UI
       recordLastPrompt(projectId, displayPrompt, hashString(displayPrompt)).catch(() => {});
@@ -952,10 +1000,13 @@ export function usePunk(projectId: string) {
         s.setConversationProcessing(projectId, false);
         s.setConversationRoutedModel(projectId, null);
         s.setLastMessageStreamingDone(projectId);
-        s.setIsPlanning(projectId, false);
 
         // Fire-and-forget: persist response summary for thread list UI
-        const conversation = s.projects.get(projectId)?.conversation;
+        // Re-read store state — setLastMessageStreamingDone above created a new
+        // state object, so `s` is stale. The fresh read ensures isStreaming is
+        // false on the last assistant message before we extract the summary.
+        const freshState = useProjectsStore.getState();
+        const conversation = freshState.projects.get(projectId)?.conversation;
         const msgs = conversation?.messages ?? [];
         let summary = "";
         // Walk backwards to find the last assistant message with text content
@@ -1027,22 +1078,18 @@ export function usePunk(projectId: string) {
           case "sdk_init_info": {
             const { models, account } = event.data;
             useWorkspaceStore.getState().setSdkInfo(models, account);
-            // Clear rateLimitInfo only when its reset window has definitively
-            // passed. sdk_init_info fires on session start AND on the hourly
-            // refreshCliModels background cycle, so we must not blindly clear —
-            // that wipes valid data on every background tick. We only clear when
-            // resetsAt (or overageResetsAt) is in the past. Future-window data is
-            // kept. This fixes stale isUsingOverage state persisting across reset
-            // windows (the auto-expire timer in InputBar only runs while mounted,
-            // so it doesn't catch app-restart staleness).
-            const current = useWorkspaceStore.getState().rateLimitInfo;
-            if (current) {
+            // Clear stale rate limit data per-provider. sdk_init_info fires on
+            // session start AND on the hourly refreshCliModels background cycle,
+            // so we must not blindly clear — that wipes valid data on every
+            // background tick. We only clear when resetsAt (or overageResetsAt)
+            // is in the past.
+            const allLimits = useWorkspaceStore.getState().rateLimitByProvider;
+            for (const [provider, current] of Object.entries(allLimits)) {
               const mainExpired = current.resetsAt && current.resetsAt * 1000 < Date.now();
               const overageExpired = current.overageResetsAt && current.overageResetsAt * 1000 < Date.now();
-              // Clear if the relevant reset window has passed
               const hasOnlyOverage = !current.resetsAt && current.overageResetsAt;
               if (hasOnlyOverage ? overageExpired : mainExpired) {
-                useWorkspaceStore.getState().setRateLimitInfo(null);
+                useWorkspaceStore.getState().setRateLimitForProvider(provider, null);
               }
             }
             break;
@@ -1056,7 +1103,8 @@ export function usePunk(projectId: string) {
             // but preserve existing utilization + status when the new event has neither,
             // as long as we're still in the same reset window.
             const incoming = event.data;
-            const current = useWorkspaceStore.getState().rateLimitInfo;
+            const provider = incoming.provider || "unknown";
+            const current = useWorkspaceStore.getState().rateLimitByProvider[provider];
             const isSameWindow =
               !current?.resetsAt ||
               !incoming.resetsAt ||
@@ -1067,7 +1115,7 @@ export function usePunk(projectId: string) {
               isSameWindow
                 ? { ...incoming, utilization: current.utilization, status: current.status }
                 : incoming;
-            useWorkspaceStore.getState().setRateLimitInfo(merged);
+            useWorkspaceStore.getState().setRateLimitForProvider(provider, merged);
             break;
           }
 
@@ -1080,11 +1128,8 @@ export function usePunk(projectId: string) {
 
           case "routing": {
             // Legacy routing event — still handled for backwards compat
-            const { model, thinking, intent } = event.data;
+            const { model } = event.data;
             store.setConversationRoutedModel(projectId, model);
-            if (thinking && intent === "plan") {
-              store.setIsPlanning(projectId, true);
-            }
             break;
           }
 
@@ -1092,9 +1137,6 @@ export function usePunk(projectId: string) {
             const d = event.data;
             // Update routing display (same as routing event)
             store.setConversationRoutedModel(projectId, d.model);
-            if (d.thinking && d.intent === "plan") {
-              store.setIsPlanning(projectId, true);
-            }
             // Inject a synthetic assistant message containing the strategy block.
             // Appears between the user message and the LLM's response —
             // collapsed by default in the UI.
@@ -1147,8 +1189,16 @@ export function usePunk(projectId: string) {
           }
 
           case "processEnded": {
-            // Always clear any suspended tool input — the process is done.
-            useProjectsStore.getState().clearPendingInput(projectId);
+            // Clear suspended tool input ONLY when the store has none — an
+            // awaiting_input pause (ask_user) emits processEnded right after
+            // pausing by design; the pendingInput card must SURVIVE it and
+            // is cleared by the user's next message instead (see sendMessage).
+            const pending =
+              useProjectsStore.getState().projects.get(projectId)?.conversation
+                .pendingInput;
+            if (!pending) {
+              useProjectsStore.getState().clearPendingInput(projectId);
+            }
 
             // This processEnded belongs to a session that was intentionally aborted
             // to make way for a new message. Skip all cleanup — isProcessing stays
@@ -1292,7 +1342,6 @@ export function usePunk(projectId: string) {
             const s = useProjectsStore.getState();
             s.setConversationError(projectId, event.data.message);
             s.setConversationProcessing(projectId, false);
-            s.setIsPlanning(projectId, false);
 
             // RETRY LOGIC: Restore the failed prompt to the InputBar
             // We use a custom event that InputBar listens to
@@ -1365,6 +1414,26 @@ export function usePunk(projectId: string) {
             useProjectsStore.getState().setPendingInput(projectId, event.data);
             break;
           }
+
+          case "steer_missed": {
+            // A steer message never got a chance to inject (task finished,
+            // hit maxTurns, or paused right before it landed) — degrade
+            // gracefully into "queued and sent next" via the same drain
+            // mechanism used elsewhere, rather than dropping it silently.
+            const { texts } = event.data;
+            for (const text of texts) {
+              messageQueueRef.current.push({ prompt: text });
+            }
+            if (messageQueueRef.current.length > 0) {
+              const next = messageQueueRef.current.shift();
+              if (next) {
+                setTimeout(() => {
+                  sendMessage(next.prompt, next.minds, next.phase);
+                }, 500);
+              }
+            }
+            break;
+          }
         }
       };
 
@@ -1399,13 +1468,18 @@ export function usePunk(projectId: string) {
         // providers with strict serde validation (DeepSeek, etc.). This is defense-
         // in-depth — the backend also sanitizes, but catching it at source prevents
         // the problematic message from entering the retry/error path at all.
-        const truncatedHistory = conversation.messages.slice(-20).map((msg) => ({
+        const truncatedHistory = conversation.messages.slice(-50).map((msg) => ({
           ...msg,
           content: Array.isArray(msg.content)
             ? msg.content.filter((c) => c && typeof c.type === "string")
             : msg.content,
         }));
         const todos = conversation.todos;
+
+        // Consume the interrupted flag — it only applies to the very next
+        // send after an abort, not to any send after that.
+        const wasInterrupted = wasInterruptedRef.current;
+        wasInterruptedRef.current = false;
 
         await sendToPunk(
           projectId,
@@ -1423,6 +1497,7 @@ export function usePunk(projectId: string) {
             powerCombo: projectCombo,
             minds,
             phase: effectivePhase,
+            ...(wasInterrupted ? { wasInterrupted: true } : {}),
           }
         );
       } catch (err) {
@@ -1447,6 +1522,9 @@ export function usePunk(projectId: string) {
     // before sessionIdRef takes effect, finishProcessing is still skipped
     // (avoids completion sound, unread badge on manual stop).
     intentionalAbortRef.current = true;
+    // Flag for the next sendMessage: the turn being stopped was cut off
+    // mid-task, not completed — see declaration above.
+    wasInterruptedRef.current = true;
 
     try {
       // abortPunk now waits for the backend process to actually terminate
@@ -1460,12 +1538,34 @@ export function usePunk(projectId: string) {
       const store = useProjectsStore.getState();
       store.setConversationProcessing(projectId, false);
       store.setLastMessageStreamingDone(projectId);
-      store.setIsPlanning(projectId, false);
       resetStreamingState(projectId);
+
+      // Drain anything queued while the aborted turn was running. Without
+      // this, a message queued during the task (because it was busy) got
+      // silently stuck forever — the only other drain site is inside
+      // finishProcessing(), which is deliberately skipped on manual abort
+      // (see the processEnded handler's intentionalAbortRef check above).
+      //
+      // Queued messages were written as independent next turns, not as a
+      // reaction to this abort, so they must NOT inherit the "interrupted"
+      // framing meant for a message the user types right after hitting stop
+      // — clear the flag before sending so it stays reserved for that case.
+      if (messageQueueRef.current.length > 0) {
+        wasInterruptedRef.current = false;
+        const next = messageQueueRef.current.shift();
+        if (next) {
+          setTimeout(() => {
+            sendMessage(next.prompt, next.minds, next.phase);
+          }, 500);
+        }
+      }
     }
-  }, [projectId]);
+  }, [projectId, sendMessage]);
 
   const clearConversation = useCallback(() => {
+    // Stale flag would otherwise wrongly frame the first message of a brand
+    // new conversation as a continuation of interrupted work.
+    wasInterruptedRef.current = false;
     // Promote session state to long-term memory before wiping it.
     // Decisions, method violations, and high-touch file patterns die on clear
     // otherwise — this bridges the session layer → brain layer.
@@ -1806,7 +1906,7 @@ function handlePunkMessage(
 
       if (
         evt.type === "content_block_delta" &&
-        evt.delta?.type === "text_delta" &&
+        evt.delta?.type === "signature_delta" &&
         evt.delta.signature
       ) {
         if (assistantMessageExists) {
@@ -1919,13 +2019,6 @@ function handlePunkMessage(
               }
             }
           }
-        }
-
-        if (toolBlock.name === "EnterPlanMode") {
-          store.setIsPlanning(projectId, true);
-        }
-        if (toolBlock.name === "ExitPlanMode") {
-          store.setIsPlanning(projectId, false);
         }
 
         return true;

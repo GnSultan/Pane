@@ -7,11 +7,13 @@ import {
   app,
   utilityProcess,
   nativeImage,
+  screen,
 } from "electron";
 import windowStateKeeper from "electron-window-state";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
+import { validateFilePath, validateDirectoryPath, validateProjectId } from "./path-guard.mjs";
 
 // ── FD Repair for macOS packaged app ─────────────────────────────────────
 // When Pane is launched as a macOS .app bundle (even from terminal via
@@ -46,7 +48,8 @@ import ignore from "ignore";
 import chokidar from "chokidar";
 import {
   registerPunkHandlers,
-  preforkPunkWorker,
+  registerPunkHandlersSync,
+  initPunkBackend,
   shutdownPunkWorker,
   punkEngine,
 } from "./punk-engine.mjs";
@@ -55,15 +58,27 @@ import { startBackupSchedule, registerBackupHandlers } from "./backup-engine.mjs
 import { initCloudAuth } from "./cloud-auth.mjs";
 import { registerCloudSyncHandlers } from "./cloud-sync.mjs";
 import { MindPunks } from "./mind-punks.mjs";
+import { DocPunk } from "./doc-punk.mjs";
 import { getModelRates } from "./pricing.mjs";
 import { updateLastPrompt, updateLastResponse, readThreadState } from "./thread-state.mjs";
 import { contextStore } from "./context-store.mjs";
-import { getPaneDb, extractMessageText, initPaneDb, runMigrationIfNeeded, pruneConversationMessages } from "./pane-db.mjs";
+import { getPaneDb, extractMessageText, initPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 import { loadRecentTurns } from "./session-turns.mjs";
 import { setCmdWorker, execThroughWorker, onCmdWorkerExit } from "./tool-executor.mjs";
-import { mergeState } from "./pane-system-prompt.mjs";
+import { mergeState, readState } from "./pane-system-prompt.mjs";
 import { runModelProfileReflection } from "./playbook-engine.mjs";
-import { restoreCheckpoint } from "./checkpoint-engine.mjs";
+import { restoreCheckpoint, snapshotAllFiles, flushJournal } from "./checkpoint-engine.mjs";
+import { bustRootMapCache } from "./intents.mjs";
+import { bustRootScopeCache } from "./root-scope.mjs";
+import {
+  discoverAll,
+  getActiveSkills,
+  activateSkill,
+  deactivateSkill,
+  setOnActiveSkillsChanged,
+} from "./skill-registry.mjs";
+import { voiceRelay } from "./voice-relay.mjs";
+import { journalExchange, companionStats } from "./companion-memory.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -81,11 +96,89 @@ process.on("uncaughtException", (error) => {
 });
 
 let mindPunks = null;
+let docPunk = null;
 // Punk engine runs in a UtilityProcess to keep the main thread free.
 // Main process is a thin relay — never touches JSON.parse or model output.
-async function registerClaudeHandlers() {
+// Synchronous: IPC handlers are registered immediately. Backend init happens
+// later via initPunkBackend() after the window is shown.
+function registerClaudeHandlers() {
   // Punk is the default engine; keep these names for backwards compatibility.
-  await registerPunkHandlers();
+  // Use sync version — handlers lazy-init backends on first call.
+  registerPunkHandlersSync();
+
+  // ── Voice relay (OpenAI Realtime) ──────────────────────────────────────
+  // Broker only: mints ephemeral tokens (key stays in main) and executes
+  // whitelisted read-only knowledge tools. Audio flows renderer↔OpenAI via
+  // WebRTC directly — never through the main process.
+  ipcMain.handle("voice_mint_token", (_event, { projectId, projectRoot, agentStatus }) => {
+    return voiceRelay.mintToken(projectId, projectRoot, agentStatus || "idle");
+  });
+  ipcMain.handle("voice_tool_call", (_event, { projectId, projectRoot, tool, args }) => {
+    return voiceRelay.runTool(projectId, projectRoot, tool, args);
+  });
+  // Screen capture for the voice layer — pull-based sight. The relay never
+  // streams frames; the model asks (look_at_screen) and gets one screenshot
+  // pushed into its conversation as input_image.
+  ipcMain.handle("voice_capture_screen", (_event, { detail }) => {
+    return voiceRelay.captureScreen(detail === "high" ? "high" : "low");
+  });
+  ipcMain.handle("voice_preview", (_event, { voice }) => {
+    return voiceRelay.previewVoice(voice);
+  });
+
+  // ── Companion memory (voice's own episodic memory of conversations) ────
+  ipcMain.handle("voice_journal_exchange", (_event, { role, text, projectId, projectName }) => {
+    return journalExchange({ role, text, projectId, projectName });
+  });
+  ipcMain.handle("voice_distill_memory", (_event, { sessionExchanges }) => {
+    return voiceRelay.distillMemory(typeof sessionExchanges === "number" ? sessionExchanges : null);
+  });
+  ipcMain.handle("voice_companion_stats", () => {
+    return companionStats();
+  });
+
+  // ── Voice debug log (renderer → disk, bypassing invisible console) ────
+  // Voice failures were silent: the hook's console.error vanishes in prod.
+  // The renderer calls voice_debug_log; main appends a timestamped line to
+  // ~/.pane/voice-debug.log. Diagnostic plumbing only — never blocks.
+  ipcMain.handle("voice_debug_log", (_event, { lines }) => {
+    try {
+      const arr = Array.isArray(lines) ? lines : [String(lines)];
+      const stamp = new Date().toISOString();
+      const out = arr.map((l) => `[${stamp}] ${typeof l === "string" ? l : JSON.stringify(l)}`).join("\n") + "\n";
+      fs.appendFileSync(path.join(os.homedir(), ".pane", "voice-debug.log"), out);
+      return { ok: true };
+    } catch {
+      return { ok: false }; // diagnostics must never break the session
+    }
+  });
+
+  // ── Mic permission self-repair ────────────────────────────────────────
+  // Symptom (hit twice by Aug 2026, macOS 27 beta): after rebuild+reinstall,
+  // enumerateDevices() returns zero audio inputs and getUserMedia fails with
+  // "Requested device not found" — no permission dialog ever appears. Cause:
+  // a stale/invalidated TCC mic grant for this bundle (macOS re-evaluates
+  // grants when an app bundle is replaced in place; a denied/expired record
+  // suppresses the prompt entirely). Fix: reset our own TCC record via
+  // tccutil; the next getUserMedia triggers a FRESH macOS prompt. Scoped to
+  // our bundle id only — never touches other apps' permissions.
+  ipcMain.handle("voice_repair_mic", () => {
+    return new Promise((resolve) => {
+      if (process.platform !== "darwin") {
+        resolve({ ok: false, error: "not darwin" });
+        return;
+      }
+      execFile("/usr/bin/tccutil", ["reset", "Microphone", "com.pane.ide"], (err, _stdout, stderr) => {
+        if (err) {
+          console.error("[voice] tccutil reset failed:", err.message, stderr);
+          resolve({ ok: false, error: String(stderr || err.message) });
+        } else {
+          console.log("[voice] TCC mic record reset — macOS will re-prompt on next getUserMedia");
+          resolve({ ok: true });
+        }
+      });
+    });
+  });
 
   // ── Token Usage Persistence Hook ───────────────────────────────────────
   // Intercept all token_usage events from backends (HTTP and CLI) and record
@@ -177,20 +270,6 @@ async function registerClaudeHandlers() {
       rates[m] = getModelRates(m);
     }
     return rates;
-  });
-
-  ipcMain.handle("check_claude_version", async () => {
-    try {
-      const { stdout } = await execFileAsync("claude", ["--version"], {
-        env: getEnvWithPath(),
-      });
-      const versionMatch = stdout.trim().match(/^([\d.]+)/);
-      if (!versionMatch)
-        return { current: null, error: "Could not parse version" };
-      return { current: versionMatch[1], error: null };
-    } catch (error) {
-      return { current: null, error: error.message };
-    }
   });
 }
 function execFileAsync(cmd, args, options = {}) {
@@ -349,6 +428,8 @@ function registerCommandHandlers() {
     return result;
   });
   ipcMain.handle("read_file", async (_event, args) => {
+    const guard = validateFilePath(args.path);
+    if (!guard.ok) throw new Error(guard.error);
     const stat = await fs.promises.stat(args.path);
     if (stat.size > 5 * 1024 * 1024) {
       throw new Error("File too large (>5MB)");
@@ -363,6 +444,8 @@ function registerCommandHandlers() {
     return buffer.toString("utf-8").replace(/\0+$/, "");
   });
   ipcMain.handle("write_file", async (_event, args) => {
+    const guard = validateFilePath(args.path);
+    if (!guard.ok) throw new Error(guard.error);
     await fs.promises.mkdir(path.dirname(args.path), { recursive: true });
     // Using 'w' flag explicitly to ensure truncation, though writeFile default is 'w'
     await fs.promises.writeFile(args.path, args.content, { encoding: "utf-8", flag: "w" });
@@ -394,9 +477,15 @@ function registerCommandHandlers() {
     }
   });
   ipcMain.handle("rename_file", async (_event, args) => {
+    const guardOld = validateFilePath(args.oldPath);
+    if (!guardOld.ok) throw new Error(`rename_file source: ${guardOld.error}`);
+    const guardNew = validateFilePath(args.newPath);
+    if (!guardNew.ok) throw new Error(`rename_file target: ${guardNew.error}`);
     await fs.promises.rename(args.oldPath, args.newPath);
   });
   ipcMain.handle("delete_file", async (_event, args) => {
+    const guard = validateFilePath(args.path);
+    if (!guard.ok) throw new Error(guard.error);
     // Move to Trash instead of permanent deletion.
     // Route through cmd-worker (utility process) to avoid SyncProcessRunner crash.
     const escapedPath = args.path.replace(/'/g, "'\\''");
@@ -415,6 +504,45 @@ function registerCommandHandlers() {
   });
   ipcMain.handle("get_home_dir", () => os.homedir());
   ipcMain.handle("get_cwd", () => process.cwd());
+
+  // ── Settings read/write ──────────────────────────────────────────────────
+  // Minimal settings.json access for the Profile UI (e.g. Z.ai plan tier).
+  // read-settings: return all settings as an object, or null if file doesn't exist.
+  // write-settings: deep-merge the provided partial object into settings.json.
+  const _settingsPath = () => path.join(os.homedir(), ".pane", "settings.json");
+  ipcMain.handle("read-settings", async () => {
+    try {
+      const raw = await fs.promises.readFile(_settingsPath(), "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  });
+  ipcMain.handle("write-settings", async (_event, partial) => {
+    const settingsFile = _settingsPath();
+    let current = {};
+    try {
+      current = JSON.parse(await fs.promises.readFile(settingsFile, "utf-8"));
+    } catch {}
+    const merged = { ...current, ...partial };
+    // Per-key merge for key maps — same rationale as save_settings: never
+    // let a stale snapshot erase keys it never saw. Keep this list in sync
+    // with save_settings below.
+    for (const mapKey of ["http_api_keys", "http_base_urls", "voice_settings"]) {
+      const partialMap = partial?.[mapKey];
+      if (partialMap && typeof partialMap === "object" && !Array.isArray(partialMap)) {
+        merged[mapKey] = { ...(current[mapKey] || {}), ...partialMap };
+      }
+    }
+    await fs.promises.mkdir(path.dirname(settingsFile), { recursive: true });
+    // Atomic write — same as save_settings. Plain writeFile truncates first;
+    // a concurrent reader (voice getApiKey, http config) then parses truncated
+    // JSON and fails, surfacing as intermittent "no API key" errors.
+    const tmpPath = settingsFile + ".tmp." + process.hrtime.bigint();
+    await fs.promises.writeFile(tmpPath, JSON.stringify(merged, null, 2), "utf-8");
+    await fs.promises.rename(tmpPath, settingsFile);
+  });
+
   ipcMain.handle("detect_project_root", async (_event, args) => {
     let current = args.startPath;
     while (true) {
@@ -611,8 +739,15 @@ function registerCommandHandlers() {
   });
   ipcMain.handle("git_push", async (_event, args) => {
     try {
-      await execFileAsync("git", ["push"], { cwd: args.path });
-      return { success: true };
+      const { stdout, stderr } = await execFileAsync("git", ["push"], {
+        cwd: args.path,
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0", // never block on credential prompt
+        },
+        maxBuffer: 1024 * 1024 * 5, // 5MB — large diffs in pre-push hooks
+      });
+      return { success: true, stdout, stderr };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: message };
@@ -620,8 +755,16 @@ function registerCommandHandlers() {
   });
   ipcMain.handle("git_pull", async (_event, args) => {
     try {
-      await execFileAsync("git", ["pull"], { cwd: args.path });
-      return { success: true };
+      const { stdout, stderr } = await execFileAsync("git", ["pull", "--no-edit"], {
+        cwd: args.path,
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0", // never block on credential prompt
+          GIT_EDITOR: "true",       // accept default merge message (--no-edit is belt-and-suspenders)
+        },
+        maxBuffer: 1024 * 1024 * 5,
+      });
+      return { success: true, stdout, stderr };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: message };
@@ -800,6 +943,39 @@ Improvements
     const win = BrowserWindow.getFocusedWindow();
     if (win) win.setTitle(args.title);
   });
+
+  // ── Manual window dragging ───────────────────────────────────────────
+  // The active thread tabs surface is app-region: no-drag so it can receive
+  // click events. When the user mousedowns and moves > threshold, we switch
+  // to window dragging via IPC: main reads the cursor screen position and
+  // moves the window by the same delta. Fire-and-forget (send, not invoke)
+  // because drag-move fires 60-120x/sec and we don't need round-trip acks.
+  let dragOrigin = null; // { mouse: {x,y}, bounds: {x,y} }
+
+  ipcMain.on("window-drag-start", () => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return;
+    dragOrigin = {
+      mouse: screen.getCursorScreenPoint(),
+      bounds: win.getBounds(),
+    };
+  });
+
+  ipcMain.on("window-drag-move", () => {
+    if (!dragOrigin) return;
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return;
+    const pos = screen.getCursorScreenPoint();
+    win.setPosition(
+      dragOrigin.bounds.x + (pos.x - dragOrigin.mouse.x),
+      dragOrigin.bounds.y + (pos.y - dragOrigin.mouse.y),
+      false, // no animation — instant follow
+    );
+  });
+
+  ipcMain.on("window-drag-end", () => {
+    dragOrigin = null;
+  });
   ipcMain.handle("set_vibrancy", (_event, args) => {
     if (!mainWindow) return;
     mainWindow.setVibrancy(args.vibrancy ?? null);
@@ -836,6 +1012,8 @@ Improvements
     const resolved = dirPath.startsWith("~/")
       ? path.join(os.homedir(), dirPath.slice(2))
       : dirPath;
+    const guard = validateDirectoryPath(resolved);
+    if (!guard.ok) throw new Error(guard.error);
     await fs.promises.mkdir(resolved, { recursive: true });
     return resolved;
   });
@@ -976,6 +1154,8 @@ Improvements
       const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
       await fs.promises.writeFile(tmpPath, json, "utf-8");
       await fs.promises.rename(tmpPath, filePath);
+      bustRootMapCache();
+      bustRootScopeCache();
       return { success: true };
     } catch (err) {
       return { success: false, error: err.message };
@@ -1032,6 +1212,7 @@ const defaultSettings = {
   http_base_urls: {},
   selected_model: null,
   completion_sound: null,
+  sidebar_collapsed: false,
   intent_routing: null,
   intent_auto_route: true,
 };
@@ -1056,12 +1237,39 @@ function registerSettingsHandlers() {
     } catch {}
 
     const merged = { ...existing, ...args.settings };
+
+    // Per-key merge for key maps — a full-map replace lets a stale instance
+    // (one whose store loaded before a key was added elsewhere) erase keys
+    // it never saw. Keys present in the partial overwrite; absent keys stay.
+    // Clearing a key still works: the renderer persists it as "".
+    // voice_settings merges per-key too: voice and accent are saved from
+    // different moments in the UI — a wholesale replace would drop one.
+    for (const mapKey of ["http_api_keys", "http_base_urls", "voice_settings"]) {
+      const partialMap = args.settings?.[mapKey];
+      if (partialMap && typeof partialMap === "object" && !Array.isArray(partialMap)) {
+        merged[mapKey] = { ...(existing[mapKey] || {}), ...partialMap };
+      }
+    }
+
     const json = JSON.stringify(merged, null, 2);
 
     // Unique tmp path per write — safe against concurrent saves.
     const tmpPath = filePath + ".tmp." + process.hrtime.bigint();
     await fs.promises.writeFile(tmpPath, json, "utf-8");
     await fs.promises.rename(tmpPath, filePath);
+
+    // Invalidate MCP client config cache — server list may have changed.
+    // Also preconnect immediately: new uvx servers can take 60s+ on first
+    // launch (package download + venv build). Starting now means the cold
+    // start happens while the user types their next message, not during
+    // the turn itself where it eats the init timeout budget.
+    try {
+      const { mcpClient } = await import("./mcp-client.mjs");
+      mcpClient.invalidateConfig();
+      mcpClient.preconnect();
+    } catch (err) {
+      console.warn("[settings] MCP config invalidation skipped:", err.message);
+    }
   });
 
   // Dock icon switches with theme — clear (glass) = no bg, default = semi-transparent dark, dark = solid dark.
@@ -1142,14 +1350,19 @@ function sendToRenderer(channel, data) {
 }
 function registerWatcherHandlers() {
   ipcMain.handle("watch_directory", async (_event, args) => {
+    // An empty/missing path would resolve to process.cwd() inside chokidar —
+    // "/" in a Finder-launched packaged app — and recursively watch the
+    // entire filesystem, freezing the app. Refuse to watch anything that
+    // isn't an absolute path.
+    if (!args?.path || !path.isAbsolute(args.path)) return;
     if (watchers.has(args.path)) return;
-    let pendingPaths = /* @__PURE__ */ new Set();
+    let pendingEvents = /* @__PURE__ */ new Map(); // path → eventType
     let debounceTimer = null;
     const flush = () => {
-      if (pendingPaths.size > 0) {
-        const paths = Array.from(pendingPaths);
-        sendToRenderer("pane://file-changed", paths);
-        pendingPaths = /* @__PURE__ */ new Set();
+      if (pendingEvents.size > 0) {
+        const events = Array.from(pendingEvents.entries()).map(([p, type]) => ({ path: p, type }));
+        sendToRenderer("pane://file-changed", events);
+        pendingEvents = /* @__PURE__ */ new Map();
       }
       debounceTimer = null;
     };
@@ -1177,8 +1390,10 @@ function registerWatcherHandlers() {
     watcher.on("error", (err) => {
       console.error("Chokidar watcher error:", err.message);
     });
-    watcher.on("all", (_eventType, filePath) => {
-      pendingPaths.add(filePath);
+    watcher.on("all", (eventType, filePath) => {
+      // Keep the latest event type per path — if a file is rapidly deleted
+      // then recreated, the newest event wins (add overwrites unlink).
+      pendingEvents.set(filePath, eventType);
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(flush, 800);
     });
@@ -1194,8 +1409,8 @@ function registerWatcherHandlers() {
 }
 /**
  * Watch ~/.pane/projects and ~/.pane/session for changes written by the MCP
- * server's pane_roadmap tool. When an external CLI agent (Gemini, Claude CLI)
- * calls pane_roadmap, it writes files directly — no Electron IPC is involved.
+ * server's pane_roadmap tool. When an external agent calls pane_roadmap, it
+ * writes files directly — no Electron IPC is involved.
  * This watcher bridges the gap so the UI roadmap panel and phase indicator
  * stay in sync regardless of which backend is driving the agent.
  */
@@ -1279,7 +1494,6 @@ function registerCheckpointHandlers(db) {
     const { projectId, workingDir, messageId } = args;
     // Full project snapshot — used for pre-turn checkpoints from the renderer.
     // The tool executor path uses the per-turn journal instead.
-    const { snapshotAllFiles, flushJournal } = await import("./checkpoint-engine.mjs");
     const journal = new Map();
     try {
       await snapshotAllFiles(workingDir, journal);
@@ -1645,6 +1859,8 @@ function registerMemoryHandlers() {
   const MEMORY_MAX_EVENTS = 500;
 
   function memoryDir(projectId) {
+    const guard = validateProjectId(projectId);
+    if (!guard.ok) throw new Error(`memoryDir: ${guard.error}`);
     return path.join(os.homedir(), ".pane", "memory", projectId);
   }
 
@@ -1974,6 +2190,55 @@ function registerSessionHandlers(db) {
     const row = db.stmts.getBlob.get(args.projectId, "session");
     return row ? JSON.parse(row.data) : null;
   });
+
+  // --- Skills visibility (InputBar chip + Profile section) ---
+  // Renderer pulls on demand; push on change. The push carries the project's
+  // full active set so the renderer store can replace, not merge.
+  setOnActiveSkillsChanged((projectId) => {
+    sendToRenderer("pane-skills-changed", {
+      projectId,
+      active: [...getActiveSkills(projectId)],
+    });
+  });
+
+  ipcMain.handle("skills_get_all", (_event, args) => {
+    // discoverAll caches for 30s — safe to call per open/render
+    const skills = discoverAll(args?.projectRoot ?? null);
+    return {
+      skills,
+      active: [...getActiveSkills(args?.projectId ?? "")],
+    };
+  });
+
+  ipcMain.handle("skills_get_active", (_event, args) => {
+    return [...getActiveSkills(args?.projectId ?? "")];
+  });
+
+  // Manual toggle from Profile — same registry functions the agent's tools use,
+  // so agent-activated and user-toggled state can never diverge.
+  ipcMain.handle("skills_set_active", (_event, args) => {
+    const { projectId, name, active, projectRoot } = args ?? {};
+    if (!projectId || !name) return { success: false, error: "projectId and name required" };
+    if (active) {
+      const result = activateSkill(projectId, name, projectRoot ?? null);
+      if (!result.success) return { success: false, error: result.error ?? null };
+    } else {
+      deactivateSkill(projectId, name);
+    }
+    // Persist to session state — same contract as the agent's
+    // activate_skill/deactivate_skill tools, so state.json stays the single
+    // source of truth regardless of who flipped the switch.
+    try {
+      const current = readState(projectId)?.activeSkills || [];
+      const next = active
+        ? [...current, name.toLowerCase()].filter((v, i, a) => a.indexOf(v) === i)
+        : current.filter((s) => s.toLowerCase() !== name.toLowerCase());
+      mergeState(projectId, { activeSkills: next });
+    } catch {
+      // Registry state is authoritative for this session even if persist fails
+    }
+    return { success: true, error: null };
+  });
 }
 
 // --- Brain Engine (knowledge graph + embeddings + semantic search) ---
@@ -2153,6 +2418,11 @@ function registerBrainHandlers() {
     return brainRequest("extract_profile", {});
   });
 
+  ipcMain.handle("brain_remove_file_from_index", async (_event, args) => {
+    const { projectId, filePath, projectRoot } = args;
+    return brainRequest("remove_file_from_index", { projectId, filePath, projectRoot });
+  });
+
   ipcMain.handle("brain_update_identity", async (_event, args) => {
     return brainRequest("update_identity", { identity: args.identity });
   });
@@ -2298,30 +2568,64 @@ function registerBrainHandlers() {
     await brainRequest('lens_comment_set_session', { postId: args.postId, sessionId: args.sessionId });
   });
 
+  // ── Doc Punk ──────────────────────────────────────────────────────────────
+  ipcMain.handle('doc_punk_run', async (_event, args) => {
+    if (!docPunk) return { post: null, skipped: "not-initialized" };
+    const { projectId, workingDir, force } = args;
+    // Fire-and-forget — results come via pane://lens-post event
+    docPunk.run(projectId, workingDir, force ?? false).catch(err => {
+      console.error("[doc-punk] run failed:", err.message);
+    });
+    return { started: true };
+  });
+
+  ipcMain.handle('doc_punk_run_all', async (_event, args) => {
+    if (!docPunk) return { results: [] };
+    const { projects } = args;
+    // Fire-and-forget
+    docPunk.runAll(projects).catch(err => {
+      console.error("[doc-punk] runAll failed:", err.message);
+    });
+    return { started: true };
+  });
+
 }
 
-async function registerIpcHandlers() {
+// Register all IPC handlers synchronously so they're ready before the window
+// loads. Slow operations (DB migrations, backend detection) are deferred to
+// initStartupServices() which runs after the window is shown.
+function registerIpcHandlers() {
   let db = null;
   try {
     db = initPaneDb();
-    await runMigrationIfNeeded(db);
-    console.log("[main] Database initialized successfully");
+    console.log("[main] Database opened");
   } catch (err) {
     console.error("[main] Failed to initialize database:", err.message);
-    console.error("[main] App will continue with limited functionality");
-    // Create a mock db object to prevent crashes
     db = { stmts: {} };
   }
 
   registerCommandHandlers();
   registerSettingsHandlers();
-  await registerClaudeHandlers();
+  registerClaudeHandlers();        // sync: registers handlers, skips backend init
   registerWatcherHandlers();
   registerCheckpointHandlers(db);
   registerStateHandlers(db);
   registerMemoryHandlers();
   registerSessionHandlers(db);
   registerBrainHandlers();
+}
+
+// Slow startup work that should NOT block the window from appearing.
+// DB migrations, backend detection (dynamic import of Claude SDK), and
+// worker prefork run here, after the window is already visible.
+async function initStartupServices() {
+  // Initialize the API backend. Fire-and-forget so
+  // handlers that call spawn() will lazy-init if they fire before this completes.
+  initPunkBackend().then(() => {
+    console.log("[main] Punk backends initialized");
+  }).catch(err => {
+    console.warn("[main] Punk backend init failed:", err.message);
+  });
 }
 let mainWindow = null;
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
@@ -2367,6 +2671,19 @@ function createWindow() {
     shell.openExternal(url);
     return { action: "deny" };
   });
+  // Mirror renderer console messages (incl. [voice] errors) to
+  // ~/.pane/voice-debug.log. Uncaught renderer errors land there too —
+  // no more invisible failures.
+  mainWindow.webContents.on("console-message", (_e, _level, message) => {
+    try {
+      if (message && (message.includes("[voice]") || message.includes("realtime") || message.includes("webrtc"))) {
+        const line = `[${new Date().toISOString()}][renderer-console] ${String(message).slice(0, 500)}\n`;
+        fs.appendFileSync(path.join(os.homedir(), ".pane", "voice-debug.log"), line);
+      }
+    } catch {
+      /* diagnostics must never break the app */
+    }
+  });
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
     // Auto-open DevTools in dev mode so you can see renderer errors
@@ -2403,12 +2720,31 @@ app.commandLine.appendSwitch('enable-zero-copy');
 app.commandLine.appendSwitch('num-raster-threads', '4');
 
 app.whenReady().then(async () => {
-  await registerIpcHandlers();
-  modelManager.initialize();
+  // ── Fast path: register IPC handlers + create window ──────────────────
+  // Nothing here awaits disk I/O or dynamic imports. The window appears in
+  // <1s even on cold filesystem. Handlers that need backends (spawn, etc.)
+  // lazy-initialize on first call.
+  registerIpcHandlers();
+  modelManager.initialize();        // async but not awaited — handler registered sync, cache load is fast
   createWindow();
-  preforkPunkWorker(); // Pre-fork to hide first-use latency
-  getBrainWorker(); // Pre-fork: start SQLite + profile (embedding model loads lazily on first embed)
-  getCmdWorker();   // Pre-fork: runs execSync in isolated libuv loop (avoids EBADF in packaged app)
+
+  // ── Background init: slow operations that must not block the window ───
+  // initStartupServices() handles DB migrations + backend detection. The SDK
+  // import alone can take 10-30s on cold disk.
+  initStartupServices();
+
+  // Pre-fork workers — non-blocking, return immediately
+  getBrainWorker(); // SQLite + embedding model (loads lazily on first embed)
+  getCmdWorker();   // isolated libuv loop for command execution
+
+  // Preconnect MCP servers — npx cold starts take 15-30s. Starting
+  // at app launch means they're ready by the first model turn.
+  try {
+    const { mcpClient } = await import("./mcp-client.mjs");
+    mcpClient.preconnect();
+  } catch (err) {
+    console.warn("[startup] MCP preconnect skipped:", err.message);
+  }
 
   // Wire brain contextual search into punk-engine so it fires every turn.
   // This is the critical link: brain searches the knowledge graph for query-
@@ -2474,28 +2810,99 @@ app.whenReady().then(async () => {
     sendToRenderer,
   });
 
+  // Wire punk runner into tool executor chain so pane_lens_findings can trigger punks
+  punkEngine.setRunPunk((punkName, projectId, workingDir, scope) =>
+    mindPunks.runSinglePunk(punkName, projectId, workingDir, scope)
+  );
+
+  // Doc punk: nightly documentation drafter
+  docPunk = new DocPunk({
+    quickCall: (sys, usr) => punkEngine.quickCall(sys, usr),
+    brainRequest,
+    sendToRenderer,
+  });
+
   // Watch ~/.pane/projects/*/roadmap.json and ~/.pane/session/*/state.json so
-  // the UI reacts when an external CLI agent (Gemini, Claude) writes via the
-  // MCP server's pane_roadmap tool. Without this the roadmap panel and phase
-  // indicator only update when the Electron-side ToolExecutor fires events.
+  // the UI reacts when an external agent writes via the MCP server's
+  // pane_roadmap tool. Without this the roadmap panel and phase indicator
+  // only update when the Electron-side ToolExecutor fires events.
   startMcpFileWatcher();
 
+  // ── Doc Punk Scheduler: nightly documentation draft at 10pm ────────────
+  // Checks if the last run was >20h ago and triggers across all active
+  // projects. Uses setTimeout to hit 10pm local time.
+  (function scheduleDocPunk() {
+    if (!docPunk) return;
+
+    const now = new Date();
+    const target = new Date(now);
+    // 10pm today (22:00 local)
+    target.setHours(22, 0, 0, 0);
+
+    // If 10pm has already passed today, schedule for tomorrow
+    if (target <= now) {
+      target.setDate(target.getDate() + 1);
+    }
+
+    const msUntilTarget = target.getTime() - now.getTime();
+
+    console.log(`[doc-punk] Scheduled next run at ${target.toLocaleString()} (in ${Math.round(msUntilTarget / 3600000)}h)`);
+
+    setTimeout(async () => {
+      try {
+        console.log("[doc-punk] Nightly run starting...");
+
+        // Discover active projects from settings
+        let settings = {};
+        try {
+          settings = JSON.parse(
+            fs.readFileSync(path.join(os.homedir(), ".pane", "settings.json"), "utf-8"),
+          );
+        } catch {}
+
+        const projectStates = settings.project_states || {};
+        const projects = Object.entries(projectStates)
+          .filter(([, state]) => state.root && typeof state.root === "string")
+          .map(([projectId, state]) => ({ projectId, workingDir: state.root }));
+
+        if (projects.length > 0) {
+          await docPunk.runAll(projects);
+        } else {
+          console.log("[doc-punk] No active projects found for nightly run");
+        }
+      } catch (err) {
+        console.error("[doc-punk] Nightly run failed:", err.message);
+      }
+
+      // Schedule the next run (24h from now)
+      scheduleDocPunk();
+    }, msUntilTarget).unref?.(); // unref so the timer doesn't keep the process alive
+  })();
+
   // ── Startup cleanup: prune accumulated noise ───────────────────────────
-  // The extraction→brain loop was never closed, so raw messages and raw brain
-  // nodes accumulated indefinitely. On first startup after this fix, clean up
-  // existing data: keep only the latest 200 messages per project, prune low-
-  // confidence brain nodes (< 0.15), and reclaim disk via VACUUM.
+  // Fire-and-forget — must not block renderer startup. Brain may not be
+  // ready yet (ONNX runtime init, model cache warmup). Short timeout on
+  // the brain probe; brain-dependent steps are skipped if not ready.
   (async () => {
     try {
-      // Get all projects that have conversation data in pane.db
-      const db = getPaneDb();
-      const projectsWithMessages = db.prepare(
-        `SELECT DISTINCT project_id FROM messages`
-      ).all().map(r => r.project_id);
+      // Guard against DB init failure — getPaneDb() throws if initPaneDb() failed
+      let db = null;
+      try { db = getPaneDb(); } catch { /* intentional: no-op — DB init failed, cleanup can't run */ }
 
-      // Get all projects that have brain data
-      const brainResult = await brainRequest("get_all_projects", {});
-      const projectsWithBrain = (brainResult?.projects || []);
+      const projectsWithMessages = db
+        ? db.prepare(`SELECT DISTINCT project_id FROM messages`).all().map(r => r.project_id)
+        : [];
+
+      // Brain probe with short timeout — brain worker may still be initializing
+      // its ONNX runtime. Cleanup is not critical; skip brain-side work if
+      // the worker isn't ready yet instead of blocking on the 30s default.
+      let projectsWithBrain = [];
+      if (projectsWithMessages.length > 0) {
+        try {
+          const brainResult = await brainRequest("get_all_projects", {}, 5000);
+          projectsWithBrain = brainResult?.projects || [];
+        } catch { /* brain not ready — skip brain-side cleanup */ }
+      }
 
       const allProjectIds = [...new Set([...projectsWithMessages, ...projectsWithBrain])];
       if (allProjectIds.length === 0) return;
@@ -2504,27 +2911,27 @@ app.whenReady().then(async () => {
 
       for (const projectId of allProjectIds) {
         // Prune old conversation messages — keep last 200
-        try {
-          pruneConversationMessages(projectId, 200);
-        } catch {}
+        try { pruneConversationMessages(projectId, 200); } catch { /* intentional: per-project failure is non-fatal */ }
 
-        // Prune low-confidence brain nodes
-        try {
-          await brainRequest("prune", { projectId });
-        } catch {}
+        // Prune low-confidence brain nodes (only if brain was reachable)
+        if (projectsWithBrain.includes(projectId)) {
+          try { await brainRequest("prune", { projectId }); } catch { /* intentional: brain prune failure is non-fatal */ }
+        }
       }
 
       // VACUUM pane.db to reclaim freelist space
-      try {
-        db.pragma("auto_vacuum = INCREMENTAL");
-        db.exec("PRAGMA incremental_vacuum(10)");
-        console.log("[main] pane.db incremental vacuum complete");
-      } catch {}
+      if (db) {
+        try {
+          db.pragma("auto_vacuum = INCREMENTAL");
+          db.exec("PRAGMA incremental_vacuum(10)");
+          console.log("[main] pane.db incremental vacuum complete");
+        } catch { /* intentional: vacuum failure is non-fatal */ }
+      }
 
-      // VACUUM brain.db
-      try {
-        await brainRequest("vacuum", {});
-      } catch {}
+      // VACUUM brain.db (skip if brain wasn't ready)
+      if (projectsWithBrain.length > 0) {
+        try { await brainRequest("vacuum", {}); } catch { /* intentional: brain vacuum failure is non-fatal */ }
+      }
 
       console.log("[main] Startup cleanup complete");
     } catch (err) {

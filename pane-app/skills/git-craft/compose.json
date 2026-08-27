@@ -1,0 +1,10 @@
+{
+  "name": "git-craft",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["git", "version-control", "commits", "history"],
+  "tags": ["git", "version-control", "commits", "history", "branching"],
+  "priority": 5
+}

@@ -279,6 +279,7 @@ export interface UserSettings {
   theme: string | null;
   panel_width: number | null;
   completion_sound: string | null;
+  sidebar_collapsed: boolean | null;
   selected_model: string | null;
   selected_model_provider?: string;
   punk_backend: string;
@@ -290,6 +291,18 @@ export interface UserSettings {
   intent_routing?: Record<string, unknown>;  // deprecated — migration only
   power_combo?: PowerCombo;
   intent_auto_route?: boolean;
+  /** External MCP server configs — each entry spawns a stdio MCP server
+   *  process whose tools become available to the model. Keyed by server
+   *  name (e.g. "figma", "github"). */
+  mcp_servers?: Record<string, McpServerConfig>;
+}
+
+/** Configuration for a single external MCP server. */
+export interface McpServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  enabled?: boolean;
 }
 
 export async function loadSettings(): Promise<UserSettings> {
@@ -317,6 +330,11 @@ export interface SendToPunkOptions {
    *  "think" uses thinking model (plan+verify), "build" uses execution model.
    *  When set, overrides heuristic router so routing stays consistent across turns. */
   phase?: string;
+  /** True only on the message immediately following a manual abort — tells the
+   *  backend the previous turn was cut off mid-task, not completed, so it can
+   *  tell the model explicitly rather than leaving it to infer from a dangling
+   *  tool call or an abruptly-cut-off reply. */
+  wasInterrupted?: boolean;
   // Mind chat overrides — when projectId starts with "mind:", these control behavior
   systemPromptOverride?: string;
   _systemOverride?: boolean;
@@ -474,6 +492,7 @@ export async function sendToPunk(
       powerCombo: opts.powerCombo,
       minds: opts.minds,
       phase: opts.phase,
+      ...(opts.wasInterrupted ? { wasInterrupted: true } : {}),
       // Mind chat overrides — forwarded when present
       ...(opts.systemPromptOverride ? { systemPromptOverride: opts.systemPromptOverride } : {}),
       ...(opts._systemOverride ? { _systemOverride: opts._systemOverride } : {}),
@@ -506,50 +525,24 @@ export async function previewRoute(message: string, projectId: string): Promise<
   return electronAPI.invoke("preview_route", { message, projectId });
 }
 
+export interface SteerClassification {
+  decision: "steer" | "queue";
+  reason: string;
+}
+
+export async function classifySteerIntent(projectId: string, message: string): Promise<SteerClassification> {
+  return electronAPI.invoke("classify_steer_intent", { projectId, message });
+}
+
+export async function steerPunk(projectId: string, message: string): Promise<{ accepted: boolean }> {
+  return electronAPI.invoke("steer_punk", { projectId, message });
+}
+
 export async function terminatePunkSession(projectId: string): Promise<void> {
   return electronAPI.invoke("terminate_punk_session", { projectId });
 }
 
-export async function reinitializePunkBackend(backend?: string): Promise<void> {
-  return electronAPI.invoke("reinitialize_punk_backend", { backend });
-}
 
-export async function getBackendAvailability(): Promise<{
-  claude: boolean;
-  gemini: boolean;
-  api: boolean;
-}> {
-  return electronAPI.invoke("get_backend_availability");
-}
-
-export interface ClaudeAuthAccount {
-  email: string | null;
-  displayName: string | null;
-  organizationName: string | null;
-  billingType: string | null;
-  hasExtraUsageEnabled: boolean;
-  subscriptionCreatedAt: string | null;
-}
-
-export interface ClaudeAuthState {
-  authenticated: boolean;
-  account: ClaudeAuthAccount | null;
-}
-
-/** Read Claude auth state directly from ~/.claude.json — no session needed. */
-export async function getClaudeAuthState(): Promise<ClaudeAuthState> {
-  return electronAPI.invoke("get_claude_auth_state");
-}
-
-/** Initiate Claude OAuth sign-in via the SDK's browser-based auth flow. */
-export async function claudeSignin(): Promise<{ success: boolean; account?: Record<string, unknown>; error?: string }> {
-  return electronAPI.invoke("claude_signin");
-}
-
-/** Sign out of Claude by removing oauthAccount from ~/.claude.json. */
-export async function claudeSignout(): Promise<{ success: boolean }> {
-  return electronAPI.invoke("claude_signout");
-}
 
 export interface OpenRouterModel {
   id: string;
@@ -597,15 +590,6 @@ export async function setWindowTitle(title: string): Promise<void> {
 
 export async function getPunkPlanInfo(): Promise<string | null> {
   return electronAPI.invoke("get_claude_plan_info");
-}
-
-export interface ClaudeVersionInfo {
-  current: string | null;
-  error: string | null;
-}
-
-export async function checkClaudeVersion(): Promise<ClaudeVersionInfo> {
-  return electronAPI.invoke("check_claude_version");
 }
 
 // --- File Checkpoints ---
@@ -1532,6 +1516,24 @@ export async function createPunk(
   return electronAPI.invoke("create_punk", { name, personaContent });
 }
 
+// ── Doc Punk ─────────────────────────────────────────────────────────────
+
+/** Trigger the doc punk to draft documentation updates for a project. */
+export async function docPunkRun(
+  projectId: string,
+  workingDir: string,
+  force?: boolean,
+): Promise<{ started: boolean }> {
+  return electronAPI.invoke("doc_punk_run", { projectId, workingDir, force });
+}
+
+/** Trigger the doc punk across all active projects (nightly run). */
+export async function docPunkRunAll(
+  projects: Array<{ projectId: string; workingDir: string }>,
+): Promise<{ started: boolean }> {
+  return electronAPI.invoke("doc_punk_run_all", { projects });
+}
+
 // ── Thread State ─────────────────────────────────────────────────────────
 // Prompt/response activity data used for the thread list UI.
 
@@ -1551,14 +1553,46 @@ export async function getAllThreadStates(projectIds: string[]): Promise<Record<s
   return electronAPI.invoke("get_all_thread_states", { projectIds });
 }
 
-/**
- * Respond to a suspended tool call (plan approval or AskUserQuestion).
- * Resolves the pending Promise in the backend, unblocking the model loop.
- */
-export async function respondToTool(
-  projectId: string,
-  toolId: string,
-  response: string,
-): Promise<boolean> {
-  return electronAPI.invoke("punk:respond-to-tool", { projectId, toolId, response });
+// ── Claude subscription OAuth ─────────────────────────────────────────────
+
+export interface ClaudeAccount {
+  email: string | null;
+  displayName: string | null;
+  billingType: string | null;
+}
+
+export interface ClaudeAuthState {
+  authenticated: boolean;
+  account: ClaudeAccount | null;
+}
+
+export async function paneClaudeLogin(): Promise<{ success: boolean; account?: ClaudeAccount | null; error?: string }> {
+  return electronAPI.invoke("pane_claude_login");
+}
+
+export async function paneClaudeLogout(): Promise<{ success: boolean }> {
+  return electronAPI.invoke("pane_claude_logout");
+}
+
+export async function paneClaudeAuthState(): Promise<ClaudeAuthState> {
+  return electronAPI.invoke("pane_claude_auth_state");
+}
+
+// ── OpenAI OAuth (Codex CLI) ────────────────────────────────────────────
+
+export interface OpenAIAuthState {
+  authenticated: boolean;
+  accountId: string | null;
+}
+
+export async function paneOpenAILogin(): Promise<{ success: boolean; accountId?: string | null; error?: string }> {
+  return electronAPI.invoke("pane_openai_login");
+}
+
+export async function paneOpenAILogout(): Promise<{ success: boolean }> {
+  return electronAPI.invoke("pane_openai_logout");
+}
+
+export async function paneOpenAIAuthState(): Promise<OpenAIAuthState> {
+  return electronAPI.invoke("pane_openai_auth_state");
 }

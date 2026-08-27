@@ -14,19 +14,33 @@ import {
 import {
   brainGetProfile,
   brainUpdateDNA,
-  reinitializePunkBackend,
-  getBackendAvailability,
-  getClaudeAuthState,
   cloudLogin,
   cloudLogout,
   cloudGetUser,
   cloudGetStatus,
   cloudTriggerBackup,
   cloudRestore,
-  type ClaudeAuthState,
+  paneClaudeLogin,
+  paneClaudeLogout,
+  paneClaudeAuthState,
+  paneOpenAILogin,
+  paneOpenAILogout,
+  paneOpenAIAuthState,
+  loadSettings,
+  saveSettings,
   type CloudUser,
   type CloudStatus,
+  type ClaudeAuthState,
+  type OpenAIAuthState,
+  type McpServerConfig,
+  type UserSettings,
 } from "../../lib/tauri-commands";
+import {
+  MCP_CATALOG,
+  CATEGORY_LABELS,
+  CATEGORY_ORDER,
+  type CatalogServer,
+} from "../../lib/mcp-catalog";
 import {
   ACTION_DEFINITIONS,
   DEFAULT_BINDINGS,
@@ -390,7 +404,7 @@ function EngineSelect({
     const labels: Record<string, string> = {
       anthropic: "Claude",
       "anthropic-api": "Anthropic API",
-      gemini: "Gemini CLI",
+      gemini: "Gemini",
       "gemini-api": "Gemini API",
       deepseek: "DeepSeek",
       openrouter: "OpenRouter",
@@ -404,8 +418,6 @@ function EngineSelect({
 
   const groupedOptions = useMemo(() => {
     const groups: Record<string, EngineOption[]> = {};
-    const isGeminiBackend = useWorkspaceStore.getState().punkBackend === "gemini";
-    const isClaudeBackend = useWorkspaceStore.getState().punkBackend === "claude-code";
     const hasCurated = curatedModels.length > 0;
 
     const isDisabled = (p: string) => disabledProviders.includes(p);
@@ -446,9 +458,9 @@ function EngineSelect({
 
       // Base provider for key lookup: "anthropic-api" → "anthropic"
       const baseProvider = provider.replace(/-api$/, "");
+      // CLI backends removed — Anthropic and Gemini are always available via API backend
       const isUsable =
-        provider === "anthropic" ? isClaudeBackend :
-        provider === "gemini" ? isGeminiBackend :
+        baseProvider === "anthropic" || baseProvider === "gemini" ||
         !!httpApiKeys?.[baseProvider];
       if (!isUsable) continue;
 
@@ -614,42 +626,20 @@ function PaneAutoSection({
   const curatedModels = useWorkspaceStore((s) => s.curatedModels);
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
 
-  const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
-  const [geminiAvailable, setGeminiAvailable] = useState(false);
-
-  useEffect(() => {
-    getBackendAvailability()
-      .then((availability) => {
-        setClaudeCodeAvailable(availability.claude);
-        setGeminiAvailable(availability.gemini);
-      })
-      .catch(() => {
-        setClaudeCodeAvailable(false);
-        setGeminiAvailable(false);
-      });
-  }, []);
+  // All providers use API keys (CLI backends have been removed).
+  // A provider is usable if it has an API key set OR if it's anthropic/gemini
+  // (which the API backend handles with its own key management).
+  const isProviderUsable = (provider: string) => {
+    const base = provider.replace(/-api$/, "");
+    return base === "anthropic" || base === "gemini" || !!httpApiKeys?.[base];
+  };
 
   // Build a flat list of all usable engines from dynamic data for auto-heal
   const usableEngines = useMemo(() => {
     const engines: EngineOption[] = [];
-    if (sdkModels && sdkModels.length > 0 && claudeCodeAvailable && !disabledProviders.includes("anthropic")) {
-      sdkModels.forEach((m) => engines.push({
-        label: m.displayName || m.value,
-        provider: "anthropic",
-        model: m.value,
-        thinking: false,
-        requiresKey: "anthropic",
-      }));
-    }
     for (const [provider, models] of Object.entries(allModels)) {
       if (!models || models.length === 0) continue;
-      if (provider === "anthropic" && engines.some((e) => e.provider === "anthropic")) continue;
-      const baseProvider = provider.replace(/-api$/, "");
-      const isUsable =
-        provider === "anthropic" ? claudeCodeAvailable :
-        provider === "gemini" ? geminiAvailable :
-        !!httpApiKeys?.[baseProvider];
-      if (!isUsable) continue;
+      if (!isProviderUsable(provider)) continue;
       if (disabledProviders.includes(provider)) continue;
       models.forEach((m) => engines.push({
         label: m.name || m.id,
@@ -661,7 +651,7 @@ function PaneAutoSection({
       }));
     }
     return engines;
-  }, [allModels, sdkModels, claudeCodeAvailable, geminiAvailable, httpApiKeys, disabledProviders]);
+  }, [allModels, httpApiKeys, disabledProviders]);
 
   const autoRoute = useWorkspaceStore((s) => s.autoEscalate);
   const setPowerCombo = useWorkspaceStore((s) => s.setPowerCombo);
@@ -686,12 +676,6 @@ function PaneAutoSection({
 
   // Auto-heal: when availability changes, reset any combo slot pointing to an unusable provider.
   useEffect(() => {
-    const isProviderUsable = (provider: string) => {
-      if (provider === "anthropic") return claudeCodeAvailable;
-      if (provider === "gemini") return geminiAvailable;
-      return !!httpApiKeys?.[provider];
-    };
-
     const firstUsable = usableEngines[0];
     if (!firstUsable) return;
 
@@ -710,7 +694,7 @@ function PaneAutoSection({
       setPowerCombo(healed);
       syncComboToProject(healed);
     }
-  }, [httpApiKeys, claudeCodeAvailable, geminiAvailable, syncComboToProject]);
+  }, [httpApiKeys, usableEngines, syncComboToProject]);
 
   const handleThinkingChange = (opt: EngineOption) => {
     const isReasoningProvider =
@@ -723,7 +707,6 @@ function PaneAutoSection({
     };
     setPowerCombo(newCombo);
     syncComboToProject(newCombo);
-    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleBuildingChange = (opt: EngineOption) => {
@@ -733,14 +716,12 @@ function PaneAutoSection({
     };
     setPowerCombo(newCombo);
     syncComboToProject(newCombo);
-    reinitializePunkBackend("api").catch(() => {});
   };
 
   const handleAutoRouteToggle = () => {
     const next = !autoRoute;
     setAutoEscalate(next);
     syncAutoRouteToProject(next);
-    reinitializePunkBackend("api").catch(() => {});
   };
 
   const resolveEngine = (
@@ -786,13 +767,8 @@ function PaneAutoSection({
   const thinkingEngine = resolveEngine(combo?.thinking);
   const buildingEngine = resolveEngine(combo?.execution);
 
-  // Check if each slot's provider is usable
-  const isProviderUsable = (provider: string) => {
-    if (provider === "anthropic") return claudeCodeAvailable;
-    if (provider === "gemini") return geminiAvailable;
-    return !!httpApiKeys[provider];
-  };
-
+  // All providers use API keys — CLI backends have been removed.
+  // Anthropic and Gemini are always available via the API backend.
   const missingThinkingKey = !isProviderUsable(thinkingEngine.provider);
   const missingBuildingKey = !isProviderUsable(buildingEngine.provider);
 
@@ -890,7 +866,7 @@ function PaneAutoSection({
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ {thinkingEngine.provider === "anthropic" ? "Claude not connected" : thinkingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${thinkingEngine.requiresKey}`} — {thinkingEngine.provider === "anthropic" ? "sign in below" : thinkingEngine.provider === "gemini" ? "install CLI" : "add key below"}
+                  ⚠ missing API key for {thinkingEngine.requiresKey} — add key below
                 </span>
               )}
             </div>
@@ -900,7 +876,7 @@ function PaneAutoSection({
                 <div className="flex flex-col gap-0.5">
                   <span
                     className="text-pane-text font-mono"
-                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
                   >
                     when building
                   </span>
@@ -926,7 +902,7 @@ function PaneAutoSection({
                   className="text-pane-error font-mono"
                   style={{ fontSize: "var(--pane-font-size-xs)" }}
                 >
-                  ⚠ {buildingEngine.provider === "anthropic" ? "Claude not connected" : buildingEngine.provider === "gemini" ? "Gemini CLI not installed" : `no API key for ${buildingEngine.requiresKey}`} — {buildingEngine.provider === "anthropic" ? "sign in below" : buildingEngine.provider === "gemini" ? "install CLI" : "add key below"}
+                  ⚠ missing API key for {buildingEngine.requiresKey} — add key below
                 </span>
               )}
             </div>
@@ -958,6 +934,261 @@ interface ApiKeyProvider {
   defaultBaseUrl?: string;
 }
 
+function ClaudeSignInCard() {
+  const [auth, setAuth] = useState<ClaudeAuthState>({ authenticated: false, account: null });
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    paneClaudeAuthState().then(setAuth).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const cleanup = window.electronAPI.on("pane-claude-signin", (raw: unknown) => {
+      const data = raw as { type?: string; output?: string[] } | undefined;
+      if (data?.type === "status" && data.output?.length) {
+        setStatus(data.output[data.output.length - 1] ?? null);
+      }
+    });
+    return () => cleanup?.();
+  }, []);
+
+  const handleSignIn = async () => {
+    setLoading(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const result = await paneClaudeLogin();
+      if (result.success) {
+        setAuth({ authenticated: true, account: result.account ?? null });
+        setStatus(null);
+      } else {
+        setError(result.error || "sign in failed");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "sign in failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await paneClaudeLogout().catch(() => {});
+    setAuth({ authenticated: false, account: null });
+    setStatus(null);
+    setError(null);
+  };
+
+  return (
+    <div className="flex flex-col gap-2 pb-3 border-b border-pane-border/20 mb-3">
+      <span
+        className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        claude.ai subscription
+      </span>
+
+      {auth.authenticated ? (
+        <div className="flex items-center justify-between px-1">
+          <div className="flex flex-col gap-0.5 min-w-0">
+            <span className="text-pane-text font-mono text-xs truncate">
+              {auth.account?.email ?? "signed in"}
+            </span>
+            {auth.account?.billingType && (
+              <span className="text-pane-text-secondary/40 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                {auth.account.billingType}
+              </span>
+            )}
+          </div>
+          <button
+            onClick={handleSignOut}
+            className="text-pane-text-secondary/50 hover:text-pane-text font-mono transition-colors shrink-0 ml-3"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            sign out
+          </button>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5 px-1">
+          <button
+            onClick={handleSignIn}
+            disabled={loading}
+            className="text-left text-pane-text font-mono hover:text-pane-accent transition-colors disabled:opacity-40"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {loading ? (status ?? "signing in…") : "sign in with claude.ai"}
+          </button>
+          {error && (
+            <span className="text-red-400/70 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              {error}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OpenAISignInCard() {
+  const [auth, setAuth] = useState<OpenAIAuthState>({ authenticated: false, accountId: null });
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    paneOpenAIAuthState().then(setAuth).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const cleanup = window.electronAPI.on("pane-openai-signin", (raw: unknown) => {
+      const data = raw as { type?: string; output?: string[] } | undefined;
+      if (data?.type === "status" && data.output?.length) {
+        setStatus(data.output[data.output.length - 1] ?? null);
+      }
+    });
+    return () => cleanup?.();
+  }, []);
+
+  const handleSignIn = async () => {
+    setLoading(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const result = await paneOpenAILogin();
+      if (result.success) {
+        setAuth({ authenticated: true, accountId: result.accountId ?? null });
+        setStatus(null);
+      } else {
+        setError(result.error || "sign in failed");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "sign in failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await paneOpenAILogout().catch(() => {});
+    setAuth({ authenticated: false, accountId: null });
+    setStatus(null);
+    setError(null);
+  };
+
+  return (
+    <div className="flex flex-col gap-2 pb-3 border-b border-pane-border/20 mb-3">
+      <span
+        className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        chatgpt subscription
+      </span>
+
+      {auth.authenticated ? (
+        <div className="flex items-center justify-between px-1">
+          <span className="text-pane-text font-mono text-xs truncate">
+            signed in
+          </span>
+          <button
+            onClick={handleSignOut}
+            className="text-pane-text-secondary/50 hover:text-pane-text font-mono transition-colors shrink-0 ml-3"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            sign out
+          </button>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5 px-1">
+          <button
+            onClick={handleSignIn}
+            disabled={loading}
+            className="text-left text-pane-text font-mono hover:text-pane-accent transition-colors disabled:opacity-40"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {loading ? (status ?? "signing in…") : "sign in with chatgpt"}
+          </button>
+          <span
+            className="text-pane-text-secondary/25 font-mono"
+            style={{ fontSize: "9px" }}
+          >
+            requires codex cli · npx @openai/codex login
+          </span>
+          {error && (
+            <span className="text-red-400/70 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              {error}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Z.ai Coding Plan Tier Selector ──────────────────────────────────────────
+// Lets the user pick their Z.ai Coding Plan (Lite/Pro/Max) so Pane can compute
+// quota utilization. Stored in settings.json as zai_plan_tier.
+const ZAI_TIERS = [
+  { value: "lite", label: "Lite", fiveHour: "2k", weekly: "10k" },
+  { value: "pro", label: "Pro", fiveHour: "12k", weekly: "60k" },
+  { value: "max", label: "Max", fiveHour: "28k", weekly: "140k" },
+] as const;
+
+function ZaiPlanTierSelector() {
+  const [tier, setTier] = useState<string>("");
+
+  useEffect(() => {
+    window.electronAPI?.invoke("read-settings")
+      .then((s: unknown) => {
+        const settings = (s && typeof s === "object" ? s : null) as Record<string, unknown> | null;
+        setTier((settings?.zai_plan_tier as string) || "");
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleChange = (newTier: string) => {
+    const next = newTier === tier ? "" : newTier;
+    setTier(next);
+    window.electronAPI?.invoke("write-settings", { zai_plan_tier: next }).catch(() => {});
+  };
+
+  return (
+    <div className="flex items-center gap-2 pl-4 border-l border-pane-border/20">
+      <span
+        className="text-pane-text-secondary/40 font-mono whitespace-nowrap"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        plan
+      </span>
+      <div className="flex items-center gap-1">
+        {ZAI_TIERS.map((t) => (
+          <button
+            key={t.value}
+            onClick={() => handleChange(t.value)}
+            className={`px-2 py-0.5 rounded-md font-mono transition-colors ${
+              tier === t.value
+                ? "text-pane-text bg-pane-text/10 ring-1 ring-pane-border/40"
+                : "text-pane-text-secondary/40 hover:text-pane-text-secondary/70"
+            }`}
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+            title={`5h: ${t.fiveHour} credits · weekly: ${t.weekly} credits`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {!tier && (
+        <span
+          className="text-pane-text-secondary/25 font-mono italic"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          select for quota tracking
+        </span>
+      )}
+    </div>
+  );
+}
+
 const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   { key: "gemini", label: "Google Gemini", placeholder: "AI...", docsUrl: "https://aistudio.google.com/app/apikey", showBaseUrl: true, defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta" },
   { key: "deepseek", label: "DeepSeek", placeholder: "sk-...", docsUrl: "https://platform.deepseek.com/api_keys", showBaseUrl: true, defaultBaseUrl: "https://api.deepseek.com/v1/chat/completions" },
@@ -967,6 +1198,7 @@ const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   { key: "kimi", label: "Kimi (Moonshot)", placeholder: "sk-...", docsUrl: "https://platform.moonshot.cn/", showBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1/chat/completions" },
   { key: "z-ai", label: "Z.ai (GLM)", placeholder: "sk-...", docsUrl: "https://z.ai/manage-apikey/apikey-list", showBaseUrl: true, defaultBaseUrl: "https://api.z.ai/api/paas/v4/chat/completions" },
   { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
+  { key: "openai", label: "OpenAI", placeholder: "sk-...", docsUrl: "https://platform.openai.com/api-keys", showBaseUrl: true, defaultBaseUrl: "https://api.openai.com/v1/chat/completions" },
   { key: "jina", label: "Jina AI", placeholder: "jina_...", docsUrl: "https://jina.ai/embeddings/" },
 ];
 
@@ -975,19 +1207,12 @@ function ApiKeysSection({
   onKeyChange,
   httpBaseUrls = {},
   onBaseUrlChange,
-  claudeCodeAvailable = false,
-  geminiAvailable: _geminiAvailable = false,
 }: {
   httpApiKeys: Record<string, string>;
   onKeyChange: (provider: string, key: string) => void;
   httpBaseUrls?: Record<string, string>;
   onBaseUrlChange?: (provider: string, url: string) => void;
-  claudeCodeAvailable?: boolean;
-  geminiAvailable?: boolean;
 }) {
-  void _geminiAvailable;
-  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
-  void (claudeCodeAvailable && sdkAccount != null);
   const [visible, setVisible] = useState<Record<string, boolean>>({});
   const [expandedActive, setExpandedActive] = useState<string | null>(null);
   const [expandedAvailable, setExpandedAvailable] = useState<string | null>(null);
@@ -1001,13 +1226,26 @@ function ApiKeysSection({
   const ProviderToggle = ({ toggleKey, label }: { toggleKey: string; label: string }) => {
     const off = disabledProviders.includes(toggleKey);
     return (
-      <button
-        onClick={() => toggleProvider(toggleKey)}
-        className={`w-6 h-3.5 rounded-full relative transition-colors shrink-0 ${off ? "bg-pane-text-secondary/20" : "bg-pane-status-added/60"}`}
+      <div
+        role="switch"
+        aria-checked={!off}
+        tabIndex={0}
+        onClick={(e) => {
+          e.stopPropagation();
+          toggleProvider(toggleKey);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleProvider(toggleKey);
+          }
+        }}
+        className={`w-6 h-3.5 rounded-full relative transition-colors shrink-0 cursor-pointer ${off ? "bg-pane-text-secondary/20" : "bg-pane-status-added/60"}`}
         title={off ? `enable ${label}` : `disable ${label}`}
       >
         <div className={`absolute top-0.5 w-2.5 h-2.5 rounded-full bg-white transition-all ${off ? "left-0.5" : "left-[11px]"}`} />
-      </button>
+      </div>
     );
   };
 
@@ -1142,6 +1380,7 @@ function ApiKeysSection({
                             />
                           </div>
                         )}
+                        {key === "z-ai" && <ZaiPlanTierSelector />}
                       </div>
                     </motion.div>
                   )}
@@ -1517,6 +1756,626 @@ function CuratedModelsSection() {
   );
 }
 
+// ─── MCP Servers Section ──────────────────────────────────────────────────────
+
+/** View mode for the add-server flow. */
+type McpAddMode = "idle" | "catalog" | "manual";
+
+/** Builds a McpServerConfig from a catalog entry + user inputs. */
+function buildCatalogConfig(
+  entry: CatalogServer,
+  inputValues: Record<string, string>,
+): McpServerConfig {
+  const env: Record<string, string> = { ...(entry.fixedEnv || {}) };
+  const finalArgs = [...entry.args];
+
+  for (const input of entry.inputs) {
+    const val = inputValues[input.envKey]?.trim();
+    if (!val) continue;
+
+    if (input.envKey === "_PATH_ARG") {
+      // Path/connection-string servers: append as trailing positional argument
+      finalArgs.push(val);
+    } else if (input.envKey === "_HEADER_ARG") {
+      // mcp-remote servers with static auth: pass as --header argument.
+      // Static Authorization headers bypass the OAuth browser flow entirely.
+      finalArgs.push("--header");
+      finalArgs.push(
+        input.headerTemplate
+          ? input.headerTemplate.replace("{value}", val)
+          : val,
+      );
+    } else {
+      env[input.envKey] = val;
+    }
+  }
+
+  const config: McpServerConfig = {
+    command: entry.command,
+    args: finalArgs,
+    enabled: true,
+  };
+  if (Object.keys(env).length > 0) config.env = env;
+  return config;
+}
+
+// ── Voice section ─────────────────────────────────────────────────────────
+// Realtime voice settings: which voice Pane speaks with + live preview.
+// Voices verified against the realtime-conversations guide (Aug 2026):
+// alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar.
+const VOICE_OPTIONS: Array<{ id: string; note: string }> = [
+  { id: "alloy", note: "neutral · balanced" },
+  { id: "ash", note: "calm · grounded" },
+  { id: "ballad", note: "expressive · warm" },
+  { id: "coral", note: "bright · friendly" },
+  { id: "echo", note: "clear · steady" },
+  { id: "sage", note: "soft · thoughtful" },
+  { id: "shimmer", note: "airy · upbeat" },
+  { id: "verse", note: "versatile · neutral" },
+  { id: "marin", note: "natural · recommended" },
+  { id: "cedar", note: "warm · recommended" },
+];
+
+function VoiceSection() {
+  const [voice, setVoice] = useState<string>("marin");
+  const [accent, setAccent] = useState<string>("none");
+  const [testing, setTesting] = useState(false);
+  const [testError, setTestError] = useState<string | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    loadSettings()
+      .then((s: UserSettings) => {
+        const vs = (s as { voice_settings?: { voice?: string; accent?: string } }).voice_settings;
+        if (vs?.voice) setVoice(vs.voice);
+        if (vs?.accent) setAccent(vs.accent);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const pick = (id: string): void => {
+    setVoice(id);
+    setTestError(null);
+    saveSettings({ voice_settings: { voice: id } } as unknown as Partial<UserSettings>)
+      .catch((err: unknown) => console.error("[voice] failed to save voice setting:", err));
+  };
+
+  const pickAccent = (id: string): void => {
+    setAccent(id);
+    setTestError(null);
+    saveSettings({ voice_settings: { accent: id } } as unknown as Partial<UserSettings>)
+      .catch((err: unknown) => console.error("[voice] failed to save accent setting:", err));
+  };
+
+  const test = async (): Promise<void> => {
+    if (testing || playing) return;
+    setTesting(true);
+    setTestError(null);
+    try {
+      const res = (await electronAPI.invoke("voice_preview", { voice })) as {
+        ok: boolean;
+        audioB64?: string;
+        error?: string;
+      };
+      if (!res.ok || !res.audioB64) {
+        setTestError(res.error ?? "preview failed");
+        setTesting(false);
+        return;
+      }
+      // CSP media-src allows blob: but not data: — decode base64 into a Blob.
+      const bin = atob(res.audioB64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mp3" }));
+      const el = new Audio(url);
+      audioRef.current = el;
+      el.onended = () => {
+        URL.revokeObjectURL(url);
+        setPlaying(false);
+      };
+      el.onerror = () => {
+        URL.revokeObjectURL(url);
+        setPlaying(false);
+        setTestError("playback failed — click test again");
+      };
+      setTesting(false);
+      setPlaying(true);
+      await el.play();
+    } catch (err: unknown) {
+      setTesting(false);
+      setPlaying(false);
+      setTestError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="grid grid-cols-2 gap-x-6 gap-y-1.5">
+        {VOICE_OPTIONS.map((v) => {
+          const selected = v.id === voice;
+          return (
+            <button
+              key={v.id}
+              onClick={() => pick(v.id)}
+              className={`flex items-baseline justify-between gap-2 px-3 py-2 rounded-md text-left font-mono btn-press transition-colors ring-1 ${
+                selected
+                  ? "bg-pane-accent/10 ring-pane-accent/40 text-pane-text"
+                  : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
+              }`}
+              style={{ fontSize: "var(--pane-font-size-sm)" }}
+            >
+              <span>{v.id}</span>
+              <span className="text-pane-text-secondary/50" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+                {v.note}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="flex items-center gap-2 mt-1">
+        <span className="text-pane-text-secondary/50 font-mono shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+          accent
+        </span>
+        {(["none", "british"] as const).map((a) => (
+          <button
+            key={a}
+            onClick={() => pickAccent(a)}
+            className={`font-mono btn-press px-2.5 py-1 rounded-md ring-1 transition-colors ${
+              accent === a
+                ? "bg-pane-accent/10 ring-pane-accent/40 text-pane-text"
+                : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
+            }`}
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {a}
+          </button>
+        ))}
+        <span
+          className="text-pane-text-secondary/40 font-mono"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+          title="OpenAI has no native accent variants — accent is steered via session instructions on top of the chosen voice."
+        >
+          no native uk voices · steered by prompt
+        </span>
+      </div>
+
+      <div className="flex items-center gap-3 mt-1">
+        <button
+          onClick={() => void test()}
+          disabled={testing || playing}
+          className={`font-mono btn-press px-3 py-1.5 rounded-md ring-1 transition-colors ${
+            testing || playing
+              ? "text-pane-text-secondary/40 ring-pane-border/25"
+              : "text-pane-accent ring-pane-accent/40 hover:bg-pane-accent/10"
+          }`}
+          style={{ fontSize: "var(--pane-font-size-sm)" }}
+        >
+          {testing ? "testing…" : playing ? "playing…" : `test ${voice}`}
+        </button>
+        {testError && (
+          <span className="text-pane-error font-mono truncate" style={{ fontSize: "var(--pane-font-size-xs)" }} title={testError}>
+            {testError}
+          </span>
+        )}
+      </div>
+      <span className="text-pane-text-secondary/50 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        changing voice reconnects an active session · needs an openai key or chatgpt sign-in
+      </span>
+    </div>
+  );
+}
+
+function McpServersSection() {
+  const [servers, setServers] = useState<Record<string, McpServerConfig>>({});
+  const [loading, setLoading] = useState(true);
+  const [addMode, setAddMode] = useState<McpAddMode>("idle");
+  const [installing, setInstalling] = useState<CatalogServer | null>(null);
+  const [installInputs, setInstallInputs] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  // Manual entry state
+  const [newName, setNewName] = useState("");
+  const [newCommand, setNewCommand] = useState("");
+  const [newArgs, setNewArgs] = useState("");
+  const [newEnv, setNewEnv] = useState("");
+
+  useEffect(() => {
+    loadSettings()
+      .then((s: UserSettings) => {
+        setServers(s.mcp_servers || {});
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
+  const persistServers = useCallback((updated: Record<string, McpServerConfig>) => {
+    setServers(updated);
+    saveSettings({ mcp_servers: updated }).catch((err: unknown) => {
+      console.error("[mcp] Failed to save server config:", err);
+    });
+  }, []);
+
+  const handleToggle = (name: string) => {
+    const existing = servers[name];
+    if (!existing) return;
+    persistServers({
+      ...servers,
+      [name]: { ...existing, enabled: existing.enabled === false ? true : false },
+    });
+  };
+
+  const handleDelete = (name: string) => {
+    const updated = { ...servers };
+    delete updated[name];
+    persistServers(updated);
+  };
+
+  // ── Catalog install ──────────────────────────────────────────────────
+
+  const startInstall = (entry: CatalogServer) => {
+    setError(null);
+    setInstalling(entry);
+    setInstallInputs({});
+    // If the server has no required inputs, install immediately
+    if (entry.inputs.length === 0) {
+      confirmInstall(entry, {});
+    }
+  };
+
+  const confirmInstall = (
+    entry: CatalogServer,
+    inputs: Record<string, string>,
+  ) => {
+    setError(null);
+    // Check required inputs
+    for (const input of entry.inputs) {
+      if (!inputs[input.envKey]?.trim()) {
+        setError(`${input.label} is required.`);
+        return;
+      }
+    }
+
+    // Use catalog id as server name, suffix if collision
+    let name = entry.id;
+    let suffix = 1;
+    while (servers[name]) {
+      name = `${entry.id}-${++suffix}`;
+    }
+
+    const config = buildCatalogConfig(entry, inputs);
+    persistServers({ ...servers, [name]: config });
+    setInstalling(null);
+    setInstallInputs({});
+  };
+
+  // ── Manual add ───────────────────────────────────────────────────────
+
+  const handleManualAdd = () => {
+    setError(null);
+    const name = newName.trim();
+    if (!name) { setError("Server name is required."); return; }
+    if (!newCommand.trim()) { setError("Command is required."); return; }
+    if (servers[name]) { setError(`A server named "${name}" already exists.`); return; }
+
+    const config: McpServerConfig = {
+      command: newCommand.trim(),
+      enabled: true,
+    };
+
+    const parsedArgs = newArgs.trim().match(/(?:[^\s"]+|"[^"]*")+/g);
+    if (parsedArgs) {
+      config.args = parsedArgs.map((a: string) => a.replace(/^"|"$/g, ""));
+    }
+
+    if (newEnv.trim()) {
+      const envObj: Record<string, string> = {};
+      for (const line of newEnv.trim().split("\n")) {
+        const eq = line.indexOf("=");
+        if (eq > 0) {
+          envObj[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+        }
+      }
+      if (Object.keys(envObj).length > 0) config.env = envObj;
+    }
+
+    persistServers({ ...servers, [name]: config });
+    setAddMode("idle");
+    setNewName("");
+    setNewCommand("");
+    setNewArgs("");
+    setNewEnv("");
+  };
+
+  if (loading) {
+    return (
+      <div className="text-pane-text-secondary/40 font-mono py-4" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        loading...
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <p
+        className="text-pane-text-secondary/50 font-mono leading-relaxed"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        Connect external MCP servers (Figma, GitHub, Notion, etc.). Their tools become available to the model. Changes take effect on the next message.
+      </p>
+
+      {/* Existing servers */}
+      {Object.entries(servers).length > 0 && (
+        <div className="flex flex-col gap-2">
+          {Object.entries(servers).map(([name, config]) => {
+            return (
+              <div
+                key={name}
+                className="flex items-center justify-between py-2 px-3 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20"
+              >
+                <div className="flex flex-col gap-0.5 min-w-0">
+                  <span
+                    className="text-pane-text font-mono truncate"
+                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                  >
+                    {name}
+                  </span>
+                  <span
+                    className="text-pane-text-secondary/40 font-mono truncate"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {config.command} {(config.args || []).join(" ")}
+                  </span>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => handleToggle(name)}
+                    className={`w-4 h-4 rounded-full transition-all duration-200 ${
+                      config.enabled !== false
+                        ? "bg-pane-accent ring-2 ring-pane-accent/30"
+                        : "bg-transparent ring-1 ring-pane-text/20 hover:ring-pane-text/40"
+                    }`}
+                    title={config.enabled !== false ? "Enabled" : "Disabled"}
+                  />
+                  <button
+                    onClick={() => handleDelete(name)}
+                    className="text-pane-text-secondary/40 hover:text-pane-error transition-colors font-mono"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    title="Remove server"
+                  >
+                    remove
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Install flow: catalog browser or credential form */}
+      {installing ? (
+        <div className="flex flex-col gap-3 py-3 px-4 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20">
+          <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-0.5">
+              <span
+                className="text-pane-text font-mono"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+              >
+                {installing.name}
+              </span>
+              <span
+                className="text-pane-text-secondary/40 font-mono"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                {installing.description}
+              </span>
+            </div>
+            <button
+              onClick={() => { setInstalling(null); setError(null); }}
+              className="text-pane-text-secondary/40 hover:text-pane-text-secondary/70 transition-colors font-mono"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              cancel
+            </button>
+          </div>
+
+          {error && (
+            <span className="text-pane-error font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              {error}
+            </span>
+          )}
+
+          {installing.inputs.length > 0 && (
+            <div className="flex flex-col gap-3">
+              {installing.inputs.map((input) => (
+                <div key={input.envKey} className="flex flex-col gap-1">
+                  <label
+                    className="text-pane-text-secondary/60 font-mono"
+                    style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  >
+                    {input.label}
+                  </label>
+                  <input
+                    type={input.secret !== false ? "password" : "text"}
+                    placeholder={input.placeholder}
+                    value={installInputs[input.envKey] || ""}
+                    onChange={(e) =>
+                      setInstallInputs((prev) => ({ ...prev, [input.envKey]: e.target.value }))
+                    }
+                    className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30 border-b border-pane-border/30 focus:border-pane-accent/50 transition-colors pb-1"
+                    style={{ fontSize: "var(--pane-font-size-sm)" }}
+                    autoFocus={installing.inputs[0]?.envKey === input.envKey}
+                  />
+                  {input.obtainUrl && (
+                    <a
+                      href={input.obtainUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-pane-accent/70 hover:text-pane-accent font-mono transition-colors"
+                      style={{ fontSize: "var(--pane-font-size-xs)" }}
+                    >
+                      {input.obtainLabel || "Get key →"}
+                    </a>
+                  )}
+                </div>
+              ))}
+              <button
+                onClick={() => confirmInstall(installing, installInputs)}
+                className="text-pane-accent font-mono hover:text-pane-accent/80 transition-colors text-left"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+              >
+                install
+              </button>
+            </div>
+          )}
+        </div>
+      ) : addMode === "catalog" ? (
+        <div className="flex flex-col gap-3 py-2">
+          {/* Catalog browser */}
+          {CATEGORY_ORDER.map((cat) => {
+            const entries = MCP_CATALOG.filter((e) => e.category === cat);
+            if (entries.length === 0) return null;
+            return (
+              <div key={cat} className="flex flex-col gap-1.5">
+                <span
+                  className="text-pane-text-secondary/30 font-mono uppercase tracking-wider"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  {CATEGORY_LABELS[cat]}
+                </span>
+                {entries.map((entry) => {
+                  const alreadyInstalled = entry.id in servers;
+                  return (
+                    <button
+                      key={entry.id}
+                      onClick={() => startInstall(entry)}
+                      disabled={alreadyInstalled}
+                      className="flex items-start gap-2.5 py-2 px-3 rounded-md text-left transition-all duration-150 group disabled:opacity-30 disabled:cursor-not-allowed hover:bg-pane-text/[0.04] ring-1 ring-pane-border/10 hover:ring-pane-border/30"
+                    >
+                      <div className="flex flex-col gap-0.5 min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className="text-pane-text font-mono"
+                            style={{ fontSize: "var(--pane-font-size-sm)" }}
+                          >
+                            {entry.name}
+                          </span>
+                          {entry.official && (
+                            <span
+                              className="text-pane-accent/40 font-mono"
+                              style={{ fontSize: "9px" }}
+                            >
+                              official
+                            </span>
+                          )}
+                        </div>
+                        <span
+                          className="text-pane-text-secondary/40 font-mono leading-snug"
+                          style={{ fontSize: "var(--pane-font-size-xs)" }}
+                        >
+                          {entry.description}
+                        </span>
+                      </div>
+                      <span
+                        className="text-pane-text-secondary/30 group-hover:text-pane-accent font-mono shrink-0 mt-0.5"
+                        style={{ fontSize: "var(--pane-font-size-xs)" }}
+                      >
+                        {alreadyInstalled ? "✓" : "+"}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            );
+          })}
+          <button
+            onClick={() => setAddMode("idle")}
+            className="text-pane-text-secondary/40 font-mono hover:text-pane-text-secondary/70 transition-colors text-left pt-1"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            close
+          </button>
+        </div>
+      ) : addMode === "manual" ? (
+        <div className="flex flex-col gap-2 py-2 px-3 rounded-md bg-pane-text/[0.03] ring-1 ring-pane-border/20">
+          {error && (
+            <span className="text-pane-error font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              {error}
+            </span>
+          )}
+          <input
+            type="text"
+            placeholder="server name (e.g. figma)"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+            autoFocus
+          />
+          <input
+            type="text"
+            placeholder="command (e.g. npx)"
+            value={newCommand}
+            onChange={(e) => setNewCommand(e.target.value)}
+            className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          />
+          <input
+            type="text"
+            placeholder='arguments (e.g. -y figma-developer-mcp --stdio)'
+            value={newArgs}
+            onChange={(e) => setNewArgs(e.target.value)}
+            className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          />
+          <textarea
+            placeholder={"environment variables (one per line):\nFIGMA_API_KEY=fig_...\nGITHUB_TOKEN=ghp_..."}
+            value={newEnv}
+            onChange={(e) => setNewEnv(e.target.value)}
+            rows={3}
+            className="w-full bg-transparent outline-none text-pane-text font-mono placeholder:text-pane-text-secondary/30 resize-none"
+            style={{ fontSize: "var(--pane-font-size-sm)" }}
+          />
+          <div className="flex items-center gap-3 pt-1">
+            <button
+              onClick={handleManualAdd}
+              className="text-pane-accent font-mono hover:text-pane-accent/80 transition-colors"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              add
+            </button>
+            <button
+              onClick={() => { setAddMode("idle"); setError(null); }}
+              className="text-pane-text-secondary/40 font-mono hover:text-pane-text-secondary/70 transition-colors"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          <button
+            onClick={() => setAddMode("catalog")}
+            className="text-pane-text-secondary/50 hover:text-pane-accent font-mono transition-colors text-left flex items-center gap-2"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            + browse servers
+          </button>
+          <button
+            onClick={() => setAddMode("manual")}
+            className="text-pane-text-secondary/30 hover:text-pane-text-secondary/60 font-mono transition-colors text-left"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            + add custom server
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Cloud Section ────────────────────────────────────────────────────────────
 
 const electronAPI = window.electronAPI;
@@ -1785,6 +2644,163 @@ function CloudSection() {
 import { TokenAnalytics } from "./TokenAnalytics";
 
 // Accordion Section Component
+// ── Skills ───────────────────────────────────────────────────────────────────
+
+interface SkillMeta {
+  name: string;
+  description: string;
+  version: string;
+  tags: string[];
+  source: "project" | "global" | "builtin";
+}
+
+/**
+ * All installed skills across sources, with the active thread's active set
+ * toggleable. List is pulled when the section expands (discoverAll caches
+ * 30s main-side, so re-expands are cheap); active set comes from the live
+ * store kept in sync by useSkillsSync.
+ */
+function SkillsSection() {
+  const [skills, setSkills] = useState<SkillMeta[] | null>(null);
+  const [toggling, setToggling] = useState<Set<string>>(new Set());
+
+  const activeProjectId = useProjectsStore((s) => s.activeProjectId);
+  const activeProjectRoot = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.root : undefined;
+  });
+  const activeSkills = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.activeSkills : undefined;
+  }) ?? [];
+
+  useEffect(() => {
+    if (!activeProjectId) return;
+    // Pull on mount and when the target thread/root changes
+    let cancelled = false;
+    window.electronAPI
+      .invoke<{ skills: SkillMeta[]; active: string[] }>("skills_get_all", {
+        projectId: activeProjectId,
+        projectRoot: activeProjectRoot ?? null,
+      })
+      .then((data) => {
+        if (!cancelled) {
+          setSkills(data.skills ?? []);
+          useProjectsStore.getState().setActiveSkills(activeProjectId, data.active ?? []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSkills([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId, activeProjectRoot]);
+
+  const toggle = async (name: string) => {
+    if (!activeProjectId || toggling.has(name)) return;
+    setToggling((prev) => new Set(prev).add(name));
+    try {
+      const isActive = activeSkills.includes(name.toLowerCase());
+      await window.electronAPI.invoke("skills_set_active", {
+        projectId: activeProjectId,
+        name,
+        active: !isActive,
+        projectRoot: activeProjectRoot ?? null,
+      });
+      // Store update arrives via pane-skills-changed push — no local echo,
+      // so a failed handler can't desync the UI from the registry.
+    } catch {
+      // Surface nothing — registry push is the source of truth; a silent
+      // failure here means the toggle didn't land, and the chip won't lie.
+    } finally {
+      setToggling((prev) => {
+        const next = new Set(prev);
+        next.delete(name);
+        return next;
+      });
+    }
+  };
+
+  if (skills === null) {
+    return (
+      <div className="py-6 text-center text-pane-text-secondary/50 font-mono" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+        loading skills…
+      </div>
+    );
+  }
+
+  if (skills.length === 0) {
+    return (
+      <div className="py-6 text-center text-pane-text-secondary/50 font-mono" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+        no skills installed — agent installs via pane_install_skill or drop into ~/.pane/skills/
+      </div>
+    );
+  }
+
+  const sourceLabel: Record<SkillMeta["source"], string> = {
+    project: "project",
+    global: "global",
+    builtin: "built-in",
+  };
+
+  return (
+    <div className="flex flex-col">
+      <span
+        className="text-pane-text-secondary/50 font-mono mb-3 block"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        {activeSkills.length} active · {skills.length} installed · toggles apply to the open thread
+      </span>
+      {skills.map((skill) => {
+        const isActive = activeSkills.includes(skill.name.toLowerCase());
+        return (
+          <div
+            key={skill.name}
+            className="flex items-start justify-between gap-4 py-3 border-b border-pane-border/15 last:border-b-0"
+          >
+            <div className="flex flex-col gap-0.5 min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-pane-text truncate" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+                  {skill.name}
+                </span>
+                <span
+                  className="font-mono text-pane-text-secondary/40 shrink-0"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  {sourceLabel[skill.source]} · v{skill.version}
+                </span>
+              </div>
+              <span
+                className="text-pane-text-secondary/70 font-mono truncate"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+                title={skill.description}
+              >
+                {skill.description}
+              </span>
+            </div>
+            <button
+              onClick={() => toggle(skill.name)}
+              disabled={toggling.has(skill.name)}
+              className="font-mono shrink-0 px-3 py-1 rounded-md ring-1 transition-colors btn-press"
+              style={{
+                fontSize: "var(--pane-font-size-xs)",
+                color: isActive ? "var(--pane-accent)" : "var(--pane-text-secondary)",
+                // ring color via style to use CSS var with alpha
+                boxShadow: isActive
+                  ? "inset 0 0 0 1px var(--pane-accent)"
+                  : "inset 0 0 0 1px color-mix(in srgb, var(--pane-text-secondary) 25%, transparent)",
+              }}
+            >
+              {toggling.has(skill.name) ? "…" : isActive ? "active" : "off"}
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function AccordionSection({
   title,
   icon,
@@ -1866,45 +2882,7 @@ export function Profile() {
   // Accordion state - only one section expanded at a time
   const [expandedSection, setExpandedSection] = useState<string | null>("identity");
 
-  // Detect which CLI backends are available in PATH
-  const [claudeCodeAvailable, setClaudeCodeAvailable] = useState(false);
-  const [geminiAvailable, setGeminiAvailable] = useState(false);
-  const [, setClaudeAuthState] = useState<ClaudeAuthState | null>(null);
-  const [, setClaudeSigninStatus] = useState<string[]>([]);
-
-  useEffect(() => {
-    // Check backend availability (is the CLI installed?)
-    getBackendAvailability()
-      .then((availability) => {
-        setClaudeCodeAvailable(availability.claude);
-        setGeminiAvailable(availability.gemini);
-        useWorkspaceStore.getState().setBackendAvailability({
-          claudeCode: availability.claude,
-          geminiCli: availability.gemini,
-        });
-      })
-      .catch(() => {
-        setClaudeCodeAvailable(false);
-        setGeminiAvailable(false);
-      });
-
-    // Read Claude auth state directly from ~/.claude.json — no session needed.
-    // This gives us the real signed-in/out state immediately, regardless of
-    // whether the SDK prefetch has fired yet.
-    getClaudeAuthState()
-      .then(setClaudeAuthState)
-      .catch(() => setClaudeAuthState({ authenticated: false, account: null }));
-  }, []);
-
-  useEffect(() => {
-    const cleanup = window.electronAPI.on("pane-claude-signin", (raw: unknown) => {
-      const data = raw as { type?: string; output?: string[] | null } | undefined;
-      if (data?.type === "status" && data.output?.length) {
-        setClaudeSigninStatus(data.output);
-      }
-    });
-    return () => cleanup?.();
-  }, []);
+  // All backends use the HTTP API (CLI backends have been removed)
 
   useEffect(() => {
     brainGetProfile()
@@ -1993,6 +2971,11 @@ export function Profile() {
         <path d="M2 12l10 5 10-5" />
       </svg>
     ),
+    skills: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+      </svg>
+    ),
     usage: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 20V10" />
@@ -2011,6 +2994,13 @@ export function Profile() {
     models: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
         <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+      </svg>
+    ),
+    voice: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+        <line x1="12" x2="12" y1="19" y2="22" />
       </svg>
     ),
   };
@@ -2053,6 +3043,16 @@ export function Profile() {
           <TokenAnalytics projectId={null} isExpanded={expandedSection === "usage"} />
         </AccordionSection>
 
+        {/* Skills Section */}
+        <AccordionSection
+          title="skills"
+          icon={icons.skills}
+          isExpanded={expandedSection === "skills"}
+          onToggle={() => setExpandedSection(expandedSection === "skills" ? null : "skills")}
+        >
+          <SkillsSection />
+        </AccordionSection>
+
         {/* AI Engines Section */}
         <AccordionSection
           title="pane auto"
@@ -2063,6 +3063,8 @@ export function Profile() {
           <PaneAutoSection httpApiKeys={httpApiKeys} />
         </AccordionSection>
 
+
+
         {/* API Keys Section */}
         {punkBackend === "api" && (
           <AccordionSection
@@ -2071,16 +3073,26 @@ export function Profile() {
             isExpanded={expandedSection === "apiKeys"}
             onToggle={() => setExpandedSection(expandedSection === "apiKeys" ? null : "apiKeys")}
           >
+            <ClaudeSignInCard />
+            <OpenAISignInCard />
             <ApiKeysSection
               httpApiKeys={httpApiKeys}
               onKeyChange={handleApiKeyChange}
               httpBaseUrls={httpBaseUrls}
               onBaseUrlChange={handleBaseUrlChange}
-              claudeCodeAvailable={claudeCodeAvailable}
-              geminiAvailable={geminiAvailable}
             />
           </AccordionSection>
         )}
+
+        {/* Voice Section */}
+        <AccordionSection
+          title="voice"
+          icon={icons.voice}
+          isExpanded={expandedSection === "voice"}
+          onToggle={() => setExpandedSection(expandedSection === "voice" ? null : "voice")}
+        >
+          <VoiceSection />
+        </AccordionSection>
 
         {/* Curate Models Section */}
         {punkBackend === "api" && (
@@ -2254,6 +3266,16 @@ export function Profile() {
           onToggle={() => setExpandedSection(expandedSection === "shortcuts" ? null : "shortcuts")}
         >
           <KeybindingsSection />
+        </AccordionSection>
+
+        {/* MCP Servers Section */}
+        <AccordionSection
+          title="integrations"
+          icon={icons.integrations}
+          isExpanded={expandedSection === "integrations"}
+          onToggle={() => setExpandedSection(expandedSection === "integrations" ? null : "integrations")}
+        >
+          <McpServersSection />
         </AccordionSection>
 
         {/* Cloud Section */}

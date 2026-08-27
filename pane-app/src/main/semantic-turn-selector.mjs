@@ -111,12 +111,12 @@ export function scoreTurnsByRelevance(queryEmbeddingBase64, turnSummaries, slidi
  * TIER 1 turns are always included. TIER 2 turns compete by relevance score.
  *
  * @param {Array<ScoredTurn>} scored - from scoreTurnsByRelevance()
- * @param {number} maxTier2Tokens - token budget for TIER 2 compressed turns (default 20000)
+ * @param {number} maxTier2Tokens - token budget for TIER 2 compressed turns (default 40000)
  * @param {number} minTurns - minimum number of TIER 2 turns to always include (default 3)
  * @param {number} maxTier2Turns - maximum TIER 2 turns to include (default 15)
  * @returns {TurnSelection}
  */
-export function selectTurns(scored, maxTier2Tokens = 20000, minTurns = 3, maxTier2Turns = 15) {
+export function selectTurns(scored, maxTier2Tokens = 40000, minTurns = 3, maxTier2Turns = 15) {
   if (!scored || scored.length === 0) {
     return { includedTurnIndices: [], droppedTurnIndices: [], relevanceScores: [], tokensUsed: 0, totalTurns: 0 };
   }
