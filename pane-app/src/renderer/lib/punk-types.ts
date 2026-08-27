@@ -333,9 +333,9 @@ export interface PunkEventAwaitingInput {
   data: {
     toolId: string;
     question: string | null;
-    inputType: "plan_approval" | "question";
   };
 }
+
 
 // ── Phase system ─────────────────────────────────────────────────────────────
 // think = discuss + brainstorm + plan (thinking model, read-only)
@@ -473,7 +473,6 @@ export interface ConversationState {
   routedModel: string | null; // Model chosen by smart router for current request
   serviceTier: string | null;
   isProcessing: boolean;
-  isPlanning: boolean;
   phase: PanePhase;
 
   isRestored: boolean; // true once loaded from disk at startup
@@ -495,11 +494,10 @@ export interface ConversationState {
   // Pagination — how much history is on disk vs. loaded in memory
   historyTotalCount: number; // Total messages in the conversation file
   historyStartIndex: number; // Index of the first loaded message (0 = all loaded)
-  // Suspended tool call awaiting user input (plan approval or AskUserQuestion)
+  // Paused ask_user call awaiting the user's answer
   pendingInput: {
     toolId: string;
     question: string | null;
-    inputType: "plan_approval" | "question";
   } | null;
 }
 
@@ -534,7 +532,6 @@ export function createEmptyConversation(): ConversationState {
     routedModel: null,
     serviceTier: null,
     isProcessing: false,
-    isPlanning: false,
     phase: "idle",
     isRestored: false,
     error: null,

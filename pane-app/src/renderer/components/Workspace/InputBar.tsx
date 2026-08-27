@@ -138,6 +138,10 @@ interface InputBarProps {
     toggle: () => void;
     interrupt: () => void;
     micStream?: MediaStream | null;
+    micDevices?: Array<{ deviceId: string; label: string }>;
+    activeMicId?: string | null;
+    onSelectMic?: (deviceId: string) => void;
+    onRefreshMics?: () => void;
     audioPulseRef?: { current: number };
   };
 }
@@ -638,6 +642,12 @@ export function InputBar({
 
   const currentPhase: PhaseName = phaseOverride ?? storePhase;
 
+  // Active skills for this thread — visibility affordance only. The registry
+  // in main is authoritative; this chip just surfaces what's loaded.
+  const activeSkills = useProjectsStore(
+    (s) => s.projects.get(projectId)?.activeSkills ?? [],
+  );
+
   // Prefill from external sources (e.g., Lens "fix" button)
   useEffect(() => {
     const handler = (e: Event) => {
@@ -999,6 +1009,10 @@ export function InputBar({
                   error={voice.error}
                   micStream={voice.micStream}
                   audioPulseRef={voice.audioPulseRef}
+                  micDevices={voice.micDevices}
+                  activeMicId={voice.activeMicId}
+                  onSelectMic={voice.onSelectMic}
+                  onRefreshMics={voice.onRefreshMics}
                   onToggle={voice.toggle}
                   onInterrupt={voice.interrupt}
                 />
@@ -1228,6 +1242,10 @@ export function InputBar({
                     error={voice.error}
                     micStream={voice.micStream}
                     audioPulseRef={voice.audioPulseRef}
+                    micDevices={voice.micDevices}
+                    activeMicId={voice.activeMicId}
+                    onSelectMic={voice.onSelectMic}
+                    onRefreshMics={voice.onRefreshMics}
                     onToggle={voice.toggle}
                     onInterrupt={voice.interrupt}
                   />
@@ -1237,6 +1255,19 @@ export function InputBar({
               <div className="flex-1" />
 
               <RateLimitIndicator />
+
+              {activeSkills.length > 0 && (
+                <div
+                  className="pointer-events-none font-mono shrink-0 px-3 py-1.5 rounded-md inline-flex items-center gap-1.5 max-w-56"
+                  title={activeSkills.join(", ")}
+                  style={{ fontSize: "var(--pane-font-size-sm)", color: "var(--pane-accent)" }}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                    <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+                  </svg>
+                  <span className="truncate">{activeSkills.join(" · ")}</span>
+                </div>
+              )}
 
               {(() => {
                 if (isMindMode) {

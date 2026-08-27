@@ -1553,18 +1553,6 @@ export async function getAllThreadStates(projectIds: string[]): Promise<Record<s
   return electronAPI.invoke("get_all_thread_states", { projectIds });
 }
 
-/**
- * Respond to a suspended tool call (plan approval or AskUserQuestion).
- * Resolves the pending Promise in the backend, unblocking the model loop.
- */
-export async function respondToTool(
-  projectId: string,
-  toolId: string,
-  response: string,
-): Promise<boolean> {
-  return electronAPI.invoke("punk:respond-to-tool", { projectId, toolId, response });
-}
-
 // ── Claude subscription OAuth ─────────────────────────────────────────────
 
 export interface ClaudeAccount {
@@ -1588,4 +1576,23 @@ export async function paneClaudeLogout(): Promise<{ success: boolean }> {
 
 export async function paneClaudeAuthState(): Promise<ClaudeAuthState> {
   return electronAPI.invoke("pane_claude_auth_state");
+}
+
+// ── OpenAI OAuth (Codex CLI) ────────────────────────────────────────────
+
+export interface OpenAIAuthState {
+  authenticated: boolean;
+  accountId: string | null;
+}
+
+export async function paneOpenAILogin(): Promise<{ success: boolean; accountId?: string | null; error?: string }> {
+  return electronAPI.invoke("pane_openai_login");
+}
+
+export async function paneOpenAILogout(): Promise<{ success: boolean }> {
+  return electronAPI.invoke("pane_openai_logout");
+}
+
+export async function paneOpenAIAuthState(): Promise<OpenAIAuthState> {
+  return electronAPI.invoke("pane_openai_auth_state");
 }

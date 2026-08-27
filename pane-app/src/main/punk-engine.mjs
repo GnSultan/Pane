@@ -1877,6 +1877,39 @@ export function registerPunkHandlersSync() {
     const { getAuthState } = await import("./claude-login.mjs");
     return await getAuthState();
   });
+
+  // ── Pane-native OpenAI OAuth (Codex CLI) ────────────────────────────────
+
+  ipcMain.handle("pane_openai_login", async () => {
+    const { startLogin } = await import("./openai-login.mjs");
+    const result = await startLogin({
+      onStatus: (status) => {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            win.webContents.send("pane-openai-signin", { type: "status", output: [status] });
+          }
+        }
+      },
+    });
+    if (result.success) {
+      const { invalidateCache } = await import("./openai-oauth.mjs");
+      invalidateCache();
+    }
+    return result;
+  });
+
+  ipcMain.handle("pane_openai_logout", async () => {
+    const { clearCredentials } = await import("./openai-login.mjs");
+    clearCredentials();
+    const { invalidateCache } = await import("./openai-oauth.mjs");
+    invalidateCache();
+    return { success: true };
+  });
+
+  ipcMain.handle("pane_openai_auth_state", async () => {
+    const { getAuthState } = await import("./openai-login.mjs");
+    return getAuthState();
+  });
 }
 
 /**

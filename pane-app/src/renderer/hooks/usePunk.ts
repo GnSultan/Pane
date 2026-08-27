@@ -876,6 +876,10 @@ export function usePunk(projectId: string) {
       const project = store.projects.get(projectId);
       if (!project) return;
 
+      // Whether this send is the reply to an ask_user pause — captured BEFORE
+      // any await so the clear happens even if steering/queueing runs first.
+      const pendingClear = !!project.conversation.pendingInput;
+
       // If already processing, either steer the message into the running
       // task (if it's a correction/refinement for that same task) or queue
       // it for after (unrelated new topic) — classification is local/regex,
@@ -930,6 +934,12 @@ export function usePunk(projectId: string) {
       const effectivePhaseEarly = (phase === "think" || phase === "build" ? phase : "build") as PanePhase;
       store.setConversationPhase(projectId, effectivePhaseEarly);
 
+      // If the agent was paused on ask_user, this message IS the reply —
+      // clear the suspended card so it can't outlive its answer.
+      if (pendingClear) {
+        useProjectsStore.getState().clearPendingInput(projectId);
+      }
+
       const userMessage: ConversationMessage = {
         id: messageId,
         type: "user",
@@ -938,6 +948,12 @@ export function usePunk(projectId: string) {
         isStreaming: false,
         phase: effectivePhaseEarly,
       };
+
+      // If the agent was paused on ask_user, this message IS the reply —
+      // clear the suspended card so it can't outlive its answer.
+      if (pendingClear) {
+        useProjectsStore.getState().clearPendingInput(projectId);
+      }
 
       // Fire-and-forget: persist prompt text for thread list UI
       recordLastPrompt(projectId, displayPrompt, hashString(displayPrompt)).catch(() => {});
@@ -984,7 +1000,6 @@ export function usePunk(projectId: string) {
         s.setConversationProcessing(projectId, false);
         s.setConversationRoutedModel(projectId, null);
         s.setLastMessageStreamingDone(projectId);
-        s.setIsPlanning(projectId, false);
 
         // Fire-and-forget: persist response summary for thread list UI
         // Re-read store state — setLastMessageStreamingDone above created a new
@@ -1113,11 +1128,8 @@ export function usePunk(projectId: string) {
 
           case "routing": {
             // Legacy routing event — still handled for backwards compat
-            const { model, thinking, intent } = event.data;
+            const { model } = event.data;
             store.setConversationRoutedModel(projectId, model);
-            if (thinking && intent === "plan") {
-              store.setIsPlanning(projectId, true);
-            }
             break;
           }
 
@@ -1125,9 +1137,6 @@ export function usePunk(projectId: string) {
             const d = event.data;
             // Update routing display (same as routing event)
             store.setConversationRoutedModel(projectId, d.model);
-            if (d.thinking && d.intent === "plan") {
-              store.setIsPlanning(projectId, true);
-            }
             // Inject a synthetic assistant message containing the strategy block.
             // Appears between the user message and the LLM's response —
             // collapsed by default in the UI.
@@ -1180,8 +1189,16 @@ export function usePunk(projectId: string) {
           }
 
           case "processEnded": {
-            // Always clear any suspended tool input — the process is done.
-            useProjectsStore.getState().clearPendingInput(projectId);
+            // Clear suspended tool input ONLY when the store has none — an
+            // awaiting_input pause (ask_user) emits processEnded right after
+            // pausing by design; the pendingInput card must SURVIVE it and
+            // is cleared by the user's next message instead (see sendMessage).
+            const pending =
+              useProjectsStore.getState().projects.get(projectId)?.conversation
+                .pendingInput;
+            if (!pending) {
+              useProjectsStore.getState().clearPendingInput(projectId);
+            }
 
             // This processEnded belongs to a session that was intentionally aborted
             // to make way for a new message. Skip all cleanup — isProcessing stays
@@ -1325,7 +1342,6 @@ export function usePunk(projectId: string) {
             const s = useProjectsStore.getState();
             s.setConversationError(projectId, event.data.message);
             s.setConversationProcessing(projectId, false);
-            s.setIsPlanning(projectId, false);
 
             // RETRY LOGIC: Restore the failed prompt to the InputBar
             // We use a custom event that InputBar listens to
@@ -1522,7 +1538,6 @@ export function usePunk(projectId: string) {
       const store = useProjectsStore.getState();
       store.setConversationProcessing(projectId, false);
       store.setLastMessageStreamingDone(projectId);
-      store.setIsPlanning(projectId, false);
       resetStreamingState(projectId);
 
       // Drain anything queued while the aborted turn was running. Without
@@ -2004,13 +2019,6 @@ function handlePunkMessage(
               }
             }
           }
-        }
-
-        if (toolBlock.name === "EnterPlanMode") {
-          store.setIsPlanning(projectId, true);
-        }
-        if (toolBlock.name === "ExitPlanMode") {
-          store.setIsPlanning(projectId, false);
         }
 
         return true;

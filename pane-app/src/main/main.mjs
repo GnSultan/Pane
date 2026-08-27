@@ -65,12 +65,20 @@ import { contextStore } from "./context-store.mjs";
 import { getPaneDb, extractMessageText, initPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 import { loadRecentTurns } from "./session-turns.mjs";
 import { setCmdWorker, execThroughWorker, onCmdWorkerExit } from "./tool-executor.mjs";
-import { mergeState } from "./pane-system-prompt.mjs";
+import { mergeState, readState } from "./pane-system-prompt.mjs";
 import { runModelProfileReflection } from "./playbook-engine.mjs";
 import { restoreCheckpoint, snapshotAllFiles, flushJournal } from "./checkpoint-engine.mjs";
 import { bustRootMapCache } from "./intents.mjs";
 import { bustRootScopeCache } from "./root-scope.mjs";
+import {
+  discoverAll,
+  getActiveSkills,
+  activateSkill,
+  deactivateSkill,
+  setOnActiveSkillsChanged,
+} from "./skill-registry.mjs";
 import { voiceRelay } from "./voice-relay.mjs";
+import { journalExchange, companionStats } from "./companion-memory.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
 let forceQuit = false;
@@ -108,8 +116,25 @@ function registerClaudeHandlers() {
   ipcMain.handle("voice_tool_call", (_event, { projectId, projectRoot, tool, args }) => {
     return voiceRelay.runTool(projectId, projectRoot, tool, args);
   });
+  // Screen capture for the voice layer — pull-based sight. The relay never
+  // streams frames; the model asks (look_at_screen) and gets one screenshot
+  // pushed into its conversation as input_image.
+  ipcMain.handle("voice_capture_screen", (_event, { detail }) => {
+    return voiceRelay.captureScreen(detail === "high" ? "high" : "low");
+  });
   ipcMain.handle("voice_preview", (_event, { voice }) => {
     return voiceRelay.previewVoice(voice);
+  });
+
+  // ── Companion memory (voice's own episodic memory of conversations) ────
+  ipcMain.handle("voice_journal_exchange", (_event, { role, text, projectId, projectName }) => {
+    return journalExchange({ role, text, projectId, projectName });
+  });
+  ipcMain.handle("voice_distill_memory", (_event, { sessionExchanges }) => {
+    return voiceRelay.distillMemory(typeof sessionExchanges === "number" ? sessionExchanges : null);
+  });
+  ipcMain.handle("voice_companion_stats", () => {
+    return companionStats();
   });
 
   // ── Voice debug log (renderer → disk, bypassing invisible console) ────
@@ -126,6 +151,33 @@ function registerClaudeHandlers() {
     } catch {
       return { ok: false }; // diagnostics must never break the session
     }
+  });
+
+  // ── Mic permission self-repair ────────────────────────────────────────
+  // Symptom (hit twice by Aug 2026, macOS 27 beta): after rebuild+reinstall,
+  // enumerateDevices() returns zero audio inputs and getUserMedia fails with
+  // "Requested device not found" — no permission dialog ever appears. Cause:
+  // a stale/invalidated TCC mic grant for this bundle (macOS re-evaluates
+  // grants when an app bundle is replaced in place; a denied/expired record
+  // suppresses the prompt entirely). Fix: reset our own TCC record via
+  // tccutil; the next getUserMedia triggers a FRESH macOS prompt. Scoped to
+  // our bundle id only — never touches other apps' permissions.
+  ipcMain.handle("voice_repair_mic", () => {
+    return new Promise((resolve) => {
+      if (process.platform !== "darwin") {
+        resolve({ ok: false, error: "not darwin" });
+        return;
+      }
+      execFile("/usr/bin/tccutil", ["reset", "Microphone", "com.pane.ide"], (err, _stdout, stderr) => {
+        if (err) {
+          console.error("[voice] tccutil reset failed:", err.message, stderr);
+          resolve({ ok: false, error: String(stderr || err.message) });
+        } else {
+          console.log("[voice] TCC mic record reset — macOS will re-prompt on next getUserMedia");
+          resolve({ ok: true });
+        }
+      });
+    });
   });
 
   // ── Token Usage Persistence Hook ───────────────────────────────────────
@@ -2137,6 +2189,55 @@ function registerSessionHandlers(db) {
   ipcMain.handle("session_read_state", (_event, args) => {
     const row = db.stmts.getBlob.get(args.projectId, "session");
     return row ? JSON.parse(row.data) : null;
+  });
+
+  // --- Skills visibility (InputBar chip + Profile section) ---
+  // Renderer pulls on demand; push on change. The push carries the project's
+  // full active set so the renderer store can replace, not merge.
+  setOnActiveSkillsChanged((projectId) => {
+    sendToRenderer("pane-skills-changed", {
+      projectId,
+      active: [...getActiveSkills(projectId)],
+    });
+  });
+
+  ipcMain.handle("skills_get_all", (_event, args) => {
+    // discoverAll caches for 30s — safe to call per open/render
+    const skills = discoverAll(args?.projectRoot ?? null);
+    return {
+      skills,
+      active: [...getActiveSkills(args?.projectId ?? "")],
+    };
+  });
+
+  ipcMain.handle("skills_get_active", (_event, args) => {
+    return [...getActiveSkills(args?.projectId ?? "")];
+  });
+
+  // Manual toggle from Profile — same registry functions the agent's tools use,
+  // so agent-activated and user-toggled state can never diverge.
+  ipcMain.handle("skills_set_active", (_event, args) => {
+    const { projectId, name, active, projectRoot } = args ?? {};
+    if (!projectId || !name) return { success: false, error: "projectId and name required" };
+    if (active) {
+      const result = activateSkill(projectId, name, projectRoot ?? null);
+      if (!result.success) return { success: false, error: result.error ?? null };
+    } else {
+      deactivateSkill(projectId, name);
+    }
+    // Persist to session state — same contract as the agent's
+    // activate_skill/deactivate_skill tools, so state.json stays the single
+    // source of truth regardless of who flipped the switch.
+    try {
+      const current = readState(projectId)?.activeSkills || [];
+      const next = active
+        ? [...current, name.toLowerCase()].filter((v, i, a) => a.indexOf(v) === i)
+        : current.filter((s) => s.toLowerCase() !== name.toLowerCase());
+      mergeState(projectId, { activeSkills: next });
+    } catch {
+      // Registry state is authoritative for this session even if persist fails
+    }
+    return { success: true, error: null };
   });
 }
 

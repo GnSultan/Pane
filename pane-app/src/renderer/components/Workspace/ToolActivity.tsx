@@ -110,9 +110,24 @@ function humanizeMcpToolName(tool: string): string {
   return t.toLowerCase().trim();
 }
 
+/** Normalize a name for redundancy comparison: lowercase, alphanumerics only. */
+function normalizeForCompare(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
 /** Extract the most meaningful parameter from MCP tool input for the summary line */
-function summarizeMcpTool(tool: string, input: Record<string, unknown>): string {
+function summarizeMcpTool(server: string, tool: string, input: Record<string, unknown>): string {
   const humanTool = humanizeMcpToolName(tool);
+
+  // Sequential-thinking chains: show progression + a hint of the thought,
+  // never the tool name restated ("sequential-thinking sequentialthinking" is noise).
+  if (typeof input.thoughtNumber === "number" && typeof input.totalThoughts === "number") {
+    const thought = typeof input.thought === "string" ? input.thought.replace(/\s+/g, " ").trim() : "";
+    const snippet = thought.length > 60 ? thought.slice(0, 60) + "…" : thought;
+    return `step ${input.thoughtNumber}/${input.totalThoughts}${snippet ? " · " + snippet : ""}`;
+  }
+
+  const redundant = normalizeForCompare(server) === normalizeForCompare(humanTool);
 
   // Priority list — first non-empty match wins
   const paramPriority = [
@@ -132,7 +147,9 @@ function summarizeMcpTool(tool: string, input: Record<string, unknown>): string 
     if (val !== null && val !== undefined && val !== "") {
       const strVal = typeof val === "string" ? val : JSON.stringify(val);
       const truncated = strVal.length > 50 ? strVal.slice(0, 50) + "…" : strVal;
-      return `${humanTool}: ${truncated}`;
+      // When the tool name just restates the server ("fetch" tool on "fetch"
+      // server), the label already says it — show only the value.
+      return redundant ? truncated : `${humanTool}: ${truncated}`;
     }
   }
 
@@ -285,7 +302,7 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
   }
 
   const mcp = parseMcpName(name);
-  if (mcp) return summarizeMcpTool(mcp.tool, input);
+  if (mcp) return summarizeMcpTool(mcp.server, mcp.tool, input);
 
   switch (name) {
     case "Read":
@@ -328,16 +345,25 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       const q = (input.query as string) || "";
       return q ? q.slice(0, 50) : "";
     }
+    case "activate_skill":
+    case "deactivate_skill": {
+      const skill = (input.name as string) || "";
+      return skill ? skill.slice(0, 60) : "";
+    }
+    case "save_memory": {
+      const fact = (input.fact as string) || "";
+      return fact ? fact.slice(0, 60) : "";
+    }
+    case "ask_user": {
+      const q = (input.question as string) || "";
+      return q ? q.slice(0, 60) : "";
+    }
     case "evaluate_js":
       return "";
     case "web_fetch": {
       const url = (input.url as string) || "";
       return url ? url.slice(0, 60) : "";
     }
-    case "EnterPlanMode":
-      return "entering plan mode";
-    case "ExitPlanMode":
-      return "ready for review";
     default:
       return name;
   }
@@ -369,11 +395,13 @@ function getToolLabel(name: string): string {
     case "explore": return "explore";
     case "evaluate_js": return "evaluate";
     case "web_fetch": return "fetch";
+    case "activate_skill": return "skill";
+    case "deactivate_skill": return "skill";
+    case "save_memory": return "memory";
+    case "ask_user": return "ask";
     case "Plan": return "plan";
     case "WebSearch":
     case "google_web_search": return "search";
-    case "EnterPlanMode": return "plan";
-    case "ExitPlanMode": return "plan";
     default: return name.toLowerCase();
   }
 }

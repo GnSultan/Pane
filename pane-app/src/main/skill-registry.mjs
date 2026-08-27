@@ -83,6 +83,23 @@ const DISCOVERY_TTL_MS = 30_000; // re-scan every 30s max
 // Map<projectId, Set<skillName>> — active skills per project
 const _activeSkills = new Map();
 
+// Notifier fired whenever a project's active-skill set changes (activate,
+// deactivate, hydrate). Registered by main.mjs to push updates to the
+// renderer; skill-registry itself stays electron-free.
+let _onActiveSkillsChanged = null;
+export function setOnActiveSkillsChanged(fn) {
+  _onActiveSkillsChanged = fn;
+}
+function _notifyActiveSkillsChanged(projectId) {
+  if (_onActiveSkillsChanged) {
+    try {
+      _onActiveSkillsChanged(projectId);
+    } catch {
+      // Notifier errors must never break skill activation
+    }
+    }
+}
+
 // Map<skillName, SkillBody> — loaded skill bodies (LRU-ish, small enough to keep)
 const _bodyCache = new Map();
 
@@ -503,6 +520,7 @@ export function hydrateActiveSkills(projectId, skillNames) {
 
   const set = new Set(skillNames.map((n) => n.toLowerCase()));
   _activeSkills.set(projectId, set);
+  _notifyActiveSkillsChanged(projectId);
 }
 
 /**
@@ -522,6 +540,7 @@ export function activateSkill(projectId, skillName, projectRoot = null) {
     _activeSkills.set(projectId, new Set());
   }
   _activeSkills.get(projectId).add(skillName.toLowerCase());
+  _notifyActiveSkillsChanged(projectId);
 
   return { success: true, body };
 }
@@ -534,7 +553,9 @@ export function activateSkill(projectId, skillName, projectRoot = null) {
 export function deactivateSkill(projectId, skillName) {
   const skills = _activeSkills.get(projectId);
   if (skills) {
+    const before = skills.size;
     skills.delete(skillName.toLowerCase());
+    if (skills.size !== before) _notifyActiveSkillsChanged(projectId);
   }
 }
 

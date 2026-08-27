@@ -15,7 +15,8 @@
  * All motion is imperative (rAF + refs) — no re-renders per frame.
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { voiceLight } from "../../lib/voice-light";
 
 export interface VoiceOrbProps {
   state:
@@ -35,9 +36,33 @@ export interface VoiceOrbProps {
   onToggle: () => void;
   /** Interrupt model speech (click while speaking). */
   onInterrupt: () => void;
+  /** Audio inputs for the right-click picker. */
+  micDevices?: Array<{ deviceId: string; label: string }>;
+  /** deviceId of the input currently feeding the session (null = default). */
+  activeMicId?: string | null;
+  /** Pin an input device (restarts the session if live). */
+  onSelectMic?: (deviceId: string) => void;
+  /** Re-enumerate inputs (called when the picker opens). */
+  onRefreshMics?: () => void;
 }
 
-export function VoiceOrb({ state, error, micStream, audioPulseRef, onToggle, onInterrupt }: VoiceOrbProps) {
+export function VoiceOrb({
+  state,
+  error,
+  micStream,
+  audioPulseRef,
+  onToggle,
+  onInterrupt,
+  micDevices,
+  activeMicId,
+  onSelectMic,
+  onRefreshMics,
+}: VoiceOrbProps) {
+  // Right-click picker: which input device feeds the model.
+  // Born from the Bluetooth-speaker incident — a speaker's phantom mic
+  // delivered digital silence and looked like "the model ignoring me".
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   // Imperatively-animated elements.
   const eyeGroupRef = useRef<SVGGElement | null>(null);
   const eyeLRef = useRef<SVGCircleElement | null>(null);
@@ -78,7 +103,13 @@ export function VoiceOrb({ state, error, micStream, audioPulseRef, onToggle, onI
 
   // ── The animation loop ─────────────────────────────────────────────────
   useEffect(() => {
-    if (state === "off") return;
+    // Session over: darken the room immediately, loop never starts.
+    if (state === "off") {
+      voiceLight.state = "off";
+      voiceLight.user = 0;
+      voiceLight.model = 0;
+      return;
+    }
 
     const buf = new Uint8Array(128);
     const startTime = performance.now();
@@ -86,6 +117,12 @@ export function VoiceOrb({ state, error, micStream, audioPulseRef, onToggle, onI
     // Blink scheduling (open-eye states only).
     let nextBlinkAt = startTime + 1800 + Math.random() * 2600;
     let blinkUntil = 0;
+    // Glow energy: model speech cadence with attack/release smoothing —
+    // fast rise on audio deltas, ~350ms fall in pauses. Separate from
+    // speakLevelRef: the mouth is pixels, the room is architecture — the
+    // mouth's 0.25 floor flattens a room-sized light into a constant.
+    let glowPulses = audioPulseRef?.current ?? 0;
+    let glowEnergy = 0;
 
     const tick = (now: number): void => {
       const t = (now - startTime) / 1000;
@@ -156,6 +193,30 @@ export function VoiceOrb({ state, error, micStream, audioPulseRef, onToggle, onI
         mouthRef.current.setAttribute("y", (17.4 - h / 2).toFixed(2));
       }
 
+      // ── Publish shared signals for the floor glow ───────────────────────
+      // The orb owns the analysis; the room reads it. Same rAF, no re-renders.
+      // (This loop only runs while live — "off" is handled in teardown.)
+      // Glow energy: count deltas since last frame; ~1 delta/ms is loud
+      // speech. Attack fast (deltas just arrived), release ~350ms — unlike
+      // speakLevelRef, whose 0.25 floor (tuned for the mouth's pixels)
+      // flattens a room-sized light into a constant.
+      const pulses = audioPulseRef?.current ?? 0;
+      const perFrame = pulses - glowPulses;
+      glowPulses = pulses;
+      if (state === "speaking") {
+        const n = perFrame / 16.7; // normalise to 60fps frames
+        const target = Math.min(1, n / 5); // ~5 deltas/frame = loud
+        glowEnergy = target > glowEnergy
+          ? glowEnergy + (target - glowEnergy) * 0.55 // attack ~1 frame
+          : glowEnergy * 0.87; // release ~350ms (0.87^21 ≈ 0.05 @60fps)
+        voiceLight.model = glowEnergy;
+      } else {
+        glowEnergy = 0;
+        voiceLight.model = 0;
+      }
+      voiceLight.state = state;
+      voiceLight.user = user;
+
       // ── Antenna ball — heartbeat speed says what the robot is doing ────
       if (antennaRef.current) {
         const speed =
@@ -187,6 +248,27 @@ export function VoiceOrb({ state, error, micStream, audioPulseRef, onToggle, onI
     }, 100);
     return () => clearInterval(id);
   }, []);
+
+  // Open-picker housekeeping: refresh the device list when it opens, close
+  // on any outside click / Escape.
+  useEffect(() => {
+    if (!pickerOpen) return;
+    onRefreshMics?.();
+    const onDown = (e: MouseEvent): void => {
+      if (!(e.target instanceof Node) || !rootRef.current?.contains(e.target)) {
+        setPickerOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") setPickerOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [pickerOpen, onRefreshMics]);
 
   const colorClass =
     state === "error"
@@ -301,28 +383,79 @@ export function VoiceOrb({ state, error, micStream, audioPulseRef, onToggle, onI
   })();
 
   return (
-    <button
-      onClick={() => {
-        if (state === "speaking") onInterrupt();
-        else onToggle();
-      }}
-      className="pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md btn-press transition-colors"
-      title={title}
-      aria-label={title}
-    >
-      <svg viewBox="0 0 24 24" width={22} height={22} className={colorClass} aria-hidden="true">
-        {/* antenna */}
-        <line x1={12} y1={2.6} x2={12} y2={6} stroke="currentColor" strokeWidth={1.1} strokeLinecap="round" />
-        <circle ref={antennaRef} cx={12} cy={2.4} r={1.3} fill="currentColor" opacity={state === "off" ? 0.35 : 0.8} />
-        {/* head */}
-        <rect x={3.6} y={6} width={16.8} height={13} rx={3.4} stroke="currentColor" strokeWidth={1.3} fill="none" />
-        {/* side bolts */}
-        <rect x={1.4} y={10.2} width={2} height={4} rx={1} fill="currentColor" opacity={0.75} />
-        <rect x={20.6} y={10.2} width={2} height={4} rx={1} fill="currentColor" opacity={0.75} />
-        {/* face */}
-        {eyes}
-        {mouth}
-      </svg>
-    </button>
+    <div ref={rootRef} className="relative">
+      <button
+        onClick={() => {
+          if (state === "speaking") onInterrupt();
+          else onToggle();
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setPickerOpen((o) => !o);
+        }}
+        className="pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md btn-press transition-colors"
+        title={title}
+        aria-label={title}
+      >
+        <svg viewBox="0 0 24 24" width={22} height={22} className={colorClass} aria-hidden="true">
+          {/* antenna */}
+          <line x1={12} y1={2.6} x2={12} y2={6} stroke="currentColor" strokeWidth={1.1} strokeLinecap="round" />
+          <circle ref={antennaRef} cx={12} cy={2.4} r={1.3} fill="currentColor" opacity={state === "off" ? 0.35 : 0.8} />
+          {/* head */}
+          <rect x={3.6} y={6} width={16.8} height={13} rx={3.4} stroke="currentColor" strokeWidth={1.3} fill="none" />
+          {/* side bolts */}
+          <rect x={1.4} y={10.2} width={2} height={4} rx={1} fill="currentColor" opacity={0.75} />
+          <rect x={20.6} y={10.2} width={2} height={4} rx={1} fill="currentColor" opacity={0.75} />
+          {/* face */}
+          {eyes}
+          {mouth}
+        </svg>
+      </button>
+
+      {/* Device picker — born from the Bluetooth-speaker incident. */}
+      {pickerOpen && (
+        <div
+          className="absolute bottom-full left-0 mb-1.5 w-64 rounded-lg bg-pane-bg ring-1 ring-pane-border/40 shadow-lg py-1 z-50"
+          role="menu"
+          aria-label="microphone input"
+        >
+          <div
+            className="px-3 py-1.5 font-mono text-pane-text-secondary/50"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            voice input
+          </div>
+          {(micDevices ?? []).length === 0 ?(
+            <div
+              className="px-3 py-1.5 font-mono text-pane-text-secondary/50"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              grant mic access once to name inputs
+            </div>
+          ) : (
+            (micDevices ?? []).map((d) => {
+              const active = d.deviceId === activeMicId;
+              return (
+                <button
+                  key={d.deviceId}
+                  onClick={() => {
+                    onSelectMic?.(d.deviceId);
+                    setPickerOpen(false);
+                  }}
+                  className={`w-full text-left px-3 py-1.5 font-mono truncate transition-colors hover:bg-pane-text/[0.04] ${
+                    active ? "text-pane-accent" : "text-pane-text-secondary"
+                  }`}
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  title={d.label}
+                >
+                  {active ? "● " : "○ "}
+                  {d.label}
+                </button>
+              );
+            })
+          )}
+        </div>
+      )}
+    </div>
   );
 }

@@ -48,6 +48,19 @@ import { recordActivity } from "./intents.mjs";
 import { getAccessToken, getOAuthHeaders, getOAuthApiUrl, hasOAuthCredentials, invalidateCache } from "./claude-oauth.mjs";
 import { buildBillingHeaderValue } from "./claude-signing.mjs";
 import {
+  getAccessToken as getOpenAIAccessToken,
+  hasOAuthCredentials as hasOpenAIOAuthCredentials,
+  getCodexBaseUrl,
+  getAccountId as getOpenAIAccountId,
+  invalidateCache as invalidateOpenAICache,
+} from "./openai-oauth.mjs";
+import {
+  codexFetch,
+  codexModels,
+  buildResponsesRequest,
+  responsesEventToChatChunks,
+} from "./codex-client.mjs";
+import {
   parseClaudeRateLimitHeaders,
   calculateZaiCredits,
   recordZaiUsage,
@@ -1394,6 +1407,21 @@ function _kimiContextLength(id) {
   return 131072; // Kimi default
 }
 
+// ─── OpenAI model helpers ────────────────────────────────────────────────────
+
+function _openaiContextLength(id) {
+  const lower = id.toLowerCase();
+  if (lower.includes("gpt-4.1"))  return 1047576; // 1M context
+  if (lower.includes("gpt-4.5"))  return 131072;
+  if (lower.includes("gpt-4o"))   return 128000;
+  if (lower.includes("gpt-4-turbo")) return 128000;
+  if (lower.startsWith("o1"))     return 200000;
+  if (lower.startsWith("o3"))     return 200000;
+  if (lower.startsWith("o4"))     return 200000;
+  if (lower.includes("codex"))    return 192000;
+  return 128000; // sensible default
+}
+
 // ─── Anthropic model helpers ─────────────────────────────────────────────────
 
 function _anthropicDisplayName(id) {
@@ -1812,6 +1840,18 @@ export class ApiBackend extends PunkBackend {
         }
       }
 
+      // If no API key for openai, try OAuth tokens from Codex CLI
+      if (provider === "openai" && !apiKey) {
+        try {
+          if (hasOpenAIOAuthCredentials()) {
+            authType = "openai-oauth";
+            console.log("[http] getApiConfig: using OpenAI OAuth tokens (Codex CLI, no API key)");
+          }
+        } catch (err) {
+          console.warn("[http] getApiConfig: OpenAI OAuth check failed:", err.message);
+        }
+      }
+
       const baseUrl = settings.http_base_urls?.[provider];
 
       // Log which keys are actually present so routing failures are easy to diagnose
@@ -1833,10 +1873,12 @@ export class ApiBackend extends PunkBackend {
   }
 
   validateApiConfig(config) {
-    if (!config.apiKey && config.authType !== "oauth") {
+    if (!config.apiKey && config.authType !== "oauth" && config.authType !== "openai-oauth") {
       const msg = config.provider === "anthropic"
         ? `Not signed in to Claude. Open settings (\u2318,) and click "sign in with claude.ai", or add an Anthropic API key.`
-        : `No API key configured. Open settings (\u2318,) and add a key under API Keys.`;
+        : config.provider === "openai"
+          ? `No OpenAI API key or ChatGPT subscription found. Run "npx @openai/codex login" to sign in with your ChatGPT account, or add an OpenAI API key in settings.`
+          : `No API key configured. Open settings (\u2318,) and add a key under API Keys.`;
       throw new Error(msg);
     }
     return true;
@@ -1850,6 +1892,7 @@ export class ApiBackend extends PunkBackend {
 
     const isOpenAI =
       isDeepSeek ||
+      provider === "openai" ||
       provider === "z-ai" ||
       provider === "kimi" ||
       provider === "openrouter" ||
@@ -3103,10 +3146,13 @@ export class ApiBackend extends PunkBackend {
           // Request usage data in streaming response for OpenAI-compatible providers.
           // Without this flag, some APIs (DeepSeek, Kimi, etc.) omit the usage object
           // from the final SSE chunk, breaking cost and cache rate tracking entirely.
+          // NOT for openai-oauth: Codex Responses API rejects unknown params,
+          // usage arrives in the response.completed event instead.
           if (
-            ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter", "z-ai"].includes(
+            ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter", "z-ai", "openai"].includes(
               apiConfig.provider,
-            )
+            ) &&
+            apiConfig.authType !== "openai-oauth"
           ) {
             body.stream_options = { include_usage: true };
           }
@@ -3373,12 +3419,28 @@ export class ApiBackend extends PunkBackend {
                 }
               }
 
-              response = await fetch(url, {
-                method: "POST",
-                headers,
-                body: safeStringify(sourceBody),
-                signal: abortController.signal,
-              });
+              // ── Codex OAuth dispatch ─────────────────────────────────────
+              // codex://responses marker: chatgpt.com must be hit via Electron
+              // net.fetch (Node TLS is Cloudflare-blocked) with the Responses
+              // API body prepared in prepareRequest. The SSE translator at the
+              // read loop converts events to chat/completions chunk shape.
+              if (url.startsWith("codex://")) {
+                const codexToken = await getOpenAIAccessToken();
+                if (!codexToken) {
+                  throw new Error("OpenAI OAuth token expired — run codex login again.");
+                }
+                const codexBody = sourceBody._codexResponses || buildResponsesRequest(sourceBody);
+                delete sourceBody._codexResponses;
+                response = await codexFetch(codexToken, getOpenAIAccountId(), codexBody);
+                response.codex = true; // flag for SSE translation in read loop
+              } else {
+                response = await fetch(url, {
+                  method: "POST",
+                  headers,
+                  body: safeStringify(sourceBody),
+                  signal: abortController.signal,
+                });
+              }
 
               if (!response.ok) {
                 const status = response.status;
@@ -3677,6 +3739,15 @@ export class ApiBackend extends PunkBackend {
                     }
 
                     // OAuth mode: token may have expired mid-session
+                    if (apiConfig.authType === "openai-oauth") {
+                      // OpenAI OAuth: invalidate cache; the codex:// dispatch
+                      // path re-reads the token (refreshed by getOpenAIAccessToken)
+                      // on every attempt, so a retry picks up the fresh token.
+                      console.warn("[http] OpenAI OAuth 401 — invalidating cache and retrying");
+                      invalidateOpenAICache();
+                      continue; // Don't consume an attempt — token refresh is a heal
+                    }
+                    // Claude OAuth: token may have expired mid-session
                     if (apiConfig.authType === "oauth") {
                       console.warn("[http] OAuth 401 — invalidating cache and retrying with fresh token");
                       invalidateCache();
@@ -4057,6 +4128,20 @@ export class ApiBackend extends PunkBackend {
 
               try {
                 const parsed = JSON.parse(data);
+                // Codex OAuth: Responses API events → chat/completions chunk
+                // shape so the existing openai parser works unchanged.
+                if (response.codex) {
+                  const chunks = responsesEventToChatChunks(parsed);
+                  for (const chunk of chunks) {
+                    this.handleStreamEvent(
+                      request.projectId,
+                      chunk,
+                      "openai",
+                      request.requestId,
+                    );
+                  }
+                  continue;
+                }
                 const emitted = this.handleStreamEvent(
                   request.projectId,
                   parsed,
@@ -4688,10 +4773,16 @@ export class ApiBackend extends PunkBackend {
                   request.requestId,
                 );
               }
-              // Signal the renderer that the session is waiting on the user.
+              // Signal the renderer that the session is paused on ask_user.
+              // Payload matches PunkEventAwaitingInput: toolId (correlation
+              // key) and question. The renderer mounts the question card;
+              // the next user message resumes the loop.
               this.onEvent(
                 request.projectId,
-                { event: "awaiting_input", data: { question } },
+                {
+                  event: "awaiting_input",
+                  data: { toolId: tool.id, question },
+                },
                 request.requestId,
               );
               awaitingUserInput = true;
@@ -6299,6 +6390,48 @@ export class ApiBackend extends PunkBackend {
         break;
       }
 
+      case "openai": {
+        const isOpenAIOAuth = apiConfig.authType === "openai-oauth";
+
+        if (isOpenAIOAuth) {
+          // OAuth mode: ChatGPT subscription via Codex backend (Responses API).
+          // chatgpt.com speaks Responses API — NOT chat/completions — and
+          // requires Electron net.fetch (Node TLS is Cloudflare-blocked).
+          // Body translation happens here; dispatch via codexFetch happens
+          // in executeTurn by recognizing the codex:// marker URL.
+          const accessToken = await getOpenAIAccessToken();
+          if (!accessToken) {
+            throw new Error(
+              "OpenAI OAuth token unavailable. Run `npx @openai/codex login` to sign in with your ChatGPT account."
+            );
+          }
+          url = "codex://responses"; // marker — dispatcher routes via codexFetch (net.fetch)
+          headers = {}; // set at dispatch time (token may refresh)
+          finalBody = {
+            ...body,
+            _codexResponses: buildResponsesRequest(body),
+          };
+        } else {
+          // API key mode: standard OpenAI chat/completions API
+          url = apiConfig.baseUrl || "https://api.openai.com/v1/chat/completions";
+          headers = {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiConfig.apiKey}`,
+          };
+        }
+
+        if (!isOpenAIOAuth) {
+          finalBody = {
+            ...body,
+            messages: systemTiers
+              ? applyPrefixCacheOptimization(body.messages, systemTiers)
+              : body.messages,
+            user: userTag,
+          };
+        }
+        break;
+      }
+
       default:
         throw new Error(`Unsupported provider: ${apiConfig.provider}`);
     }
@@ -6332,6 +6465,10 @@ export class ApiBackend extends PunkBackend {
         return "claude-sonnet-4-6";
       case "openrouter":
         return "stepfun/step-3.5-flash:free";
+      case "openai":
+        // Codex backend (OAuth mode) only accepts Codex slugs; the API-key
+        // path accepts standard names. gpt-5.4-mini exists in both registries.
+        return "gpt-5.4-mini";
       default:
         return "gpt-4";
     }
@@ -6341,6 +6478,9 @@ export class ApiBackend extends PunkBackend {
     if (!model) return this.getDefaultModel(provider);
 
     if (provider === "openrouter") return model;
+
+    // OpenAI model IDs are used as-is (gpt-4.1-mini, o4-mini, etc.)
+    if (provider === "openai") return model;
 
     // StepFun model IDs are used as-is (step-3.5-flash, step-2-mini, etc.)
     if (provider === "stepfun") return model;
@@ -7335,6 +7475,68 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
+  /**
+   * Fetch available OpenAI models via API key or Codex CLI OAuth.
+   * Uses the standard OpenAI /models endpoint for API key mode,
+   * or the Codex /models endpoint for OAuth mode.
+   */
+  async getOpenAIModels() {
+    const apiConfig = await this.getApiConfig("openai");
+    const isOAuth = apiConfig.authType === "openai-oauth";
+    if (!apiConfig.apiKey && !isOAuth) return [];
+
+    try {
+      let url, fetchHeaders;
+
+      if (isOAuth) {
+        // Codex /models requires net.fetch (Cloudflare) + client_version param.
+        // Returns Codex-specific slugs (gpt-5.6-sol etc.) — already mapped
+        // to chat-style model objects by codexModels().
+        const accessToken = await getOpenAIAccessToken();
+        if (!accessToken) return [];
+        return await codexModels(accessToken, getOpenAIAccountId());
+      } else {
+        const url = "https://api.openai.com/v1/models";
+        const fetchHeaders = {
+          Authorization: `Bearer ${apiConfig.apiKey}`,
+        };
+
+        const response = await fetch(url, {
+          headers: fetchHeaders,
+          signal: AbortSignal.timeout(12_000),
+        });
+        if (!response.ok) return [];
+
+        const json = await response.json();
+        if (!json.data) return [];
+
+        // Filter to chat-capable models — exclude embeddings, audio, TTS, etc.
+        const chatModels = json.data.filter((m) => {
+          const id = m.id?.toLowerCase() || "";
+          if (id.includes("embed") || id.includes("tts") || id.includes("whisper")) return false;
+          if (id.includes("dall-e") || id.includes("moderation")) return false;
+          // Keep GPT, o-series, and codex models
+          return id.startsWith("gpt-") || id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4") || id.includes("codex");
+        });
+
+        return chatModels
+          .map((m) => ({
+            id: m.id,
+            name: m.id,
+            context_length: _openaiContextLength(m.id),
+            provider: "OpenAI",
+            tier: m.id.includes("mini") ? 2 : 1,
+            input_cost: null,
+            output_cost: null,
+          }))
+          .sort(_byRelevance);
+      }
+    } catch (err) {
+      console.error("[http] Failed to fetch OpenAI models:", err);
+      return [];
+    }
+  }
+
   // ==========================================================================
   // Task Runner Support — Planning Call & Step Execution (class methods)
   // ==========================================================================
@@ -7367,10 +7569,12 @@ export class ApiBackend extends PunkBackend {
     };
 
     // Request usage data in streaming response for OpenAI-compatible providers
+    // NOT for openai-oauth: Codex Responses API rejects unknown params.
     if (
-      ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter"].includes(
+      ["deepseek", "kimi", "stepfun", "xiaomi", "openrouter", "openai"].includes(
         apiConfig.provider,
-      )
+      ) &&
+      apiConfig.authType !== "openai-oauth"
     ) {
       body.stream_options = { include_usage: true };
     }
@@ -7393,11 +7597,21 @@ export class ApiBackend extends PunkBackend {
 
     while (true) {
       try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers,
-          body: safeStringify(cleanBody),
-        });
+        let response;
+        if (url.startsWith("codex://")) {
+          const codexToken = await getOpenAIAccessToken();
+          if (!codexToken) throw new Error("OpenAI OAuth token expired — run codex login again.");
+          const codexBody = cleanBody._codexResponses || buildResponsesRequest(cleanBody);
+          delete cleanBody._codexResponses;
+          response = await codexFetch(codexToken, getOpenAIAccountId(), codexBody);
+          response.codex = true;
+        } else {
+          response = await fetch(url, {
+            method: "POST",
+            headers,
+            body: safeStringify(cleanBody),
+          });
+        }
 
         if (!response.ok) {
           const status = response.status;
@@ -7506,7 +7720,10 @@ export class ApiBackend extends PunkBackend {
             }
 
             let delta = "";
-            if (apiConfig.provider === "anthropic") {
+            if (response.codex) {
+              // Codex Responses API: text arrives in response.output_text.delta
+              if (parsed.type === "response.output_text.delta") delta = parsed.delta || "";
+            } else if (apiConfig.provider === "anthropic") {
               // Anthropic: content_block_delta with text_delta
               if (
                 parsed.type === "content_block_delta" &&
@@ -7665,11 +7882,21 @@ export class ApiBackend extends PunkBackend {
 
     while (true) {
       try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers,
-          body: safeStringify(cleanBody),
-        });
+        let response;
+        if (url.startsWith("codex://")) {
+          const codexToken = await getOpenAIAccessToken();
+          if (!codexToken) throw new Error("OpenAI OAuth token expired — run codex login again.");
+          const codexBody = cleanBody._codexResponses || buildResponsesRequest(cleanBody);
+          delete cleanBody._codexResponses;
+          response = await codexFetch(codexToken, getOpenAIAccountId(), codexBody);
+          response.codex = true;
+        } else {
+          response = await fetch(url, {
+            method: "POST",
+            headers,
+            body: safeStringify(cleanBody),
+          });
+        }
 
         if (!response.ok) {
           const status = response.status;
@@ -7713,6 +7940,32 @@ export class ApiBackend extends PunkBackend {
           throw new Error(
             `Conversation call failed after ${MAX_RETRIES} attempts: HTTP ${status}: ${errorText}`,
           );
+        }
+
+        // Codex Responses API always streams (stream:false rejected) —
+        // accumulate text from SSE events instead of parsing JSON.
+        if (response.codex) {
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let fullText = "";
+          let buffer = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop();
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              const payload = line.slice(6).trim();
+              if (!payload || payload === "[DONE]") continue;
+              try {
+                const ev = JSON.parse(payload);
+                if (ev.type === "response.output_text.delta") fullText += ev.delta || "";
+              } catch { /* skip keep-alive fragments */ }
+            }
+          }
+          return fullText;
         }
 
         const json = await response.json();

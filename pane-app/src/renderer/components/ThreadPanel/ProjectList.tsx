@@ -50,11 +50,7 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
   );
   const isActive = useProjectsStore((s) => s.activeProjectId === id);
   const root = useProjectsStore((s) => s.projects.get(id)?.root ?? "");
-  const activeProjectRoot = useProjectsStore((s) => {
-    if (!s.activeProjectId || s.activeProjectId === id) return "";
-    return s.projects.get(s.activeProjectId)?.root ?? "";
-  });
-  const isPeerThread = !isActive && root && activeProjectRoot === root;
+
   const rootMissing = useProjectsStore(
     (s) => s.projects.get(id)?.rootMissing ?? false,
   );
@@ -230,12 +226,7 @@ const ProjectRow = memo(function ProjectRow({ id }: { id: string }) {
             >
               {name}
             </span>
-            {isPeerThread && (
-              <span
-                className="shrink-0 inline-block w-1.5 h-1.5 rounded-full bg-pane-status-renamed/60 ml-1"
-                title="Peer thread — shares project root. Active intents may conflict."
-              />
-            )}
+
           </>
         )}
 

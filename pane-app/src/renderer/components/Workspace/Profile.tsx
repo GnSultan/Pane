@@ -23,11 +23,15 @@ import {
   paneClaudeLogin,
   paneClaudeLogout,
   paneClaudeAuthState,
+  paneOpenAILogin,
+  paneOpenAILogout,
+  paneOpenAIAuthState,
   loadSettings,
   saveSettings,
   type CloudUser,
   type CloudStatus,
   type ClaudeAuthState,
+  type OpenAIAuthState,
   type McpServerConfig,
   type UserSettings,
 } from "../../lib/tauri-commands";
@@ -1026,6 +1030,101 @@ function ClaudeSignInCard() {
   );
 }
 
+function OpenAISignInCard() {
+  const [auth, setAuth] = useState<OpenAIAuthState>({ authenticated: false, accountId: null });
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    paneOpenAIAuthState().then(setAuth).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const cleanup = window.electronAPI.on("pane-openai-signin", (raw: unknown) => {
+      const data = raw as { type?: string; output?: string[] } | undefined;
+      if (data?.type === "status" && data.output?.length) {
+        setStatus(data.output[data.output.length - 1] ?? null);
+      }
+    });
+    return () => cleanup?.();
+  }, []);
+
+  const handleSignIn = async () => {
+    setLoading(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const result = await paneOpenAILogin();
+      if (result.success) {
+        setAuth({ authenticated: true, accountId: result.accountId ?? null });
+        setStatus(null);
+      } else {
+        setError(result.error || "sign in failed");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "sign in failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await paneOpenAILogout().catch(() => {});
+    setAuth({ authenticated: false, accountId: null });
+    setStatus(null);
+    setError(null);
+  };
+
+  return (
+    <div className="flex flex-col gap-2 pb-3 border-b border-pane-border/20 mb-3">
+      <span
+        className="text-pane-text-secondary/30 font-mono tracking-wider px-0.5"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        chatgpt subscription
+      </span>
+
+      {auth.authenticated ? (
+        <div className="flex items-center justify-between px-1">
+          <span className="text-pane-text font-mono text-xs truncate">
+            signed in
+          </span>
+          <button
+            onClick={handleSignOut}
+            className="text-pane-text-secondary/50 hover:text-pane-text font-mono transition-colors shrink-0 ml-3"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            sign out
+          </button>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5 px-1">
+          <button
+            onClick={handleSignIn}
+            disabled={loading}
+            className="text-left text-pane-text font-mono hover:text-pane-accent transition-colors disabled:opacity-40"
+            style={{ fontSize: "var(--pane-font-size-xs)" }}
+          >
+            {loading ? (status ?? "signing in…") : "sign in with chatgpt"}
+          </button>
+          <span
+            className="text-pane-text-secondary/25 font-mono"
+            style={{ fontSize: "9px" }}
+          >
+            requires codex cli · npx @openai/codex login
+          </span>
+          {error && (
+            <span className="text-red-400/70 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+              {error}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Z.ai Coding Plan Tier Selector ──────────────────────────────────────────
 // Lets the user pick their Z.ai Coding Plan (Lite/Pro/Max) so Pane can compute
 // quota utilization. Stored in settings.json as zai_plan_tier.
@@ -1099,7 +1198,7 @@ const API_KEY_PROVIDERS: ApiKeyProvider[] = [
   { key: "kimi", label: "Kimi (Moonshot)", placeholder: "sk-...", docsUrl: "https://platform.moonshot.cn/", showBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1/chat/completions" },
   { key: "z-ai", label: "Z.ai (GLM)", placeholder: "sk-...", docsUrl: "https://z.ai/manage-apikey/apikey-list", showBaseUrl: true, defaultBaseUrl: "https://api.z.ai/api/paas/v4/chat/completions" },
   { key: "tavily", label: "Tavily Search", placeholder: "tvly-...", docsUrl: "https://tavily.com/#api" },
-  { key: "openai", label: "OpenAI (Voice)", placeholder: "sk-...", docsUrl: "https://platform.openai.com/api-keys" },
+  { key: "openai", label: "OpenAI", placeholder: "sk-...", docsUrl: "https://platform.openai.com/api-keys", showBaseUrl: true, defaultBaseUrl: "https://api.openai.com/v1/chat/completions" },
   { key: "jina", label: "Jina AI", placeholder: "jina_...", docsUrl: "https://jina.ai/embeddings/" },
 ];
 
@@ -1862,7 +1961,7 @@ function VoiceSection() {
         )}
       </div>
       <span className="text-pane-text-secondary/50 font-mono" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-        changing voice reconnects an active session · needs an openai key in providers
+        changing voice reconnects an active session · needs an openai key or chatgpt sign-in
       </span>
     </div>
   );
@@ -2545,6 +2644,163 @@ function CloudSection() {
 import { TokenAnalytics } from "./TokenAnalytics";
 
 // Accordion Section Component
+// ── Skills ───────────────────────────────────────────────────────────────────
+
+interface SkillMeta {
+  name: string;
+  description: string;
+  version: string;
+  tags: string[];
+  source: "project" | "global" | "builtin";
+}
+
+/**
+ * All installed skills across sources, with the active thread's active set
+ * toggleable. List is pulled when the section expands (discoverAll caches
+ * 30s main-side, so re-expands are cheap); active set comes from the live
+ * store kept in sync by useSkillsSync.
+ */
+function SkillsSection() {
+  const [skills, setSkills] = useState<SkillMeta[] | null>(null);
+  const [toggling, setToggling] = useState<Set<string>>(new Set());
+
+  const activeProjectId = useProjectsStore((s) => s.activeProjectId);
+  const activeProjectRoot = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.root : undefined;
+  });
+  const activeSkills = useProjectsStore((s) => {
+    const id = s.activeProjectId;
+    return id ? s.projects.get(id)?.activeSkills : undefined;
+  }) ?? [];
+
+  useEffect(() => {
+    if (!activeProjectId) return;
+    // Pull on mount and when the target thread/root changes
+    let cancelled = false;
+    window.electronAPI
+      .invoke<{ skills: SkillMeta[]; active: string[] }>("skills_get_all", {
+        projectId: activeProjectId,
+        projectRoot: activeProjectRoot ?? null,
+      })
+      .then((data) => {
+        if (!cancelled) {
+          setSkills(data.skills ?? []);
+          useProjectsStore.getState().setActiveSkills(activeProjectId, data.active ?? []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSkills([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId, activeProjectRoot]);
+
+  const toggle = async (name: string) => {
+    if (!activeProjectId || toggling.has(name)) return;
+    setToggling((prev) => new Set(prev).add(name));
+    try {
+      const isActive = activeSkills.includes(name.toLowerCase());
+      await window.electronAPI.invoke("skills_set_active", {
+        projectId: activeProjectId,
+        name,
+        active: !isActive,
+        projectRoot: activeProjectRoot ?? null,
+      });
+      // Store update arrives via pane-skills-changed push — no local echo,
+      // so a failed handler can't desync the UI from the registry.
+    } catch {
+      // Surface nothing — registry push is the source of truth; a silent
+      // failure here means the toggle didn't land, and the chip won't lie.
+    } finally {
+      setToggling((prev) => {
+        const next = new Set(prev);
+        next.delete(name);
+        return next;
+      });
+    }
+  };
+
+  if (skills === null) {
+    return (
+      <div className="py-6 text-center text-pane-text-secondary/50 font-mono" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+        loading skills…
+      </div>
+    );
+  }
+
+  if (skills.length === 0) {
+    return (
+      <div className="py-6 text-center text-pane-text-secondary/50 font-mono" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+        no skills installed — agent installs via pane_install_skill or drop into ~/.pane/skills/
+      </div>
+    );
+  }
+
+  const sourceLabel: Record<SkillMeta["source"], string> = {
+    project: "project",
+    global: "global",
+    builtin: "built-in",
+  };
+
+  return (
+    <div className="flex flex-col">
+      <span
+        className="text-pane-text-secondary/50 font-mono mb-3 block"
+        style={{ fontSize: "var(--pane-font-size-xs)" }}
+      >
+        {activeSkills.length} active · {skills.length} installed · toggles apply to the open thread
+      </span>
+      {skills.map((skill) => {
+        const isActive = activeSkills.includes(skill.name.toLowerCase());
+        return (
+          <div
+            key={skill.name}
+            className="flex items-start justify-between gap-4 py-3 border-b border-pane-border/15 last:border-b-0"
+          >
+            <div className="flex flex-col gap-0.5 min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-pane-text truncate" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+                  {skill.name}
+                </span>
+                <span
+                  className="font-mono text-pane-text-secondary/40 shrink-0"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                >
+                  {sourceLabel[skill.source]} · v{skill.version}
+                </span>
+              </div>
+              <span
+                className="text-pane-text-secondary/70 font-mono truncate"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+                title={skill.description}
+              >
+                {skill.description}
+              </span>
+            </div>
+            <button
+              onClick={() => toggle(skill.name)}
+              disabled={toggling.has(skill.name)}
+              className="font-mono shrink-0 px-3 py-1 rounded-md ring-1 transition-colors btn-press"
+              style={{
+                fontSize: "var(--pane-font-size-xs)",
+                color: isActive ? "var(--pane-accent)" : "var(--pane-text-secondary)",
+                // ring color via style to use CSS var with alpha
+                boxShadow: isActive
+                  ? "inset 0 0 0 1px var(--pane-accent)"
+                  : "inset 0 0 0 1px color-mix(in srgb, var(--pane-text-secondary) 25%, transparent)",
+              }}
+            >
+              {toggling.has(skill.name) ? "…" : isActive ? "active" : "off"}
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function AccordionSection({
   title,
   icon,
@@ -2715,6 +2971,11 @@ export function Profile() {
         <path d="M2 12l10 5 10-5" />
       </svg>
     ),
+    skills: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+      </svg>
+    ),
     usage: (
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 20V10" />
@@ -2782,6 +3043,16 @@ export function Profile() {
           <TokenAnalytics projectId={null} isExpanded={expandedSection === "usage"} />
         </AccordionSection>
 
+        {/* Skills Section */}
+        <AccordionSection
+          title="skills"
+          icon={icons.skills}
+          isExpanded={expandedSection === "skills"}
+          onToggle={() => setExpandedSection(expandedSection === "skills" ? null : "skills")}
+        >
+          <SkillsSection />
+        </AccordionSection>
+
         {/* AI Engines Section */}
         <AccordionSection
           title="pane auto"
@@ -2803,6 +3074,7 @@ export function Profile() {
             onToggle={() => setExpandedSection(expandedSection === "apiKeys" ? null : "apiKeys")}
           >
             <ClaudeSignInCard />
+            <OpenAISignInCard />
             <ApiKeysSection
               httpApiKeys={httpApiKeys}
               onKeyChange={handleApiKeyChange}

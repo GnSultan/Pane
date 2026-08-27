@@ -73,6 +73,10 @@ export interface Project {
   lastResponseSummary: string | null;
   /** Epoch ms of last user or model activity — for thread list sorting. */
   lastActivityAt: number | null;
+  /** Names of skills currently active for this thread (lowercase). Mirrors
+   *  the main-process skill registry; kept in sync via pane-skills-changed
+   *  pushes and skills_get_active pulls. Empty array = none active. */
+  activeSkills: string[];
   /** When true, this thread is archived — hidden from main list, visible
    *  in a collapsible "Archived" section. Migrates to conversation-level
    *  is_archived when multi-conversation (Phase 0) lands. */
@@ -122,6 +126,7 @@ function createProject(root: string, stableId?: string, nameOverride?: string): 
     lastUserPromptText: null,
     lastResponseSummary: null,
     lastActivityAt: null,
+    activeSkills: [],
   };
 }
 
@@ -274,7 +279,6 @@ interface ProjectsState {
   ) => void;
   setPendingInput: (projectId: string, pendingInput: import("../lib/punk-types").ConversationState["pendingInput"]) => void;
   clearPendingInput: (projectId: string) => void;
-  setIsPlanning: (projectId: string, isPlanning: boolean) => void;
   setConversationPhase: (projectId: string, phase: import("../lib/punk-types").ConversationState["phase"]) => void;
   updateLastToolUseInput: (
     projectId: string,
@@ -303,6 +307,7 @@ interface ProjectsState {
   getProjectEffectiveCombo: (projectId: string) => PowerCombo;
   // Thread list activity
   setThreadActivity: (projectId: string, fields: { lastUserPromptText?: string | null; lastResponseSummary?: string | null; lastActivityAt?: number | null }) => void;
+  setActiveSkills: (projectId: string, skills: string[]) => void;
 
   // Checkpoints
   addCheckpoint: (projectId: string, meta: CheckpointMeta) => void;
@@ -455,11 +460,14 @@ function createProjectsStore() {
         const carryMode = currentProject?.mode;
         const isTransientMode = carryMode === "mind" || carryMode === "profile" || carryMode === "history" || carryMode === "lens";
 
+        // Selecting a thread is navigation, not activity — do NOT touch
+        // lastActivityAt. The thread list sorts by last real activity
+        // (prompt/response); bumping on click would teleport the clicked
+        // thread to the top of the list.
         const updatedProjects = new Map(state.projects);
         const updatedProject = {
           ...project,
           hasUnreadCompletion: false,
-          lastActivityAt: Date.now(),
           ...(carryMode && !isTransientMode ? { mode: carryMode } : {}),
         };
         updatedProjects.set(id, updatedProject);
@@ -951,7 +959,6 @@ function createProjectsStore() {
           conversation: {
             ...p.conversation,
             todos: [],
-            isPlanning: false,
             phase: "idle",
             isProcessing: false,
           },
@@ -990,13 +997,6 @@ function createProjectsStore() {
       set((state) =>
         updateProject(state, projectId, (p) => ({
           conversation: { ...p.conversation, pendingInput: null },
-        })),
-      ),
-
-    setIsPlanning: (projectId, isPlanning) =>
-      set((state) =>
-        updateProject(state, projectId, (p) => ({
-          conversation: { ...p.conversation, isPlanning },
         })),
       ),
 
@@ -1090,7 +1090,6 @@ function createProjectsStore() {
             routedModel: null,
             serviceTier: null,
             isProcessing: false,
-            isPlanning: false,
             phase: "idle",
             isRestored: true,
             error: null,
@@ -1174,6 +1173,13 @@ function createProjectsStore() {
           lastUserPromptText: fields.lastUserPromptText ?? state.projects.get(projectId)?.lastUserPromptText ?? null,
           lastResponseSummary: fields.lastResponseSummary ?? state.projects.get(projectId)?.lastResponseSummary ?? null,
           lastActivityAt: fields.lastActivityAt ?? state.projects.get(projectId)?.lastActivityAt ?? null,
+        })),
+      ),
+
+    setActiveSkills: (projectId, skills) =>
+      set((state) =>
+        updateProject(state, projectId, () => ({
+          activeSkills: skills,
         })),
       ),
 

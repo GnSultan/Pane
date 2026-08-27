@@ -10,6 +10,7 @@ import { useProjectsStore } from "./stores/projects";
 import { useFileWatcher } from "./hooks/useFileWatcher";
 import { useGitStatus } from "./hooks/useGitStatus";
 import { useSettingsPersistence } from "./hooks/useSettingsPersistence";
+import { useSkillsSync } from "./hooks/useSkillsSync";
 
 function App() {
   // Sidebar visibility: conversation mode + not collapsed.
@@ -32,6 +33,7 @@ function App() {
   useFileWatcher();
   useGitStatus();
   useSettingsPersistence();
+  useSkillsSync();
 
   // Fetch models on app launch
   useEffect(() => {

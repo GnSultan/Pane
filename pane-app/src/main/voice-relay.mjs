@@ -20,7 +20,16 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { ToolExecutor } from "./tool-executor.mjs";
+import { mcpClient } from "./mcp-client.mjs";
 import { orchestrateContext } from "./context-orchestrator.mjs";
+import { getAccessToken as getOpenAIAccessToken } from "./openai-oauth.mjs";
+import { readActivities } from "./intents.mjs";
+import {
+  journalExchange,
+  recallConversations,
+  distillCompanionMemory,
+  getCompanionBlock,
+} from "./companion-memory.mjs";
 
 const { fetch } = globalThis;
 
@@ -88,6 +97,54 @@ const VOICE_TOOL_WHITELIST = new Set([
   "pane_cross_project",
 ]);
 
+/**
+ * Compact MCP tool catalog for the voice model's instructions — name plus
+ * first line of description per tool, grouped by server. Full schemas stay
+ * out of context; the model references tools by exact name via mcp_call.
+ * Bounded to 150 lines so a huge MCP surface can't blow up instructions.
+ */
+export function buildMcpCatalog() {
+  try {
+    const tools = mcpClient.getExternalTools();
+    if (!tools.length) return "";
+    const byServer = new Map();
+    for (const t of tools) {
+      // name is "ext__server__tool" — split off the server segment.
+      const parts = t.function.name.split("__");
+      const server = parts[1] ?? "unknown";
+      if (!byServer.has(server)) byServer.set(server, []);
+      byServer.get(server).push(t);
+    }
+    // Deterministic order — iteration used to follow Map insertion order,
+    // which is connection-timing-dependent. With more tools than the line
+    // cap, whole servers at the tail (apple-calendar) silently vanished
+    // from the model's instructions. Alphabetical order is stable and
+    // puts the truncation point in a predictable place.
+    const servers = [...byServer.keys()].sort();
+    const MAX_LINES = 260;
+    const lines = [];
+    let truncated = 0;
+    for (const server of servers) {
+      lines.push(`${server}:`);
+      for (const t of byServer.get(server)) {
+        const first = (t.function.description || "").split("\n")[0].slice(0, 70);
+        if (lines.length >= MAX_LINES) {
+          truncated++;
+          continue;
+        }
+        lines.push(`  - ${t.function.name} — ${first}`);
+      }
+    }
+    if (truncated > 0) {
+      lines.push(`  (+${truncated} tools omitted — line budget reached)`);
+    }
+    return lines.join("\n");
+  } catch (err) {
+    console.warn("[voice] MCP catalog build failed:", err?.message || err);
+    return "";
+  }
+}
+
 // Realtime function-tool schemas exposed to the voice model (flattened
 // Realtime shape: { type, name, description, parameters } — no .function nest).
 export const VOICE_TOOLS = [
@@ -147,6 +204,88 @@ export const VOICE_TOOLS = [
       required: ["tool"],
     },
   },
+  {
+    type: "function",
+    name: "mcp_call",
+    description:
+      "Call an external tool from Pane's MCP servers (Calendar, Notion, Gmail, " +
+      "Figma, Resend, Vercel, …). The exact tool names are listed in your " +
+      "instructions under 'Connected MCP tools'. Use them directly for real-world " +
+      "actions: check/add calendar events, search or update Notion, search mail, " +
+      "send email, manage projects. Never invent a tool name — pick from the list.",
+    parameters: {
+      type: "object",
+      properties: {
+        tool: {
+          type: "string",
+          description: "Exact tool name from the MCP list, e.g. 'ext__apple-calendar__calendar_list_events'.",
+        },
+        args: {
+          type: "object",
+          description: "Arguments object matching the tool's parameters.",
+        },
+      },
+      required: ["tool"],
+    },
+  },
+  {
+    type: "function",
+    name: "workspace_state",
+    description:
+      "Snapshot of Pane's workspace, on demand. Use when the user asks about " +
+      "threads, projects, activity, or anything 'how many / what's running'. " +
+      "Returns: thread list with per-thread agent status and last activity, " +
+      "message counts, peer threads on the current project.",
+    parameters: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    type: "function",
+    name: "look_at_screen",
+    description:
+      "Capture the Pane window and SEE it. Call when the user references " +
+      "something visible ('this file', 'that error', 'the layout', 'what am I " +
+      "looking at') or asks for visual judgment. The screenshot enters the " +
+      "conversation as an image you can inspect. Costs tokens — call when " +
+      "warranted, not reflexively.",
+    parameters: {
+      type: "object",
+      properties: {
+        detail: {
+          type: "string",
+          enum: ["low", "high"],
+          description: "'low' for layout/structure questions, 'high' for reading small text. Default 'low'.",
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    name: "recall_conversation",
+    description:
+      "Search the exact record of past voice conversations with Aslam — your own " +
+      "memory of talking together, not project memory. Exact keyword match over " +
+      "every spoken exchange, newest first. Use when he references something you " +
+      "discussed before ('remember when I said...', 'that thing from last week') " +
+      "and your distilled memory doesn't cover it, or when you need the precise " +
+      "words/context. Project facts live in project memory (pane_recall), not here.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Distinctive words from the conversation. e.g. 'voice orb glow colors'",
+        },
+        days_back: {
+          type: "number",
+          "description": "Optional: only search the last N days.",
+        },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 /**
@@ -165,8 +304,15 @@ function buildVoiceInstructions(sharedContext, agentStatusLine) {
     "Your job:\n" +
     "- Listen, discuss, answer questions about the project using the knowledge tools.\n" +
     "- Help the user think through what they want before committing to building it.\n" +
-    "- Watch and report: the agent's activity is injected into your context as it " +
-    "happens. Narrate progress when asked; stay quiet about it otherwise.\n" +
+    "- Workspace awareness: a [workspace] line is injected into your context as " +
+    "things change (thread count, running agents, open file). For deeper detail " +
+    "call workspace_state — it returns every thread with names, activity, and " +
+    "message counts. When the user asks 'how many threads', 'what's running', " +
+    "'what was I doing in X' — call workspace_state, don't guess.\n" +
+    "- Sight: you can see the Pane window. When the user references something " +
+    "visible ('this file', 'that error', 'the layout') call look_at_screen and " +
+    "the screenshot enters the conversation. Use it when warranted — every " +
+    "glance costs image tokens.\n" +
     "- When the user signals execution — \"okay let's do it\", \"go ahead\", \"build that\" — " +
     "assemble the complete instruction and call delegate_task. Natural conversation, " +
     "no confirmation ritual: if the user told you to do it, delegate.\n\n" +
@@ -178,6 +324,22 @@ function buildVoiceInstructions(sharedContext, agentStatusLine) {
     "- After delegating, tell the user the agent is on it, and keep watching. " +
     "You can relay corrections mid-run: just include them in a new delegate_task call.\n" +
     "- Speaking style: match Aslam — direct, no filler, no corporate tone.\n\n" +
+    "You also have your own memory of past conversations with Aslam (injected " +
+    "above when it exists) and the recall_conversation tool to search the exact " +
+    "record of what was said before. If he references something from days ago, " +
+    "search for it — never guess and never pretend to remember what you can't " +
+    "find.\n\n" +
+    "External world access (mcp_call):\n" +
+    "- Connected MCP tools are listed under 'Connected MCP tools' in your context. " +
+    "They are real integrations — calendar, Notion, Gmail, Figma, Resend, Vercel " +
+    "and more. When the user asks about tomorrow's schedule, a Notion page, an " +
+    "email, or asks you to send/create/update anything in those services: pick " +
+    "the matching tool and call it via mcp_call with exact name and arguments.\n" +
+    "- Prefer read tools to answer questions; use write tools when asked to act. " +
+    "For destructive actions (delete, send, spend) confirm intent first — the " +
+    "user is speaking casually, so one quick confirm beats an irreversible mistake.\n" +
+    "- If a needed tool isn't in the list, say so plainly — never fabricate a " +
+    "tool name or invent results.\n\n" +
     `Current agent status: ${agentStatusLine}`
   );
 }
@@ -193,17 +355,28 @@ export class VoiceRelay {
    * callers treat that as "voice unavailable" and never surface the key itself.
    */
   async getApiKey() {
+    let settings = null;
     try {
       const content = await fs.readFile(this.paneDir + "/settings.json", "utf-8");
-      const settings = JSON.parse(content);
-      return settings.http_api_keys?.openai || "";
+      settings = JSON.parse(content);
     } catch (err) {
       // Parse/read failures are NOT "no key" — they mean settings.json is
       // unreadable (concurrent write, corruption). Surface the real cause
       // so intermittent failures are diagnosable instead of masked.
       console.error("[voice] settings.json unreadable:", err?.message);
-      return "";
     }
+    // API key wins; ChatGPT OAuth is the fallback — both are accepted by
+    // api.openai.com for realtime client_secrets (verified live Aug 2026:
+    // OAuth token mints ek_ tokens and opens working WebRTC sessions).
+    const apiKey = settings?.http_api_keys?.openai || "";
+    if (apiKey) return apiKey;
+    try {
+      const oauth = await getOpenAIAccessToken();
+      if (oauth) return oauth;
+    } catch (err) {
+      console.warn("[voice] OpenAI OAuth fallback failed:", err?.message || err);
+    }
+    return "";
   }
 
   /**
@@ -216,10 +389,122 @@ export class VoiceRelay {
    * @returns {Promise<{ ok: true, token: string, instructions: string, tools: object[] } |
    *                     { ok: false, error: string }>}
    */
+  /**
+   * Build a workspace snapshot: threads (projects), their last activity,
+   * peer threads sharing the current project root, and message counts.
+   *
+   * Sources (verified live, Aug 2026):
+   *   - settings.json project_states — the renderer's persisted thread
+   *     registry (name, root). 24 threads at time of writing.
+   *   - intents.mjs readActivities — NDJSON activity records (2h TTL).
+   *   - pane.db messages — real persisted conversation history.
+   * Legacy paths deliberately NOT used: state_blobs editor/project (no
+   * current writers), state dirs' project.json (months stale),
+   * conversations table (orphaned migration artifact).
+   */
+  async buildWorkspaceSnapshot(currentProjectId) {
+    // Thread registry
+    const threads = [];
+    try {
+      const content = await fs.readFile(this.paneDir + "/settings.json", "utf-8");
+      const settings = JSON.parse(content);
+      const states = settings?.project_states || {};
+      const now = Date.now();
+      for (const [id, st] of Object.entries(states)) {
+        const acts = readActivities(id);
+        const last = acts.length ? acts[acts.length - 1] : null;
+        const ageMin = last ? Math.round((now - last.ts) / 60000) : null;
+        threads.push({
+          id,
+          name: st?.name || id,
+          root: st?.root || null,
+          // Active = activity within the last 15 minutes
+          active: last ? now - last.ts < 15 * 60 * 1000 : false,
+          lastActivityAgoMin: ageMin,
+          lastActivity:
+            last?.activityType === "turn_start" && last?.detail
+              ? String(last.detail).slice(0, 120)
+              : last
+                ? `${last.tool || last.activityType}${last.file ? ` (${last.file})` : ""}`
+                : null,
+        });
+      }
+    } catch (err) {
+      console.warn("[voice] workspace snapshot: settings.json unreadable:", err?.message);
+    }
+    threads.sort((a, b) => (b.lastActivityAgoMin ?? Infinity) - (a.lastActivityAgoMin ?? Infinity));
+
+    // Message counts per thread — best-effort; pane.db may be uninitialized
+    // in this process (it belongs to the main pipeline). Never fatal.
+    let messageCounts = null;
+    try {
+      const { getPaneDb } = await import("./pane-db.mjs");
+      const db = getPaneDb();
+      const rows = db.prepare("SELECT project_id, COUNT(*) AS cnt FROM messages GROUP BY project_id").all();
+      messageCounts = {};
+      for (const r of rows) messageCounts[r.project_id] = r.cnt;
+    } catch {
+      // Uninitialized in this process — counts omitted, not fabricated.
+    }
+
+    // Peers: other threads on the same project root right now
+    let peers = null;
+    try {
+      const mine = threads.find((t) => t.id === currentProjectId);
+      if (mine?.root) {
+        peers = threads
+          .filter((t) => t.id !== currentProjectId && t.root === mine.root)
+          .map((t) => ({ name: t.name, active: t.active, lastActivity: t.lastActivity, lastActivityAgoMin: t.lastActivityAsortMin ?? t.lastActivityAgoMin }));
+      }
+    } catch {
+      /* peers omitted */
+    }
+
+    const activeCount = threads.filter((t) => t.active).length;
+    return {
+      totalThreads: threads.length,
+      activeThreads: activeCount,
+      threads: threads.slice(0, 12), // bound: top 12 by recency
+      peersOnThisProject: peers,
+      messageCounts,
+    };
+  }
+
+  /**
+   * Capture the Pane window as PNG and return a data URI for the Realtime
+   * input_image content part. Pull-based: invoked only when the model calls
+   * look_at_screen. Resize keeps tokens bounded — full-res window capture
+   * would balloon every glance into hundreds of image tokens.
+   */
+  async captureScreen(detail = "low") {
+    const { BrowserWindow } = await import("electron");
+    const win = BrowserWindow.getAllWindows().find(
+      (w) => !w.isDestroyed() && w.webContents.getURL().startsWith("file://"),
+    );
+    if (!win) {
+      return { ok: false, error: "No Pane window available to capture." };
+    }
+    try {
+      const image = await win.webContents.capturePage();
+      const maxW = detail === "high" ? 1600 : 1100;
+      const origW = image.getSize().width;
+      // Resize when wider than target — nativeImage.resize is the cheap path
+      // (no canvas, no deps). detail "high" keeps more text readable.
+      const final = origW > maxW ? image.resize({ width: maxW }) : image;
+      return {
+        ok: true,
+        image: final.toDataURL(),
+        width: final.getSize().width,
+      };
+    } catch (err) {
+      return { ok: false, error: `Screen capture failed: ${err?.message || err}` };
+    }
+  }
+
   async mintToken(projectId, projectRoot, agentStatusLine = "idle") {
     const apiKey = await this.getApiKey();
     if (!apiKey) {
-      return { ok: false, error: "No OpenAI API key set — add it in Profile → API Keys." };
+      return { ok: false, error: "No OpenAI credential — add an API key in Profile → API Keys or sign in with ChatGPT (OpenAI card)." };
     }
 
     // Shared brain: same identity + about + playbook the agent gets.
@@ -229,11 +514,14 @@ export class VoiceRelay {
     } catch (err) {
       console.warn("[voice] context assembly failed, continuing with relay-only instructions:", err?.message);
     }
-    const instructions = buildVoiceInstructions(sharedContext, agentStatusLine);
+    const instructions = buildVoiceInstructions(sharedContext, agentStatusLine) + getCompanionBlock();
     const { voice, accent } = await readVoiceSetting();
-    const sessionInstructions = ACCENT_INSTRUCTIONS[accent]
-      ? instructions + "\n\n" + ACCENT_INSTRUCTIONS[accent]
-      : instructions;
+    // MCP catalog: live tool list from connected servers, grouped by server.
+    // Appended last so it reflects current connections at mint time.
+    const mcpCatalog = buildMcpCatalog();
+    const sessionInstructions =
+      (mcpCatalog ? instructions + "\n\n## Connected MCP tools\n" + mcpCatalog : instructions) +
+      (ACCENT_INSTRUCTIONS[accent] ? "\n\n" + ACCENT_INSTRUCTIONS[accent] : "");
 
     try {
       const res = await fetch(OPENAI_REALTIME_SECRET_URL, {
@@ -295,7 +583,7 @@ export class VoiceRelay {
     }
     const apiKey = await this.getApiKey();
     if (!apiKey) {
-      return { ok: false, error: "No OpenAI API key set — add it in Profile → API Keys." };
+      return { ok: false, error: "No OpenAI credential — add an API key in Profile → API Keys or sign in with ChatGPT (OpenAI card)." };
     }
     const { accent } = await readVoiceSetting();
     try {
@@ -349,6 +637,42 @@ export class VoiceRelay {
    * @param {object} args
    */
   async runTool(projectId, projectRoot, toolName, args) {
+    // Companion-memory tools execute here — they're not ToolExecutor tools.
+    if (toolName === "recall_conversation") {
+      // Normalize to the { success, output } contract the renderer expects
+      // (recallConversations returns { ok, hits, ... }).
+      const res = recallConversations(args?.query, { daysBack: args?.days_back ?? null });
+      if (res?.ok) return { success: true, output: JSON.stringify(res).slice(0, 12000) };
+      return { success: false, error: res?.error || "conversation recall failed" };
+    }
+    if (toolName === "workspace_state") {
+      return this.buildWorkspaceSnapshot(projectId);
+    }
+    // mcp_call gateway: { tool, args } → executor, which routes ext__*
+    // names to the MCP client (same path the main agent uses).
+    if (toolName === "mcp_call") {
+      const target = typeof args?.tool === "string" ? args.tool.trim() : "";
+      if (!mcpClient.isExternalTool(target)) {
+        return {
+          success: false,
+          error: `'${target || "(missing)"}' is not an MCP tool. Pick an exact name from the Connected MCP tools list.`,
+        };
+      }
+      let executor = this.executors.get(projectId);
+      if (!executor) {
+        executor = new ToolExecutor(projectId, projectRoot || "", () => {});
+        this.executors.set(projectId, executor);
+      }
+      const toolId = `voice-mcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+      try {
+        const result = await executor.executeTool(toolId, target, args?.args || {});
+        return result ?? { success: false, error: "MCP tool returned nothing." };
+      } catch (err) {
+        return { success: false, error: err?.cause?.message || err?.message || String(err) };
+      }
+    }
+    // look_at_screen never arrives here — the renderer handles capture and
+    // image push locally (the Realtime conversation lives in the renderer).
     if (!VOICE_TOOL_WHITELIST.has(toolName)) {
       return { success: false, error: `Tool '${toolName}' is not available to voice.` };
     }
@@ -365,6 +689,42 @@ export class VoiceRelay {
       // Unwrap and pass through the real error.
       return { success: false, error: err?.cause?.message || err?.message || String(err) };
     }
+  }
+
+  /**
+   * Distill the companion memory at session end. Uses the same OpenAI key
+   * as realtime/TTS; a small cheap model is enough for a ≤300-word summary.
+   * Session-scoped: safe to call on every session end — trivial sessions
+   * (few exchanges) skip the LLM call entirely.
+   */
+  async distillMemory(sessionExchanges) {
+    const apiKey = await this.getApiKey();
+    if (!apiKey) return { ok: false, error: "No OpenAI credential — API key or ChatGPT sign-in required." };
+    const llmCall = async (systemPrompt, userPrompt) => {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-5-mini",
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`OpenAI distill ${res.status}: ${body.slice(0, 300)}`);
+      }
+      const data = await res.json();
+      const text = data?.choices?.[0]?.message?.content;
+      if (typeof text !== "string") throw new Error("OpenAI distill returned no content");
+      return text;
+    };
+    return distillCompanionMemory(llmCall, { sessionExchanges });
   }
 }
 

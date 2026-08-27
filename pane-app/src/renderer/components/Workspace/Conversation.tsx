@@ -6,6 +6,8 @@ import { useRealtimeVoice } from "../../hooks/useRealtimeVoice";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
+import { AskUserCard } from "./AskUserCard";
+import { VoiceFloorGlow } from "./VoiceFloorGlow";
 import { getConversationSlice, listCheckpoints, readFile } from "../../lib/tauri-commands";
 import { restoringProjects } from "../../hooks/useSettingsPersistence";
 import type {
@@ -92,6 +94,9 @@ export const Conversation = memo(function Conversation({
     (s) => s.projects.get(projectId)?.conversation.historyStartIndex ?? 0,
   );
   const hasOlderMessages = historyStartIndex > 0;
+  const pendingInput = useProjectsStore(
+    (s) => s.projects.get(projectId)?.conversation.pendingInput ?? null,
+  );
 
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
   const [loadOlderError, setLoadOlderError] = useState<string | null>(null);
@@ -364,6 +369,8 @@ export const Conversation = memo(function Conversation({
 
   return (
     <div className="relative flex flex-col h-full w-full">
+      {/* Ambient voice light — the room reacts before you look at the orb. */}
+      <VoiceFloorGlow />
       <div
         ref={scrollRef}
         className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto pb-8 pt-8 bg-pane-bg"
@@ -438,6 +445,14 @@ export const Conversation = memo(function Conversation({
         </div>
       )}
       <div className={`relative z-10 shrink-0 flex flex-col ${sidebarCollapsed ? "max-w-5xl mx-auto w-full" : ""}`}>
+        {pendingInput && (
+          <AskUserCard
+            projectId={projectId}
+            toolId={pendingInput.toolId}
+            question={pendingInput.question}
+            onReply={handleSend}
+          />
+        )}
         <InputBar
           projectId={projectId}
           onSend={handleSend}
@@ -450,6 +465,10 @@ export const Conversation = memo(function Conversation({
             toggle: () => void voice.toggle(),
             interrupt: voice.interrupt,
             micStream: voice.micStream,
+            micDevices: voice.micDevices,
+            activeMicId: voice.activeMicId,
+            onSelectMic: voice.selectMic,
+            onRefreshMics: () => void voice.refreshMicDevices(),
             audioPulseRef: voice.audioPulseRef,
           }}
         />

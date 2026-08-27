@@ -27,6 +27,9 @@
     "productName": "Pane",
     "mac": {
       "category": "public.app-category.developer-tools",
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "hardenedRuntime": true,
       "extendInfo": {
         "CFBundleIconName": "AppIcon"
       },
