@@ -32,6 +32,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
+import { augmentCalendarResult } from "./local-time.mjs";
 import { randomUUID } from "node:crypto";
 
 const PANE_DIR = path.join(os.homedir(), ".pane");
@@ -39,6 +40,11 @@ const SETTINGS_PATH = path.join(PANE_DIR, "settings.json");
 
 /** Namespace prefix for external tools — prevents collisions with built-ins. */
 const EXT_PREFIX = "ext__";
+
+// Regex constructs the Rust regex crate (used by OpenAI's JSON Schema
+// validator, and several OpenAI-compat providers) does not support:
+// lookaheads/lookbehinds (plain or in named groups) and backreferences.
+const RUST_UNSUPPORTED_REGEX = /(\(\?<?[=!]|\\[1-9])/;
 
 /** Timeout for server initialization handshake.
  *  75s because package resolution can be slow: npx needs 15-30s, and uvx
@@ -170,6 +176,17 @@ class McpClientManager {
       return this.connections.get(name);
     }
 
+    // Defensive validation BEFORE spawn — a bad config entry (missing
+    // command, non-string args) previously threw inside the allSettled
+    // wrapper and vanished without any log line.
+    if (!cfg || typeof cfg.command !== "string") {
+      console.error(
+        `[mcp-client] Invalid config for "${name}": ${JSON.stringify(cfg)?.slice(0, 200)}`,
+      );
+      return null;
+    }
+
+    console.log(`[mcp-client] Spawning "${name}": ${cfg.command} ${(cfg.args || []).join(" ")}`);
     const proc = spawn(cfg.command, cfg.args || [], {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...getEnvWithPath(), ...(cfg.env || {}) },
@@ -268,9 +285,13 @@ class McpClientManager {
     // Connect any missing servers (parallel)
     const toConnect = enabled.filter((n) => !this.connections.has(n));
     if (toConnect.length > 0) {
-      await Promise.allSettled(
-        toConnect.map((n) => this.connect(n, config[n]))
+      const results = await Promise.allSettled(
+        toConnect.map((n) => this.connect(n, config[n])),
       );
+      // Surface silent rejections: allSettled swallows them, and connect()'s
+      // own logging only covers failures AFTER spawn. A synchronous throw
+      // (bad config entry, spawn TypeError) would otherwise be invisible.
+      this._logRejections(toConnect, results);
     }
 
     // Retry failed servers once — npx cold starts can time out on first attempt
@@ -282,9 +303,23 @@ class McpClientManager {
       console.log(
         `[mcp-client] Retrying ${stillDisconnected.length} failed server(s): ${stillDisconnected.join(", ")}`,
       );
-      await Promise.allSettled(
+      const retryResults = await Promise.allSettled(
         stillDisconnected.map((n) => this.connect(n, config[n])),
       );
+      this._logRejections(stillDisconnected, retryResults);
+    }
+  }
+
+  /** @private Log rejected connect() promises that allSettled would swallow. */
+  _logRejections(names, results) {
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.status === "rejected") {
+        const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        console.error(
+          `[mcp-client] connect("${names[i]}") REJECTED without logging: ${reason}`,
+        );
+      }
     }
   }
 
@@ -336,6 +371,42 @@ class McpClientManager {
   // ── Tool discovery ──────────────────────────────────────────────────────
 
   /**
+   * Sanitize a JSON Schema for providers that validate .pattern with Rust
+   * regex (OpenAI — and the Responses API especially — rejects lookarounds
+   * and backreferences with `invalid_json_schema` 400s that kill the whole
+   * turn for ONE tool's pattern). Strategy:
+   *   - known lookahead-based email patterns → conservative RE2-safe email regex
+   *   - any other lookaround/backreference construct → drop the pattern key
+   *     (property becomes an unconstrained string — always schema-valid).
+   * Runs at tool-discovery time so every consumer (chat, voice, prompt
+   * awareness) gets safe schemas without per-call-site patching.
+   * @param {object} schema — mutated in place (callers own fresh copies)
+   */
+  _sanitizeSchemaPatterns(schema) {
+    if (Array.isArray(schema)) {
+      for (const item of schema) this._sanitizeSchemaPatterns(item);
+      return;
+    }
+    if (!schema || typeof schema !== "object") return;
+    for (const [key, value] of Object.entries(schema)) {
+      if (key === "pattern" && typeof value === "string") {
+        if (RUST_UNSUPPORTED_REGEX.test(value)) {
+          // Lookahead email validation (e.g. resend's contact schemas) —
+          // replace with an equivalent-intent RE2-safe pattern.
+          if (value.includes("@") && value.startsWith("^")) {
+            schema[key] =
+              "^[A-Za-z0-9_'+\\-.]*[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$";
+          } else {
+            delete schema[key]; // unknown construct — unconstrain, don't poison
+          }
+        }
+      } else if (value && typeof value === "object") {
+        this._sanitizeSchemaPatterns(value);
+      }
+    }
+  }
+
+  /**
    * Get all discovered tools from all connected servers, formatted for the
    * model's tool list (OpenAI function format).
    * @returns {Array<{ type: "function", function: { name: string, description: string, parameters: object } }>}
@@ -343,12 +414,16 @@ class McpClientManager {
   getExternalTools() {
     const tools = [];
     for (const tool of this.toolIndex.values()) {
+      // Deep-copy the schema: sanitization must not corrupt the source
+      // (tool-executor matches on raw schema for validation/logging).
+      const parameters = JSON.parse(JSON.stringify(tool.inputSchema || {}));
+      this._sanitizeSchemaPatterns(parameters);
       tools.push({
         type: "function",
         function: {
           name: tool.name,
           description: tool.description,
-          parameters: tool.inputSchema,
+          parameters,
         },
       });
     }
@@ -399,11 +474,18 @@ class McpClientManager {
       const output = textParts.join("\n") || JSON.stringify(result);
 
       const isError = result?.isError === true;
-      return {
+
+      // Calendar results carry raw UTC timestamps; the consuming model has
+      // no timezone awareness unless told. Augment with labeled local times
+      // at this single choke point — every consumer (chat, voice, delegate)
+      // goes through callTool, so all display surfaces get consistent data.
+      const augmented = augmentCalendarResult(namespacedName, {
         success: !isError,
         output: isError ? undefined : output,
         error: isError ? output : undefined,
-      };
+      });
+
+      return augmented;
     } catch (err) {
       return { success: false, error: `MCP call failed: ${err.message}` };
     }

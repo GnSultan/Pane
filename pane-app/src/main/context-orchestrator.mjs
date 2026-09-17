@@ -28,6 +28,7 @@ import { getPaneDb } from "./pane-db.mjs";
 import { buildPeerSummary, pruneIntents } from "./intents.mjs";
 import { buildSkillListing, getActiveSkillContext, hydrateActiveSkills } from "./skill-registry.mjs";
 import { readState } from "./pane-system-prompt.mjs";
+import { buildTimezoneContextLine } from "./local-time.mjs";
 
 const MEMORY_DIR = path.join(os.homedir(), ".pane", "memory");
 const PLAYBOOKS_DIR = path.join(os.homedir(), ".pane", "profile", "playbooks");
@@ -129,6 +130,11 @@ function readModelProfile(modelId) {
 export function orchestrateContext(projectId, options = {}) {
   const parts = [];
 
+  // 0. Timezone anchor — the model must know the user's zone to speak
+  //    times correctly (calendar tools return raw UTC; the *_local fields
+  //    are generated in this zone). First, so it frames everything after.
+  parts.push(buildTimezoneContextLine());
+
   // 1. Identity — condensed behavioral identity
   const identity = getIdentity();
   if (identity) parts.push(identity);
@@ -150,7 +156,15 @@ export function orchestrateContext(projectId, options = {}) {
 
   // 3a. Available skills — compact listing of installable skills (names + descriptions only).
   //     Full instructions stay out of context until the model activates a skill.
-  const skillListing = buildSkillListing(options.projectRoot);
+  //     SKIPPED for the voice backend (accent fix, Sep 2026): the listing is
+  //     ~12k chars (63% of the voice blob) and the voice layer's tool
+  //     whitelist has no activate_skill — it can never use any of it. Large
+  //     realtime instructions measurably dilute accent adherence (OpenAI dev
+  //     forum reports + our own mint telemetry: 600-char preview held the
+  //     accent, 20k-char live session drifted). Voice discovers skills via
+  //     list_mcp_tools/list_skills tools if ever needed, not the blob.
+  const skillListing =
+    options.backend === "voice" ? null : buildSkillListing(options.projectRoot);
   if (skillListing) parts.push(skillListing);
 
   // 3b. Hydrate active skills from persistent state on cold start.
