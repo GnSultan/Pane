@@ -14,6 +14,7 @@ import { execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
 import { validateFilePath, validateDirectoryPath, validateProjectId } from "./path-guard.mjs";
+import { initLogCollector, attachWorker, pushEntry } from "./log-collector.mjs";
 
 // ── FD Repair for macOS packaged app ─────────────────────────────────────
 // When Pane is launched as a macOS .app bundle (even from terminal via
@@ -69,6 +70,7 @@ import { mergeState, readState } from "./pane-system-prompt.mjs";
 import { runModelProfileReflection } from "./playbook-engine.mjs";
 import { restoreCheckpoint, snapshotAllFiles, flushJournal } from "./checkpoint-engine.mjs";
 import { bustRootMapCache } from "./intents.mjs";
+import { getSnapshot } from "./agent-status.mjs";
 import { bustRootScopeCache } from "./root-scope.mjs";
 import {
   discoverAll,
@@ -116,14 +118,30 @@ function registerClaudeHandlers() {
   ipcMain.handle("voice_tool_call", (_event, { projectId, projectRoot, tool, args }) => {
     return voiceRelay.runTool(projectId, projectRoot, tool, args);
   });
+  // ── Agent status store (voice observability) ──────────────────────────
+  // Authoritative per-thread phase feed. Renderer UI may read the full
+  // snapshot; the voice relay reads it via runTool("agent_threads"),
+  // which projects through the voice-safe field whitelist.
+  ipcMain.handle("agent_status_snapshot", (_event, { limit } = {}) => {
+    return getSnapshot(typeof limit === "number" && limit > 0 ? { limit: Math.floor(limit) } : {});
+  });
   // Screen capture for the voice layer — pull-based sight. The relay never
   // streams frames; the model asks (look_at_screen) and gets one screenshot
   // pushed into its conversation as input_image.
   ipcMain.handle("voice_capture_screen", (_event, { detail }) => {
     return voiceRelay.captureScreen(detail === "high" ? "high" : "low");
   });
+  // view_image's voice twin: load an image FILE (path from the user's
+  // speech, e.g. "look at ~/Desktop/shot.png") as a data URI. Same
+  // pull-based pattern — the model asks, the pixels enter the conversation.
+  ipcMain.handle("voice_view_image", (_event, { path: imgPath, detail }) => {
+    return voiceRelay.loadImageFile(
+      typeof imgPath === "string" ? imgPath : "",
+      detail === "high" ? "high" : "low",
+    );
+  });
   ipcMain.handle("voice_preview", (_event, { voice }) => {
-    return voiceRelay.previewVoice(voice);
+    return voiceRelay.previewToken(voice);
   });
 
   // ── Companion memory (voice's own episodic memory of conversations) ────
@@ -1270,6 +1288,17 @@ function registerSettingsHandlers() {
     } catch (err) {
       console.warn("[settings] MCP config invalidation skipped:", err.message);
     }
+
+    // Voice settings changed → tell the renderer so a LIVE voice session
+    // can re-mint immediately. Voice + accent are baked into the realtime
+    // session at mint time; without this, switching accent while live did
+    // nothing until the next manual reconnect (the UI claimed "changing
+    // voice reconnects an active session" but nothing implemented it).
+    const prevVoice = existing?.voice_settings || {};
+    const nextVoice = merged.voice_settings || {};
+    if (JSON.stringify(prevVoice) !== JSON.stringify(nextVoice)) {
+      sendToRenderer("pane:voice-settings-changed", nextVoice);
+    }
   });
 
   // Dock icon switches with theme — clear (glass) = no bg, default = semi-transparent dark, dark = solid dark.
@@ -1289,6 +1318,8 @@ function getCmdWorker() {
   if (cmdWorker && !cmdWorker.killed) return cmdWorker;
   const workerPath = path.join(__dirname, "cmd-worker.mjs");
   cmdWorker = utilityProcess.fork(workerPath);
+  // Pipe worker output into the log collector (tagged worker:cmd).
+  attachWorker(cmdWorker, "cmd");
   // Register with tool-executor so executeBash routes commands through this worker.
   // The worker runs in its own V8 isolate with a clean libuv loop, bypassing the
   // main process's kqueue/uv_spawn EBADF issue in packaged macOS builds.
@@ -1378,6 +1409,18 @@ function registerWatcherHandlers() {
         /target\//,
         /\.turbo\//,
         /coverage\//,
+        // Binary/media files — never opened in the editor, so watching them
+        // serves nothing. On media-heavy projects (audio assets, photo
+        // libraries) chokidar 5's per-file fs.watch produced 19k+ FSWatcher
+        // handles (Sep 17, 2026: 17,880 open fds in 1h) — kernel watch
+        // exhaustion + EBADF spawn failures. Trade-off: these files emit NO
+        // watcher events (a new .opus won't live-refresh the file tree until
+        // a sibling file changes or the dir is reopened) — acceptable for
+        // files the editor can never open or edit in place.
+        /\.(opus|mp3|wav|flac|aac|ogg|m4a|mp4|mov|avi|mkv|webm)$/i,
+        /\.(webp|jpe?g|png|gif|bmp|ico|tiff?|heic|avif|svgz)$/i,
+        /\.(pdf|zip|gz|tgz|bz2|xz|7z|rar|dmg|iso|exe|dll|so|dylib|class|jar|war|wasm|bin|dat|b64)$/i,
+        /\.(woff2?|ttf|otf|eot)$/i,
       ],
       persistent: true,
       usePolling: false,
@@ -2267,6 +2310,8 @@ function getBrainWorker() {
 
   const workerPath = path.join(__dirname, "brain-engine.mjs");
   brainWorker = utilityProcess.fork(workerPath);
+  // Pipe worker output into the log collector (tagged worker:brain).
+  attachWorker(brainWorker, "brain");
 
   // Track whether this instance survives long enough to reset the crash counter
   const surviveTimer = setTimeout(() => {
@@ -2671,11 +2716,21 @@ function createWindow() {
     shell.openExternal(url);
     return { action: "deny" };
   });
-  // Mirror renderer console messages (incl. [voice] errors) to
-  // ~/.pane/voice-debug.log. Uncaught renderer errors land there too —
-  // no more invisible failures.
+  // Mirror renderer console messages into the log collector. Errors and
+  // warnings are always captured; [voice] lines also keep going to the
+  // legacy voice-debug.log. Uncaught renderer errors are no longer
+  // invisible in packaged builds.
   mainWindow.webContents.on("console-message", (_e, _level, message) => {
     try {
+      const msg = String(message ?? "");
+      if (msg) {
+        // Derive level from the console-message level int when available
+        // (0=verbose..3=error in Chromium; treat 3 as error, 2 as warn).
+        const lvl = _level >= 3 ? "error" : _level === 2 ? "warn" : "info";
+        if (lvl !== "info" || msg.startsWith("[")) {
+          pushEntry({ level: lvl, source: "renderer", message: msg.slice(0, 4000) });
+        }
+      }
       if (message && (message.includes("[voice]") || message.includes("realtime") || message.includes("webrtc"))) {
         const line = `[${new Date().toISOString()}][renderer-console] ${String(message).slice(0, 500)}\n`;
         fs.appendFileSync(path.join(os.homedir(), ".pane", "voice-debug.log"), line);
@@ -2720,6 +2775,12 @@ app.commandLine.appendSwitch('enable-zero-copy');
 app.commandLine.appendSwitch('num-raster-threads', '4');
 
 app.whenReady().then(async () => {
+  // ── Log collector: FIRST — before any startup code logs ───────────────
+  // Patches console.* and opens userData/logs/. Everything Pane prints
+  // from this point lands in rotating JSONL files.
+  initLogCollector(app.getPath("userData"));
+  console.log(`[log-collector] capturing — Pane ${app.getVersion()} on ${process.platform} ${os.arch()}, pid ${process.pid}`);
+
   // ── Fast path: register IPC handlers + create window ──────────────────
   // Nothing here awaits disk I/O or dynamic imports. The window appears in
   // <1s even on cold filesystem. Handlers that need backends (spawn, etc.)

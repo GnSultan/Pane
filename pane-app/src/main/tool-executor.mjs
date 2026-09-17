@@ -24,9 +24,37 @@ import { findReferences, formatReferencesOutput } from "./find-references.mjs";
 import { readState, readHandoff, mergeState } from "./pane-system-prompt.mjs";
 import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
 import { sanitizeString } from "./sanitize.mjs";
+import { buildImageEnvelope } from "./image-envelope.mjs";
 import { validateCommand, hasWriteIntent } from "./command-validator.mjs";
 import { readFileForJournal, snapshotAllFiles, flushJournal } from "./checkpoint-engine.mjs";
 import { recordIntent, recordActivity, checkConflict, readPeerIntents, readPeerActivityGrouped } from "./intents.mjs";
+import { setPhase as setAgentPhase } from "./agent-status.mjs";
+
+/**
+ * Tools that mutate state — mirrors http-backend's WRITE_TOOL_NAMES for
+ * phase classification in the agent status store. Kept local so the
+ * executor has no import cycle with the backend. When either list changes,
+ * change both (dual-copy rule).
+ */
+const STATUS_WRITE_TOOLS = new Set([
+  "run_shell_command",
+  "pane_run_in_terminal",
+  "write_file",
+  "replace",
+  "pane_revert_change",
+  "pane_remember",
+  "pane_update_memory",
+  "pane_delete_memory",
+  "pane_set_rule",
+  "pane_set_philosophy",
+  "pane_set_about",
+  "TodoWrite",
+  "Task",
+  "activate_skill",
+  "deactivate_skill",
+  "pane_install_skill",
+  "save_memory",
+]);
 import {
   activateSkill,
   deactivateSkill,
@@ -39,6 +67,7 @@ import {
   ensureGlobalSkillsDir,
 } from "./skill-registry.mjs";
 import { mcpClient } from "./mcp-client.mjs";
+import { readLogs, logCollectorStats } from "./log-collector.mjs";
 
 // ── CMD Worker (utility process for shell execution) ──────────────────────
 // In Electron 40's packaged macOS app, child_process.spawn/execSync fails with
@@ -920,6 +949,93 @@ export class ToolExecutor {
   }
 
   /**
+   * view_image — read an image file and return it as a native image envelope
+   * for vision-capable models. Unlike read_file (which would decode binary as
+   * UTF-8 mojibake), this base64s the raw bytes so the model sees actual
+   * pixels via the provider's image content block.
+   */
+  async executeViewImage(toolId, filePath) {
+    try {
+      const resolvedPath = this.resolveProjectPath(filePath);
+      if (!resolvedPath) {
+        return {
+          success: false,
+          error: `Invalid file path: ${filePath}`,
+          toolId,
+        };
+      }
+
+      let stats;
+      try {
+        stats = await fsPromises.stat(resolvedPath);
+      } catch {
+        return {
+          success: false,
+          error: `File does not exist or is not readable: ${filePath}`,
+          toolId,
+        };
+      }
+      if (stats.isDirectory()) {
+        return {
+          success: false,
+          error: `${filePath} is a directory.`,
+          toolId,
+        };
+      }
+
+      const ext = path.extname(resolvedPath).toLowerCase();
+      const MEDIA_BY_EXT = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+      };
+      const media_type = MEDIA_BY_EXT[ext];
+      if (!media_type) {
+        return {
+          success: false,
+          error:
+            `Unsupported image format "${ext || "(none)"}". Supported: PNG, JPEG, GIF, WebP. ` +
+            `If you need a screenshot, capture it as PNG (e.g. screencapture -x on macOS).`,
+          toolId,
+        };
+      }
+
+      // Cap at ~4.7MB binary (Anthropic's 5MB image limit; base64 is ~4/3 the
+      // binary size). Larger files must be downscaled first — the caller can
+      // use sips (macOS) or another tool to resize, then retry.
+      const MAX_BYTES = 4_700_000;
+      if (stats.size > MAX_BYTES) {
+        return {
+          success: false,
+          error:
+            `Image is ${(stats.size / 1024 / 1024).toFixed(1)}MB — over the ${(MAX_BYTES / 1024 / 1024).toFixed(0)}MB limit. ` +
+            `Downscale it and retry, e.g.: sips -Z 1568 --property format jpeg "${resolvedPath}" --out /tmp/pane_img.jpg`,
+          toolId,
+        };
+      }
+
+      const buf = await fsPromises.readFile(resolvedPath);
+      const b64 = buf.toString("base64");
+      const label = path.basename(resolvedPath);
+
+      return {
+        success: true,
+        output: buildImageEnvelope({ media_type, label, data: b64 }),
+        toolId,
+        metadata: { path: filePath, size: stats.size, media_type },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `Error reading image: ${error.message}`,
+        toolId,
+      };
+    }
+  }
+
+  /**
    * Read file contents
    */
   async executeReadFile(toolId, filePath, startLine = null, endLine = null) {
@@ -947,6 +1063,17 @@ export class ToolExecutor {
 
       // Get file stats
       const stats = await fsPromises.stat(resolvedPath);
+
+      // Images must go through view_image — reading them as UTF-8 produces
+      // megabytes of mojibake that floods the context. Redirect instead of
+      // failing: the model gets a next action, not a dead end.
+      if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(resolvedPath)) {
+        return {
+          success: false,
+          error: `${filePath} is an image — read_file would decode it as binary garbage. Call view_image("${filePath}") instead to see it with vision.`,
+          toolId,
+        };
+      }
 
       // Check if it's a directory
       if (stats.isDirectory()) {
@@ -1666,6 +1793,17 @@ export class ToolExecutor {
             files: _filesArg,
             detail: _fileArg ? null : (input?.command || input?.pattern || input?.query || input?.description || null),
           });
+          // ── Agent status store (voice observability) ──
+          // Phase refinement per tool call: write tools → editing, read
+          // tools → planning (exploration). ask_user is skipped above and
+          // emits 'waiting' from http-backend — never clobbered here.
+          const _isWrite = STATUS_WRITE_TOOLS.has(toolName);
+          setAgentPhase(this.projectId, {
+            phase: _isWrite ? "editing" : "planning",
+            readOnly: !_isWrite,
+            tool: toolName,
+            file: _fileArg || (_filesArg && _filesArg[0]) || null,
+          });
         }
       }
 
@@ -1714,6 +1852,9 @@ export class ToolExecutor {
         case "Read":
         case "read_file":
           return await this.executeReadFile(toolId, input.file_path || input.path, input.start_line || null, input.end_line || null);
+
+        case "view_image":
+          return await this.executeViewImage(toolId, input.file_path || input.path);
 
         case "pane_read_files": {
           // Batch read: read multiple files in one tool call.
@@ -3010,6 +3151,44 @@ When you are done, return a summary with:
           }
 
           return { success: false, error: `Unknown action: ${action}. Use 'list', 'resolve', or 'run'.`, toolId };
+        }
+
+        case "pane_logs": {
+          const action = (input?.action || "").trim();
+          if (!action) return { success: false, error: "Action is required: 'tail' or 'search'.", toolId };
+
+          const hours = Math.min(Math.max(Number(input?.hours) || 24, 1), 168);
+          const level = ["all", "info", "warn", "error"].includes(input?.level) ? input.level : "all";
+          const source = typeof input?.source === "string" && input.source.trim() ? input.source.trim() : null;
+          const limit = Math.min(Math.max(Number(input?.limit) || 100, 1), 300);
+
+          if (action === "tail" || action === "search") {
+            const grep = action === "search" ? (input?.grep || "").trim() : (input?.grep || "").trim() || null;
+            if (action === "search" && !grep) {
+              return { success: false, error: "grep pattern is required for action=search.", toolId };
+            }
+
+            const { entries, fileCount, truncated, error: readError } = readLogs({ hours, level, source, limit, grep });
+            if (readError) return { success: false, error: readError, toolId };
+
+            const stats = logCollectorStats();
+            if (entries.length === 0) {
+              return {
+                success: true,
+                output: `No log entries matched (level=${level}, source=${source ?? "all"}, last ${hours}h). Collector: ${stats.dir ?? "not initialized"}`,
+                toolId,
+              };
+            }
+
+            const lines = entries.map((e) => {
+              const time = new Date(e.ts).toISOString().slice(11, 19);
+              return `${time} ${e.level.toUpperCase().padEnd(5)} [${e.source}] ${e.message}`;
+            });
+            const header = `── ${entries.length} entr${entries.length !== 1 ? "ies" : ""}${truncated ? " (hit limit — older entries exist)" : ""} · level≥${level} · source=${source ?? "all"} · ${hours}h window · ${fileCount} file(s) ──`;
+            return { success: true, output: `${header}\n${lines.join("\n")}`, toolId };
+          }
+
+          return { success: false, error: `Unknown action: ${action}. Use 'tail' or 'search'.`, toolId };
         }
 
         case "pane_codebase_navigator": {
