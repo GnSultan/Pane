@@ -169,6 +169,8 @@ export function buildResponsesRequest(body) {
  *     → {choices:[{delta:{},finish_reason:"stop"}], usage:{...}}
  *   response.failed / response.incomplete
  *     → finish_reason error mapping
+ *   error
+ *     → throws (server-side mid-stream error must not be swallowed)
  */
 export function responsesEventToChatChunks(ev) {
   const chunks = [];
@@ -225,6 +227,16 @@ export function responsesEventToChatChunks(ev) {
       });
       break;
     }
+
+    case "error":
+      // Top-level stream error (server rejected mid-stream). Throw instead of
+      // dropping — otherwise the read loop reports a misleading "no data received".
+      {
+        const msg = ev.message || ev.error?.message || JSON.stringify(ev).slice(0, 500);
+        const err = new Error(`Codex stream error: ${ev.code || "unknown"}: ${msg}`);
+        err._codexStreamError = true;
+        throw err;
+      }
 
     case "response.failed":
       chunks.push({

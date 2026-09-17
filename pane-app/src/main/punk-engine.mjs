@@ -28,6 +28,14 @@ import { propagateCompletion } from "./completion-propagator.mjs";
 import { extractAndIndex } from "./memory-extractor.mjs";
 import { readThreadState, incrementFailure, recordSuccess, updateLastPrompt, updateLastResponse, recordApproach } from "./thread-state.mjs";
 import { recordQualityMetric, recordArbiterCorrections, isUserCorrection, recordUserCorrection, buildUserCorrectionEvent } from "./code-arbiter.mjs";
+import {
+  extractActiveSelection,
+  deriveComboFromSelection,
+  pickKeyedProvider,
+  comboSlotForTier,
+  resolveActiveModel,
+  normalizeProvider,
+} from "./model-resolver.mjs";
 
 // Node.js globals for utility process
 const { setImmediate, console } =
@@ -68,21 +76,11 @@ const __dirname = import.meta.dirname;
 // ============================================================================
 // Default Power Combo
 // ============================================================================
-
-// Global default: Opus thinks, Sonnet builds.
-// Provider-agnostic — either slot can be any provider the user has access to.
-// Used as fallback when settings.json has no power_combo configured.
-const DEFAULT_POWER_COMBO = {
-  // Keyed variants kept only for migration from old per-backend format
-  "claude-code": {
-    thinking:  { provider: "anthropic", model: "opus",   thinking: false },
-    execution: { provider: "anthropic", model: "sonnet", thinking: false },
-  },
-  api: {
-    thinking:  { provider: "openrouter", model: "stepfun/step-3.5-flash:free", thinking: true },
-    execution: { provider: "openrouter", model: "stepfun/step-3.5-flash:free", thinking: true },
-  },
-};
+// No hardcoded default combo. When settings.json has no power_combo, the
+// combo is derived from the user's active model selection (both slots =
+// selected model) via model-resolver's deriveComboFromSelection. When
+// nothing is configured at all, loadPowerCombo() returns null and callers
+// surface a clear error instead of inventing a model.
 
 // ============================================================================
 // Backend Abstraction
@@ -302,12 +300,13 @@ class PunkEngine {
   }
 
   async loadPowerCombo() {
+    let settings = {};
     try {
       const content = await fs.readFile(
         path.join(os.homedir(), ".pane", "settings.json"),
         "utf-8",
       );
-      const settings = JSON.parse(content);
+      settings = JSON.parse(content);
       const raw = settings.power_combo;
 
       // Flat format: { thinking: {...}, execution: {...} }
@@ -333,8 +332,10 @@ class PunkEngine {
       }
     } catch {}
 
-    // Default: Opus thinks, Sonnet builds
-    return DEFAULT_POWER_COMBO["claude-code"] || DEFAULT_POWER_COMBO["api"];
+    // No configured combo — derive from the user's active model selection
+    // (both slots = selected model). Never a hardcoded fallback: when
+    // nothing at all is configured, return null and let callers surface it.
+    return deriveComboFromSelection(extractActiveSelection(settings));
   }
 
   async loadIntentAutoRoute() {
@@ -1053,12 +1054,26 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     const autoRoute = request.autoRoute ?? (await this.loadIntentAutoRoute());
     const combo     = request.powerCombo ?? (await this.loadPowerCombo());
 
+    // No combo, no selection, no explicit provider/model on the request —
+    // nothing to resolve a model from. Surface it instead of inventing one.
+    // (Foreground turns always carry provider/model from the renderer; this
+    // only fires for internal spawns on an unconfigured Pane.)
+    if (!combo && !request.provider && !request.model) {
+      throw new Error(
+        "No model configured. Pick a model in the model selector (or configure a power combo in settings) so background work knows what to run on.",
+      );
+    }
+
+    // The user's active selection — same source the foreground uses.
+    const activeSelection = combo ? null : await resolveActiveModel();
+
     // Phase-based fallback route: think/verify → thinking model, build/idle → execution model
     const phase = resolvedRequest.phase || "build";
     const comboSlot = phase === "think" ? "thinking" : "execution";
     if (!resolvedRequest.intent) resolvedRequest.intent = comboSlot === "thinking" ? "plan" : "execute";
 
-    const intentRoute = combo[comboSlot] || combo["execution"];
+    const intentRoute = (combo && (combo[comboSlot] || combo["execution"])) ||
+      (activeSelection ? { provider: activeSelection.provider, model: activeSelection.model, thinking: false } : null);
 
     // When autoRoute is off the user has pinned a model — respect it exactly.
     // When autoRoute is on the router owns model selection entirely.
@@ -1075,32 +1090,52 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     } else if (localDecision?.modelTier && autoRoute) {
       // ── Heuristic tier → concrete model resolution ──
       // The heuristic router returns a tier (cheap/mid/capable/frontier).
-      // Within-phase escalation: base provider comes from the active combo slot.
+      // Tiers map to the user's configured combo slots (never to a hardcoded
+      // per-provider model table): frontier/capable → thinking slot, lower
+      // tiers → execution slot. When no combo exists, the active selection
+      // serves both slots.
       const tier = localDecision.modelTier;
       const isGemini = catalogData?.backend === "gemini";
-      const baseProvider = isGemini ? "gemini" : (intentRoute?.provider || "anthropic");
+      const baseProvider = isGemini
+        ? "gemini"
+        : (intentRoute?.provider || null);
 
-      const TIER_MODELS = {
-        gemini: { cheap: "gemini-3-flash-preview", mid: "gemini-3-flash-preview", capable: "gemini-3-flash-preview", frontier: "gemini-3-flash-preview" },
-        anthropic: { cheap: "haiku", mid: "sonnet", capable: "sonnet", frontier: "opus" },
-      };
-      const tierMap = TIER_MODELS[baseProvider] || TIER_MODELS.anthropic;
+      const tierSlot = comboSlotForTier(tier);
+      const tierRoute = (combo && (combo[tierSlot] || combo["execution"])) ||
+        (activeSelection ? { provider: activeSelection.provider, model: activeSelection.model, thinking: false } : null);
 
-      resolvedRequest.provider = baseProvider;
-      resolvedRequest.model    = tierMap[tier] || tierMap.mid;
+      resolvedRequest.provider = baseProvider || tierRoute?.provider || null;
+      // Never pair a forced provider (gemini backend) with another
+      // provider's model — mismatch → null → surfaced error downstream.
+      resolvedRequest.model    =
+        (resolvedRequest.provider && tierRoute && normalizeProvider(tierRoute.provider) === normalizeProvider(resolvedRequest.provider))
+          ? tierRoute.model
+          : (baseProvider ? null : tierRoute?.model) || null;
       resolvedRequest.thinking = strategy.reasoning === "deep";
 
       // For API backend, check key availability and remap if needed.
-      // anthropic is exempt — OAuth covers it without an explicit API key.
+      // anthropic and openai are exempt — OAuth covers them without an explicit API key.
       if (catalogData?.backend === "api") {
         const keys = catalogData.apiKeys || {};
-        if (!keys[resolvedRequest.provider] && resolvedRequest.provider !== "anthropic") {
-          const firstWithKey = Object.entries(keys).find(([, k]) => !!k)?.[0];
-          if (firstWithKey) {
-            console.log(`[punk] heuristic route ${resolvedRequest.provider} has no key → redirect to ${firstWithKey}`);
-            resolvedRequest.provider = firstWithKey;
-            const newTierMap = TIER_MODELS[firstWithKey] || {};
-            resolvedRequest.model = newTierMap[tier] || null;
+        const isOAuthCovered =
+          resolvedRequest.provider === "anthropic" ||
+          resolvedRequest.provider === "openai";
+        if (!keys[resolvedRequest.provider] && !isOAuthCovered) {
+          // Redirect only to a provider that has a key, isn't disabled, and
+          // has a configured model to run (combo slot or active selection).
+          const disabled = new Set(
+            (await this.loadSettings()).disabled_providers || [],
+          );
+          const redirect = pickKeyedProvider(
+            keys,
+            disabled,
+            [tierRoute?.provider, activeSelection?.provider].filter(Boolean),
+          );
+          if (redirect) {
+            console.log(`[punk] heuristic route ${resolvedRequest.provider} has no key → redirect to ${redirect}`);
+            resolvedRequest.provider = redirect;
+            resolvedRequest.model =
+              tierRoute?.provider === redirect ? tierRoute.model : null;
           }
         }
       }
@@ -1121,19 +1156,38 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       console.log(`[punk] heuristic routed → ${resolvedRequest.provider}/${resolvedRequest.model} (tier=${tier})`);
     } else {
       // Fallback to static routing table.
+      if (!intentRoute) {
+        throw new Error(
+          "No model configured. Pick a model in the model selector (or configure a power combo in settings) so background work knows what to run on.",
+        );
+      }
       resolvedRequest.provider = intentRoute.provider;
       resolvedRequest.model    = intentRoute.model;
       resolvedRequest.thinking = intentRoute.thinking ?? false;
 
-      // Ensure fallback has a key. anthropic is exempt — OAuth covers it.
+      // Ensure fallback has a key. anthropic and openai are exempt —
+      // OAuth covers them without an http_api_keys entry.
       if (catalogData?.backend === "api") {
         const keys = catalogData.apiKeys || {};
-        if (!keys[resolvedRequest.provider] && resolvedRequest.provider !== "anthropic") {
-          const firstWithKey = Object.entries(keys).find(([, k]) => !!k)?.[0];
-          if (firstWithKey) {
-            resolvedRequest.provider = firstWithKey;
-            resolvedRequest.model = null;
-            console.log(`[punk] fallback redirect: ${firstWithKey}`);
+        const isOAuthCovered =
+          resolvedRequest.provider === "anthropic" ||
+          resolvedRequest.provider === "openai";
+        if (!keys[resolvedRequest.provider] && !isOAuthCovered) {
+          // Only redirect to an enabled provider that has a key AND a
+          // configured model to run — never a bare provider with a default.
+          const disabled = new Set(
+            (await this.loadSettings()).disabled_providers || [],
+          );
+          const redirect = pickKeyedProvider(
+            keys,
+            disabled,
+            [intentRoute.provider, activeSelection?.provider].filter(Boolean),
+          );
+          if (redirect) {
+            resolvedRequest.provider = redirect;
+            resolvedRequest.model =
+              intentRoute.provider === redirect ? intentRoute.model : null;
+            console.log(`[punk] fallback redirect: ${redirect}`);
           }
         }
       }
@@ -1457,12 +1511,15 @@ Respond with a single concise principle statement (one sentence, under 150 chara
 
       if (!decision?.modelTier) return null;
 
-      // Map tier to concrete model from the user's power combo.
-      // frontier tier → thinking model, everything else → execution model.
+      // Map tier to concrete model from the user's power combo using the
+      // shared tier→slot mapping (same one spawn routing uses — the preview
+      // and the real route can never diverge). No combo → derive from the
+      // active selection; still nothing → no preview, not an invented model.
       const tier = decision.modelTier;
-      const route = tier === "frontier"
-        ? (combo["thinking"] || combo["execution"])
-        : (combo["execution"] || combo["thinking"]);
+      const tierSlot = comboSlotForTier(tier);
+      const route = combo
+        ? (combo[tierSlot] || combo[tierSlot === "thinking" ? "execution" : "thinking"])
+        : deriveComboFromSelection(await resolveActiveModel())?.[tierSlot];
 
       if (!route) return null;
 
@@ -1517,7 +1574,7 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       // Smart routing ON — use the execution slot from the power combo
       // (the lighter of the two models the user configured).
       const combo = await this.loadPowerCombo();
-      const explainRoute = combo["execution"] || combo["thinking"] || {};
+      const explainRoute = (combo && (combo["execution"] || combo["thinking"])) || {};
       request = {
         provider: explainRoute.provider || settings.selected_model_provider || null,
         model: explainRoute.model || settings.selected_model || null,
@@ -1525,18 +1582,44 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       };
     }
 
-    // For API-routed providers, ensure we have a key.
-    const isCliProvider = request.provider === "anthropic" || request.provider === "gemini";
-    if (!isCliProvider) {
-      const keys = settings.http_api_keys || {};
-      const currentProvider = request.provider || "deepseek";
+    // Nothing resolvable — surface it. Never invent a model.
+    if (!request.provider && !request.model) {
+      throw new Error(
+        "No model configured for background calls (quickCall). Pick a model in the model selector or configure a power combo in settings.",
+      );
+    }
 
-      if (!keys[currentProvider]) {
-        const firstWithKey = Object.entries(keys).find(([, k]) => !!k)?.[0];
+    // For API-routed providers, ensure we have a key.
+    // anthropic (Claude OAuth) and openai (Codex/ChatGPT OAuth) are exempt —
+    // OAuth credentials cover them even with no http_api_keys entry.
+    const isOAuthProvider = request.provider === "anthropic" || request.provider === "gemini" || request.provider === "openai";
+    if (!isOAuthProvider) {
+      const keys = settings.http_api_keys || {};
+
+      if (!keys[request.provider]) {
+        // Redirect only to a provider Pane actually holds a configured
+        // model for — a combo slot or the user's pinned selection. Never a
+        // bare keyed provider (that would trade a clear no-key error for a
+        // misleading no-model one).
+        const disabled = new Set(settings.disabled_providers || []);
+        const combo = await this.loadPowerCombo();
+        const preferredProviders = [
+          combo?.execution?.provider,
+          combo?.thinking?.provider,
+          settings.selected_model_provider,
+        ].filter(Boolean);
+        const firstWithKey = pickKeyedProvider(
+          keys,
+          disabled,
+          preferredProviders,
+        );
         if (firstWithKey) {
           request.provider = firstWithKey;
-          request.model = null;
-          console.log(`[punk] quickCall: ${currentProvider} has no key, switching to ${firstWithKey}`);
+          request.model =
+            combo?.execution?.provider === firstWithKey ? combo.execution.model :
+            combo?.thinking?.provider === firstWithKey ? combo.thinking.model :
+            settings.selected_model_provider === firstWithKey ? settings.selected_model : null;
+          console.log(`[punk] quickCall: no key for target provider, switching to ${firstWithKey}`);
         }
       }
     }
@@ -1623,7 +1706,11 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       projectId,
       prompt,
       workingDir,
+      // No model pin — spawn routes via the same resolution as foreground
+      // turns: request.powerCombo (combo slots) or the user's active
+      // selection. Never a hardcoded default.
       model: null,
+      provider: null,
       intent: 'other',
       history: [],
       requestId,
@@ -1678,6 +1765,7 @@ export function registerPunkHandlersSync() {
       powerCombo,
       minds,
       phase,
+      images,
       wasInterrupted,
       // Mind chat fields — when projectId starts with "mind:", these override defaults
       systemPromptOverride,
@@ -1700,6 +1788,7 @@ export function registerPunkHandlersSync() {
       powerCombo,
       minds,
       phase,
+      ...(images ? { images } : {}),
       ...(wasInterrupted ? { wasInterrupted } : {}),
       ...(systemPromptOverride ? { systemPromptOverride } : {}),
       ...(_systemOverride ? { _systemOverride } : {}),
