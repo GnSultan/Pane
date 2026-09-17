@@ -16,6 +16,12 @@
  * Mount inside the conversation container (absolute, inset-x-0 bottom-0) so
  * the light belongs to the room, not the whole window.
  *
+ * STACKING (do not regress): at Workspace root this must be z-[25] —
+ * ABOVE the active page layer ([data-page] active = z-20, opaque bg-pane-bg
+ * full-bleed: any lower and the pages paint over the glow entirely) but
+ * BELOW the top drag region (z-30) and its interactive zone (z-40). It is
+ * pointer-events-none, so it never blocks clicks at any height.
+ *
  * Perf: fixed height + opacity-only animation. All imperative rAF — zero
  * re-renders. Reads the shared voiceLight signal written every frame by
  * VoiceOrb's animation loop.
@@ -53,8 +59,10 @@ export function VoiceFloorGlow() {
           break;
         case "speaking":
           // Floor high enough to always read as "speaking"; the model's
-          // cadence rides on top — pauses dim toward the floor, speech
-          // brightens past it.
+          // REAL amplitude (analyser on the remote track, published to
+          // voiceLight by the orb) rides on top. The old code derived this
+          // from delta-event rate normalized for ~83 events/frame while
+          // the API delivers ~0.5 — always ≈0, always flat. This is real.
           target = 0.42 + Math.min(0.4, voiceLight.model * 0.85);
           break;
         case "thinking":
@@ -95,7 +103,7 @@ export function VoiceFloorGlow() {
     <div
       ref={glowRef}
       aria-hidden="true"
-      className="pointer-events-none absolute inset-x-0 bottom-0 z-[5] opacity-0"
+      className="pointer-events-none absolute inset-x-0 bottom-0 z-[25] opacity-0"
       style={{
         height: "200px",
         background:

@@ -1,18 +1,27 @@
 /**
- * VoiceOrb — the living robot face.
+ * VoiceOrb — the voice presence: a face.
  *
- * A little robot head with eyes and a mouth that:
- *   - sleeps (closed eyes) when off,
- *   - blinks and breathes when connected & idle,
- *   - LEANS IN — eyes widen with the USER's live mic amplitude while they
- *     speak (real analyser signal, not a loop),
- *   - chomps its mouth to the MODEL's audio (delta-rate driven) while it
- *     speaks, with happy ∪∪ eyes,
- *   - looks up-and-away with a wavy mouth while thinking,
- *   - scans its eyes left-right while connecting,
- *   - plays dead (X_X) with a frown on error — click to revive.
+ * A living face — one circle, two almond eyes with pupils, one mouth.
+ * Every stroke shares the same weight and color; nothing is muted or
+ * secondary, so it reads as a single drawn face:
+ *   - off: the resting face exactly as drawn in the static markup
+ *   - idle: slow blinks — each eye lens squashes to a line, reopens
+ *   - listening: eyes on you (centered), brighten (terminal blue) and
+ *     widen slightly with the USER's live mic amplitude
+ *   - speaking: pupils sweep left↔right on real saccade timing as the
+ *     MODEL talks; the mouth lens opens vertically with the model's
+ *     real audio amplitude; the head follows the gaze with a lag and
+ *     bobs gently with speech energy
+ *   - thinking: gaze drifts up-and-away, eyes half-lidded
+ *   - connecting: the eyes breathe while the session comes up
+ *   - error: red — click to retry
  *
- * All motion is imperative (rAF + refs) — no re-renders per frame.
+ * Click = wake/end; click while speaking = interrupt; right-click = mic
+ * input picker (born from the Bluetooth phantom-input incident).
+ *
+ * All motion is imperative (rAF + refs) — no re-renders per frame. The
+ * face also owns the room: it publishes smoothed user/model levels +
+ * state to the shared voiceLight signal every frame for VoiceFloorGlow.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -29,8 +38,11 @@ export interface VoiceOrbProps {
     | "error";
   error?: string | null;
   micStream?: MediaStream | null;
-  /** Mutable counter bumped once per model audio delta — the rAF loop
-   *  converts its rate-of-change into chomp intensity. No re-renders. */
+  /** Real analyser on the MODEL's audio track — true amplitude for the
+   *  mouth animation. Null until the remote track arrives. */
+  modelAnalyserRef?: { current: AnalyserNode | null };
+  /** Mutable counter bumped once per model audio delta — fallback mouth
+   *  motion when no analyser exists yet. */
   audioPulseRef?: { current: number };
   /** Toggle session on/off (called when off/error → start, live → stop). */
   onToggle: () => void;
@@ -50,6 +62,7 @@ export function VoiceOrb({
   state,
   error,
   micStream,
+  modelAnalyserRef,
   audioPulseRef,
   onToggle,
   onInterrupt,
@@ -59,21 +72,54 @@ export function VoiceOrb({
   onRefreshMics,
 }: VoiceOrbProps) {
   // Right-click picker: which input device feeds the model.
-  // Born from the Bluetooth-speaker incident — a speaker's phantom mic
-  // delivered digital silence and looked like "the model ignoring me".
   const [pickerOpen, setPickerOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   // Imperatively-animated elements.
-  const eyeGroupRef = useRef<SVGGElement | null>(null);
-  const eyeLRef = useRef<SVGCircleElement | null>(null);
-  const eyeRRef = useRef<SVGCircleElement | null>(null);
-  const mouthRef = useRef<SVGRectElement | null>(null);
-  const antennaRef = useRef<SVGCircleElement | null>(null);
+  const leftEyeRef = useRef<SVGPathElement | null>(null);
+  const rightEyeRef = useRef<SVGPathElement | null>(null);
+  const mouthPathRef = useRef<SVGPathElement | null>(null);
+  const pupilLRef = useRef<SVGPathElement | null>(null);
+  const pupilRRef = useRef<SVGPathElement | null>(null);
+  const faceGroupRef = useRef<SVGGElement | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const rafRef = useRef<number | null>(null);
-  // Smoothed intensity for model speech, derived from audioPulseRef rate.
-  const speakLevelRef = useRef(0);
+
+// ── Face geometry (24×24 viewBox; every stroke shares weight + color) ──
+const EYE_CY = 9.6;        // eye row
+const PUPIL_R = 0.62;      // pupil radius inside each lens
+/** Pupil hidden — mid-blink. */
+const PUPIL_CLOSED = "M-10 -10";
+/** Centered pupil dot at eye column cx (resting / off pose). */
+const PUPIL_DOT = (cx: number): string =>
+  `M${cx} ${EYE_CY} m${-PUPIL_R} 0 a${PUPIL_R} ${PUPIL_R} 0 1 0 ${2 * PUPIL_R} 0 a${PUPIL_R} ${PUPIL_R} 0 1 0 ${-2 * PUPIL_R} 0`;
+/** Mouth at rest — a closed-lips dash at mouth height: ~60% of the way
+ *  from the eye row (9.6) to the chin (20.9). The old row (15.6) sat at
+ *  the exact midpoint — nose territory — so the dash read as a nose. */
+const MOUTH_ROW = 16.7;
+const MOUTH_CLOSED = `M${12 - 1.4} ${MOUTH_ROW} L${12 + 1.4} ${MOUTH_ROW}`;
+
+/**
+ * Draw an almond eye: two symmetric arcs meeting at points. open ∈ [0,1]
+ * (1 = round lens, 0 = closed line). The pupil sits at (cx + gaze offsets).
+ * Stroke-only, same weight as the head circle — one drawn face.
+ */
+function setEyeShape(
+  el: SVGPathElement,
+  cx: number,
+  open: number,
+  gx: number,
+  gy: number,
+): void {
+  const w = 2.0;                       // half-width of the lens
+  const h = 1.35 * Math.max(0, open);  // half-height, squashes on blink
+  const x0 = cx + gx - w, x1 = cx + gx + w;
+  const cy = EYE_CY + gy;
+  el.setAttribute(
+    "d",
+    `M${x0.toFixed(2)} ${cy.toFixed(2)} Q${(cx + gx).toFixed(2)} ${(cy - 2 * h).toFixed(2)} ${x1.toFixed(2)} ${cy.toFixed(2)} Q${(cx + gx).toFixed(2)} ${(cy + 2 * h).toFixed(2)} ${x0.toFixed(2)} ${cy.toFixed(2)} Z`,
+  );
+}
 
   // ── Attach analyser to the mic stream when present ────────────────────
   useEffect(() => {
@@ -100,11 +146,23 @@ export function VoiceOrb({
       analyserRef.current = null;
     }
   }, [micStream, state === "off"]);
-
   // ── The animation loop ─────────────────────────────────────────────────
   useEffect(() => {
-    // Session over: darken the room immediately, loop never starts.
+    // Session over: reset every animated feature to its static off pose,
+    // darken the room, and never start the loop.
     if (state === "off") {
+      const eyeL = leftEyeRef.current;
+      const eyeR = rightEyeRef.current;
+      if (eyeL && eyeR) {
+        setEyeShape(eyeL, 8.9, 1, 0, 0);
+        setEyeShape(eyeR, 15.1, 1, 0, 0);
+      }
+      const pupilL = pupilLRef.current;
+      const pupilR = pupilRRef.current;
+      if (pupilL) pupilL.setAttribute("d", PUPIL_DOT(8.9));
+      if (pupilR) pupilR.setAttribute("d", PUPIL_DOT(15.1));
+      if (faceGroupRef.current) faceGroupRef.current.setAttribute("transform", "none");
+      if (mouthPathRef.current) mouthPathRef.current.setAttribute("d", MOUTH_CLOSED);
       voiceLight.state = "off";
       voiceLight.user = 0;
       voiceLight.model = 0;
@@ -113,121 +171,184 @@ export function VoiceOrb({
 
     const buf = new Uint8Array(128);
     const startTime = performance.now();
-    let lastPulseCount = audioPulseRef?.current ?? 0;
-    // Blink scheduling (open-eye states only).
-    let nextBlinkAt = startTime + 1800 + Math.random() * 2600;
-    let blinkUntil = 0;
-    // Glow energy: model speech cadence with attack/release smoothing —
-    // fast rise on audio deltas, ~350ms fall in pauses. Separate from
-    // speakLevelRef: the mouth is pixels, the room is architecture — the
-    // mouth's 0.25 floor flattens a room-sized light into a constant.
+    // Model audio: delta-rate fallback (before the analyser arrives) and
+    // smoothed level for the mouth + room.
     let glowPulses = audioPulseRef?.current ?? 0;
-    let glowEnergy = 0;
+    let modelSmooth = 0;
+    // Delta-rate estimator: events/second, smoothed ~150ms so the level
+    // is frame-rate independent (deltas arrive every ~20-60ms in speech).
+    let pulseRate = 0;
+    // Blink scheduling: next blink + where we are inside it.
+    let nextBlink = 1.6 + Math.random() * 2.2;
+    // Gaze: target pupil offset; pupils snap, the head eases after them.
+    let gazeX = 0, gazeY = 0;          // current pupil offset (svg units)
+    let gazeHold = 0.8 + Math.random();// seconds until next saccade
+    // Head follow: eased toward a fraction of the gaze + a gentle sway.
+    let headX = 0, headY = 0, headRot = 0;
+    // Frame timing for saccade holds (frame-rate independent).
+    let prevNow = performance.now();
+
+    /** RMS amplitude of an analyser, scaled to 0..1 speech range. */
+    const levelOf = (analyser: AnalyserNode | null): number => {
+      if (!analyser) return 0;
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const sample = buf[i] ?? 128;
+        const v = (sample - 128) / 128;
+        sum += v * v;
+      }
+      return Math.min(1, Math.sqrt(sum / buf.length) * 4);
+    };
 
     const tick = (now: number): void => {
       const t = (now - startTime) / 1000;
-      let user = 0;
+      const dt = Math.min(0.05, (now - prevNow) / 1000);
+      prevNow = now;
 
-      // Real mic amplitude when available
-      const analyser = analyserRef.current;
-      if (analyser) {
-        analyser.getByteTimeDomainData(buf);
-        let sum = 0;
-        for (let i = 0; i < buf.length; i++) {
-          const sample = buf[i] ?? 128;
-          const v = (sample - 128) / 128;
-          sum += v * v;
-        }
-        user = Math.min(1, Math.sqrt(sum / buf.length) * 4);
-      }
-
-      // ── Eyes (open-eye states: idle, listening, connecting, thinking) ──
-      const openEyes = state === "idle" || state === "listening" || state === "connecting" || state === "thinking";
-      if (openEyes) {
-        // Blink: schedule → close 140ms → reopen.
-        if (now >= nextBlinkAt) {
-          blinkUntil = now + 140;
-          nextBlinkAt = now + 2200 + Math.random() * 3000;
-        }
-        const blinking = now < blinkUntil;
-        if (eyeGroupRef.current) {
-          eyeGroupRef.current.setAttribute("transform", `translate(12 12.5) scale(1 ${blinking ? 0.08 : 1}) translate(-12 -12.5)`);
-        }
-        // Pupil behaviour per state.
-        let dx = 0;
-        let dy = 0;
-        let eyeR = 1.6;
-        if (state === "listening") {
-          // Lean in: eyes grow with the user's actual voice level.
-          eyeR = 1.6 + user * 1.1 + 0.15 * Math.sin(t * 6);
-          dy = -0.2;
-        } else if (state === "thinking") {
-          // Classic look-up-and-away, alternating sides every ~1.6s.
-          const side = Math.floor(t / 1.6) % 2 === 0 ? 1 : -1;
-          dx = side * (0.7 + 0.2 * Math.sin(t * 2));
-          dy = -0.9;
-          eyeR = 1.4;
-        } else if (state === "connecting") {
-          // Scanning left↔right while the session comes up.
-          dx = Math.sin(t * 3.2) * 1.1;
-        } else {
-          // idle — gentle wander, mostly centred.
-          dx = 0.25 * Math.sin(t * 0.7);
-        }
-        for (const eye of [eyeLRef.current, eyeRRef.current]) {
-          if (!eye) continue;
-          eye.setAttribute("r", eyeR.toFixed(2));
-          eye.style.transform = `translate(${dx}px, ${dy}px)`;
-        }
-      }
-
-      // ── Mouth (speaking: real chomp driven by model audio deltas) ──────
-      if (state === "speaking" && mouthRef.current) {
-        const pulses = audioPulseRef?.current ?? 0;
-        const rate = Math.min(1, (pulses - lastPulseCount) / 6); // ~60ms of deltas
-        lastPulseCount = pulses;
-        const target = Math.max(0.25, rate);
-        speakLevelRef.current += (target - speakLevelRef.current) * 0.3;
-        const h = 1.2 + speakLevelRef.current * 4.2; // 1.2px..5.4px chomp
-        mouthRef.current.setAttribute("height", h.toFixed(2));
-        mouthRef.current.setAttribute("y", (17.4 - h / 2).toFixed(2));
-      }
-
-      // ── Publish shared signals for the floor glow ───────────────────────
-      // The orb owns the analysis; the room reads it. Same rAF, no re-renders.
-      // (This loop only runs while live — "off" is handled in teardown.)
-      // Glow energy: count deltas since last frame; ~1 delta/ms is loud
-      // speech. Attack fast (deltas just arrived), release ~350ms — unlike
-      // speakLevelRef, whose 0.25 floor (tuned for the mouth's pixels)
-      // flattens a room-sized light into a constant.
-      const pulses = audioPulseRef?.current ?? 0;
-      const perFrame = pulses - glowPulses;
+      // ── Real levels: user from mic analyser, model from track analyser ──
+      const user = levelOf(analyserRef.current);
+      const analyserLevel = levelOf(modelAnalyserRef?.current ?? null);
+      // Delta-rate estimator: realtime audio deltas arrive every ~20-60ms
+      // during speech (15-50 events/s), NOT 3 per frame — the old
+      // perFrame/3 math computed ≈0 forever (same bug the room glow had).
+      // Smoothing over ~150ms makes this frame-rate independent.
+      const pulses = audioPulseRef?.current ?? glowPulses;
+      const newPulses = pulses - glowPulses;
       glowPulses = pulses;
-      if (state === "speaking") {
-        const n = perFrame / 16.7; // normalise to 60fps frames
-        const target = Math.min(1, n / 5); // ~5 deltas/frame = loud
-        glowEnergy = target > glowEnergy
-          ? glowEnergy + (target - glowEnergy) * 0.55 // attack ~1 frame
-          : glowEnergy * 0.87; // release ~350ms (0.87^21 ≈ 0.05 @60fps)
-        voiceLight.model = glowEnergy;
-      } else {
-        glowEnergy = 0;
-        voiceLight.model = 0;
-      }
+      const instRate = dt > 0 ? newPulses / dt : 0; // events/s this frame
+      pulseRate += (instRate - pulseRate) * Math.min(1, dt / 0.15);
+      const pulseLevel = Math.min(1, pulseRate / 30); // ~30 ev/s = solid speech
+      // Analyser is the real signal; pulses carry the motion when the
+      // analyser is absent or its AudioContext sits suspended (reads 0).
+      // max() means a dead analyser can never suppress the delta signal.
+      const model = Math.max(analyserLevel, pulseLevel);
+      // Smooth: fast attack, ~350ms release — speech swells, pauses settle.
+      const mTarget = state === "speaking" ? model : 0;
+      modelSmooth = mTarget > modelSmooth
+        ? modelSmooth + (mTarget - modelSmooth) * 0.5
+        : modelSmooth * 0.9;
+
+      // ── Publish shared signals for the floor glow ─────────────────────
       voiceLight.state = state;
       voiceLight.user = user;
+      voiceLight.model = modelSmooth;
 
-      // ── Antenna ball — heartbeat speed says what the robot is doing ────
-      if (antennaRef.current) {
-        const speed =
-          state === "error" ? 9 :
-          state === "connecting" ? 6 :
-          state === "thinking" ? 4 :
-          state === "speaking" ? 3 :
-          state === "listening" ? 2.5 : 1.4;
-        const pulse = 0.5 + 0.5 * Math.sin(t * speed);
-        antennaRef.current.setAttribute("r", (1 + pulse * 0.55).toFixed(2));
-        antennaRef.current.style.opacity = String(0.45 + pulse * 0.55);
+      // ── Blink — 0 outside a blink, sin curve inside (~130ms) ───────────
+      let blink = 0;
+      const bt = t - nextBlink;
+      if (bt >= 0) {
+        if (bt < 0.13) blink = Math.sin((bt / 0.13) * Math.PI);
+        else nextBlink = t + 2.2 + Math.random() * 3.4;
+      }
+
+      // ── Eye openness (0 = closed line, 1 = fully open) ─────────────────
+      let eyeOpen = 1;
+      if (state === "connecting") {
+        eyeOpen = 0.45 + 0.35 * (0.5 + 0.5 * Math.sin(t * 2.2));
+      } else if (state === "listening") {
+        eyeOpen = 0.9 + Math.min(0.25, user * 0.5); // widens with the voice
+      } else if (state === "speaking") {
+        eyeOpen = 0.7; // slightly narrowed — mid-sentence
+      } else if (state === "thinking") {
+        eyeOpen = 0.55; // half-lidded, gaze elsewhere
+      } else if (state === "error") {
+        eyeOpen = 0.65;
+      }
+      // The blink closes whatever state we're in.
+      eyeOpen = Math.max(0, eyeOpen * (1 - blink));
+
+      // ── Gaze — where the pupils look ────────────────────────────────────
+      // Speaking: the eyes sweep left↔right with real saccade timing —
+      // hold a direction, snap to the next. Thinking: gaze drifts
+      // up-and-away. Listening/idle: eyes on you, centered.
+      gazeHold -= dt;
+      if (state === "speaking") {
+        if (gazeHold <= 0) {
+          // Snap to a new direction: alternate sides, slight vertical roam.
+          gazeX = (Math.random() < 0.5 ? -1 : 1) * (0.35 + Math.random() * 0.55);
+          gazeY = (Math.random() - 0.5) * 0.3;
+          gazeHold = 0.5 + Math.random() * 0.7;        // hold 0.5–1.2s
+        }
+      } else if (state === "thinking") {
+        gazeX += (0.9 - gazeX) * 0.02;   // slow drift up-and-away
+        gazeY += (-0.8 - gazeY) * 0.02;
+        gazeHold = 1.0;
+      } else {
+        gazeX += (0 - gazeX) * 0.15;     // settle back to center
+        gazeY += (0 - gazeY) * 0.15;
+      }
+
+      // ── Head — follows the gaze with a lag, plus gentle speech sway ────
+      // Eyes lead, head follows: the head chases a fraction of where the
+      // pupils are, with a slow bob while the model talks.
+      let sway = 0, bob = 0;
+      if (state === "speaking") {
+        sway = Math.sin(t * 1.1) * 0.35 + Math.sin(t * 0.47) * 0.2;
+        bob = Math.sin(t * 2.3) * (0.1 + modelSmooth * 0.25);
+      } else if (state === "listening") {
+        sway = Math.sin(t * 0.6) * 0.15;   // a slight lean toward you
+        bob = Math.sin(t * 1.6) * 0.06;
+      } else if (state === "thinking") {
+        sway = Math.sin(t * 0.35) * 0.2;
+        bob = Math.sin(t * 0.5) * 0.08;
+      }
+      const headTX = gazeX * 0.45 + sway;   // head goes part of the way
+      const headTY = gazeY * 0.3 + bob;
+      headX += (headTX - headX) * 0.06;
+      headY += (headTY - headY) * 0.06;
+      headRot = headX * 3.2;                 // subtle tilt, degrees
+
+      // ── The eyes ── almond lenses; blink squashes them to a line ──────
+      const eyeL = leftEyeRef.current;
+      const eyeR = rightEyeRef.current;
+      if (eyeL && eyeR) {
+        const scale = state === "listening" ? 1 + user * 0.18 : 1;
+        setEyeShape(eyeL, 8.9, eyeOpen * scale, gazeX * 0.18, gazeY * 0.18);
+        setEyeShape(eyeR, 15.1, eyeOpen * scale, gazeX * 0.18, gazeY * 0.18);
+        // Pupils ride inside the lenses, offset by the gaze.
+        const pupilL2 = pupilLRef.current;
+        const pupilR2 = pupilRRef.current;
+        if (pupilL2 && pupilR2) {
+          if (eyeOpen > 0.25) {
+            const r = PUPIL_R * Math.min(1, eyeOpen * 1.4);
+            // Clamp so the dot stays inside the lens outline —
+            // vertically bounded by how open the lid currently is.
+            const lensH = 1.35 * Math.max(0, eyeOpen) * (state === "listening" ? 1 + user * 0.18 : 1);
+            const maxPy = Math.min(0.55, Math.max(0, lensH - r - 0.12));
+            const px = Math.max(-1.0, Math.min(1.0, gazeX));
+            const py = Math.max(-maxPy, Math.min(maxPy, gazeY));
+            pupilL2.setAttribute("d", `M${(8.9 + px).toFixed(2)} ${(EYE_CY + py).toFixed(2)} m${(-r).toFixed(2)} 0 a${r.toFixed(2)} ${r.toFixed(2)} 0 1 0 ${(2 * r).toFixed(2)} 0 a${r.toFixed(2)} ${r.toFixed(2)} 0 1 0 ${(-2 * r).toFixed(2)} 0`);
+            pupilR2.setAttribute("d", `M${(15.1 + px).toFixed(2)} ${(EYE_CY + py).toFixed(2)} m${(-r).toFixed(2)} 0 a${r.toFixed(2)} ${r.toFixed(2)} 0 1 0 ${(2 * r).toFixed(2)} 0 a${r.toFixed(2)} ${r.toFixed(2)} 0 1 0 ${(-2 * r).toFixed(2)} 0`);
+          } else {
+            pupilL2.setAttribute("d", PUPIL_CLOSED);
+            pupilR2.setAttribute("d", PUPIL_CLOSED);
+          }
+        }
+      }
+
+      // ── The mouth ── a lens that opens vertically with the voice ───────
+      // Quiet = closed-lips dash; speaking = the jaw drops on real amplitude.
+      const mouth = mouthPathRef.current;
+      if (mouth) {
+        let open = 0;
+        if (state === "speaking") open = 0.15 + modelSmooth * 0.85;
+        else if (state === "listening") open = 0.08 + user * 0.1;
+        else if (state === "thinking") open = 0.1;
+        const h = open * 1.5;                     // half-height of the lens
+        const w = 1.4 + open * 1.0;               // closed-lips dash at rest, widens as it opens
+        mouth.setAttribute(
+          "d",
+          `M${(12 - w).toFixed(2)} ${MOUTH_ROW}  Q12 ${(MOUTH_ROW - 2 * h).toFixed(2)} ${(12 + w).toFixed(2)} ${MOUTH_ROW}  Q12 ${(MOUTH_ROW + 2 * h).toFixed(2)} ${(12 - w).toFixed(2)} ${MOUTH_ROW} Z`,
+        );
+      }
+
+      // ── The face group ── head carries the features with it ────────────
+      if (faceGroupRef.current) {
+        faceGroupRef.current.setAttribute(
+          "transform",
+          `translate(${headX.toFixed(2)} ${headY.toFixed(2)}) rotate(${headRot.toFixed(2)} 12 12)`,
+        );
       }
 
       rafRef.current = requestAnimationFrame(tick);
@@ -239,16 +360,6 @@ export function VoiceOrb({
       rafRef.current = null;
     };
   }, [state]);
-
-  // Decay speakLevelRef continuously so chomps fade out.
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      speakLevelRef.current *= 0.82;
-      if (speakLevelRef.current < 0.01) speakLevelRef.current = 0;
-    }, 100);
-    return () => clearInterval(id);
-  }, []);
-
   // Open-picker housekeeping: refresh the device list when it opens, close
   // on any outside click / Escape.
   useEffect(() => {
@@ -272,9 +383,9 @@ export function VoiceOrb({
 
   const colorClass =
     state === "error"
-      ? "text-pane-error/70"
+      ? "text-pane-error/80"
       : state === "listening"
-        ? "text-pane-error"
+        ? "text-pane-terminal"
         : state === "speaking"
           ? "text-pane-accent"
           : state === "thinking"
@@ -282,8 +393,8 @@ export function VoiceOrb({
             : state === "connecting"
               ? "text-pane-accent/60"
               : state === "off"
-                ? "text-pane-text-secondary/25"
-                : "text-pane-accent/50";
+                ? "text-pane-text-secondary/40"
+                : "text-pane-accent/70";
 
   const title =
     state === "error"
@@ -295,92 +406,6 @@ export function VoiceOrb({
           : state === "connecting"
             ? "connecting…"
             : "voice live — click to end";
-
-  // ── Eye shapes per state ────────────────────────────────────────────────
-  // Open-eye states share animated circle eyes; the rest get drawn faces.
-  const eyes = (() => {
-    if (state === "idle" || state === "listening" || state === "connecting" || state === "thinking") {
-      return (
-        <g ref={eyeGroupRef}>
-          <circle ref={eyeLRef} cx={9} cy={12.5} r={1.6} fill="currentColor" />
-          <circle ref={eyeRRef} cx={15} cy={12.5} r={1.6} fill="currentColor" />
-        </g>
-      );
-    }
-    if (state === "speaking") {
-      // Happy closed ∪∪ eyes while chomping.
-      return (
-        <g stroke="currentColor" strokeWidth={1.2} strokeLinecap="round" fill="none">
-          <path d="M7.6 12.9 q1.4 -1.7 2.8 0" />
-          <path d="M13.6 12.9 q1.4 -1.7 2.8 0" />
-        </g>
-      );
-    }
-    if (state === "error") {
-      // X_X — the robot has seen the upstream error and perished.
-      return (
-        <g stroke="currentColor" strokeWidth={1.1} strokeLinecap="round">
-          <path d="M7.8 11.3 l2.4 2.4 M10.2 11.3 l-2.4 2.4" />
-          <path d="M13.8 11.3 l2.4 2.4 M16.2 11.3 l-2.4 2.4" />
-        </g>
-      );
-    }
-    // off — fast asleep.
-    return (
-      <g stroke="currentColor" strokeWidth={1.1} strokeLinecap="round" fill="none">
-        <path d="M7.7 12.8 q1.3 1.1 2.6 0" />
-        <path d="M13.7 12.8 q1.3 1.1 2.6 0" />
-      </g>
-    );
-  })();
-
-  // ── Mouth per state ─────────────────────────────────────────────────────
-  const mouth = (() => {
-    if (state === "speaking") {
-      // Animated capsule — height driven by model audio in the rAF loop.
-      return (
-        <rect
-          ref={mouthRef}
-          x={9.6}
-          y={16.7}
-          width={4.8}
-          height={1.4}
-          rx={0.9}
-          fill="currentColor"
-        />
-      );
-    }
-    if (state === "listening") {
-      // Attentive little smile.
-      return <path d="M9.7 16.9 q2.3 1.9 4.6 0" stroke="currentColor" strokeWidth={1.2} strokeLinecap="round" fill="none" />;
-    }
-    if (state === "thinking") {
-      // Wavy uncertain mouth.
-      return (
-        <path
-          d="M9.7 17.3 q1.15 -1.1 2.3 0 q1.15 1.1 2.3 0"
-          stroke="currentColor"
-          strokeWidth={1.1}
-          strokeLinecap="round"
-          fill="none"
-        />
-      );
-    }
-    if (state === "error") {
-      // Frown.
-      return <path d="M9.7 17.9 q2.3 -2 4.6 0" stroke="currentColor" strokeWidth={1.2} strokeLinecap="round" fill="none" />;
-    }
-    if (state === "connecting") {
-      // Small "o" — anticipation.
-      return <circle cx={12} cy={17.3} r={1.15} stroke="currentColor" strokeWidth={1.1} fill="none" />;
-    }
-    if (state === "idle") {
-      // Content smile, breathes with the antenna.
-      return <path d="M9.7 16.9 q2.3 1.7 4.6 0" stroke="currentColor" strokeWidth={1.2} strokeLinecap="round" fill="none" />;
-    }
-    // off — flat asleep mouth.
-    return <path d="M9.9 17.4 h4.2" stroke="currentColor" strokeWidth={1.1} strokeLinecap="round" />;
-  })();
 
   return (
     <div ref={rootRef} className="relative">
@@ -397,18 +422,20 @@ export function VoiceOrb({
         title={title}
         aria-label={title}
       >
-        <svg viewBox="0 0 24 24" width={22} height={22} className={colorClass} aria-hidden="true">
-          {/* antenna */}
-          <line x1={12} y1={2.6} x2={12} y2={6} stroke="currentColor" strokeWidth={1.1} strokeLinecap="round" />
-          <circle ref={antennaRef} cx={12} cy={2.4} r={1.3} fill="currentColor" opacity={state === "off" ? 0.35 : 0.8} />
-          {/* head */}
-          <rect x={3.6} y={6} width={16.8} height={13} rx={3.4} stroke="currentColor" strokeWidth={1.3} fill="none" />
-          {/* side bolts */}
-          <rect x={1.4} y={10.2} width={2} height={4} rx={1} fill="currentColor" opacity={0.75} />
-          <rect x={20.6} y={10.2} width={2} height={4} rx={1} fill="currentColor" opacity={0.75} />
-          {/* face */}
-          {eyes}
-          {mouth}
+        <svg viewBox="0 0 24 24" width={24} height={24} className={colorClass} aria-hidden="true">
+          {/* One drawn face — every stroke shares weight and color.
+              These static attributes ARE the off state; the loop only
+              runs while a session is live. The whole face travels
+              together inside one group — the head carries its
+              features with it as it turns. */}
+          <g ref={faceGroupRef}>
+            <circle cx={12} cy={12} r={8.9} fill="none" stroke="currentColor" strokeWidth={1.3} />
+            <path ref={leftEyeRef} d="M6.9 9.6 Q8.9 6.9 10.9 9.6 Q8.9 12.3 6.9 9.6 Z" fill="none" stroke="currentColor" strokeWidth={1.3} strokeLinecap="round" />
+            <path ref={rightEyeRef} d="M13.1 9.6 Q15.1 6.9 17.1 9.6 Q15.1 12.3 13.1 9.6 Z" fill="none" stroke="currentColor" strokeWidth={1.3} strokeLinecap="round" />
+            <path ref={pupilLRef} d="M8.9 9.6 m-0.62 0 a0.62 0.62 0 1 0 1.24 0 a0.62 0.62 0 1 0 -1.24 0" fill="none" stroke="currentColor" strokeWidth={1.3} />
+            <path ref={pupilRRef} d="M15.1 9.6 m-0.62 0 a0.62 0.62 0 1 0 1.24 0 a0.62 0.62 0 1 0 -1.24 0" fill="none" stroke="currentColor" strokeWidth={1.3} />
+            <path ref={mouthPathRef} d="M10.6 16.7 L13.4 16.7" fill="none" stroke="currentColor" strokeWidth={1.3} strokeLinecap="round" />
+          </g>
         </svg>
       </button>
 
@@ -425,7 +452,7 @@ export function VoiceOrb({
           >
             voice input
           </div>
-          {(micDevices ?? []).length === 0 ?(
+          {(micDevices ?? []).length === 0 ? (
             <div
               className="px-3 py-1.5 font-mono text-pane-text-secondary/50"
               style={{ fontSize: "var(--pane-font-size-xs)" }}
