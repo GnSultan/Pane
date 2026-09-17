@@ -30,7 +30,53 @@ import {
 import { calculateCost } from "./pricing.mjs";
 import { safeStringify } from "./sanitize.mjs";
 import { buildSummary, toolResultCache } from "./tool-result-cache.mjs";
+import {
+  isImageEnvelope,
+  parseImageEnvelope,
+  imagePlaceholder,
+  toAnthropicImageBlock,
+  toOpenAIImageUrl,
+  MAX_IMAGE_BASE64,
+} from "./image-envelope.mjs";
+
+// ── User-message image attachments ─────────────────────────────────────────
+// request.images arrives as [{type:"image", source:"data:image/jpeg;base64,..."}]
+// from the renderer (clipboard paste). Convert to the provider-native block:
+// Anthropic image block, or OpenAI-compat image_url part. Empty for others.
+function isOpenAIProvider(provider) {
+  return (
+    provider === "openai" ||
+    provider === "deepseek" ||
+    provider === "z-ai" ||
+    provider === "kimi" ||
+    provider === "openrouter" ||
+    provider === "stepfun" ||
+    provider === "xiaomi" ||
+    provider === "alibaba" ||
+    provider === "dashscope"
+  );
+}
+
+function buildRequestImageBlocks(images, openAIStyle) {
+  if (!Array.isArray(images) || images.length === 0) return [];
+  const blocks = [];
+  for (const img of images) {
+    const url = img?.source;
+    if (typeof url !== "string" || !url.startsWith("data:image/")) continue;
+    const m = url.match(/^data:(image\/[a-z+]+);base64,(.*)$/s);
+    if (!m) continue;
+    const [, media_type, data] = m;
+    if (data.length > MAX_IMAGE_BASE64) continue; // never send oversized
+    blocks.push(
+      openAIStyle
+        ? { type: "image_url", image_url: { url } }
+        : { type: "image", source: { type: "base64", media_type, data } },
+    );
+  }
+  return blocks;
+}
 import { contextStore } from "./context-store.mjs";
+import { normalizeProvider, resolveActiveModel } from "./model-resolver.mjs";
 import { compactMessages, startCompactionWorker, stopCompactionWorker } from "./compaction-driver.mjs";
 import { scoreTurnsByRelevance, selectTurns, base64ToFloat32Array, getTopRelevantSummaries, formatSemanticPool } from "./semantic-turn-selector.mjs";
 import { saveTurn, loadTurn, clearTurns } from "./session-turns.mjs";
@@ -45,6 +91,7 @@ import { getPaneDb, pruneConversationMessages } from "./pane-db.mjs";
 import { runTurnSentinel, recordQualityMetric, runDeepReview, saveDeepReview } from "./code-arbiter.mjs";
 import { classifySteerIntent } from "./steering-classifier.mjs";
 import { recordActivity } from "./intents.mjs";
+import { setPhase as setAgentPhase } from "./agent-status.mjs";
 import { getAccessToken, getOAuthHeaders, getOAuthApiUrl, hasOAuthCredentials, invalidateCache } from "./claude-oauth.mjs";
 import { buildBillingHeaderValue } from "./claude-signing.mjs";
 import {
@@ -207,6 +254,24 @@ const TOOL_DEFINITIONS = [
           end_line: {
             type: "number",
             description: "Optional: 1-based line number to end reading at",
+          },
+        },
+        required: ["file_path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "view_image",
+      description:
+        "See an image file with actual vision — returns it as a native image content block. Call this BEFORE describing, comparing, or building from any image: design exports, screenshots, mockups, Figma/web downloads, photos. If the user attached an image or named an image file, your first move is view_image, not questions. Works with PNG, JPEG, GIF, WebP up to ~4.7MB. (read_file on an image yields binary garbage — never use it for images.)",
+      parameters: {
+        type: "object",
+        properties: {
+          file_path: {
+            type: "string",
+            description: "Path to the image file (project-relative or absolute)",
           },
         },
         required: ["file_path"],
@@ -1215,6 +1280,46 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "pane_logs",
+      description:
+        "Read Pane's own runtime logs — the app's internal diagnostics, not your session journal. Use when debugging Pane itself: what failed, what crashed, what warnings fired. Logs are JSONL entries {ts, level, source, message} covering the main process, renderer, utility workers (cmd, brain), and MCP servers. Sources: 'main', 'renderer', 'worker:cmd', 'worker:brain'.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["tail", "search"],
+            description: "tail = most recent entries (newest first); search = regex match across messages.",
+          },
+          level: {
+            type: "string",
+            enum: ["all", "info", "warn", "error"],
+            description: "Minimum severity filter. Default 'all'. 'error' shows only errors.",
+          },
+          source: {
+            type: "string",
+            description: "Filter by source: 'main', 'renderer', 'worker:cmd', 'worker:brain'. Default all sources.",
+          },
+          hours: {
+            type: "number",
+            description: "How far back to look. Default 24, max 168 (7 days of retention).",
+          },
+          limit: {
+            type: "number",
+            description: "Max entries to return. Default 100, hard cap 300.",
+          },
+          grep: {
+            type: "string",
+            description: "Regex to match within message text (used by action=search; optional for tail).",
+          },
+        },
+        required: ["action"],
+      },
+    },
+  },
 ];
 
 // ── Phase-based tool lists ─────────────────────────────────────────────────
@@ -1572,6 +1677,7 @@ export { ApiBackend as HttpBackend }; // backward compat alias
 function validateMessageSequence(messages, provider) {
   const isOpenAI =
     !provider || // no provider means OpenAI-compatible
+    provider === "openai" || // includes codex:// OAuth transport
     provider === "deepseek" ||
     provider === "z-ai" ||
     provider === "kimi" ||
@@ -1821,9 +1927,15 @@ export class ApiBackend extends PunkBackend {
 
       // Normalize "-api" suffixed providers to base name for key lookup and API calls.
       // "anthropic-api" → "anthropic", "gemini-api" → "gemini"
+      // No default provider: the user's active selection is authoritative;
+      // http_provider is a legacy key still synced by older settings. Null
+      // only when neither exists — callers surface the missing config.
       const rawProvider =
-        providerOverride || settings.http_provider || "deepseek";
-      const provider = rawProvider.replace(/-api$/, "");
+        providerOverride ||
+        settings.selected_model_provider ||
+        settings.http_provider ||
+        null;
+      const provider = rawProvider ? normalizeProvider(rawProvider) : null;
 
       let apiKey = settings.http_api_keys?.[provider] || "";
       let authType = apiKey ? "api_key" : undefined;
@@ -1863,8 +1975,10 @@ export class ApiBackend extends PunkBackend {
       );
       return { provider, apiKey, baseUrl, authType };
     } catch {
+      // No settings readable — return the override as-is (may be null) with
+      // no invented provider or key. validateApiConfig surfaces the problem.
       return {
-        provider: providerOverride || "deepseek",
+        provider: providerOverride ? normalizeProvider(providerOverride) : null,
         apiKey: "",
         baseUrl: undefined,
         authType: undefined,
@@ -1873,6 +1987,11 @@ export class ApiBackend extends PunkBackend {
   }
 
   validateApiConfig(config) {
+    if (!config.provider) {
+      throw new Error(
+        "No model selected. Pick a model in the model selector (⌘,) — background tasks run on the same selection as your turns.",
+      );
+    }
     if (!config.apiKey && config.authType !== "oauth" && config.authType !== "openai-oauth") {
       const msg = config.provider === "anthropic"
         ? `Not signed in to Claude. Open settings (\u2318,) and click "sign in with claude.ai", or add an Anthropic API key.`
@@ -1941,6 +2060,30 @@ export class ApiBackend extends PunkBackend {
       return msg;
     };
 
+    // ── Image envelope extraction ─────────────────────────────────────────
+    // Tool results that carry an image envelope are converted to provider-
+    // native image blocks here. Anthropic accepts image blocks INSIDE
+    // tool_result.content (documented shape). OpenAI-compatible and Gemini
+    // APIs do NOT accept images in tool role messages — those get hoisted
+    // into a synthetic trailing user message after the loop (see below).
+    const extractedImages = [];
+    const convertToolContent = (content) => {
+      if (typeof content !== "string" || !isImageEnvelope(content)) {
+        return content;
+      }
+      const env = parseImageEnvelope(content);
+      if (!env) return imagePlaceholder(content);
+      if (isOpenAI) {
+        // OpenAI-compat: strip from the tool message, deliver via user hoist.
+        extractedImages.push(env);
+        return `[image: ${env.label} attached]`;
+      }
+      return [
+        { type: "text", text: `[image: ${env.label}]` },
+        toAnthropicImageBlock(env),
+      ];
+    };
+
     const preFiltered = [];
     // COLLAPSE CONSECUTIVE USER MESSAGES (Retry inflation fix)
     for (const msg of messages) {
@@ -1977,10 +2120,11 @@ export class ApiBackend extends PunkBackend {
                   role: "tool",
                   tool_call_id: c.tool_use_id,
                   name: c.name,
-                  content:
+                  content: convertToolContent(
                     typeof c.content === "string"
                       ? c.content
                       : safeStringify(c.content),
+                  ),
                   is_error: c.is_error,
                 };
                 if (pendingToolCallIds.has(res.tool_call_id)) {
@@ -2000,7 +2144,9 @@ export class ApiBackend extends PunkBackend {
                 const block = {
                   type: "tool_result",
                   tool_use_id: c.tool_use_id,
-                  content: typeof c.content === "string" ? c.content : safeStringify(c.content),
+                  content: convertToolContent(
+                    typeof c.content === "string" ? c.content : safeStringify(c.content),
+                  ),
                 };
                 if (c.is_error) block.is_error = true;
                 pendingToolCallIds.delete(c.tool_use_id);
@@ -2185,7 +2331,19 @@ export class ApiBackend extends PunkBackend {
         if (isReasoner) continue;
         const results = [];
         if (role === "tool" && !Array.isArray(content)) {
-          results.push(resolveResultRef(msg));
+          // NOTE: convert into a COPY — resolveResultRef returns the original
+          // msg object when context is null, and the Anthropic branch below
+          // re-resolves it independently. Mutating here would poison that
+          // path (array content → safeStringify → stringified blocks).
+          const resolvedFlat = resolveResultRef(msg);
+          results.push(
+            typeof resolvedFlat.content === "string"
+              ? {
+                  ...resolvedFlat,
+                  content: convertToolContent(resolvedFlat.content),
+                }
+              : resolvedFlat,
+          );
         } else if (Array.isArray(content)) {
           content.forEach((c) => {
             if (c.type === "tool_result") {
@@ -2193,10 +2351,11 @@ export class ApiBackend extends PunkBackend {
                 role: "tool",
                 tool_call_id: c.tool_use_id,
                 name: c.name,
-                content:
+                content: convertToolContent(
                   typeof c.content === "string"
                     ? c.content
                     : safeStringify(c.content),
+                ),
                 is_error: c.is_error,
               });
             }
@@ -2251,10 +2410,11 @@ export class ApiBackend extends PunkBackend {
                   const block = {
                     type: "tool_result",
                     tool_use_id: c.tool_use_id,
-                    content:
+                    content: convertToolContent(
                       typeof c.content === "string"
                         ? c.content
                         : safeStringify(c.content),
+                    ),
                   };
                   if (c.is_error) block.is_error = true;
                   return block;
@@ -2270,10 +2430,11 @@ export class ApiBackend extends PunkBackend {
                 const block = {
                   type: "tool_result",
                   tool_use_id: resolved.tool_call_id,
-                  content:
+                  content: convertToolContent(
                     typeof resolved.content === "string"
                       ? resolved.content
                       : safeStringify(resolved.content),
+                  ),
                 };
                 if (resolved.is_error) block.is_error = true;
                 pendingToolCallIds.delete(resolved.tool_call_id);
@@ -2331,9 +2492,45 @@ export class ApiBackend extends PunkBackend {
             .map((c) => c.text)
             .join("\n");
           if (isOpenAI) {
-            if (text) normalized.push({ role: "user", content: text });
+            const hasNativeImageUrl = content.some(
+              (c) => c && c.type === "image_url" && c.image_url?.url,
+            );
+            const dataUrlImages = content.filter(
+              (c) => c && c.type === "image" && typeof c.source === "string" && c.source.startsWith("data:"),
+            );
+            if (dataUrlImages.length === 0 && !hasNativeImageUrl) {
+              // No images — plain string, identical to the old wire format
+              // (keeps prefix-cache stability for text-only history).
+              if (text) normalized.push({ role: "user", content: text });
+            } else if (hasNativeImageUrl && dataUrlImages.length === 0) {
+              // Already converted (initial request built image_url parts) — pass through
+              normalized.push({ ...msg, content });
+            } else {
+              // Vision format: array of text + image_url parts
+              normalized.push({
+                role: "user",
+                content: [
+                  { type: "text", text: text || "[image]" },
+                  ...dataUrlImages.map((ib) => ({
+                    type: "image_url",
+                    image_url: { url: ib.source },
+                  })),
+                ],
+              });
+            }
           } else {
-            normalized.push(msg);
+            // Anthropic/Gemini: pass through, converting renderer data-URL
+            // image blocks to native source blocks
+            const converted = content.map((c) => {
+              if (c && c.type === "image" && typeof c.source === "string" && c.source.startsWith("data:")) {
+                const m = c.source.match(/^data:(image\/[a-z+]+);base64,(.*)$/s);
+                if (m) {
+                  return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
+                }
+              }
+              return c;
+            });
+            normalized.push({ ...msg, content: converted });
           }
         }
         continue;
@@ -2413,19 +2610,31 @@ export class ApiBackend extends PunkBackend {
       for (let i = 0; i < normalized.length; i++) {
         const msg = normalized[i];
 
-        // Flatten any array content that wasn't converted above
+        // Flatten any array content that wasn't converted above — EXCEPT
+        // vision-format user messages (text + image_url parts), which must
+        // stay as arrays for OpenAI vision support.
         if (Array.isArray(msg.content)) {
-          const text = msg.content
-            .filter((c) => c && typeof c.type === "string" && c.type === "text")
-            .map((c) => c.text || "")
-            .join("\n");
-          // Include tool_result content blocks as well
-          const toolResults = msg.content
-            .filter((c) => c && c.type === "tool_result" && c.content)
-            .map((c) => (typeof c.content === "string" ? c.content : safeStringify(c.content)))
-            .join("\n");
-          const combined = [text, toolResults].filter(Boolean).join("\n\n");
-          normalized[i] = { ...msg, content: combined || "" };
+          const isVisionUser =
+            msg.role === "user" &&
+            msg.content.some(
+              (c) => c && (c.type === "image_url" || c.type === "image"),
+            );
+          if (!isVisionUser) {
+            const text = msg.content
+              .filter((c) => c && typeof c.type === "string" && c.type === "text")
+              .map((c) => c.text || "")
+              .join("\n");
+            // Include tool_result content blocks as well
+            const toolResults = msg.content
+              .filter((c) => c && c.type === "tool_result" && c.content)
+              .map((c) => {
+                const s = typeof c.content === "string" ? c.content : safeStringify(c.content);
+                return isImageEnvelope(s) ? imagePlaceholder(s) : s;
+              })
+              .join("\n");
+            const combined = [text, toolResults].filter(Boolean).join("\n\n");
+            normalized[i] = { ...msg, content: combined || "" };
+          }
         }
 
         // Never send null/undefined content
@@ -2445,6 +2654,30 @@ export class ApiBackend extends PunkBackend {
           const { type: _unused, ...clean } = normalized[i];
           normalized[i] = clean;
         }
+      }
+    }
+
+    // ── Image hoist (OpenAI-compat) ─────────────────────────────────────
+    // convertToolContent strips image envelopes out of tool messages for
+    // OpenAI-compatible providers (their tool role can't carry images) and
+    // collects them here. Deliver as a synthetic trailing user message with
+    // image_url parts — appended AFTER the loop so tool_call→tool sequencing
+    // is already final. If the last message is a user message, merge into it.
+    if (isOpenAI && extractedImages.length > 0) {
+      const last = normalized[normalized.length - 1];
+      if (last?.role === "user" && typeof last.content === "string") {
+        last.content = [
+          { type: "text", text: last.content },
+          ...extractedImages.map(toOpenAIImageUrl),
+        ];
+      } else {
+        normalized.push({
+          role: "user",
+          content: [
+            { type: "text", text: "[image tool results]" },
+            ...extractedImages.map(toOpenAIImageUrl),
+          ],
+        });
       }
     }
 
@@ -2498,6 +2731,7 @@ export class ApiBackend extends PunkBackend {
     // of previous spawn's state (e.g. auto-resume re-enters spawn).
     this._healAttemptedThisTurn = false;
     this._contextHealAttemptedThisTurn = false;
+    this._imageStripAttemptedThisTurn = false;
     if (typeof this._sessionRetryCount !== "number") {
       this._sessionRetryCount = 0;
     }
@@ -2781,7 +3015,7 @@ export class ApiBackend extends PunkBackend {
               subtype: "init",
               session_id: `http-${Date.now()}`,
               tools: getToolsForPhase(request.phase || "execution"),
-              model: request.model || this.getDefaultModel(apiConfig.provider),
+              model: request.model ?? null, // display only — never invented
             },
           },
         },
@@ -3022,7 +3256,10 @@ export class ApiBackend extends PunkBackend {
       } else {
         messages.push({
           role: "user",
-          content: [{ type: "text", text: request.prompt }],
+          content: [
+            { type: "text", text: request.prompt },
+            ...buildRequestImageBlocks(request.images, isOpenAIProvider(apiConfig.provider)),
+          ],
         });
       }
 
@@ -3051,6 +3288,18 @@ export class ApiBackend extends PunkBackend {
         });
       } catch {}
 
+      // ── Agent status store (voice observability) ──
+      // Authoritative phase write: the run is live. The store schema is
+      // fixed (no prompt text) — recordActivity above keeps the richer
+      // peer-awareness record; this is the deterministic status source.
+      // A new run always starts in planning — the phase loop refines to
+      // editing once write tools execute (tool-executor emits those).
+      setAgentPhase(request.projectId, {
+        phase: "planning",
+        readOnly: request.phase !== "build" && request.phase !== "execution",
+        agent: request.model && request.provider ? `${request.model}@${request.provider}` : null,
+      });
+
       let turn = 0;
       const maxTurns = 500;
       let sessionOutput = ""; // Accumulate model text for pattern extraction (capped)
@@ -3068,9 +3317,12 @@ export class ApiBackend extends PunkBackend {
 
         // Resolve model name first — state carries it so handleStreamEvent
         // can look up the model's streaming personality at parse time.
+        // No request model → the user's active selection (same as every
+        // background path); mapModelName throws a clear error if neither
+        // resolves, so an unconfigured Pane surfaces the real problem.
         const resolvedModel = this.mapModelName(
           apiConfig.provider,
-          request.model,
+          request.model || (await this.resolveRequestModel(request, apiConfig.provider)),
         );
 
         const state = {
@@ -3176,6 +3428,7 @@ export class ApiBackend extends PunkBackend {
             apiConfig.provider === "kimi" ||
             apiConfig.provider === "stepfun" ||
             apiConfig.provider === "xiaomi" ||
+            apiConfig.provider === "openai" || // codex OAuth: buildResponsesRequest translates to Responses-API tools
             (apiConfig.provider === "openrouter" && orPersonality.supportsTools)
           ) {
             body.tools = getToolsForPhase(phase);
@@ -3521,6 +3774,117 @@ export class ApiBackend extends PunkBackend {
                       continue; // Don't consume an attempt — heal is free
                     }
 
+                    // ── HEALABLE 400: image content rejected by a text-only endpoint ──
+                    // e.g. z-ai coding endpoint: {"code":"1210","message":"messages.content.type is invalid, allowed values: ['text']"}
+                    // The provider can't receive pixels — degrade to text + an honest
+                    // notice the model can act on (ask user to run view_image-capable
+                    // model), instead of hard-failing the entire turn.
+                    if (
+                      (plainBody.includes("content.type is invalid") ||
+                        plainBody.includes("allowed values: ['text']") ||
+                        plainBody.includes("allowed values: [\"text\"]")) &&
+                      !this._imageStripAttemptedThisTurn
+                    ) {
+                      this._imageStripAttemptedThisTurn = true;
+                      const target = finalBody && finalBody !== body ? finalBody : body;
+                      let strippedCount = 0;
+                      const stripImagesFromContent = (content) => {
+                        if (!Array.isArray(content)) return content;
+                        return content.filter((part) => {
+                          const isImage =
+                            part?.type === "image_url" ||
+                            part?.type === "image" ||
+                            (part?.type === "tool_result" &&
+                              typeof part.content === "string" &&
+                              part.content.startsWith("__PANE_IMG__"));
+                          if (isImage) strippedCount++;
+                          return !isImage;
+                        });
+                      };
+                      for (const m of target.messages || []) {
+                        m.content = stripImagesFromContent(m.content);
+                        // Flatten to plain string when no structured parts remain —
+                        // some providers reject arrays even when all parts are text.
+                        if (
+                          Array.isArray(m.content) &&
+                          m.content.every((p) => p?.type === "text")
+                        ) {
+                          m.content = m.content
+                            .map((p) => p.text || "")
+                            .join("\n")
+                            .trim();
+                        }
+                      }
+                      if (strippedCount > 0) {
+                        console.warn(
+                          `[http] auto-healing: stripped ${strippedCount} image part(s) — endpoint accepts text content only`,
+                        );
+                        this.onEvent(
+                          request.projectId,
+                          {
+                            event: "status",
+                            data: {
+                              message: "endpoint is text-only — images removed for this request",
+                            },
+                          },
+                          request.requestId,
+                        );
+                        // Honest notice the model can act on — merged into the
+                        // last user message (the image hoist uses the same
+                        // pattern; pushing a consecutive user message would be
+                        // collapsed away if anything re-normalizes).
+                        // If the zai-vision MCP server is connected, point the
+                        // model at its tools — the image lives on disk at a
+                        // known path and those tools CAN see it.
+                        const visionTools = mcpClient
+                          .getExternalTools()
+                          .filter((t) =>
+                            t.function.name.startsWith("ext__zai-vision__"),
+                          )
+                          .map(
+                            (t) =>
+                              t.function.name.slice("ext__zai-vision__".length),
+                          );
+                        const visionHint =
+                          visionTools.length > 0
+                            ? ` However, vision IS available through MCP tools (server "zai-vision": ${visionTools.join(", ")}). ` +
+                              `They take an image FILE PATH, not pixels — if any of the removed images exist on disk (e.g. the user referenced a file, or a tool returned a path like ~/.pane/<file>), call the appropriate zai-vision tool with that path instead of giving up.`
+                            : " Suggest switching to a vision-capable model if they need the image analyzed.";
+                        const lastMsg =
+                          target.messages[target.messages.length - 1];
+                        const notice =
+                          "[System: this endpoint does not accept images — " +
+                          strippedCount +
+                          " attached image(s) were removed from the conversation before this request. " +
+                          "You cannot see those pixels. Tell the user plainly that the current model/endpoint cannot view pasted images inline." +
+                          visionHint +
+                          "]";
+                        if (
+                          lastMsg?.role === "user" &&
+                          typeof lastMsg.content === "string"
+                        ) {
+                          lastMsg.content = lastMsg.content + "\n\n" + notice;
+                        } else {
+                          target.messages.push({
+                            role: "user",
+                            content: notice,
+                          });
+                        }
+                        // Sync both body refs (prefix-cache copy vs original)
+                        if (finalBody && finalBody !== body) {
+                          body.messages = finalBody.messages;
+                        }
+                        this.onEvent(
+                          request.projectId,
+                          { event: "status", data: { message: null } },
+                          request.requestId,
+                        );
+                        continue; // heal is free, don't consume an attempt
+                      }
+                      // No images found to strip — the mismatch is something
+                      // else entirely; fall through to the error path.
+                    }
+
                     // ── HEALABLE 400: context window overflow ──
                     // "maximum context length is X tokens. However, you requested Y tokens"
                     // The pre-flight guardrail should catch most of these, but if estimation
@@ -3805,6 +4169,48 @@ export class ApiBackend extends PunkBackend {
                     );
                     url = "https://api.z.ai/api/coding/paas/v4/chat/completions";
                     continue; // Don't consume an attempt — endpoint switch is free
+                  }
+
+                  // Anthropic usage_limit_reached detection: 429 with this
+                  // code is a PLAN LIMIT (resets at a server-provided time),
+                  // not congestion. Retrying is predetermined to fail — the
+                  // plan limit cannot clear mid-loop. Break immediately,
+                  // emit quota_exhausted so the InputBar banner shows the
+                  // reset time, and fail the turn with the actionable truth.
+                  if (isRateLimit && apiConfig.provider === "anthropic") {
+                    const errBodyText = lastResponseBody ||
+                      (await response.text().catch(() => ""));
+                    if (errBodyText.includes("usage_limit_reached")) {
+                      let resetsAtEpoch;
+                      let planType;
+                      try {
+                        const parsed = JSON.parse(errBodyText);
+                        resetsAtEpoch = parsed?.error?.resets_at;
+                        planType = parsed?.error?.plan_type;
+                      } catch {}
+                      const planLabel = planType ? `${planType} plan` : "plan";
+                      const friendlyMsg = resetsAtEpoch
+                        ? `Anthropic ${planLabel} limit reached — resets ${new Date(resetsAtEpoch * 1000).toLocaleTimeString()}`
+                        : "Anthropic plan limit reached (usage_limit_reached) — no reset time provided";
+                      console.warn(
+                        `[http] Anthropic usage_limit_reached — breaking retry loop: ${friendlyMsg}`,
+                      );
+                      this.onEvent(
+                        request.projectId,
+                        {
+                          event: "rate_limit",
+                          data: {
+                            status: "rejected",
+                            rateLimitType: "quota_exhausted",
+                            resetsAt: resetsAtEpoch,
+                            provider: "anthropic",
+                            message: friendlyMsg,
+                          },
+                        },
+                        request.requestId,
+                      );
+                      throw new Error(friendlyMsg);
+                    }
                   }
 
                   // Z.ai terminal error detection: quota exhaustion codes (1113,
@@ -4131,6 +4537,14 @@ export class ApiBackend extends PunkBackend {
                 // Codex OAuth: Responses API events → chat/completions chunk
                 // shape so the existing openai parser works unchanged.
                 if (response.codex) {
+                  // Log first few raw event types per request for diagnosis —
+                  // catches unexpected server-side events (e.g. mid-stream errors)
+                  // without flooding logs on every delta.
+                  if (!state._codexEventCount) state._codexEventCount = 0;
+                  if (state._codexEventCount < 5) {
+                    console.log(`[codex] event: ${parsed.type}`);
+                    state._codexEventCount++;
+                  }
                   const chunks = responsesEventToChatChunks(parsed);
                   for (const chunk of chunks) {
                     this.handleStreamEvent(
@@ -4152,6 +4566,7 @@ export class ApiBackend extends PunkBackend {
                   // Content was emitted
                 }
               } catch (err) {
+                if (err && err._codexStreamError) throw err; // real server error — propagate, don't swallow
                 console.error("[punk] Failed to parse SSE data:", err, data);
               }
             }
@@ -4786,6 +5201,7 @@ export class ApiBackend extends PunkBackend {
                 request.requestId,
               );
               awaitingUserInput = true;
+              setAgentPhase(request.projectId, { phase: "waiting" });
               result = {
                 success: true,
                 output:
@@ -4928,7 +5344,10 @@ export class ApiBackend extends PunkBackend {
               }
             }
 
-            // Emit tool_result as a "user" message to match CLI worker
+            // Emit tool_result as a "user" message to match CLI worker.
+            // Image envelopes are swapped for a placeholder here — the full
+            // base64 stays in the ToolResultStore and only reaches the API
+            // at request time; the renderer (and IPC) never sees megabytes.
             const resultMeta = result.metadata || undefined;
             this.onEvent(
               request.projectId,
@@ -4943,7 +5362,9 @@ export class ApiBackend extends PunkBackend {
                           type: "tool_result",
                           tool_use_id: tool.id,
                           name: tool.name,
-                          content,
+                          content: isImageEnvelope(content)
+                            ? imagePlaceholder(content)
+                            : content,
                           is_error: isError,
                           ...(resultMeta ? { metadata: resultMeta } : {}),
                         },
@@ -5072,7 +5493,8 @@ export class ApiBackend extends PunkBackend {
               msg.includes("504") ||
               msg.includes("econnreset") ||
               msg.includes("etimedout") ||
-              msg.includes("insufficient_system_resource")
+              msg.includes("insufficient_system_resource") ||
+              msg.includes("codex stream error")
             );
           };
           if (isRecoverable(turnError) && turnRetryCount < MAX_TURN_RETRIES) {
@@ -5206,6 +5628,10 @@ export class ApiBackend extends PunkBackend {
                       const diff = stdout || "";
                       if (diff.length < 50) return; // No meaningful diff
                       const quickCallFn = (sys, usr) => {
+                        // Same selection logic as every other background
+                        // call: null provider/model resolves through
+                        // planningCall → getApiConfig → the user's active
+                        // selection. Never an invented default.
                         const cheapReq = {
                           provider: null,
                           model: null,
@@ -5495,6 +5921,13 @@ export class ApiBackend extends PunkBackend {
       // Reset session retry counter on success — next session starts fresh
       this._sessionRetryCount = 0;
 
+      // Run finished cleanly — authoritative terminal phase. awaitingUserInput
+      // means the agent paused for the user, not finished; keep 'waiting'.
+      setAgentPhase(request.projectId, {
+        phase: awaitingUserInput ? "waiting" : "done",
+        turn,
+      });
+
       this.onEvent(
         request.projectId,
         {
@@ -5519,13 +5952,25 @@ export class ApiBackend extends PunkBackend {
       // We do NOT auto-resume on:
       //   • AbortError — user explicitly cancelled
       //   • 401/403 — auth failures won't fix on retry
+      //   • 400 — request validation errors are permanent; respawning replays
+      //     the identical doomed body two more times (Sep 9 trace: image sent
+      //     to text-only z-ai endpoint, 3 fetches + 2 respawns before the
+      //     user saw the real error). The 400-heal path above handles the
+      //     recoverable subset (sequence, context, image-strip) before this.
       //   • 422 — validation errors require code changes
+      //   • Terminal OAuth — dead refresh token needs `codex login`;
+      //     respawning replays the journal into the same wall 2 more times.
+      //     (Aug 30 trace: 3 empty-stream retries + 2 session respawns
+      //     before the user saw the real error.)
       const isAuthError =
         error.message?.includes("401") ||
         error.message?.includes("403") ||
         error.message?.includes("unauthorized") ||
-        error.message?.includes("forbidden");
-      const isRecoverable = error.name !== "AbortError" && !isAuthError;
+        error.message?.includes("forbidden") ||
+        /openai oauth token (expired|unavailable)/i.test(error.message || "");
+      const isValidationError = error.message?.includes("HTTP 400");
+      const isRecoverable =
+        error.name !== "AbortError" && !isAuthError && !isValidationError;
 
       if (isRecoverable && this._sessionRetryCount < 2) {
         this._sessionRetryCount++;
@@ -5665,6 +6110,7 @@ export class ApiBackend extends PunkBackend {
           },
           request.requestId,
         );
+        setAgentPhase(request.projectId, { phase: "error" });
         this.onEvent(
           request.projectId,
           {
@@ -5760,9 +6206,21 @@ export class ApiBackend extends PunkBackend {
         let inserted = false;
         for (let i = result.length - 1; i >= 0; i--) {
           if (result[i].role === "user") {
-            const orig =
-              typeof result[i].content === "string" ? result[i].content : "";
-            result[i] = { ...result[i], content: preamble + orig };
+            if (typeof result[i].content === "string") {
+              result[i] = { ...result[i], content: preamble + result[i].content };
+            } else if (Array.isArray(result[i].content)) {
+              // Vision-format message — prepend as a leading text part so
+              // image parts survive (string concat would wipe the array).
+              result[i] = {
+                ...result[i],
+                content: [
+                  { type: "text", text: preamble.replace(/\n\n$/, "") },
+                  ...result[i].content,
+                ],
+              };
+            } else {
+              result[i] = { ...result[i], content: preamble };
+            }
             inserted = true;
             break;
           }
@@ -6217,7 +6675,20 @@ export class ApiBackend extends PunkBackend {
         const normalized = this.normalizeMessages(body.messages, "gemini");
         for (const msg of normalized) {
           if (msg.role === "user") {
-            contents.push({ role: "user", parts: [{ text: msg.content }] });
+            if (typeof msg.content === "string") {
+              contents.push({ role: "user", parts: [{ text: msg.content }] });
+            } else if (Array.isArray(msg.content)) {
+              // Vision format — map blocks to Gemini parts:
+              // text → {text}, image → {inlineData}
+              const parts = [];
+              for (const c of msg.content) {
+                if (c && c.type === "text" && c.text) parts.push({ text: c.text });
+                else if (c && c.type === "image" && c.source?.type === "base64" && c.source.data) {
+                  parts.push({ inlineData: { mimeType: c.source.media_type, data: c.source.data } });
+                }
+              }
+              if (parts.length > 0) contents.push({ role: "user", parts });
+            }
           } else if (msg.role === "assistant") {
             const parts = [];
             if (msg.thinking) parts.push({ thought: msg.thinking });
@@ -6447,35 +6918,16 @@ export class ApiBackend extends PunkBackend {
     return { url, headers, finalBody };
   }
 
-  getDefaultModel(provider) {
-    switch (provider) {
-      case "gemini":
-        return "gemini-3-flash-preview";
-      case "deepseek":
-        return "deepseek-v4-flash";
-      case "z-ai":
-        return "glm-5.2";
-      case "stepfun":
-        return "step-3.5-flash";
-      case "kimi":
-        return "moonshot-v1-128k";
-      case "xiaomi":
-        return "mimo-v2-flash";
-      case "anthropic":
-        return "claude-sonnet-4-6";
-      case "openrouter":
-        return "stepfun/step-3.5-flash:free";
-      case "openai":
-        // Codex backend (OAuth mode) only accepts Codex slugs; the API-key
-        // path accepts standard names. gpt-5.4-mini exists in both registries.
-        return "gpt-5.4-mini";
-      default:
-        return "gpt-4";
-    }
-  }
-
   mapModelName(provider, model) {
-    if (!model) return this.getDefaultModel(provider);
+    if (!model) {
+      // No model configured — surface it. Callers that legitimately have no
+      // model (init event display, model-list pings) pass an explicit
+      // sentinel or handle null; the request path throws so the user sees
+      // the real problem instead of a surprise model.
+      throw new Error(
+        `No model configured for provider "${provider}". Pick a model in the model selector (or set one for this provider in settings) — background calls will use the same selection.`,
+      );
+    }
 
     if (provider === "openrouter") return model;
 
@@ -6528,7 +6980,9 @@ export class ApiBackend extends PunkBackend {
         sonnet: "claude-sonnet-4-6",
         haiku: "claude-haiku-4-5-20251001",
       };
-      return map[model.toLowerCase()] || this.getDefaultModel(provider);
+      // Unknown alias passes through unchanged — the API's own "unknown
+      // model" error surfaces the real problem. No invented fallback.
+      return map[model.toLowerCase()] || model;
     }
 
     return model;
@@ -6696,6 +7150,11 @@ export class ApiBackend extends PunkBackend {
       // DeepSeek V4 uses reasoning_content; stepfun uses reasoning;
       // kimi uses standard content only. Tool-call handling is identical
       // to the openrouter block above so they share that logic via fallthrough.
+      // "openai" joins here: the codex:// OAuth path translates Responses-API
+      // SSE events into this exact chat/completions chunk shape before calling
+      // handleStreamEvent — without this case every chunk was silently dropped
+      // ("Stream closed prematurely (no data received)" ×3, dead turn).
+      case "openai":
       case "xiaomi":
       case "z-ai":
       case "deepseek":
@@ -7545,11 +8004,34 @@ export class ApiBackend extends PunkBackend {
    * Make a lightweight API call with no tools — used for task decomposition.
    * Returns the raw text response from the model.
    */
+  /**
+   * Resolve the model for a request: the request's explicit model wins;
+   * otherwise the user's active selection when it belongs to the provider
+   * this call is about to hit. Background calls that pass {provider:null,
+   * model:null} thereby land on the exact model the foreground uses.
+   * Returns null when nothing resolves — callers throw/skip with a clear
+   * error rather than inventing a model.
+   */
+  async resolveRequestModel(request, provider) {
+    if (request?.model) return request.model;
+    const selection = await resolveActiveModel();
+    if (
+      selection &&
+      normalizeProvider(selection.provider) === normalizeProvider(provider)
+    ) {
+      return selection.model;
+    }
+    return null;
+  }
+
   async planningCall(systemPrompt, userPrompt, request, onChunk) {
     const apiConfig = await this.getApiConfig(request.provider || null);
     this.validateApiConfig(apiConfig);
 
-    const model = this.mapModelName(apiConfig.provider, request.model);
+    const model = this.mapModelName(
+      apiConfig.provider,
+      await this.resolveRequestModel(request, apiConfig.provider),
+    );
 
     const body = {
       model,
@@ -7615,6 +8097,50 @@ export class ApiBackend extends PunkBackend {
 
         if (!response.ok) {
           const status = response.status;
+
+          // Anthropic usage_limit_reached — plan limit, not congestion (see
+          // stream-path detection for rationale). Same treatment here: no
+          // retry, quota_exhausted banner, fail fast with reset time.
+          if (
+            status === 429 &&
+            apiConfig.provider === "anthropic" &&
+            attempt === 0
+          ) {
+            const errText = await response.text().catch(() => "");
+            if (errText.includes("usage_limit_reached")) {
+              let resetsAtEpoch;
+              let planType;
+              try {
+                const parsed = JSON.parse(errText);
+                resetsAtEpoch = parsed?.error?.resets_at;
+                planType = parsed?.error?.plan_type;
+              } catch {}
+              const planLabel = planType ? `${planType} plan` : "plan";
+              const friendlyMsg = resetsAtEpoch
+                ? `Anthropic ${planLabel} limit reached — resets ${new Date(resetsAtEpoch * 1000).toLocaleTimeString()}`
+                : "Anthropic plan limit reached (usage_limit_reached) — no reset time provided";
+              console.warn(
+                `[http] Planning call: Anthropic usage_limit_reached — no retry: ${friendlyMsg}`,
+              );
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "rate_limit",
+                  data: {
+                    status: "rejected",
+                    rateLimitType: "quota_exhausted",
+                    resetsAt: resetsAtEpoch,
+                    provider: "anthropic",
+                    message: friendlyMsg,
+                  },
+                },
+                request.requestId,
+              );
+              const fatal = new Error(friendlyMsg);
+              fatal._noRetry = true;
+              throw fatal;
+            }
+          }
 
           // Client errors (4xx except 429) are not retryable — propagate immediately
           if (status >= 400 && status < 500 && status !== 429) {
@@ -7722,6 +8248,11 @@ export class ApiBackend extends PunkBackend {
             let delta = "";
             if (response.codex) {
               // Codex Responses API: text arrives in response.output_text.delta
+              if (parsed.type === "error" || parsed.type === "response.failed") {
+                throw new Error(
+                  `Codex ${parsed.type}: ${parsed.message || parsed.response?.error?.message || "stream failed"}`,
+                );
+              }
               if (parsed.type === "response.output_text.delta") delta = parsed.delta || "";
             } else if (apiConfig.provider === "anthropic") {
               // Anthropic: content_block_delta with text_delta
@@ -7836,7 +8367,10 @@ export class ApiBackend extends PunkBackend {
     const apiConfig = await this.getApiConfig(request.provider || null);
     this.validateApiConfig(apiConfig);
 
-    const model = this.mapModelName(apiConfig.provider, request.model);
+    const model = this.mapModelName(
+      apiConfig.provider,
+      await this.resolveRequestModel(request, apiConfig.provider),
+    );
 
     const fullMessages = [
       {
@@ -7901,6 +8435,49 @@ export class ApiBackend extends PunkBackend {
         if (!response.ok) {
           const status = response.status;
 
+          // Anthropic usage_limit_reached — plan limit, not congestion (see
+          // stream-path detection for rationale). No retry, banner, fail fast.
+          if (
+            status === 429 &&
+            apiConfig.provider === "anthropic" &&
+            attempt === 0
+          ) {
+            const errText = await response.text().catch(() => "");
+            if (errText.includes("usage_limit_reached")) {
+              let resetsAtEpoch;
+              let planType;
+              try {
+                const parsed = JSON.parse(errText);
+                resetsAtEpoch = parsed?.error?.resets_at;
+                planType = parsed?.error?.plan_type;
+              } catch {}
+              const planLabel = planType ? `${planType} plan` : "plan";
+              const friendlyMsg = resetsAtEpoch
+                ? `Anthropic ${planLabel} limit reached — resets ${new Date(resetsAtEpoch * 1000).toLocaleTimeString()}`
+                : "Anthropic plan limit reached (usage_limit_reached) — no reset time provided";
+              console.warn(
+                `[http] Conversation call: Anthropic usage_limit_reached — no retry: ${friendlyMsg}`,
+              );
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "rate_limit",
+                  data: {
+                    status: "rejected",
+                    rateLimitType: "quota_exhausted",
+                    resetsAt: resetsAtEpoch,
+                    provider: "anthropic",
+                    message: friendlyMsg,
+                  },
+                },
+                request.requestId,
+              );
+              const fatal = new Error(friendlyMsg);
+              fatal._noRetry = true;
+              throw fatal;
+            }
+          }
+
           // Client errors (4xx except 429) are not retryable — propagate immediately
           if (status >= 400 && status < 500 && status !== 429) {
             const errorText = await response
@@ -7961,8 +8538,16 @@ export class ApiBackend extends PunkBackend {
               if (!payload || payload === "[DONE]") continue;
               try {
                 const ev = JSON.parse(payload);
+                if (ev.type === "error" || ev.type === "response.failed") {
+                  throw new Error(
+                    `Codex ${ev.type}: ${ev.message || ev.response?.error?.message || "stream failed"}`,
+                  );
+                }
                 if (ev.type === "response.output_text.delta") fullText += ev.delta || "";
-              } catch { /* skip keep-alive fragments */ }
+              } catch (streamErr) {
+                if (streamErr instanceof SyntaxError) continue; // skip keep-alive fragments
+                throw streamErr; // real stream error — propagate to retry loop
+              }
             }
           }
           return fullText;

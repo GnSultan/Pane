@@ -390,6 +390,7 @@ function EngineSelect({
   httpApiKeys = {},
   disabledProviders = [],
   curatedModels = [],
+  openAIAuth = null,
 }: {
   value: string;
   onChange: (opt: EngineOption) => void;
@@ -398,6 +399,7 @@ function EngineSelect({
   httpApiKeys?: Record<string, string>;
   disabledProviders?: string[];
   curatedModels?: string[];
+  openAIAuth?: OpenAIAuthState | null;
 }) {
   // Provider display labels
   const providerLabel = useCallback((provider: string): string => {
@@ -412,6 +414,7 @@ function EngineSelect({
       stepfun: "StepFun",
       xiaomi: "Xiaomi MiMo",
       "z-ai": "Z.ai",
+      openai: "OpenAI",
     };
     return labels[provider] || provider;
   }, []);
@@ -424,6 +427,10 @@ function EngineSelect({
 
     // Track native provider model IDs so OpenRouter can deduplicate
     const nativeModelIds = new Set<string>();
+
+    // OAuth-authenticated openai (ChatGPT subscription via Codex CLI) needs
+    // no API key — the main process dispatches via codexFetch with OAuth tokens.
+    const openAIOAuth = !!openAIAuth?.authenticated;
 
     // Helper: look up pricing from allModels for a provider+id
     const pricingFor = (provider: string, id: string) => {
@@ -461,6 +468,7 @@ function EngineSelect({
       // CLI backends removed — Anthropic and Gemini are always available via API backend
       const isUsable =
         baseProvider === "anthropic" || baseProvider === "gemini" ||
+        (baseProvider === "openai" && openAIOAuth) ||
         !!httpApiKeys?.[baseProvider];
       if (!isUsable) continue;
 
@@ -528,7 +536,7 @@ function EngineSelect({
     }
 
     return groups;
-  }, [allModels, sdkModels, httpApiKeys, disabledProviders, curatedModels, value]);
+  }, [allModels, sdkModels, httpApiKeys, disabledProviders, curatedModels, value, openAIAuth]);
 
   const [isOpen, setIsOpen] = useState(false);
 
@@ -625,13 +633,27 @@ function PaneAutoSection({
   const disabledProviders = useWorkspaceStore((s) => s.disabledProviders);
   const curatedModels = useWorkspaceStore((s) => s.curatedModels);
   const refreshAllModels = useWorkspaceStore((s) => s.refreshAllModels);
+  const [openAIAuth, setOpenAIAuth] = useState<OpenAIAuthState>({
+    authenticated: false,
+    accountId: null,
+  });
+
+  useEffect(() => {
+    paneOpenAIAuthState().then(setOpenAIAuth).catch(() => {});
+  }, []);
 
   // All providers use API keys (CLI backends have been removed).
-  // A provider is usable if it has an API key set OR if it's anthropic/gemini
-  // (which the API backend handles with its own key management).
+  // A provider is usable if it has an API key set, if it's anthropic/gemini
+  // (which the API backend handles with its own key management), or if it's
+  // openai authenticated via ChatGPT OAuth (Codex CLI credentials).
   const isProviderUsable = (provider: string) => {
     const base = provider.replace(/-api$/, "");
-    return base === "anthropic" || base === "gemini" || !!httpApiKeys?.[base];
+    return (
+      base === "anthropic" ||
+      base === "gemini" ||
+      (base === "openai" && openAIAuth.authenticated) ||
+      !!httpApiKeys?.[base]
+    );
   };
 
   // Build a flat list of all usable engines from dynamic data for auto-heal
@@ -651,7 +673,7 @@ function PaneAutoSection({
       }));
     }
     return engines;
-  }, [allModels, httpApiKeys, disabledProviders]);
+  }, [allModels, httpApiKeys, disabledProviders, openAIAuth]);
 
   const autoRoute = useWorkspaceStore((s) => s.autoEscalate);
   const setPowerCombo = useWorkspaceStore((s) => s.setPowerCombo);
@@ -834,6 +856,7 @@ function PaneAutoSection({
                     httpApiKeys={httpApiKeys}
                     disabledProviders={disabledProviders}
                     curatedModels={curatedModels}
+                    openAIAuth={openAIAuth}
                     value={engineKey(thinkingEngine)}
                     onChange={handleThinkingChange}
                   />
@@ -893,6 +916,7 @@ function PaneAutoSection({
                   httpApiKeys={httpApiKeys}
                   disabledProviders={disabledProviders}
                   curatedModels={curatedModels}
+                  openAIAuth={openAIAuth}
                   value={engineKey(buildingEngine)}
                   onChange={handleBuildingChange}
                 />
@@ -1822,7 +1846,25 @@ function VoiceSection() {
   const [testing, setTesting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // One-shot preview session state — cleaned up on re-test, unmount, and
+  // when the line finishes (response.done) or times out.
+  const previewPcRef = useRef<RTCPeerConnection | null>(null);
+  const timeoutRef = useRef<number | null>(null);
+  const cleanupPreview = useCallback((): void => {
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    const pc = previewPcRef.current;
+    if (pc) {
+      pc.ontrack = null;
+      try { pc.close(); } catch { /* already closed */ }
+      previewPcRef.current = null;
+    }
+  }, []);
+  const cleanupPreviewRef = useRef(cleanupPreview);
+  cleanupPreviewRef.current = cleanupPreview;
+  useEffect(() => cleanupPreview, []);
 
   useEffect(() => {
     loadSettings()
@@ -1852,37 +1894,89 @@ function VoiceSection() {
     if (testing || playing) return;
     setTesting(true);
     setTestError(null);
+    // Teardown any previous preview session before starting a new one.
+    cleanupPreviewRef.current();
     try {
+      // Mint an ephemeral token (main process — key never enters here).
+      // Same endpoint as the live session, so the preview uses the SAME
+      // model, voice, and accent steering you'll hear live — the old TTS
+      // path was a different model AND 401'd under ChatGPT OAuth (TTS
+      // needs the api.model.audio.request scope; OAuth tokens lack it).
       const res = (await electronAPI.invoke("voice_preview", { voice })) as {
         ok: boolean;
-        audioB64?: string;
+        token?: string;
         error?: string;
       };
-      if (!res.ok || !res.audioB64) {
+      if (!res.ok || !res.token) {
         setTestError(res.error ?? "preview failed");
         setTesting(false);
         return;
       }
-      // CSP media-src allows blob: but not data: — decode base64 into a Blob.
-      const bin = atob(res.audioB64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mp3" }));
-      const el = new Audio(url);
-      audioRef.current = el;
-      el.onended = () => {
-        URL.revokeObjectURL(url);
-        setPlaying(false);
+
+      // ── Recvonly WebRTC session: play the line, then close ──────────
+      const pc = new RTCPeerConnection();
+      previewPcRef.current = pc;
+      // An offer with NO audio media section is rejected by
+      // /v1/realtime/calls (400 invalid_offer, "Offer did not have an
+      // audio media section"). The live session gets its m=audio line
+      // from pc.addTrack(micTrack); a listen-only preview must add the
+      // transceiver explicitly with direction "recvonly".
+      pc.addTransceiver("audio", { direction: "recvonly" });
+      const audioEl = document.createElement("audio");
+      audioEl.autoplay = true;
+      pc.ontrack = (e) => {
+        audioEl.srcObject = e.streams[0] ?? null;
+        // Explicit play(): the async token mint breaks the direct
+        // user-gesture chain that autoplay alone relies on.
+        void audioEl.play().catch(() => undefined);
       };
-      el.onerror = () => {
-        URL.revokeObjectURL(url);
-        setPlaying(false);
-        setTestError("playback failed — click test again");
+      const dc = pc.createDataChannel("oai-events");
+      dc.onopen = () => {
+        // One-shot: the instructions minted in main carry the line +
+        // accent steering; response.create makes the model say it.
+        dc.send(JSON.stringify({ type: "response.create" }));
       };
+      dc.onmessage = (e: MessageEvent<string>) => {
+        try {
+          const ev = JSON.parse(e.data) as { type?: string };
+          if (ev.type === "response.done") {
+            // Line finished — close the session cleanly.
+            cleanupPreviewRef.current();
+            setPlaying(false);
+          }
+        } catch {
+          /* ignore unparseable preview events */
+        }
+      };
+      // Safety net: never hang forever on a silent session.
+      timeoutRef.current = window.setTimeout(() => {
+        cleanupPreviewRef.current();
+        setPlaying(false);
+        setTestError("preview timed out — try again");
+      }, 20_000);
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const sdpRes = await fetch("https://api.openai.com/v1/realtime/calls", {
+        method: "POST",
+        body: offer.sdp,
+        headers: {
+          Authorization: `Bearer ${res.token}`,
+          "Content-Type": "application/sdp",
+        },
+      });
+      if (!sdpRes.ok) {
+        const body = await sdpRes.text().catch(() => "");
+        cleanupPreviewRef.current();
+        setTestError(`SDP exchange failed ${sdpRes.status}: ${body.slice(0, 200)}`);
+        setTesting(false);
+        return;
+      }
+      await pc.setRemoteDescription({ type: "answer", sdp: await sdpRes.text() });
       setTesting(false);
       setPlaying(true);
-      await el.play();
     } catch (err: unknown) {
+      cleanupPreviewRef.current();
       setTesting(false);
       setPlaying(false);
       setTestError(err instanceof Error ? err.message : String(err));

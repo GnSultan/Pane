@@ -2,16 +2,16 @@ import { useRef, useEffect, useCallback, useMemo, memo, useState, startTransitio
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { usePunk } from "../../hooks/usePunk";
-import { useRealtimeVoice } from "../../hooks/useRealtimeVoice";
 import { useScrollPosition } from "../../hooks/useScrollPosition";
+import { useVoice } from "../VoiceProvider";
 import { MessageBubble } from "./MessageBubble";
 import { InputBar } from "./InputBar";
 import { AskUserCard } from "./AskUserCard";
-import { VoiceFloorGlow } from "./VoiceFloorGlow";
 import { getConversationSlice, listCheckpoints, readFile } from "../../lib/tauri-commands";
 import { restoringProjects } from "../../hooks/useSettingsPersistence";
 import type {
   ConversationMessage,
+  ImageBlock,
   ToolResultBlock,
   ToolUseBlock,
 } from "../../lib/punk-types";
@@ -84,9 +84,8 @@ export const Conversation = memo(function Conversation({
     (s) =>
       s.projects.get(projectId)?.conversation.statusMessage === "thinking...",
   );
-  const projectRoot = useProjectsStore(
-    (s) => s.projects.get(projectId)?.root ?? null,
-  );
+  // NOTE: projectRoot is no longer consumed here — the global voice session
+  // (VoiceProvider) resolves the active project's root imperatively.
   const error = useProjectsStore(
     (s) => s.projects.get(projectId)?.conversation.error ?? null,
   );
@@ -165,52 +164,15 @@ export const Conversation = memo(function Conversation({
   const isActive = isProcessing || isThinking;
   streamingRef.current = isActive;
 
-  // ── Always-on voice relay (OpenAI Realtime) ─────────────────────────────
-  // Voice shares the agent's brain and delegates execution. Agent status is
-  // read imperatively from the store — voice never causes re-renders here.
-  // handleSend is defined below; a ref bridges so delegation never goes stale.
-  const handleSendRef = useRef<(msg: string, minds?: Array<{ id: string }>, phase?: string) => void>(() => {});
+  // ── Voice (global session) ─────────────────────────────────────────────
+  // The voice session lives in VoiceProvider at the app root — one session
+  // for all threads, surviving thread switches. This component keeps only
+  // the send path: delegated work arrives via pane:send-message (below)
+  // through this thread's own usePunk pipeline, exactly like any message.
+  const handleSendRef = useRef<(msg: string, minds?: Array<{ id: string }>, phase?: string, images?: ImageBlock[]) => void>(() => {});
   const pushAgentStatusRef = useRef<(() => void) | null>(null);
-
-  const getAgentStatus = useCallback((): { running: boolean; lastLine: string | null } => {
-    const proj = useProjectsStore.getState().projects.get(projectId);
-    const conv = proj?.conversation;
-    const running = Boolean(
-      conv?.isProcessing || conv?.statusMessage === "thinking...",
-    );
-    let lastLine: string | null = null;
-    if (running && conv?.messages) {
-      const msgs = conv.messages;
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        const m = msgs[i];
-        if (!m || m.type !== "assistant") continue;
-        const blocks = m.content;
-        if (Array.isArray(blocks)) {
-          for (let j = blocks.length - 1; j >= 0; j--) {
-            const b = blocks[j] as { type: string; text?: string } | undefined;
-            if (b?.type === "text" && b.text && b.text.trim()) {
-              lastLine = b.text.trim().slice(0, 200);
-              break;
-            }
-          }
-        }
-        if (lastLine) break;
-      }
-    }
-    return { running, lastLine };
-  }, [projectId]);
-
-  const voice = useRealtimeVoice({
-    projectId,
-    projectRoot: projectRoot,
-    getAgentStatus,
-    onDelegate: (instruction: string, phase: "think" | "build") => {
-      handleSendRef.current(instruction, undefined, phase);
-      // Let voice confirm aloud that the agent picked it up.
-      setTimeout(() => pushAgentStatusRef.current?.(), 1500);
-    },
-  });
-  pushAgentStatusRef.current = voice.pushAgentStatus;
+  const voice = useVoice();
+  if (voice) pushAgentStatusRef.current = voice.pushAgentStatus;
 
   const { applyRestored } = useScrollPosition(projectId, scrollRef, followRef, streamingRef);
 
@@ -327,20 +289,26 @@ export const Conversation = memo(function Conversation({
   }, []);
 
   const handleSend = useCallback(
-    (msg: string, minds?: Array<{ id: string }>, phase?: string) => {
-      sendMessage(msg, minds, phase);
+    (msg: string, minds?: Array<{ id: string }>, phase?: string, images?: ImageBlock[]) => {
+      sendMessage(msg, minds, phase, images);
       scrollToBottom();
     },
     [sendMessage, scrollToBottom],
   );
   handleSendRef.current = handleSend;
 
-  // Listen for send-message events from EmptyState (first message on thread creation)
+  // Listen for send-message events — EmptyState first messages AND voice
+  // delegation (thread-targeted; arrives after the provider switched the
+  // active thread, so this thread is on screen when the instruction lands).
   useEffect(() => {
     const handler = (e: Event) => {
-      const { projectId: targetId, message } = (e as CustomEvent).detail;
+      const { projectId: targetId, message, phase } = (e as CustomEvent).detail as {
+        projectId: string;
+        message: string;
+        phase?: string;
+      };
       if (targetId === projectId && message) {
-        handleSend(message);
+        handleSend(message, undefined, phase);
       }
     };
     window.addEventListener("pane:send-message", handler);
@@ -369,8 +337,6 @@ export const Conversation = memo(function Conversation({
 
   return (
     <div className="relative flex flex-col h-full w-full">
-      {/* Ambient voice light — the room reacts before you look at the orb. */}
-      <VoiceFloorGlow />
       <div
         ref={scrollRef}
         className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto pb-8 pt-8 bg-pane-bg"
@@ -415,6 +381,11 @@ export const Conversation = memo(function Conversation({
               projectId={projectId}
             />
           ))}
+
+          {/* Suspended ask_user turn — rendered in-flow after the question
+              message. The marker stays at the bottom of the conversation for
+              as long as pendingInput lives in the store. */}
+          {pendingInput && <AskUserCard />}
         </div>
       </div>
 
@@ -445,32 +416,26 @@ export const Conversation = memo(function Conversation({
         </div>
       )}
       <div className={`relative z-10 shrink-0 flex flex-col ${sidebarCollapsed ? "max-w-5xl mx-auto w-full" : ""}`}>
-        {pendingInput && (
-          <AskUserCard
-            projectId={projectId}
-            toolId={pendingInput.toolId}
-            question={pendingInput.question}
-            onReply={handleSend}
-          />
-        )}
         <InputBar
           projectId={projectId}
           onSend={handleSend}
           onAbort={abortMessage}
           isProcessing={isProcessing}
-          voice={{
+          isAwaitingInput={!!pendingInput}
+          voice={voice ? {
             state: voice.state,
             error: voice.error,
             transcript: voice.transcript,
-            toggle: () => void voice.toggle(),
+            toggle: voice.toggle,
             interrupt: voice.interrupt,
             micStream: voice.micStream,
             micDevices: voice.micDevices,
             activeMicId: voice.activeMicId,
-            onSelectMic: voice.selectMic,
-            onRefreshMics: () => void voice.refreshMicDevices(),
+            onSelectMic: voice.onSelectMic,
+            onRefreshMics: voice.onRefreshMics,
             audioPulseRef: voice.audioPulseRef,
-          }}
+            modelAnalyserRef: voice.modelAnalyserRef,
+          } : undefined}
         />
       </div>
     </div>

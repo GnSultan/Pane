@@ -323,6 +323,9 @@ export interface SendToPunkOptions {
   todos?: Todo[];
   autoRoute?: boolean;
   minds?: Array<{ id: string }>;
+  /** Image attachments (data URLs) sent with this message — converted to
+   *  provider-native image content blocks by the backend. */
+  images?: Array<{ type: "image"; source: string; label?: string }>;
   /** Per-project power combo: which model to use for each phase.
    *  When present, the backend uses this instead of reading from disk. */
   powerCombo?: PowerCombo;
@@ -492,6 +495,7 @@ export async function sendToPunk(
       powerCombo: opts.powerCombo,
       minds: opts.minds,
       phase: opts.phase,
+      ...(opts.images && opts.images.length > 0 ? { images: opts.images } : {}),
       ...(opts.wasInterrupted ? { wasInterrupted: true } : {}),
       // Mind chat overrides — forwarded when present
       ...(opts.systemPromptOverride ? { systemPromptOverride: opts.systemPromptOverride } : {}),

@@ -199,7 +199,7 @@ function createWorkspaceStore() {
     keybindings: null,
     theme: "system" as Theme,
     completionSound: "none",
-    selectedModel: "stepfun/step-3.5-flash:free",
+    selectedModel: "stepfun/step-3.5-flash",
     selectedModelProvider: "openrouter",
     selectedModelThinking: true,
     sidebarCollapsed: false,

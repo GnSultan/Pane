@@ -5,6 +5,15 @@ export interface TextBlock {
   text: string;
 }
 
+/** Image attached to a user message — pasted from clipboard, downscaled to a data URL. */
+export interface ImageBlock {
+  type: "image";
+  /** data:image/jpeg;base64,... */
+  source: string;
+  /** Display label, e.g. "pasted screenshot" */
+  label?: string;
+}
+
 export interface ToolUseBlock {
   type: "tool_use";
   id: string;
@@ -94,6 +103,7 @@ export interface StrategyBlock {
 
 export type ContentBlock =
   | TextBlock
+  | ImageBlock
   | ToolUseBlock
   | ToolResultBlock
   | ThinkingBlock
@@ -437,7 +447,7 @@ export interface ConversationMessage {
   checkpointId?: string;
   // Set when this message was injected into an already-running task rather
   // than sent as a fresh turn — see classifySteerIntent/steerPunk.
-  deliveryMode?: "steered";
+  deliveryMode?: "steered" | "ask_reply";
   // Present when type === "plan"
   planData?: PlanData;
   // Present on punk-generated turns (bug, reflection, sentinel)

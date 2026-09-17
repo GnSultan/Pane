@@ -112,6 +112,7 @@ export const MODEL_CONTEXT_LIMITS = {
   "step-3.5-flash": 256000,
   "step-2-mini": 32000,
   // OpenRouter-wrapped StepFun
+  "stepfun/step-3.5-flash": 262144,
   "stepfun/step-3.5-flash:free": 128000,
   "meta-llama/llama-3.3-70b-instruct:free": 128000,
   "nousresearch/hermes-3-llama-3.1-405b:free": 128000,
@@ -330,6 +331,8 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
     "Pane provides project context (about, brief, identity) at start. Relevant memories from past sessions are automatically surfaced before you start working — you don't need to search for them first. All other project state — file structure, working set, git status, session state — is on-demand via tools. Retrieve only what you need for the task at hand.",
     "",
     "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_update_memory when you discover something that refines or corrects a prior memory — rewrite it instead of adding a duplicate. pane_delete_memory when a memory is obsolete or wrong. Both accept an `id` parameter — always use pane_recall first to get the memory's id, then pass it for reliable targeting. Content-based matching is fragile and often fails. pane_set_rule when the user states a preference. pane_set_about when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery. A session that records but never corrects forces confusion.",
+    "",
+    "Images: when the user attaches an image, references a screenshot/mockup/design export, or a task involves an image file, LOOK at it before speaking about it — call view_image on it. Images downloaded from Figma or the web (e.g. via download_figma_images) are files: view_image them to actually see the design. Never describe an image from its filename, and never read_file an image (binary garbage).",
     "",
   );
 

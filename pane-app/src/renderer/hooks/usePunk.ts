@@ -41,6 +41,7 @@ import type {
   PunkStreamMessage,
   ConversationMessage,
   ContentBlock,
+  ImageBlock,
   ToolUseBlock,
   ToolResultBlock,
   ThinkingBlock,
@@ -871,7 +872,7 @@ export function usePunk(projectId: string) {
   const messageQueueRef = useRef<Array<{ prompt: string; minds?: Array<{ id: string }>; phase?: string }>>([]);
 
   const sendMessage = useCallback(
-    async (prompt: string, minds?: Array<{ id: string }>, phase?: string) => {
+    async (prompt: string, minds?: Array<{ id: string }>, phase?: string, images?: ImageBlock[]) => {
       const store = useProjectsStore.getState();
       const project = store.projects.get(projectId);
       if (!project) return;
@@ -943,17 +944,16 @@ export function usePunk(projectId: string) {
       const userMessage: ConversationMessage = {
         id: messageId,
         type: "user",
-        content: [{ type: "text", text: displayPrompt }],
+        content: [
+          { type: "text", text: displayPrompt || (images?.length ? "[image]" : "") },
+          ...(images && images.length > 0 ? images : []),
+        ],
         timestamp: Date.now(),
         isStreaming: false,
         phase: effectivePhaseEarly,
+        // Mark the reply so the bubble renders its link to the question above
+        deliveryMode: pendingClear ? "ask_reply" : undefined,
       };
-
-      // If the agent was paused on ask_user, this message IS the reply —
-      // clear the suspended card so it can't outlive its answer.
-      if (pendingClear) {
-        useProjectsStore.getState().clearPendingInput(projectId);
-      }
 
       // Fire-and-forget: persist prompt text for thread list UI
       recordLastPrompt(projectId, displayPrompt, hashString(displayPrompt)).catch(() => {});
@@ -1001,6 +1001,11 @@ export function usePunk(projectId: string) {
         s.setConversationRoutedModel(projectId, null);
         s.setLastMessageStreamingDone(projectId);
 
+        // An ask_user pause ends processing but NOT the turn — the agent is
+        // waiting on the user. Suppress the "task complete" signals (sound,
+        // unread badge) so the session reads as alive, just parked.
+        const awaitingAnswer = !!s.projects.get(projectId)?.conversation.pendingInput;
+
         // Fire-and-forget: persist response summary for thread list UI
         // Re-read store state — setLastMessageStreamingDone above created a new
         // state object, so `s` is stale. The fresh read ensures isStreaming is
@@ -1042,11 +1047,13 @@ export function usePunk(projectId: string) {
           }
         }, 1500);
 
-        useWorkspaceStore.getState().playCompletionSound();
+        if (!awaitingAnswer) {
+          useWorkspaceStore.getState().playCompletionSound();
+        }
 
         if (s.activeProjectId !== projectId) {
           const proj = s.projects.get(projectId);
-          if (proj) {
+          if (proj && !awaitingAnswer) {
             s.setHasUnreadCompletion(projectId, true);
             const evt = new CustomEvent("pane:task-complete", {
               detail: { projectId, projectName: proj.name },
@@ -1497,6 +1504,7 @@ export function usePunk(projectId: string) {
             powerCombo: projectCombo,
             minds,
             phase: effectivePhase,
+            ...(images && images.length > 0 ? { images } : {}),
             ...(wasInterrupted ? { wasInterrupted: true } : {}),
           }
         );

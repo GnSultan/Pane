@@ -358,6 +358,10 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       const q = (input.question as string) || "";
       return q ? q.slice(0, 60) : "";
     }
+    case "view_image": {
+      const p = (input.file_path as string) || (input.path as string) || "";
+      return p ? p.slice(0, 80) : "";
+    }
     case "evaluate_js":
       return "";
     case "web_fetch": {
@@ -399,6 +403,7 @@ function getToolLabel(name: string): string {
     case "deactivate_skill": return "skill";
     case "save_memory": return "memory";
     case "ask_user": return "ask";
+    case "view_image": return "view";
     case "Plan": return "plan";
     case "WebSearch":
     case "google_web_search": return "search";
@@ -844,14 +849,43 @@ function renderExpandedInput(name: string, input: Record<string, unknown>, resul
     case "Bash":
     case "run_shell_command":
       return <ExpandedBashInput input={input} />;
+    case "view_image":
+      return <ExpandedViewImageInput input={input} />;
     default:
       return <ExpandedDefaultInput input={input} />;
   }
 }
 
+/** view_image — the result IS an image. Show the path queried; the model
+ *  received the pixels natively (the result content is just a marker). */
+function ExpandedViewImageInput({ input }: { input: Record<string, unknown> }) {
+  const filePath = (input.file_path as string) || (input.path as string) || "";
+  return (
+    <div className="px-4 py-3 font-mono flex items-center gap-2" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-pane-text-secondary shrink-0">
+        <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+        <circle cx="8.5" cy="8.5" r="1.5" />
+        <polyline points="21 15 16 10 5 21" />
+      </svg>
+      <span className="text-pane-text-secondary truncate">{filePath}</span>
+    </div>
+  );
+}
+
 function formatToolOutput(content: unknown): string {
   if (typeof content !== "string") {
     return JSON.stringify(content, null, 2);
+  }
+
+  // Image envelopes — show the marker, never the base64 payload
+  if (content.startsWith("__PANE_IMG__")) {
+    try {
+      const env = JSON.parse(content.slice("__PANE_IMG__".length));
+      const kb = Math.round(((env.data?.length || 0) * 3) / 4 / 1024);
+      return `[image: ${env.label || "unknown"} — ${kb}KB, shown to the model natively]`;
+    } catch {
+      return "[image result]";
+    }
   }
 
   const trimmed = content.trim();

@@ -5,6 +5,7 @@ import { Profile } from "./Profile";
 import { Mind } from "./Mind";
 import { Lens } from "./Lens";
 import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
+import { VoiceFloorGlow } from "./VoiceFloorGlow";
 import { FuzzyFinder } from "../FuzzyFinder/FuzzyFinder";
 import { FileSearch } from "../FileSearch/FileSearch";
 import { GitStatus } from "../ThreadPanel/GitStatus";
@@ -191,6 +192,10 @@ export function Workspace() {
 
   return (
     <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl overflow-hidden">
+      {/* Voice floor glow — ONE glow for all threads. Mounted above every
+          thread layer so ambient light follows the voice session, not the
+          active thread: switch threads and the room keeps breathing. */}
+      <VoiceFloorGlow />
       {/* Conversation page — participates in the same [data-page] CSS system as every other page.
            Page-level visibility (conversation vs mind vs profile) is CSS-driven.
            Thread switching (project A vs project B) is JS-driven z-index 0/1 inside. */}

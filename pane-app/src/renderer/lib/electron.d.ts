@@ -4,6 +4,8 @@ export interface ElectronAPI {
   send: (channel: string, ...args: unknown[]) => void;
   on: <T = unknown>(channel: string, callback: (data: T) => void) => () => void;
   removeAllListeners: (channel: string) => void;
+  /** Resolve an absolute filesystem path from a dropped File object. */
+  getPathForFile: (file: File) => string;
 }
 
 declare global {

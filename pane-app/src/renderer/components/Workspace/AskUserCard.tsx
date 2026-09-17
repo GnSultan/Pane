@@ -1,89 +1,38 @@
-import { useState, useRef, useEffect, useCallback } from "react";
-
-interface AskUserCardProps {
-  projectId: string;
-  toolId: string;
-  question: string | null;
-  /** Sends the answer through the normal message path — same as typing in InputBar. */
-  onReply?: (message: string) => void;
-}
-
 /**
- * Renders when the agent pauses on ask_user and waits for the user's answer.
+ * In-flow marker for a suspended ask_user turn.
  *
- * The http backend's tool loop pauses after ask_user (awaiting_input event)
- * and resumes when the next user message arrives — so the answer is just a
- * normal message. onReply is wired to the conversation's send path.
+ * The backend pauses the tool loop after ask_user (awaiting_input event) and
+ * resumes when the next user message arrives. The question itself already
+ * renders as a normal assistant message right above this marker — so the
+ * marker never repeats it. It is only the suspended-turn signal in the
+ * conversation flow: the agent's move ended with a question, the next move
+ * is yours, typed in the main input.
  */
-export function AskUserCard({ question, onReply }: AskUserCardProps) {
-  const [answer, setAnswer] = useState("");
-  const [submitted, setSubmitted] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  // Focus the input as soon as the card mounts — the agent is waiting.
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
-
-  const respond = useCallback(
-    (response: string) => {
-      if (submitted) return;
-      setSubmitted(true);
-      // pendingInput is cleared by the send path once the user message lands —
-      // not here — so the card can't outlive its answer.
-      onReply?.(response);
-    },
-    [submitted, onReply],
-  );
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!answer.trim()) return;
-    respond(answer.trim());
-  };
-
-  if (submitted) return null;
-
+export function AskUserCard() {
   return (
-    <div className="px-4 pb-3">
+    <div className="mb-10 flex flex-col items-start animate-fadeIn">
       <div
-        className="rounded-xl bg-pane-surface/60 ring-1 ring-pane-border/20 px-4 py-3 font-mono animate-fade-in"
+        className="inline-flex items-center gap-2.5 font-mono text-pane-text-secondary"
         style={{ fontSize: "var(--pane-font-size-sm)" }}
       >
-        <div className="flex items-center gap-2 mb-3">
-          <span
-            className="shrink-0 opacity-60"
-            style={{
-              color: "var(--pane-terminal)",
-              fontSize: "10px",
-              textTransform: "uppercase",
-              letterSpacing: "0.08em",
-            }}
-          >
-            your move
-          </span>
-        </div>
-        {question && (
-          <div className="text-pane-text mb-3 leading-[1.6] whitespace-pre-wrap">
-            {question}
-          </div>
-        )}
-        <form onSubmit={handleSubmit} className="flex gap-2 items-center">
-          <input
-            ref={inputRef}
-            value={answer}
-            onChange={(e) => setAnswer(e.target.value)}
-            placeholder="type your answer"
-            className="flex-1 bg-transparent outline-none text-pane-text placeholder:text-pane-text-secondary/40"
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          className="shrink-0"
+        >
+          <circle
+            cx="12"
+            cy="12"
+            r="7"
+            fill="none"
+            className="animate-circle-pulse"
           />
-          <button
-            type="submit"
-            disabled={!answer.trim()}
-            className="shrink-0 text-[var(--pane-terminal)] disabled:opacity-30 transition-opacity hover:opacity-70"
-          >
-            send
-          </button>
-        </form>
+        </svg>
+        <span>waiting for your answer</span>
       </div>
     </div>
   );

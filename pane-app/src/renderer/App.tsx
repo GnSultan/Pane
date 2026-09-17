@@ -4,6 +4,7 @@ import { resolveBindings, matchAction } from "./lib/keybindings";
 import { ThreadPanel } from "./components/ThreadPanel/ThreadPanel";
 import { ActiveThreadTabs } from "./components/ActiveThreadTabs";
 import { Workspace } from "./components/Workspace/Workspace";
+import { VoiceProvider } from "./components/VoiceProvider";
 import { TaskNotification } from "./components/shared/TaskNotification";
 import { useWorkspaceStore } from "./stores/workspace";
 import { useProjectsStore } from "./stores/projects";
@@ -247,6 +248,7 @@ function App() {
   }, []);
 
   return (
+    <VoiceProvider>
     <div className="relative h-screen w-screen bg-pane-bg">
       {/* Titlebar drag region — must stay at App root level for full-width coverage.
            z-30 sits above active pages (z-20), below interactive headers (z-40).
@@ -276,6 +278,7 @@ function App() {
 
       <TaskNotification />
     </div>
+    </VoiceProvider>
   );
 }
 
