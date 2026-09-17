@@ -35,6 +35,18 @@ const REFRESH_INTERVAL_MS = 55 * 60 * 1000; // Refresh if last refresh was >55 m
 
 let _cache = null; // { accessToken, accountId, expiresAt, cachedAt }
 let _refreshToken = null;
+// Single-flight refresh (Aug 2026 fix): OpenAI refresh tokens are single-use
+// and rotate on every exchange. Two concurrent getAccessToken() calls (e.g.
+// a retrying turn + a voice session) can both read the SAME refresh token,
+// both POST it, and one burns the rotation — the loser gets exactly the
+// "refresh token has already been used" 401 that killed the Aug 30 session.
+// All refreshes share one promise; late callers await the winner's result.
+let _refreshPromise = null;
+// Terminal auth state: once the server says invalid_grant, retrying with the
+// same dead token is pointless — every stream attempt is a predetermined
+// failure with 2s/4s/6s of ceremony. Set by refresh failure; cleared when
+// the credential file changes on disk (codex login writes a fresh pair).
+let _terminalAuth = null; // { reason, at }
 
 // ── JWT Parsing ────────────────────────────────────────────────────────────
 
@@ -190,28 +202,72 @@ async function refreshViaOAuth(refreshToken) {
 
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      console.warn(`[openai-oauth] Token refresh returned HTTP ${response.status}: ${text.slice(0, 200)}`);
-      return null;
+      // Surface the real error body — it carries the actual reason
+      // ("already been used", "revoked", "expired"), which is the
+      // diagnosis. Burying it behind a generic wrapper hides root cause.
+      let code = null;
+      try {
+        const parsed = JSON.parse(text);
+        code = parsed?.error?.code || parsed?.error?.type || null;
+      } catch {
+        // Body wasn't JSON — code stays null; the raw text is logged below
+      }
+      console.warn(`[openai-oauth] Token refresh returned HTTP ${response.status} (code=${code}): ${text.slice(0, 200)}`);
+
+      // invalid_grant = the refresh token itself is dead (consumed by a
+      // rotation we didn't capture, or revoked server-side). This is
+      // TERMINAL for this token: no retry, no fallback to the stale
+      // access token — both produce doomed streams. The user must
+      // re-authenticate (codex login).
+      // 401 refresh_token_reused is the same terminal condition in a
+      // newer dress: OpenAI returns the "already been used" failure as
+      // HTTP 401 (not 400). Classifying it transient caused an infinite
+      // re-POST loop every ~30s with a known-dead token (Sep 17, 2026:
+      // 46+ consecutive 401s over an hour).
+      const terminal =
+        (response.status === 400 && /invalid_grant|already been used|revoked/i.test(text)) ||
+        (response.status === 401 && /refresh_token_reused|already been used|revoked/i.test(text));
+      return { ok: false, terminal, code, status: response.status };
     }
 
     const data = await response.json();
     if (!data.access_token) {
       console.warn("[openai-oauth] Token refresh response missing access_token");
-      return null;
+      return { ok: false, terminal: false };
     }
 
     return {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token ?? refreshToken,
-      idToken: data.id_token || null,
-      expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000,
-      accountId: deriveAccountId(data.id_token) || deriveAccountId(data.access_token) || null,
+      ok: true,
+      creds: {
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token ?? refreshToken,
+        idToken: data.id_token || null,
+        expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000,
+        accountId: deriveAccountId(data.id_token) || deriveAccountId(data.access_token) || null,
+      },
     };
   } catch (err) {
     clearTimeout(timer);
+    // Network/timeout — transient, retryable on next getAccessToken()
     console.warn("[openai-oauth] Token refresh failed:", err.message);
-    return null;
+    return { ok: false, terminal: false, transient: true };
   }
+}
+
+/**
+ * Single-flight refresh wrapper: concurrent callers share one POST.
+ * Returns { ok, creds? } — winner's outcome for everyone.
+ */
+async function refreshSingleton(refreshToken) {
+  if (_refreshPromise) return _refreshPromise;
+  _refreshPromise = (async () => {
+    try {
+      return await refreshViaOAuth(refreshToken);
+    } finally {
+      _refreshPromise = null;
+    }
+  })();
+  return _refreshPromise;
 }
 
 // ── Write-back ─────────────────────────────────────────────────────────────
@@ -309,6 +365,23 @@ export async function getAccessToken() {
     return creds.accessToken;
   }
 
+  // Terminal auth failure — the stored refresh token is dead (consumed or
+  // revoked). Latching: every subsequent call fails fast with a clear,
+  // actionable message instead of re-POSTing a known-dead token or handing
+  // out the stale access token that produces empty-stream loops.
+  // The latch is scoped to the EXACT dead refresh token: if `codex login`
+  // writes a new pair, the token on disk no longer matches and the latch
+  // self-clears — recovery doesn't depend on invalidateCache being called.
+  if (_terminalAuth && _terminalAuth.refreshToken === creds.refreshToken) {
+    console.warn(`[openai-oauth] Terminal auth state (since ${_terminalAuth.at.toISOString()}) — re-authentication required`);
+    return null;
+  }
+  if (_terminalAuth) {
+    // Different refresh token on disk — codex login happened. Clear.
+    console.log("[openai-oauth] New refresh token detected on disk — clearing terminal auth latch");
+    _terminalAuth = null;
+  }
+
   // Token needs refresh
   const refreshToken = creds.refreshToken || _refreshToken;
   if (!refreshToken) {
@@ -323,9 +396,24 @@ export async function getAccessToken() {
   }
 
   console.log("[openai-oauth] Token needs refresh, refreshing...");
-  const fresh = await refreshViaOAuth(refreshToken);
-  if (!fresh) {
-    // Refresh failed — return existing token as fallback
+  // Single-flight: concurrent callers (retrying turn + voice + models list)
+  // share ONE POST. OpenAI refresh tokens are single-use; parallel use
+  // burns the rotation and manufactures "already been used" failures.
+  const fresh = await refreshSingleton(refreshToken);
+  if (!fresh.ok) {
+    if (fresh.terminal) {
+      // The refresh token itself is dead — latch terminal state. Callers
+      // get null and surface "run codex login again" (they already
+      // null-check and throw that message). No doomed retries.
+      _terminalAuth = { reason: fresh.code || "invalid_grant", at: new Date(), refreshToken };
+      _cache = null;
+      _refreshToken = null;
+      console.error("[openai-oauth] TERMINAL: refresh token is dead (invalid_grant). Run `codex login` to re-authenticate.");
+      return null;
+    }
+    // Transient failure (network/timeout/5xx) — fall back to the existing
+    // token; it may still be accepted (see Aug 30 trace: exp Sep 2, streams
+    // still passed the auth gate even with a dead session).
     _cache = {
       accessToken: creds.accessToken,
       accountId: creds.accountId,
@@ -337,22 +425,22 @@ export async function getAccessToken() {
   }
 
   // Preserve source for write-back
-  fresh._source = creds._source;
-  fresh._sourcePath = creds._sourcePath;
+  fresh.creds._source = creds._source;
+  fresh.creds._sourcePath = creds._sourcePath;
 
   // Write back refreshed tokens
-  writeBackCredentials(fresh);
+  writeBackCredentials(fresh.creds);
 
   _cache = {
-    accessToken: fresh.accessToken,
-    accountId: fresh.accountId,
-    expiresAt: fresh.expiresAt,
+    accessToken: fresh.creds.accessToken,
+    accountId: fresh.creds.accountId,
+    expiresAt: fresh.creds.expiresAt,
     cachedAt: now,
   };
-  _refreshToken = fresh.refreshToken;
+  _refreshToken = fresh.creds.refreshToken;
 
-  console.log("[openai-oauth] Token refreshed, new expiry:", new Date(fresh.expiresAt).toISOString());
-  return fresh.accessToken;
+  console.log("[openai-oauth] Token refreshed, new expiry:", new Date(fresh.creds.expiresAt).toISOString());
+  return fresh.creds.accessToken;
 }
 
 /**
@@ -397,8 +485,12 @@ export function hasOAuthCredentials() {
 
 /**
  * Force a cache invalidation — next getAccessToken() will re-read from source.
+ * Also clears terminal-auth state: if the user runs `codex login`, the fresh
+ * credential pair on disk deserves a clean slate (and the file watcher / next
+ * read will pick it up within the 30s cache TTL anyway).
  */
 export function invalidateCache() {
   _cache = null;
   _refreshToken = null;
+  _terminalAuth = null;
 }
