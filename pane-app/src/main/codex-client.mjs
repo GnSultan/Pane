@@ -55,14 +55,27 @@ export function chatToResponsesInput(messages, systemText) {
       input.push({
         type: "message",
         role: "user",
-        content: typeof msg.content === "string"
-          ? msg.content
-          : msg.content, // normalizeMessages already stringifies arrays
+        content: toResponsesUserContent(msg.content),
       });
       continue;
     }
 
     if (msg.role === "assistant") {
+      // Reasoning items MUST be replayed before the output they produced —
+      // with store:false the server keeps nothing, so dropping them costs
+      // the model its entire chain-of-thought on every tool round-trip.
+      // Original item order within a response: reasoning → text → calls.
+      if (Array.isArray(msg.codex_reasoning_items)) {
+        for (const r of msg.codex_reasoning_items) {
+          // Only items carrying encrypted_content are replayable; summary-only
+          // items have nothing the server can decrypt and may 400 if sent.
+          if (r && r.id && typeof r.encrypted_content === "string") {
+            const item = { type: "reasoning", id: r.id, encrypted_content: r.encrypted_content };
+            if (Array.isArray(r.summary)) item.summary = r.summary;
+            input.push(item);
+          }
+        }
+      }
       // Assistant text
       if (msg.content) {
         input.push({
@@ -86,17 +99,48 @@ export function chatToResponsesInput(messages, systemText) {
     }
 
     if (msg.role === "tool") {
-      // Tool results
+      // Tool results. output must be a STRING — the Responses API rejects
+      // arrays here (images are hoisted out of tool messages by
+      // normalizeMessages into a trailing user message before this point).
       input.push({
         type: "function_call_output",
         call_id: msg.tool_call_id,
-        output: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? ""),
+        output: typeof msg.content === "string"
+          ? msg.content
+          : JSON.stringify(msg.content ?? ""),
       });
       continue;
     }
   }
 
   return input;
+}
+
+/**
+ * Map chat-style user content to the Responses-API content shape.
+ * Strings pass through. Arrays of parts become Responses content parts:
+ *   {type:"text"} → {type:"input_text", text}
+ *   {type:"image_url", image_url:{url}} → {type:"input_image", image_url}
+ *   {type:"image", source:"data:…"} → {type:"input_image", image_url}
+ * Unknown part types are dropped rather than sent (server 400s on them).
+ * Returns "" for empty content so the API never sees a null.
+ */
+export function toResponsesUserContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content == null ? "" : content;
+  const parts = [];
+  for (const c of content) {
+    if (!c || typeof c !== "object") continue;
+    if (c.type === "text" && typeof c.text === "string") {
+      parts.push({ type: "input_text", text: c.text });
+    } else if (c.type === "image_url" && c.image_url?.url) {
+      parts.push({ type: "input_image", image_url: c.image_url.url });
+    } else if (c.type === "image" && typeof c.source === "string" && c.source.startsWith("data:")) {
+      // Renderer data-URL block → Responses input_image (data URLs allowed)
+      parts.push({ type: "input_image", image_url: c.source });
+    }
+  }
+  return parts.length > 0 ? parts : "";
 }
 
 function safeArgs(tc) {
@@ -141,6 +185,11 @@ export function buildResponsesRequest(body) {
     input: chatToResponsesInput(chatMessages),
     store: false,
     stream: true, // MANDATORY — server rejects non-streaming
+    // Ask for encrypted reasoning payloads. With store:false this is the only
+    // way reasoning items become replayable across tool round-trips —
+    // output_item.done then carries encrypted_content, which
+    // responsesEventToChatChunks captures and chatToResponsesInput replays.
+    include: ["reasoning.encrypted_content"],
   };
 
   if (body.tools?.length) {
@@ -208,6 +257,20 @@ export function responsesEventToChatChunks(ev) {
             },
           }],
         });
+      } else if (item?.type === "reasoning") {
+        // Reasoning model finished a reasoning block. Capture the replayable
+        // item — with store:false the server discards all state, so the ONLY
+        // way the model keeps its chain-of-thought across a tool round-trip
+        // is Pane sending this item back in the next request's input.
+        // Only items with encrypted_content are replayable; summary-only
+        // items carry nothing the server can decrypt.
+        if (item.id && typeof item.encrypted_content === "string") {
+          const captured = { id: item.id, encrypted_content: item.encrypted_content };
+          if (Array.isArray(item.summary)) captured.summary = item.summary;
+          chunks.push({
+            choices: [{ delta: { codex_reasoning_item: captured } }],
+          });
+        }
       }
       break;
     }

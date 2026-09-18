@@ -2177,6 +2177,13 @@ export class ApiBackend extends PunkBackend {
         if (isOpenAI) {
           const assistantMsg = { role: "assistant", content: "" };
 
+          // Codex OAuth transport: replayable reasoning items must survive
+          // normalization — chatToResponsesInput sends them back to keep the
+          // model's chain-of-thought across tool round-trips (store:false).
+          if (Array.isArray(msg.codex_reasoning_items)) {
+            assistantMsg.codex_reasoning_items = msg.codex_reasoning_items;
+          }
+
           // 1. Extract potential reasoning (verbatim field or from thinking blocks)
           let reasoning = undefined;
           if (msg.reasoning_content !== undefined) {
@@ -4778,6 +4785,15 @@ export class ApiBackend extends PunkBackend {
           if (deepseekThinking || zaiThinking) {
             assistantEntry.reasoning_content = state.thinking;
           }
+          // Codex OAuth transport: carry replayable reasoning items into the
+          // conversation history. normalizeMessages preserves this field on
+          // OpenAI assistant messages, and chatToResponsesInput replays them
+          // before the assistant's text/tool_calls on the next round-trip —
+          // required with store:false or the model loses its chain-of-thought
+          // after every tool call.
+          if (Array.isArray(state.codexReasoningItems) && state.codexReasoningItems.length > 0) {
+            assistantEntry.codex_reasoning_items = state.codexReasoningItems;
+          }
           messages.push(assistantEntry);
           journal.append(assistantEntry, { turn, phase: "response" });
 
@@ -6163,6 +6179,25 @@ export class ApiBackend extends PunkBackend {
     let finalBody = body;
     const userTag = `pane-project-${request?.projectId?.slice(0, 8) || "unknown"}`;
 
+    // codex_reasoning_items is codex-transport-only state (replayable
+    // reasoning for store:false round-trips). The codex path consumes it in
+    // buildResponsesRequest; strict providers (DeepSeek serde) reject unknown
+    // fields, so every non-codex request gets a mapped copy without it.
+    // body.messages itself is NEVER mutated — it's the live conversation
+    // array the codex round-trips still need.
+    if (
+      body.messages &&
+      body.messages.some((m) => m.codex_reasoning_items) &&
+      apiConfig.authType !== "openai-oauth"
+    ) {
+      finalBody = {
+        ...body,
+        messages: body.messages.map(
+          ({ codex_reasoning_items: _c, ...rest }) => rest,
+        ),
+      };
+    }
+
     // Extract _tiers metadata from system messages. Used by Anthropic for
     // cache breakpoints and prefix-cache providers for frozen/session split.
     // NOT deleted from the original message — persists across tool loop
@@ -7162,6 +7197,18 @@ export class ApiBackend extends PunkBackend {
       case "stepfun": {
         const delta = event.choices?.[0]?.delta;
         const hasDeltaToolCalls = !!delta?.tool_calls?.length;
+
+        // Codex transport: replayable reasoning item (from
+        // response.output_item.done). Collected so the turn-finalizer can
+        // attach it to the assistant entry — chatToResponsesInput sends it
+        // back on the next round-trip, preserving the model's chain of
+        // thought across tool calls (store:false keeps nothing server-side).
+        if (delta?.codex_reasoning_item?.id) {
+          if (!Array.isArray(state.codexReasoningItems)) {
+            state.codexReasoningItems = [];
+          }
+          state.codexReasoningItems.push(delta.codex_reasoning_item);
+        }
 
         if (!hasDeltaToolCalls && state.toolUses.size === 0) {
           if (delta?.content) content = delta.content;
