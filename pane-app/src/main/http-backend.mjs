@@ -1842,6 +1842,36 @@ function stripToolHistory(messages) {
     });
 }
 
+// ── Plan-limit error classification ─────────────────────────────────────────
+// A 429 whose body identifies a plan/quota limit (Anthropic usage_limit_reached,
+// Z.ai balance/resource exhaustion) is NOT congestion: retrying is predetermined
+// failure because the limit cannot clear mid-loop. Every retry gate (stream-path
+// network catch, per-turn catch, session auto-resume) must classify these errors
+// as terminal and propagate them to the user instead of blind-retrying.
+// Phrases must stay in sync with the friendly messages thrown at the detection
+// sites (grep "usage_limit_reached") and formatZaiQuotaError (provider-monitor.mjs).
+export function isPlanLimitError(message) {
+  const msg = (message || "").toLowerCase();
+  if (msg.includes("usage_limit_reached")) return true;
+  if (msg.includes("anthropic") && msg.includes("limit reached")) return true;
+  if (msg.includes("z.ai")) {
+    return (
+      msg.includes("quota") ||
+      msg.includes("balance") ||
+      msg.includes("resource package") ||
+      msg.includes("recharge") ||
+      msg.includes("limit reached") ||
+      msg.includes("fair usage") ||
+      msg.includes("coding plan") ||
+      msg.includes("package issue") ||
+      // 1311 — plan-tier mismatch: no plan keywords at all in the message
+      msg.includes("doesn't include this model") ||
+      msg.includes("does not include this model")
+    );
+  }
+  return false;
+}
+
 export class ApiBackend extends PunkBackend {
   get supportsToolCalling() {
     return true;
@@ -4216,7 +4246,11 @@ export class ApiBackend extends PunkBackend {
                         },
                         request.requestId,
                       );
-                      throw new Error(friendlyMsg);
+                      // _noRetry stops the network catch below from re-fetching
+                      // 7 more times — the plan limit cannot clear mid-loop.
+                      const fatal = new Error(friendlyMsg);
+                      fatal._noRetry = true;
+                      throw fatal;
                     }
                   }
 
@@ -4254,8 +4288,12 @@ export class ApiBackend extends PunkBackend {
                         request.requestId,
                       );
 
-                      // Surface the friendly error, not raw JSON
-                      throw new Error(friendlyMsg);
+                      // Surface the friendly error, not raw JSON.
+                      // _noRetry stops the network catch below from re-fetching
+                      // 7 more times — quota exhaustion can't clear mid-loop.
+                      const fatal = new Error(friendlyMsg);
+                      fatal._noRetry = true;
+                      throw fatal;
                     }
 
                     // Preserve body for error message if we exhaust retries
@@ -4376,6 +4414,13 @@ export class ApiBackend extends PunkBackend {
               // Network-level failures: 7+ retries with progressive backoff
               if (err.name === "AbortError") {
                 // User cancelled — don't retry
+                throw err;
+              }
+
+              // Plan-limit / quota-exhaustion errors are terminal — the limit
+              // cannot clear mid-loop. Propagate immediately; the banner was
+              // already emitted at the detection site.
+              if (err._noRetry || isPlanLimitError(err.message)) {
                 throw err;
               }
 
@@ -5499,6 +5544,11 @@ export class ApiBackend extends PunkBackend {
         } catch (turnError) {
           // Per-turn error handling — retry recoverable errors inside the loop
           if (turnError.name === "AbortError") throw turnError; // propagate to outer
+          // Plan-limit errors are terminal — no amount of turn retries or
+          // checkpoint restores will clear a provider plan limit. Propagate.
+          if (turnError._noRetry || isPlanLimitError(turnError.message)) {
+            throw turnError;
+          }
           const isRecoverable = (err) => {
             const msg = (err.message || "").toLowerCase();
             return (
@@ -5985,8 +6035,17 @@ export class ApiBackend extends PunkBackend {
         error.message?.includes("forbidden") ||
         /openai oauth token (expired|unavailable)/i.test(error.message || "");
       const isValidationError = error.message?.includes("HTTP 400");
+      // Plan-limit errors are terminal: respawning replays the journal into the
+      // same 429 wall two more times (Sep 19 trace: 8 fetches × 3 turn retries
+      // × 2 session respawns ≈ 6 minutes of silent blind retries before the
+      // user saw the real error). Fail the session with the actionable truth.
+      const isPlanLimit =
+        error._noRetry || isPlanLimitError(error.message);
       const isRecoverable =
-        error.name !== "AbortError" && !isAuthError && !isValidationError;
+        error.name !== "AbortError" &&
+        !isAuthError &&
+        !isValidationError &&
+        !isPlanLimit;
 
       if (isRecoverable && this._sessionRetryCount < 2) {
         this._sessionRetryCount++;
