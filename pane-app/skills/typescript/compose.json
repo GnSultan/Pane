@@ -1,0 +1,10 @@
+{
+  "name": "typescript",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["typescript", "type-safety", "static-analysis"],
+  "tags": ["typescript", "types", "errors", "prevention"],
+  "priority": 5
+}

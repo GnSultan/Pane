@@ -196,8 +196,16 @@ export async function explore(query, projectId, projectRoot, options = {}) {
   // ── 2. Symbol resolution ──────────────────────────────────────────
   let allSymbols = [];
   try {
-    const symbolsPath = path.join(PANE_DIR, "brain", "symbols", `${projectId}.json`);
-    const exported = JSON.parse(fs.readFileSync(symbolsPath, "utf-8"));
+    const { resolveProjectScope } = await import("./root-scope.mjs");
+    const scopeIds = resolveProjectScope(projectId);
+    let exported = null;
+    for (const sid of scopeIds) {
+      const symbolsPath = path.join(PANE_DIR, "brain", "symbols", `${sid}.json`);
+      try {
+        const candidate = JSON.parse(fs.readFileSync(symbolsPath, "utf-8"));
+        if (candidate?.symbols?.length > 0) { exported = candidate; break; }
+      } catch { /* try next sibling */ }
+    }
     if (exported?.symbols) {
       allSymbols = scoreSymbols(exported.symbols, query).slice(0, 15);
     }

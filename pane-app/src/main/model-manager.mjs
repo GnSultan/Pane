@@ -126,7 +126,7 @@ class ModelManager {
       // from the API too — richer data, and works without a CLI installed.
       // "anthropic" and "gemini" (no -api) are populated by CLI prefetch, not here.
       // "anthropic-api" and "gemini-api" are HTTP-fetched when user has API keys.
-      const providers = ["openrouter", "deepseek", "gemini-api", "anthropic-api", "xiaomi", "z-ai"];
+      const providers = ["openrouter", "deepseek", "gemini-api", "anthropic-api", "xiaomi", "z-ai", "kimi", "openai"];
       const results = await Promise.allSettled(
         providers.map(p => this.refreshModels(p))
       );
@@ -188,6 +188,12 @@ class ModelManager {
           break;
         case "z-ai":
           newModels = await this.backend.getZaiModels();
+          break;
+        case "kimi":
+          newModels = await this.backend.getKimiModels();
+          break;
+        case "openai":
+          newModels = await this.backend.getOpenAIModels();
           break;
         default:
           return false;

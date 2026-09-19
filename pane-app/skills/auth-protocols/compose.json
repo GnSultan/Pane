@@ -1,0 +1,10 @@
+{
+  "name": "auth-protocols",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["auth-protocols", "authentication", "authorization", "oauth", "jwt", "sessions", "webauthn"],
+  "tags": ["auth", "oauth", "oidc", "jwt", "sessions", "webauthn", "rbac", "authorization"],
+  "priority": 5
+}

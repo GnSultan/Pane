@@ -1198,13 +1198,13 @@ export function formatGuidanceForContext(suggestions) {
 }
 
 // ============================================================================
-// Verdict as follow-up prompt — for CLI backends where Pane can't inject
-// into the system prompt mid-session. Instead, sends a follow-up user message.
+// Verdict as follow-up prompt — unused since CLI backends were removed, but
+// kept for potential re-use as a correction injection mechanism.
 // ============================================================================
 
 /**
  * Format a verdict as a user-facing prompt for the model to fix issues.
- * Used by CLI backend follow-up mechanism.
+ * Unused since CLI backends were removed — kept for potential re-use.
  *
  * @param {ArbiterVerdict} verdict
  * @returns {string}

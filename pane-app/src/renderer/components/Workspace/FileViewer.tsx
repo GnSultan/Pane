@@ -191,20 +191,9 @@ export function FileViewer() {
           console.error("Auto-save failed:", err);
         }
       }, 800);
-      
-      // Scroll to bottom to show the last edit position
-      if (editorRef.current) {
-        const editor = editorRef.current.editor;
-        const session = editor.session;
-        const lineCount = session.getLength();
-        const lineHeight = editor.renderer.lineHeight;
-        const scrollerHeight = editor.renderer.scroller.clientHeight;
-        
-        // Calculate scroll position to show the bottom of the file
-        // Keep the last few lines visible
-        const targetScrollTop = (lineCount * lineHeight) - (scrollerHeight * 0.7);
-        editor.session.setScrollTop(Math.max(0, targetScrollTop));
-      }
+      // Do not touch scroll position here — user is editing at their chosen
+      // location. Agent write scroll tracking is handled by the isProcessing
+      // RAF loop (followRef), which only runs during AI processing.
     },
     [activeFilePath, activeProjectId],
   );

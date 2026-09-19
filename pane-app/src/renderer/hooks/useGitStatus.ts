@@ -17,6 +17,7 @@ export function useGitStatus() {
       if (cancelled) return;
       const state = useProjectsStore.getState();
       for (const [projectId, project] of state.projects) {
+        if (!project.root) continue; // unbound thread — nothing to check
         const now = Date.now();
         const lastFetch = lastFetchRef.current.get(projectId) ?? 0;
         if (now - lastFetch < 3000) continue;

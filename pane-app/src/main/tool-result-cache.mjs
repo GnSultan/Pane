@@ -71,6 +71,19 @@ export function storeRaw(projectId, turnIndex, seq, entry) {
 export function summarize(toolName, rawContent) {
   if (!rawContent) return `(${toolName}: empty result)`;
 
+  // Image envelopes — never inline base64 fragments into the summary.
+  // Non-fresh turns send the summary as the tool result content; the model
+  // should see a clean marker, not kilobytes of alphabet soup.
+  if (typeof rawContent === "string" && rawContent.startsWith("__PANE_IMG__")) {
+    try {
+      const env = JSON.parse(rawContent.slice("__PANE_IMG__".length));
+      const kb = Math.round(((env.data?.length || 0) * 3) / 4 / 1024);
+      return `(view_image: ${env.label || "image"} shown to model as native image, ${kb}KB — use view_image again if you need to re-examine it)`;
+    } catch {
+      return "(view_image: image result)";
+    }
+  }
+
   // Type guard — tool results can be objects (pane_read_files, pane_directory, etc.)
   if (typeof rawContent !== "string") {
     rawContent =

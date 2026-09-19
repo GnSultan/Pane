@@ -680,103 +680,18 @@ export function recordPlaybookFeedback(db, projectId, verdict) {
 // One-time migration — archive the dead weight
 // ============================================================================
 
-// Session exhaust that accumulated in the graph but belongs to handoff/journal
-// state (which has its own storage in ~/.pane/session and events.jsonl).
-const EXHAUST_TYPES = ["accomplishment", "command", "intent", "discovery", "blocker", "file_edit"];
-
-/**
- * Clean the graph of nodes that never earned their place:
- *   - "principle" nodes from the old runaway consolidation (126K+, ~0 accessed)
- *   - journaling exhaust types that were never meant to be knowledge
- * Only zero-access nodes are touched — anything ever recalled survives.
- * Guarded by a syntheses marker; runs once.
- */
-export function runPlaybookMigration(db) {
-  ensurePlaybookSchema(db);
-  if (getSynthesis(db, "__global__", "playbook-migration")) {
-    return { skipped: "already-ran" };
-  }
-
-  const started = Date.now();
-  const targets = db.prepare(`
-    SELECT id FROM nodes
-    WHERE access_count = 0
-      AND entity_type IN ('principle', ${EXHAUST_TYPES.map(() => "?").join(",")})
-  `).all(...EXHAUST_TYPES);
-
-  const ids = targets.map((r) => r.id);
-  let deleted = 0;
-
-  const purge = db.transaction((batch) => {
-    for (const id of batch) {
-      db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(id);
-      db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(id, id);
-      db.prepare("DELETE FROM nodes WHERE id = ?").run(id);
-      deleted++;
-    }
-  });
-
-  // Batch to keep transactions bounded
-  for (let i = 0; i < ids.length; i += 5000) {
-    purge(ids.slice(i, i + 5000));
-  }
-
-  putSynthesis(db, "__global__", "playbook-migration", `deleted=${deleted}`, "");
-
-  // Retire digest.txt — the old graduation target. It accumulated raw
-  // session dumps (the graduation filter was confidence≥0.9 on nodes born
-  // at 0.95 ceiling) and nothing injected it. Playbooks replace it.
-  try {
-    const digestPath = path.join(PANE_DIR, "profile", "digest.txt");
-    if (fs.existsSync(digestPath)) {
-      fs.renameSync(digestPath, digestPath + ".pre-playbook.bak");
-    }
-  } catch {}
-
-  // Reclaim space. One-time synchronous cost in the utility process —
-  // queued messages wait, nothing breaks.
-  let vacuumMs = 0;
-  try {
-    const vStart = Date.now();
-    db.exec("VACUUM");
-    vacuumMs = Date.now() - vStart;
-  } catch (err) {
-    console.warn(`[playbook] VACUUM failed (non-fatal): ${err.message}`);
-  }
-
-  console.log(
-    `[playbook] migration: deleted ${deleted} dead nodes in ${Date.now() - started - vacuumMs}ms, ` +
-    `VACUUM ${vacuumMs}ms`
-  );
-  return { deleted, vacuumMs };
-}
-
-// Dead node types that never earn recall: profile_atom (session-derived, never
-// accessed) and raw error nodes (superseded by error_fix). file/project/symbol
-// are load-bearing code intelligence and are deliberately NOT touched.
-const HYGIENE_DEAD_TYPES = ["profile_atom", "error"];
 const MAX_NODE_VERSIONS = 3;   // Keep the latest few revisions per node, not full history
 
 /**
- * One-time storage hygiene on the brain graph:
- *   - trim node_versions to the latest N per node (edit history the playbook
- *     engine never reads — pure write log)
- *   - purge zero-access dead-type nodes
- *   - VACUUM to reclaim the freed pages
- * Guarded by a syntheses marker; runs once per brain.db.
+ * Ongoing storage maintenance — trim node_versions history.
+ * Old versions are pure write log that the playbook engine never reads.
+ * Runs every lifecycle cycle (cheap: only touches excess versions).
  */
 export function runStorageHygiene(db) {
   ensurePlaybookSchema(db);
-  if (getSynthesis(db, "__global__", "storage-hygiene-v1")) {
-    return { skipped: "already-ran" };
-  }
-
-  const started = Date.now();
   let versionsDeleted = 0;
-  let nodesDeleted = 0;
 
   try {
-    // Trim node_versions: keep only the latest MAX_NODE_VERSIONS per node.
     const vres = db.prepare(`
       DELETE FROM node_versions WHERE rowid IN (
         SELECT rowid FROM (
@@ -791,95 +706,10 @@ export function runStorageHygiene(db) {
     console.warn(`[playbook] node_versions trim failed (non-fatal): ${err.message}`);
   }
 
-  try {
-    const dead = db.prepare(`
-      SELECT id FROM nodes
-      WHERE access_count = 0
-        AND entity_type IN (${HYGIENE_DEAD_TYPES.map(() => "?").join(",")})
-    `).all(...HYGIENE_DEAD_TYPES);
-    const ids = dead.map((r) => r.id);
-
-    const purge = db.transaction((batch) => {
-      for (const id of batch) {
-        db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(id);
-        db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(id, id);
-        db.prepare("DELETE FROM nodes WHERE id = ?").run(id);
-        nodesDeleted++;
-      }
-    });
-    for (let i = 0; i < ids.length; i += 5000) {
-      purge(ids.slice(i, i + 5000));
-    }
-  } catch (err) {
-    console.warn(`[playbook] dead node purge failed (non-fatal): ${err.message}`);
+  if (versionsDeleted > 0) {
+    console.log(`[playbook] storage hygiene: trimmed ${versionsDeleted} node versions`);
   }
-
-  putSynthesis(db, "__global__", "storage-hygiene-v1",
-    `versions=${versionsDeleted} nodes=${nodesDeleted}`, "");
-
-  let vacuumMs = 0;
-  try {
-    const vStart = Date.now();
-    db.exec("VACUUM");
-    vacuumMs = Date.now() - vStart;
-  } catch (err) {
-    console.warn(`[playbook] hygiene VACUUM failed (non-fatal): ${err.message}`);
-  }
-
-  console.log(
-    `[playbook] storage hygiene: trimmed ${versionsDeleted} node versions, ` +
-    `purged ${nodesDeleted} dead nodes in ${Date.now() - started - vacuumMs}ms, VACUUM ${vacuumMs}ms`
-  );
-  return { versionsDeleted, nodesDeleted, vacuumMs };
-}
-
-/**
- * One-time corpus cleanup: purge auto-generated error_fix noise.
- *
- * Before the surprise-gated extractor landed, tool/shell errors were captured
- * verbatim as "error_fix" nodes with the template text `Fixed: <raw error>`
- * ("Fixed: File does not exist", "Fixed: <tool_use_error>...", "Fixed: Unknown
- * tool: Read"). These carry no lesson — they echo the error. Genuine fixes
- * explain a root cause and never match this template. We purge only the
- * zero-access templated echoes, so any that were ever recalled survive.
- * Guarded by its own marker; runs once.
- */
-export function runCorpusCleanup(db) {
-  ensurePlaybookSchema(db);
-  if (getSynthesis(db, "__global__", "corpus-cleanup-v1")) {
-    return { skipped: "already-ran" };
-  }
-
-  let purged = 0;
-  try {
-    // The stored content is JSON: {"text":"Fixed: ...","metadata":{...}}.
-    // Match the templated echo at the start of the text field, zero-access only.
-    const noise = db.prepare(`
-      SELECT id FROM nodes
-      WHERE entity_type = 'error_fix'
-        AND access_count = 0
-        AND content LIKE '{"text":"Fixed: %'
-    `).all();
-    const ids = noise.map((r) => r.id);
-
-    const purge = db.transaction((batch) => {
-      for (const id of batch) {
-        db.prepare("DELETE FROM node_versions WHERE node_id = ?").run(id);
-        db.prepare("DELETE FROM edges WHERE source_id = ? OR target_id = ?").run(id, id);
-        db.prepare("DELETE FROM nodes WHERE id = ?").run(id);
-        purged++;
-      }
-    });
-    for (let i = 0; i < ids.length; i += 5000) {
-      purge(ids.slice(i, i + 5000));
-    }
-  } catch (err) {
-    console.warn(`[playbook] corpus cleanup failed (non-fatal): ${err.message}`);
-  }
-
-  putSynthesis(db, "__global__", "corpus-cleanup-v1", `purged=${purged}`, "");
-  console.log(`[playbook] corpus cleanup: purged ${purged} templated error_fix echoes`);
-  return { purged };
+  return { versionsDeleted };
 }
 
 // ============================================================================

@@ -1,14 +1,29 @@
 import { useState, useCallback, useRef, useEffect, useLayoutEffect, forwardRef, useImperativeHandle } from "react";
 import { measureCaretPos } from "../../lib/measure-caret";
 
+/** Image MIME types the canvas pipeline can decode + re-encode losslessly-enough
+ *  for inline attachment. Animated GIF, SVG, and TIFF intentionally excluded —
+ *  they keep the file-path route so the original file stays intact. */
+const INLINE_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/bmp",
+]);
+
 export interface CaretTextAreaProps extends React.TextareaHTMLAttributes<HTMLTextAreaElement> {
   minHeight?: number;
   maxHeight?: number;
   autoResize?: boolean;
+  /** Called when files/folders are dropped onto the textarea. paths are absolute filesystem paths. */
+  onDropFiles?: (paths: string[]) => void;
+  /** Called when an image is pasted from the clipboard or dropped as a file.
+   *  sourceName carries the dropped file's name (undefined for clipboard). */
+  onPasteImage?: (blob: Blob, sourceName?: string) => void;
 }
 
 export const CaretTextArea = forwardRef<HTMLTextAreaElement, CaretTextAreaProps>(
-  ({ value = "", onChange, onFocus, onBlur, onKeyDown, onScroll, placeholder, className, style, minHeight = 56, maxHeight = 400, autoResize = true, ...props }, ref) => {
+  ({ value = "", onChange, onFocus, onBlur, onKeyDown, onScroll, placeholder, className, style, minHeight = 56, maxHeight = 400, autoResize = true, onDropFiles, onPasteImage, ...props }, ref) => {
     const internalRef = useRef<HTMLTextAreaElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [caretPos, setCaretPos] = useState<{ top: number; left: number; lineHeight: number; fontSize: number } | null>(null);
@@ -73,8 +88,99 @@ export const CaretTextArea = forwardRef<HTMLTextAreaElement, CaretTextAreaProps>
       ...style,
     };
 
+    // Drag-and-drop: extract filesystem paths from dropped files
+    const [dragOver, setDragOver] = useState(false);
+    const dragEnabled = Boolean(onDropFiles || onPasteImage);
+    const handleDragOver = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer.types.includes("Files")) {
+        e.dataTransfer.dropEffect = "copy";
+        setDragOver(true);
+      }
+    }, []);
+    const handleDragLeave = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // Only set false if we're leaving the container itself (not a child)
+      if (e.currentTarget === e.target) setDragOver(false);
+    }, []);
+    const handleDrop = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragOver(false);
+      if (!onDropFiles) return;
+      const files = e.dataTransfer.files;
+      if (!files || files.length === 0) return;
+      const paths: string[] = [];
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i] as File & { path?: string };
+        // In sandboxed renderers File.path is undefined; webUtils (exposed via
+        // preload) is the supported replacement. It must be called synchronously
+        // with the live File object.
+        const filePath = file.path ?? window.electronAPI?.getPathForFile?.(file);
+        if (!filePath) continue;
+        // Canvas-encodable images become inline attachments (same pipeline as
+        // paste). Others keep the path route: animated GIFs would lose motion
+        // in a canvas re-encode, and SVG/TIFF aren't decodable everywhere —
+        // the model can still view_image the original file by path.
+        if (onPasteImage && INLINE_IMAGE_TYPES.has(file.type)) {
+          onPasteImage(file, file.name);
+        } else {
+          paths.push(filePath);
+        }
+      }
+      if (paths.length > 0) onDropFiles(paths);
+    }, [onDropFiles, onPasteImage]);
+
+    // Clipboard image paste — pull image blobs out before the default paste
+    // (which would do nothing useful with binary). Text pastes pass through.
+    const handlePaste = useCallback((e: React.ClipboardEvent) => {
+      if (!onPasteImage) return;
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item && item.type.startsWith("image/")) {
+          const blob = item.getAsFile();
+          if (blob) {
+            e.preventDefault();
+            onPasteImage(blob);
+            return;
+          }
+        }
+      }
+    }, [onPasteImage]);
+
     return (
-      <div ref={containerRef} className={`relative overflow-hidden ${className || ""}`}>
+      <div
+        ref={containerRef}
+        className={`relative overflow-hidden ${className || ""}`}
+        onDragOver={dragEnabled ? handleDragOver : undefined}
+        onDragLeave={dragEnabled ? handleDragLeave : undefined}
+        onDrop={dragEnabled ? handleDrop : undefined}
+      >
+        {/* Drop indicator — dashed accent border when dragging files over */}
+        {dragOver && (
+          <div
+            aria-hidden
+            className="absolute inset-0 z-10 pointer-events-none rounded-xl flex items-center justify-center"
+            style={{
+              border: "2px dashed var(--pane-accent)",
+              background:
+                "color-mix(in oklab, var(--pane-bg) 82%, transparent)",
+            }}
+          >
+            <span
+              className="text-xs"
+              style={{ color: "var(--pane-accent)" }}
+            >
+              {onPasteImage
+                ? "drop images to attach · drop files to insert paths"
+                : "drop files to insert paths"}
+            </span>
+          </div>
+        )}
         <textarea
           {...props}
           ref={internalRef}
@@ -82,6 +188,7 @@ export const CaretTextArea = forwardRef<HTMLTextAreaElement, CaretTextAreaProps>
           placeholder={placeholder}
           onChange={onChange}
           onKeyDown={onKeyDown}
+          onPaste={handlePaste}
           onFocus={(e) => {
             setFocused(true);
             updateCaret();

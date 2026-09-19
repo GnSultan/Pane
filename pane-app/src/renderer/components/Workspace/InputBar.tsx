@@ -2,10 +2,12 @@ import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } fr
 import { useProjectsStore } from "../../stores/projects";
 import { useWorkspaceStore } from "../../stores/workspace";
 import { useShallow } from "zustand/react/shallow";
-import type { Todo } from "../../lib/punk-types";
+import type { Todo, ImageBlock } from "../../lib/punk-types";
 import { isThinkingModel } from "../../lib/models";
 import { showFilePicker, brainMindGetAll, brainMindAdd, type MindEntry } from "../../lib/tauri-commands";
+import { prepareClipboardImage } from "../../lib/clipboard-image";
 import { useMindStore } from "../../stores/mind";
+import { VoiceOrb } from "./VoiceOrb";
 import { CaretTextArea } from "../shared";
 
 const EMPTY_TODOS: Todo[] = [];
@@ -63,81 +65,55 @@ function formatRelativeTime(epochMs: number): string {
 }
 
 function RateLimitIndicator() {
-  const info = useWorkspaceStore((s) => s.rateLimitInfo);
-  const provider = useWorkspaceStore((s) => s.selectedModelProvider);
-  const sdkAccount = useWorkspaceStore((s) => s.sdkAccount);
-  const setRateLimitInfo = useWorkspaceStore((s) => s.setRateLimitInfo);
+  const activeProjectId = useProjectsStore((s) => s.activeProjectId);
+  const projectProvider = useProjectsStore(
+    (s) => (activeProjectId ? s.projects.get(activeProjectId)?.selectedModelProvider : undefined) ?? null,
+  );
+  const wsProvider = useWorkspaceStore((s) => s.selectedModelProvider);
+  // Per-project provider takes priority, matching how InputBar resolves the model.
+  const provider = projectProvider ?? wsProvider;
+  const info = useWorkspaceStore((s) => s.rateLimitByProvider[provider]);
+  const setRateLimitForProvider = useWorkspaceStore((s) => s.setRateLimitForProvider);
 
-  // Compute before the conditional return so useEffect is always called unconditionally.
-  const resetEpochMs = info?.resetsAt ? info.resetsAt * 1000 : null;
-  const overageResetMs = info?.overageResetsAt ? info.overageResetsAt * 1000 : null;
+  const resetEpochMs = info?.resetsAt ? info.resetsAt * 1000 : info?.overageResetsAt ? info.overageResetsAt * 1000 : null;
 
-  // Auto-expire: schedule a clear when the reset time passes so the warning
-  // disappears on its own without needing another backend event.
+  // Auto-expire when reset window passes.
   useEffect(() => {
-    const epochMs = resetEpochMs ?? overageResetMs;
-    if (!epochMs) return;
-    const delay = epochMs - Date.now();
-    if (delay <= 0) {
-      setRateLimitInfo(null);
-      return;
-    }
-    const t = setTimeout(() => setRateLimitInfo(null), delay);
+    if (!resetEpochMs) return;
+    const delay = resetEpochMs - Date.now();
+    if (delay <= 0) { setRateLimitForProvider(provider, null); return; }
+    const t = setTimeout(() => setRateLimitForProvider(provider, null), delay);
     return () => clearTimeout(t);
-  }, [resetEpochMs, overageResetMs, setRateLimitInfo]);
+  }, [resetEpochMs, setRateLimitForProvider, provider]);
 
-  // Only show for Claude (anthropic) provider — rate limits are Claude-specific.
-  if (!info || provider !== "anthropic") return null;
+  if (!info) return null;
 
   const pct = info.utilization != null ? Math.round(info.utilization * 100) : null;
-  const isOverage = info.isUsingOverage === true;
   const isRejected = info.status === "rejected";
-  // overageStatus: "rejected" means "overage billing is disabled on this account" — the API
-  // sends this on every response for accounts that haven't enabled pay-as-you-go overage.
-  // Only treat it as actionable when the request itself was also rejected (status: "rejected"),
-  // otherwise it's a false positive for subscription users who are well within their limits.
-  const overageRejected = info.overageStatus === "rejected" && isRejected;
+  const resetTime = resetEpochMs ? formatRelativeTime(resetEpochMs) : null;
 
-  // Subscription users: don't show until 60% utilization — below that is noise.
-  // Credit users (pay-as-you-go): show overage state immediately since it has
-  // direct cost implications.
-  const isSubscription =
-    (sdkAccount as Record<string, unknown> | null)?.billingType === "stripe_subscription" ||
-    sdkAccount?.subscription != null;
-
-  // Overage rejected (exhausted all usage / overage disabled and request blocked)
-  if (overageRejected) {
-    const resetTime = overageResetMs ? formatRelativeTime(overageResetMs) : null;
-    // "out of credits" only makes sense for credit/pay-as-you-go users.
-    // Subscription users see "limit reached · resets in Xh" instead.
-    const label = isSubscription
-      ? `limit reached${resetTime ? ` · resets ${resetTime}` : ""}`
-      : `extra usage · out of credits${resetTime ? ` · resets ${resetTime}` : ""}`;
+  // Exhausted / rejected — short word, reset time.
+  if (isRejected) {
     return (
       <span className="font-mono tabular-nums text-pane-error" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-        {label}
+        limit{resetTime && ` · ${resetTime}`}
       </span>
     );
   }
 
-  // Standard rate limit at ≥60% — this takes priority over the generic
-  // "extra usage" label because a concrete percentage is always more
-  // informative. If the SDK sends utilization even in overage state, show it.
-  if (pct != null && pct >= 60) {
-    const resetTime = resetEpochMs ? formatRelativeTime(resetEpochMs) : null;
-    const prefix = isOverage ? "extra usage · " : "";
+  // Always visible — color escalates as usage climbs.
+  if (pct != null) {
+    const color = pct >= 90 ? "text-pane-error" : pct >= 60 ? "text-[var(--pane-status-modified)]" : "text-pane-text-secondary/30";
     return (
-      <span
-        className={`font-mono tabular-nums ${isRejected ? "text-pane-error" : "text-[var(--pane-status-modified)]"}`}
-        style={{ fontSize: "var(--pane-font-size-xs)" }}
-      >
-        {prefix}{pct}%{isRejected ? " · limit reached" : " · limit"}{resetTime && ` · resets ${resetTime}`}
+      <span className={`font-mono tabular-nums ${color}`} style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        usage {pct}%
       </span>
     );
   }
 
   return null;
 }
+
 
 // ─── Static caret (no-blink) ─────────────────────────────────────────────────
 //
@@ -152,10 +128,40 @@ function RateLimitIndicator() {
 
 interface InputBarProps {
   projectId: string;
-  onSend: (message: string, minds?: Array<{ id: string }>, phase?: string) => void;
+  onSend: (message: string, minds?: Array<{ id: string }>, phase?: string, images?: ImageBlock[]) => void;
   onAbort: () => void;
   isProcessing: boolean;
+  /** True while the agent is paused on ask_user — a live turn awaiting the
+   *  user's answer. The bar behaves as mid-conversation (expanded, focused,
+   *  answer-flavored placeholder) rather than idle or spinning. */
+  isAwaitingInput?: boolean;
+  /** Always-on voice relay controls. Optional to keep InputBar usable standalone. */
+  voice?: {
+    state: string;
+    error: string | null;
+    transcript: string;
+    toggle: () => void;
+    interrupt: () => void;
+    micStream?: MediaStream | null;
+    micDevices?: Array<{ deviceId: string; label: string }>;
+    activeMicId?: string | null;
+    onSelectMic?: (deviceId: string) => void;
+    onRefreshMics?: () => void;
+    audioPulseRef?: { current: number };
+    /** Real analyser on the model's audio track — drives the speaking ring. */
+    modelAnalyserRef?: { current: AnalyserNode | null };
+  };
 }
+
+/** Voice states the orb understands (subset of VoiceState from the hook). */
+type VoiceOrbPropsState =
+  | "off"
+  | "idle"
+  | "connecting"
+  | "listening"
+  | "thinking"
+  | "speaking"
+  | "error";
 
 function isConversationVisible(): boolean {
   const { activeProjectId, projects } = useProjectsStore.getState();
@@ -192,7 +198,7 @@ function fuzzyScore(text: string, query: string): number {
 const PROVIDER_NAMES: Record<string, string> = {
   anthropic: "Claude",
   "anthropic-api": "Anthropic API",
-  gemini: "Gemini CLI",
+  gemini: "Gemini",
   "gemini-api": "Gemini API",
   deepseek: "DeepSeek",
   openrouter: "OpenRouter",
@@ -614,6 +620,8 @@ export function InputBar({
   onSend,
   onAbort,
   isProcessing,
+  isAwaitingInput,
+  voice,
 }: InputBarProps) {
   const [value, setValue] = useState("");
   const [modelPickerExpanded, setModelPickerExpanded] = useState(false);
@@ -623,6 +631,36 @@ export function InputBar({
 
   // Attach menu: closed → menu → thoughts
   const [attachMenu, setAttachMenu] = useState<"closed" | "menu" | "thoughts">("closed");
+
+  // Pasted image attachments — downscaled data URLs, sent as image content
+  // blocks on the user message. One strip, shown above the textarea.
+  const [pastedImages, setPastedImages] = useState<ImageBlock[]>([]);
+  // Set when a paste/drop couldn't be prepared (undecodable image). Cleared
+  // on the next successful attachment or when the user starts typing.
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+
+  const handlePasteImage = useCallback(async (blob: Blob, sourceName?: string) => {
+    const prepared = await prepareClipboardImage(blob);
+    if (!prepared) {
+      // Never fail silently — the user dropped/pasted something and nothing
+      // appeared. Surface why, so they know to retry or use a different image.
+      setAttachmentError(
+        `couldn't read ${sourceName || "the pasted image"} — try PNG, JPEG, or WebP`,
+      );
+      setExpandedSection("input");
+      return;
+    }
+    setAttachmentError(null);
+    setPastedImages((prev) => [
+      ...prev,
+      {
+        type: "image",
+        source: prepared.dataUrl,
+        label: `${sourceName || "pasted image"} (${prepared.width}×${prepared.height}, ${Math.round(prepared.bytes / 1024)}KB)`,
+      },
+    ]);
+    setExpandedSection("input");
+  }, []);
 
   // Mind mode — redirects Enter to mind store instead of conversation
   const [isMindMode, setIsMindMode] = useState(false);
@@ -641,6 +679,12 @@ export function InputBar({
   );
 
   const currentPhase: PhaseName = phaseOverride ?? storePhase;
+
+  // Active skills for this thread — visibility affordance only. The registry
+  // in main is authoritative; this chip just surfaces what's loaded.
+  const activeSkills = useProjectsStore(
+    (s) => s.projects.get(projectId)?.activeSkills ?? [],
+  );
 
   // Prefill from external sources (e.g., Lens "fix" button)
   useEffect(() => {
@@ -737,13 +781,17 @@ export function InputBar({
     if (isProcessing) {
       wasProcessingRef.current = true;
       setIsFadingOut(false);
-    } else if (wasProcessingRef.current) {
+    } else if (wasProcessingRef.current && !isAwaitingInput) {
+      // An ask_user pause flips isProcessing off — but the turn is not over.
+      // Suppress the fade-out ghost so the bar reads "waiting", not "done".
       wasProcessingRef.current = false;
       setIsFadingOut(true);
       const timer = setTimeout(() => setIsFadingOut(false), 1500);
       return () => clearTimeout(timer);
+    } else {
+      wasProcessingRef.current = false;
     }
-  }, [isProcessing]);
+  }, [isProcessing, isAwaitingInput]);
 
   // Collapse to ghost state when clicking outside the card or todos panel.
   useEffect(() => {
@@ -768,6 +816,24 @@ export function InputBar({
       textareaRef.current.focus();
     }
   }, [expandedSection]);
+
+  // ask_user pause — the turn is alive, waiting on the user. Expand the
+  // input and focus it so the answer is one keystroke away. This is a live
+  // turn, not an idle one: the bar must feel mid-conversation.
+  const awaitingFocusRef = useRef(false);
+  useEffect(() => {
+    if (isAwaitingInput) {
+      // Don't fight the user: only expand if they haven't collapsed it
+      // themselves after the pause landed.
+      if (!awaitingFocusRef.current) {
+        setExpandedSection("input");
+        requestAnimationFrame(() => textareaRef.current?.focus());
+      }
+      awaitingFocusRef.current = true;
+    } else {
+      awaitingFocusRef.current = false;
+    }
+  }, [isAwaitingInput]);
 
   // Cmd+K focus
   useEffect(() => {
@@ -800,6 +866,7 @@ export function InputBar({
     const next = e.target.value;
     const pos = e.target.selectionStart ?? next.length;
     setValue(next);
+    if (attachmentError) setAttachmentError(null);
     // @m shortcut — opens thoughts picker directly
     if (attachMenu === "closed") {
       let wordStart = pos;
@@ -854,12 +921,14 @@ export function InputBar({
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         const trimmed = value.trim();
-        if (trimmed) {
+        if (trimmed || pastedImages.length > 0) {
           if (isMindMode) {
             handleMindSave();
           } else {
-            onSend(buildPrompt(trimmed), undefined, currentPhase);
+            onSend(buildPrompt(trimmed), undefined, currentPhase, pastedImages.length > 0 ? pastedImages : undefined);
             setValue("");
+            setPastedImages([]);
+            setAttachmentError(null);
             setExpandedSection("none");
             setPhaseOverride(null);
           }
@@ -877,7 +946,7 @@ export function InputBar({
         }
       }
     },
-    [value, isProcessing, isMindMode, onSend, onAbort, buildPrompt, currentPhase, handleMindSave],
+    [value, isProcessing, isMindMode, onSend, onAbort, buildPrompt, currentPhase, handleMindSave, pastedImages],
   );
 
   return (
@@ -885,7 +954,7 @@ export function InputBar({
       {/* Processing indicator — absolute like the ghost trigger, floats over scroll
           content with zero layout footprint and no background. Hidden once the
           user expands the input bar (expanded card takes over). */}
-      {(isProcessing || isFadingOut) && expandedSection === "none" && (
+      {(isProcessing || isFadingOut) && expandedSection === "none" && !isAwaitingInput && (
         <div
           className={`absolute bottom-0 left-0 right-0 flex items-center gap-3 px-3 pb-3 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
         >
@@ -954,6 +1023,39 @@ export function InputBar({
             </button>
           )}
           <div className="ml-auto shrink-0 flex items-center gap-1.5">
+            <RateLimitIndicator />
+            {/* Active skills — same ghost affordance as the idle bar so
+                loaded skills stay visible while the agent works. */}
+            {activeSkills.length > 0 && (
+              <button
+                onClick={() => setExpandedSection("input")}
+                className="font-mono btn-press shrink-0 inline-flex items-center gap-1 max-w-40 text-pane-accent/75 hover:text-pane-accent transition-colors"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+                title={`skills: ${activeSkills.join(", ")}`}
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                  <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+                </svg>
+                <span className="truncate">{activeSkills.join(" · ")}</span>
+              </button>
+            )}
+            {/* Voice presence — visible in EVERY input state, even while
+                the agent is processing and the bar is collapsed. */}
+            {voice && (
+              <VoiceOrb
+                state={voice.state as VoiceOrbPropsState}
+                error={voice.error}
+                micStream={voice.micStream}
+                audioPulseRef={voice.audioPulseRef}
+                modelAnalyserRef={voice.modelAnalyserRef}
+                micDevices={voice.micDevices}
+                activeMicId={voice.activeMicId}
+                onSelectMic={voice.onSelectMic}
+                onRefreshMics={voice.onRefreshMics}
+                onToggle={voice.toggle}
+                onInterrupt={voice.interrupt}
+              />
+            )}
             {/* Mode pill — shows active phase in collapsed bar */}
             <button
               onClick={() => setExpandedSection("input")}
@@ -981,19 +1083,58 @@ export function InputBar({
         </div>
       )}
 
-      {/* Ghost trigger — absolute, zero layout footprint, floats over scroll content */}
-      {expandedSection === "none" && !isProcessing && !isFadingOut && (
+      {/* Ghost trigger — absolute, zero layout footprint, floats over scroll content.
+          While awaiting an answer the ghost reads as a live pause, not idle:
+          the click target expands the input so the user can answer. */}
+      {expandedSection === "none" && !isProcessing && !isFadingOut && !isAwaitingInput && (
         <div
           className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-transparent font-mono px-5 py-3 pointer-events-none"
           style={{ fontSize: "var(--pane-font-size-xs)" }}
         >
-          <button
-            onClick={() => setExpandedSection("input")}
-            className="pointer-events-auto text-left text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors"
-          >
-            let's build
-          </button>
+          <div className="pointer-events-auto flex items-center gap-2">
+            <button
+              onClick={() => setExpandedSection("input")}
+              className="text-left text-pane-text-secondary/25 hover:text-pane-text-secondary/40 transition-colors"
+            >
+              let's build
+            </button>
+            {/* Voice presence — the living orb. Click = wake/end, speaking = interrupt. */}
+            {voice && (
+              <div className="pointer-events-auto -mb-0.5">
+                <VoiceOrb
+                  state={voice.state as VoiceOrbPropsState}
+                  error={voice.error}
+                  micStream={voice.micStream}
+                  audioPulseRef={voice.audioPulseRef}
+                  modelAnalyserRef={voice.modelAnalyserRef}
+                  micDevices={voice.micDevices}
+                  activeMicId={voice.activeMicId}
+                  onSelectMic={voice.onSelectMic}
+                  onRefreshMics={voice.onRefreshMics}
+                  onToggle={voice.toggle}
+                  onInterrupt={voice.interrupt}
+                />
+              </div>
+            )}
+          </div>
           <div className="pointer-events-auto shrink-0 flex items-center gap-1.5">
+            <RateLimitIndicator />
+            {/* Active skills — ghost affordance so loaded skills stay
+                visible even when the bar is collapsed. Click expands the
+                input, where the full (larger) chip lives. */}
+            {activeSkills.length > 0 && (
+              <button
+                onClick={() => setExpandedSection("input")}
+                className="font-mono btn-press shrink-0 inline-flex items-center gap-1 max-w-40 text-pane-accent/75 hover:text-pane-accent transition-colors"
+                style={{ fontSize: "var(--pane-font-size-xs)" }}
+                title={`skills: ${activeSkills.join(", ")}`}
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                  <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+                </svg>
+                <span className="truncate">{activeSkills.join(" · ")}</span>
+              </button>
+            )}
             {/* Mode pill — shows active phase in ghost trigger */}
             <button
               onClick={() => setExpandedSection("input")}
@@ -1014,8 +1155,55 @@ export function InputBar({
         </div>
       )}
 
-      {/* Processing bar above expanded card — spinner + stop float above, InputBar stays clean */}
-      {expandedSection === "input" && (isProcessing || isFadingOut) && attachMenu !== "thoughts" && (
+      {/* Waiting ghost — ask_user pause, collapsed. The turn is alive but
+          parked on the user; this reads as a pause, not an idle bar. Click
+          expands the input to type the answer. */}
+      {expandedSection === "none" && !isProcessing && !isFadingOut && isAwaitingInput && (
+        <div
+          className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-transparent font-mono px-5 py-3"
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        >
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setExpandedSection("input")}
+              className="flex items-center gap-2 text-left text-pane-text-secondary hover:text-pane-text transition-colors animate-text-ember"
+            >
+              waiting for your answer
+            </button>
+            {voice && (
+              <div className="-mb-0.5">
+                <VoiceOrb
+                  state={voice.state as VoiceOrbPropsState}
+                  error={voice.error}
+                  micStream={voice.micStream}
+                  modelAnalyserRef={voice.modelAnalyserRef}
+                  micDevices={voice.micDevices}
+                  activeMicId={voice.activeMicId}
+                  onSelectMic={voice.onSelectMic}
+                  onRefreshMics={voice.onRefreshMics}
+                  onToggle={voice.toggle}
+                  onInterrupt={voice.interrupt}
+                />
+              </div>
+            )}
+          </div>
+          <div className="shrink-0 flex items-center gap-1.5">
+            <RateLimitIndicator />
+            <button
+              onClick={() => setExpandedSection("input")}
+              className="font-mono btn-press shrink-0 px-2 py-0.5 rounded transition-colors"
+              style={{ fontSize: "var(--pane-font-size-xs)", color: PHASE_CONFIG[currentPhase]?.color || "var(--pane-text-secondary)" }}
+            >
+              {currentPhase}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Processing bar above expanded card — spinner + stop float above, InputBar stays clean.
+          Suppressed during an ask_user pause: the turn is parked on the user,
+          nothing is running and there is nothing to stop. */}
+      {expandedSection === "input" && (isProcessing || isFadingOut) && !isAwaitingInput && attachMenu !== "thoughts" && (
         <div
           className={`flex items-center gap-3 px-3 pb-2 bg-transparent ${isFadingOut ? "animate-fadeOut" : "animate-fadeIn"}`}
         >
@@ -1054,13 +1242,61 @@ export function InputBar({
 
       {/* One card. Textarea + thoughts picker + button bar in column. */}
       {expandedSection === "input" && <div ref={cardRef} className="rounded-xl ring-1 relative flex flex-col ring-pane-border/40 mx-px mb-px">
+        {/* Pasted images — thumbnail strip above the textarea. Each removable. */}
+        {attachMenu !== "thoughts" && pastedImages.length > 0 && (
+          <div className="flex gap-2 px-3 pt-3 flex-wrap">
+            {pastedImages.map((img, i) => (
+              <div key={i} className="relative group/img" title={img.label}>
+                <img
+                  src={img.source}
+                  alt={img.label || "pasted image"}
+                  className="h-16 w-auto max-w-32 object-cover rounded-md ring-1 ring-pane-border/40"
+                />
+                <button
+                  onClick={() => setPastedImages((prev) => prev.filter((_, j) => j !== i))}
+                  className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-pane-bg ring-1 ring-pane-border/60
+                    text-pane-text-secondary hover:text-pane-error flex items-center justify-center
+                    opacity-0 group-hover/img:opacity-100 transition-opacity"
+                  style={{ fontSize: "11px", lineHeight: 1 }}
+                  title="remove"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Attachment failure — shown until the user attaches successfully or types. */}
+        {attachMenu !== "thoughts" && attachmentError && (
+          <div className="flex items-center justify-between gap-2 mx-3 mt-3 px-3 py-2 rounded-md
+            bg-pane-error/10 text-pane-error text-xs ring-1 ring-pane-error/30">
+            <span>{attachmentError}</span>
+            <button
+              onClick={() => setAttachmentError(null)}
+              className="shrink-0 hover:opacity-70"
+              style={{ fontSize: "11px", lineHeight: 1 }}
+              title="dismiss"
+            >
+              ×
+            </button>
+          </div>
+        )}
+
         {attachMenu !== "thoughts" && (
           <CaretTextArea
             ref={textareaRef}
             value={value}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
-            placeholder={isMindMode ? "what's on your mind?" : "let's build..."}
+            onPasteImage={handlePasteImage}
+            placeholder={
+              isMindMode
+                ? "what's on your mind?"
+                : isAwaitingInput
+                  ? "answer..."
+                  : "let's build..."
+            }
             minHeight={56}
             maxHeight={window.innerHeight * 0.4}
             autoResize
@@ -1068,20 +1304,35 @@ export function InputBar({
             style={{
               padding: "1rem 1.25rem 0.75rem 1.25rem",
             }}
+            onDropFiles={(paths) => {
+              const ta = textareaRef.current;
+              if (!ta) return;
+              const insertion = paths.map(p => `\`${p}\``).join(" ");
+              const pos = ta.selectionStart ?? ta.value.length;
+              const newValue = ta.value.slice(0, pos) + (pos > 0 && !ta.value.slice(pos - 1, pos).endsWith(" ") ? " " : "") + insertion + " " + ta.value.slice(pos);
+              setValue(newValue);
+              // Restore cursor after the inserted paths
+              const newCursorPos = pos + (pos > 0 && !ta.value.slice(pos - 1, pos).endsWith(" ") ? 1 : 0) + insertion.length + 1;
+              requestAnimationFrame(() => {
+                ta.focus();
+                ta.setSelectionRange(newCursorPos, newCursorPos);
+              });
+            }}
           />
         )}
 
         {/* Send — top right, only when textarea is visible */}
-        {attachMenu !== "thoughts" && value.trim().length > 0 && (
+        {attachMenu !== "thoughts" && (value.trim().length > 0 || pastedImages.length > 0) && (
           <button
             onClick={() => {
               const trimmed = value.trim();
-              if (!trimmed) return;
+              if (!trimmed && pastedImages.length === 0) return;
               if (isMindMode) {
                 handleMindSave();
               } else {
-                onSend(buildPrompt(trimmed), undefined, currentPhase);
+                onSend(buildPrompt(trimmed), undefined, currentPhase, pastedImages.length > 0 ? pastedImages : undefined);
                 setValue("");
+                setPastedImages([]);
                 setPhaseOverride(null);
               }
             }}
@@ -1126,7 +1377,7 @@ export function InputBar({
             />
           ) : (
             <>
-              {/* Left group: attach + mind toggle, side by side with explicit gap */}
+              {/* Left group: attach + mind toggle */}
               <div className="shrink-0 flex items-center gap-3">
                 {/* Attach (+) button */}
                 {attachMenu === "menu" ? (
@@ -1193,9 +1444,41 @@ export function InputBar({
                     <circle cx="12" cy="12" r="3" fill={isMindMode ? "currentColor" : "none"} />
                   </svg>
                 </button>
+
+                {/* Voice presence — beside mind. Wakes the always-on voice layer. */}
+                {voice && (
+                  <VoiceOrb
+                    state={voice.state as VoiceOrbPropsState}
+                    error={voice.error}
+                    micStream={voice.micStream}
+                    audioPulseRef={voice.audioPulseRef}
+                    modelAnalyserRef={voice.modelAnalyserRef}
+                    micDevices={voice.micDevices}
+                    activeMicId={voice.activeMicId}
+                    onSelectMic={voice.onSelectMic}
+                    onRefreshMics={voice.onRefreshMics}
+                    onToggle={voice.toggle}
+                    onInterrupt={voice.interrupt}
+                  />
+                )}
               </div>
 
               <div className="flex-1" />
+
+              <RateLimitIndicator />
+
+              {activeSkills.length > 0 && (
+                <div
+                  className="pointer-events-none font-mono shrink-0 px-3 py-1.5 rounded-md inline-flex items-center gap-1.5 max-w-56"
+                  title={activeSkills.join(", ")}
+                  style={{ fontSize: "var(--pane-font-size-sm)", color: "var(--pane-accent)" }}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                    <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+                  </svg>
+                  <span className="truncate">{activeSkills.join(" · ")}</span>
+                </div>
+              )}
 
               {(() => {
                 if (isMindMode) {
@@ -1231,7 +1514,6 @@ export function InputBar({
                   </button>
                 );
               })()}
-              <RateLimitIndicator />
               <div className="pointer-events-auto">
                 <ModelPickerTrigger
                   value={selectedModel}

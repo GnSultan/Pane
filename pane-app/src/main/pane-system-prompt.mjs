@@ -39,6 +39,7 @@ import { BASE_CONFIDENCE, getEffectiveConfidence } from "./extraction-tuning.mjs
 import { getActiveJournal, applyMergeDelta } from "./session-journal.mjs";
 import { getIdentity } from "./identity.mjs";
 import { lookupModelContext } from "./model-registry.mjs";
+import { resolveProjectScope } from "./root-scope.mjs";
 
 const PANE_DIR    = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -79,6 +80,9 @@ function defaultState() {
 
     // Orchestration phase — tracks where in the pipeline this session is
     phase: "idle",  // "idle" | "discovery" | "planning" | "execution"
+
+    // Active skills — names of skills activated during this session
+    activeSkills: [],
   };
 }
 
@@ -108,6 +112,7 @@ export const MODEL_CONTEXT_LIMITS = {
   "step-3.5-flash": 256000,
   "step-2-mini": 32000,
   // OpenRouter-wrapped StepFun
+  "stepfun/step-3.5-flash": 262144,
   "stepfun/step-3.5-flash:free": 128000,
   "meta-llama/llama-3.3-70b-instruct:free": 128000,
   "nousresearch/hermes-3-llama-3.1-405b:free": 128000,
@@ -319,13 +324,15 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   // ── PANE OPERATING PRINCIPLES ───────────────────────────────────────────
   // Compressed from the former ~1,276-token Pane Intelligence Guide.
   // Tool-specific behavioral guidance now lives in tool descriptions
-  // (http-backend.mjs / pane-mcp-server.mjs) where it has maximum impact.
+  // (http-backend.mjs) where it has maximum impact.
   stableParts.push(
     "## Working in Pane",
     "",
-    "Pane provides project context (about, brief, identity) at start. All other project state — file structure, working set, git status, session state, memories — is on-demand via tools. Retrieve only what you need for the task at hand.",
+    "Pane provides project context (about, brief, identity) at start. Relevant memories from past sessions are automatically surfaced before you start working — you don't need to search for them first. All other project state — file structure, working set, git status, session state — is on-demand via tools. Retrieve only what you need for the task at hand.",
     "",
-    "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_set_rule when the user states a preference. pane_set_about when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery.",
+    "Closed loop: persist discoveries as you go. pane_remember for root causes, patterns, and decisions. pane_update_memory when you discover something that refines or corrects a prior memory — rewrite it instead of adding a duplicate. pane_delete_memory when a memory is obsolete or wrong. Both accept an `id` parameter — always use pane_recall first to get the memory's id, then pass it for reliable targeting. Content-based matching is fragile and often fails. pane_set_rule when the user states a preference. pane_set_about when you understand the project's purpose. A session that discovers but doesn't record forces re-discovery. A session that records but never corrects forces confusion.",
+    "",
+    "Images: when the user attaches an image, references a screenshot/mockup/design export, or a task involves an image file, LOOK at it before speaking about it — call view_image on it. Images downloaded from Figma or the web (e.g. via download_figma_images) are files: view_image them to actually see the design. Never describe an image from its filename, and never read_file an image (binary garbage).",
     "",
   );
 
@@ -353,9 +360,14 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
   // Skip for mind: threads — those are thought journals, not code projects.
   if (!projectId.startsWith("mind:")) {
     let projectAbout = "";
-    try {
-      projectAbout = fs.readFileSync(path.join(MEMORY_DIR, projectId, "about.md"), "utf-8").trim();
-    } catch {}
+    // Root-scoped: fall back to sibling threads sharing the same root.
+    // A new thread inherits the project's about.md from its siblings.
+    for (const sid of resolveProjectScope(projectId)) {
+      try {
+        const candidate = fs.readFileSync(path.join(MEMORY_DIR, sid, "about.md"), "utf-8").trim();
+        if (candidate) { projectAbout = candidate; break; }
+      } catch {}
+    }
 
     if (projectAbout) {
       stableParts.push("## About");
@@ -559,7 +571,7 @@ export function compileContext(projectId, intent = "other", historyLength = 0) {
     frozen,    // Tier 1: never changes within session (cacheable prefix)
     session,   // Tier 2: changes when files/scope change (extends cache when stable)
     turn,      // Tier 3: changes every turn (never cached)
-    // Backward compat — used by CLI backends and existing callers
+    // Backward compat — used by existing callers
     stable,
     dynamic,
     full,

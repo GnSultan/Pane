@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Hardened runtime resource access. Without audio-input, CoreAudio
+         delivers a track of zeros: sessions connect, bytes flow, the model
+         hears silence. Symptom first seen in the first signed production
+         build (Aug 2026) — dev builds never hit it. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <!-- Electron's baseline requirements (previously injected by
+         electron-builder defaults — restated so they survive the explicit
+         entitlements override). -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

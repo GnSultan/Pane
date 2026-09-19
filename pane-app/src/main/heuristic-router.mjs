@@ -57,7 +57,7 @@ export function jaccardSimilarity(a, b) {
 
 // ── Regex pattern sets ──────────────────────────────────────────────────────
 
-const FAILURE_PATTERNS = [
+export const FAILURE_PATTERNS = [
   /\bthat didn'?t work\b/i,
   /\bstill (broken|failing|not working|wrong|bugged)\b/i,
   /\btry again\b/i,

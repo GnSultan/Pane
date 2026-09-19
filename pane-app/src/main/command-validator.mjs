@@ -3,7 +3,7 @@
  *
  * Single source of truth for command validation used by both:
  * - tool-executor.mjs (HTTP backend path → cmd-worker)
- * - pane-mcp-server.mjs (MCP stdio server path → execSync)
+ * - http-backend.mjs (HTTP backend path → execSync)
  *
  * Two-layer validation:
  * 1. Blacklist: reject explicitly dangerous patterns (rm -rf /, mkfs, etc.)

@@ -266,12 +266,20 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
     if (pushState === "busy") return;
     setPushState("busy");
     try {
-      await electronAPI.invoke("git_push", { path: root });
+      const result = await electronAPI.invoke("git_push", { path: root }) as { success: boolean; error?: string };
+      if (!result.success) {
+        console.error("Push failed:", result.error);
+        setPushState("err");
+        return;
+      }
       setPushState("ok");
       const ab = await getAheadBehind(root).catch(() => ({ ahead: 0, behind: 0 }));
       setAhead(ab.ahead);
       setBehind(ab.behind);
-    } catch { setPushState("err"); }
+    } catch (err) {
+      console.error("Push failed:", err);
+      setPushState("err");
+    }
     setTimeout(() => setPushState("idle"), 2500);
   };
 
@@ -279,10 +287,18 @@ export function GitStatus({ root, projectId }: GitStatusProps) {
     if (pullState === "busy") return;
     setPullState("busy");
     try {
-      await electronAPI.invoke("git_pull", { path: root });
+      const result = await electronAPI.invoke("git_pull", { path: root }) as { success: boolean; error?: string };
+      if (!result.success) {
+        console.error("Pull failed:", result.error);
+        setPullState("err");
+        return;
+      }
       await load();
       setPullState("ok");
-    } catch { setPullState("err"); }
+    } catch (err) {
+      console.error("Pull failed:", err);
+      setPullState("err");
+    }
     setTimeout(() => { setPullState("idle"); }, 2500);
   };
 
