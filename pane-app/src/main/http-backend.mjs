@@ -97,6 +97,7 @@ import { buildBillingHeaderValue } from "./claude-signing.mjs";
 import {
   getAccessToken as getOpenAIAccessToken,
   hasOAuthCredentials as hasOpenAIOAuthCredentials,
+  isOpenAIOAuthTerminal,
   getCodexBaseUrl,
   getAccountId as getOpenAIAccountId,
   invalidateCache as invalidateOpenAICache,
@@ -2146,24 +2147,39 @@ export class ApiBackend extends PunkBackend {
       let apiKey = settings.http_api_keys?.[provider] || "";
       let authType = apiKey ? "api_key" : undefined;
 
-      // If no API key for anthropic, try OAuth tokens from Claude Code keychain
-      if (provider === "anthropic" && !apiKey) {
+      // Credential precedence (Sep 25 2026): OAuth FIRST, API key as fallback.
+      // The old order (key wins whenever present) sent every request out on a
+      // zero-credit sk-proj key while a valid ChatGPT subscription token sat
+      // unused in ~/.codex/auth.json — the account 429'd on billing
+      // (insufficient_quota) for hours. A custom baseUrl forces API-key mode:
+      // OAuth dispatches via chatgpt.com's Codex backend (codex:// marker),
+      // which cannot speak to a user-supplied endpoint.
+      const wantsOAuth =
+        (provider === "anthropic" || provider === "openai") &&
+        !settings.http_base_urls?.[provider];
+
+      if (wantsOAuth && provider === "anthropic") {
         try {
           if (await hasOAuthCredentials()) {
             authType = "oauth";
-            console.log("[http] getApiConfig: using Claude OAuth tokens (no API key)");
+            apiKey = "";
+            console.log("[http] getApiConfig: Claude OAuth takes precedence over API key");
           }
         } catch (err) {
           console.warn("[http] getApiConfig: OAuth check failed:", err.message);
         }
       }
 
-      // If no API key for openai, try OAuth tokens from Codex CLI
-      if (provider === "openai" && !apiKey) {
+      if (wantsOAuth && provider === "openai") {
         try {
-          if (hasOpenAIOAuthCredentials()) {
+          if (hasOpenAIOAuthCredentials() && !isOpenAIOAuthTerminal()) {
             authType = "openai-oauth";
-            console.log("[http] getApiConfig: using OpenAI OAuth tokens (Codex CLI, no API key)");
+            apiKey = "";
+            console.log("[http] getApiConfig: OpenAI OAuth takes precedence over API key");
+          } else if (hasOpenAIOAuthCredentials() && isOpenAIOAuthTerminal()) {
+            console.warn(
+              "[http] getApiConfig: OpenAI OAuth terminally dead (invalid_grant) — falling back to API key. Run `npx @openai/codex login` to restore subscription auth.",
+            );
           }
         } catch (err) {
           console.warn("[http] getApiConfig: OpenAI OAuth check failed:", err.message);

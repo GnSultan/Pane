@@ -120,7 +120,15 @@ function readCodexCredentials() {
     try {
       const parsed = JSON.parse(readFileSync(candidate, "utf-8"));
       const tokens = parsed.tokens;
-      if (!tokens || typeof tokens.access_token !== "string" || !tokens.access_token) continue;
+      if (!tokens || typeof tokens.access_token !== "string" || !tokens.access_token) {
+        // Present-but-tokenless file at an EXPLICIT CODEX_HOME means "no
+        // codex credentials here" — do not silently fall through to the
+        // real home's auth.json (tests and embedded contexts rely on the
+        // override being authoritative). A tokenless file at the default
+        // path simply ends the search.
+        if (codexHome && candidate === join(codexHome, "auth.json")) return null;
+        continue;
+      }
 
       return {
         accessToken: tokens.access_token,
@@ -481,6 +489,20 @@ export function hasOAuthCredentials() {
 
   const codexCreds = readCodexCredentials();
   return codexCreds !== null && !!codexCreds.accessToken;
+}
+
+/**
+ * Whether OAuth is terminally dead — refresh token burned (invalid_grant).
+ * Credential precedence (getApiConfig) consults this: when the subscription
+ * token can't be refreshed, requests must fall back to the API key instead
+ * of taking OAuth precedence and 401-looping. Self-clears when codex login
+ * writes a new pair (the getAccessToken latch is scoped to the dead token;
+ * this view is for *deciding*, not enforcing — enforcement stays there).
+ */
+export function isOpenAIOAuthTerminal() {
+  if (!_terminalAuth) return false;
+  const creds = readPaneCredentials() ?? readCodexCredentials();
+  return !!(creds && _terminalAuth.refreshToken === creds.refreshToken);
 }
 
 /**
