@@ -706,6 +706,16 @@ export class ToolExecutor {
   }
 
   /**
+   * Peer-spawn bridge — called when the model invokes pane_spawn_peer.
+   * The renderer owns threads (zustand store), so the executor hands the
+   * spawn request to the renderer via this callback, which main wires to a
+   * webContents.send. Same rail as ask_user's awaiting_input event.
+   */
+  setPeerSpawn(fn) {
+    this._onPeerSpawn = fn;
+  }
+
+  /**
    * Read the distilled playbook for this project (+ global craft profile).
    * These are tested principles the reflection engine graduated from accumulated
    * experience — injected so they shape behavior without needing recall.
@@ -3053,6 +3063,63 @@ When you are done, return a summary with:
           } catch (err) {
             return { success: false, error: `Execution failed: ${err.message}`, toolId };
           }
+        }
+
+        case "pane_spawn_peer": {
+          // Fire-and-forget delegation to a PEER THREAD. Unlike pane_delegate
+          // (blocking sub-agent in this thread), the peer is a full independent
+          // thread created by the renderer (threads live in the renderer's
+          // zustand store — main cannot mint them directly). Same rail as
+          // ask_user: emit an event to the renderer, return a pending-style
+          // result immediately, and let the renderer do the creation + kickoff.
+          // The completion notice comes back later as the delegator's next
+          // input via the same pane:send-message rail voice uses.
+          const objective = (input?.objective || "").trim();
+          if (!objective) return { success: false, error: "Objective is required.", toolId };
+          const name = (input?.name || "").trim() || null;
+
+          // Deduced thread name: first ~6 words of the objective. The
+          // ellipsis marks a derived (auto) name; an explicit name is kept as-is.
+          let derivedName = name;
+          if (!derivedName) {
+            const words = objective
+              .toLowerCase()
+              .replace(/[^a-z0-9\s-]/g, "")
+              .trim()
+              .split(/\s+/)
+              .slice(0, 6)
+              .join(" ");
+            derivedName = (words || "peer") + "…";
+          }
+
+          if (!this._onPeerSpawn) {
+            return {
+              success: false,
+              error: "Peer spawning is not available (renderer bridge not wired).",
+              toolId,
+            };
+          }
+
+          this._onPeerSpawn({
+            sourceProjectId: this.projectId,
+            sourceRoot: this.projectRoot,
+            objective,
+            threadName: derivedName,
+            toolId,
+          });
+
+          // Fire-and-forget: acknowledge immediately. The renderer creates the
+          // thread, kicks its executor, and delivers the completion notice
+          // back here as a future pane:send-message delivery.
+          return {
+            success: true,
+            output:
+              `Peer thread "${derivedName}" is being created and will start working. ` +
+              `This call returns immediately — continue with your own work. ` +
+              `You will receive a completion notice as your next input when the peer ` +
+              `finishes or fails; do not poll for it.`,
+            toolId,
+          };
         }
 
         case "explore": {

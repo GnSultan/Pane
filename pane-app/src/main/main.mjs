@@ -2668,6 +2668,10 @@ async function initStartupServices() {
   // handlers that call spawn() will lazy-init if they fire before this completes.
   initPunkBackend().then(() => {
     console.log("[main] Punk backends initialized");
+    // Bridges registered before backends existed (registerClaudeHandlers runs
+    // at module load, createWindow wires them before initPunkBackend) — push
+    // them into the now-live backend so pane_spawn_peer works from turn 1.
+    punkEngine.repropagateBridges();
   }).catch(err => {
     console.warn("[main] Punk backend init failed:", err.message);
   });
@@ -2856,6 +2860,16 @@ app.whenReady().then(async () => {
 
   punkEngine.setQuickCall((sys, usr) => punkEngine.quickCall(sys, usr));
   punkEngine.setAgentCall((sys, prompt, workingDir, options) => punkEngine.agentCall(sys, prompt, workingDir, options));
+
+  // Peer-thread spawning: pane_spawn_peer hands off to the renderer (threads
+  // live in the renderer's zustand store). usePeerThreads (app root) listens
+  // on "peer-spawn-request" and runs the spawn → watch → completion-notice
+  // lifecycle; the notice lands in the delegator via pane:send-message.
+  punkEngine.setPeerSpawnBridge((req) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send("peer-spawn-request", req);
+    }
+  });
 
   punkEngine.setBrainIndexer((projectId, events) =>
     brainRequest("index_events", { projectId, events })

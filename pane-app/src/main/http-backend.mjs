@@ -985,6 +985,37 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "pane_spawn_peer",
+      description:
+        "Spawn a PEER THREAD to run a task in parallel — you continue working while it runs in the background. " +
+        "Unlike pane_delegate (a blocking sub-agent inside this thread), the peer is a full independent thread: " +
+        "its own context, its own journal, visible in the thread list. It inherits the project's memory corpus " +
+        "(about, playbook, knowledge graph) automatically. Fire-and-forget: this call returns immediately with the " +
+        "peer's thread ID. When the peer finishes or fails, you receive a completion notice as your next input. " +
+        "Use for parallelizable work that doesn't need your context: 'add tests for the auth module while I refactor the API layer', " +
+        "'update the docs while I fix the build'. The objective must be complete and self-contained — the peer " +
+        "does NOT see this conversation. When in doubt, use pane_delegate instead (you stay accountable for the result).",
+      parameters: {
+        type: "object",
+        properties: {
+          objective: {
+            type: "string",
+            description:
+              "Complete, self-contained instruction for the peer. Include all context — the peer does not see this conversation.",
+          },
+          name: {
+            type: "string",
+            description:
+              "Optional short thread name, e.g. 'auth tests'. Defaults to a name derived from the objective.",
+          },
+        },
+        required: ["objective"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "pane_read_files",
       description:
         "Read multiple files at once and return all their contents in a single response. Use this instead of sequential Read calls when you know you need several files — each sequential read resends the entire conversation, so batching 3 reads into 1 call saves significant overhead. Accepts an array of file paths.",
@@ -1358,6 +1389,93 @@ function getToolsForPhase(phase) {
   // during planning and execution alike.
   const external = mcpClient.getExternalTools();
   return [...builtIn, ...external];
+}
+
+// ── Provider tools-array cap ────────────────────────────────────────────────
+// OpenAI (chat/completions AND the Codex Responses API) hard-caps tools[] at
+// 128 entries and rejects the whole request with 400 array_above_max_length.
+// With many MCP servers connected (Sep 25: vercel 212 + resend 105 + … = 410
+// external tools + 59 built-in = 469), the raw list far exceeds the cap.
+// Anthropic and the OpenAI-compatible providers accept large arrays, so the
+// cap is only applied when needed — never a silent global degradation.
+export const OPENAI_TOOLS_CAP = 128;
+
+/**
+ * Deterministically reduce a tool list to at most `cap` entries, dropping
+ * external (ext__*) tools only. Built-ins are never dropped — they implement
+ * the core loop. Servers are dropped whole: "drop 341 tools" is a server-level
+ * decision, not a per-tool one, and a partially-visible server would desync
+ * from the prompt's per-server listing. Small servers are kept first (ascending
+ * alphabetical), which maximizes surviving server diversity — with 59 built-ins
+ * and a 128 cap, 69 external slots remain: the small servers (calendar, gmail,
+ * notion, …) fit and only the tool-count monsters (vercel 212, resend 105) drop.
+ * Fully deterministic: connection order can't affect the result, unlike the
+ * toolIndex Map (timing-dependent — voice-relay's buildMcpCatalog hit the same
+ * nondeterminism before switching to alphabetical).
+ * @param {Array} tools full tool list (built-in + external)
+ * @param {number} cap provider maximum, e.g. OPENAI_TOOLS_CAP
+ * @param {(externalCount: number) => string} [buildNotice] optional callback
+ *   returning a system-prompt notice naming the dropped servers, so the
+ *   prompt and the tools array stay in lockstep.
+ * @returns {{ tools: Array, notice: string|null }}
+ */
+export function capToolsForProvider(tools, cap, buildNotice) {
+  const builtIns = tools.filter((t) => !t.function.name.startsWith("ext__"));
+  const externals = tools.filter((t) => t.function.name.startsWith("ext__"));
+  const overBy = builtIns.length + externals.length - cap;
+  if (overBy <= 0) return { tools, notice: null };
+
+  // Group externals by server so whole servers can be dropped. Within-server
+  // tools sorted by name — output order must not depend on connection order.
+  const byServer = new Map();
+  for (const t of externals) {
+    const server = t.function.name.split("__")[1] ?? "unknown";
+    if (!byServer.has(server)) byServer.set(server, []);
+    byServer.get(server).push(t);
+  }
+  for (const list of byServer.values()) {
+    list.sort((a, b) =>
+      a.function.name < b.function.name ? -1 : 1,
+    );
+  }
+  // Keep servers ascending alphabetically while they fit — small servers
+  // first maximizes how many distinct integrations survive the cap.
+  const serversAscending = [...byServer.keys()].sort();
+  const droppedServers = [];
+  let externalBudget = cap - builtIns.length;
+  if (externalBudget < 0) {
+    // Degenerate: built-ins alone exceed the cap. Drop ALL externals and
+    // hard-slice built-ins — a truncated core toolset is still more capable
+    // than a 400 that fails every request.
+    const notice = buildNotice
+      ? buildNotice(0) +
+        ` All external integrations were dropped (built-in tools alone exceed the provider's ${cap}-tool limit).`
+      : null;
+    return { tools: builtIns.slice(0, cap), notice };
+  }
+
+  const keptByServer = new Map();
+  for (const server of serversAscending) {
+    const serverTools = byServer.get(server);
+    if (serverTools.length <= externalBudget) {
+      keptByServer.set(server, serverTools);
+      externalBudget -= serverTools.length;
+    } else {
+      droppedServers.push(server);
+    }
+  }
+  if (!droppedServers.length) return { tools, notice: null };
+
+  // Reassemble: built-ins first (core loop), then kept externals in stable
+  // alphabetical server order.
+  const keptExternals = [...keptByServer.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .flatMap(([, ts]) => ts);
+  const notice = buildNotice
+    ? buildNotice(keptExternals.length) +
+      ` Because this provider limits requests to ${cap} tools, the following MCP servers are NOT available this session: ${droppedServers.sort().join(", ")}. Do not call their tools (ext__<server>__…) — treat them as unavailable.`
+    : null;
+  return { tools: [...builtIns, ...keptExternals], notice };
 }
 
 function getAnthropicToolsForPhase(phase) {
@@ -1921,6 +2039,19 @@ export class ApiBackend extends PunkBackend {
     }
   }
 
+  /**
+   * Peer-spawn bridge: pane_spawn_peer needs the renderer to create the
+   * thread (threads live in the renderer's zustand store). Forward spawn
+   * requests to every window via webContents.send; the renderer's
+   * usePeerThreads hook owns the full spawn → watch → notice lifecycle.
+   */
+  setPeerSpawnBridge(sendFn) {
+    this._peerSpawnSend = sendFn;
+    for (const executor of this.toolExecutors.values()) {
+      if (executor.setPeerSpawn) executor.setPeerSpawn(sendFn);
+    }
+  }
+
   getToolExecutor(projectId, projectRoot) {
     let executor = this.toolExecutors.get(projectId);
     if (!executor) {
@@ -1938,6 +2069,9 @@ export class ApiBackend extends PunkBackend {
       }
       if (this._runPunk && executor.setRunPunk) {
         executor.setRunPunk(this._runPunk);
+      }
+      if (this._peerSpawnSend && executor.setPeerSpawn) {
+        executor.setPeerSpawn(this._peerSpawnSend);
       }
       this.toolExecutors.set(projectId, executor);
     }
@@ -2769,6 +2903,7 @@ export class ApiBackend extends PunkBackend {
     this._healAttemptedThisTurn = false;
     this._contextHealAttemptedThisTurn = false;
     this._imageStripAttemptedThisTurn = false;
+    this._toolsCapAttemptedThisTurn = false;
     if (typeof this._sessionRetryCount !== "number") {
       this._sessionRetryCount = 0;
     }
@@ -2808,27 +2943,50 @@ export class ApiBackend extends PunkBackend {
       // The model receives external tools in its tools[] array, but without
       // prompt-level awareness it doesn't know they exist or what they do.
       // The namespaced names (ext__server__toolname) are opaque otherwise.
+      // The listing must enumerate only what the tools[] array will actually
+      // contain: on providers with a tools cap, whole servers get dropped, and
+      // advertising dropped tools would make the model call tools that don't
+      // exist. Provider is resolved above — cap only where the API demands it.
       const mcpStatus = mcpClient.getStatus();
       const connectedServers = mcpStatus.filter(
         (s) => s.status === "connected" && s.toolCount > 0,
       );
+      // Mirrors the condition at body.tools assembly below — keep in sync.
+      const providerNeedsCap = apiConfig.provider === "openai";
       let _mcpAwareness = "";
       if (connectedServers.length > 0) {
+        const visibleToolNames = providerNeedsCap
+          ? new Set(
+              capToolsForProvider(
+                getToolsForPhase("execution"),
+                OPENAI_TOOLS_CAP,
+              ).tools.map((t) => t.function.name),
+            )
+          : null;
         const lines = connectedServers.map((s) => {
           const tools = mcpClient.getExternalTools()
             .filter(
-              (t) => t.function.name.startsWith(`ext__${s.name}__`),
+              (t) =>
+                t.function.name.startsWith(`ext__${s.name}__`) &&
+                (!visibleToolNames ||
+                  visibleToolNames.has(t.function.name)),
             )
             .map(
               (t) =>
                 `  - ${t.function.name}: ${t.function.description?.slice(0, 120) || "External tool"}`,
             );
-          return `${s.name} (${s.toolCount} tools):\n${tools.join("\n")}`;
+          // Servers whose tools were dropped by the cap are omitted entirely —
+          // a "(0 tools)" entry would advertise an empty server.
+          if (!tools.length) return null;
+          return `${s.name} (${tools.length} tools):\n${tools.join("\n")}`;
         });
-        _mcpAwareness =
-          "You have access to external integrations via MCP servers. " +
-          "These are real tools connected to external services — use them directly when the user asks about those services:\n\n" +
-          lines.join("\n\n");
+        const visibleLines = lines.filter(Boolean);
+        if (visibleLines.length > 0) {
+          _mcpAwareness =
+            "You have access to external integrations via MCP servers. " +
+            "These are real tools connected to external services — use them directly when the user asks about those services:\n\n" +
+            visibleLines.join("\n\n");
+        }
       }
 
       const gitStatus = await this.getGitStatus(request.workingDir);
@@ -3469,6 +3627,41 @@ export class ApiBackend extends PunkBackend {
             (apiConfig.provider === "openrouter" && orPersonality.supportsTools)
           ) {
             body.tools = getToolsForPhase(phase);
+            // OpenAI rejects >128 tools with 400 array_above_max_length
+            // (Sep 25: 59 built-in + 410 MCP = 469 → every request failed).
+            // Cap applies to both openai auth modes — chat/completions and
+            // the Codex Responses API share the limit. Prompt listing above
+            // is filtered by the same helper, so they stay in lockstep.
+            if (apiConfig.provider === "openai") {
+              const capped = capToolsForProvider(
+                body.tools,
+                OPENAI_TOOLS_CAP,
+              );
+              if (capped.notice) {
+                console.warn(
+                  `[http] tools[] capped to ${capped.tools.length} for OpenAI (limit ${OPENAI_TOOLS_CAP})`,
+                );
+                // Two delivery paths, both needed by auth mode:
+                // API-key mode restructures via applyPrefixCacheOptimization
+                // (turn tier → preamble on last user message); OAuth/codex
+                // mode sends messages as-is and strips _tiers — so the
+                // notice must also ride the system message content itself.
+                if (systemTiers) {
+                  systemTiers.turn =
+                    (systemTiers.turn || "") + "\n\n" + capped.notice;
+                }
+                const sysMsg = body.messages?.find((m) => m.role === "system");
+                if (sysMsg) {
+                  sysMsg.content =
+                    (typeof sysMsg.content === "string"
+                      ? sysMsg.content
+                      : JSON.stringify(sysMsg.content)) +
+                    "\n\n" +
+                    capped.notice;
+                }
+              }
+              body.tools = capped.tools;
+            }
           } else if (apiConfig.provider === "anthropic") {
             body.tools = getAnthropicToolsForPhase(phase);
           }
@@ -3809,6 +4002,66 @@ export class ApiBackend extends PunkBackend {
                         request.requestId,
                       );
                       continue; // Don't consume an attempt — heal is free
+                    }
+
+                    // ── HEALABLE 400: tools array exceeds provider limit ──
+                    // OpenAI (chat/completions and Codex Responses):
+                    // {"error":{"message":"Invalid 'tools': array too long.
+                    //  Expected an array with maximum length 128, but got an
+                    //  array with length 469 instead.","type":"invalid_request_error",
+                    //  "param":"tools","code":"array_above_max_length"}}
+                    // Pre-flight capping (body assembly above) should prevent
+                    // this, but heal anyway if a provider changes its limit or
+                    // an assembly path was missed — the alternative is every
+                    // request failing hard.
+                    if (
+                      (plainBody.includes("array_above_max_length") ||
+                        (plainBody.includes("array too long") &&
+                          plainBody.includes("'tools'"))) &&
+                      !this._toolsCapAttemptedThisTurn
+                    ) {
+                      this._toolsCapAttemptedThisTurn = true;
+                      // Extract the advertised max if present: "maximum length 128"
+                      const maxMatch = plainBody.match(
+                        /maximum length (\d+)/,
+                      );
+                      const cap = maxMatch
+                        ? parseInt(maxMatch[1], 10)
+                        : OPENAI_TOOLS_CAP;
+                      const target =
+                        finalBody && finalBody !== body ? finalBody : body;
+                      if (Array.isArray(target.tools) && target.tools.length > cap) {
+                        const before = target.tools.length;
+                        const capped = capToolsForProvider(target.tools, cap);
+                        target.tools = capped.tools;
+                        // Invalidate any pre-built Codex Responses body — it
+                        // was built from the uncapped tools array and would
+                        // be reused verbatim on the retry.
+                        delete target._codexResponses;
+                        if (finalBody && finalBody !== body) {
+                          delete body._codexResponses;
+                        }
+                        console.warn(
+                          `[http] auto-healing: capped tools[] ${before} → ${capped.tools.length} (400: array_above_max_length)`,
+                        );
+                        this.onEvent(
+                          request.projectId,
+                          {
+                            event: "status",
+                            data: {
+                              message: `too many tools for this provider — reduced to ${capped.tools.length}`,
+                            },
+                          },
+                          request.requestId,
+                        );
+                        this.onEvent(
+                          request.projectId,
+                          { event: "status", data: { message: null } },
+                          request.requestId,
+                        );
+                        continue; // heal is free, don't consume an attempt
+                      }
+                      // tools already under the cap — different cause; fall through
                     }
 
                     // ── HEALABLE 400: image content rejected by a text-only endpoint ──

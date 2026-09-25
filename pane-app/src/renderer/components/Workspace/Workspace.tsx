@@ -29,6 +29,9 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
   // Always start unmounted. startTransition defers the heavy Conversation render
   // so the initial paint (empty area) happens first, keeping the app responsive
   // when restoring a conversation with many large code blocks.
+  // Exception: forceMount threads (peer-thread spawns) mount immediately —
+  // their objective arrives via pane:send-message, and a never-mounted
+  // Conversation has no listener to receive it.
   const [mounted, setMounted] = useState(false);
   const mountedRef = useRef(false);
   const [, startTransition] = useTransition();
@@ -39,7 +42,7 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
     const apply = (state: ReturnType<typeof useProjectsStore.getState>) => {
       if (!ref.current) return;
       const isActive = state.activeProjectId === projectId;
-      if (isActive && !mountedRef.current) {
+      if ((isActive || state.forceMount.has(projectId)) && !mountedRef.current) {
         mountedRef.current = true;
         startTransition(() => setMounted(true));
       }
@@ -50,7 +53,11 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
 
     apply(useProjectsStore.getState());
     return useProjectsStore.subscribe((state, prev) => {
-      if (state.activeProjectId !== prev.activeProjectId) apply(state);
+      if (
+        state.activeProjectId !== prev.activeProjectId ||
+        state.forceMount !== prev.forceMount
+      )
+        apply(state);
     });
   }, [projectId]);
 

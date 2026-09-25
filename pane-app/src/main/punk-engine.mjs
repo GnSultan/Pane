@@ -216,6 +216,34 @@ class PunkEngine {
     }
   }
 
+  /**
+   * Peer-spawn bridge → API backend → every ToolExecutor. The renderer's
+   * usePeerThreads hook receives "peer-spawn-request" and owns the thread
+   * creation + kickoff + completion-notice lifecycle.
+   *
+   * May be called before initialize() (registerClaudeHandlers runs at module
+   * load, backends come up later via initPunkBackend) — so like setAgentCall,
+   * store on the engine and re-propagate after the backend exists. The
+   * .then() in initStartupServices re-wires engine-held bridges.
+   */
+  setPeerSpawnBridge(fn) {
+    this._peerSpawnBridge = fn;
+    if (this.backends.api) {
+      this.backends.api.setPeerSpawnBridge(fn);
+    }
+  }
+
+  /**
+   * Push engine-held bridges into a freshly initialized API backend.
+   * Called from initStartupServices after initPunkBackend() resolves —
+   * covers bridges registered before the backend existed.
+   */
+  repropagateBridges() {
+    if (this._peerSpawnBridge && this.backends.api) {
+      this.backends.api.setPeerSpawnBridge(this._peerSpawnBridge);
+    }
+  }
+
   setBrainIndexer(fn) {    this._brainIndexer = fn;
   }
 

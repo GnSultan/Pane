@@ -142,6 +142,11 @@ interface ProjectsState {
   projects: Map<string, Project>;
   activeProjectId: string | null;
   projectOrder: string[]; // ordered list of project IDs for Cmd+1/2/3
+  /** Threads whose Conversation must mount even though they've never been
+   *  activated. Used by peer-thread spawning: a peer's objective arrives via
+   *  pane:send-message, but a never-activated thread has no listener until
+   *  its Conversation mounts. Managed via setForceMount. */
+  forceMount: Set<string>;
 
   // Project lifecycle
   addProject: (root: string, stableId?: string, nameOverride?: string) => string; // returns project ID
@@ -262,6 +267,8 @@ interface ProjectsState {
   clearConversation: (projectId: string) => void;
   clearSessionContext: (projectId: string) => void;
   setHasUnreadCompletion: (projectId: string, hasUnread: boolean) => void;
+  /** Force-mount a thread's Conversation without activating it (peer threads). */
+  setForceMount: (projectId: string, forced: boolean) => void;
   setHasUnreadLens: (projectId: string, hasUnread: boolean) => void;
   restoreConversation: (
     projectId: string,
@@ -333,6 +340,7 @@ function createProjectsStore() {
     projects: new Map(),
     activeProjectId: null,
     projectOrder: [],
+    forceMount: new Set(),
 
     addProject: (root: string, stableId?: string, nameOverride?: string) => {
       const state = get();
@@ -971,6 +979,16 @@ function createProjectsStore() {
           hasUnreadCompletion: hasUnread,
         })),
       ),
+
+    setForceMount: (projectId, forced) =>
+      set((state) => {
+        // Immutable copy — ConversationLayer subscribes to this set; an
+        // in-place mutation would not notify subscribers.
+        const next = new Set(state.forceMount);
+        if (forced) next.add(projectId);
+        else next.delete(projectId);
+        return { forceMount: next };
+      }),
 
     setHasUnreadLens: (projectId, hasUnread) =>
       set((state) =>

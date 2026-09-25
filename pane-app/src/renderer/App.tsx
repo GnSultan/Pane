@@ -12,6 +12,7 @@ import { useFileWatcher } from "./hooks/useFileWatcher";
 import { useGitStatus } from "./hooks/useGitStatus";
 import { useSettingsPersistence } from "./hooks/useSettingsPersistence";
 import { useSkillsSync } from "./hooks/useSkillsSync";
+import { usePeerThreads } from "./hooks/usePeerThreads";
 
 function App() {
   // Sidebar visibility: conversation mode + not collapsed.
@@ -35,6 +36,10 @@ function App() {
   useGitStatus();
   useSettingsPersistence();
   useSkillsSync();
+  // Peer-thread spawning — listens for pane_spawn_peer requests from main and
+  // runs the full spawn → watch → completion-notice lifecycle. Mounted once
+  // at app root; survives thread switches like the voice session.
+  usePeerThreads();
 
   // Fetch models on app launch
   useEffect(() => {
