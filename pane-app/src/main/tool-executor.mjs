@@ -67,6 +67,10 @@ import {
   ensureGlobalSkillsDir,
 } from "./skill-registry.mjs";
 import { mcpClient } from "./mcp-client.mjs";
+import {
+  MCP_GATEWAY_TOOL_NAMES,
+  executeMcpGatewayTool,
+} from "./mcp-gateway.mjs";
 import { readLogs, logCollectorStats } from "./log-collector.mjs";
 
 // ── CMD Worker (utility process for shell execution) ──────────────────────
@@ -1822,6 +1826,16 @@ export class ToolExecutor {
       // with ext__server__toolname and routed to the MCP client.
       if (mcpClient.isExternalTool(toolName)) {
         const result = await mcpClient.callTool(toolName, input);
+        return { ...result, toolId };
+      }
+
+      // ── MCP gateway tools ──
+      // mcp_search_tools / mcp_get_tool_schema / mcp_call_tool — constant-
+      // cost access to every tool on every server (providers cap tools[];
+      // see mcp-gateway.mjs). Routed before the built-in switch; names are
+      // disjoint from built-ins and ext__*.
+      if (MCP_GATEWAY_TOOL_NAMES.has(toolName)) {
+        const result = await executeMcpGatewayTool(toolName, input);
         return { ...result, toolId };
       }
 

@@ -3,6 +3,10 @@ import {
   capToolsForProvider,
   OPENAI_TOOLS_CAP,
 } from "../http-backend.mjs";
+import {
+  MCP_GATEWAY_TOOL_DEFINITIONS,
+  MCP_GATEWAY_TOOL_NAMES,
+} from "../mcp-gateway.mjs";
 
 // Real-world shape (Sep 25 2026): 59 built-in Pane tools + 410 external MCP
 // tools (vercel 212, resend 105, portfolio 27, notion 24, gmail 15,
@@ -165,5 +169,55 @@ describe("capToolsForProvider", () => {
     // And the heal's max-length extraction
     const maxMatch = plainBody.match(/maximum length (\d+)/);
     expect(maxMatch?.[1]).toBe("128");
+  });
+
+  it("reports gated (gateway-only) servers, not lost ones", () => {
+    // With the MCP gateway, capped servers stay callable via
+    // mcp_call_tool — the notice must say "gateway-only", never
+    // "not available", or the model would refuse to use them.
+    const { builtIns, all } = makeTools(59);
+    expect(builtIns.length).toBe(59);
+    const result = capToolsForProvider(all, OPENAI_TOOLS_CAP, (n) => `[kept ${n}]`);
+    expect(result.gatedServers).toEqual([
+      "portfolio",
+      "resend",
+      "vercel",
+    ]);
+    expect(result.notice).toContain("mcp_call_tool");
+    expect(result.notice).toContain("mcp_search_tools");
+    expect(result.notice).not.toContain("NOT available");
+  });
+
+  it("keeps the 3 gateway tools through every cap tier", () => {
+    // The gateway tools (mcp_search_tools, mcp_get_tool_schema,
+    // mcp_call_tool) are built-ins pushed into TOOL_DEFINITIONS — they
+    // must survive both the normal cap and the degenerate all-externals-
+    // dropped branch, or gated servers become unreachable.
+    const { all } = makeTools(59);
+    const withGateway = [
+      ...all,
+      ...MCP_GATEWAY_TOOL_DEFINITIONS,
+    ];
+    const normal = capToolsForProvider(withGateway, OPENAI_TOOLS_CAP);
+    for (const g of MCP_GATEWAY_TOOL_NAMES) {
+      expect(
+        normal.tools.some((t) => t.function.name === g),
+      ).toBe(true);
+    }
+    // Degenerate: cap below built-ins count → all externals gateway-only
+    const degenerate = capToolsForProvider(withGateway, 30);
+    for (const g of MCP_GATEWAY_TOOL_NAMES) {
+      expect(
+        degenerate.tools.some((t) => t.function.name === g),
+      ).toBe(true);
+    }
+    expect(degenerate.gatedServers.length).toBe(Object.keys(SERVERS).length);
+  });
+
+  it("degrades to slicing built-ins when they alone exceed the cap", () => {
+    const { builtIns } = makeTools(200, {});
+    const result = capToolsForProvider(builtIns, 128, () => "");
+    expect(result.tools.length).toBe(128);
+    expect(result.notice).toContain("exceed the provider's 128-tool limit");
   });
 });

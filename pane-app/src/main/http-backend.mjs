@@ -117,6 +117,10 @@ import {
   getZaiPlanLimits,
 } from "./provider-monitor.mjs";
 import { mcpClient } from "./mcp-client.mjs";
+import {
+  MCP_GATEWAY_TOOL_DEFINITIONS,
+  MCP_GATEWAY_TOOL_NAMES,
+} from "./mcp-gateway.mjs";
 
 // ── OAuth body transformation helpers ─────────────────────────────────────
 
@@ -1353,6 +1357,13 @@ const TOOL_DEFINITIONS = [
   },
 ];
 
+// MCP gateway tools ride at the end of the built-in list: constant 3-tool
+// footprint giving access to every tool on every connected MCP server.
+// Needed because providers cap tools[] (OpenAI: 128) while server count
+// keeps growing — see mcp-gateway.mjs. Read-only discovery + gateway call;
+// the target tools' own write semantics apply once dispatched.
+TOOL_DEFINITIONS.push(...MCP_GATEWAY_TOOL_DEFINITIONS);
+
 // ── Phase-based tool lists ─────────────────────────────────────────────────
 // planning  — reads + exploration only: model cannot modify files during planning
 // execution — all tools: model implements the plan
@@ -1387,6 +1398,8 @@ function getToolsForPhase(phase) {
   // External MCP tools — always included regardless of phase. External tools
   // are typically data-source connectors (Figma, GitHub) needed for context
   // during planning and execution alike.
+  // Plus the 3 gateway tools (already in TOOL_DEFINITIONS via push) — they
+  // give every phase access to the servers the tools[] cap had to gate.
   const external = mcpClient.getExternalTools();
   return [...builtIn, ...external];
 }
@@ -1403,27 +1416,25 @@ export const OPENAI_TOOLS_CAP = 128;
 /**
  * Deterministically reduce a tool list to at most `cap` entries, dropping
  * external (ext__*) tools only. Built-ins are never dropped — they implement
- * the core loop. Servers are dropped whole: "drop 341 tools" is a server-level
- * decision, not a per-tool one, and a partially-visible server would desync
- * from the prompt's per-server listing. Small servers are kept first (ascending
- * alphabetical), which maximizes surviving server diversity — with 59 built-ins
- * and a 128 cap, 69 external slots remain: the small servers (calendar, gmail,
- * notion, …) fit and only the tool-count monsters (vercel 212, resend 105) drop.
- * Fully deterministic: connection order can't affect the result, unlike the
- * toolIndex Map (timing-dependent — voice-relay's buildMcpCatalog hit the same
- * nondeterminism before switching to alphabetical).
+ * the core loop (and carry the MCP gateway tools, which keep gated servers
+ * reachable). Servers are dropped whole: a partially-visible server would
+ * desync from the prompt's per-server listing. Small servers are kept first
+ * (ascending alphabetical), maximizing surviving server diversity. Fully
+ * deterministic: connection order can't affect the result.
+ * Dropped servers are NOT lost — they stay callable through the mcp_call_tool
+ * gateway, so callers should present this as "gateway-only", not "gone".
  * @param {Array} tools full tool list (built-in + external)
  * @param {number} cap provider maximum, e.g. OPENAI_TOOLS_CAP
  * @param {(externalCount: number) => string} [buildNotice] optional callback
  *   returning a system-prompt notice naming the dropped servers, so the
  *   prompt and the tools array stay in lockstep.
- * @returns {{ tools: Array, notice: string|null }}
+ * @returns {{ tools: Array, notice: string|null, gatedServers: string[] }}
  */
 export function capToolsForProvider(tools, cap, buildNotice) {
   const builtIns = tools.filter((t) => !t.function.name.startsWith("ext__"));
   const externals = tools.filter((t) => t.function.name.startsWith("ext__"));
   const overBy = builtIns.length + externals.length - cap;
-  if (overBy <= 0) return { tools, notice: null };
+  if (overBy <= 0) return { tools, notice: null, gatedServers: [] };
 
   // Group externals by server so whole servers can be dropped. Within-server
   // tools sorted by name — output order must not depend on connection order.
@@ -1445,13 +1456,25 @@ export function capToolsForProvider(tools, cap, buildNotice) {
   let externalBudget = cap - builtIns.length;
   if (externalBudget < 0) {
     // Degenerate: built-ins alone exceed the cap. Drop ALL externals and
-    // hard-slice built-ins — a truncated core toolset is still more capable
-    // than a 400 that fails every request.
+    // hard-slice built-ins — but the gateway tools ride at the FRONT of the
+    // slice: they're the escape hatch that keeps every external server
+    // callable, so losing them to a slice would strand all integrations.
+    const gateway = builtIns.filter((t) =>
+      MCP_GATEWAY_TOOL_NAMES.has(t.function.name),
+    );
+    const nonGateway = builtIns.filter(
+      (t) => !MCP_GATEWAY_TOOL_NAMES.has(t.function.name),
+    );
+    const allServers = [...byServer.keys()].sort();
     const notice = buildNotice
       ? buildNotice(0) +
-        ` All external integrations were dropped (built-in tools alone exceed the provider's ${cap}-tool limit).`
+        ` All external integrations moved to gateway-only mode (built-in tools alone exceed the provider's ${cap}-tool limit). Every server remains callable via mcp_search_tools / mcp_call_tool.`
       : null;
-    return { tools: builtIns.slice(0, cap), notice };
+    return {
+      tools: [...gateway, ...nonGateway].slice(0, cap),
+      notice,
+      gatedServers: allServers,
+    };
   }
 
   const keptByServer = new Map();
@@ -1464,7 +1487,7 @@ export function capToolsForProvider(tools, cap, buildNotice) {
       droppedServers.push(server);
     }
   }
-  if (!droppedServers.length) return { tools, notice: null };
+  if (!droppedServers.length) return { tools, notice: null, gatedServers: [] };
 
   // Reassemble: built-ins first (core loop), then kept externals in stable
   // alphabetical server order.
@@ -1473,9 +1496,13 @@ export function capToolsForProvider(tools, cap, buildNotice) {
     .flatMap(([, ts]) => ts);
   const notice = buildNotice
     ? buildNotice(keptExternals.length) +
-      ` Because this provider limits requests to ${cap} tools, the following MCP servers are NOT available this session: ${droppedServers.sort().join(", ")}. Do not call their tools (ext__<server>__…) — treat them as unavailable.`
+      ` This provider limits requests to ${cap} tools, so some MCP servers have no direct tools listed above. They are STILL FULLY AVAILABLE — every tool on every connected server is callable via mcp_search_tools (find by keyword) and mcp_call_tool (call by exact name). Gateway-only servers this session: ${droppedServers.sort().join(", ")}.`
     : null;
-  return { tools: [...builtIns, ...keptExternals], notice };
+  return {
+    tools: [...builtIns, ...keptExternals],
+    notice,
+    gatedServers: droppedServers.sort(),
+  };
 }
 
 function getAnthropicToolsForPhase(phase) {
@@ -2954,15 +2981,18 @@ export class ApiBackend extends PunkBackend {
       // Mirrors the condition at body.tools assembly below — keep in sync.
       const providerNeedsCap = apiConfig.provider === "openai";
       let _mcpAwareness = "";
+      let _gatewayOnlyServers = /** @type {string[]} */ ([]);
       if (connectedServers.length > 0) {
-        const visibleToolNames = providerNeedsCap
-          ? new Set(
-              capToolsForProvider(
-                getToolsForPhase("execution"),
-                OPENAI_TOOLS_CAP,
-              ).tools.map((t) => t.function.name),
+        const capResult = providerNeedsCap
+          ? capToolsForProvider(
+              getToolsForPhase("execution"),
+              OPENAI_TOOLS_CAP,
             )
           : null;
+        const visibleToolNames = capResult
+          ? new Set(capResult.tools.map((t) => t.function.name))
+          : null;
+        _gatewayOnlyServers = capResult ? capResult.gatedServers : [];
         const lines = connectedServers.map((s) => {
           const tools = mcpClient.getExternalTools()
             .filter(
@@ -2975,17 +3005,29 @@ export class ApiBackend extends PunkBackend {
               (t) =>
                 `  - ${t.function.name}: ${t.function.description?.slice(0, 120) || "External tool"}`,
             );
-          // Servers whose tools were dropped by the cap are omitted entirely —
-          // a "(0 tools)" entry would advertise an empty server.
-          if (!tools.length) return null;
+          if (!tools.length) {
+            // Gated server: no direct tools in tools[], but fully reachable
+            // through the gateway — one line instead of enumeration. Never
+            // omit: the model must know the integration exists.
+            return `${s.name} (${mcpStatus.find((x) => x.name === s.name)?.toolCount ?? "?"} tools, gateway-only): all tools reachable via mcp_search_tools (try server:'${s.name}') and mcp_call_tool.`;
+          }
           return `${s.name} (${tools.length} tools):\n${tools.join("\n")}`;
         });
-        const visibleLines = lines.filter(Boolean);
-        if (visibleLines.length > 0) {
+        // Deterministic order: direct-tool servers alphabetically, then
+        // gateway-only entries (capToolsForProvider already sorts them).
+        const direct = lines.filter(
+          (l) => !l.includes("gateway-only"),
+        );
+        const gated = lines.filter((l) => l.includes("gateway-only"));
+        if (direct.length + gated.length > 0) {
           _mcpAwareness =
             "You have access to external integrations via MCP servers. " +
-            "These are real tools connected to external services — use them directly when the user asks about those services:\n\n" +
-            visibleLines.join("\n\n");
+            "These are real tools connected to external services — use them directly when the user asks about those services.\n" +
+            (_gatewayOnlyServers.length
+              ? "Servers marked gateway-only exceed this provider's tools[] limit — their tools are NOT in your tool list but ARE fully callable: mcp_search_tools finds them by keyword, mcp_call_tool executes them by exact name.\n"
+              : "") +
+            "\n" +
+            [...direct, ...gated].join("\n\n");
         }
       }
 
@@ -3639,7 +3681,7 @@ export class ApiBackend extends PunkBackend {
               );
               if (capped.notice) {
                 console.warn(
-                  `[http] tools[] capped to ${capped.tools.length} for OpenAI (limit ${OPENAI_TOOLS_CAP})`,
+                  `[http] tools[] capped to ${capped.tools.length} for OpenAI (limit ${OPENAI_TOOLS_CAP}); gateway-only servers: ${capped.gatedServers.join(", ") || "none"}`,
                 );
                 // Two delivery paths, both needed by auth mode:
                 // API-key mode restructures via applyPrefixCacheOptimization
