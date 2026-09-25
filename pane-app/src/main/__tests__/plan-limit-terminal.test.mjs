@@ -57,6 +57,35 @@ describe("isPlanLimitError", () => {
     for (const v of variants) expect(isPlanLimitError(v)).toBe(true);
   });
 
+  // ── OpenAI: billing-fatal 429 (Sep 25 trace: credit_balance_exhausted
+  //    blind-retried by three nested gates ≈2min/attempt while the UI
+  //    showed nothing) ──
+  it("classifies the OpenAI friendly message", () => {
+    expect(
+      isPlanLimitError(
+        "OpenAI credits exhausted — add credits at platform.openai.com/settings/organization/billing, or switch provider.",
+      ),
+    ).toBe(true);
+  });
+
+  it("classifies the raw OpenAI upstream body", () => {
+    // Defense in depth: if the friendly wrapper is lost, the raw body's
+    // identifier phrases still classify.
+    expect(
+      isPlanLimitError(
+        'HTTP 429: {"error":{"message":"You have no credits remaining.","type":"insufficient_quota","code":"credit_balance_exhausted"}}',
+      ),
+    ).toBe(true);
+  });
+
+  it("classifies the no-credits phrase without the code", () => {
+    // Some OpenAI payloads omit the code field; the human phrase alone
+    // must still classify.
+    expect(
+      isPlanLimitError('HTTP 429: {"error":{"message":"You have no credits remaining. Add credits to continue using the API."}}'),
+    ).toBe(true);
+  });
+
   // ── Congestion must NOT be classified terminal — mirroring the opposite
   //    axis: a plain 429 without plan-limit identity is still retryable. ──
   it("does not classify plain congestion 429s", () => {

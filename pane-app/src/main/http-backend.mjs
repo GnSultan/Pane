@@ -1999,6 +1999,21 @@ export function isPlanLimitError(message) {
   const msg = (message || "").toLowerCase();
   if (msg.includes("usage_limit_reached")) return true;
   if (msg.includes("anthropic") && msg.includes("limit reached")) return true;
+  // OpenAI billing-fatal 429 (Sep 25 trace): "insufficient_quota" /
+  // "credit_balance_exhausted" ("You have no credits remaining"). Retrying a
+  // dead account is predetermined failure — same pathology the Anthropic
+  // branch closes. Phrases match the detection-site wording below (grep
+  // "insufficient_quota" in this file).
+  if (
+    msg.includes("insufficient_quota") ||
+    msg.includes("credit_balance_exhausted") ||
+    msg.includes("no credits remaining") ||
+    // The friendly message thrown at the detection sites — this is the exact
+    // string the retry gates see on error.message.
+    msg.includes("credits exhausted")
+  ) {
+    return true;
+  }
   if (msg.includes("z.ai")) {
     return (
       msg.includes("quota") ||
@@ -4543,6 +4558,46 @@ export class ApiBackend extends PunkBackend {
                       );
                       // _noRetry stops the network catch below from re-fetching
                       // 7 more times — the plan limit cannot clear mid-loop.
+                      const fatal = new Error(friendlyMsg);
+                      fatal._noRetry = true;
+                      throw fatal;
+                    }
+                  }
+
+                  // OpenAI billing-fatal 429 detection (Sep 25 trace): OpenAI
+                  // returns 429 insufficient_quota / credit_balance_exhausted
+                  // when the account balance is zero — a billing state, not
+                  // congestion. It cannot clear mid-loop, so the exponential
+                  // backoff (7 retries ≈ 2min) and session respawns are
+                  // predetermined failure while the UI shows nothing. Break
+                  // immediately and surface the actionable truth.
+                  if (isRateLimit && apiConfig.provider === "openai") {
+                    const errBodyText = lastResponseBody ||
+                      (await response.text().catch(() => ""));
+                    if (
+                      errBodyText.includes("insufficient_quota") ||
+                      errBodyText.includes("credit_balance_exhausted")
+                    ) {
+                      const friendlyMsg =
+                        "OpenAI credits exhausted — add credits at platform.openai.com/settings/organization/billing, or switch provider.";
+                      console.warn(
+                        `[http] OpenAI insufficient_quota — breaking retry loop: ${friendlyMsg}`,
+                      );
+                      this.onEvent(
+                        request.projectId,
+                        {
+                          event: "rate_limit",
+                          data: {
+                            status: "rejected",
+                            rateLimitType: "quota_exhausted",
+                            provider: "openai",
+                            message: friendlyMsg,
+                          },
+                        },
+                        request.requestId,
+                      );
+                      // _noRetry stops the network catch below from re-fetching
+                      // 7 more times — a dead balance can't clear mid-loop.
                       const fatal = new Error(friendlyMsg);
                       fatal._noRetry = true;
                       throw fatal;
@@ -8553,6 +8608,40 @@ export class ApiBackend extends PunkBackend {
             );
             fatal._noRetry = true;
             throw fatal;
+          }
+
+          // Billing-fatal 429 (Sep 25 trace: OpenAI insufficient_quota burned
+          // 7×30s planner retries while arbiter/brain relay loops all failed
+          // the same way for 20+ minutes). A zero balance cannot clear
+          // mid-loop — read the body once, fail fast with the actionable truth.
+          if (status === 429) {
+            const errText = await response.text().catch(() => "");
+            if (
+              errText.includes("insufficient_quota") ||
+              errText.includes("credit_balance_exhausted")
+            ) {
+              const friendlyMsg =
+                "OpenAI credits exhausted — add credits at platform.openai.com/settings/organization/billing, or switch provider.";
+              console.warn(
+                `[http] Planning call: OpenAI insufficient_quota — no retry: ${friendlyMsg}`,
+              );
+              this.onEvent(
+                request.projectId,
+                {
+                  event: "rate_limit",
+                  data: {
+                    status: "rejected",
+                    rateLimitType: "quota_exhausted",
+                    provider: "openai",
+                    message: friendlyMsg,
+                  },
+                },
+                request.requestId,
+              );
+              const fatal = new Error(friendlyMsg);
+              fatal._noRetry = true;
+              throw fatal;
+            }
           }
 
           // Rate limit or server error: retry with backoff
