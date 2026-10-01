@@ -912,6 +912,51 @@ function ExpandedComputerInput({ input }: { input: Record<string, unknown> }) {
   );
 }
 
+/** Image-envelope tool result — render the actual pixels the model saw.
+ *  Both computer screenshots and view_image results arrive as
+ *  __PANE_IMG__{json} envelopes; decode and show them inline. The model
+ *  receives the same bytes natively — this closes the loop for the human. */
+function ToolResultImage({ content }: { content: string }) {
+  const img = useMemo(() => {
+    try {
+      const env = JSON.parse(content.slice("__PANE_IMG__".length));
+      if (typeof env.data === "string" && typeof env.media_type === "string") {
+        return {
+          src: `data:${env.media_type};base64,${env.data}`,
+          label: typeof env.label === "string" ? env.label : "image",
+          kb: Math.round(((env.data.length * 3) / 4) / 1024),
+        };
+      }
+    } catch {
+      // malformed envelope — fall through to the plain marker below
+    }
+    return null;
+  }, [content]);
+
+  if (!img) {
+    return (
+      <div className="px-4 pb-4 font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+        [image result]
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-4 pb-4">
+      <img
+        src={img.src}
+        alt={img.label}
+        loading="lazy"
+        className="rounded-md border border-pane-border/10 max-w-full h-auto"
+        style={{ maxHeight: 360 }}
+      />
+      <div className="mt-1.5 font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        {img.label} · {img.kb >= 1024 ? `${(img.kb / 1024).toFixed(1)}MB` : `${img.kb}KB`} · shown to the model natively
+      </div>
+    </div>
+  );
+}
+
 function formatToolOutput(content: unknown): string {
   if (typeof content !== "string") {
     return JSON.stringify(content, null, 2);
@@ -1107,12 +1152,16 @@ export function ToolActivity({ toolUse, toolResult, isHistorical }: ToolActivity
 
           {/* Success output — hide for Edit/Write/Read (input already shows what changed) */}
           {toolResult && !toolResult.is_error && !["Edit", "Write", "Read", "replace", "write_file", "read_file"].includes(toolUse.name) && (
-            <div
-              className="px-4 pb-4 overflow-x-auto max-h-[250px] overflow-y-auto text-pane-text-secondary leading-[1.6]"
-              style={{ fontSize: "var(--pane-font-size-sm)" }}
-            >
-              <MarkdownText text={formatToolOutput(toolResult.content)} />
-            </div>
+            typeof toolResult.content === "string" && toolResult.content.startsWith("__PANE_IMG__") ? (
+              <ToolResultImage content={toolResult.content} />
+            ) : (
+              <div
+                className="px-4 pb-4 overflow-x-auto max-h-[250px] overflow-y-auto text-pane-text-secondary leading-[1.6]"
+                style={{ fontSize: "var(--pane-font-size-sm)" }}
+              >
+                <MarkdownText text={formatToolOutput(toolResult.content)} />
+              </div>
+            )
           )}
         </div>
       )}
