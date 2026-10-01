@@ -286,6 +286,65 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "computer",
+      description:
+        "Act on the computer's screen and input: see what's on screen and drive the UI like a human would. " +
+        "Actions: screenshot (returns the screen as an image you can see — take one before acting), click (x,y — double/right via flags), move, drag (from/to), scroll (up/down + amount), type (text into the focused field), key (name + modifiers, e.g. key 'c' with modifiers ['cmd']), display_info, permissions. " +
+        "ALL x/y coordinates are in PHYSICAL SCREENSHOT PIXELS (the same space a screenshot occupies) — conversion to logical points is handled internally. " +
+        "Loop: screenshot to see, act, screenshot again to verify. If any action reports missing Accessibility or Screen Recording, tell the user the exact System Settings path to grant it — retrying will not help.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["screenshot", "click", "move", "drag", "scroll", "type", "key", "display_info", "permissions"],
+            description: "What to do",
+          },
+          x: { type: "number", description: "X in physical screenshot pixels (for click/move)" },
+          y: { type: "number", description: "Y in physical screenshot pixels (for click/move)" },
+          double: { type: "boolean", description: "Click action: double-click" },
+          right: { type: "boolean", description: "Click action: right-click" },
+          from: {
+            type: "object",
+            properties: { x: { type: "number" }, y: { type: "number" } },
+            description: "Drag action: start point in physical pixels",
+          },
+          to: {
+            type: "object",
+            properties: { x: { type: "number" }, y: { type: "number" } },
+            description: "Drag action: end point in physical pixels",
+          },
+          region: {
+            type: "object",
+            properties: {
+              x: { type: "number" },
+              y: { type: "number" },
+              w: { type: "number" },
+              h: { type: "number" },
+            },
+            description: "Screenshot action: crop region in physical pixels (full screen if omitted)",
+          },
+          direction: { type: "string", enum: ["up", "down"], description: "Scroll action: direction" },
+          amount: { type: "number", description: "Scroll action: amount in wheel lines (default 3)" },
+          text: { type: "string", description: "Type action: literal text to type into the focused field" },
+          key: {
+            type: "string",
+            description:
+              "Key action: key name — return, tab, escape, space, delete, forwarddelete, a-z, 0-9, f1-f20, arrows (left/right/up/down), home, end, pageup, pagedown, help",
+          },
+          modifiers: {
+            type: "array",
+            items: { type: "string", enum: ["cmd", "ctrl", "alt", "shift", "fn"] },
+            description: "Key action: modifiers held while pressing (cmd/ctrl/alt/shift/fn)",
+          },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "write_file",
       description:
         "Write the full contents to a file. Overwrites existing files.",
@@ -1373,6 +1432,7 @@ const WRITE_TOOL_NAMES = new Set([
   "pane_run_in_terminal",
   "write_file",
   "replace",
+  "computer",
   "pane_revert_change",
   "pane_remember",
   "pane_update_memory",

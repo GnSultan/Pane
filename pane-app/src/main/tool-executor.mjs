@@ -1050,6 +1050,137 @@ export class ToolExecutor {
   }
 
   /**
+   * computer — native macOS screen capture and input actuation.
+   * Wraps computer-use.mjs. Capture results return an image envelope (same
+   * path as view_image) so vision models see actual pixels; every input
+   * action verifies it registered with the HID system before reporting
+   * success, so macOS's silent-drop state surfaces as an instructive error.
+   */
+  async executeComputer(toolId, input) {
+    try {
+      const cu = await import("./computer-use.mjs");
+      const action = (input.action || "").trim();
+
+      const fail = (error) => ({ success: false, error, toolId });
+      const ok = (output, metadata = undefined) => ({
+        success: true,
+        output,
+        toolId,
+        ...(metadata ? { metadata } : {}),
+      });
+
+      switch (action) {
+        case "screenshot": {
+          // capture fresh, return as image envelope for vision
+          const r = await cu.captureScreen(
+            input.region && typeof input.region.x === "number"
+              ? input.region
+              : undefined,
+            undefined
+          );
+          if (!r.ok) return fail(r.error);
+          // Enforce the same size cap as view_image (4.7MB binary)
+          const stats = await fsPromises.stat(r.path);
+          if (stats.size > 4_700_000) {
+            // Auto-downscale instead of failing — screenshots are always ours
+            const small = r.path.replace(/\.png$/, "") + "-downscaled.jpg";
+            await execThroughWorker(
+              `sips -Z 1568 --property format jpeg "${r.path}" --out "${small}"`,
+              { timeout: 15 }
+            );
+            return await this.executeViewImage(toolId, small);
+          }
+          const view = await this.executeViewImage(toolId, r.path);
+          if (view.success && view.metadata) {
+            view.metadata.temporaryFile = r.path;
+          }
+          return view;
+        }
+
+        case "click": {
+          if (!Number.isFinite(input.x) || !Number.isFinite(input.y)) {
+            return fail("click requires numeric x and y in PHYSICAL screenshot pixels");
+          }
+          const r = await cu.clickAt({
+            x: input.x,
+            y: input.y,
+            double: input.double === true,
+            right: input.right === true,
+          });
+          return r.ok ? ok(`Clicked at (${input.x}, ${input.y})${input.double ? " (double)" : ""}${input.right ? " (right)" : ""}.`) : fail(r.error);
+        }
+
+        case "move": {
+          if (!Number.isFinite(input.x) || !Number.isFinite(input.y)) {
+            return fail("move requires numeric x and y in PHYSICAL screenshot pixels");
+          }
+          const r = await cu.movePointerTo({ x: input.x, y: input.y });
+          return r.ok ? ok(`Moved pointer to (${input.x}, ${input.y}).`) : fail(r.error);
+        }
+
+        case "drag": {
+          if (!input.from || !input.to) return fail("drag requires from:{x,y} and to:{x,y}");
+          const r = await cu.dragFromTo(input.from, input.to);
+          return r.ok ? ok(`Dragged from (${input.from.x}, ${input.from.y}) to (${input.to.x}, ${input.to.y}).`) : fail(r.error);
+        }
+
+        case "scroll": {
+          const direction = input.direction === "up" ? "up" : "down";
+          const amount = Number.isFinite(input.amount) ? input.amount : 3;
+          const r = await cu.scrollAt(direction, amount);
+          return r.ok ? ok(`Scrolled ${direction} ${amount}.`) : fail(r.error);
+        }
+
+        case "type": {
+          if (typeof input.text !== "string" || input.text.length === 0) {
+            return fail("type requires non-empty text");
+          }
+          const r = await cu.typeText(input.text);
+          return r.ok ? ok(`Typed ${input.text.length} characters.`) : fail(r.error);
+        }
+
+        case "key": {
+          const key = typeof input.key === "string" ? input.key : "";
+          const mods = Array.isArray(input.modifiers) ? input.modifiers : [];
+          if (!key) return fail("key requires a key name, e.g. \"return\", \"tab\", \"c\", \"f5\"");
+          const r = await cu.pressKey(key, mods);
+          return r.ok
+            ? ok(`Pressed ${[...mods, key].join("+")}.`)
+            : fail(r.error);
+        }
+
+        case "display_info": {
+          const r = await cu.getDisplayInfo();
+          if (!r.ok) return fail(r.error);
+          const p = await cu.probePermissions();
+          return ok(
+            `Main display: ${r.logical.w}×${r.logical.h} logical points; screenshots are ${r.physical.w}×${r.physical.h} physical pixels (${r.scale}× scale). ` +
+            `All computer tool coordinates are PHYSICAL screenshot pixels. Screen Recording: ${p.screenRecording ? "granted" : "MISSING"}. ` +
+            `Accessibility: ${p.accessibility ? "granted" : "MISSING"}.`,
+            { logical: r.logical, physical: r.physical, scale: r.scale, permissions: p }
+          );
+        }
+
+        case "permissions": {
+          const p = await cu.probePermissions();
+          return ok(
+            `Screen Recording: ${p.screenRecording ? "granted" : "MISSING"}. Accessibility: ${p.accessibility ? "granted" : "MISSING"}. ` +
+            (p.errors.length ? p.errors.join(" ") : "All computer-use permissions granted."),
+            p
+          );
+        }
+
+        default:
+          return fail(
+            `Unknown action "${action}". Actions: screenshot, click, move, drag, scroll, type, key, display_info, permissions.`
+          );
+      }
+    } catch (error) {
+      return { success: false, error: `computer tool error: ${error.message}`, toolId };
+    }
+  }
+
+  /**
    * Read file contents
    */
   async executeReadFile(toolId, filePath, startLine = null, endLine = null) {
@@ -1879,6 +2010,9 @@ export class ToolExecutor {
 
         case "view_image":
           return await this.executeViewImage(toolId, input.file_path || input.path);
+
+        case "computer":
+          return await this.executeComputer(toolId, input);
 
         case "pane_read_files": {
           // Batch read: read multiple files in one tool call.
