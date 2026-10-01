@@ -1843,6 +1843,8 @@ const VOICE_OPTIONS: Array<{ id: string; note: string }> = [
 function VoiceSection() {
   const [voice, setVoice] = useState<string>("marin");
   const [accent, setAccent] = useState<string>("none");
+  const [wakePhrase, setWakePhrase] = useState<string>("maya");
+  const [wakeEnabled, setWakeEnabled] = useState<boolean>(false);
   const [testing, setTesting] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -1869,24 +1871,33 @@ function VoiceSection() {
   useEffect(() => {
     loadSettings()
       .then((s: UserSettings) => {
-        const vs = (s as { voice_settings?: { voice?: string; accent?: string } }).voice_settings;
+        const vs = (s as { voice_settings?: { voice?: string; accent?: string; wake_word?: string; wake_word_enabled?: boolean } }).voice_settings;
         if (vs?.voice) setVoice(vs.voice);
         if (vs?.accent) setAccent(vs.accent);
+        if (vs?.wake_word) setWakePhrase(vs.wake_word);
+        if (vs?.wake_word_enabled) setWakeEnabled(true);
       })
       .catch(() => undefined);
   }, []);
 
+  const saveWake = (): void => {
+    const clean = wakePhrase.trim().toLowerCase();
+    if (!clean) return;
+    saveSettings({ voice_settings: { wake_word: clean } })
+      .catch((err: unknown) => console.error("[voice] failed to save wake word:", err));
+  };
+
   const pick = (id: string): void => {
     setVoice(id);
     setTestError(null);
-    saveSettings({ voice_settings: { voice: id } } as unknown as Partial<UserSettings>)
+    saveSettings({ voice_settings: { voice: id } })
       .catch((err: unknown) => console.error("[voice] failed to save voice setting:", err));
   };
 
   const pickAccent = (id: string): void => {
     setAccent(id);
     setTestError(null);
-    saveSettings({ voice_settings: { accent: id } } as unknown as Partial<UserSettings>)
+    saveSettings({ voice_settings: { accent: id } })
       .catch((err: unknown) => console.error("[voice] failed to save accent setting:", err));
   };
 
@@ -2034,6 +2045,53 @@ function VoiceSection() {
           no native uk voices · steered by prompt
         </span>
       </div>
+
+      <div className="flex items-center gap-2 mt-3">
+        <span className="text-pane-text-secondary/50 font-mono shrink-0" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+          wake word
+        </span>
+        <input
+          value={wakePhrase}
+          onChange={(e) => setWakePhrase(e.target.value.toLowerCase())}
+          onBlur={() => saveWake()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          }}
+          disabled={!wakeEnabled}
+          placeholder="maya"
+          maxLength={40}
+          className={`flex-1 min-w-0 px-2.5 py-1 rounded-md font-mono ring-1 bg-pane-bg outline-none transition-colors ${
+            wakeEnabled
+              ? "ring-pane-border/40 text-pane-text focus:ring-pane-accent/40"
+              : "ring-pane-border/25 text-pane-text-secondary/30"
+          }`}
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+        />
+        <button
+          onClick={() => {
+            setWakeEnabled((prev) => {
+              const next = !prev;
+              saveSettings({ voice_settings: { wake_word_enabled: next } })
+                .catch((err: unknown) => console.error("[voice] failed to save wake setting:", err));
+              return next;
+            });
+          }}
+          className={`font-mono btn-press px-2.5 py-1 rounded-md ring-1 transition-colors shrink-0 ${
+            wakeEnabled
+              ? "bg-pane-accent/10 ring-pane-accent/40 text-pane-text"
+              : "bg-pane-bg ring-pane-border/25 text-pane-text-secondary hover:text-pane-text"
+          }`}
+          style={{ fontSize: "var(--pane-font-size-xs)" }}
+          title="When on, parking the voice session keeps a local listener running — say the word to wake it. The armed mic feeds only the on-device spotter; nothing is sent anywhere."
+        >
+          {wakeEnabled ? "armed" : "off"}
+        </button>
+      </div>
+      {wakeEnabled && (
+        <span className="text-pane-text-secondary/40 font-mono block" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+          on-device listening · session parks into armed mode after 30s idle · say “{wakePhrase || "maya"}” to wake
+        </span>
+      )}
 
       <div className="flex items-center gap-3 mt-1">
         <button

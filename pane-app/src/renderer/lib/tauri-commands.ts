@@ -295,6 +295,15 @@ export interface UserSettings {
    *  process whose tools become available to the model. Keyed by server
    *  name (e.g. "figma", "github"). */
   mcp_servers?: Record<string, McpServerConfig>;
+  /** Voice settings (Profile → voice). voice/accent are baked into the
+   *  realtime session at mint time; wake_word/wake_word_enabled drive the
+   *  on-device keyword spotter for armed standby. */
+  voice_settings?: {
+    voice?: string;
+    accent?: string;
+    wake_word?: string;
+    wake_word_enabled?: boolean;
+  };
 }
 
 /** Configuration for a single external MCP server. */

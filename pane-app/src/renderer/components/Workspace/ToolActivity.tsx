@@ -362,6 +362,14 @@ function summarizeTool(name: string, input: Record<string, unknown>): string {
       const p = (input.file_path as string) || (input.path as string) || "";
       return p ? p.slice(0, 80) : "";
     }
+    case "computer": {
+      const action = (input.action as string) || "";
+      const parts = [action];
+      if (typeof input.x === "number" && typeof input.y === "number") parts.push(`(${input.x}, ${input.y})`);
+      if (input.key) parts.push(String(input.key));
+      if (typeof input.text === "string") parts.push(`"${input.text.slice(0, 24)}"`);
+      return parts.join(" ").slice(0, 60);
+    }
     case "evaluate_js":
       return "";
     case "web_fetch": {
@@ -404,6 +412,7 @@ function getToolLabel(name: string): string {
     case "save_memory": return "memory";
     case "ask_user": return "ask";
     case "view_image": return "view";
+    case "computer": return "screen";
     case "Plan": return "plan";
     case "WebSearch":
     case "google_web_search": return "search";
@@ -851,6 +860,8 @@ function renderExpandedInput(name: string, input: Record<string, unknown>, resul
       return <ExpandedBashInput input={input} />;
     case "view_image":
       return <ExpandedViewImageInput input={input} />;
+    case "computer":
+      return <ExpandedComputerInput input={input} />;
     default:
       return <ExpandedDefaultInput input={input} />;
   }
@@ -868,6 +879,35 @@ function ExpandedViewImageInput({ input }: { input: Record<string, unknown> }) {
         <polyline points="21 15 16 10 5 21" />
       </svg>
       <span className="text-pane-text-secondary truncate">{filePath}</span>
+    </div>
+  );
+}
+
+/** computer — screen/input action. Shows the action verb + coordinates/args. */
+function ExpandedComputerInput({ input }: { input: Record<string, unknown> }) {
+  const action = (input.action as string) || "?";
+  const segs: string[] = [action];
+  if (typeof input.x === "number" && typeof input.y === "number") {
+    segs.push(`(${input.x}, ${input.y})`);
+    if (input.double === true) segs.push("double");
+    if (input.right === true) segs.push("right");
+  }
+  if (input.from && input.to) segs.push(`(${(input.from as any).x},${(input.from as any).y})→(${(input.to as any).x},${(input.to as any).y})`);
+  if (typeof input.direction === "string") segs.push(`${input.direction}${typeof input.amount === "number" ? " " + input.amount : ""}`);
+  if (typeof input.text === "string") segs.push(`"${input.text.slice(0, 40)}"`);
+  if (typeof input.key === "string") {
+    const mods = Array.isArray(input.modifiers) ? (input.modifiers as string[]).join("+") + "+" : "";
+    segs.push(`${mods}${input.key}`);
+  }
+  return (
+    <div className="px-4 py-3 font-mono flex items-center gap-2" style={{ fontSize: "var(--pane-font-size-sm)" }}>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-pane-text-secondary shrink-0">
+        <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+        <line x1="8" y1="21" x2="16" y2="21" />
+        <line x1="12" y1="17" x2="12" y2="21" />
+        <path d="M6 8 l4 2 -4 2" transform="translate(2 0)" />
+      </svg>
+      <span className="text-pane-text-secondary truncate">{segs.join(" · ")}</span>
     </div>
   );
 }

@@ -78,9 +78,9 @@ export function summarize(toolName, rawContent) {
     try {
       const env = JSON.parse(rawContent.slice("__PANE_IMG__".length));
       const kb = Math.round(((env.data?.length || 0) * 3) / 4 / 1024);
-      return `(view_image: ${env.label || "image"} shown to model as native image, ${kb}KB — use view_image again if you need to re-examine it)`;
+      return `(${toolName}: ${env.label || "image"} shown to model as native image, ${kb}KB — call ${toolName} again if you need to re-examine it)`;
     } catch {
-      return "(view_image: image result)";
+      return `(${toolName}: image result)`;
     }
   }
 

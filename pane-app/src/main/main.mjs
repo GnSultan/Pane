@@ -80,6 +80,7 @@ import {
   setOnActiveSkillsChanged,
 } from "./skill-registry.mjs";
 import { voiceRelay } from "./voice-relay.mjs";
+import { registerWakeWordIpc } from "./wake-word.mjs";
 import { journalExchange, companionStats } from "./companion-memory.mjs";
 const __dirname = import.meta.dirname;
 const isMac = process.platform === "darwin";
@@ -118,6 +119,10 @@ function registerClaudeHandlers() {
   ipcMain.handle("voice_tool_call", (_event, { projectId, projectRoot, tool, args }) => {
     return voiceRelay.runTool(projectId, projectRoot, tool, args);
   });
+  // ── Wake word (local keyword spotting) ────────────────────────────────
+  // Fully local: 16 kHz PCM chunks from the renderer run through a bundled
+  // sherpa-onnx model. No audio ever leaves the machine.
+  registerWakeWordIpc(ipcMain);
   // ── Agent status store (voice observability) ──────────────────────────
   // Authoritative per-thread phase feed. Renderer UI may read the full
   // snapshot; the voice relay reads it via runTool("agent_threads"),
@@ -2793,14 +2798,52 @@ app.whenReady().then(async () => {
   modelManager.initialize();        // async but not awaited — handler registered sync, cache load is fast
   createWindow();
 
-  // ── Background init: slow operations that must not block the window ───
-  // initStartupServices() handles DB migrations + backend detection. The SDK
-  // import alone can take 10-30s on cold disk.
-  initStartupServices();
-
   // Pre-fork workers — non-blocking, return immediately
   getBrainWorker(); // SQLite + embedding model (loads lazily on first embed)
   getCmdWorker();   // isolated libuv loop for command execution
+
+  // ── Launch-time TCC permission gate (macOS) ──────────────────────────
+  // Probes Screen Recording + Accessibility the moment the app starts, so
+  // permissions surface on launch instead of being discovered by a failing
+  // model tool call. Fires the native Accessibility prompt when missing and
+  // watches the app's TCC identity — a rebuild re-signs the bundle and
+  // silently voids every grant; that gets logged loudly here, not discovered
+  // turn after turn. Must run AFTER getCmdWorker(): the probes shell out
+  // through the cmd worker. Non-blocking: never delays window or first turn.
+  try {
+    const { checkPermissionsAtLaunch } = await import("./computer-use.mjs");
+    checkPermissionsAtLaunch()
+      .then(gate => {
+        if (gate.skipped) return;
+        const stillMissing = [
+          !gate.screenRecording && !gate.screenRecordingAfterPrompt ? "Screen Recording" : null,
+          !gate.accessibility && !gate.accessibilityAfterPrompt ? "Accessibility" : null,
+        ].filter(Boolean);
+        if (stillMissing.length) {
+          const why = gate.identityChanged
+            ? "Pane was rebuilt — macOS reset its permissions for this build."
+            : "Pane needs these to control the screen for you.";
+          // Native notification: visible on the desktop, not buried in logs.
+          try {
+            const { Notification } = require("electron");
+            new Notification({
+              title: "Pane: permission needed",
+              body: `Grant ${stillMissing.join(" and ")} in System Settings → Privacy & Security. ${why}`,
+            }).show();
+          } catch (e) {
+            console.warn("[startup] permission notification failed:", e.message);
+          }
+          console.warn(`[startup] permissions still missing after launch prompts: ${stillMissing.join(", ")}`);
+        }
+      })
+      .catch(err => console.warn("[startup] permission check failed:", err.message));
+  } catch (err) {
+    console.warn("[startup] permission gate unavailable:", err.message);
+  }
+
+  // initStartupServices() handles DB migrations + backend detection. The SDK
+  // import alone can take 10-30s on cold disk.
+  initStartupServices();
 
   // Preconnect MCP servers — npx cold starts take 15-30s. Starting
   // at app launch means they're ready by the first model turn.
