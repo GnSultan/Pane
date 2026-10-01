@@ -30,6 +30,8 @@ import { voiceLight } from "../../lib/voice-light";
 export interface VoiceOrbProps {
   state:
     | "off"
+    | "standby" // session open, mic parked — click wakes instantly
+    | "armed" // standby + listening for the wake word — say the name
     | "idle"
     | "connecting"
     | "listening"
@@ -244,7 +246,9 @@ function setEyeShape(
 
       // ── Eye openness (0 = closed line, 1 = fully open) ─────────────────
       let eyeOpen = 1;
-      if (state === "connecting") {
+      if (state === "standby" || state === "armed") {
+        eyeOpen = 0.06; // eyes closed — resting, session alive under it
+      } else if (state === "connecting") {
         eyeOpen = 0.45 + 0.35 * (0.5 + 0.5 * Math.sin(t * 2.2));
       } else if (state === "listening") {
         eyeOpen = 0.9 + Math.min(0.25, user * 0.5); // widens with the voice
@@ -392,20 +396,26 @@ function setEyeShape(
             ? "text-pane-accent/70"
             : state === "connecting"
               ? "text-pane-accent/60"
-              : state === "off"
-                ? "text-pane-text-secondary/40"
-                : "text-pane-accent/70";
+              : state === "standby" || state === "armed"
+                ? "text-pane-accent/45"
+                : state === "off"
+                  ? "text-pane-text-secondary/40"
+                  : "text-pane-accent/70";
 
   const title =
     state === "error"
       ? (error ?? "voice error — click to retry")
       : state === "off"
         ? "wake pane voice"
-        : state === "speaking"
-          ? "interrupt"
-          : state === "connecting"
-            ? "connecting…"
-            : "voice live — click to end";
+        : state === "armed"
+          ? "listening for its name — say it to wake"
+          : state === "standby"
+            ? "voice on standby — click to wake"
+            : state === "speaking"
+              ? "interrupt"
+              : state === "connecting"
+                ? "connecting…"
+                : "voice live — click to end";
 
   return (
     <div ref={rootRef} className="relative">

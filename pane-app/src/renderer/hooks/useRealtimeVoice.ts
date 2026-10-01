@@ -19,9 +19,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useProjectsStore } from "../stores/projects";
+import { createWakeWordListener } from "../lib/wakeWordListener";
+import { loadSettings } from "../lib/tauri-commands";
 
 export type VoiceState =
   | "off" // feature disabled / no key
+  | "standby" // session OPEN, mic detached — instant wake (warm standby)
+  | "armed" // standby + local wake-word listener running — say the name
   | "idle" // connected, listening, not speaking
   | "connecting" // minting token + WebRTC setup
   | "listening" // user is speaking (VAD detected speech)
@@ -78,6 +82,17 @@ function backoffDelay(attempt: number): number {
  *    3. else the first input that is not a speaker.
  *  Speakers are skipped — their "mic" endpoints are usually phantom.
  */
+/** Classify a getUserMedia failure as a permission problem. Pure — module
+ *  scope so every site (connect, wake) shares one definition. */
+function isMicPermissionFailure(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    /Requested device not found/i.test(msg) ||
+    /not ?allowed/i.test(msg) ||
+    /permission denied/i.test(msg)
+  );
+}
+
 async function acquireMic(pinnedId: string | null): Promise<MediaStream> {
   const devices = await navigator.mediaDevices.enumerateDevices();
   const inputs = devices.filter((d) => d.kind === "audioinput");
@@ -262,6 +277,56 @@ export function useRealtimeVoice(opts: {
   const micStreamRef = useRef<MediaStream | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const enabledRef = useRef(false); // user intent: session should be live
+  // ── Warm standby (Sep 2026) ────────────────────────────────────────────
+  // The full boot chain (token mint → context orchestration → mic acquire →
+  // ICE/DTLS → data channel) takes seconds and runs on EVERY toggle. Warm
+  // standby keeps the realtime session OPEN with the mic detached: toggle
+  // off parks the session via sender.replaceTrack(null) (no renegotiation —
+  // the same WebRTC primitive production mute buttons use), toggle on wakes
+  // it with getUserMedia + replaceTrack(track). No mint, no ICE, no SDP —
+  // wake is a mic-acquire, sub-second even on Bluetooth.
+  // micAttachedRef: is the mic track currently on the sender? The visual
+  //   truth is sender.track, but every read site is in a transition and the
+  //   ref makes intent explicit and cheap to check in guards.
+  // wakingRef: a wake is in flight (mic acquire can take >1s on Bluetooth)
+  //   — blocks a second toggle from double-acquiring or racing detach.
+  // placeholderTrackRef: a silent track sent while detached, ONLY for the
+  //   reconnect-during-standby path — a realtime session needs an audio
+  //   m-line to negotiate at all, so a session minted with no mic gets a
+  //   placeholder instead of a failed negotiation. Never sent while a real
+  //   mic is attached; replaced (not stacked) on wake.
+  const micAttachedRef = useRef(false);
+  const wakingRef = useRef(false);
+  // Parked intent (warm standby): session open, mic detached. Distinct from
+  // enabledRef (mic live). Reconnect guards check BOTH — a parked session
+  // that drops must silently rebuild itself into standby, not wake the mic.
+  const standbyRef = useRef(false);
+  // ── Wake-word mode (armed standby) ────────────────────────────────────
+  // While parked, a local keyword spotter listens for the configured
+  // phrase ("maya" by default). armedRef mirrors the listener's liveness;
+  // reparkTimerRef auto-re-parks N seconds after the last conversation
+  // activity — the hands-free loop: say the name → talk → silence → armed
+  // again. wakeWordRef holds the phrase from settings.
+  const armedRef = useRef(false);
+  const reparkTimerRef = useRef<number | null>(null);
+  const wakeListenerRef = useRef<import("../lib/wakeWordListener").WakeWordListener | null>(null);
+  const wakeWordRef = useRef<string>("maya");
+  // Wake-word enabled (settings). Parking arms the listener ONLY when this
+  // is true — armed mode is opt-in, never default.
+  const wakeEnabledRef = useRef(false);
+  // Late-bound handle so handleEvent can schedule a re-park without a
+  // circular dependency (scheduleRePark needs wake; wake precedes it).
+  const reparkFnRef = useRef<(() => void) | null>(null);
+  // Render-time handle to scheduleRePark for call sites that precede its
+  // definition (manual orb wake) — see scheduleRePark tail comment.
+  const scheduleReParkRef = useRef<(() => void) | null>(null);
+  // Same for toggle(): arm-on-park references armWakeWord, defined later.
+  const armFnRef = useRef<(() => void) | null>(null);
+  const placeholderTrackRef = useRef<MediaStreamTrack | null>(null);
+  // The audio sender itself, captured at addTrack time. After
+  // replaceTrack(null) the sender's track is null, so it cannot be found by
+  // track-kind predicates — hold the handle instead of rediscovering it.
+  const senderRef = useRef<RTCRtpSender | null>(null);
   // Full minted session instructions + detected accent, retained for
   // turn-boundary accent reassertion (see speech_stopped handler).
   const sessionInstructionsRef = useRef("");
@@ -429,6 +494,131 @@ export function useRealtimeVoice(opts: {
     }
   }, []);
 
+  /** Capture diagnostics: meter the exact stream we send. Shared by the
+   *  initial connect and the standby wake — bytesSent rising proves
+   *  transport, NOT that the payload contains a voice. A dead Bluetooth
+   *  input or zero input volume still sends bytes — encoded silence. This
+   *  meter proves which one we have. Re-entrant: stops any prior meter
+   *  before starting (detach also stops it; this covers odd callers). */
+  const startMicMeter = useCallback(
+    (mic: MediaStream): void => {
+      const micTrack = mic.getTracks()[0];
+      if (!micTrack) return;
+      if (meterTimerRef.current !== null) {
+        clearInterval(meterTimerRef.current);
+        meterTimerRef.current = null;
+      }
+      if (meterCtxRef.current) {
+        void meterCtxRef.current.close().catch(() => undefined);
+        meterCtxRef.current = null;
+      }
+      try {
+        const Ctx =
+          window.AudioContext ??
+          (window as unknown as { webkitAudioContext?: typeof AudioContext })
+            .webkitAudioContext;
+        if (!Ctx) return;
+        const mctx = new Ctx();
+        meterCtxRef.current = mctx;
+        const src = mctx.createMediaStreamSource(mic);
+        const analyser = mctx.createAnalyser();
+        analyser.fftSize = 2048;
+        src.connect(analyser); // analyser only — never to destination
+        const buf = new Float32Array(analyser.fftSize);
+        sawSignalRef.current = false;
+        let silentMs = 0;
+        let warned = false;
+        meterTimerRef.current = window.setInterval(() => {
+          analyser.getFloatTimeDomainData(buf);
+          let peak = 0;
+          let sumSq = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const s = buf[i] ?? 0;
+            const a = Math.abs(s);
+            if (a > peak) peak = a;
+            sumSq += s * s;
+          }
+          const rms = Math.sqrt(sumSq / buf.length);
+          if (peak > 0.02) sawSignalRef.current = true;
+          if (peak <= 0.02) silentMs += 500;
+          else silentMs = 0;
+          vlog(
+            "mic meter — peak:",
+            peak.toFixed(4),
+            "rms:",
+            rms.toFixed(4),
+            "sawSignal:",
+            sawSignalRef.current ? "yes" : "no",
+          );
+          // Dead-capture warning (once): 12s of digital silence while live
+          // is a capture failure, not "model ignoring you".
+          if (!warned && silentMs >= 12000 && !sawSignalRef.current) {
+            warned = true;
+            vlog(
+              "⚠ MIC SILENT 12s+ — captured stream is digital silence. Check input device/volume. label:",
+              micTrack.label,
+            );
+            setError(
+              `Mic is capturing silence (${micTrack.label}). Check your input device — System Settings → Sound → Input.`,
+            );
+          }
+        }, 500);
+      } catch (meterErr) {
+        vlog(
+          "mic meter unavailable (non-fatal):",
+          meterErr instanceof Error ? meterErr.message : String(meterErr),
+        );
+      }
+    },
+    [],
+  );
+
+  /** Detach the mic from the live session WITHOUT closing it (warm
+   *  standby). The session stays negotiated — sender.replaceTrack(null)
+   *  reuses the existing audio m-line, no SDP exchange. The mic tracks are
+   *  STOPPED (capture ends, OS indicator off); nothing audio-sensitive
+   *  survives this call. Idempotent: parking an already-parked session is
+   *  a no-op. */
+  const detachMic = useCallback((): void => {
+    const sender = senderRef.current;
+    standbyRef.current = true;
+    // Stop the meter first — it reads the stream we're about to stop, and
+    // a running meter against dead tracks is the "12s silence" false alarm.
+    if (meterTimerRef.current !== null) {
+      clearInterval(meterTimerRef.current);
+      meterTimerRef.current = null;
+    }
+    if (meterCtxRef.current) {
+      void meterCtxRef.current.close().catch(() => undefined);
+      meterCtxRef.current = null;
+    }
+    if (micStreamRef.current) {
+      for (const t of micStreamRef.current.getTracks()) t.stop();
+      micStreamRef.current = null;
+      setMicStream(null);
+    }
+    // replaceTrack(null) on the audio sender: fires no negotiationneeded
+    // (transceiver direction stays sendrecv), so the remote session is
+    // undisturbed. This is the standard WebRTC "hard mute" primitive.
+    if (sender && sender.track) {
+      sender
+        .replaceTrack(null)
+        .catch((err) => vlog("detach replaceTrack failed:", String(err)));
+    }
+    micAttachedRef.current = false;
+    // Mute output too — parked means parked. The model must not speak
+    // into an empty room mid-standby (a pending response could still be
+    // streaming), and the remote audio track stays attached.
+    if (audioElRef.current) audioElRef.current.muted = true;
+    // Clear any audio the model had queued — nothing the user said should
+    // transcribe into a parked session.
+    if (dcRef.current?.readyState === "open") {
+      send({ type: "input_audio_buffer.clear" });
+      send({ type: "response.cancel" });
+    }
+  }, [send]);
+
+
   /** Tear down the current session completely (tracks, channel, timers). */
   const teardown = useCallback((): void => {
     // Invalidate any in-flight connect(): its captured epoch is now stale,
@@ -446,6 +636,32 @@ export function useRealtimeVoice(opts: {
     if (statsTimerRef.current !== null) {
       clearInterval(statsTimerRef.current);
       statsTimerRef.current = null;
+    }
+    // Wake-word bookkeeping: teardown kills armed intent too — a torn-down
+    // session can't be woken by name. The listener is stopped HERE, not by
+    // callers: the settings-changed re-mint tears down with no preceding
+    // disarm, and an orphaned listener keeps feeding the spotter — doubled
+    // audio that defeats detection (two interleaved 100ms chunk streams
+    // never match the keyword's token path; proven kws-interleave-test).
+    if (wakeListenerRef.current) {
+      wakeListenerRef.current.stop();
+      wakeListenerRef.current = null;
+    }
+    armedRef.current = false;
+    if (reparkTimerRef.current !== null) {
+      window.clearTimeout(reparkTimerRef.current);
+      reparkTimerRef.current = null;
+    }
+    // Warm-standby bookkeeping: a torn-down session has no sender, no park
+    // intent, no placeholder. (toggle-off no longer tears down — this runs
+    // on real end-of-life: unmount, fatal, re-mint.)
+    senderRef.current = null;
+    standbyRef.current = false;
+    micAttachedRef.current = false;
+    wakingRef.current = false;
+    if (placeholderTrackRef.current) {
+      placeholderTrackRef.current.stop();
+      placeholderTrackRef.current = null;
     }
     if (meterTimerRef.current !== null) {
       clearInterval(meterTimerRef.current);
@@ -1006,6 +1222,7 @@ export function useRealtimeVoice(opts: {
     [send, sendToolResponse],
   );
 
+
   /** Route an incoming server event. */
   const handleEvent = useCallback(
     (event: RealtimeEvent): void => {
@@ -1054,6 +1271,12 @@ export function useRealtimeVoice(opts: {
         }
         case "input_audio_buffer.speech_started":
           setState("listening");
+          // User spoke — hold off the re-park timer (it reschedules on the
+          // next response.done).
+          if (reparkTimerRef.current !== null) {
+            window.clearTimeout(reparkTimerRef.current);
+            reparkTimerRef.current = null;
+          }
           break;
         case "input_audio_buffer.speech_stopped":
           setState("thinking");
@@ -1151,6 +1374,10 @@ export function useRealtimeVoice(opts: {
         }
         case "response.done":
           setState((s) => (s === "speaking" || s === "thinking" ? "idle" : s));
+          // Hands-free loop: once the model finishes and the user doesn't
+          // speak again, re-park + re-arm. Armed mode is opt-in from
+          // settings; scheduleRePark is a no-op when never armed.
+          reparkFnRef.current?.();
           break;
         case "response.output_audio.delta":
           setState("speaking");
@@ -1189,14 +1416,8 @@ export function useRealtimeVoice(opts: {
    *  enumerateDevices returns zero inputs and getUserMedia throws
    *  "Requested device not found" with no permission dialog. Repair:
    *  main resets our own TCC record; the next getUserMedia re-prompts. */
-  const isMicPermissionFailure = (err: unknown): boolean => {
-    const msg = err instanceof Error ? err.message : String(err);
-    return (
-      /Requested device not found/i.test(msg) ||
-      /not ?allowed/i.test(msg) ||
-      /permission denied/i.test(msg)
-    );
-  };
+  // (isMicPermissionFailure hoisted to module scope — shared by connect and
+  // the standby wake path.)
 
   /** Reset Pane's own TCC mic record (main-side tccutil) so macOS shows a
    *  fresh permission prompt. Returns true when the retry is worth doing. */
@@ -1245,6 +1466,60 @@ export function useRealtimeVoice(opts: {
     }
   }, []);
 
+  /** Wake from standby: re-acquire the mic and attach it to the open
+   *  session. This is the entire boot we skip — no mint, no ICE, no SDP;
+   *  getUserMedia latency is all that remains (fast on built-in mics,
+   *  ~1s on Bluetooth). */
+  const wake = useCallback(async (): Promise<void> => {
+    const pc = pcRef.current;
+    const sender = senderRef.current;
+    if (!pc || !sender || micAttachedRef.current || wakingRef.current) return;
+    wakingRef.current = true;
+    standbyRef.current = false;
+    try {
+      const mic = await acquireMic(micDeviceIdRef.current);
+      const track = mic.getTracks()[0];
+      if (!track) throw new Error("microphone granted no audio track");
+      // Session died while we awaited getUserMedia (standby reconnect can
+      // tear down) — release the mic and let the reconnect own the state.
+      if (!pcRef.current || pcRef.current !== pc) {
+        for (const t of mic.getTracks()) t.stop();
+        return;
+      }
+      micStreamRef.current = mic;
+      setMicStream(mic);
+      setActiveMicId(track.getSettings().deviceId ?? null);
+      await sender.replaceTrack(track);
+      // A placeholder from a standby reconnect may still be set — stop it
+      // once the real track has taken its place on the sender.
+      if (placeholderTrackRef.current) {
+        placeholderTrackRef.current.stop();
+        placeholderTrackRef.current = null;
+      }
+      micAttachedRef.current = true;
+      // Un-park output alongside input — detachMic muted the audio element.
+      if (audioElRef.current) audioElRef.current.muted = false;
+      void refreshMicDevices();
+      startMicMeter(mic);
+      setState("idle");
+    } catch (err) {
+      // Permission lost while parked, device unplugged — surface it, stay
+      // parked so the session is still there once the user fixes the mic.
+      vlog("wake failed:", err instanceof Error ? err.message : String(err));
+      standbyRef.current = true;
+      setState("error");
+      setError(
+        isMicPermissionFailure(err)
+          ? "Microphone permission is blocked. Open System Settings → Privacy & Security → Microphone, allow Pane, then click the bot again."
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    } finally {
+      wakingRef.current = false;
+    }
+  }, [acquireMic, refreshMicDevices, startMicMeter]);
+
   /** Establish the session (token + WebRTC + data channel). */
   const connect = useCallback(async (): Promise<void> => {
     // Dual guard (two-voices bug, Aug 2026): pcRef covers the steady state,
@@ -1265,7 +1540,9 @@ export function useRealtimeVoice(opts: {
     // requests can outlive the toggle (switch voice, then click off before
     // the handoff fires). The enabled effect sets enabledRef BEFORE its
     // initial connect(), so every legitimate entry passes this check.
-    if (!enabledRef.current) return;
+    // EXCEPTION: a parked (standby) session rebuilding itself after a drop
+    // passes deliberately — it stays parked, mic detached, no capture.
+    if (!enabledRef.current && !standbyRef.current) return;
     const myId = ++connectSeqRef.current;
     connectingIdRef.current = myId;
     pendingConnectRef.current = false;
@@ -1297,6 +1574,10 @@ export function useRealtimeVoice(opts: {
         setAvailable(false);
         setError(reason);
         enabledRef.current = false;
+        // A mint failure while parked is a credential/config problem, not a
+        // network drop — looping reconnect into standby would hammer the
+        // mint endpoint forever. Park is over; the next wake boots fresh.
+        standbyRef.current = false;
         return;
       }
       // Retain the full session instructions — turn-boundary accent
@@ -1322,92 +1603,73 @@ export function useRealtimeVoice(opts: {
         return;
       }
 
-      // ── WebRTC setup (verified flow from OpenAI realtime-webrtc docs) ──
-      const mic = await acquireMic(micDeviceIdRef.current);
-      micStreamRef.current = mic;
-      setMicStream(mic);
-      const micTrack = mic.getTracks()[0];
-      if (!micTrack) throw new Error("microphone granted no audio track");
-      // Same staleness check after the second await.
+      // Standby-mint path (session died parked, rebuilding into standby):
+      // skip mic acquisition entirely — no capture while parked — and
+      // attach a silent placeholder so the SDP has an audio m-line to
+      // negotiate. Realtime sessions require one; a mic-less offer fails.
+      const mintingIntoStandby = standbyRef.current;
+      let micTrack: MediaStreamTrack;
+      if (mintingIntoStandby) {
+        // Silent AudioContext source → MediaStreamDestination yields a
+        // real audio track with no capture device: no OS input indicator,
+        // no mic permission involved. Digital silence for the whole
+        // parked span; the model receives nothing (buffer stays cleared).
+        const actx = new AudioContext();
+        const silentNode = actx.createBufferSource();
+        silentNode.buffer = actx.createBuffer(
+          1,
+          actx.sampleRate * 10,
+          actx.sampleRate,
+        ); // all zeros
+        const silentDest = actx.createMediaStreamDestination();
+        silentNode.connect(silentDest);
+        silentNode.start();
+        const placeholder = silentDest.stream.getAudioTracks()[0];
+        if (!placeholder) throw new Error("silent placeholder yielded no track");
+        micTrack = placeholder;
+        placeholderTrackRef.current = placeholder;
+        // The AudioContext must outlive the track. It closes when the
+        // placeholder is stopped in teardown/wake — tracked via onended.
+        placeholder.onended = () => void actx.close().catch(() => undefined);
+        vlog("minting into standby — silent placeholder track attached");
+      } else {
+        // ── WebRTC setup (verified flow from OpenAI realtime-webrtc docs) ──
+        const mic = await acquireMic(micDeviceIdRef.current);
+        micStreamRef.current = mic;
+        setMicStream(mic);
+        const realTrack = mic.getTracks()[0];
+        if (!realTrack) throw new Error("microphone granted no audio track");
+        micTrack = realTrack;
+      }
+      // Same staleness check after the second await. (No await occurred on
+      // the standby path, but the check is free and guards the else-branch
+      // future edits could reorder.)
       if (epoch !== sessionEpochRef.current) {
         vlog(
           "connect aborted — stale epoch after mic acquire (session superseded)",
         );
-        for (const t of mic.getTracks()) t.stop(); // don't leak the mic
+        if (!mintingIntoStandby && micStreamRef.current) {
+          for (const t of micStreamRef.current.getTracks()) t.stop(); // don't leak the mic
+          micStreamRef.current = null;
+        }
+        if (micTrack) micTrack.stop();
         if (connectingIdRef.current === myId) connectingIdRef.current = null; // owner release — superseded
         return;
       }
-      vlog(
-        "mic acquired — label:",
-        micTrack.label || "(no label)",
-        "enabled:",
-        micTrack.enabled,
-      );
-      setActiveMicId(micTrack.getSettings().deviceId ?? null);
-      // Labels are empty pre-permission; re-enumerate now that we have it.
-      void refreshMicDevices();
-
-      // ── Capture diagnostics: meter the exact stream we send ──────────
-      // bytesSent rising proves transport, NOT that the payload contains
-      // a voice. A dead Bluetooth input or zero input volume still sends
-      // bytes — encoded silence. This meter proves which one we have.
-      try {
-        const Ctx =
-          window.AudioContext ??
-          (window as unknown as { webkitAudioContext?: typeof AudioContext })
-            .webkitAudioContext;
-        if (Ctx) {
-          const mctx = new Ctx();
-          meterCtxRef.current = mctx;
-          const src = mctx.createMediaStreamSource(mic);
-          const analyser = mctx.createAnalyser();
-          analyser.fftSize = 2048;
-          src.connect(analyser); // analyser only — never to destination
-          const buf = new Float32Array(analyser.fftSize);
-          sawSignalRef.current = false;
-          let silentMs = 0;
-          let warned = false;
-          meterTimerRef.current = window.setInterval(() => {
-            analyser.getFloatTimeDomainData(buf);
-            let peak = 0;
-            let sumSq = 0;
-            for (let i = 0; i < buf.length; i++) {
-              const s = buf[i] ?? 0;
-              const a = Math.abs(s);
-              if (a > peak) peak = a;
-              sumSq += s * s;
-            }
-            const rms = Math.sqrt(sumSq / buf.length);
-            if (peak > 0.02) sawSignalRef.current = true;
-            if (peak <= 0.02) silentMs += 500;
-            else silentMs = 0;
-            vlog(
-              "mic meter — peak:",
-              peak.toFixed(4),
-              "rms:",
-              rms.toFixed(4),
-              "sawSignal:",
-              sawSignalRef.current ? "yes" : "no",
-            );
-            // Dead-capture warning (once): 12s of digital silence while live
-            // is a capture failure, not "model ignoring you".
-            if (!warned && silentMs >= 12000 && !sawSignalRef.current) {
-              warned = true;
-              vlog(
-                "⚠ MIC SILENT 12s+ — captured stream is digital silence. Check input device/volume. label:",
-                micTrack.label,
-              );
-              setError(
-                `Mic is capturing silence (${micTrack.label}). Check your input device — System Settings → Sound → Input.`,
-              );
-            }
-          }, 500);
-        }
-      } catch (meterErr) {
+      if (!mintingIntoStandby) {
         vlog(
-          "mic meter unavailable (non-fatal):",
-          meterErr instanceof Error ? meterErr.message : String(meterErr),
+          "mic acquired — label:",
+          micTrack.label || "(no label)",
+          "enabled:",
+          micTrack.enabled,
         );
+        setActiveMicId(micTrack.getSettings().deviceId ?? null);
+        // Labels are empty pre-permission; re-enumerate now that we have it.
+        void refreshMicDevices();
+
+        // ── Capture diagnostics: meter the exact stream we send ────────
+        // (see startMicMeter — shared with the standby wake path)
+        startMicMeter(micStreamRef.current!);
       }
 
       const pc = new RTCPeerConnection();
@@ -1456,7 +1718,24 @@ export function useRealtimeVoice(opts: {
         }
       };
 
-      pc.addTrack(micTrack);
+      const sender = pc.addTrack(micTrack);
+      // Hold the sender for the standby lifecycle: after replaceTrack(null)
+      // its track is null and it can't be found by kind-predicates again.
+      senderRef.current = sender;
+      if (mintingIntoStandby) {
+        // Placeholder occupies the m-line; mic is NOT attached. The parked
+        // session is negotiated but inert until wake() swaps a real track.
+        micAttachedRef.current = false;
+        if (audioElRef.current) audioElRef.current.muted = true;
+      } else {
+        micAttachedRef.current = true;
+        // A placeholder from a standby-mode reconnect is superseded by this
+        // real track — stop it once the real one is on the sender.
+        if (placeholderTrackRef.current) {
+          placeholderTrackRef.current.stop();
+          placeholderTrackRef.current = null;
+        }
+      }
 
       const dc = pc.createDataChannel("oai-events");
       dcRef.current = dc;
@@ -1553,10 +1832,15 @@ export function useRealtimeVoice(opts: {
           "data channel closed",
           enabledRef.current
             ? "(unexpected — will reconnect)"
-            : "(expected — user off)",
+            : standbyRef.current
+              ? "(unexpected while parked — will reconnect into standby)"
+              : "(expected — user off)",
         );
-        // Unexpected drop while enabled → reconnect with backoff.
-        if (enabledRef.current && pcRef.current) scheduleReconnect();
+        // Unexpected drop while enabled OR parked → reconnect with backoff.
+        // Parked reconnects mint straight back into standby (placeholder
+        // track, no capture) so wake stays instant.
+        if ((enabledRef.current || standbyRef.current) && pcRef.current)
+          scheduleReconnect();
       };
 
       const offer = await pc.createOffer();
@@ -1591,11 +1875,17 @@ export function useRealtimeVoice(opts: {
         vlog("PC state:", st);
         if (st === "connected") {
           reconnectAttemptRef.current = 0;
-          setState("idle");
+          // A standby-mode reconnect completing must land in standby, not
+          // idle — the mic is not attached. The user is not listening.
+          setState(standbyRef.current ? "standby" : "idle");
           pushAgentStatus(true);
+          // A mint landing in standby must re-arm (settings-changed re-mint
+          // disarmed on teardown): armed mode is opt-in, the armed ear is
+          // the point of parking. armFnRef is the late-bound handle.
+          if (standbyRef.current && wakeEnabledRef.current) armFnRef.current?.();
         } else if (
           (st === "failed" || st === "disconnected" || st === "closed") &&
-          enabledRef.current
+          (enabledRef.current || standbyRef.current)
         ) {
           vlog(
             "connection lost — scheduling reconnect, attempt",
@@ -1656,36 +1946,98 @@ export function useRealtimeVoice(opts: {
 
   const scheduleReconnect = useCallback((): void => {
     if (reconnectTimerRef.current !== null) return;
-    if (!enabledRef.current) return;
+    // Live (enabled) sessions always reconnect. Parked (standby) sessions
+    // reconnect too — silently, back into standby with a placeholder
+    // track — so wake stays instant even after an overnight drop. A
+    // session that is neither (user never enabled, or hard-off) stays down.
+    if (!enabledRef.current && !standbyRef.current) return;
+    // teardown() resets standbyRef (end-of-life bookkeeping) — but here it
+    // is NOT end-of-life, it's a rebuild. Capture park intent across the
+    // teardown: without this, connect() takes the mic path and silently
+    // REACTIVATES the microphone on a session the user parked.
+    const rebuildIntoStandby = !enabledRef.current && standbyRef.current;
     teardown();
+    if (rebuildIntoStandby) standbyRef.current = true;
     const attempt = reconnectAttemptRef.current++;
-    setState("connecting");
+    setState(enabledRef.current ? "connecting" : "standby");
     reconnectTimerRef.current = window.setTimeout(() => {
       reconnectTimerRef.current = null;
       void connect();
     }, backoffDelay(attempt));
   }, [connect, teardown]);
 
-  /** User toggles voice on/off. */
+  /** User toggles voice on/off. Off → WARM STANDBY when a session is open:
+   *  the realtime session stays negotiated with the mic detached (capture
+   *  ends, OS indicator off); the conversation continues across standby —
+   *  no distill, no teardown. On → wake is just getUserMedia +
+   *  replaceTrack (no mint/ICE/SDP). Full teardown + distill remains for
+   *  unmount, fatal error, and settings re-mint. */
   const toggle = useCallback(async (): Promise<void> => {
     vlog("toggle — enabled:", enabledRef.current ? "on→off" : "off→on");
-    if (enabledRef.current) {
-      enabledRef.current = false;
+    if (armedRef.current && !enabledRef.current) {
+      // Armed (parked + listening for the name): toggle means "stop
+      // listening entirely" — disarm and go fully off, same as standby.
+      disarmWakeWord();
       teardown();
       distillAtCloseRef.current();
-      // Deliberate end-of-session: unresolved calls must NOT replay into a
-      // future session (a Tuesday call answering itself Thursday would be
-      // confusing, not helpful). Auto-reconnect keeps the map — only the
-      // user's toggle-off discards it.
       pendingCallsRef.current.clear();
       setState("off");
+      return;
+    }
+    if (enabledRef.current) {
+      enabledRef.current = false;
+      const sessionAlive =
+        !!pcRef.current &&
+        pcRef.current.connectionState === "connected" &&
+        !!dcRef.current &&
+        dcRef.current.readyState === "open";
+      if (sessionAlive) {
+        // ── Park it. Mic stops; session stays. Context stays loaded. ──
+        detachMic();
+        setState("standby");
+        vlog("voice parked — session stays open, mic detached");
+        // Wake-word mode: parking arms the local listener (opt-in via
+        // settings) so the phrase wakes it hands-free. armFnRef is the
+        // late-bound handle — armWakeWord is defined below (needs wake).
+        if (wakeEnabledRef.current) armFnRef.current?.();
+        return;
+      }
+      // No session to park (still connecting, or died while enabled) —
+      // full teardown, same as before standby existed.
+      teardown();
+      distillAtCloseRef.current();
+      pendingCallsRef.current.clear();
+      setState("off");
+      return;
+    }
+    // ── On ──
+    if (
+      pcRef.current &&
+      pcRef.current.connectionState === "connected" &&
+      dcRef.current &&
+      dcRef.current.readyState === "open"
+    ) {
+      // Warm session parked below us — wake it. Fresh instructions/context
+      // come with the wake's first status push; the minted persona is
+      // still in the session. (If the user changed voice/accent while
+      // parked, the settings-changed effect already re-minted.)
+      reconnectAttemptRef.current = 0;
+      eventCountRef.current = 0;
+      enabledRef.current = true;
+      setState("idle"); // optimistic — wake sets it again on completion
+      await wake();
+      // A manual wake joins the hands-free loop too: after the next
+      // completed exchange, park and re-arm like a word-triggered wake.
+      // response.done's reparkFnRef is empty until scheduleRePark has run
+      // once — the render-time ref always has the current function.
+      scheduleReParkRef.current?.();
       return;
     }
     enabledRef.current = true;
     reconnectAttemptRef.current = 0;
     eventCountRef.current = 0;
     await connect();
-  }, [connect, teardown]);
+  }, [connect, teardown, detachMic, wake]);
 
   /** Interrupt model speech (barge-in). */
   const interrupt = useCallback((): void => {
@@ -1709,17 +2061,139 @@ export function useRealtimeVoice(opts: {
     [scheduleReconnect],
   );
 
+  // ── Wake-word armed mode ────────────────────────────────────────────────
+  // While parked, listen for the configured phrase with the LOCAL keyword
+  // spotter (main process). On detection: wake the session exactly as the
+  // toggle does. After the conversation goes quiet (no speech for
+  // RE_PARK_AFTER_MS following a completed model response), park again and
+  // re-arm — the hands-free loop. The armed mic feeds ONLY the local
+  // spotter; the realtime session's track stays detached until wake.
+  const RE_PARK_AFTER_MS = 30_000;
+
+  const disarmWakeWord = useCallback((): void => {
+    if (reparkTimerRef.current !== null) {
+      window.clearTimeout(reparkTimerRef.current);
+      reparkTimerRef.current = null;
+    }
+    if (!armedRef.current) return;
+    armedRef.current = false;
+    wakeListenerRef.current?.stop();
+    wakeListenerRef.current = null;
+    vlog("wake word disarmed");
+    if (!enabledRef.current && standbyRef.current) setState("standby");
+  }, []);
+
+  const scheduleRePark = useCallback((): void => {
+    if (reparkTimerRef.current !== null) window.clearTimeout(reparkTimerRef.current);
+    reparkTimerRef.current = window.setTimeout(() => {
+      reparkTimerRef.current = null;
+      if (!enabledRef.current) return; // already parked/off
+      if (!wakeEnabledRef.current) return; // armed mode off — stay live
+      vlog("voice idle — re-parking and re-arming wake word");
+      enabledRef.current = false;
+      detachMic();
+      setState("armed");
+      armedRef.current = true;
+      const listener = createWakeWordListener(wakeWordRef.current);
+      wakeListenerRef.current = listener;
+      void listener.start().then((ok) => {
+        if (!ok && armedRef.current) {
+          // Mic unavailable (or spotter failed) — plain standby, no armed
+          // ear. Click-to-wake still works.
+          vlog("wake-word listener failed to start — plain standby");
+          armedRef.current = false;
+          wakeListenerRef.current = null;
+          setState("standby");
+        }
+      });
+    }, RE_PARK_AFTER_MS);
+    reparkFnRef.current = scheduleRePark;
+  }, [detachMic]);
+  // Render-time handle so paths defined BEFORE scheduleRePark (the manual
+  // orb wake in toggle) can enter the hands-free loop without a cycle in
+  // the dependency graph. reparkFnRef only populates after scheduleRePark
+  // has run once — useless for a first manual wake.
+  scheduleReParkRef.current = scheduleRePark;
+
+  const armWakeWord = useCallback((): void => {
+    if (armedRef.current) return;
+    if (!standbyRef.current) return; // only meaningful while parked
+    armedRef.current = true;
+    setState("armed");
+    vlog("wake word armed — listening for:", wakeWordRef.current);
+    const listener = createWakeWordListener(wakeWordRef.current);
+    wakeListenerRef.current = listener;
+    listener.onDetect((_keyword) => {
+      if (enabledRef.current || !standbyRef.current) return; // already awake
+      vlog(`wake word detected — waking`);
+      // Same wake path as the toggle: swap the mic in, no re-mint.
+      reconnectAttemptRef.current = 0;
+      eventCountRef.current = 0;
+      enabledRef.current = true;
+      armedRef.current = false;
+      wakeListenerRef.current?.stop();
+      wakeListenerRef.current = null;
+      setState("idle");
+      void wake().then(() => scheduleRePark());
+    });
+    void listener.start().then((ok) => {
+      if (!ok && armedRef.current) {
+        vlog("wake-word listener failed to start — plain standby");
+        armedRef.current = false;
+        wakeListenerRef.current = null;
+        setState("standby");
+      }
+    });
+  }, [wake, scheduleRePark]);
+  armFnRef.current = armWakeWord;
+
+  /** Configure (or change) the wake phrase. Re-arms if currently armed. */
+  const setWakePhrase = useCallback(
+    (phrase: string): void => {
+      const clean = phrase.trim().toLowerCase();
+      if (!clean) return;
+      wakeWordRef.current = clean;
+      if (armedRef.current) {
+        armedRef.current = false;
+        wakeListenerRef.current?.stop();
+        wakeListenerRef.current = null;
+        if (standbyRef.current) armWakeWord();
+      }
+    },
+    [armWakeWord],
+  );
+
+
+
   // Voice/accent changed in settings (Profile) → re-mint a live session.
   // Voice + accent are baked in at mint time; a settings change with no
   // reconnect meant the old voice/accent kept playing until manual
   // restart. Immediate swap, zero backoff — this is a deliberate change,
-  // not a network failure.
+  // not a network failure. A PARKED session also re-mints (the next wake
+  // must speak the new voice), rebuilding into standby — no mic ever.
+  // Wake-word settings ride along on the same event: phrase changes
+  // re-configure the spotter; enable/disable re-arms or disarms a parked
+  // session (the re-mint below rebuilds into standby, and toggle-park
+  // arms from there — but an already-parked session needs the explicit
+  // arm/disarm here since no park event will fire).
   useEffect(() => {
     const unlisten = window.electronAPI.on(
       "pane:voice-settings-changed",
-      () => {
-        if (!enabledRef.current) return;
-        vlog("voice settings changed — re-minting live session");
+      (next: { wake_word?: string; wake_word_enabled?: boolean }) => {
+        if (typeof next?.wake_word === "string" && next.wake_word.trim()) {
+          setWakePhrase(next.wake_word.trim().toLowerCase());
+        }
+        wakeEnabledRef.current = next?.wake_word_enabled === true;
+        if (!enabledRef.current && standbyRef.current) {
+          if (wakeEnabledRef.current) armFnRef.current?.();
+          else disarmWakeWord();
+        }
+        if (!enabledRef.current && !standbyRef.current) return;
+        vlog(
+          enabledRef.current
+            ? "voice settings changed — re-minting live session"
+            : "voice settings changed while parked — re-minting into standby",
+        );
         // Reset the attempt counter so the swap takes the shortest
         // backoff (1s at attempt 0) — a deliberate change, not failure.
         reconnectAttemptRef.current = 0;
@@ -1727,7 +2201,22 @@ export function useRealtimeVoice(opts: {
       },
     );
     return unlisten;
-  }, [scheduleReconnect]);
+  }, [scheduleReconnect, disarmWakeWord]);
+
+  // Load wake-word settings once at mount: phrase + whether parking arms.
+  useEffect(() => {
+    loadSettings()
+      .then((s) => {
+        const vs = (
+          s as {
+            voice_settings?: { wake_word?: string; wake_word_enabled?: boolean };
+          }
+        ).voice_settings;
+        if (vs?.wake_word?.trim()) wakeWordRef.current = vs.wake_word.trim().toLowerCase();
+        wakeEnabledRef.current = vs?.wake_word_enabled === true;
+      })
+      .catch(() => undefined);
+  }, []);
 
   // ── Agent observation: watch conversation store for status changes ────
   useEffect(() => {
@@ -1779,5 +2268,10 @@ export function useRealtimeVoice(opts: {
     interrupt,
     /** Imperative status push — e.g. right after delegation fires. */
     pushAgentStatus,
+    /** Wake-word: arm while parked (opt-in), disarm, set phrase. */
+    armWakeWord,
+    disarmWakeWord,
+    setWakePhrase,
+    armedRef,
   };
 }

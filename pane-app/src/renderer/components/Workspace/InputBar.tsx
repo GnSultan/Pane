@@ -156,6 +156,8 @@ interface InputBarProps {
 /** Voice states the orb understands (subset of VoiceState from the hook). */
 type VoiceOrbPropsState =
   | "off"
+  | "standby"
+  | "armed"
   | "idle"
   | "connecting"
   | "listening"
