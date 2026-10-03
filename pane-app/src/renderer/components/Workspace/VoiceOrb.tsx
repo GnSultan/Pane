@@ -163,7 +163,9 @@ function setEyeShape(
       const pupilR = pupilRRef.current;
       if (pupilL) pupilL.setAttribute("d", PUPIL_DOT(8.9));
       if (pupilR) pupilR.setAttribute("d", PUPIL_DOT(15.1));
-      if (faceGroupRef.current) faceGroupRef.current.setAttribute("transform", "none");
+      // "none" is not a valid SVG transform attribute value (CSS only) —
+      // removing the attribute is the identity reset.
+      faceGroupRef.current?.removeAttribute("transform");
       if (mouthPathRef.current) mouthPathRef.current.setAttribute("d", MOUTH_CLOSED);
       voiceLight.state = "off";
       voiceLight.user = 0;
