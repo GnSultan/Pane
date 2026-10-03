@@ -5,11 +5,13 @@ import { Profile } from "./Profile";
 import { Mind } from "./Mind";
 import { Lens } from "./Lens";
 import { ChangeHistoryPanel } from "./ChangeHistoryPanel";
+import { VoiceFloorGlow } from "./VoiceFloorGlow";
 import { FuzzyFinder } from "../FuzzyFinder/FuzzyFinder";
 import { FileSearch } from "../FileSearch/FileSearch";
 import { GitStatus } from "../ThreadPanel/GitStatus";
 import { Menu, type PaneMode } from "../ThreadPanel/Menu";
 import { useProjectsStore } from "../../stores/projects";
+import { useWorkspaceStore } from "../../stores/workspace";
 import { detectProjectRoot } from "../../lib/tauri-commands";
 
 import type { ElectronAPI } from '../../lib/electron';
@@ -27,6 +29,9 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
   // Always start unmounted. startTransition defers the heavy Conversation render
   // so the initial paint (empty area) happens first, keeping the app responsive
   // when restoring a conversation with many large code blocks.
+  // Exception: forceMount threads (peer-thread spawns) mount immediately —
+  // their objective arrives via pane:send-message, and a never-mounted
+  // Conversation has no listener to receive it.
   const [mounted, setMounted] = useState(false);
   const mountedRef = useRef(false);
   const [, startTransition] = useTransition();
@@ -37,7 +42,7 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
     const apply = (state: ReturnType<typeof useProjectsStore.getState>) => {
       if (!ref.current) return;
       const isActive = state.activeProjectId === projectId;
-      if (isActive && !mountedRef.current) {
+      if ((isActive || state.forceMount.has(projectId)) && !mountedRef.current) {
         mountedRef.current = true;
         startTransition(() => setMounted(true));
       }
@@ -48,7 +53,11 @@ const ConversationLayer = memo(function ConversationLayer({ projectId }: { proje
 
     apply(useProjectsStore.getState());
     return useProjectsStore.subscribe((state, prev) => {
-      if (state.activeProjectId !== prev.activeProjectId) apply(state);
+      if (
+        state.activeProjectId !== prev.activeProjectId ||
+        state.forceMount !== prev.forceMount
+      )
+        apply(state);
     });
   }, [projectId]);
 
@@ -176,6 +185,7 @@ export function Workspace() {
     return id ? s.projects.get(id)?.hasUnreadLens ?? false : false;
   });
   const setMode = useProjectsStore((s) => s.setMode);
+  const sidebarCollapsed = useWorkspaceStore((s) => s.sidebarCollapsed);
 
   const handleSelectMode = useCallback((newMode: PaneMode) => {
     const id = useProjectsStore.getState().activeProjectId;
@@ -189,6 +199,10 @@ export function Workspace() {
 
   return (
     <div ref={wsRef} data-mode="conversation" className="h-full relative bg-pane-bg rounded-xl overflow-hidden">
+      {/* Voice floor glow — ONE glow for all threads. Mounted above every
+          thread layer so ambient light follows the voice session, not the
+          active thread: switch threads and the room keeps breathing. */}
+      <VoiceFloorGlow />
       {/* Conversation page — participates in the same [data-page] CSS system as every other page.
            Page-level visibility (conversation vs mind vs profile) is CSS-driven.
            Thread switching (project A vs project B) is JS-driven z-index 0/1 inside. */}
@@ -247,6 +261,22 @@ export function Workspace() {
           />
         </div>
       )}
+
+      {/* Sidebar expand — appears at the same bottom-left corner where the Menu icon
+           sits inside ThreadPanel. Only when sidebar is collapsed and in conversation mode. */}
+      {mode === "conversation" && sidebarCollapsed && (
+        <button
+          onClick={() => useWorkspaceStore.getState().toggleSidebar()}
+          className="absolute bottom-1.5 left-1.5 z-50 w-6 h-6 flex items-center justify-center rounded-md text-pane-text-secondary/50 hover:text-pane-text-secondary transition-colors btn-press pointer-events-auto"
+          title="Show threads"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M10 4 6 8l4 4" />
+          </svg>
+        </button>
+      )}
+
+
     </div>
   );
 }

@@ -332,12 +332,20 @@ function computeAdjustments(sampleData, currentRatios) {
  *
  * @param {object} options
  * @param {string} options.apiKey — Anthropic API key (optional — passive only if omitted)
- * @param {string} [options.model] — Anthropic model for count_tokens (default: "claude-sonnet-4-6")
+ * @param {string} [options.model] — Anthropic model for count_tokens. No default:
+ *   active calibration requires an explicit model (upstream API needs one —
+ *   a model name is mandatory on the count_tokens endpoint), so omitted → passive.
  * @param {object} [options.ratios] — Current RATIOS to adjust (imported from token-budget.mjs)
  * @returns {Promise<{ calibrated: boolean, adjusted: boolean, changes: object, totalCalls: number }>}
  */
 export async function runCalibration(options = {}) {
-  const { apiKey, model = "claude-sonnet-4-6", ratios = null } = options;
+  const { apiKey, model = null, ratios = null } = options;
+  if (apiKey && !model) {
+    console.warn(
+      "[calibration] runCalibration called with apiKey but no model — running passive only. " +
+      "Pass an explicit model; the count_tokens API requires one and Pane does not invent one.",
+    );
+  }
 
   calibrationState.totalCalls++;
   calibrationState.lastRun = Date.now();

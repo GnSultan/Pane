@@ -9,6 +9,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { validateProjectId } from './path-guard.mjs';
 
 const BASE_PATH = join(homedir(), '.pane', 'session');
 
@@ -49,6 +50,8 @@ function defaults() {
  * @returns {string}
  */
 function threadPath(projectId) {
+  const guard = validateProjectId(projectId);
+  if (!guard.ok) throw new Error(`threadPath: ${guard.error}`);
   return join(BASE_PATH, projectId, 'thread.json');
 }
 

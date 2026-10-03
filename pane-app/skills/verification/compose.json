@@ -1,0 +1,10 @@
+{
+  "name": "verification",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["verification", "build-quality", "correctness"],
+  "tags": ["verification", "build", "test", "quality"],
+  "priority": 5
+}

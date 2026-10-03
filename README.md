@@ -4,6 +4,8 @@
 
 Every line of Pane was written by AI agents running inside Pane — including this file.
 
+→ **[Read the docs](https://gnsultan.github.io/Pane)**
+
 ---
 
 ## What it is

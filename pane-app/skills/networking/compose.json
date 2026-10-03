@@ -1,0 +1,10 @@
+{
+  "name": "networking",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["networking", "http", "api-design", "protocols"],
+  "tags": ["networking", "http", "api", "rest", "graphql", "websockets", "tls"],
+  "priority": 5
+}

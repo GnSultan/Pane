@@ -1,9 +1,8 @@
 /**
  * Pane Tool Executor
  *
- * Executes tools locally for HTTP backends (DeepSeek, Kimi, Anthropic, etc.)
- * Handles Bash commands, file operations, and other tools that CLI backends
- * would execute themselves.
+ * Executes tools locally for all backends (DeepSeek, Kimi, Anthropic, etc.)
+ * Handles Bash commands, file operations, and other tools.
  *
  * Architecture:
  * 1. Receives tool calls from HTTP backend
@@ -15,16 +14,64 @@
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import os from "node:os";
 import vm from "node:vm";
+import crypto from "node:crypto";
 
 import { getPaneDb, pruneChangeHistory } from "./pane-db.mjs";
 import { findReferences, formatReferencesOutput } from "./find-references.mjs";
-import { readState, readHandoff } from "./pane-system-prompt.mjs";
+import { readState, readHandoff, mergeState } from "./pane-system-prompt.mjs";
 import { replay as replayJournal, readLastProgress } from "./session-journal.mjs";
 import { sanitizeString } from "./sanitize.mjs";
-import { validateCommand } from "./command-validator.mjs";
+import { buildImageEnvelope } from "./image-envelope.mjs";
+import { validateCommand, hasWriteIntent } from "./command-validator.mjs";
+import { readFileForJournal, snapshotAllFiles, flushJournal } from "./checkpoint-engine.mjs";
+import { recordIntent, recordActivity, checkConflict, readPeerIntents, readPeerActivityGrouped } from "./intents.mjs";
+import { setPhase as setAgentPhase } from "./agent-status.mjs";
+
+/**
+ * Tools that mutate state — mirrors http-backend's WRITE_TOOL_NAMES for
+ * phase classification in the agent status store. Kept local so the
+ * executor has no import cycle with the backend. When either list changes,
+ * change both (dual-copy rule).
+ */
+const STATUS_WRITE_TOOLS = new Set([
+  "run_shell_command",
+  "pane_run_in_terminal",
+  "write_file",
+  "replace",
+  "pane_revert_change",
+  "pane_remember",
+  "pane_update_memory",
+  "pane_delete_memory",
+  "pane_set_rule",
+  "pane_set_philosophy",
+  "pane_set_about",
+  "TodoWrite",
+  "Task",
+  "activate_skill",
+  "deactivate_skill",
+  "pane_install_skill",
+  "save_memory",
+]);
+import {
+  activateSkill,
+  deactivateSkill,
+  getActiveSkills,
+  discoverAll,
+  findSkill,
+  loadSkill,
+  buildSkillListing,
+  installSkill,
+  ensureGlobalSkillsDir,
+} from "./skill-registry.mjs";
+import { mcpClient } from "./mcp-client.mjs";
+import {
+  MCP_GATEWAY_TOOL_NAMES,
+  executeMcpGatewayTool,
+} from "./mcp-gateway.mjs";
+import { readLogs, logCollectorStats } from "./log-collector.mjs";
 
 // ── CMD Worker (utility process for shell execution) ──────────────────────
 // In Electron 40's packaged macOS app, child_process.spawn/execSync fails with
@@ -633,6 +680,8 @@ export class ToolExecutor {
     this.projectRoot = projectRoot;
     this.onEvent = onEvent;
     this.activeProcesses = new Map(); // toolId -> child process
+    /** @type {{width:number, height:number, physicalW:number, physicalH:number}|null} */
+    this._lastSeen = null; // pixel space of the last tier-fit screenshot the model saw
     this._brainRequest = null;
     /** @type {Map<string, string|null>} relativePath → preEditContent (null = file didn't exist) */
     this.fileJournal = new Map();
@@ -654,8 +703,22 @@ export class ToolExecutor {
     this._quickCall = fn;
   }
 
+  setRunPunk(fn) {
+    this._runPunk = fn;
+  }
+
   setAgentCall(fn) {
     this._agentCall = fn;
+  }
+
+  /**
+   * Peer-spawn bridge — called when the model invokes pane_spawn_peer.
+   * The renderer owns threads (zustand store), so the executor hands the
+   * spawn request to the renderer via this callback, which main wires to a
+   * webContents.send. Same rail as ask_user's awaiting_input event.
+   */
+  setPeerSpawn(fn) {
+    this._onPeerSpawn = fn;
   }
 
   /**
@@ -776,7 +839,6 @@ export class ToolExecutor {
     const relativePath = path.relative(this.projectRoot, resolvedPath);
     if (this.fileJournal.has(relativePath)) return; // already captured pre-edit state
 
-    const { readFileForJournal } = await import("./checkpoint-engine.mjs");
     const content = await readFileForJournal(resolvedPath);
     if (content !== undefined) {
       this.fileJournal.set(relativePath, content);
@@ -821,11 +883,9 @@ export class ToolExecutor {
     // Copy-on-write: if command has write intent, pre-snapshot all project files
     // as a safety net — shell commands can modify any file, not just ones the
     // model has explicitly opened via write_file/replace.
-    const { hasWriteIntent: checkWriteIntent } = await import("./command-validator.mjs");
-    const { snapshotAllFiles: preSnapshot } = await import("./checkpoint-engine.mjs");
-    if (checkWriteIntent(command)) {
+    if (hasWriteIntent(command)) {
       try {
-        await preSnapshot(this.projectRoot, this.fileJournal);
+        await snapshotAllFiles(this.projectRoot, this.fileJournal);
       } catch {
         // snapshot failure shouldn't block the command
       }
@@ -905,6 +965,383 @@ export class ToolExecutor {
   }
 
   /**
+   * view_image — read an image file and return it as a native image envelope
+   * for vision-capable models. Unlike read_file (which would decode binary as
+   * UTF-8 mojibake), this base64s the raw bytes so the model sees actual
+   * pixels via the provider's image content block.
+   */
+  async executeViewImage(toolId, filePath) {
+    try {
+      const resolvedPath = this.resolveProjectPath(filePath);
+      if (!resolvedPath) {
+        return {
+          success: false,
+          error: `Invalid file path: ${filePath}`,
+          toolId,
+        };
+      }
+
+      let stats;
+      try {
+        stats = await fsPromises.stat(resolvedPath);
+      } catch {
+        return {
+          success: false,
+          error: `File does not exist or is not readable: ${filePath}`,
+          toolId,
+        };
+      }
+      if (stats.isDirectory()) {
+        return {
+          success: false,
+          error: `${filePath} is a directory.`,
+          toolId,
+        };
+      }
+
+      const ext = path.extname(resolvedPath).toLowerCase();
+      const MEDIA_BY_EXT = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+      };
+      const media_type = MEDIA_BY_EXT[ext];
+      if (!media_type) {
+        return {
+          success: false,
+          error:
+            `Unsupported image format "${ext || "(none)"}". Supported: PNG, JPEG, GIF, WebP. ` +
+            `If you need a screenshot, capture it as PNG (e.g. screencapture -x on macOS).`,
+          toolId,
+        };
+      }
+
+      // Cap at ~4.7MB binary (Anthropic's 5MB image limit; base64 is ~4/3 the
+      // binary size). Larger files must be downscaled first — the caller can
+      // use sips (macOS) or another tool to resize, then retry.
+      const MAX_BYTES = 4_700_000;
+      if (stats.size > MAX_BYTES) {
+        return {
+          success: false,
+          error:
+            `Image is ${(stats.size / 1024 / 1024).toFixed(1)}MB — over the ${(MAX_BYTES / 1024 / 1024).toFixed(0)}MB limit. ` +
+            `Downscale it and retry, e.g.: sips -Z 1568 --property format jpeg "${resolvedPath}" --out /tmp/pane_img.jpg`,
+          toolId,
+        };
+      }
+
+      const buf = await fsPromises.readFile(resolvedPath);
+      const b64 = buf.toString("base64");
+      const label = path.basename(resolvedPath);
+
+      return {
+        success: true,
+        output: buildImageEnvelope({ media_type, label, data: b64 }),
+        toolId,
+        metadata: { path: filePath, size: stats.size, media_type },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `Error reading image: ${error.message}`,
+        toolId,
+      };
+    }
+  }
+
+  /**
+   * computer — native macOS screen capture and input actuation.
+   * Wraps computer-use.mjs. Screenshots are pre-resized to the strictest
+   * vision tier (standard: 1568 edge / 1568 visual tokens) so the image the
+   * model sees is never server-resized and its coordinates map 1:1 onto that
+   * seen space; coordinates from click/move/drag are scaled from the last
+   * seen space back to physical pixels before actuation. Mutating actions
+   * auto-attach a verification screenshot unless take_screenshot:false.
+   * Supports batching: action:"batch", actions:[{action:"click",...},...].
+   */
+  async executeComputer(toolId, input) {
+    try {
+      const cu = await import("./computer-use.mjs");
+      const vt = await import("./vision-tiers.mjs");
+
+      const fail = (error) => ({ success: false, error, toolId });
+      const ok = (output, metadata = undefined) => ({
+        success: true,
+        output,
+        toolId,
+        ...(metadata ? { metadata } : {}),
+      });
+
+      /** Scale model-space coords (last seen image) → physical px.
+       *  When no screenshot has been taken this session, coordinates are
+       *  assumed already physical and pass through unchanged. */
+      const toPhysical = (x, y) => {
+        if (!this._lastSeen) return { x, y };
+        const seen = this._lastSeen;
+        if (seen.width === seen.physicalW && seen.height === seen.physicalH) return { x, y };
+        return vt.scalePoint(x, y, { width: seen.width, height: seen.height }, { width: seen.physicalW, height: seen.physicalH });
+      };
+
+      /** Capture → tier-fit → record seen space → image envelope. */
+      const captureFitted = async (region) => {
+        const r = await cu.captureScreen(
+          region && typeof region.x === "number" ? region : undefined,
+          undefined
+        );
+        if (!r.ok) return fail(r.error);
+        const size = await cu.readPngSize(r.path);
+        if (!size.ok) return fail(size.error);
+        const fit = await vt.fitScreenshotToTier(
+          r.path, size.w, size.h, vt.STANDARD_TIER,
+          (cmd, opts) => execThroughWorker(cmd, opts)
+        );
+        if (!fit.ok) return fail(fit.error);
+        // Regions map into the full-screen physical space; only full-screen
+        // captures define the coordinate space for subsequent actions.
+        if (!region) this._lastSeen = { width: fit.width, height: fit.height, physicalW: size.w, physicalH: size.h };
+        const view = await this.executeViewImage(toolId, fit.path);
+        if (view.success) {
+          view.metadata = {
+            ...(view.metadata || {}),
+            temporaryFile: fit.downscaled ? fit.path : r.path,
+            seenWidth: fit.width,
+            seenHeight: fit.height,
+            physicalWidth: size.w,
+            physicalHeight: size.h,
+            downscaled: fit.downscaled,
+          };
+        }
+        return view;
+      };
+
+      /** One atomic action from a spec. Returns {ok, output} without toolId. */
+      const runSingleAction = async (spec) => {
+        const action = (spec.action || "").trim();
+        switch (action) {
+          case "screenshot":
+            return await captureFitted(spec.region);
+          case "click": {
+            if (!Number.isFinite(spec.x) || !Number.isFinite(spec.y)) {
+              return fail("click requires numeric x and y in screenshot pixels (the space of the last screenshot you took)");
+            }
+            const p = toPhysical(spec.x, spec.y);
+            const r = await cu.clickAt({ ...p, double: spec.double === true, right: spec.right === true });
+            return r.ok ? ok(`Clicked at (${spec.x}, ${spec.y})${spec.double ? " (double)" : ""}${spec.right ? " (right)" : ""}.`) : fail(r.error);
+          }
+          case "move": {
+            if (!Number.isFinite(spec.x) || !Number.isFinite(spec.y)) {
+              return fail("move requires numeric x and y in screenshot pixels");
+            }
+            const p = toPhysical(spec.x, spec.y);
+            const r = await cu.movePointerTo(p);
+            return r.ok ? ok(`Moved pointer to (${spec.x}, ${spec.y}).`) : fail(r.error);
+          }
+          case "drag": {
+            if (!spec.from || !spec.to) return fail("drag requires from:{x,y} and to:{x,y} in screenshot pixels");
+            const fp = toPhysical(spec.from.x, spec.from.y);
+            const tp = toPhysical(spec.to.x, spec.to.y);
+            const r = await cu.dragFromTo(fp, tp);
+            return r.ok ? ok(`Dragged from (${spec.from.x}, ${spec.from.y}) to (${spec.to.x}, ${spec.to.y}).`) : fail(r.error);
+          }
+          case "scroll": {
+            const direction = spec.direction === "up" ? "up" : "down";
+            const amount = Number.isFinite(spec.amount) ? spec.amount : 3;
+            const r = await cu.scrollAt(direction, amount);
+            return r.ok ? ok(`Scrolled ${direction} ${amount}.`) : fail(r.error);
+          }
+          case "type": {
+            if (typeof spec.text !== "string" || spec.text.length === 0) {
+              return fail("type requires non-empty text");
+            }
+            const r = await cu.typeText(spec.text);
+            return r.ok ? ok(`Typed ${spec.text.length} characters.`) : fail(r.error);
+          }
+          case "key": {
+            const key = typeof spec.key === "string" ? spec.key : "";
+            const mods = Array.isArray(spec.modifiers) ? spec.modifiers : [];
+            if (!key) return fail("key requires a key name, e.g. \"return\", \"tab\", \"c\", \"f5\"");
+            const r = await cu.pressKey(key, mods);
+            return r.ok ? ok(`Pressed ${[...mods, key].join("+")}.`) : fail(r.error);
+          }
+          case "ax_elements": {
+            const ax = await import("./ax-tree.mjs");
+            const r = await ax.listElements(
+              {
+                role: typeof spec.ax_role === "string" ? spec.ax_role : undefined,
+                nameContains: typeof spec.ax_name_contains === "string" ? spec.ax_name_contains : undefined,
+                nameIs: typeof spec.ax_name_is === "string" ? spec.ax_name_is : undefined,
+                limit: Number.isFinite(spec.ax_limit) ? spec.ax_limit : undefined,
+              },
+              this._lastSeen
+            );
+            if (!r.ok) return fail(r.error);
+            const shown = r.elements
+              .slice(0, 30)
+              .map((e) => `${e.role} '${e.name}' @ (${e.x},${e.y}) ${e.w}x${e.h}`)
+              .join("\n");
+            const more = r.elements.length > 30 ? `\n(+${r.elements.length - 30} more — narrow with ax_name_contains or ax_role)` : "";
+            return ok(
+              `Frontmost app: ${r.app}. ${r.elements.length} element(s). Bounds are in your last screenshot's pixel space — click them directly.\n${shown}${more}${r.note ? `\n${r.note}` : ""}`,
+              { app: r.app, elements: r.elements }
+            );
+          }
+          case "ax_focused": {
+            const ax = await import("./ax-tree.mjs");
+            const r = await ax.readFocusedUI(this._lastSeen);
+            if (!r.ok) return fail(r.error);
+            return ok(
+              `Focused: ${r.role}${r.name ? ` '${r.name}'` : ""}${r.value ? ` (value: '${r.value.slice(0, 100)}')` : ""}${Number.isFinite(r.x) ? ` @ (${r.x},${r.y}) ${r.w}x${r.h} in screenshot space` : ""}.`,
+              r
+            );
+          }
+          case "display_info": {
+            const r = await cu.getDisplayInfo();
+            if (!r.ok) return fail(r.error);
+            const p = await cu.probePermissions();
+            return ok(
+              `Main display: ${r.logical.w}×${r.logical.h} logical points; screenshots are ${r.physical.w}×${r.physical.h} physical pixels (${r.scale}× scale). ` +
+              `Coordinates are in the pixel space of the screenshot you last took — take a screenshot first, then click what you see in it. ` +
+              `Screen Recording: ${p.screenRecording ? "granted" : "MISSING"}. ` +
+              `Accessibility: ${p.accessibility ? "granted" : "MISSING"}.`,
+              { logical: r.logical, physical: r.physical, scale: r.scale, permissions: p }
+            );
+          }
+          case "permissions": {
+            const p = await cu.probePermissions();
+            return ok(
+              `Screen Recording: ${p.screenRecording ? "granted" : "MISSING"}. Accessibility: ${p.accessibility ? "granted" : "MISSING"}. ` +
+              (p.errors.length ? p.errors.join(" ") : "All computer-use permissions granted."),
+              p
+            );
+          }
+          default:
+            return fail(
+              `Unknown action "${action}". Actions: screenshot, click, move, drag, scroll, type, key, display_info, permissions, ax_elements, ax_focused, batch.`
+            );
+        }
+      };
+
+      const MUTATING = new Set(["click", "move", "drag", "scroll", "type", "key"]);
+      const topAction = (input.action || "").trim();
+
+      // ── Batch mode: many actions, one round trip, one final screenshot ──
+      if (topAction === "batch" || Array.isArray(input.actions)) {
+        const specs = Array.isArray(input.actions) ? input.actions : [];
+        if (specs.length === 0) return fail("batch requires a non-empty actions array");
+        if (specs.length > 10) return fail("batch supports at most 10 actions per call");
+        const results = [];
+        for (const spec of specs) {
+          const r = await runSingleAction(spec);
+          results.push({ action: spec.action, success: r.success, output: r.success ? r.output : r.error });
+          if (!r.success) break; // stop at first failure — state is now uncertain
+        }
+        const allOk = results.every((r) => r.success);
+        // Extract envelope outputs — they must NEVER appear as text lines
+        // (megabytes of base64) nor in metadata.batchSteps (IPC flooding).
+        // Policy: the LAST screenshot in the batch becomes the result image;
+        // earlier screenshots are noted but not shipped (batching exists to
+        // avoid intermediate verification — verify between calls instead).
+        let envelopeOutput = null;
+        const shotIdx = [];
+        results.forEach((r, i) => {
+          if (typeof r.output === "string" && r.output.startsWith("__PANE_IMG__")) {
+            envelopeOutput = r.output;
+            shotIdx.push(i);
+          }
+        });
+        // Last screenshot rides as the image; earlier ones were superseded.
+        shotIdx.forEach((i, n) => {
+          results[i].output = n === shotIdx.length - 1
+            ? "(screenshot — final state attached as image)"
+            : "(screenshot taken mid-batch — superseded by final image)";
+        });
+        const wantsShot = input.take_screenshot !== false && !envelopeOutput;
+        let attach = null;
+        if (wantsShot) {
+          const v = await captureFitted();
+          attach = v;
+        }
+        const lines = results.map((r) => `${r.success ? "✔" : "✖"} ${r.action}: ${r.output}`);
+        // On failure the text lines ARE the output — the model must see the
+        // error (metadata never reaches it). Skip the envelope entirely;
+        // the model can screenshot next turn if it needs visual state.
+        if (!allOk) {
+          const failed = results.filter((r) => !r.success);
+          return {
+            success: false,
+            output: lines.join("\n") +
+              `\nBatch stopped at first failure (${failed.length}/${results.length}). State after the failed action is unverified — take a screenshot before retrying.`,
+            toolId,
+            metadata: { batchSteps: results.map((r) => ({ action: r.action, success: r.success, output: r.output })) },
+          };
+        }
+        if (attach) {
+          if (!attach.success) {
+            return {
+              success: allOk,
+              output: lines.join("\n") + `\n(warning: verification screenshot failed: ${attach.error})`,
+              toolId,
+            };
+          }
+          envelopeOutput = attach.output;
+        }
+        if (envelopeOutput) {
+          const summary = `${results.length} action(s): ${results.map((r) => r.action).join(" → ")}`;
+          try {
+            const env = JSON.parse(envelopeOutput.slice("__PANE_IMG__".length));
+            env.label = `after batch (${summary}) — ${env.label}`;
+            return {
+              success: allOk,
+              output: "__PANE_IMG__" + JSON.stringify(env),
+              toolId,
+              metadata: { ...(attach?.metadata || {}), batchSteps: results.map((r) => ({ action: r.action, success: r.success, output: r.output })) },
+            };
+          } catch {
+            // Malformed envelope — fall through to text lines.
+          }
+        }
+        return {
+          success: allOk,
+          output: lines.join("\n"),
+          toolId,
+        };
+      }
+
+      // ── Single action mode ──
+      if (MUTATING.has(topAction)) {
+        const r = await runSingleAction(input);
+        if (!r.success) return r;
+        // Auto-attach a verification screenshot unless opted out.
+        if (input.take_screenshot === false) return r;
+        const v = await captureFitted();
+        if (!v.success) {
+          // Action succeeded but verification failed — still success, warn.
+          return ok(`${r.output}\n(warning: verification screenshot failed: ${v.error})`, r.metadata);
+        }
+        // The verification screenshot IS the output: it rides the image
+        // envelope so the model sees the post-action state natively. The
+        // action summary rides the envelope label (shown in history/cache
+        // placeholders) — and a text line is prepended via the label only.
+        // Keep the summary short; labels surface in tool-result placeholders.
+        const summary = r.output.split("\n")[0];
+        try {
+          const env = JSON.parse(v.output.slice("__PANE_IMG__".length));
+          env.label = `after: ${summary} — ${env.label}`;
+          return ok("__PANE_IMG__" + JSON.stringify(env), v.metadata);
+        } catch {
+          return v;
+        }
+      }
+
+      return await runSingleAction(input);
+    } catch (error) {
+      return { success: false, error: `computer tool error: ${error.message}`, toolId };
+    }
+  }
+
+  /**
    * Read file contents
    */
   async executeReadFile(toolId, filePath, startLine = null, endLine = null) {
@@ -932,6 +1369,17 @@ export class ToolExecutor {
 
       // Get file stats
       const stats = await fsPromises.stat(resolvedPath);
+
+      // Images must go through view_image — reading them as UTF-8 produces
+      // megabytes of mojibake that floods the context. Redirect instead of
+      // failing: the model gets a next action, not a dead end.
+      if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(resolvedPath)) {
+        return {
+          success: false,
+          error: `${filePath} is an image — read_file would decode it as binary garbage. Call view_image("${filePath}") instead to see it with vision.`,
+          toolId,
+        };
+      }
 
       // Check if it's a directory
       if (stats.isDirectory()) {
@@ -1086,6 +1534,10 @@ export class ToolExecutor {
         // File doesn't exist yet — new file creation, oldString stays ""
       }
 
+      // ── Cross-thread conflict check ──
+      const relativePath = path.relative(this.projectRoot, resolvedPath);
+      const conflict = checkConflict(this.projectRoot, this.projectId, relativePath);
+
       // Copy-on-write: save pre-edit state for checkpoint/restore
       await this.journalFileWrite(filePath);
 
@@ -1095,12 +1547,14 @@ export class ToolExecutor {
       // Write file
       await fsPromises.writeFile(resolvedPath, content, DEFAULT_ENCODING);
 
+      // ── Record intent for cross-thread awareness ──
+      recordIntent(this.projectId, relativePath, { action: "editing" });
+
       // Invalidate cache — file content changed
       fileReadCache.invalidate(resolvedPath);
 
       // Record the change in change history
       try {
-        const relativePath = path.relative(this.projectRoot, resolvedPath);
         await this.recordChange({
           filePath: relativePath,
           oldString: previousContent,
@@ -1116,7 +1570,13 @@ export class ToolExecutor {
 
       // ── Reflex Gate: scan for quality violations ──
       const gate = scanForViolations(content, previousContent, filePath);
-      const baseOutput = `File written successfully: ${filePath} (${stats.size} bytes)`;
+      let baseOutput = `File written successfully: ${filePath} (${stats.size} bytes)`;
+
+      // ── Cross-thread conflict warning ──
+      if (conflict.conflicted) {
+        const peerIds = conflict.by.map((c) => `\`${c.threadId.slice(0, 8)}\``).join(", ");
+        baseOutput += `\n\n⚠ Peer conflict: another thread (${peerIds}) recently touched this file. They may be mid-change — coordinate with the user if this wasn't intentional.`;
+      }
 
       return {
         success: true,
@@ -1126,6 +1586,7 @@ export class ToolExecutor {
           path: filePath,
           size: stats.size,
           violations: gate.violations.length > 0 ? gate.violations : undefined,
+          peerConflict: conflict.conflicted ? conflict.by.map((c) => ({ threadId: c.threadId, file: c.file })) : undefined,
         },
       };
     } catch (error) {
@@ -1199,6 +1660,10 @@ export class ToolExecutor {
         ? currentContent.substring(0, matchIndex).split("\n").length
         : 1;
 
+      // ── Cross-thread conflict check ──
+      const relativePath = path.relative(this.projectRoot, resolvedPath);
+      const conflict = checkConflict(this.projectRoot, this.projectId, relativePath);
+
       // Copy-on-write: save pre-edit state for checkpoint/restore
       await this.journalFileWrite(filePath);
 
@@ -1206,12 +1671,14 @@ export class ToolExecutor {
       const newContent = currentContent.replace(oldString, newString);
       await fsPromises.writeFile(resolvedPath, newContent, DEFAULT_ENCODING);
 
+      // ── Record intent for cross-thread awareness ──
+      recordIntent(this.projectId, relativePath, { action: "editing" });
+
       // Invalidate cache — file content changed
       fileReadCache.invalidate(resolvedPath);
 
       // Record the change in change history
       try {
-        const relativePath = path.relative(this.projectRoot, resolvedPath);
         await this.recordChange({
           filePath: relativePath,
           oldString,
@@ -1227,13 +1694,19 @@ export class ToolExecutor {
 
       // ── Reflex Gate: scan for quality violations ──
       const gate = scanForViolations(newContent, currentContent, filePath);
-      const baseOutput = `File edited: ${filePath}\nNew size: ${stats.size} bytes`;
+      let baseOutput = `File edited: ${filePath}\nNew size: ${stats.size} bytes`;
+
+      // ── Cross-thread conflict warning ──
+      if (conflict.conflicted) {
+        const peerIds = conflict.by.map((c) => `\`${c.threadId.slice(0, 8)}\``).join(", ");
+        baseOutput += `\n\n⚠ Peer conflict: another thread (${peerIds}) recently touched this file. They may be mid-change — coordinate with the user if this wasn't intentional.`;
+      }
 
       return {
         success: true,
         output: gate.summary ? baseOutput + gate.summary : baseOutput,
         toolId,
-        metadata: { startLine, ...(gate.violations.length > 0 ? { violations: gate.violations } : {}) },
+        metadata: { startLine, ...(gate.violations.length > 0 ? { violations: gate.violations } : {}), ...(conflict.conflicted ? { peerConflict: conflict.by.map((c) => ({ threadId: c.threadId, file: c.file })) } : {}) },
       };
     } catch (error) {
       return {
@@ -1607,6 +2080,57 @@ export class ToolExecutor {
     };
 
     try {
+      // ── Cross-thread activity awareness ──
+      // Record tool calls so peer threads on the same root can see this
+      // thread is active and what it's working on. We don't record file
+      // writes here — those go through executeWriteFile/executeReplace
+      // which call recordIntent (which calls recordActivity with file_write).
+      // Skip noise: pane_check_intents, pane_checkpoint, Task, ask_user —
+      // these don't represent file/code activity.
+      {
+        const _skipActivity = new Set(["pane_check_intents", "pane_checkpoint", "Task", "ask_user"]);
+        if (!_skipActivity.has(toolName)) {
+          const _fileArg = input?.file_path || input?.path || input?.dir_path || null;
+          const _filesArg = Array.isArray(input?.paths) ? input.paths : null;
+          recordActivity(this.projectId, {
+            activityType: "tool_call",
+            tool: toolName,
+            file: _fileArg,
+            files: _filesArg,
+            detail: _fileArg ? null : (input?.command || input?.pattern || input?.query || input?.description || null),
+          });
+          // ── Agent status store (voice observability) ──
+          // Phase refinement per tool call: write tools → editing, read
+          // tools → planning (exploration). ask_user is skipped above and
+          // emits 'waiting' from http-backend — never clobbered here.
+          const _isWrite = STATUS_WRITE_TOOLS.has(toolName);
+          setAgentPhase(this.projectId, {
+            phase: _isWrite ? "editing" : "planning",
+            readOnly: !_isWrite,
+            tool: toolName,
+            file: _fileArg || (_filesArg && _filesArg[0]) || null,
+          });
+        }
+      }
+
+      // ── External MCP tools ──
+      // Tools from external MCP servers (Figma, GitHub, etc.) are namespaced
+      // with ext__server__toolname and routed to the MCP client.
+      if (mcpClient.isExternalTool(toolName)) {
+        const result = await mcpClient.callTool(toolName, input);
+        return { ...result, toolId };
+      }
+
+      // ── MCP gateway tools ──
+      // mcp_search_tools / mcp_get_tool_schema / mcp_call_tool — constant-
+      // cost access to every tool on every server (providers cap tools[];
+      // see mcp-gateway.mjs). Routed before the built-in switch; names are
+      // disjoint from built-ins and ext__*.
+      if (MCP_GATEWAY_TOOL_NAMES.has(toolName)) {
+        const result = await executeMcpGatewayTool(toolName, input);
+        return { ...result, toolId };
+      }
+
       switch (toolName) {
         case "pane_codebase_compass": {
           if (!this._brainRequest) return { success: false, error: "Brain worker not available for codebase compass.", toolId };
@@ -1644,6 +2168,12 @@ export class ToolExecutor {
         case "Read":
         case "read_file":
           return await this.executeReadFile(toolId, input.file_path || input.path, input.start_line || null, input.end_line || null);
+
+        case "view_image":
+          return await this.executeViewImage(toolId, input.file_path || input.path);
+
+        case "computer":
+          return await this.executeComputer(toolId, input);
 
         case "pane_read_files": {
           // Batch read: read multiple files in one tool call.
@@ -1739,10 +2269,18 @@ export class ToolExecutor {
           const query = (input?.query || "").trim();
 
           // Try brain semantic search first (if export exists)
-          const brainExportPath = path.join(paneDir, "brain", "exports", `${this.projectId}.json`);
-          if (query && fs.existsSync(brainExportPath)) {
-            const exported = await readJson(brainExportPath);
-            if (exported && exported.length > 0) {
+          // Root-scoped: fall back to sibling threads sharing the same root
+          const { resolveProjectScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveProjectScope(this.projectId);
+          let exported = null;
+          for (const sid of scopeIds) {
+            const brainExportPath = path.join(paneDir, "brain", "exports", `${sid}.json`);
+            if (query && fs.existsSync(brainExportPath)) {
+              const candidate = await readJson(brainExportPath);
+              if (candidate && candidate.length > 0) { exported = candidate; break; }
+            }
+          }
+          if (query && exported && exported.length > 0) {
               const queryEmbedding = await embedText(query, paneDir);
               const queryLower = query.toLowerCase();
 
@@ -1758,22 +2296,30 @@ export class ToolExecutor {
               if (scored.length > 0) {
                 const matches = scored.slice(0, 30);
                 const out = matches.map(r => {
-                  return `[${r.type}] (match: ${(r.score * 100).toFixed(0)}%)\n${r.content}`;
+                  const idTag = r.id ? ` (id: ${r.id})` : "";
+                  return `[${r.type}] (match: ${(r.score * 100).toFixed(0)}%)${idTag}\n${r.content}`;
                 }).join("\n\n");
                 return { success: true, output: out, toolId };
               }
             }
-          }
 
           // Fallback: JSONL fuzzy search
-          const eventsPath = path.join(memoryDir, "events.jsonl");
-          let raw = "";
-          try { raw = await fsPromises.readFile(eventsPath, "utf-8"); }
-          catch { return { success: true, output: "No project memory yet — this is the first session.", toolId }; }
-
-          const events = raw.trim().split("\n").map(line => {
-            try { return JSON.parse(line); } catch { return null; }
-          }).filter(Boolean);
+          // Root-scoped JSONL fallback: aggregate events from all sibling threads
+          // (scopeIds already declared above from brain export attempt)
+          let events = [];
+          for (const sid of scopeIds) {
+            const eventsPath = path.join(paneDir, "memory", sid, "events.jsonl");
+            try {
+              const raw = await fsPromises.readFile(eventsPath, "utf-8");
+              const parsed = raw.trim().split("\n").map(line => {
+                try { return JSON.parse(line); } catch { return null; }
+              }).filter(Boolean);
+              events.push(...parsed);
+            } catch { /* sibling may not have events.jsonl yet */ }
+          }
+          if (events.length === 0) {
+            return { success: true, output: "No project memory yet — this is the first session.", toolId };
+          }
 
           let matches;
           if (query) {
@@ -1801,21 +2347,35 @@ export class ToolExecutor {
             return `${Math.floor(seconds / 86400)}d ago`;
           };
 
+          // Compute deterministic node IDs for JSONL events — same hash as brain-engine.mjs nodeId()
+          const computeNodeId = (type, content) => {
+            const hash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 12);
+            return `${type}-${hash}`;
+          };
+
           const out = matches.map(e => {
             const ago = e.timestamp ? timeSince(e.timestamp) : "";
             const meta = e.metadata ? Object.entries(e.metadata).map(([k, v]) => `${k}=${v}`).join(" ") : "";
-            return `[${e.type}]${ago ? ` (${ago})` : ""}${meta ? ` {${meta}}` : ""}\n${e.content}`;
+            const memId = computeNodeId(e.type, e.content);
+            return `[${e.type}]${ago ? ` (${ago})` : ""} (id: ${memId})${meta ? ` {${meta}}` : ""}\n${e.content}`;
           }).join("\n\n");
           return { success: true, output: out, toolId };
         }
 
         case "pane_remember": {
           if (!input?.content) return { success: false, error: "Nothing to remember — content is required.", toolId };
+
+          // Tag with active skills so the playbook engine can correlate
+          // observations with skills and build skill-specific principles.
+          const activeSkills = getActiveSkills(this.projectId);
+          const skillTags = activeSkills.size > 0 ? [...activeSkills] : [];
+
           const event = {
             type: input.type || "decision",
             content: input.content,
             timestamp: Date.now(),
             source: "http-backend",
+            ...(skillTags.length > 0 ? { skills: skillTags } : {}),
           };
           await fsPromises.mkdir(memoryDir, { recursive: true });
           await fsPromises.appendFile(
@@ -1830,7 +2390,94 @@ export class ToolExecutor {
               events: [event],
             }).catch(err => console.warn("[tool-executor] brain index_events (from pane_remember) failed:", err.message));
           }
-          return { success: true, output: `Saved to project memory: [${event.type}] ${event.content}`, toolId };
+          const tagNote = skillTags.length > 0 ? ` [skills: ${skillTags.join(", ")}]` : "";
+          return { success: true, output: `Saved to project memory: [${event.type}] ${event.content}${tagNote}`, toolId };
+        }
+
+        case "pane_update_memory": {
+          const { content: oldContent, newContent, type, id } = input;
+          if (!oldContent && !id) return { success: false, error: "Either the memory id or content of the memory to update is required.", toolId };
+          if (!newContent) return { success: false, error: "New content is required.", toolId };
+
+          // Direct SQLite mutation — bypasses brain worker IPC entirely.
+          // The brain worker is single-threaded and blocks on ONNX inference
+          // (416MB model), causing 15s+ timeouts for what should be <5ms SQLite ops.
+          const { directUpdateMemory, notifyBrainReembed } = await import("./memory-direct.mjs");
+          const result = directUpdateMemory(this.projectId, oldContent || "", newContent, type || null, id || null);
+          if (!result.success) {
+            return { success: false, error: result.error || "Memory update failed.", toolId };
+          }
+
+          // Notify brain worker to re-embed in background (fire-and-forget, non-blocking)
+          if (this._brainRequest) {
+            notifyBrainReembed(this._brainRequest, result.nodeId, newContent);
+          }
+
+          // Also update events.jsonl so the file-based fallback stays in sync
+          const eventsPath = path.join(memoryDir, "events.jsonl");
+          try {
+            const raw = await fsPromises.readFile(eventsPath, "utf-8");
+            const lines = raw.trim().split("\n");
+            let updated = 0;
+            const updatedLines = lines.map(line => {
+              try {
+                const e = JSON.parse(line);
+                const matchKey = id || oldContent.slice(0, 40);
+                if (e.content && (id ? e.id === id || e.nodeId === id : e.content.includes(matchKey))) {
+                  e.content = newContent;
+                  e.metadata = { ...(e.metadata || {}), updated: true, updated_at: new Date().toISOString() };
+                  updated++;
+                }
+                return JSON.stringify(e);
+              } catch { return line; }
+            });
+            if (updated > 0) {
+              await fsPromises.writeFile(eventsPath, updatedLines.join("\n") + "\n");
+            }
+          } catch (e) { console.warn("[pane_update_memory] events.jsonl sync failed:", e.message); }
+
+          return {
+            success: true,
+            output: `Memory updated (id: ${result.nodeId}): replaced with refined content.`,
+            toolId,
+          };
+        }
+
+        case "pane_delete_memory": {
+          const { content: memContent, type, id } = input;
+          if (!memContent && !id) return { success: false, error: "Either the memory id or content of the memory to delete is required.", toolId };
+
+          // Direct SQLite mutation — bypasses brain worker IPC entirely.
+          // The brain worker is single-threaded and blocks on ONNX inference
+          // (416MB model), causing 15s+ timeouts for what should be <5ms SQLite ops.
+          const { directDeleteMemory } = await import("./memory-direct.mjs");
+          const result = directDeleteMemory(this.projectId, memContent || "", type || null, id || null);
+          if (!result.success) {
+            return { success: false, error: result.error || "Memory deletion failed.", toolId };
+          }
+
+          // Also remove from events.jsonl to keep the file-based fallback in sync
+          const eventsPath = path.join(memoryDir, "events.jsonl");
+          try {
+            const raw = await fsPromises.readFile(eventsPath, "utf-8");
+            const lines = raw.trim().split("\n");
+            const matchKey = id || memContent.slice(0, 40);
+            const filteredLines = lines.filter(line => {
+              try {
+                const e = JSON.parse(line);
+                return !(e.content && (id ? e.id === id || e.nodeId === id : e.content.includes(matchKey)));
+              } catch { return true; }
+            });
+            if (filteredLines.length < lines.length) {
+              await fsPromises.writeFile(eventsPath, filteredLines.join("\n") + "\n");
+            }
+          } catch (e) { console.warn("[pane_delete_memory] events.jsonl sync failed:", e.message); }
+
+          return {
+            success: true,
+            output: `Memory deleted (id: ${result.nodeId}).`,
+            toolId,
+          };
         }
 
         case "pane_recall_all": {
@@ -1923,7 +2570,8 @@ export class ToolExecutor {
                 const label = typeLabel(n.entity_type);
                 const conf = (n.confidence * 100).toFixed(0);
                 const accesses = n.access_count || 0;
-                parts.push(`  [${label}] (${conf}% conf, ${accesses}x) ${n.content?.slice(0, 200) || n.name}`);
+                const idTag = n.id ? ` (id: ${n.id})` : "";
+                parts.push(`  [${label}]${idTag} (${conf}% conf, ${accesses}x) ${n.content?.slice(0, 200) || n.name}`);
               }
               if (nodes.length > 10) parts.push(`  ... and ${nodes.length - 10} more`);
             }
@@ -1935,10 +2583,18 @@ export class ToolExecutor {
         }
 
         case "pane_brief": {
-          const briefPath = path.join(memoryDir, "brief.md");
+          // Root-scoped: try current thread first, then siblings
+          const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveScope(this.projectId);
           let brief = "";
-          try { brief = await fsPromises.readFile(briefPath, "utf-8"); }
-          catch { return { success: true, output: "No project brief yet — memory will accumulate as you work.", toolId }; }
+          for (const sid of scopeIds) {
+            const briefPath = path.join(paneDir, "memory", sid, "brief.md");
+            try {
+              brief = await fsPromises.readFile(briefPath, "utf-8");
+              if (brief.trim()) break;
+            } catch { /* try next sibling */ }
+          }
+          if (!brief.trim()) return { success: true, output: "No project brief yet — memory will accumulate as you work.", toolId };
           return { success: true, output: brief, toolId };
         }
 
@@ -1957,7 +2613,16 @@ export class ToolExecutor {
         }
 
         case "pane_checkpoint": {
-          const { flushJournal } = await import("./checkpoint-engine.mjs");
+          // If no files have been modified this turn, snapshot the full project
+          // so the checkpoint captures the current state as a safety net.
+          // This lets pane_checkpoint work at any moment, not just mid-edit.
+          if (this.fileJournal.size === 0) {
+            try {
+              await snapshotAllFiles(this.projectRoot, this.fileJournal);
+            } catch {
+              return { success: false, error: "Checkpoint not saved — project snapshot failed.", toolId };
+            }
+          }
           const result = await flushJournal({
             projectId: this.projectId,
             workingDir: this.projectRoot,
@@ -1966,7 +2631,7 @@ export class ToolExecutor {
           });
           if (!result.id) {
             const why = result.reason === "no-files-journaled"
-              ? "no files have been modified in this turn yet"
+              ? "no files found in the project to snapshot"
               : "no snapshot could be taken";
             return { success: false, error: `Checkpoint not saved — ${why}.`, toolId };
           }
@@ -1980,8 +2645,12 @@ export class ToolExecutor {
         }
 
         case "pane_change_history": {
-          const db = getPaneDb();
-          const rows = db.stmts.getChanges.all(this.projectId);
+          const paneDb = getPaneDb();
+          // Root-scoped: include edits from sibling threads sharing the same root
+          const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveScope(this.projectId);
+          const ph = scopeIds.map(() => "?").join(", ");
+          const rows = paneDb.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) ORDER BY timestamp DESC LIMIT 500`).all(...scopeIds);
           if (rows.length === 0) return { success: true, output: "No change history yet. Changes will be recorded as you edit files.", toolId };
 
           const out = rows.map(c => {
@@ -1997,16 +2666,21 @@ export class ToolExecutor {
 
         case "pane_search_changes": {
           const { query, file_path: filePath } = input;
-          const db = getPaneDb();
+          const paneDb = getPaneDb();
+          // Root-scoped: include edits from sibling threads
+          const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveScope(this.projectId);
+          const ph = scopeIds.map(() => "?").join(", ");
           let rows = [];
 
           if (filePath) {
-            rows = db.stmts.searchChangesByFile.all(this.projectId, filePath);
+            rows = paneDb.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) AND file_path = ? ORDER BY timestamp DESC LIMIT 200`).all(...scopeIds, filePath);
           } else if (query) {
             const like = `%${query}%`;
-            rows = db.stmts.searchChanges.all(this.projectId, like, like, like, like);
+            rows = paneDb.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) AND (file_path LIKE ? OR description LIKE ? OR new_string LIKE ? OR old_string LIKE ?) ORDER BY timestamp DESC LIMIT 200`)
+              .all(...scopeIds, like, like, like, like);
           } else {
-            rows = db.stmts.getChanges.all(this.projectId);
+            rows = paneDb.prepare(`SELECT * FROM change_history WHERE project_id IN (${ph}) ORDER BY timestamp DESC LIMIT 500`).all(...scopeIds);
           }
 
           if (rows.length === 0) return { success: true, output: "No matching changes found.", toolId };
@@ -2084,7 +2758,8 @@ export class ToolExecutor {
             parts.push(`## ${type} (${nodes.length} total, showing top ${sorted.length})`);
             for (const n of sorted) {
               const conf = n.confidence != null ? ` [confidence: ${n.confidence.toFixed(2)}]` : "";
-              parts.push(`- ${n.content}${conf}`);
+              const idTag = n.id ? ` (id: ${n.id})` : "";
+              parts.push(`- ${n.content}${conf}${idTag}`);
             }
             parts.push("");
           }
@@ -2134,7 +2809,7 @@ export class ToolExecutor {
 
           if (top.length === 0) return { success: true, output: `No cross-project insights found for "${query}".`, toolId };
 
-          const out = top.map(r => `[${r.project}] [${r.type}] (match: ${(r.score * 100).toFixed(0)}%)\n${r.content}`).join("\n\n");
+          const out = top.map(r => `[${r.project}] [${r.type}] (match: ${(r.score * 100).toFixed(0)}%)${r.id ? ` (id: ${r.id})` : ""}\n${r.content}`).join("\n\n");
           return { success: true, output: out, toolId };
         }
 
@@ -2142,10 +2817,18 @@ export class ToolExecutor {
           const query = (input?.query || "").trim();
           if (!query) return { success: false, error: "Query is required.", toolId };
 
-          const symbolsPath = path.join(paneDir, "brain", "symbols", `${this.projectId}.json`);
+          // Root-scoped: fall back to sibling threads sharing the same root
+          const { resolveProjectScope: resolveScope } = await import("./root-scope.mjs");
+          const scopeIds = resolveScope(this.projectId);
           let exported = null;
-          try { exported = JSON.parse(await fsPromises.readFile(symbolsPath, "utf-8")); }
-          catch { return { success: true, output: "Symbol index not available yet — it builds automatically when you open a project in Pane.", toolId }; }
+          for (const sid of scopeIds) {
+            const symbolsPath = path.join(paneDir, "brain", "symbols", `${sid}.json`);
+            try {
+              const candidate = JSON.parse(await fsPromises.readFile(symbolsPath, "utf-8"));
+              if (candidate?.symbols?.length > 0) { exported = candidate; break; }
+            } catch { /* try next sibling */ }
+          }
+          if (!exported) return { success: true, output: "Symbol index not available yet — it builds automatically when you open a project in Pane.", toolId };
 
           if (!exported?.symbols?.length) return { success: true, output: "No symbols indexed for this project.", toolId };
 
@@ -2213,6 +2896,55 @@ export class ToolExecutor {
           return { success: true, output: formatReferencesOutput(symbol, byFile, totalMatches, filesSearched), toolId };
         }
 
+        case "pane_check_intents": {
+          const file = (input?.file || "").trim();
+
+          if (file) {
+            // Check for conflicts on a specific file
+            const conflict = checkConflict(this.projectRoot, this.projectId, file);
+            if (conflict.conflicted) {
+              const peerList = conflict.by.map((c) =>
+                `- Thread \`${c.threadId.slice(0, 8)}\` touched \`${c.file}\` ${Math.round((Date.now() - c.ts) / 60000)}m ago`
+              ).join("\n");
+              return {
+                success: true,
+                output: `⚠ Conflict: other threads recently touched \`${file}\`:\n${peerList}\n\nCoordinate with the user before modifying this file.`,
+                toolId,
+              };
+            }
+            return {
+              success: true,
+              output: `No conflicts on \`${file}\`. No other active threads have touched it recently.`,
+              toolId,
+            };
+          }
+
+          // Get all peer activity — activity-based, not just file writes
+          const grouped = readPeerActivityGrouped(this.projectRoot, this.projectId);
+          if (grouped.size === 0) {
+            return { success: true, output: "No other threads are actively working on this project root.", toolId };
+          }
+
+          const lines = [`Active peer thread(s) on this project root (${grouped.size}):`];
+          for (const [, entry] of grouped) {
+            const shortId = entry.threadId.slice(0, 8);
+            const ago = Math.round((Date.now() - entry.lastActivity) / 60000);
+            const agoStr = ago < 1 ? "just now" : `${ago}m ago`;
+            lines.push(`\nThread \`${shortId}\` (active ${agoStr}):`);
+            if (entry.task) lines.push(`  Working on: ${entry.task}`);
+            if (entry.tools.length > 0) lines.push(`  Tools: ${entry.tools.slice(0, 6).join(", ")}`);
+            if (entry.files.length > 0) {
+              lines.push(`  Files:`);
+              for (const f of entry.files.slice(0, 8)) {
+                lines.push(`    - \`${f}\``);
+              }
+              if (entry.files.length > 8) lines.push(`    ... and ${entry.files.length - 8} more`);
+            }
+          }
+
+          return { success: true, output: lines.join("\n"), toolId };
+        }
+
         case "pane_profile": {
           const profileDir = path.join(paneDir, "profile");
           const parts = [];
@@ -2276,8 +3008,300 @@ export class ToolExecutor {
         }
 
         case "activate_skill": {
-          const name = input.name || "unknown";
-          return { success: true, output: `Skill "${name}" activated. (Note: Skill instructions are normally injected into context; this is a mock confirmation.)`, toolId };
+          const name = (input.name || "").trim();
+          if (!name) return { success: false, error: "Skill name is required.", toolId };
+
+          const result = activateSkill(this.projectId, name, this.projectRoot);
+          if (!result.success) {
+            return { success: false, error: result.error, toolId };
+          }
+
+          const body = result.body;
+          const outputParts = [
+            `## Skill Activated: ${name}`,
+            "",
+            body.instructions,
+          ];
+
+          // Include compose info if present
+          if (body.compose) {
+            outputParts.push("");
+            outputParts.push("### Compatibility");
+            const c = body.compose;
+            if (c.extends?.length) outputParts.push(`- Extends: ${c.extends.join(", ")}`);
+            if (c.conflicts?.length) outputParts.push(`- Conflicts with: ${c.conflicts.join(", ")}`);
+            if (c.requires?.length) outputParts.push(`- Requires: ${c.requires.join(", ")}`);
+          }
+
+          // Include playbook if present
+          if (body.playbook) {
+            outputParts.push("");
+            outputParts.push("### Domain Principles");
+            outputParts.push(body.playbook);
+          }
+
+          // Include tool info if present
+          if (body.tools) {
+            outputParts.push("");
+            outputParts.push(`### Bundled Tools: ${body.tools.length || Object.keys(body.tools).length} tool(s) available`);
+          }
+
+          // Persist active skill in session state so context-orchestrator injects it
+          try {
+            mergeState(this.projectId, {
+              activeSkills: [...(readState(this.projectId)?.activeSkills || []), name.toLowerCase()]
+                .filter((v, i, a) => a.indexOf(v) === i), // dedupe
+            });
+          } catch {
+            // mergeState not critical — skill still works via tool result
+          }
+
+          return { success: true, output: outputParts.join("\n"), toolId };
+        }
+
+        case "deactivate_skill": {
+          const name = (input.name || "").trim();
+          if (!name) return { success: false, error: "Skill name is required.", toolId };
+
+          const activeSkills = getActiveSkills(this.projectId);
+          if (!activeSkills.has(name.toLowerCase())) {
+            return {
+              success: true,
+              output: `Skill "${name}" is not currently active. Active skills: ${activeSkills.size > 0 ? [...activeSkills].join(", ") : "none"}.`,
+              toolId,
+            };
+          }
+
+          deactivateSkill(this.projectId, name);
+
+          // Persist deactivation in session state
+          try {
+            const current = readState(this.projectId)?.activeSkills || [];
+            mergeState(this.projectId, {
+              activeSkills: current.filter((s) => s.toLowerCase() !== name.toLowerCase()),
+            });
+          } catch {
+            // mergeState not critical
+          }
+
+          const remaining = getActiveSkills(this.projectId);
+          return {
+            success: true,
+            output: `Skill "${name}" deactivated.${remaining.size > 0 ? ` Remaining active: ${[...remaining].join(", ")}.` : " No skills currently active."}`,
+            toolId,
+          };
+        }
+
+        case "pane_list_active_skills": {
+          const activeSkills = getActiveSkills(this.projectId);
+
+          if (activeSkills.size === 0) {
+            return {
+              success: true,
+              output: "No skills are currently active. Use `pane_list_skills` to see available skills and `activate_skill` to load one.",
+              toolId,
+            };
+          }
+
+          const lines = [];
+          for (const name of activeSkills) {
+            const body = loadSkill(name, this.projectRoot);
+            const meta = findSkill(name, this.projectRoot);
+            const desc = meta?.description || (body?.instructions ? body.instructions.slice(0, 100) + "..." : "no description");
+            const tags = meta?.tags?.length ? ` [${meta.tags.join(", ")}]` : "";
+            lines.push(`- **${name}**${tags}: ${desc}`);
+          }
+
+          return {
+            success: true,
+            output: `## Active Skills (${activeSkills.size})\n\n${lines.join("\n")}\n\nUse \`deactivate_skill\` to unload a skill when it's no longer needed.`,
+            toolId,
+          };
+        }
+
+        case "pane_install_skill": {
+          const url = (input.url || "").trim();
+          if (!url) return { success: false, error: "Skill URL or path is required.", toolId };
+
+          const renameTo = (input.name || "").trim() || null;
+
+          // Handle github: URLs
+          if (url.startsWith("github:")) {
+            const githubPath = url.slice(7);
+            const parts = githubPath.split("/");
+            if (parts.length < 3) {
+              return { success: false, error: "GitHub path must be: github:owner/repo/path/to/skill", toolId };
+            }
+
+            const owner = parts[0];
+            const repo = parts[1];
+            const skillPath = parts.slice(2).join("/");
+            const repoUrl = `https://github.com/${owner}/${repo}.git`;
+
+            const tmpDir = path.join(os.tmpdir(), `pane-skill-${repo}-${Date.now()}`);
+
+            try {
+              execSync(`git clone --depth 1 "${repoUrl}" "${tmpDir}"`, {
+                stdio: "pipe",
+                timeout: 30_000,
+              });
+            } catch (err) {
+              return { success: false, error: `Failed to clone repo: ${err.message}`, toolId };
+            }
+
+            const skillDir = path.join(tmpDir, skillPath);
+            if (!fs.existsSync(skillDir)) {
+              try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+              return { success: false, error: `Skill path "${skillPath}" not found in repo.`, toolId };
+            }
+
+            const skillName = renameTo || parts[parts.length - 1];
+            ensureGlobalSkillsDir();
+            const result = installSkill(skillDir, skillName);
+
+            try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+
+            if (!result.success) {
+              return { success: false, error: result.error, toolId };
+            }
+
+            return {
+              success: true,
+              output: `## Skill Installed: ${result.name}\n\nInstalled from \`${url}\` to ~/.pane/skills/${result.name}/\n\nUse \`pane_list_skills\` to see all available skills, and \`activate_skill\` to load it.`,
+              toolId,
+            };
+          }
+
+          // Local directory path
+          const resolved = path.resolve(url);
+          if (!fs.existsSync(resolved)) {
+            return { success: false, error: `Path "${resolved}" does not exist.`, toolId };
+          }
+          if (!fs.statSync(resolved).isDirectory()) {
+            return { success: false, error: `Path "${resolved}" is not a directory.`, toolId };
+          }
+
+          ensureGlobalSkillsDir();
+          const result = installSkill(resolved, renameTo);
+          if (!result.success) {
+            return { success: false, error: result.error, toolId };
+          }
+
+          return {
+            success: true,
+            output: `## Skill Installed: ${result.name}\n\nInstalled from \`${resolved}\` to ~/.pane/skills/${result.name}/\n\nUse \`pane_list_skills\` to see all available skills, and \`activate_skill\` to load it.`,
+            toolId,
+          };
+        }
+
+        case "pane_list_skills": {
+          const query = (input.query || "").toLowerCase();
+          const skills = discoverAll(this.projectRoot);
+
+          if (skills.length === 0) {
+            return {
+              success: true,
+              output: "No skills installed. Skills can be installed to ~/.pane/skills/ or to .pane/skills/ in your project. Each skill is a directory with a SKILL.md file.",
+              toolId,
+            };
+          }
+
+          let filtered = skills;
+          if (query) {
+            filtered = skills.filter(
+              (s) =>
+                s.name.toLowerCase().includes(query) ||
+                s.description.toLowerCase().includes(query) ||
+                s.tags.some((t) => t.toLowerCase().includes(query)),
+            );
+          }
+
+          if (filtered.length === 0) {
+            return {
+              success: true,
+              output: `No skills match "${input.query}". Use pane_list_skills without a query to see all ${skills.length} available skills.`,
+              toolId,
+            };
+          }
+
+          const lines = filtered.map((s) => {
+            const tagStr = s.tags.length > 0 ? ` [${s.tags.join(", ")}]` : "";
+            const sourceLabel = s.source === "project" ? " (project)" : s.source === "builtin" ? " (built-in)" : "";
+            return `- **${s.name}**${sourceLabel}${tagStr}: ${s.description}`;
+          });
+
+          return {
+            success: true,
+            output: `## Available Skills (${filtered.length}${query ? ` matching "${input.query}"` : ""} of ${skills.length} total)\n\n${lines.join("\n")}\n\nUse \`activate_skill\` with a skill name to load its instructions. Use \`pane_skill_info\` for full details on a specific skill.`,
+            toolId,
+          };
+        }
+
+        case "pane_skill_info": {
+          const name = (input.name || "").trim();
+          if (!name) return { success: false, error: "Skill name is required.", toolId };
+
+          const meta = findSkill(name, this.projectRoot);
+          if (!meta) {
+            return {
+              success: true,
+              output: `Skill "${name}" not found. Use pane_list_skills to see available skills.`,
+              toolId,
+            };
+          }
+
+          const body = loadSkill(name, this.projectRoot);
+          const parts = [
+            `## ${meta.name}`,
+            `**Version:** ${meta.version}`,
+            `**Source:** ${meta.source}${meta.projectRoot ? ` (${meta.projectRoot})` : ""}`,
+            `**Tags:** ${meta.tags.length > 0 ? meta.tags.join(", ") : "none"}`,
+            `**Path:** ${meta.path}`,
+            "",
+            `### Description`,
+            meta.description,
+          ];
+
+          if (body?.instructions) {
+            parts.push("");
+            parts.push("### Instructions");
+            parts.push(body.instructions);
+          }
+
+          if (body?.compose) {
+            parts.push("");
+            parts.push("### Composition");
+            const c = body.compose;
+            if (c.extends?.length) parts.push(`- Extends: ${c.extends.join(", ")}`);
+            if (c.provides?.length) parts.push(`- Provides: ${c.provides.join(", ")}`);
+            if (c.conflicts?.length) parts.push(`- Conflicts: ${c.conflicts.join(", ")}`);
+            if (c.requires?.length) parts.push(`- Requires: ${c.requires.join(", ")}`);
+            if (c.priority !== undefined) parts.push(`- Priority: ${c.priority}`);
+          }
+
+          if (body?.playbook) {
+            parts.push("");
+            parts.push("### Domain Principles");
+            parts.push(body.playbook);
+          }
+
+          if (body?.tools) {
+            parts.push("");
+            parts.push("### Bundled Tools");
+            const tools = body.tools;
+            const toolNames = Array.isArray(tools) 
+              ? tools.map(t => typeof t === "string" ? t : t.function?.name || t.name || "unnamed")
+              : Object.keys(tools);
+            parts.push(toolNames.map(t => `- ${t}`).join("\n"));
+          }
+
+          if (body?.modelPrefs) {
+            parts.push("");
+            parts.push("### Model Preferences");
+            parts.push(JSON.stringify(body.modelPrefs, null, 2));
+          }
+
+          return { success: true, output: parts.join("\n"), toolId };
         }
 
         case "save_memory": {
@@ -2350,6 +3374,63 @@ When you are done, return a summary with:
           }
         }
 
+        case "pane_spawn_peer": {
+          // Fire-and-forget delegation to a PEER THREAD. Unlike pane_delegate
+          // (blocking sub-agent in this thread), the peer is a full independent
+          // thread created by the renderer (threads live in the renderer's
+          // zustand store — main cannot mint them directly). Same rail as
+          // ask_user: emit an event to the renderer, return a pending-style
+          // result immediately, and let the renderer do the creation + kickoff.
+          // The completion notice comes back later as the delegator's next
+          // input via the same pane:send-message rail voice uses.
+          const objective = (input?.objective || "").trim();
+          if (!objective) return { success: false, error: "Objective is required.", toolId };
+          const name = (input?.name || "").trim() || null;
+
+          // Deduced thread name: first ~6 words of the objective. The
+          // ellipsis marks a derived (auto) name; an explicit name is kept as-is.
+          let derivedName = name;
+          if (!derivedName) {
+            const words = objective
+              .toLowerCase()
+              .replace(/[^a-z0-9\s-]/g, "")
+              .trim()
+              .split(/\s+/)
+              .slice(0, 6)
+              .join(" ");
+            derivedName = (words || "peer") + "…";
+          }
+
+          if (!this._onPeerSpawn) {
+            return {
+              success: false,
+              error: "Peer spawning is not available (renderer bridge not wired).",
+              toolId,
+            };
+          }
+
+          this._onPeerSpawn({
+            sourceProjectId: this.projectId,
+            sourceRoot: this.projectRoot,
+            objective,
+            threadName: derivedName,
+            toolId,
+          });
+
+          // Fire-and-forget: acknowledge immediately. The renderer creates the
+          // thread, kicks its executor, and delivers the completion notice
+          // back here as a future pane:send-message delivery.
+          return {
+            success: true,
+            output:
+              `Peer thread "${derivedName}" is being created and will start working. ` +
+              `This call returns immediately — continue with your own work. ` +
+              `You will receive a completion notice as your next input when the peer ` +
+              `finishes or fails; do not poll for it.`,
+            toolId,
+          };
+        }
+
         case "explore": {
           const { explore } = await import("./tool-explore.mjs");
           const result = await explore(
@@ -2359,6 +3440,131 @@ When you are done, return a summary with:
             { brainRequest: this._brainRequest },
           );
           return { success: true, output: result || "No relevant results found.", toolId };
+        }
+
+        case "pane_lens_findings": {
+          const action = (input?.action || "").trim();
+          if (!action) return { success: false, error: "Action is required: 'list', 'resolve', or 'run'.", toolId };
+
+          if (action === "list") {
+            // List all undismissed findings for this project, grouped by punk
+            if (!this._brainRequest) return { success: false, error: "Brain engine not available.", toolId };
+            try {
+              const result = await this._brainRequest("findings_list", {
+                projectId: this.projectId,
+                limit: 100,
+              });
+              const findings = result?.findings || [];
+              if (findings.length === 0) {
+                return { success: true, output: "No undismissed findings from any punk.", toolId };
+              }
+
+              // Group by punk
+              const byPunk = {};
+              for (const f of findings) {
+                if (!byPunk[f.punk]) byPunk[f.punk] = [];
+                byPunk[f.punk].push(f);
+              }
+
+              const sections = [];
+              for (const [punk, punkFindings] of Object.entries(byPunk)) {
+                const items = punkFindings.map(f => {
+                  let structured = {};
+                  try { structured = JSON.parse(f.structured || "{}"); } catch {}
+                  const loc = f.location ? ` @ ${f.location}` : "";
+                  const remediation = structured.remediation ? `\n   Fix: ${structured.remediation}` : "";
+                  return `  [${f.severity}] (id: ${f.id}) ${f.finding}${loc}${remediation}`;
+                }).join("\n\n");
+                sections.push(`## ${punk} (${punkFindings.length} finding${punkFindings.length > 1 ? "s" : ""})\n\n${items}`);
+              }
+
+              return { success: true, output: sections.join("\n\n"), toolId };
+            } catch (err) {
+              return { success: false, error: `Failed to list findings: ${err.message}`, toolId };
+            }
+          }
+
+          if (action === "resolve") {
+            const ids = input?.findingIds;
+            if (!Array.isArray(ids) || ids.length === 0) {
+              return { success: false, error: "findingIds array is required for resolve action.", toolId };
+            }
+            if (!this._brainRequest) return { success: false, error: "Brain engine not available.", toolId };
+
+            let resolved = 0;
+            let failed = 0;
+            for (const id of ids) {
+              try {
+                await this._brainRequest("finding_dismiss", { findingId: id });
+                resolved++;
+              } catch (err) {
+                console.warn(`[tool-executor] finding_dismiss failed for ${id}:`, err.message);
+                failed++;
+              }
+            }
+
+            const msg = `Resolved ${resolved} finding${resolved !== 1 ? "s" : ""}${failed > 0 ? `, ${failed} failed` : ""}.`;
+            return { success: true, output: msg, toolId };
+          }
+
+          if (action === "run") {
+            const punk = (input?.punk || "").trim();
+            if (!punk) return { success: false, error: "Punk name is required for run action (e.g. 'ghost', 'ash', 'sage').", toolId };
+            if (!this._runPunk) return { success: false, error: "Punk engine not available.", toolId };
+
+            // Fire-and-forget: the punk runs asynchronously and results arrive
+            // via pane://punk-complete events to the Lens UI. The model gets
+            // confirmation that the run was triggered.
+            try {
+              this._runPunk(punk, this.projectId, this.projectRoot, input?.task || null)
+                .catch(err => console.warn(`[tool-executor] punk ${punk} run failed:`, err.message));
+
+              const taskDesc = input?.task ? ` with task: "${input.task}"` : "";
+              return { success: true, output: `Triggered ${punk} punk${taskDesc}. Results will appear in Lens.`, toolId };
+            } catch (err) {
+              return { success: false, error: `Failed to trigger punk: ${err.message}`, toolId };
+            }
+          }
+
+          return { success: false, error: `Unknown action: ${action}. Use 'list', 'resolve', or 'run'.`, toolId };
+        }
+
+        case "pane_logs": {
+          const action = (input?.action || "").trim();
+          if (!action) return { success: false, error: "Action is required: 'tail' or 'search'.", toolId };
+
+          const hours = Math.min(Math.max(Number(input?.hours) || 24, 1), 168);
+          const level = ["all", "info", "warn", "error"].includes(input?.level) ? input.level : "all";
+          const source = typeof input?.source === "string" && input.source.trim() ? input.source.trim() : null;
+          const limit = Math.min(Math.max(Number(input?.limit) || 100, 1), 300);
+
+          if (action === "tail" || action === "search") {
+            const grep = action === "search" ? (input?.grep || "").trim() : (input?.grep || "").trim() || null;
+            if (action === "search" && !grep) {
+              return { success: false, error: "grep pattern is required for action=search.", toolId };
+            }
+
+            const { entries, fileCount, truncated, error: readError } = readLogs({ hours, level, source, limit, grep });
+            if (readError) return { success: false, error: readError, toolId };
+
+            const stats = logCollectorStats();
+            if (entries.length === 0) {
+              return {
+                success: true,
+                output: `No log entries matched (level=${level}, source=${source ?? "all"}, last ${hours}h). Collector: ${stats.dir ?? "not initialized"}`,
+                toolId,
+              };
+            }
+
+            const lines = entries.map((e) => {
+              const time = new Date(e.ts).toISOString().slice(11, 19);
+              return `${time} ${e.level.toUpperCase().padEnd(5)} [${e.source}] ${e.message}`;
+            });
+            const header = `── ${entries.length} entr${entries.length !== 1 ? "ies" : ""}${truncated ? " (hit limit — older entries exist)" : ""} · level≥${level} · source=${source ?? "all"} · ${hours}h window · ${fileCount} file(s) ──`;
+            return { success: true, output: `${header}\n${lines.join("\n")}`, toolId };
+          }
+
+          return { success: false, error: `Unknown action: ${action}. Use 'tail' or 'search'.`, toolId };
         }
 
         case "pane_codebase_navigator": {

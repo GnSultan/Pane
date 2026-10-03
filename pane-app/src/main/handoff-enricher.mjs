@@ -17,6 +17,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { resolveHandoffTarget } from "./model-resolver.mjs";
 
 const PANE_DIR = path.join(os.homedir(), ".pane");
 const SESSION_DIR = path.join(PANE_DIR, "session");
@@ -48,19 +49,34 @@ function readSettings() {
  */
 export async function enrichHandoff(projectId, updateLatestHandoffFn) {
   const settings = readSettings();
-  const provider = settings.http_provider || "deepseek";
+  // Single source of truth: legacy http_model override, else the user's
+  // active selection. Never an invented per-provider default.
+  const target = resolveHandoffTarget(settings);
+  const provider = target?.provider || null;
+  const model = target?.model || null;
   const apiKey =
     settings.http_api_keys?.[provider] || settings.http_api_key || "";
+  // Known native endpoints for providers the user commonly selects; any
+  // other OpenAI-compatible provider needs an explicit http_base_urls
+  // entry, else enrichment skips with a log (never a guessed URL).
+  const KNOWN_BASE_URLS = {
+    deepseek: "https://api.deepseek.com/v1",
+    "z-ai": "https://api.z.ai/api/paas/v4",
+    anthropic: "https://api.anthropic.com/v1",
+    openrouter: "https://openrouter.ai/api/v1",
+    kimi: "https://api.moonshot.ai/v1",
+    stepfun: "https://api.stepfun.com/v1",
+  };
   const baseUrl =
     settings.http_base_urls?.[provider] ||
-    (provider === "deepseek" ? "https://api.deepseek.com/v1" :
-     provider === "z-ai" ? "https://api.z.ai/api/paas/v4" :
-     provider === "anthropic" ? "https://api.anthropic.com/v1" :
-     "");
-  const model = settings.http_model || getDefaultModelForProvider(provider);
+    KNOWN_BASE_URLS[provider] ||
+    "";
 
-  if (!apiKey || !baseUrl) {
-    console.log("[handoff-enricher] No API config, skipping enrichment");
+  if (!target || !model || !apiKey || !baseUrl) {
+    console.log(
+      "[handoff-enricher] No model/credential configured, skipping enrichment " +
+      "(provider=" + provider + ", model=" + model + ", hasKey=" + !!apiKey + ")",
+    );
     return false;
   }
 
@@ -253,7 +269,7 @@ async function callAnthropic(apiKey, baseUrl, model, prompt) {
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: model || "claude-3-haiku-20240307",
+      model,
       max_tokens: 1500,
       temperature: 0.3,
       messages: [{ role: "user", content: prompt }],
@@ -380,15 +396,6 @@ function mergeEnrichment(projectId, handoff, enrichment, updateFn) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function getDefaultModelForProvider(provider) {
-  const defaults = {
-    deepseek: "deepseek-v4-flash",
-    kimi: "moonshot-v1-8k",
-    openrouter: "openai/gpt-4o-mini",
-    anthropic: "claude-3-haiku-20240307",
-    gemini: "gemini-2.0-flash",
-    "z-ai": "glm-5.2",
-  };
-  return defaults[provider] || "deepseek-v4-flash";
-}
+// getDefaultModelForProvider removed — the active model now resolves through
+// model-resolver (legacy http_model override → user's active selection).
+// No invented per-provider defaults.

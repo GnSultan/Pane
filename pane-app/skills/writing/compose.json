@@ -1,0 +1,10 @@
+{
+  "name": "writing",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["writing", "documentation", "prose", "comments", "naming"],
+  "tags": ["writing", "documentation", "comments", "naming", "prose"],
+  "priority": 5
+}
