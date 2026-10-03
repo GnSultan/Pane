@@ -3056,7 +3056,6 @@ export class ApiBackend extends PunkBackend {
     // of previous spawn's state (e.g. auto-resume re-enters spawn).
     this._healAttemptedThisTurn = false;
     this._contextHealAttemptedThisTurn = false;
-    this._imageStripAttemptedThisTurn = false;
     this._toolsCapAttemptedThisTurn = false;
     if (typeof this._sessionRetryCount !== "number") {
       this._sessionRetryCount = 0;
@@ -4000,6 +3999,11 @@ export class ApiBackend extends PunkBackend {
 
           // Track retry history for debugging
           const retryHistory = [];
+          // Per-request image-strip latch: a later request in the same turn
+          // can re-inject images (tool results) into a freshly rebuilt body
+          // — each request must be able to earn one strip again. Bounded by
+          // request._imageStripCount (cap 50) across the whole session.
+          this._imageStripAttemptedThisRequest = false;
           // Preserves the error body across the retry loop boundary — the 400
           // handler reads response.text() to check for "insufficient tool messages",
           // which exhausts the body stream. If the error is NOT healable and we
@@ -4302,8 +4306,20 @@ export class ApiBackend extends PunkBackend {
                       // The provider can't receive pixels under any model —
                       // degrade to text + an honest notice the model can act
                       // on, instead of hard-failing the entire turn.
-                      if (!this._imageStripAttemptedThisTurn) {
-                      this._imageStripAttemptedThisTurn = true;
+                      // Per-request latch (not per-turn): a tool result can
+                      // re-inject images into a LATER request of the same
+                      // turn — each rebuilt body must be able to earn the
+                      // strip again. Loop safety: one request can only
+                      // contain N images; each strip removes ≥1, so the
+                      // sequence swap→strip→swap→strip is bounded by the
+                      // image count in any single request.
+                      if (
+                        !this._imageStripAttemptedThisRequest &&
+                        request._imageStripCount !== 50
+                      ) {
+                      this._imageStripAttemptedThisRequest = true;
+                      request._imageStripCount =
+                        (request._imageStripCount || 0) + 1;
                       const target = finalBody && finalBody !== body ? finalBody : body;
                       let strippedCount = 0;
                       const stripImagesFromContent = (content) => {
@@ -4404,6 +4420,135 @@ export class ApiBackend extends PunkBackend {
                       }
                     }
 
+                    // ── HEALABLE 400: z-ai prompt-length overflow (1261) ──
+                    // The z.ai coding endpoint reports context overflow as
+                    // {"code":"1261","message":"Prompt exceeds max length"}.
+                    // Primary path: the 1210 vision swap above lands the
+                    // request on glm-4.5v, whose window is smaller than the
+                    // text models' — the base64 image (billed as prompt
+                    // tokens) overflows it. Strip the images (stage-2 logic,
+                    // reused) instead of killing the turn; the notice tells
+                    // the model its eyes are gone and where pixels still
+                    // exist (zai-vision MCP paths). No-image case falls
+                    // through to the generic context-prune heal below.
+                    if (
+                      plainBody.includes("Prompt exceeds max length") ||
+                      plainBody.includes("exceeds max length") ||
+                      plainBody.includes("prompt length exceeded")
+                    ) {
+                      if (
+                        this._imageStripAttemptedThisRequest ||
+                        request._imageStripCount === 50
+                      ) {
+                        // already stripped this request — pure text overflow;
+                        // fall through to the context-prune heal below
+                      } else if (
+                        sourceBody.messages?.some((m) =>
+                          Array.isArray(m.content) &&
+                          m.content.some(
+                            (p) =>
+                              p?.type === "image_url" ||
+                              p?.type === "image" ||
+                              (p?.type === "tool_result" &&
+                                typeof p.content === "string" &&
+                                p.content.startsWith("__PANE_IMG__")),
+                          ),
+                        )
+                      ) {
+                        this._imageStripAttemptedThisRequest = true;
+                        request._imageStripCount =
+                          (request._imageStripCount || 0) + 1;
+                        const target =
+                          finalBody && finalBody !== body ? finalBody : body;
+                        let strippedCount = 0;
+                        const stripImagesFromContent = (content) => {
+                          if (!Array.isArray(content)) return content;
+                          return content.filter((part) => {
+                            const isImage =
+                              part?.type === "image_url" ||
+                              part?.type === "image" ||
+                              (part?.type === "tool_result" &&
+                                typeof part.content === "string" &&
+                                part.content.startsWith("__PANE_IMG__"));
+                            if (isImage) strippedCount++;
+                            return !isImage;
+                          });
+                        };
+                        for (const m of target.messages || []) {
+                          m.content = stripImagesFromContent(m.content);
+                          if (
+                            Array.isArray(m.content) &&
+                            m.content.every((p) => p?.type === "text")
+                          ) {
+                            m.content = m.content
+                              .map((p) => p.text || "")
+                              .join("\n")
+                              .trim();
+                          }
+                        }
+                        // A 1261 means even text-only prompt is potentially
+                        // oversized for the swapped vision model — also drop
+                        // the swap back to the user's selected model so the
+                        // next request runs on the model they chose.
+                        if (
+                          sourceBody.model === "glm-4.5v" &&
+                          typeof request.model === "string" &&
+                          request.model
+                        ) {
+                          sourceBody.model = request.model;
+                          if (finalBody && finalBody !== body) {
+                            body.model = sourceBody.model;
+                          }
+                          console.warn(
+                            `[http] auto-healing: 1261 after vision swap — reverting to selected model ${request.model}`,
+                          );
+                        }
+                        const lastMsg =
+                          target.messages[target.messages.length - 1];
+                        const notice =
+                          "[System: this endpoint rejected the request because the prompt exceeds its maximum length — " +
+                          strippedCount +
+                          " attached image(s) were removed from the conversation before this request. " +
+                          "You cannot see those pixels. Tell the user plainly that the current model/endpoint cannot view images inline and the conversation is too large for its vision model." +
+                          "]";
+                        if (
+                          lastMsg?.role === "user" &&
+                          typeof lastMsg.content === "string"
+                        ) {
+                          lastMsg.content = lastMsg.content + "\n\n" + notice;
+                        } else {
+                          target.messages.push({
+                            role: "user",
+                            content: notice,
+                          });
+                        }
+                        if (finalBody && finalBody !== body) {
+                          body.messages = finalBody.messages;
+                        }
+                        console.warn(
+                          `[http] auto-healing: 1261 prompt overflow — stripped ${strippedCount} image part(s), reverting model`,
+                        );
+                        this.onEvent(
+                          request.projectId,
+                          {
+                            event: "status",
+                            data: {
+                              message: "prompt too large for vision model — images removed",
+                            },
+                          },
+                          request.requestId,
+                        );
+                        this.onEvent(
+                          request.projectId,
+                          { event: "status", data: { message: null } },
+                          request.requestId,
+                        );
+                        continue; // heal is free, don't consume an attempt
+                      }
+                      // no images in the request — genuine text overflow;
+                      // fall through to the context-prune heal below
+                    }
+
                     // ── HEALABLE 400: context window overflow ──
                     // "maximum context length is X tokens. However, you requested Y tokens"
                     // The pre-flight guardrail should catch most of these, but if estimation
@@ -4412,7 +4557,9 @@ export class ApiBackend extends PunkBackend {
                     if (
                       (errorBody.includes("maximum context length") ||
                         errorBody.includes("context length") ||
-                        errorBody.includes("reduce the length of the messages")) &&
+                        errorBody.includes("reduce the length of the messages") ||
+                        plainBody.includes("exceeds max length") ||
+                        plainBody.includes("Prompt exceeds max length")) &&
                       !this._contextHealAttemptedThisTurn
                     ) {
                       this._contextHealAttemptedThisTurn = true;

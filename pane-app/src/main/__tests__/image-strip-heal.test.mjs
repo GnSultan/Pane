@@ -17,6 +17,16 @@ export function isTextOnlyContentError(plainBody) {
   );
 }
 
+// z-ai prompt-overflow signature (1261) — MUST match the 1261 branch in
+// http-backend.mjs, and MUST NOT match the 1210 text-only signature above
+export function isPromptOverflowError(plainBody) {
+  return (
+    plainBody.includes("Prompt exceeds max length") ||
+    plainBody.includes("exceeds max length") ||
+    plainBody.includes("prompt length exceeded")
+  );
+}
+
 // The strip transformation — MUST stay in sync with the heal branch
 export function stripImageParts(messages) {
   let strippedCount = 0;
@@ -56,6 +66,19 @@ describe("400 image-strip heal", () => {
 
   it("matches a hypothetical JSON-quoted variant", () => {
     expect(isTextOnlyContentError(`allowed values: ["text"]`)).toBe(true);
+  });
+
+  it("does not match the 1261 prompt-overflow signature as text-only", () => {
+    // 1261 must route to the prompt-overflow branch, not the 1210 strip
+    const body = `{"error":{"code":"1261","message":"Prompt exceeds max length"}}`;
+    expect(isTextOnlyContentError(body)).toBe(false);
+    expect(isPromptOverflowError(body)).toBe(true);
+  });
+
+  it("matches lowercase prompt-overflow phrasing variants", () => {
+    expect(isPromptOverflowError("the prompt exceeds max length")).toBe(true);
+    expect(isPromptOverflowError("prompt length exceeded")).toBe(true);
+    expect(isPromptOverflowError("totally unrelated")).toBe(false);
   });
 
   it("does not match unrelated 400s", () => {

@@ -858,13 +858,13 @@ export class VoiceRelay {
     }
     const resolved = path.resolve(expanded);
     try {
-      const stats = await fsPromises.stat(resolved);
+      const stats = await fs.stat(resolved);
       // 20MB raw-file cap — images larger than this are almost certainly
       // wrong (misselected exports); post-resize PNG may still be big.
       if (stats.size > 20 * 1024 * 1024) {
         return { ok: false, error: `Image is ${(stats.size / 1048576).toFixed(1)}MB — too large. Ask the user to export a smaller version.` };
       }
-      const buf = await fsPromises.readFile(resolved);
+      const buf = await fs.readFile(resolved);
       const image = nativeImage.createFromBuffer(buf);
       if (image.isEmpty()) {
         return {
