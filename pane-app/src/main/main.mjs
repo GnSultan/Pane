@@ -145,6 +145,36 @@ function registerClaudeHandlers() {
       detail === "high" ? "high" : "low",
     );
   });
+  // Screenshot display for tool-result cards. The backend swaps image
+  // envelopes for text placeholders before events reach the renderer (to
+  // keep base64 out of IPC), but the screenshot PNG lives at
+  // metadata.temporaryFile — this reads it back on demand. Not
+  // path-guard's validateFilePath: that scopes project files; screenshots
+  // are a distinct resource class in tmp. Scope here is tighter: tmp-dir
+  // PNGs we created (pane-shot-*/pane-cu-* prefixes) only.
+  ipcMain.handle("computer_screenshot", (_event, filePath) => {
+    if (typeof filePath !== "string" || !filePath) {
+      return { ok: false, error: "path is required" };
+    }
+    const resolved = path.resolve(filePath);
+    const tmp = os.tmpdir();
+    // Must live in tmp AND carry our screenshot naming prefix
+    if (!resolved.startsWith(tmp + path.sep) || !/pane-(shot|cu)-/.test(path.basename(resolved))) {
+      return { ok: false, error: "not a pane screenshot" };
+    }
+    if (!/\.png$/i.test(resolved)) {
+      return { ok: false, error: "not a PNG" };
+    }
+    try {
+      const buf = fs.readFileSync(resolved);
+      if (buf.length === 0 || buf.length > 10 * 1024 * 1024) {
+        return { ok: false, error: "screenshot file missing or too large" };
+      }
+      return { ok: true, dataUri: `data:image/png;base64,${buf.toString("base64")}` };
+    } catch (e) {
+      return { ok: false, error: `read failed: ${e.message}` };
+    }
+  });
   ipcMain.handle("voice_preview", (_event, { voice }) => {
     return voiceRelay.previewToken(voice);
   });

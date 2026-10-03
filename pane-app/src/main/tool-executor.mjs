@@ -680,6 +680,8 @@ export class ToolExecutor {
     this.projectRoot = projectRoot;
     this.onEvent = onEvent;
     this.activeProcesses = new Map(); // toolId -> child process
+    /** @type {{width:number, height:number, physicalW:number, physicalH:number}|null} */
+    this._lastSeen = null; // pixel space of the last tier-fit screenshot the model saw
     this._brainRequest = null;
     /** @type {Map<string, string|null>} relativePath → preEditContent (null = file didn't exist) */
     this.fileJournal = new Map();
@@ -1051,15 +1053,18 @@ export class ToolExecutor {
 
   /**
    * computer — native macOS screen capture and input actuation.
-   * Wraps computer-use.mjs. Capture results return an image envelope (same
-   * path as view_image) so vision models see actual pixels; every input
-   * action verifies it registered with the HID system before reporting
-   * success, so macOS's silent-drop state surfaces as an instructive error.
+   * Wraps computer-use.mjs. Screenshots are pre-resized to the strictest
+   * vision tier (standard: 1568 edge / 1568 visual tokens) so the image the
+   * model sees is never server-resized and its coordinates map 1:1 onto that
+   * seen space; coordinates from click/move/drag are scaled from the last
+   * seen space back to physical pixels before actuation. Mutating actions
+   * auto-attach a verification screenshot unless take_screenshot:false.
+   * Supports batching: action:"batch", actions:[{action:"click",...},...].
    */
   async executeComputer(toolId, input) {
     try {
       const cu = await import("./computer-use.mjs");
-      const action = (input.action || "").trim();
+      const vt = await import("./vision-tiers.mjs");
 
       const fail = (error) => ({ success: false, error, toolId });
       const ok = (output, metadata = undefined) => ({
@@ -1069,112 +1074,268 @@ export class ToolExecutor {
         ...(metadata ? { metadata } : {}),
       });
 
-      switch (action) {
-        case "screenshot": {
-          // capture fresh, return as image envelope for vision
-          const r = await cu.captureScreen(
-            input.region && typeof input.region.x === "number"
-              ? input.region
-              : undefined,
-            undefined
-          );
-          if (!r.ok) return fail(r.error);
-          // Enforce the same size cap as view_image (4.7MB binary)
-          const stats = await fsPromises.stat(r.path);
-          if (stats.size > 4_700_000) {
-            // Auto-downscale instead of failing — screenshots are always ours
-            const small = r.path.replace(/\.png$/, "") + "-downscaled.jpg";
-            await execThroughWorker(
-              `sips -Z 1568 --property format jpeg "${r.path}" --out "${small}"`,
-              { timeout: 15 }
+      /** Scale model-space coords (last seen image) → physical px.
+       *  When no screenshot has been taken this session, coordinates are
+       *  assumed already physical and pass through unchanged. */
+      const toPhysical = (x, y) => {
+        if (!this._lastSeen) return { x, y };
+        const seen = this._lastSeen;
+        if (seen.width === seen.physicalW && seen.height === seen.physicalH) return { x, y };
+        return vt.scalePoint(x, y, { width: seen.width, height: seen.height }, { width: seen.physicalW, height: seen.physicalH });
+      };
+
+      /** Capture → tier-fit → record seen space → image envelope. */
+      const captureFitted = async (region) => {
+        const r = await cu.captureScreen(
+          region && typeof region.x === "number" ? region : undefined,
+          undefined
+        );
+        if (!r.ok) return fail(r.error);
+        const size = await cu.readPngSize(r.path);
+        if (!size.ok) return fail(size.error);
+        const fit = await vt.fitScreenshotToTier(
+          r.path, size.w, size.h, vt.STANDARD_TIER,
+          (cmd, opts) => execThroughWorker(cmd, opts)
+        );
+        if (!fit.ok) return fail(fit.error);
+        // Regions map into the full-screen physical space; only full-screen
+        // captures define the coordinate space for subsequent actions.
+        if (!region) this._lastSeen = { width: fit.width, height: fit.height, physicalW: size.w, physicalH: size.h };
+        const view = await this.executeViewImage(toolId, fit.path);
+        if (view.success) {
+          view.metadata = {
+            ...(view.metadata || {}),
+            temporaryFile: fit.downscaled ? fit.path : r.path,
+            seenWidth: fit.width,
+            seenHeight: fit.height,
+            physicalWidth: size.w,
+            physicalHeight: size.h,
+            downscaled: fit.downscaled,
+          };
+        }
+        return view;
+      };
+
+      /** One atomic action from a spec. Returns {ok, output} without toolId. */
+      const runSingleAction = async (spec) => {
+        const action = (spec.action || "").trim();
+        switch (action) {
+          case "screenshot":
+            return await captureFitted(spec.region);
+          case "click": {
+            if (!Number.isFinite(spec.x) || !Number.isFinite(spec.y)) {
+              return fail("click requires numeric x and y in screenshot pixels (the space of the last screenshot you took)");
+            }
+            const p = toPhysical(spec.x, spec.y);
+            const r = await cu.clickAt({ ...p, double: spec.double === true, right: spec.right === true });
+            return r.ok ? ok(`Clicked at (${spec.x}, ${spec.y})${spec.double ? " (double)" : ""}${spec.right ? " (right)" : ""}.`) : fail(r.error);
+          }
+          case "move": {
+            if (!Number.isFinite(spec.x) || !Number.isFinite(spec.y)) {
+              return fail("move requires numeric x and y in screenshot pixels");
+            }
+            const p = toPhysical(spec.x, spec.y);
+            const r = await cu.movePointerTo(p);
+            return r.ok ? ok(`Moved pointer to (${spec.x}, ${spec.y}).`) : fail(r.error);
+          }
+          case "drag": {
+            if (!spec.from || !spec.to) return fail("drag requires from:{x,y} and to:{x,y} in screenshot pixels");
+            const fp = toPhysical(spec.from.x, spec.from.y);
+            const tp = toPhysical(spec.to.x, spec.to.y);
+            const r = await cu.dragFromTo(fp, tp);
+            return r.ok ? ok(`Dragged from (${spec.from.x}, ${spec.from.y}) to (${spec.to.x}, ${spec.to.y}).`) : fail(r.error);
+          }
+          case "scroll": {
+            const direction = spec.direction === "up" ? "up" : "down";
+            const amount = Number.isFinite(spec.amount) ? spec.amount : 3;
+            const r = await cu.scrollAt(direction, amount);
+            return r.ok ? ok(`Scrolled ${direction} ${amount}.`) : fail(r.error);
+          }
+          case "type": {
+            if (typeof spec.text !== "string" || spec.text.length === 0) {
+              return fail("type requires non-empty text");
+            }
+            const r = await cu.typeText(spec.text);
+            return r.ok ? ok(`Typed ${spec.text.length} characters.`) : fail(r.error);
+          }
+          case "key": {
+            const key = typeof spec.key === "string" ? spec.key : "";
+            const mods = Array.isArray(spec.modifiers) ? spec.modifiers : [];
+            if (!key) return fail("key requires a key name, e.g. \"return\", \"tab\", \"c\", \"f5\"");
+            const r = await cu.pressKey(key, mods);
+            return r.ok ? ok(`Pressed ${[...mods, key].join("+")}.`) : fail(r.error);
+          }
+          case "ax_elements": {
+            const ax = await import("./ax-tree.mjs");
+            const r = await ax.listElements(
+              {
+                role: typeof spec.ax_role === "string" ? spec.ax_role : undefined,
+                nameContains: typeof spec.ax_name_contains === "string" ? spec.ax_name_contains : undefined,
+                nameIs: typeof spec.ax_name_is === "string" ? spec.ax_name_is : undefined,
+                limit: Number.isFinite(spec.ax_limit) ? spec.ax_limit : undefined,
+              },
+              this._lastSeen
             );
-            return await this.executeViewImage(toolId, small);
+            if (!r.ok) return fail(r.error);
+            const shown = r.elements
+              .slice(0, 30)
+              .map((e) => `${e.role} '${e.name}' @ (${e.x},${e.y}) ${e.w}x${e.h}`)
+              .join("\n");
+            const more = r.elements.length > 30 ? `\n(+${r.elements.length - 30} more — narrow with ax_name_contains or ax_role)` : "";
+            return ok(
+              `Frontmost app: ${r.app}. ${r.elements.length} element(s). Bounds are in your last screenshot's pixel space — click them directly.\n${shown}${more}${r.note ? `\n${r.note}` : ""}`,
+              { app: r.app, elements: r.elements }
+            );
           }
-          const view = await this.executeViewImage(toolId, r.path);
-          if (view.success && view.metadata) {
-            view.metadata.temporaryFile = r.path;
+          case "ax_focused": {
+            const ax = await import("./ax-tree.mjs");
+            const r = await ax.readFocusedUI(this._lastSeen);
+            if (!r.ok) return fail(r.error);
+            return ok(
+              `Focused: ${r.role}${r.name ? ` '${r.name}'` : ""}${r.value ? ` (value: '${r.value.slice(0, 100)}')` : ""}${Number.isFinite(r.x) ? ` @ (${r.x},${r.y}) ${r.w}x${r.h} in screenshot space` : ""}.`,
+              r
+            );
           }
-          return view;
-        }
-
-        case "click": {
-          if (!Number.isFinite(input.x) || !Number.isFinite(input.y)) {
-            return fail("click requires numeric x and y in PHYSICAL screenshot pixels");
+          case "display_info": {
+            const r = await cu.getDisplayInfo();
+            if (!r.ok) return fail(r.error);
+            const p = await cu.probePermissions();
+            return ok(
+              `Main display: ${r.logical.w}×${r.logical.h} logical points; screenshots are ${r.physical.w}×${r.physical.h} physical pixels (${r.scale}× scale). ` +
+              `Coordinates are in the pixel space of the screenshot you last took — take a screenshot first, then click what you see in it. ` +
+              `Screen Recording: ${p.screenRecording ? "granted" : "MISSING"}. ` +
+              `Accessibility: ${p.accessibility ? "granted" : "MISSING"}.`,
+              { logical: r.logical, physical: r.physical, scale: r.scale, permissions: p }
+            );
           }
-          const r = await cu.clickAt({
-            x: input.x,
-            y: input.y,
-            double: input.double === true,
-            right: input.right === true,
-          });
-          return r.ok ? ok(`Clicked at (${input.x}, ${input.y})${input.double ? " (double)" : ""}${input.right ? " (right)" : ""}.`) : fail(r.error);
-        }
-
-        case "move": {
-          if (!Number.isFinite(input.x) || !Number.isFinite(input.y)) {
-            return fail("move requires numeric x and y in PHYSICAL screenshot pixels");
+          case "permissions": {
+            const p = await cu.probePermissions();
+            return ok(
+              `Screen Recording: ${p.screenRecording ? "granted" : "MISSING"}. Accessibility: ${p.accessibility ? "granted" : "MISSING"}. ` +
+              (p.errors.length ? p.errors.join(" ") : "All computer-use permissions granted."),
+              p
+            );
           }
-          const r = await cu.movePointerTo({ x: input.x, y: input.y });
-          return r.ok ? ok(`Moved pointer to (${input.x}, ${input.y}).`) : fail(r.error);
+          default:
+            return fail(
+              `Unknown action "${action}". Actions: screenshot, click, move, drag, scroll, type, key, display_info, permissions, ax_elements, ax_focused, batch.`
+            );
         }
+      };
 
-        case "drag": {
-          if (!input.from || !input.to) return fail("drag requires from:{x,y} and to:{x,y}");
-          const r = await cu.dragFromTo(input.from, input.to);
-          return r.ok ? ok(`Dragged from (${input.from.x}, ${input.from.y}) to (${input.to.x}, ${input.to.y}).`) : fail(r.error);
+      const MUTATING = new Set(["click", "move", "drag", "scroll", "type", "key"]);
+      const topAction = (input.action || "").trim();
+
+      // ── Batch mode: many actions, one round trip, one final screenshot ──
+      if (topAction === "batch" || Array.isArray(input.actions)) {
+        const specs = Array.isArray(input.actions) ? input.actions : [];
+        if (specs.length === 0) return fail("batch requires a non-empty actions array");
+        if (specs.length > 10) return fail("batch supports at most 10 actions per call");
+        const results = [];
+        for (const spec of specs) {
+          const r = await runSingleAction(spec);
+          results.push({ action: spec.action, success: r.success, output: r.success ? r.output : r.error });
+          if (!r.success) break; // stop at first failure — state is now uncertain
         }
-
-        case "scroll": {
-          const direction = input.direction === "up" ? "up" : "down";
-          const amount = Number.isFinite(input.amount) ? input.amount : 3;
-          const r = await cu.scrollAt(direction, amount);
-          return r.ok ? ok(`Scrolled ${direction} ${amount}.`) : fail(r.error);
-        }
-
-        case "type": {
-          if (typeof input.text !== "string" || input.text.length === 0) {
-            return fail("type requires non-empty text");
+        const allOk = results.every((r) => r.success);
+        // Extract envelope outputs — they must NEVER appear as text lines
+        // (megabytes of base64) nor in metadata.batchSteps (IPC flooding).
+        // Policy: the LAST screenshot in the batch becomes the result image;
+        // earlier screenshots are noted but not shipped (batching exists to
+        // avoid intermediate verification — verify between calls instead).
+        let envelopeOutput = null;
+        const shotIdx = [];
+        results.forEach((r, i) => {
+          if (typeof r.output === "string" && r.output.startsWith("__PANE_IMG__")) {
+            envelopeOutput = r.output;
+            shotIdx.push(i);
           }
-          const r = await cu.typeText(input.text);
-          return r.ok ? ok(`Typed ${input.text.length} characters.`) : fail(r.error);
+        });
+        // Last screenshot rides as the image; earlier ones were superseded.
+        shotIdx.forEach((i, n) => {
+          results[i].output = n === shotIdx.length - 1
+            ? "(screenshot — final state attached as image)"
+            : "(screenshot taken mid-batch — superseded by final image)";
+        });
+        const wantsShot = input.take_screenshot !== false && !envelopeOutput;
+        let attach = null;
+        if (wantsShot) {
+          const v = await captureFitted();
+          attach = v;
         }
-
-        case "key": {
-          const key = typeof input.key === "string" ? input.key : "";
-          const mods = Array.isArray(input.modifiers) ? input.modifiers : [];
-          if (!key) return fail("key requires a key name, e.g. \"return\", \"tab\", \"c\", \"f5\"");
-          const r = await cu.pressKey(key, mods);
-          return r.ok
-            ? ok(`Pressed ${[...mods, key].join("+")}.`)
-            : fail(r.error);
+        const lines = results.map((r) => `${r.success ? "✔" : "✖"} ${r.action}: ${r.output}`);
+        // On failure the text lines ARE the output — the model must see the
+        // error (metadata never reaches it). Skip the envelope entirely;
+        // the model can screenshot next turn if it needs visual state.
+        if (!allOk) {
+          const failed = results.filter((r) => !r.success);
+          return {
+            success: false,
+            output: lines.join("\n") +
+              `\nBatch stopped at first failure (${failed.length}/${results.length}). State after the failed action is unverified — take a screenshot before retrying.`,
+            toolId,
+            metadata: { batchSteps: results.map((r) => ({ action: r.action, success: r.success, output: r.output })) },
+          };
         }
-
-        case "display_info": {
-          const r = await cu.getDisplayInfo();
-          if (!r.ok) return fail(r.error);
-          const p = await cu.probePermissions();
-          return ok(
-            `Main display: ${r.logical.w}×${r.logical.h} logical points; screenshots are ${r.physical.w}×${r.physical.h} physical pixels (${r.scale}× scale). ` +
-            `All computer tool coordinates are PHYSICAL screenshot pixels. Screen Recording: ${p.screenRecording ? "granted" : "MISSING"}. ` +
-            `Accessibility: ${p.accessibility ? "granted" : "MISSING"}.`,
-            { logical: r.logical, physical: r.physical, scale: r.scale, permissions: p }
-          );
+        if (attach) {
+          if (!attach.success) {
+            return {
+              success: allOk,
+              output: lines.join("\n") + `\n(warning: verification screenshot failed: ${attach.error})`,
+              toolId,
+            };
+          }
+          envelopeOutput = attach.output;
         }
-
-        case "permissions": {
-          const p = await cu.probePermissions();
-          return ok(
-            `Screen Recording: ${p.screenRecording ? "granted" : "MISSING"}. Accessibility: ${p.accessibility ? "granted" : "MISSING"}. ` +
-            (p.errors.length ? p.errors.join(" ") : "All computer-use permissions granted."),
-            p
-          );
+        if (envelopeOutput) {
+          const summary = `${results.length} action(s): ${results.map((r) => r.action).join(" → ")}`;
+          try {
+            const env = JSON.parse(envelopeOutput.slice("__PANE_IMG__".length));
+            env.label = `after batch (${summary}) — ${env.label}`;
+            return {
+              success: allOk,
+              output: "__PANE_IMG__" + JSON.stringify(env),
+              toolId,
+              metadata: { ...(attach?.metadata || {}), batchSteps: results.map((r) => ({ action: r.action, success: r.success, output: r.output })) },
+            };
+          } catch {
+            // Malformed envelope — fall through to text lines.
+          }
         }
-
-        default:
-          return fail(
-            `Unknown action "${action}". Actions: screenshot, click, move, drag, scroll, type, key, display_info, permissions.`
-          );
+        return {
+          success: allOk,
+          output: lines.join("\n"),
+          toolId,
+        };
       }
+
+      // ── Single action mode ──
+      if (MUTATING.has(topAction)) {
+        const r = await runSingleAction(input);
+        if (!r.success) return r;
+        // Auto-attach a verification screenshot unless opted out.
+        if (input.take_screenshot === false) return r;
+        const v = await captureFitted();
+        if (!v.success) {
+          // Action succeeded but verification failed — still success, warn.
+          return ok(`${r.output}\n(warning: verification screenshot failed: ${v.error})`, r.metadata);
+        }
+        // The verification screenshot IS the output: it rides the image
+        // envelope so the model sees the post-action state natively. The
+        // action summary rides the envelope label (shown in history/cache
+        // placeholders) — and a text line is prepended via the label only.
+        // Keep the summary short; labels surface in tool-result placeholders.
+        const summary = r.output.split("\n")[0];
+        try {
+          const env = JSON.parse(v.output.slice("__PANE_IMG__".length));
+          env.label = `after: ${summary} — ${env.label}`;
+          return ok("__PANE_IMG__" + JSON.stringify(env), v.metadata);
+        } catch {
+          return v;
+        }
+      }
+
+      return await runSingleAction(input);
     } catch (error) {
       return { success: false, error: `computer tool error: ${error.message}`, toolId };
     }

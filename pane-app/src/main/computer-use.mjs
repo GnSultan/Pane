@@ -379,6 +379,15 @@ function toLogical(x, y, scale) {
   return { x: Math.round(x / scale), y: Math.round(y / scale) };
 }
 
+/** Read PNG pixel dimensions via sips. Returns {ok,w,h} or {ok:false,error}. */
+export async function readPngSize(pngPath) {
+  const r = await execThroughWorker(`sips -g pixelWidth -g pixelHeight "${pngPath}"`, { timeout: 10 });
+  const w = (r.stdout || "").match(/pixelWidth: (\d+)/);
+  const h = (r.stdout || "").match(/pixelHeight: (\d+)/);
+  if (r.success && w && h) return { ok: true, w: Number(w[1]), h: Number(h[1]) };
+  return { ok: false, error: `could not read PNG size: ${firstErr(r)}` };
+}
+
 // ── Screen capture ─────────────────────────────────────────────────────────
 
 /**

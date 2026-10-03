@@ -913,30 +913,85 @@ function ExpandedComputerInput({ input }: { input: Record<string, unknown> }) {
 }
 
 /** Image-envelope tool result — render the actual pixels the model saw.
- *  Both computer screenshots and view_image results arrive as
- *  __PANE_IMG__{json} envelopes; decode and show them inline. The model
- *  receives the same bytes natively — this closes the loop for the human. */
-function ToolResultImage({ content }: { content: string }) {
-  const img = useMemo(() => {
+ *  Two paths:
+ *  1. content is a __PANE_IMG__ envelope (voice/legacy path) → decode inline.
+ *  2. content is the placeholder text (live computer/view_image path — the
+ *     backend swaps envelopes out before events reach us) → load from
+ *     metadata.temporaryFile via the validated computer_screenshot IPC.
+ *  The model receives the same bytes natively — this closes the loop for
+ *  the human. */
+function ToolResultImage({
+  content,
+  metadata,
+}: {
+  content: string;
+  metadata?: Record<string, unknown>;
+}) {
+  // Path 1: full envelope present
+  const envelope = useMemo(() => {
+    if (!content.startsWith("__PANE_IMG__")) return null;
     try {
       const env = JSON.parse(content.slice("__PANE_IMG__".length));
       if (typeof env.data === "string" && typeof env.media_type === "string") {
         return {
           src: `data:${env.media_type};base64,${env.data}`,
           label: typeof env.label === "string" ? env.label : "image",
-          kb: Math.round(((env.data.length * 3) / 4) / 1024),
         };
       }
     } catch {
-      // malformed envelope — fall through to the plain marker below
+      // malformed envelope — fall through to the file path
     }
     return null;
   }, [content]);
 
+  // Path 2: placeholder + file path in metadata (live events swap envelopes
+  // out before IPC). computer → validated computer_screenshot channel;
+  // view_image → existing voice_view_image loader (reads metadata.path).
+  const tempFile = typeof metadata?.temporaryFile === "string" ? (metadata.temporaryFile as string) : undefined;
+  const viewPath = typeof metadata?.path === "string" ? (metadata.path as string) : undefined;
+  const [fileSrc, setFileSrc] = useState<string | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (!envelope && (tempFile || viewPath)) {
+      const p = tempFile
+        ? window.electronAPI?.invoke<{ ok: boolean; dataUri?: string; error?: string }>(
+            "computer_screenshot",
+            tempFile,
+          )
+        : window.electronAPI?.invoke<{ ok: boolean; image?: string; error?: string }>(
+            "voice_view_image",
+            { path: viewPath, detail: "low" },
+          );
+      p?.then((r) => {
+          if (cancelled) return;
+          const raw = r as { ok?: boolean; dataUri?: string; image?: string; error?: string } | undefined;
+          const src = raw?.ok ? (tempFile ? raw.dataUri : raw.image) : undefined;
+          if (src) setFileSrc(src);
+          else setFileError(raw?.error || "image unavailable");
+        })
+        .catch((e: unknown) => {
+          if (!cancelled) setFileError(String(e));
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [envelope, tempFile, viewPath]);
+
+  const img = useMemo(() => {
+    if (envelope) return { ...envelope, kb: 0 };
+    if (fileSrc) {
+      // kb unknown for file path; estimate later if needed
+      return { src: fileSrc, label: "screenshot", kb: 0 };
+    }
+    return null;
+  }, [envelope, fileSrc]);
+
   if (!img) {
     return (
-      <div className="px-4 pb-4 font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-sm)" }}>
-        [image result]
+      <div className="px-4 pb-4 font-mono text-pane-text-secondary" style={{ fontSize: "var(--pane-font-size-xs)" }}>
+        {fileError ? `[screenshot unavailable: ${fileError}]` : "[image result]"}
       </div>
     );
   }
@@ -951,7 +1006,11 @@ function ToolResultImage({ content }: { content: string }) {
         style={{ maxHeight: 360 }}
       />
       <div className="mt-1.5 font-mono text-pane-text-secondary/60" style={{ fontSize: "var(--pane-font-size-xs)" }}>
-        {img.label} · {img.kb >= 1024 ? `${(img.kb / 1024).toFixed(1)}MB` : `${img.kb}KB`} · shown to the model natively
+        {img.label}
+        {img.kb > 0 ? ` · ${img.kb >= 1024 ? `${(img.kb / 1024).toFixed(1)}MB` : `${img.kb}KB`}` : ""}
+        {typeof metadata?.downscaled === "boolean" && metadata.downscaled
+          ? ` · downscaled ${String(metadata.physicalWidth ?? "?")}×${String(metadata.physicalHeight ?? "?")} → ${String(metadata.seenWidth ?? "?")}×${String(metadata.seenHeight ?? "?")} for vision`
+          : " · shown to the model natively"}
       </div>
     </div>
   );
@@ -1152,8 +1211,12 @@ export function ToolActivity({ toolUse, toolResult, isHistorical }: ToolActivity
 
           {/* Success output — hide for Edit/Write/Read (input already shows what changed) */}
           {toolResult && !toolResult.is_error && !["Edit", "Write", "Read", "replace", "write_file", "read_file"].includes(toolUse.name) && (
-            typeof toolResult.content === "string" && toolResult.content.startsWith("__PANE_IMG__") ? (
-              <ToolResultImage content={toolResult.content} />
+            typeof toolResult.content === "string" &&
+            (toolResult.content.startsWith("__PANE_IMG__") ||
+              ((typeof toolResult.metadata?.temporaryFile === "string" ||
+                typeof toolResult.metadata?.path === "string") &&
+                ["computer", "view_image"].includes(toolUse.name))) ? (
+              <ToolResultImage content={toolResult.content} metadata={toolResult.metadata} />
             ) : (
               <div
                 className="px-4 pb-4 overflow-x-auto max-h-[250px] overflow-y-auto text-pane-text-secondary leading-[1.6]"

@@ -289,30 +289,66 @@ const TOOL_DEFINITIONS = [
       name: "computer",
       description:
         "Act on the computer's screen and input: see what's on screen and drive the UI like a human would. " +
-        "Actions: screenshot (returns the screen as an image you can see — take one before acting), click (x,y — double/right via flags), move, drag (from/to), scroll (up/down + amount), type (text into the focused field), key (name + modifiers, e.g. key 'c' with modifiers ['cmd']), display_info, permissions. " +
-        "ALL x/y coordinates are in PHYSICAL SCREENSHOT PIXELS (the same space a screenshot occupies) — conversion to logical points is handled internally. " +
-        "Loop: screenshot to see, act, screenshot again to verify. If any action reports missing Accessibility or Screen Recording, tell the user the exact System Settings path to grant it — retrying will not help.",
+        "Actions: screenshot (returns the image — ALWAYS take one before acting), click (x,y — double/right via flags), move, drag (from/to), scroll (up/down + amount), type (text into the focused field), key (name + modifiers, e.g. key 'c' with modifiers ['cmd']), display_info, permissions, ax_elements (list UI elements by role/name with bounds — native macOS apps), ax_focused (what has keyboard focus). " +
+        "BATCHING: pass action:'batch' with actions:[{action:'click',...},{action:'type',...}] to run up to 10 actions in one call — a verification screenshot is attached automatically. " +
+        "COORDINATES: give x/y in the pixel space of the screenshot you last took (what you SAW). Scaling to physical pixels is handled internally — never rescale yourself. If you haven't taken a screenshot yet, take one first. " +
+        "Mutating actions (click/move/drag/scroll/type/key) automatically attach a post-action screenshot so you can verify the effect — pass take_screenshot:false to skip. " +
+        "If any action reports missing Accessibility or Screen Recording, tell the user the exact System Settings path to grant it — retrying will not help.",
       parameters: {
         type: "object",
         properties: {
           action: {
             type: "string",
-            enum: ["screenshot", "click", "move", "drag", "scroll", "type", "key", "display_info", "permissions"],
-            description: "What to do",
+            enum: ["screenshot", "click", "move", "drag", "scroll", "type", "key", "display_info", "permissions", "ax_elements", "ax_focused", "batch"],
+            description: "What to do ('batch' to run many actions in one call)",
           },
-          x: { type: "number", description: "X in physical screenshot pixels (for click/move)" },
-          y: { type: "number", description: "Y in physical screenshot pixels (for click/move)" },
+          ax_role: {
+            type: "string",
+            description: "ax_elements: filter by role — button, text field, checkbox, radio button, static text, menu item, pop up button, list, row, slider, tab (omit for all interactive)",
+          },
+          ax_name_contains: { type: "string", description: "ax_elements: filter by name substring (case-sensitive)" },
+          ax_name_is: { type: "string", description: "ax_elements: filter by exact name" },
+          ax_limit: { type: "number", description: "ax_elements: max elements to return (default 30, max 60)" },
+          actions: {
+            type: "array",
+            maxItems: 10,
+            items: {
+              type: "object",
+              properties: {
+                action: { type: "string", enum: ["screenshot", "click", "move", "drag", "scroll", "type", "key", "display_info", "permissions", "ax_elements", "ax_focused"] },
+                x: { type: "number" },
+                y: { type: "number" },
+                double: { type: "boolean" },
+                right: { type: "boolean" },
+                from: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } } },
+                to: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } } },
+                direction: { type: "string", enum: ["up", "down"] },
+                amount: { type: "number" },
+                text: { type: "string" },
+                key: { type: "string" },
+                modifiers: { type: "array", items: { type: "string", enum: ["cmd", "ctrl", "alt", "shift", "fn"] } },
+              },
+              required: ["action"],
+            },
+            description: "batch mode: the actions to run in order (stop at first failure)",
+          },
+          take_screenshot: {
+            type: "boolean",
+            description: "Mutating actions/batch: attach a verification screenshot after (default true)",
+          },
+          x: { type: "number", description: "X in the pixel space of your last screenshot (for click/move)" },
+          y: { type: "number", description: "Y in the pixel space of your last screenshot (for click/move)" },
           double: { type: "boolean", description: "Click action: double-click" },
           right: { type: "boolean", description: "Click action: right-click" },
           from: {
             type: "object",
             properties: { x: { type: "number" }, y: { type: "number" } },
-            description: "Drag action: start point in physical pixels",
+            description: "Drag action: start point in your last screenshot's pixel space",
           },
           to: {
             type: "object",
             properties: { x: { type: "number" }, y: { type: "number" } },
-            description: "Drag action: end point in physical pixels",
+            description: "Drag action: end point in your last screenshot's pixel space",
           },
           region: {
             type: "object",
@@ -322,7 +358,7 @@ const TOOL_DEFINITIONS = [
               w: { type: "number" },
               h: { type: "number" },
             },
-            description: "Screenshot action: crop region in physical pixels (full screen if omitted)",
+            description: "Screenshot action: crop region in physical pixels (full screen if omitted). Note: a cropped screenshot does NOT update the coordinate space",
           },
           direction: { type: "string", enum: ["up", "down"], description: "Scroll action: direction" },
           amount: { type: "number", description: "Scroll action: amount in wheel lines (default 3)" },
@@ -4203,11 +4239,70 @@ export class ApiBackend extends PunkBackend {
                     // notice the model can act on (ask user to run view_image-capable
                     // model), instead of hard-failing the entire turn.
                     if (
-                      (plainBody.includes("content.type is invalid") ||
-                        plainBody.includes("allowed values: ['text']") ||
-                        plainBody.includes("allowed values: [\"text\"]")) &&
-                      !this._imageStripAttemptedThisTurn
+                      plainBody.includes("content.type is invalid") ||
+                      plainBody.includes("allowed values: ['text']") ||
+                      plainBody.includes("allowed values: [\"text\"]")
                     ) {
+                      // ── HEALABLE 400, stage 1 (z-ai): vision upgrade ──
+                      // The z.ai coding endpoint rejects image parts on every
+                      // text model (glm-4.6/5.x) with this exact 1210 — but it
+                      // DOES accept images through glm-4.5v (verified Oct 2
+                      // 2026 with live probes: only 4.5v takes image_url parts
+                      // on /api/coding/paas/v4). Upgrading the request keeps
+                      // the model's eyes instead of degrading to text.
+                      // The model check is its own loop guard: after the swap
+                      // a repeated 1210 skips this branch and falls through to
+                      // the strip heal below, so the loop always terminates.
+                      // Per-request self-arming also matters mid-turn: a tool
+                      // result can re-inject images into a LATER request of
+                      // the same turn, and each new request rebuilds the body
+                      // with the user's selected text model — it must be able
+                      // to earn the swap again (the old once-per-turn strip
+                      // latch alone let those second 1210s kill the turn).
+                      if (
+                        apiConfig.provider === "z-ai" &&
+                        sourceBody.model !== "glm-4.5v"
+                      ) {
+                        const prevModel = sourceBody.model;
+                        sourceBody.model = "glm-4.5v";
+                        // glm-4.5v on the coding endpoint rejects
+                        // max_tokens > 16384 with its own 1210 — clamp.
+                        if (
+                          typeof sourceBody.max_tokens === "number" &&
+                          sourceBody.max_tokens > 16384
+                        ) {
+                          sourceBody.max_tokens = 16384;
+                        }
+                        if (finalBody && finalBody !== body) {
+                          body.model = sourceBody.model;
+                          body.max_tokens = sourceBody.max_tokens;
+                        }
+                        console.warn(
+                          `[http] auto-healing: z-ai model ${prevModel} is text-only on this endpoint — upgrading request to glm-4.5v (vision-capable)`,
+                        );
+                        this.onEvent(
+                          request.projectId,
+                          {
+                            event: "status",
+                            data: {
+                              message: "model upgraded to glm-4.5v — the active model can't see images",
+                            },
+                          },
+                          request.requestId,
+                        );
+                        this.onEvent(
+                          request.projectId,
+                          { event: "status", data: { message: null } },
+                          request.requestId,
+                        );
+                        continue; // heal is free, don't consume an attempt
+                      }
+
+                      // ── HEALABLE 400, stage 2 (all providers): strip ──
+                      // The provider can't receive pixels under any model —
+                      // degrade to text + an honest notice the model can act
+                      // on, instead of hard-failing the entire turn.
+                      if (!this._imageStripAttemptedThisTurn) {
                       this._imageStripAttemptedThisTurn = true;
                       const target = finalBody && finalBody !== body ? finalBody : body;
                       let strippedCount = 0;
@@ -4306,6 +4401,7 @@ export class ApiBackend extends PunkBackend {
                       }
                       // No images found to strip — the mismatch is something
                       // else entirely; fall through to the error path.
+                      }
                     }
 
                     // ── HEALABLE 400: context window overflow ──
