@@ -131,8 +131,16 @@ export function useSettingsPersistence() {
         if (settings.keybindings)
           ws.setKeybindingsRaw(settings.keybindings as Partial<Record<ActionId, KeyBinding>>);
         if (settings.theme) ws.setTheme(settings.theme as Theme);
-        if (settings.completion_sound)
-          ws.setCompletionSound(settings.completion_sound);
+        if (settings.completion_sound) {
+          // "Tink"/"Pop" (macOS system sounds) no longer ship — map onto
+          // the bundled default so old settings keep making sound.
+          const legacySystemSounds = new Set(["Tink", "Pop"]);
+          ws.setCompletionSound(
+            legacySystemSounds.has(settings.completion_sound)
+              ? "pane-default"
+              : settings.completion_sound,
+          );
+        }
         if (settings.sidebar_collapsed !== null && settings.sidebar_collapsed !== undefined)
           ws.setSidebarCollapsed(settings.sidebar_collapsed);
 

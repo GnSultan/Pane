@@ -36,7 +36,9 @@ interface WorkspaceState {
   fontWeight: number;
   keybindings: Partial<Record<ActionId, KeyBinding>> | null;
   theme: Theme;
-  completionSound: string; // "none" | system sound name | custom file path
+  // "none" | "pane-default" (bundled) | absolute path to a picked audio file.
+  // Legacy values "Tink"/"Pop" (macOS system sounds) migrate to "pane-default".
+  completionSound: string;
   selectedModel: string; // Model alias (e.g., "opus", "sonnet", "haiku") or full model name
   selectedModelProvider: string; // The provider for the current model
   selectedModelThinking: boolean;
@@ -411,13 +413,22 @@ function createWorkspaceStore() {
       applyTheme(theme);
       return set({ theme });
     },
-    setCompletionSound: (sound: string) => set({ completionSound: sound }),
+    setCompletionSound: (sound: string) => {
+      // "Tink"/"Pop" were macOS system sounds (pre custom-sound support);
+      // they no longer ship — map them onto the bundled default.
+      const legacySystemSounds = new Set(["Tink", "Pop"]);
+      const value =
+        legacySystemSounds.has(sound) || sound === "pane-default"
+          ? "pane-default"
+          : sound;
+      set({ completionSound: value });
+    },
     playCompletionSound: () => {
       const { completionSound } = get();
       if (completionSound === "none") return;
-      window.electronAPI.invoke("play_sound", {
-        sound: completionSound,
-      });
+      window.electronAPI
+        .invoke("play_sound", { sound: completionSound })
+        .catch((err) => console.error("[sound] playback failed:", err));
     },
     toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
     setSidebarCollapsed: (collapsed: boolean) => set({ sidebarCollapsed: collapsed }),

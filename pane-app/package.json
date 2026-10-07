@@ -61,6 +61,13 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "electron/assets/sounds/",
+        "to": "assets/sounds",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "files": [

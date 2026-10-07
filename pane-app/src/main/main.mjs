@@ -982,14 +982,112 @@ Improvements
   ipcMain.handle("reveal_in_finder", (_event, args) => {
     shell.showItemInFolder(args.path);
   });
+  // ── Completion sound ─────────────────────────────────────────────────
+  // sound === "pane-default" → the bundled MP3 in electron/assets/sounds/
+  //   (dev) or resourcesPath/assets/sounds (packaged, via extraResources).
+  // Otherwise `sound` is an absolute path to a user-picked audio file
+  //   (chosen via pick_audio_file) — validated: must exist, be a file, and
+  //   carry a known audio extension. NOT project path-guard's
+  //   validateFilePath: that scopes project files; sounds are a distinct
+  //   user-chosen resource class (same pattern as computer_screenshot).
+  const AUDIO_EXTENSIONS = /\.(mp3|wav|aiff?|m4a|caf|aac|ogg|flac)$/i;
+  let currentSoundProcess = null; // afplay child — killed if a new sound starts
   ipcMain.handle("play_sound", async (_event, args) => {
-    const { sound } = args;
-    if (sound === "none") return;
-    const soundPath = `/System/Library/Sounds/${sound}.aiff`;
+    const { sound } = args ?? {};
+    if (sound === "none") return { ok: true };
+    let soundPath;
+    if (sound === "pane-default") {
+      soundPath = getAssetPath("sounds", "pane-default.mp3");
+    } else if (typeof sound === "string" && AUDIO_EXTENSIONS.test(sound)) {
+      const resolved = path.resolve(sound);
+      try {
+        const stat = await fs.promises.stat(resolved);
+        if (!stat.isFile()) {
+          return { ok: false, error: `Not a file: ${resolved}` };
+        }
+        soundPath = resolved;
+      } catch {
+        return { ok: false, error: `Sound file not found: ${resolved}` };
+      }
+    } else {
+      return { ok: false, error: "Unsupported sound reference." };
+    }
+    // Only one sound at a time — a new completion kills the previous afplay
+    // so overlapping finishes don't stack 2.5s clips into a wall of noise.
+    if (currentSoundProcess && !currentSoundProcess.killed) {
+      currentSoundProcess.kill("SIGKILL");
+      currentSoundProcess = null;
+    }
     try {
-      await execFileAsync("afplay", [soundPath]);
+      const child = execFile(
+        "afplay",
+        [soundPath],
+        { timeout: 12000, killSignal: "SIGKILL" },
+        () => {}, // swallow exit errors — afplay SIGKILL on overlap is normal
+      );
+      currentSoundProcess = child;
     } catch (error) {
       console.error("Sound playback failed:", error);
+      return { ok: false, error: error.message };
+    }
+    return { ok: true };
+  });
+
+  // Sound picker — file dialog restricted to audio types. Returns the
+  // absolute path (persisted as completionSound), or null on cancel.
+  ipcMain.handle("pick_audio_file", async () => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      title: "Choose a completion sound",
+      properties: ["openFile"],
+      filters: [
+        {
+          name: "Audio",
+          extensions: ["mp3", "wav", "aiff", "aif", "m4a", "caf", "aac", "ogg", "flac"],
+        },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+
+  // ── OS push notification (task completion) ───────────────────────────
+  // Fires ONLY when no Pane window is focused — an attentive user watching
+  // the stream gets no popup. The renderer owns the "which project finished"
+  // logic; main only owns the focus gate (it sees real OS focus) and the
+  // click routing.
+  ipcMain.handle("show_notification", (_event, args) => {
+    const { title, body, projectId } = args ?? {};
+    // Gate: any focused Pane window → user is looking at Pane → skip.
+    const focused = BrowserWindow.getAllWindows().some(
+      (w) => w.isFocused() && !w.isDestroyed(),
+    );
+    if (focused) return { ok: true, skipped: "focused" };
+    try {
+      const { Notification } = require("electron");
+      if (!Notification.isSupported()) return { ok: false, error: "unsupported" };
+      const notification = new Notification({
+        title: typeof title === "string" && title ? title : "Pane",
+        body: typeof body === "string" ? body : "",
+        silent: false,
+      });
+      if (projectId && typeof projectId === "string") {
+        // Each notification closes over its own projectId — no id-keyed
+        // registry needed (Electron Notification has no public .id).
+        notification.on("click", () => {
+          const win = BrowserWindow.getAllWindows().find((w) => !w.isDestroyed());
+          if (!win) return;
+          if (win.isMinimized()) win.restore();
+          win.show();
+          win.focus();
+          win.webContents.send("pane://notification-clicked", { projectId });
+        });
+      }
+      notification.show();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
     }
   });
   ipcMain.handle("set_window_title", (_event, args) => {

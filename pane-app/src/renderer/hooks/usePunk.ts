@@ -1049,6 +1049,18 @@ export function usePunk(projectId: string) {
 
         if (!awaitingAnswer) {
           useWorkspaceStore.getState().playCompletionSound();
+          // OS push notification. Sole gate is window focus, checked in main
+          // (fires only when no Pane window is focused) — not which project
+          // is active: walking away mid-watch still deserves a push. Sound
+          // is fully ungated: plays even while watching, per decision.
+          const proj = s.projects.get(projectId);
+          window.electronAPI
+            .invoke("show_notification", {
+              title: "Pane — task completed",
+              body: proj ? `${proj.name} finished. Click to open.` : "Task finished.",
+              projectId,
+            })
+            .catch(() => {});
         }
 
         if (s.activeProjectId !== projectId) {

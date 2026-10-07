@@ -3366,7 +3366,8 @@ export function Profile() {
             {/* Separator */}
             <div className="border-t border-pane-border/20" />
 
-            {/* Sound — three dots: none / subtle / present. Active dot uses accent color. Clicking plays immediately */}
+            {/* Sound — three dots: none / pane-default (bundled) / custom (browse).
+                Active dot uses accent color. Clicking plays immediately (except none). */}
             <div className="flex items-center justify-between py-4">
               <span
                 className="text-pane-text-secondary/50 font-mono"
@@ -3377,16 +3378,37 @@ export function Profile() {
               <div className="flex items-center gap-3">
                 {[
                   { id: "none", label: "none" },
-                  { id: "Tink", label: "subtle" },
-                  { id: "Pop", label: "present" },
+                  { id: "pane-default", label: "default" },
+                  { id: "__custom__", label: "custom" },
                 ].map((s) => {
-                  const isActive = s.id === "Pop"
-                    ? completionSound !== "none" && completionSound !== "Tink"
-                    : completionSound === s.id;
+                  // Custom is "active" when completionSound holds any absolute
+                  // path (a picked file) — not the sentinel "__custom__".
+                  const isActive =
+                    s.id === "__custom__"
+                      ? completionSound !== "none" &&
+                        completionSound !== "pane-default"
+                      : completionSound === s.id;
                   return (
                     <button
                       key={s.id}
+                      title={s.label}
                       onClick={() => {
+                        if (s.id === "__custom__") {
+                          // Browse for a custom sound; picking one selects AND
+                          // previews it. Cancel keeps the current selection.
+                          window.electronAPI
+                            .invoke("pick_audio_file")
+                            .then((picked) => {
+                              if (typeof picked === "string" && picked) {
+                                setCompletionSound(picked);
+                                window.electronAPI.invoke("play_sound", {
+                                  sound: picked,
+                                });
+                              }
+                            })
+                            .catch(() => {});
+                          return;
+                        }
                         setCompletionSound(s.id);
                         if (s.id !== "none") {
                           window.electronAPI.invoke("play_sound", { sound: s.id });
@@ -3402,6 +3424,18 @@ export function Profile() {
                 })}
               </div>
             </div>
+            {/* Custom sound filename — shown only when a picked file is active */}
+            {completionSound !== "none" && completionSound !== "pane-default" && (
+              <div className="flex items-center justify-between pb-4 -mt-2">
+                <span
+                  className="text-pane-text-secondary/40 font-mono truncate max-w-[220px]"
+                  style={{ fontSize: "var(--pane-font-size-xs)" }}
+                  title={completionSound}
+                >
+                  {completionSound.split("/").pop()}
+                </span>
+              </div>
+            )}
           </div>
         </AccordionSection>
 
