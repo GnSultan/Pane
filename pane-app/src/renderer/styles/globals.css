@@ -608,6 +608,16 @@ html, body {
   scrollbar-color: color-mix(in srgb, var(--pane-text-secondary) 18%, transparent) transparent;
 }
 
+/* Skill strip (InputBar) — scrollable but scrollbar-less. Trackpads swipe;
+   the strip is one line tall and a visible 3px bar would fight the chips. */
+.pane-scroll-invisible {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* legacy Edge */
+}
+.pane-scroll-invisible::-webkit-scrollbar {
+  display: none;
+}
+
 /* macOS window drag regions — use app-region (standard), not -webkit-app-region.
    The -webkit- prefix was removed in Chromium 118+ (Electron 28+ uses Chromium 118+).
    Electron 40 ships with Chromium ~125 — the webkit prefix does nothing. */

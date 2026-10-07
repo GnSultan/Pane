@@ -1485,20 +1485,12 @@ const WRITE_TOOL_NAMES = new Set([
 ]);
 
 function getToolsForPhase(phase) {
-  // User-facing phases "think"/"analyze" and internal "planning" are all read-only.
-  // "build"/"execution" get the full tool set.
-  const readOnlyPhases = new Set(["planning", "think", "analyze"]);
-  const builtIn = readOnlyPhases.has(phase)
-    ? TOOL_DEFINITIONS.filter((t) => !WRITE_TOOL_NAMES.has(t.function.name))
-    : TOOL_DEFINITIONS;
-
-  // External MCP tools — always included regardless of phase. External tools
-  // are typically data-source connectors (Figma, GitHub) needed for context
-  // during planning and execution alike.
-  // Plus the 3 gateway tools (already in TOOL_DEFINITIONS via push) — they
-  // give every phase access to the servers the tools[] cap had to gate.
+  // Phase no longer restricts tools (removed Oct 2026): "think" used to get
+  // a read-only subset, which became friction — the model knows when to
+  // plan vs act. The phase argument is kept for call-site stability.
+  // External MCP tools are always included.
   const external = mcpClient.getExternalTools();
-  return [...builtIn, ...external];
+  return [...TOOL_DEFINITIONS, ...external];
 }
 
 // ── Provider tools-array cap ────────────────────────────────────────────────
@@ -3659,7 +3651,9 @@ export class ApiBackend extends PunkBackend {
       // editing once write tools execute (tool-executor emits those).
       setAgentPhase(request.projectId, {
         phase: "planning",
-        readOnly: request.phase !== "build" && request.phase !== "execution",
+        // Phase no longer gates tools (Oct 2026) — runs always start with
+        // the full set; tool-executor flips readOnly:false on first write.
+        readOnly: false,
         agent: request.model && request.provider ? `${request.model}@${request.provider}` : null,
       });
 

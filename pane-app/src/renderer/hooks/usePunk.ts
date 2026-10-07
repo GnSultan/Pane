@@ -1459,7 +1459,8 @@ export function usePunk(projectId: string) {
       try {
         const conversation = project.conversation;
         // Phase-based intent — single source of truth, no per-message re-classification.
-        const effectivePhase = phase || "think";
+        // Default "build" — full tools, execute intent (restriction removed Oct 2026).
+        const effectivePhase = phase || "build";
         const intent = PHASE_TO_INTENT[effectivePhase] || "execute";
 
         const activeFile = project.activeFilePath || undefined;

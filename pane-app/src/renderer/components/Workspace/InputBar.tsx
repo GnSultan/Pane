@@ -16,6 +16,10 @@ const EMPTY_TODOS: Todo[] = [];
 // think = discuss + brainstorm + plan (thinking model)
 // build = execute the plan (execution model)
 // Phase is sticky — persists across messages until explicitly changed.
+// NO keyword auto-detection: typing "hold on" or "build it" no longer
+// switches modes. The pill is manual-only. Phase also does NOT restrict
+// tools anymore — every phase gets the full set (restriction removed
+// Oct 2026: think-mode had become friction, not safety).
 
 const _PHASE_CYCLE = ["think", "build"] as const;
 type PhaseName = typeof _PHASE_CYCLE[number];
@@ -24,34 +28,6 @@ const PHASE_CONFIG: Record<PhaseName, { color: string }> = {
   think: { color: "var(--pane-status-modified)" },
   build: { color: "var(--pane-status-added)" },
 };
-
-/**
- * Detect a strong phase transition signal from the user's message.
- * Only explicit action or pause phrases trigger a switch.
- * Weak references ("let's plan this later") are NOT transitions.
- */
-function detectPhaseTransition(text: string, currentPhase: PhaseName): PhaseName | null {
-  const t = text.trim().toLowerCase();
-
-  // think → build: user approves a plan and wants action now
-  if (currentPhase === "think") {
-    if (/^(do it|go ahead|ship it|let'?s go|build it|execute|make it happen|yes do it|ok do it|start building|let'?s build|implement it|go for it)\s*[.!]?$/i.test(t)) {
-      return "build";
-    }
-    if (t.length < 20 && /^(yes|yep|yup|ok|okay|sure|proceed|approved|lgtm|go)\s*[.!]?$/i.test(t)) {
-      return "build";
-    }
-  }
-
-  // build → think: user wants to stop and rethink
-  if (currentPhase === "build") {
-    if (/^(wait|stop|hold on|let'?s (talk|discuss|think|rethink)|actually|pause)\b/i.test(t)) {
-      return "think";
-    }
-  }
-
-  return null;
-}
 
 function formatRelativeTime(epochMs: number): string {
   const diff = epochMs - Date.now();
@@ -62,6 +38,50 @@ function formatRelativeTime(epochMs: number): string {
   if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+/**
+ * Pointer drag-to-scroll props for the skill strips: native horizontal wheel
+ * works on trackpads, but a mouse user has no way to swipe a one-line strip.
+ * Handlers use e.currentTarget (not a stored ref), so the SAME props object
+ * can be spread onto every strip — each event knows its own element.
+ * setPointerCapture keeps moves flowing after the cursor leaves the strip.
+ * Clicks are swallowed after a real drag (≥4px) so releasing doesn't
+ * trigger surrounding click handlers.
+ */
+function useDragToScrollProps() {
+  const drag = useRef<{ x: number; left: number; moved: boolean } | null>(null);
+  const swallowed = useRef(false);
+  return {
+    onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+      const el = e.currentTarget;
+      if (e.pointerType === "touch") return; // native touch pan
+      if (el.scrollWidth <= el.clientWidth) return; // nothing to scroll
+      drag.current = { x: e.clientX, left: el.scrollLeft, moved: false };
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch {
+        /* pointer already released — drag simply won't engage */
+      }
+    },
+    onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+      const d = drag.current;
+      if (!d) return;
+      const dx = e.clientX - d.x;
+      if (Math.abs(dx) >= 4) d.moved = true;
+      if (d.moved) e.currentTarget.scrollLeft = d.left - dx;
+    },
+    onPointerUp: () => {
+      if (drag.current?.moved) swallowed.current = true;
+      drag.current = null;
+    },
+    onClickCapture: (e: React.MouseEvent) => {
+      if (!swallowed.current) return;
+      swallowed.current = false;
+      e.stopPropagation();
+      e.preventDefault();
+    },
+  };
 }
 
 function RateLimitIndicator() {
@@ -671,12 +691,14 @@ export function InputBar({
   // phaseOverride is a local tap (cleared after send to re-sync with store).
   const [phaseOverride, setPhaseOverride] = useState<PhaseName | null>(null);
 
-  // Read sticky phase from conversation store — authoritative source of truth
+  // Read sticky phase from conversation store — authoritative source of truth.
+  // Default is "build": the restriction-free default. "think" remains
+  // available as a manual switch for thinking-model conversations.
   const storePhase = useProjectsStore(
     (s) => {
       const raw = s.projects.get(projectId)?.conversation.phase;
       if (raw === "think" || raw === "build") return raw as PhaseName;
-      return "think" as PhaseName; // default to think for new conversations
+      return "build" as PhaseName;
     }
   );
 
@@ -687,6 +709,10 @@ export function InputBar({
   const activeSkills = useProjectsStore(
     (s) => s.projects.get(projectId)?.activeSkills ?? [],
   );
+
+  // Shared drag-to-scroll props for both skill strips (ghost + card). Safe to
+  // share: handlers resolve their element from e.currentTarget per event.
+  const dragToScrollHandlers = useDragToScrollProps();
 
   // Prefill from external sources (e.g., Lens "fix" button)
   useEffect(() => {
@@ -758,16 +784,6 @@ export function InputBar({
     },
     [setAutoEscalate, projectId],
   );
-
-  // Phase transition detection — only updates phaseOverride on strong signals.
-  // Weak references ("let's think about this") inside build phase do NOT switch.
-  useEffect(() => {
-    if (phaseOverride) return; // user already tapped the pill
-    const trimmed = value.trim();
-    if (trimmed.length < 3) return;
-    const transition = detectPhaseTransition(trimmed, currentPhase);
-    if (transition) setPhaseOverride(transition);
-  }, [value, currentPhase, phaseOverride]);
 
   // Clear override when input is fully empty — a <3 threshold (intended for
   // auto-detected transitions) also killed manual pill toggles: user clicks
@@ -1121,21 +1137,23 @@ export function InputBar({
           </div>
           <div className="pointer-events-auto shrink-0 flex items-center gap-1.5">
             <RateLimitIndicator />
-            {/* Active skills — ghost affordance so loaded skills stay
-                visible even when the bar is collapsed. Click expands the
-                input, where the full (larger) chip lives. */}
+            {/* Active skills — ghost affordance. Horizontally scrollable so
+                multiple skills stay readable: strip shows ~one skill and
+                swipes/drag-scrolls through the rest (overflow clipped). */}
             {activeSkills.length > 0 && (
-              <button
-                onClick={() => setExpandedSection("input")}
-                className="font-mono btn-press shrink-0 inline-flex items-center gap-1 max-w-40 text-pane-accent/75 hover:text-pane-accent transition-colors"
+              <div
+                className="font-mono shrink-0 inline-flex items-center gap-1 max-w-40 overflow-x-auto pane-scroll-invisible cursor-grab active:cursor-grabbing select-none"
                 style={{ fontSize: "var(--pane-font-size-xs)" }}
-                title={`skills: ${activeSkills.join(", ")}`}
+                title={activeSkills.join(", ")}
+                {...dragToScrollHandlers}
               >
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-pane-accent/75 pointer-events-none">
                   <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
                 </svg>
-                <span className="truncate">{activeSkills.join(" · ")}</span>
-              </button>
+                <span className="whitespace-nowrap text-pane-accent/75 pointer-events-none">
+                  {activeSkills.join(" · ")}
+                </span>
+              </div>
             )}
             {/* Mode pill — shows active phase in ghost trigger */}
             <button
@@ -1471,14 +1489,15 @@ export function InputBar({
 
               {activeSkills.length > 0 && (
                 <div
-                  className="pointer-events-none font-mono shrink-0 px-3 py-1.5 rounded-md inline-flex items-center gap-1.5 max-w-56"
+                  className="font-mono shrink-0 px-3 py-1.5 rounded-md inline-flex items-center gap-1.5 max-w-56 overflow-x-auto pane-scroll-invisible cursor-grab active:cursor-grabbing select-none"
                   title={activeSkills.join(", ")}
                   style={{ fontSize: "var(--pane-font-size-sm)", color: "var(--pane-accent)" }}
+                  {...dragToScrollHandlers}
                 >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 pointer-events-none">
                     <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
                   </svg>
-                  <span className="truncate">{activeSkills.join(" · ")}</span>
+                  <span className="whitespace-nowrap pointer-events-none">{activeSkills.join(" · ")}</span>
                 </div>
               )}
 
