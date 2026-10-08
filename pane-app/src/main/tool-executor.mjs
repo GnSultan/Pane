@@ -65,6 +65,7 @@ import {
   buildSkillListing,
   installSkill,
   ensureGlobalSkillsDir,
+  readSkillResource,
 } from "./skill-registry.mjs";
 import { mcpClient } from "./mcp-client.mjs";
 import {
@@ -3046,6 +3047,20 @@ export class ToolExecutor {
             outputParts.push(`### Bundled Tools: ${body.tools.length || Object.keys(body.tools).length} tool(s) available`);
           }
 
+          // Companion resources — SKILL.md may route to relative files
+          // ("Read references/voice.md"). Those are instructions, not imports:
+          // surface them so the agent knows what exists and how to load it.
+          if (body.resources?.length) {
+            outputParts.push("");
+            outputParts.push(`### Skill Resources (${body.resources.length})`);
+            outputParts.push(
+              `Skill root: \`${body.skillPath}\` — relative paths in the instructions above resolve from here. Use \`pane_read_skill_resource\` (or a file-read tool with the skill root) to load them; they are not included in this activation.`,
+            );
+            for (const r of body.resources) {
+              outputParts.push(`- \`${r.path}\` (${r.bytes} bytes)`);
+            }
+          }
+
           // Persist active skill in session state so context-orchestrator injects it
           try {
             mergeState(this.projectId, {
@@ -3301,7 +3316,41 @@ export class ToolExecutor {
             parts.push(JSON.stringify(body.modelPrefs, null, 2));
           }
 
+          if (body?.resources?.length) {
+            parts.push("");
+            parts.push(`### Skill Resources (${body.resources.length})`);
+            parts.push(
+              `Skill root: \`${body.skillPath}\`. Relative paths in the instructions resolve from the skill root — read them with \`pane_read_skill_resource\` or a file-read tool; they are not loaded automatically.`,
+            );
+            for (const r of body.resources) {
+              parts.push(`- \`${r.path}\` (${r.bytes} bytes)`);
+            }
+          } else if (body) {
+            parts.push("");
+            parts.push("### Skill Resources");
+            parts.push("None declared. If the instructions route to a relative file that is not listed here, it is missing from this install — reinstall the skill.");
+          }
+
           return { success: true, output: parts.join("\n"), toolId };
+        }
+
+        case "pane_read_skill_resource": {
+          const name = (input.name || "").trim();
+          const resPath = (input.path || "").trim();
+          if (!name || !resPath) {
+            return { success: false, error: "Both 'name' (skill) and 'path' (relative resource path) are required.", toolId };
+          }
+
+          const result = readSkillResource(name, resPath, this.projectRoot);
+          if (!result.success) {
+            return { success: false, error: result.error, toolId };
+          }
+
+          return {
+            success: true,
+            output: `## ${name} / ${resPath}\n(source: ${result.absolutePath})\n\n${result.content}`,
+            toolId,
+          };
         }
 
         case "save_memory": {

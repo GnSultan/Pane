@@ -54,11 +54,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PANE_DIR = path.join(os.homedir(), ".pane");
-const GLOBAL_SKILLS_DIR = path.join(PANE_DIR, "skills");
+const DEFAULT_GLOBAL_SKILLS_DIR = path.join(PANE_DIR, "skills");
 
 // Resolve pane-app root: <pane-app>/src/main/skill-registry.mjs → <pane-app>
 const PANE_APP_ROOT = path.resolve(__dirname, "..", "..");
 const BUILTIN_SKILLS_DIR = path.join(PANE_APP_ROOT, "skills");
+
+// Mutable so tests can redirect installs away from the real ~/.pane/skills.
+let GLOBAL_SKILLS_DIR = DEFAULT_GLOBAL_SKILLS_DIR;
 
 // Known skill subdirectories within a skill package
 const SKILL_FILES = {
@@ -75,9 +78,11 @@ const SKILL_FILES = {
 // In-memory caches
 // ---------------------------------------------------------------------------
 
-// Map<skillName, SkillMetadata> — populated by discoverAll()
-let _discoveredCache = null;
-let _discoveredAt = 0;
+// Map<cacheKey, SkillMetadata[]> keyed by projectRoot ("" for global-only) —
+// populated by discoverAll(). A single shared cache would serve project A's
+// scan results to project B (wrong paths, missed project-local skills) within
+// the TTL, so each root gets its own entry.
+const _discoveredCache = new Map();
 const DISCOVERY_TTL_MS = 30_000; // re-scan every 30s max
 
 // Map<projectId, Set<skillName>> — active skills per project
@@ -100,7 +105,12 @@ function _notifyActiveSkillsChanged(projectId) {
     }
 }
 
-// Map<skillName, SkillBody> — loaded skill bodies (LRU-ish, small enough to keep)
+// Map<cacheKey, { body: SkillBody, mtimeMs: number }> — loaded skill bodies.
+// Freshness is checked against the SKILL.md mtime on every read: reinstalling a
+// skill (pane_install_skill, manual copy, external edit) changes the file, and a
+// stale body must never be served for an activation. Discovery-cache
+// invalidation alone does not reach this cache — the mtime check makes the two
+// caches independently correct.
 const _bodyCache = new Map();
 
 // ---------------------------------------------------------------------------
@@ -119,12 +129,22 @@ const _bodyCache = new Map();
  */
 
 /**
+ * @typedef {object} SkillResource
+ * @property {string} path - Relative path within the skill package (e.g. "references/voice.md")
+ * @property {string} absolutePath - Absolute path on disk
+ * @property {number} bytes - File size
+ */
+
+/**
  * @typedef {object} SkillBody
  * @property {string} instructions - SKILL.md body without frontmatter
  * @property {object|null} compose - Parsed compose.json or null
  * @property {string|null} playbook - playbook.md content or null
  * @property {object|null} tools - Parsed tools.json or null
  * @property {object|null} modelPrefs - Parsed model-prefs.json or null
+ * @property {string} skillPath - Absolute path to the skill directory (for
+ *   resolving relative companion resources like references/*.md)
+ * @property {SkillResource[]} resources - Companion files (knowledge/, references/)
  */
 
 /**
@@ -298,9 +318,10 @@ function scanDirectory(dir, source, projectRoot = null) {
  * @returns {SkillMetadata[]}
  */
 export function discoverAll(projectRoot = null) {
-  // Use cache if fresh
-  if (_discoveredCache && Date.now() - _discoveredAt < DISCOVERY_TTL_MS) {
-    return _discoveredCache;
+  const cacheKey = projectRoot || "";
+  const cached = _discoveredCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < DISCOVERY_TTL_MS) {
+    return cached.skills;
   }
 
   const seen = new Map(); // name → SkillMetadata
@@ -334,8 +355,7 @@ export function discoverAll(projectRoot = null) {
     }
   }
 
-  _discoveredCache = allSkills;
-  _discoveredAt = Date.now();
+  _discoveredCache.set(cacheKey, { at: Date.now(), skills: allSkills });
   return allSkills;
 }
 
@@ -352,44 +372,135 @@ export function findSkill(name, projectRoot = null) {
  * Invalidate the discovery cache (e.g., after installing/removing a skill).
  */
 export function invalidateDiscoveryCache() {
-  _discoveredCache = null;
-  _discoveredAt = 0;
+  _discoveredCache.clear();
 }
 
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
 
+// Companion-resource directories that may be routed from SKILL.md with
+// relative paths ("Read references/voice.md"). These are routing instructions,
+// not imports — the agent resolves them against the skill root.
+const RESOURCE_DIRS = ["knowledge", "references"];
+
+/**
+ * Recursively list companion resource files under a skill directory.
+ * Only files are listed; hidden files are skipped. Returns relative paths
+ * (POSIX-style, relative to the skill root) so they match how SKILL.md
+ * routes them.
+ *
+ * @param {string} skillDir
+ * @returns {SkillResource[]}
+ */
+function collectResources(skillDir) {
+  /** @type {SkillResource[]} */
+  const out = [];
+  for (const dirName of RESOURCE_DIRS) {
+    const root = path.join(skillDir, dirName);
+    const walk = (relDir, absDir) => {
+      let entries;
+      try {
+        entries = fs.readdirSync(absDir, { withFileTypes: true });
+      } catch {
+        return; // unreadable or absent — skip
+      }
+      for (const e of entries) {
+        if (e.name.startsWith(".")) continue;
+        const abs = path.join(absDir, e.name);
+        const rel = `${relDir}/${e.name}`;
+        if (e.isDirectory()) walk(rel, abs);
+        else if (e.isFile()) {
+          try {
+            out.push({ path: rel, absolutePath: abs, bytes: fs.statSync(abs).size });
+          } catch { /* file vanished mid-walk — skip */ }
+        }
+      }
+    };
+    walk(dirName, root);
+  }
+  return out.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/**
+ * Read a companion resource file from a skill package, resolved against the
+ * skill root. Only paths that escape the skill root are refused.
+ *
+ * @param {string} skillName
+ * @param {string} relativePath - e.g. "references/voice.md"
+ * @param {string} [projectRoot]
+ * @returns {{ success: boolean, error?: string, content?: string, absolutePath?: string }}
+ */
+export function readSkillResource(skillName, relativePath, projectRoot = null) {
+  const meta = findSkill(skillName, projectRoot);
+  if (!meta) {
+    return { success: false, error: `Skill "${skillName}" not found.` };
+  }
+  const abs = path.resolve(meta.path, relativePath);
+  if (!abs.startsWith(meta.path + path.sep)) {
+    return { success: false, error: `Refusing to read outside skill directory: ${relativePath}` };
+  }
+  try {
+    const content = fs.readFileSync(abs, "utf-8");
+    return { success: true, content, absolutePath: abs };
+  } catch (err) {
+    return {
+      success: false,
+      error: `Resource "${relativePath}" could not be read from skill "${skillName}" (${err.code || err.message}). Check pane_skill_info for the skill's resource list — the file may be missing from this install.`,
+    };
+  }
+}
+
 /**
  * Load the full body of a skill by name.
- * Cached in memory after first load.
+ * Cached in memory, with freshness checked against the SKILL.md mtime so a
+ * reinstall or in-place edit is always picked up.
  *
  * @param {string} name - Skill name
  * @param {string} [projectRoot] - Project root for project-local resolution
  * @returns {SkillBody|null}
  */
 export function loadSkill(name, projectRoot = null) {
-  // Check cache
   const cacheKey = projectRoot ? `${projectRoot}::${name}` : name;
-  if (_bodyCache.has(cacheKey)) return _bodyCache.get(cacheKey);
 
   const meta = findSkill(name, projectRoot);
-  if (!meta) return null;
+  if (!meta) {
+    // Skill removed: drop any stale cache entry so a later reinstall starts clean.
+    _bodyCache.delete(cacheKey);
+    return null;
+  }
 
-  const body = {};
+  // Cache is only trusted while the SKILL.md on disk is unchanged — a
+  // reinstall (pane_install_skill, manual copy) or in-place edit bumps the
+  // mtime and forces a reload from disk.
+  const skillFile = path.join(meta.path, SKILL_FILES.instructions);
+  let mtimeMs = 0;
+  try {
+    mtimeMs = fs.statSync(skillFile).mtimeMs;
+  } catch {
+    // stat failed — fall through; the read below surfaces the real error
+  }
+
+  const cached = _bodyCache.get(cacheKey);
+  if (cached && cached.mtimeMs === mtimeMs) {
+    return cached.body;
+  }
+  _bodyCache.delete(cacheKey);
+
+  const body = { skillPath: meta.path };
 
   // Load SKILL.md body
   try {
-    const content = fs.readFileSync(
-      path.join(meta.path, SKILL_FILES.instructions),
-      "utf-8",
-    );
+    const content = fs.readFileSync(skillFile, "utf-8");
     const { body: instructions } = parseFrontmatter(content);
     body.instructions = instructions;
   } catch (err) {
     console.warn(`[skills] Failed to read SKILL.md for ${name}: ${err.message}`);
     return null;
   }
+
+  // Companion resources (knowledge/, references/)
+  body.resources = collectResources(meta.path);
 
   // Load compose.json
   try {
@@ -430,7 +541,7 @@ export function loadSkill(name, projectRoot = null) {
     body.modelPrefs = null;
   }
 
-  _bodyCache.set(cacheKey, body);
+  _bodyCache.set(cacheKey, { body, mtimeMs });
   return body;
 }
 
@@ -701,8 +812,14 @@ export function installSkill(sourceDir, renameTo = null) {
     // Recursive copy
     fs.cpSync(sourceDir, destDir, { recursive: true });
 
-    // Invalidate cache
+    // Invalidate cache — both the discovery (metadata) cache and any cached
+    // body for this skill (global form and every project-scoped form; a
+    // project-local skill of the same name is untouched and keeps its entry).
     invalidateDiscoveryCache();
+    _bodyCache.delete(skillName);
+    for (const key of [..._bodyCache.keys()]) {
+      if (key.endsWith(`::${skillName}`)) _bodyCache.delete(key);
+    }
 
     return { success: true, name: skillName };
   } catch (err) {
@@ -720,8 +837,12 @@ export function removeSkill(skillName) {
   try {
     fs.rmSync(skillDir, { recursive: true, force: true });
     invalidateDiscoveryCache();
-    // Also clear from body cache
+    // Clear cached bodies under every key form this skill may have been
+    // loaded with (bare name, and "<projectRoot>::<name>" project-scoped).
     _bodyCache.delete(skillName);
+    for (const key of [..._bodyCache.keys()]) {
+      if (key.endsWith(`::${skillName}`)) _bodyCache.delete(key);
+    }
     return { success: true };
   } catch (err) {
     return { success: false, error: `Failed to remove skill: ${err.message}` };
@@ -746,6 +867,11 @@ export const __test = {
   validateFrontmatter,
   validateCompose,
   scanDirectory,
-  GLOBAL_SKILLS_DIR,
+  get GLOBAL_SKILLS_DIR() { return GLOBAL_SKILLS_DIR; },
+  setGlobalSkillsDir(dir) {
+    GLOBAL_SKILLS_DIR = dir;
+    invalidateDiscoveryCache();
+    _bodyCache.clear();
+  },
   BUILTIN_SKILLS_DIR,
 };

@@ -1333,6 +1333,28 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "pane_read_skill_resource",
+      description:
+        "Read a companion resource file bundled inside an installed skill, e.g. the references/*.md or knowledge/* files a SKILL.md routes to ('Read references/voice.md'). Those route lines are instructions, not imports — nothing is loaded automatically. Resolve the route with this tool when the skill tells you to read a relative file.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "The skill the resource belongs to",
+          },
+          path: {
+            type: "string",
+            description: "Relative path inside the skill package, e.g. 'references/voice.md'",
+          },
+        },
+        required: ["name", "path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "deactivate_skill",
       description:
         "Deactivates an active skill by name. Use this when a skill is no longer needed for the current task or when switching to a different domain. Does nothing if the skill isn't active.",
