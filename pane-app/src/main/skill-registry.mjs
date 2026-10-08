@@ -97,6 +97,31 @@ let GLOBAL_SKILLS_DIR = DEFAULT_GLOBAL_SKILLS_DIR;
 const MAX_SKILL_MD_BYTES = 2 * 1024 * 1024;   // 2 MiB — SKILL.md is prose
 const MAX_RESOURCE_BYTES = 256 * 1024;        // companion file → model context
 const MAX_BODY_CACHE_ENTRIES = 64;
+// Companion JSON/markdown files loaded by loadSkill(). Individually capped:
+// an adversarial package can ship a 2 GiB tools.json and none of the other
+// guards look at it — these files are read whole into memory and cached.
+const MAX_COMPANION_BYTES = 512 * 1024;       // compose/tools/model-prefs/playbook
+
+// Read a companion file with a size cap. Returns null when absent, too
+// large (warned), or unreadable — loadSkill already treats null as
+// "not present", and an oversized one is a broken package, not a skill.
+function readCompanion(file) {
+  let size = 0;
+  try {
+    size = fs.statSync(file).size;
+  } catch {
+    return null; // absent — normal
+  }
+  if (size > MAX_COMPANION_BYTES) {
+    console.warn(`[skills] Ignoring ${file}: ${size} bytes exceeds companion limit ${MAX_COMPANION_BYTES}`);
+    return null;
+  }
+  try {
+    return fs.readFileSync(file, "utf-8");
+  } catch {
+    return null;
+  }
+}
 
 // Known skill subdirectories within a skill package
 const SKILL_FILES = {
@@ -383,7 +408,13 @@ function scanDirectory(dir, source, projectRoot = null) {
   entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+    // Dot-dirs are never skills: installSkill stages into `.staging-*`
+    // siblings before the atomic rename, and a discovery scan during that
+    // window (or after a failed swap the finally-cleanup missed) would list
+    // the half-installed package as a real skill for up to the 30s discovery
+    // TTL. Editor droppings (.DS_Store dirs, .Trash) fall under the same
+    // rule. A legitimate skill name can't start with "." (validateSkillName).
+    if (entry.name.startsWith(".") || !entry.isDirectory()) continue;
 
     const skillDir = path.join(dir, entry.name);
     const skillFile = path.join(skillDir, SKILL_FILES.instructions);
@@ -431,11 +462,27 @@ function scanDirectory(dir, source, projectRoot = null) {
   return skills;
 }
 
+// Layer-by-layer merge. The `seen` set is keyed on the LOWERCASED name:
+// activation, lookup, and the active-skill set are all case-insensitive, so
+// a global "DUP" under a project "dup" is unreachable — findSkill always
+// resolves the project one. Keying dedupe the same way keeps the listing
+// honest (one entry per activation-reachable skill) instead of advertising
+// a shadowed twin the model can never load.
+function mergeLayer(allSkills, seen, layerSkills) {
+  for (const skill of layerSkills) {
+    const key = skill.name.toLowerCase();
+    if (!seen.has(key)) {
+      seen.set(key, skill);
+      allSkills.push(skill);
+    }
+  }
+}
+
 /**
  * Discover all available skills across all sources.
  * Results are cached for DISCOVERY_TTL_MS to avoid repeated disk scans.
  *
- * Discovery order (first wins on name conflict):
+ * Discovery order (first wins on name conflict, case-insensitive):
  *   1. Project-local (projectRoot)
  *   2. User-global (~/.pane/skills/)
  *   3. Pane built-in (<pane-app>/skills/)
@@ -450,37 +497,21 @@ export function discoverAll(projectRoot = null) {
     return cached.skills;
   }
 
-  const seen = new Map(); // name → SkillMetadata
+  const seen = new Map(); // lowercased name → SkillMetadata
   const allSkills = [];
 
   // Layer 1: Project-local (highest priority — first in wins)
   if (projectRoot) {
     const projectSkillsDir = path.join(projectRoot, ".pane", "skills");
-    const projectSkills = scanDirectory(projectSkillsDir, "project", projectRoot);
-    for (const skill of projectSkills) {
-      seen.set(skill.name, skill);
-      allSkills.push(skill);
-    }
+    mergeLayer(allSkills, seen, scanDirectory(projectSkillsDir, "project", projectRoot));
   }
 
   // Layer 2: User-global
-  const globalSkills = scanDirectory(GLOBAL_SKILLS_DIR, "global");
-  for (const skill of globalSkills) {
-    if (!seen.has(skill.name)) {
-      seen.set(skill.name, skill);
-      allSkills.push(skill);
-    }
-  }
+  mergeLayer(allSkills, seen, scanDirectory(GLOBAL_SKILLS_DIR, "global"));
 
   // Layer 3: Pane built-in (lowest priority) — resolves to the packaged
   // resources dir in production, <pane-app>/skills in development.
-  const builtinSkills = scanDirectory(resolveBuiltinSkillsDir(), "builtin");
-  for (const skill of builtinSkills) {
-    if (!seen.has(skill.name)) {
-      seen.set(skill.name, skill);
-      allSkills.push(skill);
-    }
-  }
+  mergeLayer(allSkills, seen, scanDirectory(resolveBuiltinSkillsDir(), "builtin"));
 
   _discoveredCache.set(cacheKey, { at: Date.now(), skills: allSkills });
   return allSkills;
@@ -513,9 +544,11 @@ const RESOURCE_DIRS = ["knowledge", "references"];
 
 /**
  * Recursively list companion resource files under a skill directory.
- * Only files are listed; hidden files are skipped. Returns relative paths
- * (POSIX-style, relative to the skill root) so they match how SKILL.md
- * routes them.
+ * Regular files are listed; symlinked files are listed too (a legitimate
+ * packaging pattern — and the read path contains them via realpath, so
+ * listing is safe). Symlinked DIRECTORIES are skipped: walking them would
+ * happily enumerate an escape target, and the resource list is advisory.
+ * Hidden files are skipped. Returns relative POSIX-style paths.
  *
  * @param {string} skillDir
  * @returns {SkillResource[]}
@@ -536,11 +569,15 @@ function collectResources(skillDir) {
         if (e.name.startsWith(".")) continue;
         const abs = path.join(absDir, e.name);
         const rel = `${relDir}/${e.name}`;
-        if (e.isDirectory()) walk(rel, abs);
-        else if (e.isFile()) {
+        if (e.isDirectory()) {
+          walk(rel, abs);
+        } else if (e.isFile() || e.isSymbolicLink()) {
+          // isSymbolicLink entries are included; reads still go through the
+          // realpath containment check in readSkillResource, so a link that
+          // escapes is listed but never readable.
           try {
             out.push({ path: rel, absolutePath: abs, bytes: fs.statSync(abs).size });
-          } catch { /* file vanished mid-walk — skip */ }
+          } catch { /* dangling link or vanished — skip */ }
         }
       }
     };
@@ -679,42 +716,30 @@ export function loadSkill(name, projectRoot = null) {
   // Companion resources (knowledge/, references/)
   body.resources = collectResources(meta.path);
 
-  // Load compose.json
-  try {
-    const composeRaw = fs.readFileSync(
-      path.join(meta.path, SKILL_FILES.compose),
-      "utf-8",
-    );
-    body.compose = JSON.parse(composeRaw);
-  } catch {
+  // Companion JSON/markdown — each read individually size-capped
+  // (readCompanion). A present-but-oversized file is treated as absent with
+  // a warning; a present-but-invalid JSON degrades to null exactly as a
+  // missing file would (the skill still works minus that facet).
+  const composeRaw = readCompanion(path.join(meta.path, SKILL_FILES.compose));
+  if (composeRaw !== null) {
+    try { body.compose = JSON.parse(composeRaw); } catch { body.compose = null; }
+  } else {
     body.compose = null;
   }
 
-  // Load playbook.md
-  try {
-    body.playbook = fs.readFileSync(
-      path.join(meta.path, SKILL_FILES.playbook),
-      "utf-8",
-    ).trim();
-  } catch {
-    body.playbook = null;
-  }
+  body.playbook = readCompanion(path.join(meta.path, SKILL_FILES.playbook))?.trim() || null;
 
-  // Load tools.json
-  try {
-    body.tools = JSON.parse(
-      fs.readFileSync(path.join(meta.path, SKILL_FILES.tools), "utf-8"),
-    );
-  } catch {
+  const toolsRaw = readCompanion(path.join(meta.path, SKILL_FILES.tools));
+  if (toolsRaw !== null) {
+    try { body.tools = JSON.parse(toolsRaw); } catch { body.tools = null; }
+  } else {
     body.tools = null;
   }
 
-  // Load model-prefs.json
-  try {
-    body.modelPrefs = JSON.parse(
-      fs.readFileSync(path.join(meta.path, SKILL_FILES.modelPrefs), "utf-8"),
-    );
-  } catch {
+  const prefsRaw = readCompanion(path.join(meta.path, SKILL_FILES.modelPrefs));
+  if (prefsRaw !== null) {
+    try { body.modelPrefs = JSON.parse(prefsRaw); } catch { body.modelPrefs = null; }
+  } else {
     body.modelPrefs = null;
   }
 
@@ -900,8 +925,9 @@ export function getActiveSkillContext(projectId, projectRoot = null) {
 
     // Inject at reasonable length — skill instructions can be large but
     // we trust the skill author. Cap at 3000 chars per skill defensively.
+    // (The full body stays reachable on disk at body.skillPath/SKILL.md.)
     const instructions = body.instructions.length > 3000
-      ? body.instructions.slice(0, 3000) + "\n\n[...skill truncated for context — use pane_skill_info for full content]"
+      ? body.instructions.slice(0, 3000) + `\n\n[...skill truncated for context — full body at ${body.skillPath}/SKILL.md]`
       : body.instructions;
 
     let block = `## Active Skill: ${name}\n\n${instructions}`;
@@ -912,7 +938,7 @@ export function getActiveSkillContext(projectId, projectRoot = null) {
     // past what the guardrail's flat overhead assumption expects.
     if (body.playbook) {
       const playbook = body.playbook.length > 3000
-        ? body.playbook.slice(0, 3000) + "\n\n[...playbook truncated for context — use pane_skill_info for full content]"
+        ? body.playbook.slice(0, 3000) + `\n\n[...playbook truncated for context — full file at ${body.skillPath}/playbook.md]`
         : body.playbook;
       block += `\n\n### Domain Principles for ${name}\n\n${playbook}`;
     }
@@ -1051,8 +1077,27 @@ export function installSkill(sourceDir, renameTo = null) {
     const skillName = renameTo || frontmatter.name;
     const destDir = path.join(GLOBAL_SKILLS_DIR, skillName);
 
-    // Recursive copy
-    fs.cpSync(sourceDir, destDir, { recursive: true });
+    // Atomic install: copy into a sibling temp dir, then swap over the
+    // destination. Plain cpSync(src, dest) has two failure modes this fixes:
+    //   1. It MERGES into an existing install — files removed from the new
+    //      package (or from a previous version) survive as zombies.
+    //   2. src === dest (re-installing an already-installed skill) throws
+    //      ERR_FS_CP_EINVAL, so the common "reinstall to update" flow died.
+    // renameSync over an existing dir only succeeds when dest is empty, so
+    // remove a non-empty destination first — after the copy has fully
+    // succeeded, never before.
+    const stagingDir = path.join(
+      GLOBAL_SKILLS_DIR,
+      `.staging-${skillName}-${process.pid}-${Date.now()}`,
+    );
+    try {
+      fs.cpSync(sourceDir, stagingDir, { recursive: true });
+      try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { /* absent — fine */ }
+      fs.renameSync(stagingDir, destDir);
+    } finally {
+      // Leftover staging dir only on a failed swap — clean it up.
+      try { fs.rmSync(stagingDir, { recursive: true, force: true }); } catch { /* already moved */ }
+    }
 
     // Invalidate cache — both the discovery (metadata) cache and any cached
     // body for this skill (global form and every project-scoped form; a
@@ -1086,6 +1131,23 @@ export function removeSkill(skillName) {
   const skillDir = path.join(GLOBAL_SKILLS_DIR, skillName);
   if (!skillDir.startsWith(GLOBAL_SKILLS_DIR + path.sep)) {
     return { success: false, error: `Refusing to remove a directory outside the global skills dir: ${skillName}` };
+  }
+  if (!fs.existsSync(skillDir)) {
+    // Nothing on disk. rmSync(force) would swallow this and report success —
+    // a no-op "removed" is a lie that hides the real situation: either the
+    // skill is already gone (stale discovery cache) or it was hand-copied
+    // under a different directory name than its frontmatter name. Kill the
+    // stale cache entry either way so the ghost disappears from listings,
+    // and tell the caller what actually happened.
+    invalidateDiscoveryCache();
+    _bodyCache.delete(skillName);
+    for (const key of [..._bodyCache.keys()]) {
+      if (key.endsWith(`::${skillName}`)) _bodyCache.delete(key);
+    }
+    return {
+      success: false,
+      error: `"${skillName}" has no directory at ~/.pane/skills/${skillName}/. It was either already removed (listing cache now refreshed) or installed under a different directory name — run pane_list_skills and remove by the listed name, or delete the directory manually.`,
+    };
   }
   try {
     fs.rmSync(skillDir, { recursive: true, force: true });

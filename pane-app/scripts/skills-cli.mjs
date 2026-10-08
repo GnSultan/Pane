@@ -22,7 +22,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PANE_DIR = path.join(os.homedir(), ".pane");
@@ -140,26 +140,26 @@ async function cmdInfo(name) {
 async function cmdInstall(source) {
   if (!source) error("Source path or URL is required.");
 
-  const { installSkill, ensureGlobalSkillsDir } = await getRegistry();
+  const { installSkill, ensureGlobalSkillsDir, parseSkillSource, validateSkillName } = await getRegistry();
+
+  // Validate the whole source at the boundary — same rule the in-app
+  // pane_install_skill path applies. execSync with interpolated strings is a
+  // shell: "$(cmd)" in owner/repo is code execution, so nothing unchecked is
+  // ever allowed near a command line here either.
+  const parsed = parseSkillSource(source);
+  if (parsed.error) error(parsed.error);
 
   // Handle github: URLs
-  if (source.startsWith("github:")) {
-    const githubPath = source.slice(7); // github:owner/repo/path/to/skill
-    const parts = githubPath.split("/");
-    if (parts.length < 3) {
-      error("GitHub path must be: github:owner/repo/path/to/skill");
-    }
-
-    const owner = parts[0];
-    const repo = parts[1];
-    const skillPath = parts.slice(2).join("/");
+  if (parsed.kind === "github") {
+    const { owner, repo, skillPath } = parsed;
     const repoUrl = `https://github.com/${owner}/${repo}.git`;
 
     const tmpDir = path.join(os.tmpdir(), `pane-skill-${repo}-${Date.now()}`);
     log(`Cloning ${repoUrl}...`);
 
     try {
-      execSync(`git clone --depth 1 "${repoUrl}" "${tmpDir}"`, {
+      // argv mode — no shell, so no injection surface by construction.
+      execFileSync("git", ["clone", "--depth", "1", repoUrl, tmpDir], {
         stdio: "pipe",
         timeout: 30000,
       });
@@ -173,7 +173,11 @@ async function cmdInstall(source) {
       error(`Skill path "${skillPath}" not found in repo.`);
     }
 
-    const skillName = parts[parts.length - 1];
+    const skillName = skillPath.split("/").pop();
+    if (!validateSkillName(skillName)) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      error(`Invalid skill directory name "${skillName}" in repo path.`);
+    }
     ensureGlobalSkillsDir();
     const result = installSkill(skillDir, skillName);
 
@@ -188,7 +192,7 @@ async function cmdInstall(source) {
   }
 
   // Local directory
-  const resolved = path.resolve(source);
+  const resolved = path.resolve(parsed.localPath);
   if (!fs.existsSync(resolved)) {
     error(`Path "${resolved}" does not exist.`);
   }

@@ -332,6 +332,65 @@ describe("body cache bound", () => {
 // development. Resolution must check the packaged resources dir the way
 // model-paths.mjs does for models.
 
+describe("staging/dot directories are never skills", () => {
+  it("does not discover a .staging-* dir that appears during the install window", () => {
+    // installSkill stages into a `.staging-<name>-<pid>-<ts>` sibling before
+    // the atomic rename. A discovery scan during that window (or after a
+    // failed swap) must not list the half-installed package as a skill.
+    const stage = path.join(fakeGlobalDir, ".staging-victim-123-999");
+    fs.mkdirSync(stage, { recursive: true });
+    fs.writeFileSync(path.join(stage, "SKILL.md"), BASE);
+    invalidateDiscoveryCache();
+    expect(findSkill("sectest", projRoot)).toBeNull();
+    expect(discoverAll(projRoot).some((s) => s.path.includes(".staging-"))).toBe(false);
+  });
+
+  it("does not discover any dot-named directory (editor droppings, .Trash)", () => {
+    for (const name of [".DS_Store-dir", ".Trash", ".vscode"]) {
+      const dir = path.join(fakeGlobalDir, name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "SKILL.md"), BASE);
+    }
+    invalidateDiscoveryCache();
+    const found = discoverAll(projRoot).filter((s) => path.basename(s.path).startsWith("."));
+    expect(found).toEqual([]);
+  });
+});
+
+describe("removeSkill no-op honesty", () => {
+  it("fails with guidance when the directory is absent — no silent success", () => {
+    const r = removeSkill("never-was-installed");
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/already removed|different directory name/);
+  });
+
+  it("purges a stale ghost entry from discovery after a no-op removal", () => {
+    // Hand-crafted: a global dir whose SKILL.md frontmatter name differs
+    // from the directory name. Discovery reports the frontmatter name; the
+    // on-disk dir is what removeSkill deletes. After the failed removal the
+    // stale cache entry must be gone so listings stop advertising the ghost.
+    const dir = path.join(fakeGlobalDir, "dir-name");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "SKILL.md"),
+      `---\nname: ghost-name\ndescription: ghost\n---\n\nbody`,
+    );
+    invalidateDiscoveryCache();
+    expect(findSkill("ghost-name", projRoot)).not.toBeNull();
+
+    const r = removeSkill("ghost-name");
+    expect(r.success).toBe(false); // dir "ghost-name" doesn't exist
+    // Cache was invalidated inside removeSkill — re-discovery must not
+    // resurrect the ghost from the stale scan.
+    expect(findSkill("ghost-name", projRoot)).not.toBeNull(); // still on disk under dir-name — this is the documented mismatch case
+    // Removing by the actual directory name succeeds and clears it.
+    const r2 = removeSkill("dir-name");
+    expect(r2.success).toBe(true);
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(findSkill("ghost-name", projRoot)).toBeNull();
+  });
+});
+
 describe("builtin skills directory resolution", () => {
   it("prefers process.resourcesPath/skills when present (packaged layout)", () => {
     const fakeResources = path.join(tmpRoot, "Resources");

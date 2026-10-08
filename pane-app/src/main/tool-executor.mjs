@@ -3032,7 +3032,13 @@ export class ToolExecutor {
           const outputParts = [
             `## Skill Activated: ${name}`,
             "",
-            body.instructions,
+            // SKILL.md can legitimately be large (2 MiB ceiling), but a tool
+            // result is one conversation turn — cap it like shell output
+            // (MAX_OUTPUT_SIZE) with a pointer to the full body on disk.
+            body.instructions.length > MAX_OUTPUT_SIZE
+              ? body.instructions.slice(0, MAX_OUTPUT_SIZE) +
+                `\n\n[...instructions truncated at ${MAX_OUTPUT_SIZE} chars — full body: ${body.skillPath}/SKILL.md]`
+              : body.instructions,
           ];
 
           // Include compose info if present
@@ -3049,7 +3055,12 @@ export class ToolExecutor {
           if (body.playbook) {
             outputParts.push("");
             outputParts.push("### Domain Principles");
-            outputParts.push(body.playbook);
+            outputParts.push(
+              body.playbook.length > MAX_OUTPUT_SIZE
+                ? body.playbook.slice(0, MAX_OUTPUT_SIZE) +
+                  `\n\n[...playbook truncated at ${MAX_OUTPUT_SIZE} chars — full file: ${body.skillPath}/playbook.md]`
+                : body.playbook,
+            );
           }
 
           // Missing compose requirements do not block activation, but they
@@ -3367,7 +3378,12 @@ export class ToolExecutor {
           if (body?.instructions) {
             parts.push("");
             parts.push("### Instructions");
-            parts.push(body.instructions);
+            parts.push(
+              body.instructions.length > MAX_OUTPUT_SIZE
+                ? body.instructions.slice(0, MAX_OUTPUT_SIZE) +
+                  `\n\n[...instructions truncated at ${MAX_OUTPUT_SIZE} chars — full body: ${meta.path}/SKILL.md]`
+                : body.instructions,
+            );
           }
 
           if (body?.compose) {
@@ -3384,7 +3400,12 @@ export class ToolExecutor {
           if (body?.playbook) {
             parts.push("");
             parts.push("### Domain Principles");
-            parts.push(body.playbook);
+            parts.push(
+              body.playbook.length > MAX_OUTPUT_SIZE
+                ? body.playbook.slice(0, MAX_OUTPUT_SIZE) +
+                  `\n\n[...playbook truncated at ${MAX_OUTPUT_SIZE} chars — full file: ${meta.path}/playbook.md]`
+                : body.playbook,
+            );
           }
 
           if (body?.tools) {
@@ -3400,7 +3421,12 @@ export class ToolExecutor {
           if (body?.modelPrefs) {
             parts.push("");
             parts.push("### Model Preferences");
-            parts.push(JSON.stringify(body.modelPrefs, null, 2));
+            const prefsJson = JSON.stringify(body.modelPrefs, null, 2);
+            parts.push(
+              prefsJson.length > MAX_OUTPUT_SIZE
+                ? prefsJson.slice(0, MAX_OUTPUT_SIZE) + `\n\n[...model-prefs.json truncated at ${MAX_OUTPUT_SIZE} chars]`
+                : prefsJson,
+            );
           }
 
           if (body?.resources?.length) {
