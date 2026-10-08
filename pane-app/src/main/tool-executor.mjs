@@ -64,8 +64,11 @@ import {
   loadSkill,
   buildSkillListing,
   installSkill,
+  removeSkill,
   ensureGlobalSkillsDir,
   readSkillResource,
+  parseSkillSource,
+  validateSkillName,
 } from "./skill-registry.mjs";
 import { mcpClient } from "./mcp-client.mjs";
 import {
@@ -117,6 +120,12 @@ export function onCmdWorkerExit() {
 /**
  * Execute a command through the cmd-worker utility process.
  * Returns a promise that resolves with { success, stdout, stderr, exitCode }.
+ *
+ * Two modes:
+ *   - string command (default): runs via `/bin/sh -c <command>` in the worker
+ *   - options.argv = [file, ...args]: runs with NO shell — spawn(file, args).
+ *     Use argv mode whenever any argument is not fully controlled by Pane:
+ *     it eliminates command-injection by construction.
  */
 export function execThroughWorker(command, options = {}) {
   return new Promise((resolve) => {
@@ -136,13 +145,15 @@ export function execThroughWorker(command, options = {}) {
     };
     _cmdWorker.on("message", handler);
 
-    _cmdWorker.postMessage({
+    const message = {
       id,
       command,
       cwd: options.cwd,
       env: options.env,
       timeout: options.timeout || 120,
-    });
+    };
+    if (options.argv) message.argv = options.argv;
+    _cmdWorker.postMessage(message);
 
     // Safety timeout — if worker never responds, reject
     const safeTimeout = setTimeout(() => {
@@ -3041,6 +3052,19 @@ export class ToolExecutor {
             outputParts.push(body.playbook);
           }
 
+          // Missing compose requirements do not block activation, but they
+          // must be visible — the skill may not fully work without them.
+          if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+            outputParts.push("");
+            outputParts.push("### ⚠ Unmet Requirements");
+            outputParts.push(
+              result.warnings.map((w) => `- ${w}`).join("\n"),
+            );
+            outputParts.push(
+              "The skill activated, but it declares requirements that are not active. Activate them too if this skill misbehaves.",
+            );
+          }
+
           // Include tool info if present
           if (body.tools) {
             outputParts.push("");
@@ -3140,55 +3164,78 @@ export class ToolExecutor {
 
           const renameTo = (input.name || "").trim() || null;
 
-          // Handle github: URLs
-          if (url.startsWith("github:")) {
-            const githubPath = url.slice(7);
-            const parts = githubPath.split("/");
-            if (parts.length < 3) {
-              return { success: false, error: "GitHub path must be: github:owner/repo/path/to/skill", toolId };
-            }
-
-            const owner = parts[0];
-            const repo = parts[1];
-            const skillPath = parts.slice(2).join("/");
-            const repoUrl = `https://github.com/${owner}/${repo}.git`;
-
-            const tmpDir = path.join(os.tmpdir(), `pane-skill-${repo}-${Date.now()}`);
-
-            try {
-              execSync(`git clone --depth 1 "${repoUrl}" "${tmpDir}"`, {
-                stdio: "pipe",
-                timeout: 30_000,
-              });
-            } catch (err) {
-              return { success: false, error: `Failed to clone repo: ${err.message}`, toolId };
-            }
-
-            const skillDir = path.join(tmpDir, skillPath);
-            if (!fs.existsSync(skillDir)) {
-              try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
-              return { success: false, error: `Skill path "${skillPath}" not found in repo.`, toolId };
-            }
-
-            const skillName = renameTo || parts[parts.length - 1];
-            ensureGlobalSkillsDir();
-            const result = installSkill(skillDir, skillName);
-
-            try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
-
-            if (!result.success) {
-              return { success: false, error: result.error, toolId };
-            }
-
+          // Validate the whole source at the boundary — every component that
+          // reaches a path or a child process is charset-checked here. The
+          // old code interpolated owner/repo into an execSync template string
+          // (double quotes do not stop $(...) substitution) and joined a
+          // model-supplied rename straight onto the global skills dir.
+          const source = parseSkillSource(url);
+          if (source.error) {
+            return { success: false, error: source.error, toolId };
+          }
+          if (renameTo !== null && !validateSkillName(renameTo)) {
             return {
-              success: true,
-              output: `## Skill Installed: ${result.name}\n\nInstalled from \`${url}\` to ~/.pane/skills/${result.name}/\n\nUse \`pane_list_skills\` to see all available skills, and \`activate_skill\` to load it.`,
+              success: false,
+              error: `Invalid skill name "${renameTo}" — use letters, digits, ".", "_", "-"; no traversal, separators, or shell syntax.`,
               toolId,
             };
           }
 
+          // Handle github: URLs
+          if (source.kind === "github") {
+            const { owner, repo, skillPath } = source;
+            const repoUrl = `https://github.com/${owner}/${repo}.git`;
+            const tmpDir = path.join(os.tmpdir(), `pane-skill-${repo}-${Date.now()}`);
+
+            // Clone through the cmd-worker in argv mode — no shell, so no
+            // injection surface, and it works in the packaged app where
+            // main-process execSync hits the Chromium/libuv EBADF conflict
+            // (see the comment atop executeBash). Also non-blocking.
+            let cloneResult;
+            try {
+              cloneResult = await execThroughWorker("", {
+                argv: ["git", "clone", "--depth", "1", repoUrl, tmpDir],
+                timeout: 60,
+              });
+            } catch (err) {
+              try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+              return { success: false, error: `Failed to clone repo: ${err.message}`, toolId };
+            }
+            if (!cloneResult.success) {
+              try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+              const why = cloneResult.stderr || cloneResult.stdout || cloneResult.errorMessage || "git clone failed";
+              return {
+                success: false,
+                error: `Failed to clone ${repoUrl}: ${why}${/not found|does not exist|Authentication/i.test(why) ? " (check that the repo exists and is public)" : ""}`,
+                toolId,
+              };
+            }
+
+            try {
+              const skillDir = path.join(tmpDir, skillPath);
+              if (!fs.existsSync(skillDir)) {
+                return { success: false, error: `Skill path "${skillPath}" not found in repo.`, toolId };
+              }
+
+              const skillName = renameTo || skillPath.split("/").pop();
+              ensureGlobalSkillsDir();
+              const result = installSkill(skillDir, skillName);
+              if (!result.success) {
+                return { success: false, error: result.error, toolId };
+              }
+
+              return {
+                success: true,
+                output: `## Skill Installed: ${result.name}\n\nInstalled from \`${url}\` to ~/.pane/skills/${result.name}/\n\nUse \`pane_list_skills\` to see all available skills, and \`activate_skill\` to load it.`,
+                toolId,
+              };
+            } finally {
+              try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+            }
+          }
+
           // Local directory path
-          const resolved = path.resolve(url);
+          const resolved = path.resolve(source.localPath);
           if (!fs.existsSync(resolved)) {
             return { success: false, error: `Path "${resolved}" does not exist.`, toolId };
           }
@@ -3205,6 +3252,44 @@ export class ToolExecutor {
           return {
             success: true,
             output: `## Skill Installed: ${result.name}\n\nInstalled from \`${resolved}\` to ~/.pane/skills/${result.name}/\n\nUse \`pane_list_skills\` to see all available skills, and \`activate_skill\` to load it.`,
+            toolId,
+          };
+        }
+
+        case "pane_uninstall_skill": {
+          const name = (input.name || "").trim();
+          if (!name) return { success: false, error: "Skill name is required.", toolId };
+          if (!validateSkillName(name)) {
+            return { success: false, error: `Invalid skill name "${name}" — use letters, digits, ".", "_", "-".`, toolId };
+          }
+
+          // Never uninstall built-ins or project-local skills — those are
+          // part of Pane / the repo and are not managed by this tool.
+          const meta = findSkill(name, this.projectRoot);
+          if (meta?.source === "builtin") {
+            return { success: false, error: `"${name}" is a built-in Pane skill and cannot be uninstalled. Only skills installed to ~/.pane/skills/ can be removed.`, toolId };
+          }
+          if (meta?.source === "project") {
+            return { success: false, error: `"${name}" is a project-local skill (${meta.path}) — delete that directory from the repo to remove it. pane_uninstall_skill only removes ~/.pane/skills/ installs.`, toolId };
+          }
+
+          const result = removeSkill(name);
+          if (!result.success) {
+            return { success: false, error: result.error, toolId };
+          }
+
+          // An uninstalled skill can no longer be active — drop it everywhere.
+          deactivateSkill(this.projectId, name);
+          try {
+            const current = readState(this.projectId)?.activeSkills || [];
+            mergeState(this.projectId, {
+              activeSkills: current.filter((s) => s.toLowerCase() !== name.toLowerCase()),
+            });
+          } catch { /* best-effort persist */ }
+
+          return {
+            success: true,
+            output: `## Skill Uninstalled: ${name}\n\nRemoved from ~/.pane/skills/${name}/ and deactivated if it was active. Use \`pane_list_skills\` to see what remains.`,
             toolId,
           };
         }
@@ -3258,9 +3343,11 @@ export class ToolExecutor {
 
           const meta = findSkill(name, this.projectRoot);
           if (!meta) {
+            // Failure, not a success-shaped "not found" — keeps the tool
+            // protocol honest for callers that branch on `success`.
             return {
-              success: true,
-              output: `Skill "${name}" not found. Use pane_list_skills to see available skills.`,
+              success: false,
+              error: `Skill "${name}" not found. Use pane_list_skills to see available skills.`,
               toolId,
             };
           }

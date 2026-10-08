@@ -103,6 +103,28 @@ function runCommand({ id, command, cwd, env, timeout }) {
     stdio: ["pipe", "pipe", "pipe"],
     shell: true,
   });
+  runChild(id, child, timeout);
+}
+
+/**
+ * Run a single command in argv mode — spawn(file, args) with NO shell.
+ * Used when any argument is not fully controlled by Pane (e.g. the
+ * github:owner/repo components of pane_install_skill): no shell means no
+ * command-injection surface by construction.
+ */
+function runArgv({ id, argv, cwd, env, timeout }) {
+  const [file, ...args] = argv;
+  const child = spawn(file, args, {
+    cwd: cwd || process.cwd(),
+    env: { ...getEnvWithPath(), ...(env || {}) },
+    stdio: ["pipe", "pipe", "pipe"],
+    shell: false,
+  });
+  runChild(id, child, timeout);
+}
+
+/** Shared child lifecycle for runCommand/runArgv: buffers, caps, timeout. */
+function runChild(id, child, timeout) {
 
   activeChildren.set(id, child);
 
@@ -217,7 +239,16 @@ function drain() {
   while (running < MAX_CONCURRENT && backlog.length > 0) {
     const entry = backlog.shift();
     running++;
-    runCommand(entry);
+    startEntry(entry);
+  }
+}
+
+/** Start a backlogged/fresh entry in whichever mode it specifies. */
+function startEntry(data) {
+  if (Array.isArray(data.argv) && data.argv.length > 0) {
+    runArgv(data);
+  } else {
+    runCommand(data);
   }
 }
 
@@ -255,15 +286,16 @@ process.parentPort.on("message", (msg) => {
     return;
   }
 
-  const { id, command } = data;
+  const { id, command, argv } = data;
+  const isArgv = Array.isArray(argv) && argv.length > 0;
 
-  if (!id || typeof command !== "string") {
+  if (!id || (!isArgv && typeof command !== "string") || (isArgv && typeof argv[0] !== "string")) {
     try {
       process.parentPort.postMessage({
         type: "result",
         id: id || null,
         success: false,
-        errorMessage: `Invalid command: ${typeof command}`,
+        errorMessage: `Invalid command: ${isArgv ? "argv[0] must be a string" : typeof command}`,
       });
     } catch (_) {
       // parentPort may be closed — nothing we can do
@@ -274,7 +306,7 @@ process.parentPort.on("message", (msg) => {
   // Normal command execution
   if (running < MAX_CONCURRENT) {
     running++;
-    runCommand(data);
+    startEntry(data);
   } else {
     backlog.push(data);
   }

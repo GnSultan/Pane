@@ -21,7 +21,8 @@
  *
  *   1. Project-local:  <project-root>/.pane/skills/
  *   2. User-global:    ~/.pane/skills/
- *   3. Pane built-in:  <pane-app>/skills/
+ *   3. Pane built-in:  <Resources>/skills/ (packaged) or <pane-app>/skills/ (dev)
+ *                      — see resolveBuiltinSkillsDir()
  *
  * ## Composition model
  *
@@ -58,10 +59,44 @@ const DEFAULT_GLOBAL_SKILLS_DIR = path.join(PANE_DIR, "skills");
 
 // Resolve pane-app root: <pane-app>/src/main/skill-registry.mjs → <pane-app>
 const PANE_APP_ROOT = path.resolve(__dirname, "..", "..");
-const BUILTIN_SKILLS_DIR = path.join(PANE_APP_ROOT, "skills");
+const DEV_BUILTIN_SKILLS_DIR = path.join(PANE_APP_ROOT, "skills");
+
+/**
+ * Resolve the built-in skills directory.
+ *
+ * Packaged app: electron-builder ships skills/ via extraResources →
+ *   <app>/Contents/Resources/skills — this is where it lives in the dmg
+ *   (app.asar does not contain <root>/skills; the dev path does not exist
+ *   there, and the builtin layer silently vanished in production before
+ *   this check existed).
+ * Development: <pane-app>/skills.
+ *
+ * Same pattern as model-paths.mjs resolveModelCache().
+ *
+ * @returns {string}
+ */
+export function resolveBuiltinSkillsDir() {
+  if (process.resourcesPath) {
+    const bundled = path.join(process.resourcesPath, "skills");
+    try {
+      if (fs.existsSync(bundled)) return bundled;
+    } catch { /* unreadable — fall through to dev path */ }
+  }
+  return DEV_BUILTIN_SKILLS_DIR;
+}
 
 // Mutable so tests can redirect installs away from the real ~/.pane/skills.
 let GLOBAL_SKILLS_DIR = DEFAULT_GLOBAL_SKILLS_DIR;
+
+// ── Hard limits (adversarial-package defense) ───────────────────────────────
+// Skills are installable from arbitrary GitHub repos by the agent. Nothing
+// downstream assumes good faith: file sizes are capped at the boundaries
+// where untrusted bytes enter (discovery scan, body load, resource read),
+// and the in-memory caches are bounded so long sessions can't grow without
+// limit.
+const MAX_SKILL_MD_BYTES = 2 * 1024 * 1024;   // 2 MiB — SKILL.md is prose
+const MAX_RESOURCE_BYTES = 256 * 1024;        // companion file → model context
+const MAX_BODY_CACHE_ENTRIES = 64;
 
 // Known skill subdirectories within a skill package
 const SKILL_FILES = {
@@ -110,7 +145,9 @@ function _notifyActiveSkillsChanged(projectId) {
 // skill (pane_install_skill, manual copy, external edit) changes the file, and a
 // stale body must never be served for an activation. Discovery-cache
 // invalidation alone does not reach this cache — the mtime check makes the two
-// caches independently correct.
+// caches independently correct. Bounded at MAX_BODY_CACHE_ENTRIES (oldest
+// insertion evicted) so a long session across many projects can't grow it
+// without limit.
 const _bodyCache = new Map();
 
 // ---------------------------------------------------------------------------
@@ -169,12 +206,15 @@ const _bodyCache = new Map();
  * Throws if no valid frontmatter is found.
  */
 function parseFrontmatter(content) {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  // Strip a UTF-8 BOM — editors emit it, and it would otherwise break the
+  // opening `---` match and reject the whole SKILL.md.
+  const text = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   if (!match?.[1]) {
     throw new Error("No YAML frontmatter found in SKILL.md");
   }
   const raw = match[1].trim();
-  const body = content.slice(match[0].length).trim();
+  const body = text.slice(match[0].length).trim();
 
   // Minimal YAML parser — handles the simple key: value and key: [array] subset
   const frontmatter = {};
@@ -212,6 +252,75 @@ function parseFrontmatter(content) {
   }
 
   return { frontmatter, body };
+}
+
+/**
+ * Validate a skill name used as a path component (install rename, remove,
+ * global directory name). Refuses traversal (".."), absolute-looking names,
+ * separators, hidden names, shell metacharacters, and overlong strings.
+ *
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function validateSkillName(name) {
+  return (
+    typeof name === "string" &&
+    name.length >= 1 &&
+    name.length <= 64 &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) &&
+    !name.endsWith(".") // blocks ".." and "foo.." edge cases explicitly
+  );
+}
+
+// Charset for owner/repo/path components of a github: skill source. Same
+// class as validateSkillName minus the leading-alpha requirement (repo
+// folders like "01-skill" are legal). Shell metacharacters, whitespace,
+// separators, and traversal segments are all excluded by construction —
+// whatever passes here is safe to interpolate into a command line even
+// though the clone runs argv-mode (no shell) anyway.
+const GITHUB_COMPONENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Parse and validate a model-supplied skill source (pane_install_skill).
+ * Returns a discriminated result; every component that reaches a path or a
+ * child process is charset-validated here, at the boundary, before use.
+ *
+ *   github:owner/repo/path/to/skill  →  { kind: "github", owner, repo, skillPath }
+ *   /local/dir or relative/dir       →  { kind: "local", localPath }
+ *   anything else                    →  { error }
+ *
+ * @param {string} raw
+ * @returns {{ kind?: "github"|"local", owner?: string, repo?: string, skillPath?: string, localPath?: string, error?: string }}
+ */
+export function parseSkillSource(raw) {
+  const url = typeof raw === "string" ? raw.trim() : "";
+  if (!url) return { error: "Skill source is empty. Use github:owner/repo/path/to/skill or a local directory path." };
+
+  if (url.startsWith("github:")) {
+    const parts = url.slice("github:".length).split("/");
+    if (parts.length < 3 || parts.some((p) => !p)) {
+      return { error: "GitHub path must be: github:owner/repo/path/to/skill" };
+    }
+    const [owner, repo, ...rest] = parts;
+    if (!GITHUB_COMPONENT_RE.test(owner)) {
+      return { error: `Invalid GitHub owner "${owner}" — allowed: letters, digits, ".", "_", "-" (no shell syntax, no traversal).` };
+    }
+    if (!GITHUB_COMPONENT_RE.test(repo)) {
+      return { error: `Invalid GitHub repo "${repo}" — allowed: letters, digits, ".", "_", "-" (no shell syntax, no traversal).` };
+    }
+    for (const seg of rest) {
+      if (seg === "." || seg === ".." || !GITHUB_COMPONENT_RE.test(seg)) {
+        return { error: `Invalid path segment "${seg}" in skill path — no traversal (".."), no shell syntax, no separators.` };
+      }
+    }
+    return { kind: "github", owner, repo, skillPath: rest.join("/") };
+  }
+
+  // Local path — must not be a URL scheme we don't support
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)) {
+    return { error: `Unsupported skill source "${url}". Use github:owner/repo/path/to/skill or a local directory path.` };
+  }
+  return { kind: "local", localPath: url };
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +379,9 @@ function scanDirectory(dir, source, projectRoot = null) {
     return skills; // Directory doesn't exist — not an error
   }
 
+  // Deterministic order regardless of filesystem readdir behavior.
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
 
@@ -277,6 +389,22 @@ function scanDirectory(dir, source, projectRoot = null) {
     const skillFile = path.join(skillDir, SKILL_FILES.instructions);
 
     try {
+      // Size guard BEFORE the read: an adversarial package must not be able
+      // to force a multi-gigabyte read through discovery.
+      let size = 0;
+      try {
+        size = fs.statSync(skillFile).size;
+      } catch (statErr) {
+        if (statErr.code === "ENOENT") continue; // no SKILL.md — skip silently
+        throw statErr;
+      }
+      if (size > MAX_SKILL_MD_BYTES) {
+        console.warn(
+          `[skills] Skipping ${skillDir}: SKILL.md is ${size} bytes (limit ${MAX_SKILL_MD_BYTES})`,
+        );
+        continue;
+      }
+
       const content = fs.readFileSync(skillFile, "utf-8");
       const { frontmatter } = parseFrontmatter(content);
       const errors = validateFrontmatter(frontmatter);
@@ -295,10 +423,8 @@ function scanDirectory(dir, source, projectRoot = null) {
         ...(projectRoot ? { projectRoot } : {}),
       });
     } catch (err) {
-      // No SKILL.md or invalid — skip silently unless it's a parse error
-      if (err.code !== "ENOENT") {
-        console.warn(`[skills] Error reading ${skillFile}: ${err.message}`);
-      }
+      // Invalid frontmatter etc. — skip with a warning (ENOENT handled above)
+      console.warn(`[skills] Error reading ${skillFile}: ${err.message}`);
     }
   }
 
@@ -346,8 +472,9 @@ export function discoverAll(projectRoot = null) {
     }
   }
 
-  // Layer 3: Pane built-in (lowest priority)
-  const builtinSkills = scanDirectory(BUILTIN_SKILLS_DIR, "builtin");
+  // Layer 3: Pane built-in (lowest priority) — resolves to the packaged
+  // resources dir in production, <pane-app>/skills in development.
+  const builtinSkills = scanDirectory(resolveBuiltinSkillsDir(), "builtin");
   for (const skill of builtinSkills) {
     if (!seen.has(skill.name)) {
       seen.set(skill.name, skill);
@@ -424,25 +551,68 @@ function collectResources(skillDir) {
 
 /**
  * Read a companion resource file from a skill package, resolved against the
- * skill root. Only paths that escape the skill root are refused.
+ * skill root. Two containment checks, both required:
+ *
+ *   1. Lexical — the resolved path string must sit under the skill root.
+ *   2. Realpath — the file's real location (symlinks resolved) must also sit
+ *      under the skill root's real location. Without this, a skill shipped by
+ *      an untrusted repo can bundle `references/creds -> ~/.ssh/id_rsa` and
+ *      route "Read references/creds": the path string is contained, the read
+ *      is not.
+ *
+ * Oversized files are truncated with a visible marker rather than refused —
+ * a big reference file is usually legitimate, and the agent stays functional
+ * either way.
  *
  * @param {string} skillName
  * @param {string} relativePath - e.g. "references/voice.md"
  * @param {string} [projectRoot]
- * @returns {{ success: boolean, error?: string, content?: string, absolutePath?: string }}
+ * @returns {{ success: boolean, error?: string, content?: string, absolutePath?: string, truncated?: boolean }}
  */
 export function readSkillResource(skillName, relativePath, projectRoot = null) {
   const meta = findSkill(skillName, projectRoot);
   if (!meta) {
     return { success: false, error: `Skill "${skillName}" not found.` };
   }
+
+  // 1. Lexical containment
   const abs = path.resolve(meta.path, relativePath);
   if (!abs.startsWith(meta.path + path.sep)) {
     return { success: false, error: `Refusing to read outside skill directory: ${relativePath}` };
   }
+
+  // 2. Realpath containment — symlinks resolved on both sides
   try {
-    const content = fs.readFileSync(abs, "utf-8");
-    return { success: true, content, absolutePath: abs };
+    const realSkillRoot = fs.realpathSync(meta.path);
+    const realTarget = fs.realpathSync(abs);
+    if (!realTarget.startsWith(realSkillRoot + path.sep)) {
+      return {
+        success: false,
+        error: `Refusing to read outside skill directory: "${relativePath}" resolves (symlink) outside the skill root.`,
+      };
+    }
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return {
+        success: false,
+        error: `Resource "${relativePath}" could not be read from skill "${skillName}" (ENOENT). Check pane_skill_info for the skill's resource list — the file may be missing from this install.`,
+      };
+    }
+    return {
+      success: false,
+      error: `Resource "${relativePath}" could not be read from skill "${skillName}" (${err.code || err.message}). Check pane_skill_info for the skill's resource list.`,
+    };
+  }
+
+  try {
+    let content = fs.readFileSync(abs, "utf-8");
+    let truncated = false;
+    if (Buffer.byteLength(content, "utf-8") > MAX_RESOURCE_BYTES) {
+      content = Buffer.from(content, "utf-8").subarray(0, MAX_RESOURCE_BYTES).toString("utf-8");
+      content += `\n\n[...resource truncated at ${MAX_RESOURCE_BYTES} bytes — read the file directly with a file-read tool if you need the rest]`;
+      truncated = true;
+    }
+    return { success: true, content, absolutePath: abs, truncated };
   } catch (err) {
     return {
       success: false,
@@ -476,7 +646,14 @@ export function loadSkill(name, projectRoot = null) {
   const skillFile = path.join(meta.path, SKILL_FILES.instructions);
   let mtimeMs = 0;
   try {
-    mtimeMs = fs.statSync(skillFile).mtimeMs;
+    const st = fs.statSync(skillFile);
+    if (st.size > MAX_SKILL_MD_BYTES) {
+      console.warn(
+        `[skills] Refusing to load ${name}: SKILL.md is ${st.size} bytes (limit ${MAX_SKILL_MD_BYTES})`,
+      );
+      return null;
+    }
+    mtimeMs = st.mtimeMs;
   } catch {
     // stat failed — fall through; the read below surfaces the real error
   }
@@ -541,6 +718,11 @@ export function loadSkill(name, projectRoot = null) {
     body.modelPrefs = null;
   }
 
+  // Bound the cache — oldest insertion evicted first (Map preserves order).
+  if (_bodyCache.size >= MAX_BODY_CACHE_ENTRIES) {
+    const oldest = _bodyCache.keys().next().value;
+    _bodyCache.delete(oldest);
+  }
   _bodyCache.set(cacheKey, { body, mtimeMs });
   return body;
 }
@@ -636,10 +818,16 @@ export function hydrateActiveSkills(projectId, skillNames) {
 
 /**
  * Activate a skill for a project.
+ * Compose conflicts are enforced (documented in compose.json and surfaced by
+ * pane_skill_info: "skills that cannot be active simultaneously") — the
+ * activation is refused and nothing is added to the active set. Missing
+ * requirements do NOT block activation; they come back as `warnings` so the
+ * caller can surface them (a partial stack is often intentional).
+ *
  * @param {string} projectId
  * @param {string} skillName
  * @param {string} [projectRoot] - Project root for project-local skill resolution
- * @returns {{ success: boolean, error?: string, body?: SkillBody }}
+ * @returns {{ success: boolean, error?: string, warnings?: string[], body?: SkillBody }}
  */
 export function activateSkill(projectId, skillName, projectRoot = null) {
   const body = loadSkill(skillName, projectRoot);
@@ -647,13 +835,27 @@ export function activateSkill(projectId, skillName, projectRoot = null) {
     return { success: false, error: `Skill "${skillName}" not found. Use pane_list_skills to see available skills.` };
   }
 
-  if (!_activeSkills.has(projectId)) {
-    _activeSkills.set(projectId, new Set());
+  // Enforce compose conflicts against the currently active set (this skill
+  // included). validateComposition loads bodies again, but they're cached.
+  const existing = _activeSkills.get(projectId) || new Set();
+  const candidate = new Set([...existing, skillName.toLowerCase()]);
+  const composition = validateComposition([...candidate], projectRoot);
+  if (composition.conflicts.length > 0) {
+    return {
+      success: false,
+      error: `Cannot activate "${skillName}": ${composition.conflicts.join("; ")}. Deactivate the conflicting skill first (deactivate_skill).`,
+    };
   }
-  _activeSkills.get(projectId).add(skillName.toLowerCase());
+
+  if (!existing.size) _activeSkills.set(projectId, existing);
+  existing.add(skillName.toLowerCase());
   _notifyActiveSkillsChanged(projectId);
 
-  return { success: true, body };
+  return {
+    success: true,
+    body,
+    warnings: composition.missingRequirements,
+  };
 }
 
 /**
@@ -791,6 +993,11 @@ export function ensureGlobalSkillsDir() {
  * Install a skill from a source directory into the global skills directory.
  * Simple copy — no git/npm resolution yet.
  *
+ * Trust boundary: `renameTo` and the frontmatter name both become path
+ * components under ~/.pane/skills and are validated with validateSkillName
+ * (no traversal, no separators, no shell syntax). compose.json, when present,
+ * must parse. Oversized SKILL.md is refused.
+ *
  * @param {string} sourceDir - Source skill directory (must contain SKILL.md)
  * @param {string} [renameTo] - Optional rename of the skill directory
  * @returns {{ success: boolean, error?: string, name?: string }}
@@ -799,11 +1006,46 @@ export function installSkill(sourceDir, renameTo = null) {
   // Verify source has SKILL.md
   const sourceSkillFile = path.join(sourceDir, SKILL_FILES.instructions);
   try {
+    // Names become path components under the global skills dir — validate
+    // before any join, and refuse anything that could escape it.
+    if (renameTo !== null && !validateSkillName(renameTo)) {
+      return { success: false, error: `Invalid skill name "${renameTo}" — use letters, digits, ".", "_", "-"; no traversal, separators, or shell syntax.` };
+    }
+
+    let size = 0;
+    try {
+      size = fs.statSync(sourceSkillFile).size;
+    } catch (statErr) {
+      return { success: false, error: `Failed to install skill: source has no readable SKILL.md (${statErr.code || statErr.message})` };
+    }
+    if (size > MAX_SKILL_MD_BYTES) {
+      return { success: false, error: `Failed to install skill: SKILL.md is too large (${size} bytes, limit ${MAX_SKILL_MD_BYTES}).` };
+    }
+
     const content = fs.readFileSync(sourceSkillFile, "utf-8");
     const { frontmatter } = parseFrontmatter(content);
     const errors = validateFrontmatter(frontmatter);
     if (errors.length > 0) {
       return { success: false, error: `Invalid SKILL.md: ${errors.join(", ")}` };
+    }
+    if (!validateSkillName(frontmatter.name)) {
+      return { success: false, error: `Invalid skill name "${frontmatter.name}" in SKILL.md frontmatter — use letters, digits, ".", "_", "-" (no traversal, separators, or shell syntax).` };
+    }
+
+    // compose.json is optional, but a present-but-unparseable one is a broken
+    // package: refuse at the boundary instead of silently degrading to null.
+    const composePath = path.join(sourceDir, SKILL_FILES.compose);
+    try {
+      fs.accessSync(composePath);
+      const compose = JSON.parse(fs.readFileSync(composePath, "utf-8"));
+      const composeErrors = validateCompose(compose);
+      if (composeErrors.length > 0) {
+        return { success: false, error: `Invalid compose.json: ${composeErrors.join(", ")}` };
+      }
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        return { success: false, error: `Invalid compose.json: ${err.message}` };
+      }
     }
 
     const skillName = renameTo || frontmatter.name;
@@ -828,12 +1070,23 @@ export function installSkill(sourceDir, renameTo = null) {
 }
 
 /**
- * Remove a skill from the global skills directory.
+ * Remove a skill from the global skills directory. Never touches
+ * project-local or built-in skills. The name is validated (validateSkillName)
+ * and the resolved destination re-checked for containment — this function
+ * recursively deletes, so it must never be able to point outside the global
+ * skills dir.
+ *
  * @param {string} skillName
  * @returns {{ success: boolean, error?: string }}
  */
 export function removeSkill(skillName) {
+  if (!validateSkillName(skillName)) {
+    return { success: false, error: `Invalid skill name "${skillName}" — refusing to remove.` };
+  }
   const skillDir = path.join(GLOBAL_SKILLS_DIR, skillName);
+  if (!skillDir.startsWith(GLOBAL_SKILLS_DIR + path.sep)) {
+    return { success: false, error: `Refusing to remove a directory outside the global skills dir: ${skillName}` };
+  }
   try {
     fs.rmSync(skillDir, { recursive: true, force: true });
     invalidateDiscoveryCache();
@@ -866,12 +1119,19 @@ export const __test = {
   parseFrontmatter,
   validateFrontmatter,
   validateCompose,
+  validateSkillName,
+  parseSkillSource,
   scanDirectory,
+  resolveBuiltinSkillsDir,
+  bodyCacheSize: () => _bodyCache.size,
+  MAX_SKILL_MD_BYTES,
+  MAX_RESOURCE_BYTES,
+  MAX_BODY_CACHE_ENTRIES,
   get GLOBAL_SKILLS_DIR() { return GLOBAL_SKILLS_DIR; },
   setGlobalSkillsDir(dir) {
     GLOBAL_SKILLS_DIR = dir;
     invalidateDiscoveryCache();
     _bodyCache.clear();
   },
-  BUILTIN_SKILLS_DIR,
+  BUILTIN_SKILLS_DIR: DEV_BUILTIN_SKILLS_DIR,
 };

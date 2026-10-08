@@ -1404,6 +1404,24 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "pane_uninstall_skill",
+      description:
+        "Uninstall a skill that was installed to ~/.pane/skills/ (e.g. via pane_install_skill). Removes its directory and deactivates it if active. Built-in Pane skills and project-local skills (.pane/skills/ in the repo) cannot be uninstalled this way — only global installs.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "The name of the installed skill to remove",
+          },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "pane_lens_findings",
       description:
         "Interact with Lens punk findings — the background code analysts that watch the codebase. Use 'list' to read all undismissed findings grouped by punk. Use 'resolve' to mark findings as resolved after fixing them. Use 'run' to trigger a specific punk with an optional task directive.",
@@ -1503,6 +1521,7 @@ const WRITE_TOOL_NAMES = new Set([
   "activate_skill",
   "deactivate_skill",
   "pane_install_skill",
+  "pane_uninstall_skill",
   "save_memory",
 ]);
 
@@ -1523,6 +1542,16 @@ function getToolsForPhase(phase) {
 // Anthropic and the OpenAI-compatible providers accept large arrays, so the
 // cap is only applied when needed — never a silent global degradation.
 export const OPENAI_TOOLS_CAP = 128;
+
+/**
+ * Read-only access to the built-in tool definitions — for tests that pin the
+ * agent-facing tool surface (names + required params must stay in lockstep
+ * with tool-executor's switch). The array itself stays module-private so
+ * callers can't mutate it from outside.
+ */
+export function getBuiltinToolDefinitions() {
+  return TOOL_DEFINITIONS;
+}
 
 /**
  * Deterministically reduce a tool list to at most `cap` entries, dropping

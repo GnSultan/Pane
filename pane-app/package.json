@@ -63,6 +63,13 @@
         ]
       },
       {
+        "from": "skills/",
+        "to": "skills",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "electron/assets/sounds/",
         "to": "assets/sounds",
         "filter": [
