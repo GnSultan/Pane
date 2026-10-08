@@ -599,7 +599,7 @@ export const LazyHighlightedCode = memo(function LazyHighlightedCode({
 
 // --- Block rendering ---
 
-const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|pane_directory|pane_checkpoint|pane_delegate|activate_skill|save_memory|web_fetch|read|write|edit|grep|bash|search|todo|task|Claude CLI|Gemini CLI";
+const TOOL_NAMES = "read_file|write_file|replace|run_shell_command|glob|grep_search|google_web_search|TodoWrite|Task|pane_directory|pane_checkpoint|pane_delegate|activate_skill|deactivate_skill|save_memory|web_fetch|read|write|edit|grep|bash|search|todo|task";
 const PATH_REGEX = new RegExp(`(?:^|\\s)((?:(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\.[a-zA-Z0-9]{1,10}|(?:\\.?\\.?\\/|~|(?:[\\w.@-]+\\/)+)[\\w.@-]+\\/?|[\\w.@-]+\\.[a-zA-Z0-9]{2,10}|${TOOL_NAMES})(?::)?)`, "g");
 const SPECIAL_REGEX = new RegExp(`^(?:\\.?\\.?\\/|~|[a-zA-Z]:\\\\|(?:[\\w.@-]+\\/)+)[^\\s]*$|^[\\w.@-]+\\.[a-zA-Z0-9]{1,10}$|^\\.[a-zA-Z][a-zA-Z0-9_.-]*$|^(?:${TOOL_NAMES})(?::)?$`);
 

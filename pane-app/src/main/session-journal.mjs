@@ -69,6 +69,7 @@ function defaultState() {
     lastIntent: null,
     startedAt: Date.now(),
     phase: "idle",
+    activeSkills: [],
   };
 }
 
@@ -176,6 +177,7 @@ export function applyMergeDelta(state, delta) {
   if (delta.lastIntent)              state.lastIntent = delta.lastIntent;
   if (delta.gitStatus !== undefined) state.gitStatus = delta.gitStatus;
   if (delta.phase)                   state.phase = delta.phase;
+  if (delta.activeSkills)            state.activeSkills = delta.activeSkills;
 
   return state;
 }

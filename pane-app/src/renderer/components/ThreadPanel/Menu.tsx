@@ -81,12 +81,12 @@ function ChangeHistoryIcon() {
 }
 
 function MenuTriggerIcon() {
-  // Three horizontal bars, left-aligned, longest at top — suggesting a menu.
+  // Three vertical dots — quiet, minimal trigger.
   return (
-    <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M2 4.5h12" />
-      <path d="M2 8h9" />
-      <path d="M2 11.5h6" />
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" stroke="none">
+      <circle cx="8" cy="3.5" r="1.5" />
+      <circle cx="8" cy="8" r="1.5" />
+      <circle cx="8" cy="12.5" r="1.5" />
     </svg>
   );
 }
@@ -197,7 +197,7 @@ export function Menu({ currentMode, isGitRepo, hasUnreadLens, onSelectMode }: Me
         /* Icon button — only visible when closed */
         <button
           onClick={handleToggle}
-          className="pointer-events-auto w-8 h-8 flex items-center justify-center rounded-md text-pane-text-secondary hover:text-pane-text transition-colors btn-press"
+          className="pointer-events-auto w-6 h-6 flex items-center justify-center rounded-md text-pane-text-secondary/50 hover:text-pane-text-secondary transition-colors btn-press"
           title="modes"
         >
           <MenuTriggerIcon />

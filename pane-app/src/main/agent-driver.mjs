@@ -83,10 +83,9 @@ const STALL_ERROR_THRESHOLD = 3; // Same error appearing this many times
 // ── Provider mapping for API backend routing ─────────────────────────────────
 // Agent tools (goal_complete, agent_report_progress, agent_needs_input,
 // agent_checkpoint) are only defined in http-backend.mjs's TOOL_DEFINITIONS.
-// The CLI backend (claude-cli, gemini-cli) does NOT have these tools.
 // Agent spawns MUST route to the API backend.
 //
-// Map CLI providers to their API variants:
+// Map raw provider names to their API backend variants:
 const API_PROVIDER_MAP = {
   "anthropic": "anthropic-api",
   "gemini": "gemini-api",
