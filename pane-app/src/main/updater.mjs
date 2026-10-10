@@ -7,7 +7,10 @@
 // - All state reaches the renderer as push events on "pane://update-status"
 //   (push channels are ungated by design — no preload change needed).
 // - Handlers register inside initUpdater(), which main.mjs calls BEFORE
-//   createWindow — so the IPC allowlist snapshot includes them.
+//   createWindow — so the IPC allowlist snapshot includes them. They register
+//   in dev too (with honest "dev" responses): the allowlist is built from
+//   actual registrations, so a channel the renderer can invoke in one mode
+//   must be registered in every mode. Only the feed machinery is dev-skipped.
 // - macOS: electron-updater cannot auto-install a Developer-ID-signed
 //   mac app unless the build is actually signed (build:mac currently
 //   strips native-module signatures, no signing identity in CI). On mac
@@ -42,15 +45,51 @@ function pushStatus(status) {
 }
 
 let initialized = false;
+let devMode = false;
 
 export function initUpdater() {
   if (initialized) return;
   initialized = true;
 
-  // Never run the update machinery for a dev run — local builds have no
+  // Channels register in EVERY mode. The IPC allowlist snapshot (taken at
+  // createWindow) is built from actual ipcMain.handle registrations — if the
+  // renderer can invoke a channel in one mode, it must be registered there.
+  // In dev the handlers answer with honest state; only the feed machinery
+  // (events, timers, autoUpdater) is skipped, because a local build has no
   // feed and autoUpdater would just error.
+  ipcMain.handle("update:check", async () => {
+    if (devMode) return { ok: true, devMode: true };
+    try {
+      const result = await autoUpdater.checkForUpdates();
+      return { ok: true, version: result?.updateInfo?.version ?? null };
+    } catch (err) {
+      return { ok: false, error: String(err?.message ?? err).slice(0, 200) };
+    }
+  });
+  ipcMain.handle("update:download", async () => {
+    if (devMode) return { ok: true, devMode: true };
+    try {
+      await autoUpdater.downloadUpdate();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err?.message ?? err).slice(0, 200) };
+    }
+  });
+  ipcMain.handle("update:install", () => {
+    if (devMode) return { ok: true, devMode: true };
+    // quitAndInstall is fire-and-forget by design — the app exits here.
+    autoUpdater.quitAndInstall();
+    return { ok: true };
+  });
+  ipcMain.handle("update:get_status", () =>
+    devMode ? { state: "dev" } : lastStatus,
+  );
+
+  // Dev run: symmetric IPC surface, no machinery. UpdateToast renders
+  // nothing for state "dev", and no feed checks ever fire.
   if (!app.isPackaged) {
-    console.log("[updater] dev mode — update checks disabled");
+    devMode = true;
+    console.log("[updater] dev mode — feed machinery disabled, handlers active");
     return;
   }
 
@@ -82,31 +121,6 @@ export function initUpdater() {
     console.error("[updater] error:", err?.message ?? err);
     pushStatus({ state: "error", message: String(err?.message ?? err).slice(0, 200) });
   });
-
-  // Renderer → main actions. Registering here means the IPC allowlist
-  // snapshot (taken at createWindow, after this runs) includes them.
-  ipcMain.handle("update:check", async () => {
-    try {
-      const result = await autoUpdater.checkForUpdates();
-      return { ok: true, version: result?.updateInfo?.version ?? null };
-    } catch (err) {
-      return { ok: false, error: String(err?.message ?? err).slice(0, 200) };
-    }
-  });
-  ipcMain.handle("update:download", async () => {
-    try {
-      await autoUpdater.downloadUpdate();
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: String(err?.message ?? err).slice(0, 200) };
-    }
-  });
-  ipcMain.handle("update:install", () => {
-    // quitAndInstall is fire-and-forget by design — the app exits here.
-    autoUpdater.quitAndInstall();
-    return { ok: true };
-  });
-  ipcMain.handle("update:get_status", () => lastStatus);
 
   // First check 30s after launch, then every 6h. The renderer asks for a
   // manual check anytime via update:check (settings surface / banner).

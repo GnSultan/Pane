@@ -6,7 +6,7 @@ import { EventEmitter } from "node:events";
  *   - consent defaults (autoDownload off, install-on-quit on)
  *   - handler registration + idempotent init
  *   - status push to lastStatus + push events to windows
- *   - dev-mode early return (no handlers)
+ *   - dev mode: same channels registered, machinery off, honest responses
  * electron + electron-updater are lazy-getter hostile at plain import —
  * both mocked here, mirroring vision-normalize / computer-orchestration.
  */
@@ -86,10 +86,23 @@ describe("updater", () => {
     expect(autoUpdaterInstance.autoInstallOnAppQuit).toBe(true);
   });
 
-  it("dev mode registers nothing", async () => {
+  it("dev mode registers the same channels, machinery stays off", async () => {
     await freshInit({ isPackaged: false });
-    expect(registeredHandlers().size).toBe(0);
-    expect(autoUpdaterInstance).toBeUndefined(); // lazy getter never touched
+    const handlers = registeredHandlers();
+    // Symmetry: the renderer can invoke update:* in dev, so the channels
+    // must be registered — exactly as in packaged mode.
+    expect([...handlers.keys()].sort()).toEqual(
+      ["update:check", "update:download", "update:get_status", "update:install"],
+    );
+    // But the lazy autoUpdater getter is never touched — no feed machinery.
+    expect(autoUpdaterInstance).toBeUndefined();
+    // Handlers answer with honest dev state, never the feed.
+    expect(await handlers.get("update:check")()).toEqual({ ok: true, devMode: true });
+    expect(await handlers.get("update:download")()).toEqual({ ok: true, devMode: true });
+    expect(handlers.get("update:install")()).toEqual({ ok: true, devMode: true });
+    expect(handlers.get("update:get_status")()).toEqual({ state: "dev" });
+    // And the consent flip never happened.
+    expect(autoUpdaterInstance?.autoDownload).toBeUndefined();
   });
 
   it("init is idempotent — no double registration", async () => {

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 type UpdateStatus =
-  | { state: "idle" | "checking" | "up-to-date" }
+  | { state: "idle" | "checking" | "up-to-date" | "dev" }
   | { state: "available"; version: string | null }
   | { state: "downloading"; percent: number }
   | { state: "ready"; version: string | null }
@@ -14,6 +14,7 @@ type UpdateStatus =
  * Dismissable — skipping an update is a first-class choice.
  * Bottom-right, so it never collides with the TaskNotification stack
  * (top-right). Visual language matches TaskNotification: pane tokens.
+ * State "dev" (dev builds, machinery off) renders nothing — silent.
  */
 export function UpdateToast() {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
@@ -21,14 +22,21 @@ export function UpdateToast() {
 
   useEffect(() => {
     // Catch up on any status pushed before mount (e.g. a ready update).
-    window.electronAPI
-      .invoke<{ state: UpdateStatus["state"] }>("update:get_status")
-      .then((s) => {
-        if (s && s.state !== "idle" && s.state !== "up-to-date") {
-          setStatus(s as UpdateStatus);
-        }
-      })
-      .catch(() => {});
+    // The IPC gate throws synchronously (not a rejected promise) when main
+    // hasn't registered a channel — e.g. an older main during dev HMR — so
+    // this is try/caught in the effect, never allowed to reach the boundary.
+    try {
+      window.electronAPI
+        .invoke<{ state: UpdateStatus["state"] }>("update:get_status")
+        .then((s) => {
+          if (s && s.state !== "idle" && s.state !== "up-to-date") {
+            setStatus(s as UpdateStatus);
+          }
+        })
+        .catch(() => {});
+    } catch {
+      // Skew (renderer newer than main): stay silent.
+    }
     const unlisten = window.electronAPI.on<UpdateStatus>("pane://update-status", (s) => {
       // A new state re-shows the toast even if a previous one was dismissed.
       setStatus(s);
