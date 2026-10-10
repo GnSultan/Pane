@@ -2735,50 +2735,6 @@ export class ToolExecutor {
           }
         }
 
-        case "pane_knowledge_graph": {
-          const exportsDir = path.join(paneDir, "brain", "exports");
-          let exported = null;
-          try { exported = JSON.parse(await fsPromises.readFile(path.join(exportsDir, `${this.projectId}.json`), "utf-8")); }
-          catch { return { success: true, output: "Knowledge graph is empty — it grows as you work.", toolId }; }
-
-          if (!exported || exported.length === 0) return { success: true, output: "Knowledge graph is empty — it grows as you work.", toolId };
-
-          // Group by type, sort by confidence within each group
-          const byType = {};
-          for (const node of exported) {
-            if (!node.type) continue;
-            if (!byType[node.type]) byType[node.type] = [];
-            byType[node.type].push(node);
-          }
-
-          const parts = [`Knowledge graph: ${exported.length} nodes\n`];
-
-          // Priority order: decisions and lessons first, then patterns, then everything else
-          const typeOrder = ["decision", "lesson", "pattern", "error_fix", "principle"];
-          const orderedTypes = [
-            ...typeOrder.filter(t => byType[t]),
-            ...Object.keys(byType).filter(t => !typeOrder.includes(t)),
-          ];
-
-          for (const type of orderedTypes) {
-            const nodes = byType[type];
-            if (!nodes || nodes.length === 0) continue;
-            // Sort by confidence descending, show top 8 per type with FULL content
-            const sorted = nodes
-              .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
-              .slice(0, 8);
-            parts.push(`## ${type} (${nodes.length} total, showing top ${sorted.length})`);
-            for (const n of sorted) {
-              const conf = n.confidence != null ? ` [confidence: ${n.confidence.toFixed(2)}]` : "";
-              const idTag = n.id ? ` (id: ${n.id})` : "";
-              parts.push(`- ${n.content}${conf}${idTag}`);
-            }
-            parts.push("");
-          }
-
-          return { success: true, output: parts.join("\n"), toolId };
-        }
-
         case "pane_cross_project": {
           const query = (input?.query || "").trim();
           if (!query) return { success: false, error: "Query is required for cross-project search.", toolId };
