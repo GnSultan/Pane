@@ -21,6 +21,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSy
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { shell } from "electron";
+import { validateOpenExternal } from "./ipc-allowlist.mjs";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -334,7 +335,11 @@ export async function startLogin(options = {}) {
 
       console.log("[openai-login] authorize URL:", authorizeUrl.toString());
       onStatus?.("opening browser...");
-      shell.openExternal(authorizeUrl.toString());
+      const safeAuthUrl = validateOpenExternal(authorizeUrl.toString());
+      if (!safeAuthUrl) {
+        throw new Error(`[openai-login] refusing to open unvalidated auth URL: ${String(authorizeUrl).slice(0, 120)}`);
+      }
+      shell.openExternal(safeAuthUrl);
 
       onStatus?.("waiting for authorization...");
       const { code, state: returnedState } = await codePromise;

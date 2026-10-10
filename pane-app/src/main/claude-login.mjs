@@ -22,6 +22,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSy
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { shell } from "electron";
+import { validateOpenExternal } from "./ipc-allowlist.mjs";
 
 // keytar: native binding for macOS Keychain — no child_process spawn.
 // execFileSync("/usr/bin/security") fails silently inside Electron's main process
@@ -425,7 +426,11 @@ export async function startLogin(options = {}) {
 
       console.log("[claude-login] authorize URL:", authorizeUrl.toString());
       onStatus?.("opening browser...");
-      shell.openExternal(authorizeUrl.toString());
+      const safeAuthUrl = validateOpenExternal(authorizeUrl.toString());
+      if (!safeAuthUrl) {
+        throw new Error(`[claude-login] refusing to open unvalidated auth URL: ${String(authorizeUrl).slice(0, 120)}`);
+      }
+      shell.openExternal(safeAuthUrl);
 
       onStatus?.("waiting for authorization...");
       const { code, state: returnedState } = await codePromise;

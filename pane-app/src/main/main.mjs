@@ -10,6 +10,27 @@ import {
   screen,
 } from "electron";
 import windowStateKeeper from "electron-window-state";
+import {
+  allowChannel,
+  allowedChannels,
+  validateOpenExternal,
+} from "./ipc-allowlist.mjs";
+
+// ── IPC registration through the allowlist ────────────────────────────────
+// Every handler main registers is whitelisted for the preload bridge at
+// registration time (see ipc-allowlist.mjs). Registering is the ONLY way a
+// channel becomes callable from the renderer — the allowlist cannot drift
+// from the actual handlers.
+const rawIpcHandle = ipcMain.handle.bind(ipcMain);
+const rawIpcOn = ipcMain.on.bind(ipcMain);
+ipcMain.handle = (channel, ...rest) => {
+  allowChannel(channel);
+  return rawIpcHandle(channel, ...rest);
+};
+ipcMain.on = (channel, ...rest) => {
+  allowChannel(channel);
+  return rawIpcOn(channel, ...rest);
+};
 import { execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
@@ -124,12 +145,9 @@ function registerClaudeHandlers() {
   // sherpa-onnx model. No audio ever leaves the machine.
   registerWakeWordIpc(ipcMain);
   // ── Agent status store (voice observability) ──────────────────────────
-  // Authoritative per-thread phase feed. Renderer UI may read the full
-  // snapshot; the voice relay reads it via runTool("agent_threads"),
-  // which projects through the voice-safe field whitelist.
-  ipcMain.handle("agent_status_snapshot", (_event, { limit } = {}) => {
-    return getSnapshot(typeof limit === "number" && limit > 0 ? { limit: Math.floor(limit) } : {});
-  });
+  // Authoritative per-thread phase feed. The voice relay reads it directly
+  // (voiceSnapshot / getSnapshot import); the renderer-facing
+  // agent_status_snapshot handler was removed Oct 2026 — never invoked.
   // Screen capture for the voice layer — pull-based sight. The relay never
   // streams frames; the model asks (look_at_screen) and gets one screenshot
   // pushed into its conversation as input_image.
@@ -186,25 +204,11 @@ function registerClaudeHandlers() {
   ipcMain.handle("voice_distill_memory", (_event, { sessionExchanges }) => {
     return voiceRelay.distillMemory(typeof sessionExchanges === "number" ? sessionExchanges : null);
   });
-  ipcMain.handle("voice_companion_stats", () => {
-    return companionStats();
-  });
-
-  // ── Voice debug log (renderer → disk, bypassing invisible console) ────
-  // Voice failures were silent: the hook's console.error vanishes in prod.
-  // The renderer calls voice_debug_log; main appends a timestamped line to
-  // ~/.pane/voice-debug.log. Diagnostic plumbing only — never blocks.
-  ipcMain.handle("voice_debug_log", (_event, { lines }) => {
-    try {
-      const arr = Array.isArray(lines) ? lines : [String(lines)];
-      const stamp = new Date().toISOString();
-      const out = arr.map((l) => `[${stamp}] ${typeof l === "string" ? l : JSON.stringify(l)}`).join("\n") + "\n";
-      fs.appendFileSync(path.join(os.homedir(), ".pane", "voice-debug.log"), out);
-      return { ok: true };
-    } catch {
-      return { ok: false }; // diagnostics must never break the session
-    }
-  });
+  // voice_companion_stats removed Oct 2026 — never invoked from the
+  // renderer; the relay owns companion memory internally.
+  // voice_debug_log removed Oct 2026 — the console-message mirror below
+  // captures [voice] lines into the same file; the direct channel had no
+  // remaining callers.
 
   // ── Mic permission self-repair ────────────────────────────────────────
   // Symptom (hit twice by Aug 2026, macOS 27 beta): after rebuild+reinstall,
@@ -285,22 +289,10 @@ function registerClaudeHandlers() {
     return origHandleBackendEvent(projectId, event, requestId);
   };
 
-  ipcMain.handle("send_to_claude", async (_event, args) => {
-    const { projectId, prompt, workingDir, model, intent } = args;
-    await punkEngine.spawn({
-      projectId,
-      prompt,
-      workingDir,
-      model,
-      intent,
-    });
-  });
-  ipcMain.handle("abort_claude", async (_event, args) => {
-    await punkEngine.abort(args.projectId);
-  });
-  ipcMain.handle("terminate_claude_session", async (_event, args) => {
-    await punkEngine.terminate(args.projectId);
-  });
+  // Legacy CLI-era handlers (send_to_claude / abort_claude /
+  // terminate_claude_session) removed Oct 2026 — never invoked from the
+  // renderer; send_to_punk + steer_punk + terminate_punk_session supersede
+  // them.
   ipcMain.handle("get_token_analytics", async (_event, { projectId, sinceMs }) => {
     try {
       const db = getPaneDb();
@@ -2566,23 +2558,8 @@ function registerBrainHandlers() {
     return brainRequest("session_pins_clear", { projectId });
   });
 
-  ipcMain.handle("brain_index_project_files", async (_event, args) => {
-    const { projectId, projectRoot } = args;
-    return brainRequest("index_project_files", { projectId, projectRoot });
-  });
-
-  ipcMain.handle("brain_get_related", async (_event, args) => {
-    const { nodeId } = args;
-    return brainRequest("get_related", { nodeId });
-  });
-
   ipcMain.handle("brain_get_stats", async () => {
     return brainRequest("get_stats", {});
-  });
-
-  ipcMain.handle("brain_prune", async (_event, args) => {
-    const { projectId } = args;
-    return brainRequest("prune", { projectId });
   });
 
   ipcMain.handle("brain_get_intelligence_stats", async (_event, args) => {
@@ -2857,6 +2834,13 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // The preload bridge only crosses channels main registered (see
+      // ipc-allowlist.mjs). The list is snapshotted AFTER all handlers
+      // registered — window creation runs last in whenReady — and passed
+      // as an argument the preload reads and freezes.
+      additionalArguments: [
+        "--pane-ipc-allowlist=" + Buffer.from(JSON.stringify(allowedChannels())).toString("base64"),
+      ],
     },
   });
   windowState.manage(mainWindow);
@@ -2864,8 +2848,43 @@ function createWindow() {
     mainWindow?.show();
   });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    // shell.openExternal is a code-execution vector when handed arbitrary
+    // schemes (file:, intent:, custom app schemes). Only http/https/pane:
+    // pass; everything else is refused and logged, not opened.
+    const safe = validateOpenExternal(url);
+    if (safe) {
+      shell.openExternal(safe);
+    } else {
+      console.warn(`[main] window-open refused (scheme not allowed): ${String(url).slice(0, 120)}`);
+    }
     return { action: "deny" };
+  });
+  // Navigation guard: the preload bridge (with the IPC allowlist) stays
+  // attached wherever this window's webContents goes. A compromised
+  // renderer must not be able to re-point the window at a remote page and
+  // inherit that bridge, so cross-origin navigation is blocked — same
+  // origin (local renderer file or dev server) is allowed. Links to
+  // validated web URLs are handed to the system browser instead.
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    const current = mainWindow.webContents.getURL();
+    if (current) {
+      try {
+        const a = new URL(url);
+        const b = new URL(current);
+        if (a.protocol === b.protocol && a.host === b.host && a.port === b.port) {
+          return; // same origin — in-app navigation is fine
+        }
+      } catch {
+        /* fall through to block */
+      }
+    }
+    event.preventDefault();
+    const safe = validateOpenExternal(url);
+    if (safe) {
+      shell.openExternal(safe);
+    } else {
+      console.warn(`[main] navigation refused (blocked and not openable): ${String(url).slice(0, 120)}`);
+    }
   });
   // Mirror renderer console messages into the log collector. Errors and
   // warnings are always captured; [voice] lines also keep going to the
