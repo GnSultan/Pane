@@ -334,14 +334,6 @@ export function disposeWakeWord() {
   activePhrase = null;
 }
 
-export function wakeWordStatus() {
-  return {
-    active: spotter !== null && stream !== null,
-    phrase: activePhrase,
-    modelFound: resolveModelDir() !== null,
-  };
-}
-
 // ── IPC surface ───────────────────────────────────────────────────────────
 // wake_word_configure {phrase} → {ok, error?}
 // wake_word_feed Float32Array → fire-and-forget hot path; detection is
@@ -376,5 +368,6 @@ export function registerWakeWordIpc(ipcMain) {
     return { ok: true };
   });
 
-  ipcMain.handle("wake_word_status", () => wakeWordStatus());
+  // wake_word_status removed Oct 2026 — the configure response carries
+  // status; the renderer never invoked this channel.
 }
