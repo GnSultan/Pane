@@ -35,6 +35,7 @@ import { execFile } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
 import { validateFilePath, validateDirectoryPath, validateProjectId } from "./path-guard.mjs";
+import { initUpdater } from "./updater.mjs";
 import { initLogCollector, attachWorker, pushEntry } from "./log-collector.mjs";
 
 // ── FD Repair for macOS packaged app ─────────────────────────────────────
@@ -2956,6 +2957,9 @@ app.whenReady().then(async () => {
   // <1s even on cold filesystem. Handlers that need backends (spawn, etc.)
   // lazy-initialize on first call.
   registerIpcHandlers();
+  // Updater handlers register here too — before createWindow so the IPC
+  // allowlist snapshot includes them.
+  initUpdater();
   modelManager.initialize();        // async but not awaited — handler registered sync, cache load is fast
   createWindow();
 

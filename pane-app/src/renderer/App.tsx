@@ -6,6 +6,7 @@ import { ActiveThreadTabs } from "./components/ActiveThreadTabs";
 import { Workspace } from "./components/Workspace/Workspace";
 import { VoiceProvider } from "./components/VoiceProvider";
 import { TaskNotification } from "./components/shared/TaskNotification";
+import { UpdateToast } from "./components/shared/UpdateToast";
 import { useWorkspaceStore } from "./stores/workspace";
 import { useProjectsStore } from "./stores/projects";
 import { useFileWatcher } from "./hooks/useFileWatcher";
@@ -282,6 +283,7 @@ function App() {
       </div>
 
       <TaskNotification />
+      <UpdateToast />
     </div>
     </VoiceProvider>
   );

@@ -1,5 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+// macOS-only suite: exercises macOS-native computer-use paths (sips
+// binary, TCC accessibility probes); the ax_elements case additionally
+// requires live macOS accessibility permissions. Declared here so Linux
+// CI skips instead of failing.
+const macDescribe = process.platform === "darwin" ? describe : describe.skip;
+
+// LIVE-DESKTOP cases: ax_elements / ax_focused drive REAL AppleScript
+// against whatever app is frontmost right now — their outcome is machine
+// state (accessibility grants, frontmost app), not code state. They pass
+// as unit gates only when opted in: PANE_COMPUTER_LIVE=1 npm test.
+const liveIt = process.env.PANE_COMPUTER_LIVE
+  ? (name, fn, timeout) => it(name, fn, timeout)
+  : (name, fn, timeout) => it.skip(name, fn, timeout);
+
 /**
  * executeComputer orchestration test — drives the real method through:
  *   screenshot  → capture (mocked) → readPngSize (mocked sips) → tier-fit
@@ -73,7 +87,7 @@ vi.mock("../computer-use.mjs", () => ({
 // Mock sips so tier-fit runs deterministically and fast: report target dims.
 import { vi as _vi } from "vitest";
 
-describe("executeComputer — full orchestration", () => {
+macDescribe("executeComputer — full orchestration", () => {
   let ex;
   beforeEach(() => {
     shellHist.length = 0;
@@ -186,7 +200,7 @@ describe("executeComputer — full orchestration", () => {
     expect(captureCount).toBe(before);
   });
 
-  it("ax_elements: returns elements in seen space with metadata", async () => {
+  liveIt("ax_elements: returns elements in seen space with metadata", async () => {
     await ex.executeComputer("t1", { action: "screenshot" });
     // listElements runs real AppleScript against the FRONTMOST app — in CI
     // that's this process; expect ok with whatever the tree holds.
@@ -202,7 +216,7 @@ describe("executeComputer — full orchestration", () => {
     }
   }, 20000);
 
-  it("ax_focused: returns ok even when no focused element (Chromium)", async () => {
+  liveIt("ax_focused: returns ok even when no focused element (Chromium)", async () => {
     const r = await ex.executeComputer("t1", { action: "ax_focused" });
     expect(r.success).toBe(true);
     expect(typeof r.output).toBe("string");

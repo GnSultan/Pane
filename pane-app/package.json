@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.1.0",
+  "version": "0.4.168",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -115,6 +115,11 @@
     ],
     "directories": {
       "output": "dist"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "GnSultan",
+      "repo": "Pane"
     }
   },
   "dependencies": {
@@ -128,6 +133,7 @@
     "ace-builds": "^1.40.8",
     "better-sqlite3": "^12.6.2",
     "chokidar": "^5.0.0",
+    "electron-updater": "^6.8.9",
     "electron-window-state": "^5.0.3",
     "framer-motion": "^12.38.0",
     "fuse.js": "^7.1.0",
