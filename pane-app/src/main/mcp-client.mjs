@@ -427,6 +427,15 @@ class McpClientManager {
         },
       });
     }
+    // Deterministic order by namespaced name. toolIndex is a Map populated
+    // in connection order, and servers reconnect in arbitrary order — an
+    // unsorted array reorders the wire tools[] between turns, which breaks
+    // the provider's prompt cache at the first divergent tool (Anthropic
+    // caches tools → system → messages; auto-cachers cache the raw prefix).
+    // Sort is stable across reconnects: same tool set → same wire order.
+    tools.sort((a, b) =>
+      a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0,
+    );
     return tools;
   }
 

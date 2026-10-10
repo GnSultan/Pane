@@ -238,6 +238,20 @@ function registerClaudeHandlers() {
   // them to SQLite for long-term analytics.
   const origHandleBackendEvent = punkEngine.handleBackendEvent.bind(punkEngine);
   punkEngine.handleBackendEvent = (projectId, event, requestId) => {
+    if (event.event === "cache_break") {
+      // Prompt prefix changed between turns — the provider's cache was
+      // invalidated. Logged here so Pane's own long sessions make prefix
+      // instability visible ( PunkEventTokenUsage shows the cost; this
+      // shows the cause).
+      try {
+        const d = event.data || {};
+        console.warn(
+          `[cache-break] ${projectId?.slice(0, 8)} model=${d.model} changed=${d.changed} — cache invalidated this turn`,
+        );
+      } catch {
+        /* telemetry only */
+      }
+    }
     if (event.event === "token_usage") {
       try {
         const db = getPaneDb();
@@ -2929,6 +2943,17 @@ app.whenReady().then(async () => {
   // Pre-fork workers — non-blocking, return immediately
   getBrainWorker(); // SQLite + embedding model (loads lazily on first embed)
   getCmdWorker();   // isolated libuv loop for command execution
+
+  // ── Startup janitor: Pane keeps itself alive ──────────────────────────
+  // Sweeps orphaned atomic-write tmp files, rotates voice-debug.log,
+  // prunes checkpoints past retention, vacuums fragmented pane.db.
+  // Deferred off the startup critical path; every step logs what it
+  // reclaimed and fails soft.
+  setImmediate(() => {
+    import("./janitor.mjs")
+      .then(({ runStartupJanitor }) => runStartupJanitor())
+      .catch((err) => console.warn("[janitor] startup run failed:", err.message));
+  });
 
   // ── Launch-time TCC permission gate (macOS) ──────────────────────────
   // Probes Screen Recording + Accessibility the moment the app starts, so

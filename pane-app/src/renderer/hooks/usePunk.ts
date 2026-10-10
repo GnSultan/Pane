@@ -1138,6 +1138,25 @@ export function usePunk(projectId: string) {
             break;
           }
 
+          case "cache_break": {
+            // Prompt prefix changed since the previous turn — the provider
+            // re-read the whole prefix at fresh-input price. Record it so
+            // diagnostics can correlate a cache-hit-rate drop with a cause,
+            // and refresh the token-analytics timestamp so the accordion's
+            // polling fetches the updated cache stats.
+            const d = event.data;
+            useWorkspaceStore.setState({
+              lastCacheBreak:
+                d.changed === "tools"
+                  ? `tools array changed (${d.model})`
+                  : d.changed === "system"
+                    ? `system prompt changed (${d.model})`
+                    : `tools + system changed (${d.model})`,
+            });
+            useWorkspaceStore.setState({ lastTokenUsageAt: Date.now() });
+            break;
+          }
+
           case "token_usage": {
             // Signal analytics to refresh (ContextUsageIndicator removed; this timestamp
             // still drives TokenAnalytics polling)

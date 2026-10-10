@@ -333,6 +333,15 @@ export interface PunkEventTokenUsage {
   };
 }
 
+export interface PunkEventCacheBreak {
+  event: "cache_break";
+  data: {
+    model: string;
+    changed: "tools" | "system" | "tools+system";
+    combined: string;
+  };
+}
+
 export interface PunkEventRateLimit {
   event: "rate_limit";
   data: RateLimitInfo;
@@ -378,6 +387,7 @@ export type PunkStreamEvent = (
   | PunkEventSdkInitInfo
   | PunkEventRateLimit
   | PunkEventTokenUsage
+  | PunkEventCacheBreak
   | PunkEventAwaitingInput
   | PunkEventPhaseChanged
   | PunkEventSteerMissed

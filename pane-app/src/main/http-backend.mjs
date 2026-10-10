@@ -7,6 +7,7 @@ import { execThroughWorker } from "./tool-executor.mjs";
 const { AbortController, fetch, TextDecoder, console } = globalThis;
 
 import { PunkBackend } from "./punk-backend.mjs";
+import { fingerprintPart, comparePrefixParts } from "./prompt-fingerprint.mjs";
 import { ToolExecutor } from "./tool-executor.mjs";
 import {
   mergeState,
@@ -2187,9 +2188,80 @@ export class ApiBackend extends PunkBackend {
     this.paneDir = path.join(os.homedir(), ".pane");
     this.toolExecutors = new Map(); // projectId -> ToolExecutor
     this._brainRequest = null;
+    // Prompt-prefix fingerprints, keyed by `${projectId}:${model}` — the key
+    // providers actually cache under. Each turn's tools+system prefix is
+    // fingerprinted and compared to the previous turn's; a change means the
+    // provider's prompt cache was invalidated at the first divergent byte.
+    this._prefixFingerprints = new Map();
     // Start the compaction worker thread — keeps context compaction off
     // the main process event loop.
     startCompactionWorker();
+  }
+
+  /**
+   * Prompt-prefix cache-break telemetry.
+   *
+   * Anthropic caches in order: tools → system → messages. Auto-caching
+   * providers (DeepSeek, Kimi, Qwen) cache the raw serialized prefix.
+   * Either way, the first byte that differs from the previous request
+   * invalidates everything downstream of it. The tools array and system
+   * content are the only parts of the prefix Pane itself assembles, so a
+   * fingerprint over tools+system localizes every self-inflicted break.
+   *
+   * Emits a `cache_break` backend event when a component changes on a
+   * mid-conversation turn (first turn of a conversation has no prior
+   * fingerprint — that's a cold cache, not a break).
+   *
+   * @param {string} projectId
+   * @param {string|null} model resolved model id (null → no key, skip)
+   * @param {{tools: any[]|null, system: any|null}} prefixParts request prefix
+   *   before messages — tools array and system content in wire order
+   * @param {string} requestId
+   */
+  emitCacheBreakTelemetry(projectId, model, prefixParts, requestId) {
+    try {
+      if (!model) return;
+      const toolsFp = fingerprintPart(prefixParts.tools);
+      const systemFp = fingerprintPart(prefixParts.system);
+      if (!toolsFp && !systemFp) return;
+
+      const key = `${projectId}:${model}`;
+      const previous = this._prefixFingerprints.get(key);
+      // Cap the map — one entry per conversation+model, but defensive
+      // against unbounded growth if keys churn (model renames, many projects).
+      if (this._prefixFingerprints.size > 512) {
+        const firstKey = this._prefixFingerprints.keys().next().value;
+        this._prefixFingerprints.delete(firstKey);
+      }
+      this._prefixFingerprints.set(key, { toolsFp, systemFp, at: Date.now() });
+      if (!previous) return;
+
+      // First turn of a conversation has no prior fingerprint — that's a
+      // cold cache, not a break. Only a mid-conversation change is a break.
+      const changed = comparePrefixParts(previous, prefixParts);
+      if (!changed) return;
+
+      // Fingerprint changed: localize WHERE the prefix diverged so the log
+      // says what to fix, not just that something broke.
+      console.warn(
+        `[cache-break] ${key}: prompt prefix changed since previous turn — provider cache invalidated at ${changed}. ` +
+        `toolsFp=${(toolsFp || "-").slice(0, 8)} systemFp=${(systemFp || "-").slice(0, 8)}`
+      );
+      this.onEvent(
+        projectId,
+        {
+          event: "cache_break",
+          data: {
+            model,
+            changed,
+          },
+        },
+        requestId,
+      );
+    } catch (err) {
+      // Telemetry must never break the turn.
+      console.warn("[cache-break] telemetry failed:", err.message);
+    }
   }
 
   setBrainRequest(fn) {
@@ -7721,6 +7793,35 @@ export class ApiBackend extends PunkBackend {
         if (msg._tiers) delete msg._tiers;
         if (msg._tokenEstimate !== undefined) delete msg._tokenEstimate;
       }
+    }
+
+    // ── Prompt-prefix cache-break telemetry ─────────────────────────────
+    // finalBody now holds the exact wire prefix for every provider:
+    //   anthropic: tools[] + system[] (breakpoints anchored here)
+    //   gemini:    tools + systemInstruction (or cachedContent name)
+    //   OpenAI-compatible: tools + messages[0].system (applyPrefixCache
+    //   puts the frozen tier there — identical across turns is the contract)
+    // Fingerprinting HERE means any future change to prefix assembly shows
+    // up as a cache_break event instead of a silent cost regression.
+    if (request?.requestId) {
+      let prefixTools = finalBody.tools ?? null;
+      let prefixSystem = null;
+      if (apiConfig.provider === "anthropic") {
+        prefixSystem = finalBody.system ?? null;
+      } else if (apiConfig.provider === "gemini") {
+        prefixSystem = finalBody.cachedContent
+          ? { cachedContent: finalBody.cachedContent }
+          : (finalBody.systemInstruction ?? null);
+      } else {
+        const first = finalBody.messages?.[0];
+        if (first?.role === "system") prefixSystem = first.content;
+      }
+      this.emitCacheBreakTelemetry(
+        request.projectId,
+        finalBody.model ?? body.model,
+        { tools: prefixTools, system: prefixSystem },
+        request.requestId,
+      );
     }
 
     return { url, headers, finalBody };

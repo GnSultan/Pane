@@ -77,6 +77,10 @@ interface WorkspaceState {
   rateLimitByProvider: Record<string, import("../lib/punk-types").RateLimitInfo>;
   setRateLimitForProvider: (provider: string, info: import("../lib/punk-types").RateLimitInfo | null) => void;
   lastTokenUsageAt: number;
+  // Human-readable description of the most recent prompt-prefix cache break
+  // ("tools array changed (claude-...)" etc.), or null when the prefix is
+  // stable. Set by the cache_break event in usePunk.
+  lastCacheBreak: string | null;
   // Profile data
   increaseFontSize: () => void;
   decreaseFontSize: () => void;
@@ -308,6 +312,7 @@ function createWorkspaceStore() {
       });
     },
     lastTokenUsageAt: 0,
+    lastCacheBreak: null,
     increaseFontSize: () =>
       set((state) => {
         const next = Math.max(1, state.fontSize + 1);
