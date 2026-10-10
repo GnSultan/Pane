@@ -11,6 +11,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { resolveProjectScope } from "./root-scope.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -432,6 +433,29 @@ export function indexFileSymbols(db, projectId, filePath, projectRoot) {
 }
 
 /**
+ * Remove all symbols and relationships for a file that has been deleted.
+ * Called from the file watcher's unlink path for immediate cleanup.
+ *
+ * @param {object} db - better-sqlite3 database
+ * @param {string} projectId
+ * @param {string} filePath - absolute path to the deleted file
+ * @param {string} projectRoot
+ * @returns {{ removed: number }} count of symbol rows deleted
+ */
+export function removeFileFromSymbolIndex(db, projectId, filePath, projectRoot) {
+  const relPath = path.relative(projectRoot, filePath);
+  const removed = db.prepare(
+    `DELETE FROM symbols WHERE project_id = ? AND file_path = ?`
+  ).run(projectId, relPath).changes;
+
+  db.prepare(
+    `DELETE FROM file_relationships WHERE project_id = ? AND (source_file = ? OR target_file = ?)`
+  ).run(projectId, relPath, relPath);
+
+  return { removed };
+}
+
+/**
  * Walk and index all parseable files in a project.
  * Reuses brain-engine's walkFn to respect the same skip rules.
  *
@@ -454,8 +478,61 @@ export function indexProjectSymbols(db, projectId, projectRoot, walkFn) {
     }
   }
 
-  console.log(`[symbol-index] ${projectId}: ${added} symbols across ${files_changed} changed files (${skipped} unchanged)`);
-  return { added, skipped, files_changed };
+  // Reconciliation: delete symbols + relationships for files that no longer exist.
+  // Without this, deleted files (schema-init.ts, packages/sync, etc.) leave
+  // phantom rows that make explore/compass/find_symbol return ghost results.
+  const orphaned = reconcileDeletedFiles(db, projectId, projectRoot, files);
+  if (orphaned > 0) {
+    console.log(`[symbol-index] ${projectId}: removed ${orphaned} orphaned file(s) from index`);
+  }
+
+  console.log(`[symbol-index] ${projectId}: ${added} symbols across ${files_changed} changed files (${skipped} unchanged${orphaned > 0 ? `, ${orphaned} deleted` : ""})`);
+  return { added, skipped, files_changed, orphaned };
+}
+
+/**
+ * Delete symbols and file_relationships entries for files that have been
+ * removed from the filesystem. Called after a full project walk.
+ *
+ * @param {object} db - better-sqlite3 database
+ * @param {string} projectId
+ * @param {string} projectRoot
+ * @param {string[]} currentFiles - absolute paths returned by the walk
+ * @returns {number} count of orphaned files cleaned up
+ */
+function reconcileDeletedFiles(db, projectId, projectRoot, currentFiles) {
+  // Build a set of relative paths that currently exist
+  const currentRelPaths = new Set(
+    currentFiles.map(f => path.relative(projectRoot, f))
+  );
+
+  // Find all distinct file_paths in the symbols table for this project
+  const knownPaths = db.prepare(
+    `SELECT DISTINCT file_path FROM symbols WHERE project_id = ?`
+  ).all(projectId).map(r => r.file_path);
+
+  let orphaned = 0;
+  const deleteSymbols = db.prepare(
+    `DELETE FROM symbols WHERE project_id = ? AND file_path = ?`
+  );
+  const deleteRelationships = db.prepare(
+    `DELETE FROM file_relationships WHERE project_id = ? AND (source_file = ? OR target_file = ?)`
+  );
+
+  const purge = db.transaction((orphans) => {
+    for (const relPath of orphans) {
+      deleteSymbols.run(projectId, relPath);
+      deleteRelationships.run(projectId, relPath, relPath);
+      orphaned++;
+    }
+  });
+
+  const orphans = knownPaths.filter(p => !currentRelPaths.has(p));
+  if (orphans.length > 0) {
+    purge(orphans);
+  }
+
+  return orphaned;
 }
 
 // ---------------------------------------------------------------------------
@@ -469,8 +546,9 @@ export function indexProjectSymbols(db, projectId, projectRoot, walkFn) {
  * @returns Symbol rows sorted by relevance.
  */
 export function findSymbols(db, projectId, query, { kind, file, limit = 20 } = {}) {
-  let sql = `SELECT * FROM symbols WHERE project_id = ?`;
-  const params = [projectId];
+  const scopeIds = resolveProjectScope(projectId);
+  let sql = `SELECT * FROM symbols WHERE project_id IN (${scopeIds.map(() => "?").join(",")})`;
+  const params = [...scopeIds];
 
   if (kind)  { sql += ` AND kind = ?`;            params.push(kind); }
   if (file)  { sql += ` AND file_path LIKE ?`;    params.push(`%${file}%`); }
@@ -511,12 +589,13 @@ export function getFileSymbols(db, projectId, filePath) {
  */
 export function resolveSymbolNames(db, projectId, names) {
   if (!names || names.length === 0) return [];
+  const scopeIds = resolveProjectScope(projectId);
   const ph = names.map(() => "?").join(",");
   return db.prepare(
     `SELECT name, kind, file_path, line, doc FROM symbols
-     WHERE project_id = ? AND name IN (${ph})
+     WHERE project_id IN (${scopeIds.map(() => "?").join(",")}) AND name IN (${ph})
      ORDER BY name COLLATE NOCASE`
-  ).all(projectId, ...names);
+  ).all(...scopeIds, ...names);
 }
 
 /**

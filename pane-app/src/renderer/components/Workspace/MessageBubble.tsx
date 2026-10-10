@@ -314,7 +314,7 @@ export function MessageBubble({
     const text = getMessageText(message);
     const [isExpanded, setIsExpanded] = useState(false);
     // Text-based heuristic avoids scrollHeight DOM read (forces layout reflow on every user message)
-    const showExpand = text.split('\n').length > 10 || text.length > 600;
+    const showExpand = !!text && (text.split('\n').length > 10 || text.length > 600);
 
     const truncatedText = isExpanded || !showExpand ? text : text.split('\n').slice(0, 10).join('\n');
 
@@ -324,17 +324,38 @@ export function MessageBubble({
           className="rounded-md ring-1 ring-pane-border/40 relative"
           style={{ maxWidth: "65ch" }}
         >
-          <p
-            className="text-pane-text font-mono leading-[1.75] whitespace-pre-wrap px-4 py-4"
-            style={{
-              fontSize: "var(--pane-font-size)",
-              maxHeight: isExpanded ? 'none' : 'calc(24px * 10)',
-              overflow: isExpanded ? 'visible' : 'hidden',
-              paddingBottom: showExpand ? '32px' : undefined,
-            }}
-          >
-            {renderInline(truncatedText)}
-          </p>
+          {text && (
+            <p
+              className="text-pane-text font-mono leading-[1.75] whitespace-pre-wrap px-4 py-4"
+              style={{
+                fontSize: "var(--pane-font-size)",
+                maxHeight: isExpanded ? 'none' : 'calc(24px * 10)',
+                overflow: isExpanded ? 'visible' : 'hidden',
+                paddingBottom: showExpand ? '32px' : undefined,
+              }}
+            >
+              {renderInline(truncatedText)}
+            </p>
+          )}
+          {/* Pasted images — thumbnails inside the bubble, below the text */}
+          {message.content.some((b) => b.type === "image") && (
+            <div className={`flex gap-2 flex-wrap px-4 ${text ? "pb-4" : "py-4"}`}>
+              {message.content
+                .filter((b) => b.type === "image")
+                .map((b, i) => {
+                  const img = b as { type: "image"; source: string };
+                  return (
+                    <img
+                      key={i}
+                      src={img.source}
+                      alt="attached image"
+                      className="h-32 w-auto rounded ring-1 ring-pane-border/30 cursor-pointer hover:ring-pane-accent/50 transition-all"
+                      onClick={() => window.open(img.source, "_blank")}
+                    />
+                  );
+                })}
+            </div>
+          )}
           {showExpand && (
             <div className="absolute bottom-0 left-0 right-0 p-1.5 pointer-events-none">
               <button
@@ -351,6 +372,22 @@ export function MessageBubble({
           )}
         </div>
         <div className="flex items-center justify-end gap-2 mt-1">
+          {message.deliveryMode === "steered" && (
+            <span
+              className="text-pane-text-secondary/40 font-mono"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              steered in
+            </span>
+          )}
+          {message.deliveryMode === "ask_reply" && (
+            <span
+              className="text-pane-text-secondary/40 font-mono"
+              style={{ fontSize: "var(--pane-font-size-xs)" }}
+            >
+              answer
+            </span>
+          )}
           {message.checkpointId && (
             <CheckpointIndicator
               checkpointId={message.checkpointId}
@@ -369,13 +406,17 @@ export function MessageBubble({
   }
 
   if (message.type === "assistant") {
-    // Filter out TodoWrite tool calls — they render in TodoPanel only
+    // Filter out TodoWrite tool calls — they render in TodoPanel only.
+    // ask_user is also filtered: its question already renders as a normal
+    // assistant message (the backend surfaces it before pausing), so the
+    // tool row would only duplicate it.
     // Also deduplicate tool_use blocks by ID (robustness against backend issues)
     const seenToolIds = new Set<string>();
     const filteredContent = message.content.filter((b) => {
       if (b.type === "tool_use") {
         const tool = b as ToolUseBlock;
         if (tool.name === "TodoWrite") return false;
+        if (tool.name === "ask_user") return false;
         if (seenToolIds.has(tool.id)) return false;
         seenToolIds.add(tool.id);
       }

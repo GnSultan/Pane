@@ -71,13 +71,8 @@ class ModelManager {
 
     this.startRefreshTimer();
 
-    ipcMain.handle("get_models", async (_event, args) => {
-      const { provider, forceRefresh } = args || {};
-      if (forceRefresh) await this.refreshModels(provider);
-
-      if (provider) return this.models[provider] || [];
-      return this.models;
-    });
+    // get_models handler removed Oct 2026 — get_all_models supersedes it;
+    // the renderer never invoked this one.
 
     ipcMain.handle("refresh_all_models", async () => {
       return await this.refreshAllModels();
@@ -126,7 +121,7 @@ class ModelManager {
       // from the API too — richer data, and works without a CLI installed.
       // "anthropic" and "gemini" (no -api) are populated by CLI prefetch, not here.
       // "anthropic-api" and "gemini-api" are HTTP-fetched when user has API keys.
-      const providers = ["openrouter", "deepseek", "gemini-api", "anthropic-api", "xiaomi", "z-ai"];
+      const providers = ["openrouter", "deepseek", "gemini-api", "anthropic-api", "xiaomi", "z-ai", "kimi", "openai"];
       const results = await Promise.allSettled(
         providers.map(p => this.refreshModels(p))
       );
@@ -188,6 +183,12 @@ class ModelManager {
           break;
         case "z-ai":
           newModels = await this.backend.getZaiModels();
+          break;
+        case "kimi":
+          newModels = await this.backend.getKimiModels();
+          break;
+        case "openai":
+          newModels = await this.backend.getOpenAIModels();
           break;
         default:
           return false;

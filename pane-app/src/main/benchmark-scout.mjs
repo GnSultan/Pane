@@ -135,7 +135,7 @@ const EMBEDDED_PRIORS = [
     codingScore: 0.78, reasoningScore: 0.80, generalScore: 0.79,
     costInputMtok: 1.25, costOutputMtok: 5.0,  arenaRank: 18,
   },
-  // Gemini CLI auto-routing alias
+  // Gemini API alias (same routing)
   {
     model: "gemini-3-flash-preview",      provider: "gemini",
     codingScore: 0.82, reasoningScore: 0.85, generalScore: 0.83,

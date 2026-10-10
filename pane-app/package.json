@@ -1,6 +1,6 @@
 {
   "name": "pane",
-  "version": "0.1.0",
+  "version": "0.4.168",
   "type": "module",
   "description": "The lightest IDE ever built",
   "main": "./out/main/index.js",
@@ -15,18 +15,23 @@
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",
     "typecheck": "tsc --noEmit",
+    "typecheck:main": "node scripts/check-main-types.mjs",
+    "typecheck:main:update": "node scripts/check-main-types.mjs --update",
     "lint": "eslint src/renderer/",
     "build:icon": "node scripts/build-icon.mjs",
     "download-models": "node scripts/download-models.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "postinstall": "electron-rebuild -f --only node-pty,better-sqlite3"
+    "postinstall": "electron-rebuild -f --only node-pty,better-sqlite3,keytar"
   },
   "build": {
     "appId": "com.pane.ide",
     "productName": "Pane",
     "mac": {
       "category": "public.app-category.developer-tools",
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "hardenedRuntime": true,
       "extendInfo": {
         "CFBundleIconName": "AppIcon"
       },
@@ -58,6 +63,20 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "skills/",
+        "to": "skills",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "electron/assets/sounds/",
+        "to": "assets/sounds",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "files": [
@@ -65,15 +84,15 @@
       "src/main/main.mjs",
       "src/main/model-manager.mjs",
       "src/main/model-paths.mjs",
-      "src/main/cli-worker.mjs",
+      "src/main/cmd-worker.mjs",
       "src/main/pty-worker.mjs",
-      "src/main/pane-mcp-server.mjs",
       "src/main/brain-engine.mjs",
       "src/main/punk-engine.mjs",
       "src/main/http-backend.mjs",
       "src/main/context-manager.mjs",
       "src/main/session-context.mjs",
       "src/main/tool-executor.mjs",
+      "src/main/mcp-client.mjs",
       "src/main/classify-intent.mjs",
       "src/main/intent-classifier.mjs",
       "src/main/planning-agent.mjs",
@@ -89,18 +108,21 @@
     "asarUnpack": [
       "node_modules/node-pty/**",
       "node_modules/better-sqlite3/**",
-      "node_modules/@anthropic-ai/claude-agent-sdk/**",
-      "node_modules/@anthropic-ai/claude-agent-sdk-*/**",
+      "node_modules/keytar/**",
       "node_modules/@vscode/ripgrep/**",
       "node_modules/onnxruntime-node/**",
       "node_modules/@huggingface/transformers/**"
     ],
     "directories": {
       "output": "dist"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "GnSultan",
+      "repo": "Pane"
     }
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.193",
     "@fontsource-variable/bricolage-grotesque": "^5.2.10",
     "@fontsource-variable/dm-sans": "^5.2.8",
     "@fontsource-variable/geist": "^5.2.8",
@@ -111,16 +133,20 @@
     "ace-builds": "^1.40.8",
     "better-sqlite3": "^12.6.2",
     "chokidar": "^5.0.0",
+    "electron-updater": "^6.8.9",
     "electron-window-state": "^5.0.3",
     "framer-motion": "^12.38.0",
     "fuse.js": "^7.1.0",
     "glob": "^11.0.0",
     "ignore": "^7.0.5",
+    "keytar": "^7.9.0",
     "node-pty": "^1.1.0",
     "onnxruntime-node": "^1.25.1",
     "react": "^18.3.1",
     "react-ace": "^12.0.0",
     "react-dom": "^18.3.1",
+    "sharp": "^0.35.3",
+    "sherpa-onnx-node": "^1.13.8",
     "strip-ansi": "^7.1.2",
     "zustand": "^5.0.0"
   },

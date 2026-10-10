@@ -1,0 +1,10 @@
+{
+  "name": "shell-craft",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["shell", "cli", "scripting", "commands"],
+  "tags": ["shell", "bash", "cli", "scripting", "commands"],
+  "priority": 5
+}

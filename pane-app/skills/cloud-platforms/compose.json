@@ -1,0 +1,10 @@
+{
+  "name": "cloud-platforms",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["cloud-platforms", "cloud", "deployment", "serverless", "kubernetes", "iaac"],
+  "tags": ["cloud", "aws", "gcp", "azure", "cloudflare", "serverless", "kubernetes", "containers", "iaac", "devops"],
+  "priority": 5
+}

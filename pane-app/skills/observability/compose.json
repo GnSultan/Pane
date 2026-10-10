@@ -1,0 +1,10 @@
+{
+  "name": "observability",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["observability", "monitoring", "logging", "tracing", "alerting", "incident-response"],
+  "tags": ["observability", "monitoring", "logging", "tracing", "metrics", "alerts", "incident-response"],
+  "priority": 5
+}

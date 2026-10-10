@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Typecheck, lint, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          # Skip native rebuild in the gate job — no app packaging here,
+          # and electron-rebuild is the slowest step in the tree.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+          npm_config_build_from_source: "false"
+
+      - name: Typecheck (renderer)
+        run: npm run typecheck
+
+      - name: Typecheck (main process gate)
+        run: npm run typecheck:main
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  package-mac:
+    name: Package macOS (arm64)
+    # Packaging on every master push keeps the release artifact real —
+    # a broken build:mac is discovered the day it breaks, not the day
+    # someone wants to ship.
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    needs: gate
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build + package
+        run: npm run build:mac
+        env:
+          # Unsigned for now — auto-UPDATE install on macOS requires a
+          # Developer-ID signature + notarization. The check/notify path
+          # works regardless; set CSC_LINK + CSC_KEY_PASSWORD (and
+          # APPLE_ID/APPLE_APP_SPECIFIC_PASSWORD for notarization) as
+          # repo secrets to make auto-install real.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pane-macos-arm64
+          path: dist/*.dmg
+          retention-days: 14

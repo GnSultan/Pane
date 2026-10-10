@@ -43,6 +43,20 @@ export function TaskNotification() {
     };
   }, []);
 
+  // OS notification click → main restores/focuses the window and sends the
+  // project to jump to. Same navigation as clicking the in-app toast.
+  useEffect(() => {
+    const unlisten = window.electronAPI.on(
+      "pane://notification-clicked",
+      (data: unknown) => {
+        const ev = data as { projectId?: string } | undefined;
+        if (!ev?.projectId) return;
+        setActiveProject(ev.projectId);
+      },
+    );
+    return () => unlisten();
+  }, []);
+
   // Listen for review completion — mark Lens as having unread findings
   useEffect(() => {
     const unlisten = window.electronAPI.on(

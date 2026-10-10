@@ -1,0 +1,10 @@
+{
+  "name": "security",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["security", "threat-modeling", "auth", "secrets-management"],
+  "tags": ["security", "auth", "threat-modeling", "owasp", "secrets"],
+  "priority": 5
+}

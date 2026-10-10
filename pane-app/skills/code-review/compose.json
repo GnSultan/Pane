@@ -1,0 +1,10 @@
+{
+  "name": "code-review",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["code-review"],
+  "tags": ["review", "quality", "architecture", "analysis"],
+  "priority": 5
+}

@@ -1,0 +1,10 @@
+{
+  "name": "refactor",
+  "version": "1.0.0",
+  "extends": [],
+  "conflicts": [],
+  "requires": [],
+  "provides": ["refactoring", "code-transformation", "restructuring"],
+  "tags": ["refactor", "restructure", "cleanup", "transform"],
+  "priority": 5
+}

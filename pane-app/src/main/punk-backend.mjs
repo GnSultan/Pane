@@ -20,9 +20,7 @@ export class PunkBackend {
   get supportsToolCalling() { return false; }
 
   /**
-   * Whether the backend supports resuming a session by ID.
-   * CLI backends that use the claude-agent-sdk support this; Gemini does not.
-   * Used by the planning agent to decide whether Pass 2 (session resume) is viable.
+   * Legacy: CLI backends have been removed. Session resume is not supported.
    */
   get supportsSessionResume() { return false; }
 

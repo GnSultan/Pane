@@ -13,6 +13,7 @@
  */
 
 import { app, shell, safeStorage, ipcMain } from "electron";
+import { validateOpenExternal } from "./ipc-allowlist.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -104,7 +105,11 @@ async function login() {
     `&scope=read:user`;
 
   // Open system browser
-  shell.openExternal(authUrl);
+  const safeAuthUrl = validateOpenExternal(authUrl);
+  if (!safeAuthUrl) {
+    throw new Error(`[cloud-auth] refusing to open unvalidated auth URL: ${authUrl.slice(0, 120)}`);
+  }
+  shell.openExternal(safeAuthUrl);
 
   // Wait for the deep link callback
   return new Promise((resolve, reject) => {

@@ -15,6 +15,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { resolveProjectScope } from "./root-scope.mjs";
 
 const PANE_DIR = path.join(os.homedir(), ".pane");
 
@@ -48,9 +49,15 @@ export function isArchFile(filePath) {
  */
 export function getUIConstraints(projectId) {
   try {
-    const raw = fs.readFileSync(
-      path.join(PANE_DIR, "memory", projectId, "ui-constraints.json"), "utf-8"
-    );
+    const scopeIds = resolveProjectScope(projectId);
+    let raw = null;
+    for (const sid of scopeIds) {
+      try {
+        raw = fs.readFileSync(path.join(PANE_DIR, "memory", sid, "ui-constraints.json"), "utf-8");
+        if (raw) break;
+      } catch { /* try next sibling */ }
+    }
+    if (!raw) return null;
     const rules = JSON.parse(raw);
     if (!Array.isArray(rules) || rules.length === 0) return null;
     const lines = ["[Pane Design Context — rules for this component]"];
@@ -68,9 +75,15 @@ export function getUIConstraints(projectId) {
  */
 export function getArchBrief(projectId, filePath) {
   try {
-    const raw = fs.readFileSync(
-      path.join(PANE_DIR, "memory", projectId, "subsystems.json"), "utf-8"
-    );
+    const scopeIds = resolveProjectScope(projectId);
+    let raw = null;
+    for (const sid of scopeIds) {
+      try {
+        raw = fs.readFileSync(path.join(PANE_DIR, "memory", sid, "subsystems.json"), "utf-8");
+        if (raw) break;
+      } catch { /* try next sibling */ }
+    }
+    if (!raw) return null;
     const raw_parsed = JSON.parse(raw);
     // Support both formats: object { name: {...} } and array [{ id, name, ... }]
     // Also support { subsystems: [...] } wrapper
@@ -136,8 +149,14 @@ export async function getRelevantMemories(projectId, query, brainRequest) {
  */
 export function getFileSymbols(projectId, filePath) {
   try {
-    const symbolsPath = path.join(PANE_DIR, "brain", "symbols", `${projectId}.json`);
-    const exported = JSON.parse(fs.readFileSync(symbolsPath, "utf-8"));
+    const scopeIds = resolveProjectScope(projectId);
+    let exported = null;
+    for (const sid of scopeIds) {
+      try {
+        exported = JSON.parse(fs.readFileSync(path.join(PANE_DIR, "brain", "symbols", `${sid}.json`), "utf-8"));
+        if (exported?.symbols?.length > 0) break;
+      } catch { /* try next sibling */ }
+    }
     if (!exported?.symbols) return null;
     // Normalize paths for matching — symbol index may store relative or absolute.
     // Compare by basename + parent dir to avoid false matches.

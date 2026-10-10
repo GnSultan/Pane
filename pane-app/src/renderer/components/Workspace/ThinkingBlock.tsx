@@ -18,6 +18,7 @@ export function ThinkingBlockDisplay({
 }: ThinkingBlockProps) {
   const thinkingText = block.thinking;
   const contentRef = useRef<HTMLDivElement>(null);
+  const followRef = useRef(true);
   const [userToggle, setUserToggle] = useState<boolean | null>(null);
 
   // Start collapsed by default, user can expand to see thinking
@@ -29,9 +30,33 @@ export function ThinkingBlockDisplay({
     setIsBreathing(isStreaming && !isExpanded);
   }, [isStreaming, isExpanded]);
 
-  // Internal auto-scroll for the thinking block itself
+  // Re-engage follow whenever the block is (re)expanded, so opening always starts pinned to bottom.
   useEffect(() => {
-    if (isStreaming && contentRef.current) {
+    if (isExpanded) followRef.current = true;
+  }, [isExpanded]);
+
+  // Wheel listener: disengage follow on scroll up, re-engage on scroll down near bottom.
+  // Mirrors Conversation.tsx's workspace-level follow behavior.
+  useEffect(() => {
+    const container = contentRef.current;
+    if (!container) return;
+    const handleWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) {
+        followRef.current = false;
+      } else if (e.deltaY > 0 && isStreaming) {
+        const { scrollTop, scrollHeight, clientHeight } = container;
+        if (scrollHeight - scrollTop - clientHeight < 40) {
+          followRef.current = true;
+        }
+      }
+    };
+    container.addEventListener("wheel", handleWheel, { passive: true });
+    return () => container.removeEventListener("wheel", handleWheel);
+  }, [isExpanded, isStreaming]);
+
+  // Internal auto-scroll for the thinking block itself — only while following.
+  useEffect(() => {
+    if (isStreaming && followRef.current && contentRef.current) {
       contentRef.current.scrollTop = contentRef.current.scrollHeight;
     }
   }, [thinkingText, isStreaming]);
