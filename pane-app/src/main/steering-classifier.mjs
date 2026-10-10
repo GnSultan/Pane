@@ -3,7 +3,7 @@
  * already running is a correction/refinement for THAT task (steer it in at
  * the next turn boundary) or an unrelated new topic (queue it for after).
  *
- * Deliberately separate from heuristic-router.mjs: that module classifies a
+ * Deliberately separate from turn-signals.mjs: turn-signals classifies a
  * message in isolation (intent/complexity/escalation between independent
  * turns). This answers a different question — "is this about the task that
  * is currently running" — so it gets its own small module, the same way
@@ -16,7 +16,7 @@
  * than making the user wait a bit longer for an unrelated message.
  */
 
-import { FAILURE_PATTERNS, jaccardSimilarity } from "./heuristic-router.mjs";
+import { FAILURE_PATTERNS, jaccardSimilarity } from "./turn-signals.mjs";
 import { isUserCorrection } from "./code-arbiter.mjs";
 
 // Explicit "this is a different thing" signals — override everything else,

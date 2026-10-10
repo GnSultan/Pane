@@ -88,15 +88,6 @@ export function resolveModelForProvider(selection, provider) {
 }
 
 /**
- * Map a heuristic-router tier to a power-combo slot. frontier/capable →
- * thinking slot; everything else → execution slot. Shared by spawn routing
- * and previewRoute so the prediction and the real route can't diverge.
- */
-export function comboSlotForTier(tier) {
-  return tier === "frontier" || tier === "capable" ? "thinking" : "execution";
-}
-
-/**
  * Derive a power combo from the active selection when the user hasn't
  * configured one explicitly: both slots point at the selected model.
  * Returns null when there is no selection — never a hardcoded combo.

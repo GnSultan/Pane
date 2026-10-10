@@ -5,7 +5,6 @@ import os from "node:os";
 import {
   extractActiveSelection,
   resolveModelForProvider,
-  comboSlotForTier,
   deriveComboFromSelection,
   pickKeyedProvider,
   resolveVoiceDistillModel,
@@ -93,22 +92,6 @@ describe("resolveModelForProvider", () => {
         "anthropic",
       ),
     ).toBeNull();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Tier → combo slot mapping (shared by spawn routing and previewRoute)
-// ---------------------------------------------------------------------------
-
-describe("comboSlotForTier", () => {
-  it("maps frontier and capable to the thinking slot", () => {
-    expect(comboSlotForTier("frontier")).toBe("thinking");
-    expect(comboSlotForTier("capable")).toBe("thinking");
-  });
-
-  it("maps cheap and mid to the execution slot", () => {
-    expect(comboSlotForTier("cheap")).toBe("execution");
-    expect(comboSlotForTier("mid")).toBe("execution");
   });
 });
 

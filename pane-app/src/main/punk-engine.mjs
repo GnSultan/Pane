@@ -21,8 +21,7 @@ import { routingStore } from "./routing-store.mjs";
 import { classifyDomain } from "./routing-oracle.mjs";
 import { ensurePriors } from "./benchmark-scout.mjs";
 // intent-classifier.mjs removed — LLM-based classifier was dead code (never called)
-import { detectFailureSignals, detectSuccessSignals, djb2Hash } from "./heuristic-router.mjs";
-import { routeIntegrated, recordOutcome, getClassifierStats } from "./heuristic-router.mjs";
+import { detectFailureSignals, detectSuccessSignals, djb2Hash } from "./turn-signals.mjs";
 import { contextStore } from "./context-store.mjs";
 import { propagateCompletion } from "./completion-propagator.mjs";
 import { extractAndIndex } from "./memory-extractor.mjs";
@@ -32,7 +31,6 @@ import {
   extractActiveSelection,
   deriveComboFromSelection,
   pickKeyedProvider,
-  comboSlotForTier,
   resolveActiveModel,
   normalizeProvider,
 } from "./model-resolver.mjs";
@@ -40,36 +38,6 @@ import {
 // Node.js globals for utility process
 const { setImmediate, console } =
   globalThis;
-
-// ============================================================================
-// Outcome scoring helpers
-// ============================================================================
-
-/**
- * Compute a basic quality score for a completed outcome.
- * Higher score = better outcome.
- *
- * @param {Object} tracked - tracked outcome data
- * @returns {number} 0-1 score
- */
-function computeOutcomeScore(tracked) {
-  let score = 0.5; // baseline
-
-  // Response length: very short responses are often errors or refusals
-  if (tracked.responseLength < 20) score -= 0.3;
-  else if (tracked.responseLength < 50) score -= 0.1;
-  else if (tracked.responseLength > 500) score += 0.1;
-
-  // Tool errors reduce score significantly
-  if (tracked.hadToolErrors) score -= 0.25;
-
-  // Response time: very slow is bad (could indicate struggle)
-  if (tracked.responseTimeMs > 60000) score -= 0.15;
-  else if (tracked.responseTimeMs > 30000) score -= 0.05;
-
-  // Clamp to valid range
-  return Math.max(0.01, Math.min(1.0, score));
-}
 
 const __dirname = import.meta.dirname;
 
@@ -148,9 +116,6 @@ class PunkEngine {
     // Worker agent listeners: requestId → { onText, resolve, reject, streamedText }
     // Used by agentCall() — events are consumed internally, never forwarded to renderer.
     this._workerAgentListeners = new Map();
-
-    // Log learned classifier status at startup
-    if (getClassifierStats()) console.log("[punk] learned classifier ready");
 
     // Safety sweep: evict any _activeOutcomes entries older than 10 minutes
     // (covers crashes/hangs where neither processEnded nor error fires) and
@@ -269,14 +234,6 @@ class PunkEngine {
     ensurePriors().catch(err =>
       console.warn("[punk] benchmark-scout failed (non-fatal):", err.message)
     );
-
-    // Log learned classifier status at startup (static import already loaded)
-    const stats = getClassifierStats();
-    if (stats) {
-      console.log(`[punk] learned classifier ready (${stats.sampleCount} samples, ${stats.vocabSize} vocab)`);
-    } else {
-      console.log("[punk] learned classifier initialized");
-    }
   }
 
   /**
@@ -576,28 +533,6 @@ class PunkEngine {
           });
         } catch (err) {
           console.warn("[punk] outcome update failed (non-fatal):", err.message);
-        }
-
-        // Train the learned classifier with this completed outcome
-        if (tracked.userPrompt && tracked.projectId) {
-          try {
-            // Compute a basic quality score based on response signals
-            const score = computeOutcomeScore(tracked);
-            recordOutcome({
-              projectId: tracked.projectId,
-              prompt: tracked.userPrompt,
-              taskType: tracked.taskType,
-              domain: tracked.domain,
-              model: tracked.model || "unknown",
-              provider: tracked.provider || "unknown",
-              responseTimeMs: elapsed,
-              hadToolErrors: tracked.hadToolErrors,
-              responseLength: tracked.responseLength,
-              score,
-            });
-          } catch (err) {
-            console.warn("[punk] classifier training failed (non-fatal):", err.message);
-          }
         }
 
         // Fire principle extraction immediately — do NOT store responseText in
@@ -1026,48 +961,43 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       // Struggle count for backward compat with outcome tracking
       struggleCount = threadState.consecutiveFailures;
 
-      // ── Route via integrated engine (heuristic + learned classifier) ──
-      localDecision = await routeIntegrated({
-        message:        resolvedRequest.prompt ?? "",
-        turnCount:      history.length,
-        workingSetSize: workingSet.length,
-        pendingTodos,
-        phase:          sessionState?.phase || "idle",
-        threadState: {
-          consecutiveFailures: threadState.consecutiveFailures,
-          lastFailureType:     threadState.lastFailureType,
-          approachesTried:     threadState.approachesTried?.length || 0,
-          lastResponseSummary: threadState.lastResponseSummary,
-          lastUserPromptHash:  threadState.lastUserPromptHash,
-        },
-        backend: catalogData?.backend ?? "claude-code",
-      });
+      // ── Decision from phase + thread state (no heuristic router) ──────
+      // The heuristic router (complexity scoring, task-type/mode/tier
+      // classification) was removed Oct 2026. Strategy comes from the
+      // session phase; escalation comes from thread-state, which has
+      // always owned the failure counter. Model selection happens in the
+      // ROUTING block below via the user's power combo.
+      const escalationStage = threadState.escalationStage || 0;
+      const classification = classifyDomain(resolvedRequest.prompt ?? "");
+      const mode = classification === "explanation" ? "discuss"
+        : classification === "debugging" || classification === "architecture" ? "analyze"
+        : "direct";
 
-      // If the heuristic resets failures (success detected), apply it
-      if (localDecision.resetFailures) {
-        recordSuccess(resolvedRequest.projectId);
-      }
+      localDecision = {
+        taskType: classification,
+        mode,
+        escalationStage,
+        routedBy: "phase",
+      };
 
       // Record the approach for this stage
-      const approachLabel = localDecision.escalationStage >= 2 ? "explore_first"
-        : localDecision.escalationStage >= 1 ? "self_review"
+      const approachLabel = escalationStage >= 2 ? "explore_first"
+        : escalationStage >= 1 ? "self_review"
         : "direct";
       recordApproach(resolvedRequest.projectId, approachLabel);
 
       strategy = {
-        mode:         localDecision.mode,
-        discovery:    localDecision.discovery,
-        reasoning:    localDecision.reasoning,
-        verification: localDecision.verification,
-        confidence:   localDecision.confidence,
-        reason:       localDecision.reason || null,
+        mode,
+        discovery:    mode === "analyze",
+        reasoning:    mode === "analyze" ? "deep" : "shallow",
+        verification: mode === "analyze" ? "none" : "diff",
+        confidence:   1.0,
+        reason:       `phase routing (${classification})`,
         signals:      [],
       };
 
       console.log(
-        `[punk] heuristic → mode=${localDecision.mode} tier=${localDecision.modelTier} ` +
-        `complexity=${localDecision.complexityScore} stage=${localDecision.escalationStage} ` +
-        `task=${localDecision.taskType}`,
+        `[punk] routed → mode=${mode} stage=${escalationStage} task=${classification}`,
       );
     }
 
@@ -1107,7 +1037,8 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     // When autoRoute is on the router owns model selection entirely.
     const userExplicitOverride = !autoRoute;
 
-    // Escalation level from heuristic router (already computed, not from old struggle detection)
+    // Escalation level from thread-state (consecutive-failure derived —
+    // thread-state has always owned the counter; the router only mirrored it)
     let escalationLevel = localDecision?.escalationStage ?? 0;
 
     if (userExplicitOverride) {
@@ -1115,31 +1046,35 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       // Phase affects strategy (mode, discovery, reasoning) but NOT model selection.
       resolvedRequest.thinking = request.thinking ?? false;
       console.log(`[punk] user model lock → ${resolvedRequest.provider}/${resolvedRequest.model}`);
-    } else if (localDecision?.modelTier && autoRoute) {
-      // ── Heuristic tier → concrete model resolution ──
-      // The heuristic router returns a tier (cheap/mid/capable/frontier).
-      // Tiers map to the user's configured combo slots (never to a hardcoded
-      // per-provider model table): frontier/capable → thinking slot, lower
-      // tiers → execution slot. When no combo exists, the active selection
-      // serves both slots.
-      const tier = localDecision.modelTier;
+    } else if (autoRoute) {
+      // ── Phase → combo-slot model resolution ──
+      // No heuristic router: auto-route resolves through the user's power
+      // combo by phase. Discussion turns take the thinking slot; direct
+      // build turns take the execution slot. Escalation (struggling on the
+      // same problem) upgrades to the thinking slot — the user is paying
+      // for a second opinion, not a faster wrong answer. When no combo
+      // exists, the active selection serves both slots.
       const isGemini = catalogData?.backend === "gemini";
       const baseProvider = isGemini
         ? "gemini"
         : (intentRoute?.provider || null);
 
-      const tierSlot = comboSlotForTier(tier);
-      const tierRoute = (combo && (combo[tierSlot] || combo["execution"])) ||
+      const wantsThinking =
+        localDecision?.mode === "discuss" ||
+        localDecision?.mode === "analyze" ||
+        escalationLevel >= 2;
+      const phaseSlot = wantsThinking ? "thinking" : "execution";
+      const phaseRoute = (combo && (combo[phaseSlot] || combo["execution"])) ||
         (activeSelection ? { provider: activeSelection.provider, model: activeSelection.model, thinking: false } : null);
 
-      resolvedRequest.provider = baseProvider || tierRoute?.provider || null;
+      resolvedRequest.provider = baseProvider || phaseRoute?.provider || null;
       // Never pair a forced provider (gemini backend) with another
       // provider's model — mismatch → null → surfaced error downstream.
       resolvedRequest.model    =
-        (resolvedRequest.provider && tierRoute && normalizeProvider(tierRoute.provider) === normalizeProvider(resolvedRequest.provider))
-          ? tierRoute.model
-          : (baseProvider ? null : tierRoute?.model) || null;
-      resolvedRequest.thinking = strategy.reasoning === "deep";
+        (resolvedRequest.provider && phaseRoute && normalizeProvider(phaseRoute.provider) === normalizeProvider(resolvedRequest.provider))
+          ? phaseRoute.model
+          : (baseProvider ? null : phaseRoute?.model) || null;
+      resolvedRequest.thinking = wantsThinking;
 
       // For API backend, check key availability and remap if needed.
       // anthropic and openai are exempt — OAuth covers them without an explicit API key.
@@ -1222,30 +1157,26 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     }
 
     // ── ESCALATION ────────────────────────────────────────────────────────
-    // The heuristic router computes escalation stages 0-4 with richer hints
-    // and pre-actions. We inject the escalation hint into the system prompt
-    // and set the escalation level for downstream use.
+    // thread-state owns the consecutive-failure counter; escalationStage on
+    // the decision is derived from it in the classification branch. Stage-
+    // aware, domain-specific hints still inject into the system prompt.
     if (localDecision?.escalationStage >= 1 && !userExplicitOverride && autoRoute) {
       escalationLevel = localDecision.escalationStage;
 
-      // Inject the heuristic router's escalation hint (stage-aware, domain-specific)
-      if (localDecision.escalationHint) {
-        // Build the rich domain-aware hint from _buildEscalationHint for stages 2+
-        // The heuristic router's hint is a brief behavioral instruction;
-        // combine it with the full domain-specific escalation for deep context.
-        const richHint = struggleCount >= 2
-          ? _buildEscalationHint(struggleCount, localDecision.taskType)
-          : localDecision.escalationHint;
-        resolvedRequest.escalationHint  = richHint;
-        resolvedRequest.escalationLevel = escalationLevel;
-      }
+      // Build the rich domain-aware hint for stages 2+; a brief behavioral
+      // instruction for stage 1.
+      const richHint = escalationLevel >= 2
+        ? _buildEscalationHint(struggleCount, localDecision.taskType)
+        : "A previous attempt on this problem did not work. Re-examine assumptions before trying the same approach again.";
+      resolvedRequest.escalationHint  = richHint;
+      resolvedRequest.escalationLevel = escalationLevel;
 
       // Enable deep thinking on escalated sessions
       if (escalationLevel >= 2) {
         resolvedRequest.thinking = true;
       }
 
-      console.log(`[punk] escalation stage ${escalationLevel} injected (heuristic)`);
+      console.log(`[punk] escalation stage ${escalationLevel} injected`);
     }
 
     // Force openrouter for slash-namespaced models
@@ -1253,8 +1184,9 @@ Respond with a single concise principle statement (one sentence, under 150 chara
       resolvedRequest.provider = "openrouter";
     }
 
-    // Domain for outcome recording — derived from heuristic or regex fallback
-    const domain = localDecision
+    // Domain for outcome recording — from the classification (already regex-
+    // derived via routing-oracle), falling back to the raw classify pass.
+    const domain = localDecision?.taskType
       ? _taskTypeToDomain(localDecision.taskType)
       : classifyDomain(resolvedRequest.prompt ?? "");
 
@@ -1279,17 +1211,12 @@ Respond with a single concise principle statement (one sentence, under 150 chara
             provider:     resolvedRequest.provider,
             model:        resolvedRequest.model,
             thinking:     resolvedRequest.thinking ?? false,
-            // heuristic metadata
+            // decision metadata (phase-based — no heuristic router)
             routedBy:         localDecision?.routedBy ?? null,
-            heuristicTier:    localDecision?.modelTier ?? null,
-            complexityScore:  localDecision?.complexityScore ?? null,
             localTaskType:    localDecision?.taskType ?? null,
-            localComplexity:  localDecision?.complexity ?? null,
-            localAtomHints:   localDecision?.atomHints ?? [],
-            // escalation (from heuristic router)
+            // escalation (derived from thread-state consecutive failures)
             escalationLevel,
             struggleCount,
-            preActions:       localDecision?.preActions ?? [],
           },
         },
         request.requestId,
@@ -1414,8 +1341,8 @@ Respond with a single concise principle statement (one sentence, under 150 chara
           model:               resolvedRequest.model,
           provider:            resolvedRequest.provider,
           routingConfidence: strategy.confidence,
-          oracleUsed:          localDecision?.routedBy === "integrated",
-          oracleConfidence:    localDecision?.routedBy === "integrated" ? (localDecision.confidence || 0.85) : null,
+          oracleUsed:          false,
+          oracleConfidence:    null,
           promptLength:        (resolvedRequest.prompt ?? "").length,
           explored:            false,
         });
@@ -1514,51 +1441,40 @@ Respond with a single concise principle statement (one sentence, under 150 chara
     const autoRoute = await this.loadIntentAutoRoute();
     if (!autoRoute) return null; // User has pinned a model — no preview needed
 
-    const settings = await this.loadSettings();
     const combo = await this.loadPowerCombo();
 
     try {
-      const state = readState(projectId);
       const threadState = readThreadState(projectId);
 
-      const decision = await routeIntegrated({
-        message:        message || "",
-        turnCount:      0,
-        workingSetSize: state?.workingSet?.length || 0,
-        pendingTodos:   (state?.todos || []).filter(t => t.status !== "completed").length,
-        phase:          state?.phase || "idle",
-        threadState: {
-          consecutiveFailures: threadState?.consecutiveFailures || 0,
-          lastFailureType:     threadState?.lastFailureType || null,
-          approachesTried:     threadState?.approachesTried?.length || 0,
-          lastResponseSummary: null,
-          lastUserPromptHash:  null,
-        },
-        backend: settings.punk_backend || "api",
-      });
+      // Same decision the real route makes: classification → mode,
+      // escalation stage from thread-state. The preview and the actual
+      // routing can never diverge because both derive from this.
+      const classification = classifyDomain(message || "");
+      const mode = classification === "explanation" ? "discuss"
+        : classification === "debugging" || classification === "architecture" ? "analyze"
+        : "direct";
+      const escalationStage = threadState?.escalationStage || 0;
 
-      if (!decision?.modelTier) return null;
-
-      // Map tier to concrete model from the user's power combo using the
-      // shared tier→slot mapping (same one spawn routing uses — the preview
-      // and the real route can never diverge). No combo → derive from the
-      // active selection; still nothing → no preview, not an invented model.
-      const tier = decision.modelTier;
-      const tierSlot = comboSlotForTier(tier);
+      // Same slot resolution as the ROUTING block: discussion/analysis and
+      // escalated turns take the thinking slot; direct build turns take the
+      // execution slot. No combo → derive from the active selection; still
+      // nothing → no preview, not an invented model.
+      const wantsThinking = mode === "discuss" || mode === "analyze" || escalationStage >= 2;
+      const phaseSlot = wantsThinking ? "thinking" : "execution";
       const route = combo
-        ? (combo[tierSlot] || combo[tierSlot === "thinking" ? "execution" : "thinking"])
-        : deriveComboFromSelection(await resolveActiveModel())?.[tierSlot];
+        ? (combo[phaseSlot] || combo[phaseSlot === "thinking" ? "execution" : "thinking"])
+        : deriveComboFromSelection(await resolveActiveModel())?.[phaseSlot];
 
       if (!route) return null;
 
       return {
         model:      route.model,
         provider:   route.provider,
-        tier,
-        mode:       decision.mode,
-        taskType:   decision.taskType,
-        confidence: decision.confidence,
-        reason:     decision.reason,
+        tier:       phaseSlot,
+        mode,
+        taskType:   classification,
+        confidence: 1.0,
+        reason:     `phase routing (${classification})`,
       };
     } catch {
       return null;

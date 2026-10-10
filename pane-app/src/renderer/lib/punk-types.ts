@@ -88,14 +88,8 @@ export interface StrategyBlock {
   provider: string;
   model: string;
   thinking: boolean;
-  // classifier routing fields
-  classifierRouted?: boolean;
-  classifierConfidence?: number | null;
-  classifierExploring?: boolean;
-  // null when classifier didn't run (system override, no API key)
+  // task classification (phase-based — regex-derived domain)
   localTaskType: string | null;
-  localComplexity: string | null;
-  localAtomHints: string[];
   // escalation fields (present when struggle detected)
   escalationLevel?: number;
   struggleCount?: number;
@@ -222,9 +216,6 @@ export interface PunkEventStrategy {
     provider: string;
     model: string;
     thinking: boolean;
-    classifierRouted?: boolean;
-    classifierConfidence?: number | null;
-    classifierExploring?: boolean;
   };
 }
 
